@@ -174,6 +174,7 @@ recent turns
 live files being generated
 supervised process status
 tool-call/event stream
+provider activity from live Codex session logs
 ```
 
 Keys:

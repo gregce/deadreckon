@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
@@ -25,7 +25,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
 use serde::de::DeserializeOwned;
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, thiserror::Error)]
@@ -1294,6 +1294,7 @@ struct AttachLive {
     total_bytes: u64,
     files: Vec<LiveFile>,
     pids: Vec<LivePid>,
+    provider_activity: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1326,11 +1327,13 @@ fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
         .into_iter()
         .map(live_pid)
         .collect::<Vec<_>>();
+    let provider_activity = collect_provider_activity(state);
     AttachLive {
         file_count,
         total_bytes,
         files,
         pids,
+        provider_activity,
     }
 }
 
@@ -1374,6 +1377,179 @@ fn live_pid(pid: u32) -> LivePid {
         alive,
         command,
     }
+}
+
+fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> Vec<String> {
+    if state.provider.as_deref() != Some("cli:codex") {
+        return Vec::new();
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let sessions_root = home.join(".codex/sessions");
+    let since = state.started_at - ChronoDuration::minutes(2);
+    let mut candidates = Vec::new();
+    collect_recent_jsonl_files(&sessions_root, since, &mut candidates, 0);
+    candidates.sort_by(|left, right| right.1.cmp(&left.1));
+    let working_dir = state.working_dir.to_string_lossy().to_string();
+    for (path, _) in candidates.into_iter().take(12) {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if !raw.contains(&working_dir) {
+            continue;
+        }
+        let mut items = raw
+            .lines()
+            .filter_map(codex_activity_line)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            continue;
+        }
+        items.push(format!(
+            "{} provider log {}",
+            format_age(
+                fs::metadata(&path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .map(DateTime::<Utc>::from),
+            ),
+            path.display()
+        ));
+        return items
+            .into_iter()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+    }
+    Vec::new()
+}
+
+fn collect_recent_jsonl_files(
+    root: &Path,
+    since: DateTime<Utc>,
+    files: &mut Vec<(PathBuf, DateTime<Utc>)>,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_recent_jsonl_files(&path, since, files, depth + 1);
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(modified_at) = metadata.modified().ok().map(DateTime::<Utc>::from) else {
+            continue;
+        };
+        if modified_at >= since {
+            files.push((path, modified_at));
+        }
+    }
+}
+
+fn codex_activity_line(line: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let timestamp = short_timestamp(value.get("timestamp").and_then(Value::as_str));
+    let payload = value.get("payload")?;
+    match (
+        value.get("type").and_then(Value::as_str),
+        payload.get("type").and_then(Value::as_str),
+    ) {
+        (Some("event_msg"), Some("task_started")) => Some(format!("{timestamp} codex started")),
+        (Some("event_msg"), Some("agent_message")) => payload
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|message| format!("{timestamp} agent {}", one_line(message, 140))),
+        (Some("event_msg"), Some("token_count")) => {
+            let usage = payload.get("info")?.get("total_token_usage")?;
+            let total = usage.get("total_tokens").and_then(Value::as_u64)?;
+            let window = payload
+                .get("info")
+                .and_then(|info| info.get("model_context_window"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let rate = payload
+                .get("rate_limits")
+                .and_then(|limits| limits.get("primary"))
+                .and_then(|primary| primary.get("used_percent"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            Some(format!(
+                "{timestamp} tokens {total}/{window} rate {rate:.0}%"
+            ))
+        }
+        (Some("response_item"), Some("function_call")) => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let args = payload
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Some(format!(
+                "{timestamp} tool {name} {}",
+                one_line(&tool_call_summary(name, args), 140)
+            ))
+        }
+        (Some("response_item"), Some("function_call_output")) => payload
+            .get("output")
+            .and_then(Value::as_str)
+            .map(|output| format!("{timestamp} result {}", one_line(output, 140))),
+        _ => None,
+    }
+}
+
+fn tool_call_summary(name: &str, args: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(args) else {
+        return one_line(args, 140);
+    };
+    match name {
+        "exec_command" => value
+            .get("cmd")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| value.to_string()),
+        "update_plan" => value
+            .get("plan")
+            .and_then(Value::as_array)
+            .map(|plan| {
+                plan.iter()
+                    .filter_map(|item| {
+                        Some(format!(
+                            "{}:{}",
+                            item.get("status")?.as_str()?,
+                            item.get("step")?.as_str()?
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or_else(|| value.to_string()),
+        _ => value.to_string(),
+    }
+}
+
+fn short_timestamp(timestamp: Option<&str>) -> String {
+    timestamp
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc).format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "--:--:--".to_string())
 }
 
 fn render_attach(
@@ -1484,8 +1660,19 @@ fn render_attach(
             live.file_count
         )));
     }
+    trace_items.extend(
+        live.provider_activity
+            .iter()
+            .rev()
+            .take(10)
+            .map(|item| ListItem::new(item.clone())),
+    );
     frame.render_widget(
-        List::new(trace_items).block(Block::default().borders(Borders::ALL).title("tool calls")),
+        List::new(trace_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("tool calls / provider activity"),
+        ),
         vertical[3],
     );
     frame.render_widget(
