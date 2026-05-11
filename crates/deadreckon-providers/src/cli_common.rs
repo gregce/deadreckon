@@ -124,3 +124,16 @@ pub(crate) async fn write_output(path: Option<&PathBuf>, output: &CliOutput) -> 
             source,
         })
 }
+
+pub(crate) fn ensure_success(provider: &str, output: &CliOutput) -> Result<()> {
+    if output.status_code == Some(0) {
+        return Ok(());
+    }
+    Err(ProviderError::Cli {
+        provider: provider.to_string(),
+        detail: format!(
+            "subprocess exited with {:?}: {}{}",
+            output.status_code, output.stdout, output.stderr
+        ),
+    })
+}

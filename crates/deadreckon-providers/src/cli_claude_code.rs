@@ -3,7 +3,7 @@ use std::time::Instant;
 use serde_json::json;
 use which::which;
 
-use crate::cli_common::{run_cli, write_output};
+use crate::cli_common::{ensure_success, run_cli, write_output};
 use crate::{
     Provider, ProviderEntry, ProviderFuture, ProviderKind, ProviderRequest, ProviderResponse,
     ProviderUsage, Result, SpendEstimate,
@@ -49,6 +49,7 @@ impl CliClaudeCodeProvider {
         )
         .await?;
         write_output(request.output_path.as_ref(), &output).await?;
+        ensure_success(&self.name, &output)?;
         let wall_time_seconds = started.elapsed().as_secs_f64();
         let usage = ProviderUsage {
             input_tokens: 0,

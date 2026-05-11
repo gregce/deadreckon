@@ -3,7 +3,7 @@ use std::time::Instant;
 use serde_json::json;
 use which::which;
 
-use crate::cli_common::{run_cli, write_output};
+use crate::cli_common::{ensure_success, run_cli, write_output};
 use crate::{
     Provider, ProviderEntry, ProviderFuture, ProviderKind, ProviderRequest, ProviderResponse,
     ProviderUsage, Result, SpendEstimate,
@@ -30,10 +30,11 @@ impl CliCodexProvider {
 
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let started = Instant::now();
-        let mut args = self.extra_args.clone();
+        let mut args = vec!["exec".to_string()];
         // `codex --help` on this machine lists `exec` as "Run Codex
         // non-interactively"; V0 uses that verb for subscription-BYOK turns.
-        args.extend(["exec".to_string(), request.prompt.clone()]);
+        args.extend(self.extra_args.clone());
+        args.push(request.prompt.clone());
         let output = run_cli(
             &self.name,
             &self.binary,
@@ -44,6 +45,7 @@ impl CliCodexProvider {
         )
         .await?;
         write_output(request.output_path.as_ref(), &output).await?;
+        ensure_success(&self.name, &output)?;
         let wall_time_seconds = started.elapsed().as_secs_f64();
         let usage = ProviderUsage {
             input_tokens: 0,
