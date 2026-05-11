@@ -155,6 +155,8 @@ mod tests {
                 skill_name: "default-coding".to_string(),
                 max_spend_usd: None,
                 max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
             },
         )
         .expect("run");

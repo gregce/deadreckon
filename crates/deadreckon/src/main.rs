@@ -447,6 +447,8 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
             skill_name: skill,
             max_spend_usd: effective_max_spend,
             max_wall_seconds: effective_max_wall_seconds,
+            run_id: None,
+            codebase: None,
         },
     )?;
     print_run_started(&state);
@@ -1086,6 +1088,8 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             skill_name: parent.skill_name.clone(),
             max_spend_usd: effective_max_spend,
             max_wall_seconds: effective_max_wall_seconds,
+            run_id: None,
+            codebase: None,
         },
     )?;
     align_extended_run_with_parent(&paths, &mut state, &parent)?;
@@ -1769,6 +1773,8 @@ fn normalize_import(
             skill_name: "default-coding".to_string(),
             max_spend_usd: None,
             max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
         },
     )?;
     let old_root = state.run_root.clone();

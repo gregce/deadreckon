@@ -1,5 +1,9 @@
 # Changelog
 
+## Codebase modes (alpha) — 2026-05-11
+
+- P1: Added codebase mode records, fresh-mode metadata, and deterministic mode resolution plumbing without changing `PipelineState`.
+
 ## Lifecycle ergonomics
 
 Phase commits: `4481617`, `556897d`, `91ab9a6`.

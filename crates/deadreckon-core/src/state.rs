@@ -9,6 +9,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use crate::codebase::{CodebaseMode, CodebaseRecord, write_codebase_record};
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::paths::{DeadreckonPaths, SOURCE_ROOT, task_key, workspace_scope};
 
@@ -130,6 +131,8 @@ pub struct RunOptions {
     pub skill_name: String,
     pub max_spend_usd: Option<f64>,
     pub max_wall_seconds: Option<f64>,
+    pub run_id: Option<String>,
+    pub codebase: Option<CodebaseRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,9 +181,12 @@ impl PipelineState {
 pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<PipelineState> {
     let scope = workspace_scope(&options.cwd)?;
     let task_key = task_key(&options.goal);
-    let run_id = Uuid::new_v4().simple().to_string();
+    let run_id = options
+        .run_id
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     let run_root = paths.run_root(&scope, &run_id);
-    let working_dir = run_root.join("working");
+    let codebase = options.codebase.unwrap_or_else(CodebaseRecord::fresh);
+    let working_dir = working_dir_for_codebase(&run_root, &codebase);
     fs::create_dir_all(&working_dir).with_path(&working_dir)?;
     fs::create_dir_all(run_root.join("snapshots")).with_path(run_root.join("snapshots"))?;
     let gate_dir = run_root.join("gate");
@@ -226,8 +232,23 @@ pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<Pipeli
     };
     state.set_phase_status(PhaseId(0), PhaseStatus::Planned)?;
     save_state(&state)?;
+    write_codebase_record(&state.working_dir, &codebase)?;
     write_current_pointer(paths, &state)?;
     Ok(state)
+}
+
+fn working_dir_for_codebase(run_root: &Path, codebase: &CodebaseRecord) -> PathBuf {
+    match codebase.mode {
+        CodebaseMode::Worktree => codebase
+            .worktree_path
+            .clone()
+            .unwrap_or_else(|| run_root.join("working")),
+        CodebaseMode::InPlace => codebase
+            .source_path
+            .clone()
+            .unwrap_or_else(|| run_root.join("working")),
+        CodebaseMode::Copy | CodebaseMode::Fresh => run_root.join("working"),
+    }
 }
 
 pub fn default_phases(now: DateTime<Utc>) -> Vec<PhaseState> {
@@ -412,6 +433,8 @@ mod tests {
                 skill_name: "default-coding".to_string(),
                 max_spend_usd: Some(1.0),
                 max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
             },
         )
         .expect("create run");
@@ -442,6 +465,8 @@ mod tests {
                 skill_name: "default-coding".to_string(),
                 max_spend_usd: None,
                 max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
             },
         )
         .expect("create run");

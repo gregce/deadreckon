@@ -227,6 +227,8 @@ fn extend_refuses_incomplete_parent() {
             skill_name: "default-coding".to_string(),
             max_spend_usd: Some(1.0),
             max_wall_seconds: Some(30.0),
+            run_id: None,
+            codebase: None,
         },
     )
     .expect("parent");
@@ -450,6 +452,8 @@ fn completed_parent(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineSta
             skill_name: "default-coding".to_string(),
             max_spend_usd: Some(1.0),
             max_wall_seconds: Some(30.0),
+            run_id: None,
+            codebase: None,
         },
     )
     .expect("run");
