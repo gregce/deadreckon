@@ -306,10 +306,7 @@ fn build_cli_subagent_prompt(state: &PipelineState, history: &[String]) -> Strin
 }
 
 fn is_cli_provider_name(provider: &str) -> bool {
-    matches!(
-        provider,
-        "cli:claude-code" | "cli-claude-code" | "cli:codex" | "cli-codex"
-    )
+    provider.starts_with("cli:") || provider.starts_with("cli-")
 }
 
 fn parse_action(response: &ProviderResponse) -> Result<Action> {

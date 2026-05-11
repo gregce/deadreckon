@@ -14,7 +14,7 @@ Audit date: 2026-05-11. Scope: `/Users/gdc/deadreckon/`.
 | `resume` did not continue execution. | Resolved. | `deadreckon resume` reloads state/history and re-enters `run_turn_loop`; integration tests verify history survives. |
 | Anti-self-attestation gate was absent. | Resolved. | `crates/deadreckon/src/bin/dr-gate.rs` writes `proofs/turn-acceptance.json`; core validates `run_id`, producer, and pass status before completion. |
 | Provenance IDs were not tied to traces. | Resolved. | Tool traces carry `tool_call_id`; provenance records reuse those ids; integration tests assert every provenance id appears in traces. |
-| Demo cast was hand-authored placeholder output. | Resolved. | `demo.cast` now contains asciicast v2 JSON generated from real release-binary `doctor/run --provider cli:codex/list/attach/show/undo` output using `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke`. |
+| Demo cast was hand-authored placeholder output. | Resolved. | `demo.cast` now contains asciicast v2 JSON generated from real release-binary `init/run --provider cli-codex/list/attach/show/undo/kill/resume` output using `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke`. |
 | Keyless tests did not prove agentic behavior. | Resolved. | `cargo test --workspace` includes mock OpenAI-compatible provider tests, three-turn integration, kill, resume-history, acceptance-marker, and fake CLI-provider tests. |
 | Original V0 first-run UX was incomplete. | Resolved. | `deadreckon init`, `deadreckon config get/set`, actionable `doctor`, config-backed spend defaults, high-spend confirmation guards, TUI Ctrl-D detach, and colored spend/context meters are implemented in `crates/deadreckon/src/main.rs` and covered by integration tests. |
 
