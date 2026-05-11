@@ -6,6 +6,6 @@ Tier 1 crates are logged in commit messages. Tier 2 crates are listed here.
 |---|---:|---:|---|---|---|
 | toml | 0.9.12 | 2 | Parse `/Users/gdc/.deadreckon/config.toml` for BYOK provider routing. | Hand-rolled parsing would violate the structured-parser preference; JSON config would violate the rider's TOML path. | c881a88 |
 | axum | 0.8.9 | 2 | Keyless OpenAI-compatible mock provider used by primary-flow integration tests. | Hand-written TCP HTTP would obscure the provider contract; adding a production server surface is avoided by keeping this as a dev-dependency. | 1b425dd |
-| serde_yaml | 0.9.34 | 1 | Parse `acceptance.yaml` for dr-gate checks. | YAML is prescribed by the robustness rider. | 14a9351 |
-| tokio-stream | 0.1.18 | 1 | Stream-oriented test/runtime support for async run events. | Manual stream wrappers would add noise around broadcast handling. | 14a9351 |
-| tokio-util | 0.7.18 | 1 | Hierarchical `CancellationToken` for run, provider, and sandbox cancellation. | Homegrown cancellation would be less reliable than Tokio's standard utility. | 14a9351 |
+| serde_yaml | 0.9.34 | 1 | Parse `acceptance.yaml` for dr-gate checks. | YAML is prescribed by the robustness rider. | cec49f3 |
+| tokio-stream | 0.1.18 | 1 | Stream-oriented test/runtime support for async run events. | Manual stream wrappers would add noise around broadcast handling. | cec49f3 |
+| tokio-util | 0.7.18 | 1 | Hierarchical `CancellationToken` for run, provider, and sandbox cancellation. | Homegrown cancellation would be less reliable than Tokio's standard utility. | cec49f3 |

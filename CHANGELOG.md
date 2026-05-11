@@ -2,7 +2,7 @@
 
 ## 0.1.0 - Robustness Milestone (alpha)
 
-Commit: `14a9351`.
+Implementation commit: `cec49f3`.
 
 - Hardened the run loop with broadcast/file-backed events, per-turn timers, cancellation tokens, wall-clock CLI spend accounting, partial-trace resume, and `resume --from-turn`.
 - Hardened sandbox execution with generated Seatbelt/bwrap policy inputs, tmp `$HOME`, network denial, persisted profiles, and adversarial path/network tests.
