@@ -1,14 +1,12 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Core state, locking, and run artifacts for the deadreckon harness.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod error;
+pub mod paths;
+pub mod state;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use error::{DeadreckonError, Result};
+pub use paths::{DEFAULT_DEADRECKON_HOME, DeadreckonPaths, SOURCE_ROOT};
+pub use state::{
+    CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, RunListEntry, RunOptions,
+    RunStatus,
+};
