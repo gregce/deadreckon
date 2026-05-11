@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -1406,16 +1406,13 @@ fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> Provider
         state.working_dir.to_string_lossy().to_string(),
         state.run_root.join("working").to_string_lossy().to_string(),
     ];
-    for (path, _) in candidates.into_iter().take(12) {
+    for (path, _) in candidates {
+        if !codex_session_matches_run(&path, &working_dirs) {
+            continue;
+        }
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        if !working_dirs
-            .iter()
-            .any(|working_dir| raw.contains(working_dir))
-        {
-            continue;
-        }
         let mut activity = ProviderActivity::default();
         for line in raw.lines() {
             if let Some(line) = codex_activity_line(line, &mut activity) {
@@ -1447,6 +1444,30 @@ fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> Provider
         return activity;
     }
     ProviderActivity::default()
+}
+
+fn codex_session_matches_run(path: &Path, working_dirs: &[String]) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let reader = io::BufReader::new(file);
+    for line in reader.lines().map_while(std::result::Result::ok).take(8) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let Some(cwd) = value
+            .get("payload")
+            .and_then(|payload| payload.get("cwd"))
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        return working_dirs.iter().any(|working_dir| working_dir == cwd);
+    }
+    false
 }
 
 fn collect_recent_jsonl_files(
