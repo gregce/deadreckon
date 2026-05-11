@@ -5,6 +5,7 @@ pub mod error;
 pub mod lock;
 pub mod paths;
 pub mod state;
+pub mod turn_loop;
 
 pub use artifacts::{
     ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
@@ -19,3 +20,4 @@ pub use state::{
     CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, RunListEntry, RunOptions,
     RunStatus, create_run, list_runs, load_run, save_state,
 };
+pub use turn_loop::{RunLoopConfig, RunLoopOutcome, run_turn_loop};

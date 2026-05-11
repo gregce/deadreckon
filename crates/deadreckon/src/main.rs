@@ -1,8 +1,5 @@
-use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use std::time::Instant;
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -12,13 +9,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use deadreckon_core::{
-    DeadreckonError, DeadreckonPaths, PhaseId, PhaseStatus, ProvenanceRecord, RunOptions,
-    RunStatus, SpendRecord, TraceRecord, acquire_lock, append_provenance, append_spend,
-    append_trace, create_run, inventory_files, list_runs, load_run, release_lock_file,
-    restore_snapshot, save_state, snapshot_working,
+    DeadreckonError, DeadreckonPaths, PhaseId, PhaseStatus, ProvenanceRecord, RunLoopConfig,
+    RunLoopOutcome, RunOptions, RunStatus, SpendRecord, TraceRecord, acquire_lock, append_trace,
+    create_run, inventory_files, list_runs, load_run, release_lock_file, restore_snapshot,
+    run_turn_loop, save_state,
 };
-use deadreckon_providers::{ProviderRouter, ProviderUsage};
-use deadreckon_sandbox::{SandboxBackend, SandboxSpec, run as run_sandbox};
+use deadreckon_providers::ProviderRouter;
+use deadreckon_sandbox::SandboxBackend;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -27,7 +24,6 @@ use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 enum CliError {
@@ -68,6 +64,8 @@ enum Commands {
         provider: Option<String>,
         #[arg(long, default_value = "default-coding")]
         skill: String,
+        #[arg(long)]
+        smoke: bool,
     },
     Doctor,
     List {
@@ -115,7 +113,8 @@ async fn main() -> Result<()> {
             sandbox,
             provider,
             skill,
-        } => run_command(goal, max_spend, sandbox, provider, skill).await,
+            smoke,
+        } => run_command(goal, max_spend, sandbox, provider, skill, smoke).await,
         Commands::Doctor => {
             doctor_command();
             Ok(())
@@ -136,7 +135,14 @@ async fn run_command(
     sandbox: String,
     provider: Option<String>,
     skill: String,
+    smoke: bool,
 ) -> Result<()> {
+    if smoke {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "--smoke is reserved for an explicit labeled fallback; default run is provider-driven"
+                .to_string(),
+        )));
+    }
     let paths = DeadreckonPaths::discover();
     let cwd = std::env::current_dir()?;
     let backend: SandboxBackend = sandbox.parse()?;
@@ -164,123 +170,27 @@ async fn run_command(
     save_state(&state)?;
     lock.heartbeat("provider")?;
     let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
-    let usage = estimate_usage(&state.goal);
-    let spend = router.estimate_for_route(provider.as_deref(), usage)?;
-    let next_total = state.total_spend_usd + spend.cost_usd;
-    // REPORT.md: Billing Guardrails pause before the next turn can exceed the
-    // caller's durable run cap.
-    if max_spend.is_some_and(|cap| next_total > cap) {
-        state.pause_reason = Some(format!(
-            "estimated turn spend ${:.6} would exceed cap ${:.6}",
-            spend.cost_usd,
-            max_spend.unwrap_or_default()
-        ));
-        save_state(&state)?;
-        println!(
-            "paused run {}: {}",
-            state.run_id,
-            state.pause_reason.as_deref().unwrap_or("spend cap reached")
-        );
-        lock.release()?;
-        return Ok(());
-    }
-
-    append_trace(
-        &state,
-        &TraceRecord {
-            timestamp: Utc::now(),
-            run_id: state.run_id.clone(),
-            turn: 1,
-            event: "provider.route.estimated".to_string(),
-            latency_ms: None,
-            detail: json!({
-                "provider": spend.provider,
-                "model": spend.model,
-                "input_tokens": spend.input_tokens,
-                "output_tokens": spend.output_tokens,
-                "cost_usd": spend.cost_usd,
-            }),
-        },
-    )?;
-
-    snapshot_working(&state, 0)?;
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
-    lock.heartbeat("sandbox")?;
-
-    let started = Instant::now();
-    let sandbox_output = run_sandbox(SandboxSpec {
-        backend,
-        cwd: state.working_dir.clone(),
-        program: OsString::from("sh"),
-        args: vec![OsString::from("-lc"), OsString::from(coding_turn_script())],
-        env: BTreeMap::from([("DEADRECKON_GOAL".to_string(), state.goal.clone())]),
-        allow_network: false,
-    })
+    lock.heartbeat("turn-loop")?;
+    let outcome = run_turn_loop(
+        &mut state,
+        &router,
+        RunLoopConfig {
+            provider: provider.clone(),
+            max_spend_usd: max_spend,
+            sandbox_backend: backend,
+            max_turns: 12,
+        },
+    )
     .await?;
-    append_trace(
-        &state,
-        &TraceRecord {
-            timestamp: Utc::now(),
-            run_id: state.run_id.clone(),
-            turn: 1,
-            event: "tool.sandbox.run".to_string(),
-            latency_ms: Some(started.elapsed().as_millis()),
-            detail: json!({
-                "backend": sandbox_output.backend.to_string(),
-                "status_code": sandbox_output.status_code,
-                "stdout": sandbox_output.stdout,
-                "stderr": sandbox_output.stderr,
-                "warning": sandbox_output.warning,
-            }),
-        },
-    )?;
-
-    if sandbox_output.status_code != Some(0) {
-        state.failure_reason = Some("sandbox coding turn failed".to_string());
-        state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
-        save_state(&state)?;
-        lock.release()?;
-        return Ok(());
-    }
-
-    state.set_phase_status(PhaseId(40), PhaseStatus::Completed)?;
-    snapshot_working(&state, 1)?;
-    let files = inventory_files(&state.working_dir)?;
-    append_provenance(
-        &state,
-        &ProvenanceRecord {
-            timestamp: Utc::now(),
-            prompt_id: "turn-1".to_string(),
-            model: spend.model.clone(),
-            tool_call_id: Uuid::new_v4().to_string(),
-            session_id: state.run_id.clone(),
-            files,
-        },
-    )?;
-
-    state.turn = 1;
-    state.total_spend_usd = next_total;
-    append_spend(
-        &state,
-        &SpendRecord {
-            timestamp: Utc::now(),
-            turn: 1,
-            provider: spend.provider,
-            model: spend.model,
-            input_tokens: spend.input_tokens,
-            output_tokens: spend.output_tokens,
-            cost_usd: spend.cost_usd,
-            total_cost_usd: state.total_spend_usd,
-            cap_usd: max_spend,
-        },
-    )?;
-    state.set_phase_status(PhaseId(50), PhaseStatus::Completed)?;
-    state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
-    save_state(&state)?;
     lock.release()?;
 
-    println!("completed run {}", state.run_id);
+    match outcome {
+        RunLoopOutcome::Done => println!("completed run {}", state.run_id),
+        RunLoopOutcome::PausedAtCap => println!("paused run {}", state.run_id),
+        RunLoopOutcome::Failed => println!("failed run {}", state.run_id),
+    }
     println!("state {}", state.state_path().display());
     println!("working {}", state.working_dir.display());
     Ok(())
@@ -590,33 +500,4 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
         .map(serde_json::from_str)
         .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
         .map_err(CliError::from)
-}
-
-fn estimate_usage(goal: &str) -> ProviderUsage {
-    let words = goal.split_whitespace().count() as u64;
-    ProviderUsage {
-        input_tokens: 128 + words * 4,
-        output_tokens: 256,
-    }
-}
-
-fn coding_turn_script() -> &'static str {
-    r#"set -eu
-mkdir -p src
-cat > Cargo.toml <<'TOML'
-[package]
-name = "deadreckon-output"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-TOML
-cat > src/main.rs <<'RS'
-fn main() {
-    println!("hello from deadreckon");
-}
-RS
-printf '%s\n' "$DEADRECKON_GOAL" > GOAL.txt
-printf 'completed\n' > RESULT.txt
-"#
 }
