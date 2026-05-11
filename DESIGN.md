@@ -27,7 +27,7 @@ Source lives under `/Users/gdc/deadreckon/`:
 - `crates/deadreckon-core`: run paths, phase machine, JSON state, codebase mode records, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports.
 - `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, OpenAI-compatible, `cli:claude-code`, `cli:codex`, and explicit `--smoke` scripted adapters, fallback routing, spend estimates.
 - `crates/deadreckon-sandbox`: `sandbox-exec`, `bwrap`, `docker`, and `none` backends using `tokio::process::Command`; default `auto`.
-- `crates/deadreckon`: clap CLI, ratatui attach UI, init/config/run/list/attach/kill/resume/undo/show/import/materialize/extend/doctor.
+- `crates/deadreckon`: clap CLI, ratatui attach UI, init/config/run/list/doc/attach/kill/resume/undo/show/import/materialize/extend/doctor.
 - `skills/default-coding/SKILL.md`: Markdown skill loaded at runtime.
 - `tests/`: workspace integration tests.
 
@@ -86,6 +86,12 @@ resource caps.
 Lineage and codebase mode metadata intentionally stay outside `PipelineState`;
 show/list/hints derive them from marker files and `working/.deadreckon/codebase.json`
 so the state schema remains stable.
+
+Self-documenting run artifacts also live outside `PipelineState`. Each run
+starts `working/.deadreckon/docs/`, appends deterministic per-turn records, and
+attempts one `run-narrator` polish pass before promotion unless `--no-docs` is
+set. Public copies land under `docs/` in the promoted artifact, and `apply`
+builds its default commit body from the narrative and decisions docs.
 
 ## Decisions And Conflicts
 

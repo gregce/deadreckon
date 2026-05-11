@@ -5,7 +5,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseEventKind,
@@ -15,13 +15,15 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use deadreckon_core::{
-    CodebaseMode, CodebaseRecord, DeadreckonError, DeadreckonPaths, ModeFlags, PhaseId,
-    PhaseStatus, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunLoopConfig,
-    RunLoopOutcome, RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions, acquire_lock,
-    append_provenance, append_trace, copy_source_to_working, copy_tree, create_run,
-    create_worktree, inventory_files, list_runs, load_run, prepare_worktree_record,
-    preview_git_state, read_codebase_record, record_for_resolved_mode, release_lock_file,
-    resolve_mode, restore_snapshot, run_turn_loop, save_state, terminate_pid,
+    CodebaseMode, CodebaseRecord, DeadreckonError, DeadreckonPaths, DocKind, ModeFlags, PhaseId,
+    PhaseStatus, PolishConfig, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent,
+    RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunOptions, RunStatus, SpendRecord,
+    TraceRecord, WorktreeOptions, acquire_lock, append_parent_narrative_update, append_provenance,
+    append_trace, apply_commit_body, copy_source_to_working, copy_tree, create_run,
+    create_worktree, doc_path_for_kind, docs_status_for_state, inventory_files, list_runs,
+    load_run, polish_run_docs, prepare_worktree_record, preview_git_state, read_codebase_record,
+    record_for_resolved_mode, release_lock_file, resolve_mode, restore_snapshot, run_turn_loop,
+    save_state, terminate_pid,
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_sandbox::SandboxBackend;
@@ -87,7 +89,7 @@ fn error_hint(err: &CliError) -> Option<&'static str> {
     name = "deadreckon",
     version,
     about = "Unattended agentic coding harness",
-    after_help = "Lifecycle:\n  run <goal>\n  attach <run-id>\n  resume <run-id>\n  undo [--run <run-id>]\n  materialize <run-id> [--dest <path>]\n  extend <run-id> <new-goal>"
+    after_help = "Lifecycle:\n  run <goal>\n  attach <run-id>\n  doc <run-id>\n  resume <run-id>\n  undo [--run <run-id>]\n  materialize <run-id> [--dest <path>]\n  extend <run-id> <new-goal>"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -156,6 +158,10 @@ enum Commands {
         no_confirm: bool,
         #[arg(long)]
         no_hints: bool,
+        #[arg(long)]
+        no_docs: bool,
+        #[arg(long)]
+        doc_skill: Option<String>,
     },
     Doctor,
     List {
@@ -206,6 +212,25 @@ enum Commands {
         provider: Option<String>,
         #[arg(long)]
         sandbox: Option<String>,
+        #[arg(long)]
+        no_docs: bool,
+        #[arg(long)]
+        doc_skill: Option<String>,
+    },
+    Doc {
+        run_id: String,
+        #[arg(long, value_enum, default_value_t = CliDocKind::Narrative)]
+        kind: CliDocKind,
+        #[arg(long)]
+        export: Option<PathBuf>,
+        #[arg(long)]
+        polish: bool,
+        #[arg(long)]
+        no_confirm: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        doc_skill: Option<String>,
     },
     Attach {
         run_id: String,
@@ -238,6 +263,25 @@ enum Commands {
     Import {
         source: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliDocKind {
+    Narrative,
+    AsBuilt,
+    Decisions,
+    Delta,
+}
+
+impl From<CliDocKind> for DocKind {
+    fn from(value: CliDocKind) -> Self {
+        match value {
+            CliDocKind::Narrative => DocKind::Narrative,
+            CliDocKind::AsBuilt => DocKind::AsBuilt,
+            CliDocKind::Decisions => DocKind::Decisions,
+            CliDocKind::Delta => DocKind::Delta,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -297,6 +341,8 @@ async fn main_inner() -> Result<()> {
             i_know_its_a_lot,
             no_confirm,
             no_hints,
+            no_docs,
+            doc_skill,
         } => {
             run_command(RunCommandArgs {
                 goal,
@@ -320,6 +366,8 @@ async fn main_inner() -> Result<()> {
                 i_know_its_a_lot,
                 no_confirm,
                 no_hints,
+                no_docs,
+                doc_skill,
             })
             .await
         }
@@ -356,6 +404,8 @@ async fn main_inner() -> Result<()> {
             max_wall_seconds,
             provider,
             sandbox,
+            no_docs,
+            doc_skill,
         } => {
             extend_command(ExtendCommandArgs {
                 parent_run_id,
@@ -367,8 +417,30 @@ async fn main_inner() -> Result<()> {
                 max_wall_seconds,
                 provider,
                 sandbox,
+                no_docs,
+                doc_skill,
                 post_actions: true,
             })
+            .await
+        }
+        Commands::Doc {
+            run_id,
+            kind,
+            export,
+            polish,
+            no_confirm,
+            force,
+            doc_skill,
+        } => {
+            doc_command(
+                run_id,
+                kind.into(),
+                export,
+                polish,
+                no_confirm,
+                force,
+                doc_skill,
+            )
             .await
         }
         Commands::Attach { run_id, no_hints } => attach_command(run_id, no_hints).await,
@@ -469,6 +541,8 @@ struct RunCommandArgs {
     i_know_its_a_lot: bool,
     no_confirm: bool,
     no_hints: bool,
+    no_docs: bool,
+    doc_skill: Option<String>,
 }
 
 struct ExtendCommandArgs {
@@ -481,6 +555,8 @@ struct ExtendCommandArgs {
     max_wall_seconds: Option<f64>,
     provider: Option<String>,
     sandbox: Option<String>,
+    no_docs: bool,
+    doc_skill: Option<String>,
     post_actions: bool,
 }
 
@@ -507,6 +583,8 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         i_know_its_a_lot,
         no_confirm,
         no_hints,
+        no_docs,
+        doc_skill,
     } = args;
     if smoke && provider.is_some() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
@@ -524,6 +602,9 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     let effective_max_wall_seconds = max_wall_seconds
         .or(defaults.cli_max_wall_seconds)
         .or(Some(3600.0));
+    let effective_doc_skill = doc_skill
+        .or(defaults.doc_skill.clone())
+        .unwrap_or_else(|| "run-narrator".to_string());
     if max_spend.is_none() {
         let cap = effective_max_spend.unwrap_or(10.0);
         println!(
@@ -672,6 +753,13 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
             from_turn: None,
             event_sender: None,
             cancellation_token: None,
+            docs: RunLoopDocsConfig {
+                home: paths.home().to_path_buf(),
+                config_path: Some(paths.config_path()),
+                doc_provider: defaults.doc_provider.clone(),
+                doc_skill: effective_doc_skill,
+                no_docs,
+            },
         },
     )
     .await?;
@@ -699,6 +787,8 @@ struct ConfigDefaults {
     sandbox: Option<String>,
     max_spend: Option<f64>,
     cli_max_wall_seconds: Option<f64>,
+    doc_provider: Option<String>,
+    doc_skill: Option<String>,
 }
 
 fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
@@ -725,6 +815,12 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
                     .and_then(toml::Value::as_integer)
                     .map(|value| value as f64)
             }),
+        doc_provider: get_toml_path(&root, "defaults.doc_provider")
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string),
+        doc_skill: get_toml_path(&root, "defaults.doc_skill")
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string),
     })
 }
 
@@ -1243,7 +1339,7 @@ fn init_config_text(
         _ => "[\"anthropic\", \"openai\", \"cli:claude-code\", \"cli:codex\"]",
     };
     let mut out = format!(
-        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\nmax_spend = {max_spend}\ncli_max_wall_seconds = 3600\nsandbox = \"{sandbox}\"\n\n"
+        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\ndoc_provider = \"{provider}\"\ndoc_skill = \"run-narrator\"\nmax_spend = {max_spend}\ncli_max_wall_seconds = 3600\nsandbox = \"{sandbox}\"\n\n"
     );
     match provider {
         "cli:claude-code" => {
@@ -1512,17 +1608,25 @@ fn apply_command(
         )));
     }
 
-    let commit_message = message.unwrap_or_else(|| {
-        format!(
-            "{} (deadreckon run {})",
-            state.goal.lines().next().unwrap_or("deadreckon run"),
-            state.run_id.chars().take(8).collect::<String>()
-        )
-    });
+    let (commit_subject, commit_body) = match message {
+        Some(message) => (message, None),
+        None => (
+            format!(
+                "{} (deadreckon run {})",
+                state.goal.lines().next().unwrap_or("deadreckon run"),
+                state.run_id.chars().take(8).collect::<String>()
+            ),
+            Some(apply_commit_body(&state)),
+        ),
+    };
+    let full_merge_message = commit_body
+        .as_ref()
+        .map(|body| format!("{commit_subject}\n\n{body}"))
+        .unwrap_or_else(|| commit_subject.clone());
     match strategy.as_str() {
         "merge" => git_status(
             git_root,
-            &["merge", "--no-ff", branch, "-m", &commit_message],
+            &["merge", "--no-ff", branch, "-m", &full_merge_message],
         )?,
         "squash" => {
             git_status(git_root, &["merge", "--squash", branch]).map_err(|err| {
@@ -1534,7 +1638,11 @@ fn apply_command(
                     ),
                 ))
             })?;
-            git_status(git_root, &["commit", "-m", &commit_message])?;
+            if let Some(body) = commit_body.as_deref() {
+                git_status(git_root, &["commit", "-m", &commit_subject, "-m", body])?;
+            } else {
+                git_status(git_root, &["commit", "-m", &commit_subject])?;
+            }
         }
         "cherry-pick" => {
             let base = record.base_sha.as_deref().unwrap_or("HEAD");
@@ -1634,6 +1742,8 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         max_wall_seconds,
         provider,
         sandbox,
+        no_docs,
+        doc_skill,
         post_actions,
     } = args;
     let new_goal = new_goal.trim().to_string();
@@ -1677,6 +1787,9 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     let effective_max_wall_seconds = max_wall_seconds
         .or(defaults.cli_max_wall_seconds)
         .or(Some(3600.0));
+    let effective_doc_skill = doc_skill
+        .or(defaults.doc_skill.clone())
+        .unwrap_or_else(|| "run-narrator".to_string());
     let sandbox = sandbox
         .or(defaults.sandbox)
         .unwrap_or_else(|| "auto".to_string());
@@ -1699,6 +1812,9 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             effective_provider,
             effective_max_spend,
             effective_max_wall_seconds,
+            doc_provider: defaults.doc_provider.clone(),
+            doc_skill: effective_doc_skill,
+            no_docs,
             backend,
             post_actions,
             context_turns,
@@ -1759,9 +1875,9 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             event: "extended_from_parent".to_string(),
             latency_ms: None,
             detail: json!({
-                "parent_run_id": parent.run_id,
-                "parent_scope": parent.scope,
-                "parent_goal": parent.goal,
+                "parent_run_id": parent.run_id.clone(),
+                "parent_scope": parent.scope.clone(),
+                "parent_goal": parent.goal.clone(),
                 "parent_completed_at": parent.updated_at,
                 "context_turns_included": context_turns,
             }),
@@ -1791,6 +1907,13 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             from_turn: None,
             event_sender: None,
             cancellation_token: None,
+            docs: RunLoopDocsConfig {
+                home: paths.home().to_path_buf(),
+                config_path: Some(paths.config_path()),
+                doc_provider: defaults.doc_provider.clone(),
+                doc_skill: effective_doc_skill,
+                no_docs,
+            },
         },
     )
     .await?;
@@ -1806,6 +1929,9 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         RunLoopOutcome::Failed => println!("failed extended run {}", state.run_id),
     }
     print_run_locations(&state);
+    if completed {
+        append_parent_narrative_update(&parent, &state)?;
+    }
     if completed && post_actions {
         Box::pin(complete_run_actions(&state, true)).await?;
     }
@@ -1820,6 +1946,9 @@ struct ExtendWorktreeArgs {
     effective_provider: Option<String>,
     effective_max_spend: Option<f64>,
     effective_max_wall_seconds: Option<f64>,
+    doc_provider: Option<String>,
+    doc_skill: String,
+    no_docs: bool,
     backend: SandboxBackend,
     post_actions: bool,
     context_turns: Option<u32>,
@@ -1834,6 +1963,9 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         effective_provider,
         effective_max_spend,
         effective_max_wall_seconds,
+        doc_provider,
+        doc_skill,
+        no_docs,
         backend,
         post_actions,
         context_turns,
@@ -1899,9 +2031,9 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
             event: "extended_from_parent".to_string(),
             latency_ms: None,
             detail: json!({
-                "parent_run_id": parent.run_id,
-                "parent_scope": parent.scope,
-                "parent_goal": parent.goal,
+                "parent_run_id": parent.run_id.clone(),
+                "parent_scope": parent.scope.clone(),
+                "parent_goal": parent.goal.clone(),
                 "parent_completed_at": parent.updated_at,
                 "context_turns_included": context_turns,
                 "mode": "worktree",
@@ -1932,6 +2064,13 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
             from_turn: None,
             event_sender: None,
             cancellation_token: None,
+            docs: RunLoopDocsConfig {
+                home: paths.home().to_path_buf(),
+                config_path: Some(paths.config_path()),
+                doc_provider,
+                doc_skill,
+                no_docs,
+            },
         },
     )
     .await?;
@@ -1947,6 +2086,9 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         RunLoopOutcome::Failed => println!("failed extended run {}", state.run_id),
     }
     print_run_locations(&state);
+    if completed {
+        append_parent_narrative_update(&parent, &state)?;
+    }
     if completed && post_actions {
         Box::pin(complete_run_actions(&state, true)).await?;
     }
@@ -2265,20 +2407,27 @@ fn list_command(scope: Option<String>) -> Result<()> {
         println!("no runs");
         return Ok(());
     }
-    println!("RUN\tSTATUS\tSCOPE\tUPDATED\tMODE\tMATERIALIZED\tGOAL");
+    println!("RUN\tSTATUS\tSCOPE\tUPDATED\tMODE\tDOCS\tMATERIALIZED\tGOAL");
     for run in runs {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             run.run_id,
             run.status,
             run.scope,
             run.updated_at,
             codebase_mode_status(&paths, &run),
+            docs_status(&paths, &run),
             materialized_status(&paths, &run),
             run.goal
         );
     }
     Ok(())
+}
+
+fn docs_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEntry) -> String {
+    load_run(paths, &run.run_id)
+        .map(|state| docs_status_for_state(&state).to_string())
+        .unwrap_or_else(|_| "n/a".to_string())
 }
 
 fn codebase_mode_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEntry) -> String {
@@ -2310,6 +2459,98 @@ fn materialized_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEn
         1 => "yes (1 time)".to_string(),
         count => format!("yes ({count} times)"),
     }
+}
+
+async fn doc_command(
+    run_id: String,
+    kind: DocKind,
+    export: Option<PathBuf>,
+    polish: bool,
+    no_confirm: bool,
+    force: bool,
+    doc_skill: Option<String>,
+) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let mut state = load_run(&paths, &run_id)?;
+    if polish {
+        if state.status != RunStatus::Completed {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "run {} is {}; docs are not yet polished",
+                    state.run_id, state.status
+                ),
+                &format!("deadreckon resume {} or omit --polish", state.run_id),
+            )));
+        }
+        let defaults = config_defaults(&paths)?;
+        let doc_provider = defaults
+            .doc_provider
+            .clone()
+            .or_else(|| state.provider.clone());
+        let Some(provider) = doc_provider.clone() else {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "no doc provider configured",
+                "deadreckon init or set defaults.doc_provider",
+            )));
+        };
+        if !no_confirm && io::stdin().is_terminal() {
+            let answer = prompt("doc polish may use one provider turn; continue? [y/N]: ")?;
+            if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                println!("cancelled");
+                return Ok(());
+            }
+        } else if !no_confirm && !io::stdin().is_terminal() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "non-interactive doc polish requires --no-confirm",
+                &format!("deadreckon doc {} --polish --no-confirm", state.run_id),
+            )));
+        }
+        let router = ProviderRouter::from_config_path(&paths.config_path(), Some(&provider))?;
+        polish_run_docs(
+            &mut state,
+            &router,
+            &PolishConfig {
+                home: paths.home().to_path_buf(),
+                doc_skill: doc_skill
+                    .or(defaults.doc_skill)
+                    .unwrap_or_else(|| "run-narrator".to_string()),
+                doc_provider: Some(provider),
+                no_llm: false,
+                force,
+            },
+        )
+        .await?;
+        save_state(&state)?;
+    }
+    let Some(path) = doc_path_for_kind(&state.working_dir, kind) else {
+        if kind == DocKind::Delta {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "no delta produced; this run did not affect a project AS-BUILT",
+                "deadreckon doc <run-id> --kind narrative",
+            )));
+        }
+        return Err(CliError::Core(DeadreckonError::NotFound(format!(
+            "{} for run {}",
+            kind.file_name(),
+            state.run_id
+        ))));
+    };
+    if let Some(dest) = export {
+        if dest.exists() && !force {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("dest {} exists", dest.display()),
+                "--force or pick a fresh path",
+            )));
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&path, &dest)?;
+        println!("exported {} to {}", kind.file_name(), dest.display());
+    } else {
+        print!("{}", fs::read_to_string(&path)?);
+    }
+    Ok(())
 }
 
 async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
@@ -2430,6 +2671,7 @@ async fn resume_command(
     let provider = state.provider.clone();
     let backend: SandboxBackend = state.sandbox.parse()?;
     let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
+    let defaults = config_defaults(&paths)?;
     let max_spend_usd = state.max_spend_usd;
     let max_wall_seconds = state.max_wall_seconds;
     let outcome = run_turn_loop(
@@ -2444,6 +2686,15 @@ async fn resume_command(
             from_turn,
             event_sender: None,
             cancellation_token: None,
+            docs: RunLoopDocsConfig {
+                home: paths.home().to_path_buf(),
+                config_path: Some(paths.config_path()),
+                doc_provider: defaults.doc_provider,
+                doc_skill: defaults
+                    .doc_skill
+                    .unwrap_or_else(|| "run-narrator".to_string()),
+                no_docs: false,
+            },
         },
     )
     .await?;
@@ -2781,6 +3032,7 @@ fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
         }
         println!("  apply:   deadreckon apply {}", state.run_id);
         println!("  abandon: deadreckon abandon {}", state.run_id);
+        println!("  docs:    deadreckon doc {}", state.run_id);
         return;
     }
     let task_prefix = state.task_key.chars().take(24).collect::<String>();
@@ -2794,6 +3046,7 @@ fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
         state.run_id
     );
     println!("  show:        deadreckon show {}", state.run_id);
+    println!("  docs:        deadreckon doc {}", state.run_id);
 }
 
 async fn complete_run_actions(
@@ -2811,9 +3064,9 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
     let paths = DeadreckonPaths::discover();
     loop {
         let prompt_text = if is_worktree_run(state) {
-            "completed action [a apply, b abandon, s show, q quit]: "
+            "completed action [a apply, b abandon, d docs, s show, q quit]: "
         } else {
-            "completed action [m materialize, e extend, s show, q quit]: "
+            "completed action [m materialize, e extend, d docs, s show, q quit]: "
         };
         let answer = prompt(prompt_text)?;
         match completion_action_from_input(&answer) {
@@ -2827,6 +3080,18 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
                 None,
             )?,
             Some(CompletionAction::Abandon) => abandon_command(state.run_id.clone(), false, false)?,
+            Some(CompletionAction::Docs) => {
+                Box::pin(doc_command(
+                    state.run_id.clone(),
+                    DocKind::Narrative,
+                    None,
+                    false,
+                    true,
+                    false,
+                    None,
+                ))
+                .await?
+            }
             Some(CompletionAction::Show) => show_command(state.run_id.clone(), None)?,
             Some(CompletionAction::Quit) | None => break,
         }
@@ -2840,6 +3105,7 @@ enum CompletionAction {
     Extend,
     Apply,
     Abandon,
+    Docs,
     Show,
     Quit,
 }
@@ -2850,6 +3116,7 @@ fn completion_action_from_input(input: &str) -> Option<CompletionAction> {
         "e" | "extend" => Some(CompletionAction::Extend),
         "a" | "apply" => Some(CompletionAction::Apply),
         "b" | "abandon" => Some(CompletionAction::Abandon),
+        "d" | "doc" | "docs" => Some(CompletionAction::Docs),
         "s" | "show" => Some(CompletionAction::Show),
         "q" | "quit" | "" => Some(CompletionAction::Quit),
         _ => None,
@@ -2901,6 +3168,8 @@ async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<
         max_wall_seconds: state.max_wall_seconds,
         provider: state.provider.clone(),
         sandbox: Some(state.sandbox.clone()),
+        no_docs: false,
+        doc_skill: None,
         post_actions: false,
     })
     .await
@@ -2995,6 +3264,7 @@ async fn handle_tui_completion_key(
         KeyCode::Char('e') => CompletionAction::Extend,
         KeyCode::Char('a') => CompletionAction::Apply,
         KeyCode::Char('b') => CompletionAction::Abandon,
+        KeyCode::Char('d') => CompletionAction::Docs,
         KeyCode::Char('s') => CompletionAction::Show,
         _ => return Ok(false),
     };
@@ -3011,6 +3281,18 @@ async fn handle_tui_completion_key(
             None,
         ),
         CompletionAction::Abandon => abandon_command(state.run_id.clone(), false, false),
+        CompletionAction::Docs => {
+            Box::pin(doc_command(
+                state.run_id.clone(),
+                DocKind::Narrative,
+                None,
+                false,
+                true,
+                false,
+                None,
+            ))
+            .await
+        }
         CompletionAction::Show => show_command(state.run_id.clone(), None),
         CompletionAction::Quit => Ok(()),
     };
@@ -3675,9 +3957,9 @@ fn render_attach(
         && state.status == RunStatus::Completed
         && is_worktree_run(state)
     {
-        "completed: a apply  b abandon  s show  Tab focus  j/k scroll  q/Esc quit"
+        "completed: a apply  b abandon  d docs  s show  Tab focus  j/k scroll  q/Esc quit"
     } else if tui_state.show_completion_actions && state.status == RunStatus::Completed {
-        "completed: m materialize  e extend  s show  Tab focus  j/k scroll  q/Esc quit"
+        "completed: m materialize  e extend  d docs  s show  Tab focus  j/k scroll  q/Esc quit"
     } else {
         "Tab focus  ↑/↓ j/k scroll  PgUp/PgDn  Home/End  mouse wheel  Ctrl-D detach  q/Esc quit"
     };

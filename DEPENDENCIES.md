@@ -10,3 +10,5 @@ Tier 1 crates are logged in commit messages. Tier 2 crates are listed here.
 | serde_yaml | 0.9.34 | 1 | Parse `acceptance.yaml` for dr-gate checks. | YAML is prescribed by the robustness rider. | cec49f3 |
 | tokio-stream | 0.1.18 | 1 | Stream-oriented test/runtime support for async run events. | Manual stream wrappers would add noise around broadcast handling. | cec49f3 |
 | tokio-util | 0.7.18 | 1 | Hierarchical `CancellationToken` for run, provider, and sandbox cancellation. | Homegrown cancellation would be less reliable than Tokio's standard utility. | cec49f3 |
+| regex | 1.12.3 | 1 | Detect decision markers and deterministic auto-title phrases for self-documenting run drafts. | Hand-rolled matching would be weaker than the rider's regex contract. | self-documenting-runs |
+| sha2 | 0.10.9 | 1 | Compute SHA-256 polish input hashes for idempotent doc-provider calls. | `DefaultHasher` is not stable or cryptographic and would violate the rider hash requirement. | self-documenting-runs |

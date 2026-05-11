@@ -53,6 +53,8 @@ pub struct CodebaseRecord {
     pub head_was_detached: bool,
     pub created_at: DateTime<Utc>,
     pub deadreckon_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_polish_hash: Option<String>,
 }
 
 impl CodebaseRecord {
@@ -71,6 +73,7 @@ impl CodebaseRecord {
             head_was_detached: false,
             created_at: Utc::now(),
             deadreckon_version: env!("CARGO_PKG_VERSION").to_string(),
+            doc_polish_hash: None,
         }
     }
 }

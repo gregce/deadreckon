@@ -226,6 +226,7 @@ After a run completes, the TUI footer adds lifecycle actions:
 ```text
 a        apply a completed worktree run
 b        abandon a completed worktree run
+d        print the run narrative docs
 m        materialize a completed copy/fresh artifact
 e        extend a completed copy/fresh run with a follow-up goal
 s        show run details
@@ -238,14 +239,14 @@ The TUI does not start, kill, resume, or undo runs. Use CLI commands for those c
 Completed `run` and `extend` commands show the same lifecycle actions in the CLI:
 
 ```text
-completed action [a apply, b abandon, s show, q quit]:
-completed action [m materialize, e extend, s show, q quit]:
+completed action [a apply, b abandon, d docs, s show, q quit]:
+completed action [m materialize, e extend, d docs, s show, q quit]:
 ```
 
 Worktree runs use `a` to squash-apply changes to the current branch or `b` to
 discard the worktree and temporary branch. Copy/fresh runs use `m` to copy the
 library artifact into a normal directory, `e` to start a child run from the
-completed artifact, or `s` to inspect state and lineage. Pass `--no-hints` to
+completed artifact, `d` to read `RUN-NARRATIVE.md`, or `s` to inspect state and lineage. Pass `--no-hints` to
 `run` or `attach` when scripting.
 
 `extend` is still available for completed worktree runs from the CLI. It creates

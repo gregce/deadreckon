@@ -35,6 +35,7 @@ This document captures the system as built today — what's wired, what's load-b
 22. [What's Built vs Scaffolding-Thin](#22-whats-built-vs-scaffolding-thin)
 23. [Glossary](#23-glossary)
 24. [Codebase Modes](#24-codebase-modes)
+25. [Self-Documenting Runs](#25-self-documenting-runs)
 
 ---
 
@@ -1351,6 +1352,8 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 - Codebase-default running: worktree mode, copy mode, in-place mode, fresh-mode preservation, preflight + preview UX, and `codebase.json` files-not-fields metadata.
 - `apply` and `abandon` for worktree rollback/apply lifecycle.
 - `materialize`, `extend`, `undo`, `list`, and `show` integration with codebase mode metadata, including worktree extension branches chained from parent `dr/...` branches.
+- Self-documenting run artifacts in stoa shape: `RUN-NARRATIVE.md`, `RUN-AS-BUILT.md`, `RUN-DECISIONS.md`, optional `AS-BUILT-DELTA.md`, per-turn `_incremental.jsonl`, and `polish.json`.
+- `deadreckon doc`, `list` DOCS status, doc-aware `apply` commit bodies, extend-parent narrative updates, diff coverage retry, and the repo/user/project `run-narrator` skill mechanism.
 - Acceptance gate with signed marker; anti-self-attestation actually enforced.
 - `init`, `config get/set`, `run`, `doctor`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import` verbs.
 - `ratatui` attach TUI with spend meter, context meter, recent activity.
@@ -1457,6 +1460,56 @@ semantics.
 ### 24.12 Not Yet Built
 
 V1 candidates remain in `docs/V1-CANDIDATES.md`: richer apply targets, remote-aware refresh, multi-repo orchestration, and conflict-resolution assistance. This section does not remove any robust-rider thin items.
+
+---
+
+## 25. Self-Documenting Runs
+
+### 25.1 The Three Artifacts
+
+Every run starts `working/.deadreckon/docs/` and writes three human-readable Markdown files:
+
+- `RUN-NARRATIVE.md` for the chronological implementation story.
+- `RUN-AS-BUILT.md` for the subsystem shape changed by the run.
+- `RUN-DECISIONS.md` for detected multi-alternative decisions.
+
+When the worktree has a nearby `AS-BUILT-ARCHITECTURE.md` or `AS-BUILT.md` and the diff is broad enough, deadreckon also emits `AS-BUILT-DELTA.md` as a proposed amendment.
+
+### 25.2 Frontmatter
+
+The docs use stoa-style bold frontmatter: Date, Last updated, Status, Run ID, Goal, optional Parent run, Commit span or working-directory mode, Owner, Provider, Sandbox, Spend, and Doc-writer. Fresh runs omit commit span; copy and in-place runs identify their working path.
+
+### 25.3 Per-Turn Templating
+
+After every successful tool/provider turn, `turn_loop.rs` calls `append_turn_doc`. The deterministic record lands in `_incremental.jsonl` and rewrites the Markdown drafts with turn sections containing tool kind, latency, files, outcome, trace citation, snapshot reference, and worktree commit SHA when available.
+
+### 25.4 End-of-Run Polish Pass
+
+Before acceptance/promotion, `polish_run_docs` resolves `run-narrator` in project, user, then repo order. It substitutes run placeholders, sends one doc-provider completion unless `--no-docs` is set, parses JSON into the three docs plus optional delta, retries once on malformed JSON, and records status/cost/hash/provider in `polish.json`. Provider, JSON, or skill failures are nonfatal; templated docs remain.
+
+### 25.5 Phase And Decision Detection
+
+`docs.rs` coalesces turns into 3-8 phases by file overlap and tool-kind continuity. Decision candidates are detected with case-insensitive marker regexes and a minimum response length so incidental short phrases do not become decisions.
+
+### 25.6 Diff Coverage And Retry
+
+After polish, deadreckon verifies every changed file appears in `RUN-NARRATIVE.md` by relative path or basename. Missing files trigger up to two polish retries with an explicit omission list. Remaining omissions are logged as `docs.warning` traces and do not fail the run.
+
+### 25.7 AS-BUILT-DELTA
+
+The delta is generated for worktree runs whose source has an AS-BUILT file at the root or beside touched files and whose diff touches at least three files or adds public/exported API. Public docs are copied to `working/docs/`; the branch gets a `turn docs: deadreckon run docs for <id>` commit so `apply` carries docs forward.
+
+### 25.8 Apply Commit Body
+
+When `deadreckon apply` builds the default squash or merge message, it reads `RUN-NARRATIVE.md` and `RUN-DECISIONS.md` to include an executive summary, phase list, decision count, open-thread count, and a `docs/RUN-NARRATIVE.md` trace pointer. `--message` still overrides the generated body.
+
+### 25.9 `deadreckon doc`
+
+`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another artifact, `--export <path>` writes it to disk, `--force` overwrites exports, and `--polish --no-confirm` requests a fresh doc polish turn.
+
+### 25.10 Cost And Idempotency
+
+`polish.json` stores a SHA-256 inputs hash over goal, traces, provenance, spend, incremental records, changed files, and source AS-BUILT content. A matching polished hash skips duplicate provider calls unless forced. CLI subscription providers report wall time rather than USD cost.
 - **Trace** — every LLM call and every tool dispatch, with latency + structured detail.
 - **CLI sub-agent** — a `cli:*` provider whose `complete()` invocation is one whole turn (the sub-agent does its own tool calls inside). Detected by `response.trace["kind"] == "cli_subagent"`.
 - **dr-gate** — the standalone binary at `crates/deadreckon/src/bin/dr-gate.rs` that owns acceptance verification. The agent cannot impersonate it.

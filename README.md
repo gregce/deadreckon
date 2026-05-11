@@ -62,6 +62,7 @@ Apply a completed worktree run back to your current branch:
 
 ```bash
 deadreckon list
+deadreckon doc <run-id>
 deadreckon apply <run-id>
 deadreckon abandon <run-id>
 ```
@@ -86,7 +87,11 @@ deadreckon show <new-run-id>
 ```
 
 Completed runs print a next-action menu by default. Worktree runs offer
-`a` apply, `b` abandon, and `s` show. Copy/fresh runs offer `m` materialize,
-`e` extend, and `s` show. In the TUI, the same keys are available after
+`a` apply, `b` abandon, `d` docs, and `s` show. Copy/fresh runs offer `m` materialize,
+`e` extend, `d` docs, and `s` show. In the TUI, the same keys are available after
 completion. Use `--no-hints` on `run` or `attach` to suppress completion
 guidance.
+
+Every run writes stoa-shaped docs under `.deadreckon/docs/` and promotes public
+copies under `library/<scope>/<run-id>/docs/`. `deadreckon doc <run-id>` prints
+the narrative; use `--kind as-built|decisions|delta` for the other artifacts.

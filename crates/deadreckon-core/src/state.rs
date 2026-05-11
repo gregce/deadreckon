@@ -10,6 +10,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::codebase::{CodebaseMode, CodebaseRecord, write_codebase_record};
+use crate::docs::ensure_docs_started;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::paths::{DeadreckonPaths, SOURCE_ROOT, task_key, workspace_scope};
 
@@ -233,6 +234,7 @@ pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<Pipeli
     state.set_phase_status(PhaseId(0), PhaseStatus::Planned)?;
     save_state(&state)?;
     write_codebase_record(&state.working_dir, &codebase)?;
+    ensure_docs_started(&state)?;
     write_current_pointer(paths, &state)?;
     Ok(state)
 }

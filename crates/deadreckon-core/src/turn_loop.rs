@@ -17,12 +17,14 @@ use crate::artifacts::{
     inventory_files, snapshot_working,
 };
 use crate::codebase::{CodebaseMode, read_codebase_record};
+use crate::docs::{TurnDocInput, append_turn_doc};
 use crate::error::{DeadreckonError, IoContext, Result};
 use crate::events::{RunEvent, RunEventKind, emit_event, event_preview, tool_args_json};
 use crate::gate::validate_acceptance_marker;
 use crate::paths::DeadreckonPaths;
+use crate::polish::{PolishConfig, polish_run_docs};
 use crate::promotion::promote_completed_run;
-use crate::state::{PhaseId, PhaseStatus, PipelineState, save_state};
+use crate::state::{PhaseId, PhaseStatus, PipelineState, RunStatus, save_state};
 
 #[derive(Debug, Clone)]
 pub struct RunLoopConfig {
@@ -34,6 +36,16 @@ pub struct RunLoopConfig {
     pub from_turn: Option<u32>,
     pub event_sender: Option<broadcast::Sender<RunEvent>>,
     pub cancellation_token: Option<CancellationToken>,
+    pub docs: RunLoopDocsConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunLoopDocsConfig {
+    pub home: PathBuf,
+    pub config_path: Option<PathBuf>,
+    pub doc_provider: Option<String>,
+    pub doc_skill: String,
+    pub no_docs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,8 +245,29 @@ pub async fn run_turn_loop(
                     }),
                 },
             )?;
-            append_provenance_for_files(state, turn, &tool_call_id, &response.model, changed)?;
+            append_provenance_for_files(
+                state,
+                turn,
+                &tool_call_id,
+                &response.model,
+                changed.clone(),
+            )?;
             commit_worktree_turn(state, turn, "cli_subagent")?;
+            append_turn_doc(
+                state,
+                TurnDocInput {
+                    turn,
+                    tool_kind: "cli_subagent".to_string(),
+                    latency_ms: response
+                        .trace
+                        .get("duration_ms")
+                        .and_then(Value::as_u64)
+                        .map(u128::from),
+                    files: changed,
+                    outcome: event_preview(&response.content),
+                    response_text: response.content.clone(),
+                },
+            )?;
             emit_event(
                 state,
                 config.event_sender.as_ref(),
@@ -246,6 +279,7 @@ pub async fn run_turn_loop(
                 },
             )?;
             state.turn = turn;
+            complete_run_docs(state, router, &config).await?;
             run_acceptance_gate(state)?;
             validate_acceptance_marker(state)?;
             promote_if_ready(state)?;
@@ -312,8 +346,25 @@ pub async fn run_turn_loop(
                 )?;
                 let changed = changed_files_since_snapshot(state, turn.saturating_sub(1))?;
                 snapshot_working(state, turn)?;
-                append_provenance_for_files(state, turn, &tool_call_id, &response.model, changed)?;
+                append_provenance_for_files(
+                    state,
+                    turn,
+                    &tool_call_id,
+                    &response.model,
+                    changed.clone(),
+                )?;
                 commit_worktree_turn(state, turn, &format!("bash {tool_call_id}"))?;
+                append_turn_doc(
+                    state,
+                    TurnDocInput {
+                        turn,
+                        tool_kind: "bash".to_string(),
+                        latency_ms: Some(started.elapsed().as_millis()),
+                        files: changed,
+                        outcome: format!("status={:?}", output.status_code),
+                        response_text: response.content.clone(),
+                    },
+                )?;
                 emit_event(
                     state,
                     config.event_sender.as_ref(),
@@ -364,14 +415,26 @@ pub async fn run_turn_loop(
                     },
                 )?;
                 snapshot_working(state, turn)?;
+                let changed = vec![target.clone()];
                 append_provenance_for_files(
                     state,
                     turn,
                     &tool_call_id,
                     &response.model,
-                    vec![target],
+                    changed.clone(),
                 )?;
                 commit_worktree_turn(state, turn, &format!("write_file {tool_call_id}"))?;
+                append_turn_doc(
+                    state,
+                    TurnDocInput {
+                        turn,
+                        tool_kind: "write_file".to_string(),
+                        latency_ms: None,
+                        files: changed,
+                        outcome: "ok".to_string(),
+                        response_text: response.content.clone(),
+                    },
+                )?;
                 emit_event(
                     state,
                     config.event_sender.as_ref(),
@@ -386,6 +449,18 @@ pub async fn run_turn_loop(
             }
             Action::Done { summary } => {
                 state.turn = turn;
+                append_turn_doc(
+                    state,
+                    TurnDocInput {
+                        turn,
+                        tool_kind: "done".to_string(),
+                        latency_ms: None,
+                        files: Vec::new(),
+                        outcome: summary.clone().unwrap_or_else(|| "done".to_string()),
+                        response_text: response.content.clone(),
+                    },
+                )?;
+                complete_run_docs(state, router, &config).await?;
                 run_acceptance_gate(state)?;
                 validate_acceptance_marker(state)?;
                 promote_if_ready(state)?;
@@ -640,6 +715,38 @@ fn promote_if_ready(state: &mut PipelineState) -> Result<()> {
     promote_completed_run(&paths, state).map(|_| ())
 }
 
+async fn complete_run_docs(
+    state: &mut PipelineState,
+    router: &ProviderRouter,
+    config: &RunLoopConfig,
+) -> Result<()> {
+    let owned_router = if let (Some(config_path), Some(doc_provider)) = (
+        config.docs.config_path.as_ref(),
+        config.docs.doc_provider.as_deref(),
+    ) {
+        ProviderRouter::from_config_path(config_path, Some(doc_provider)).ok()
+    } else {
+        None
+    };
+    let router = owned_router.as_ref().unwrap_or(router);
+    let previous_status = state.status;
+    state.status = RunStatus::Completed;
+    let result = polish_run_docs(
+        state,
+        router,
+        &PolishConfig {
+            home: config.docs.home.clone(),
+            doc_skill: config.docs.doc_skill.clone(),
+            doc_provider: config.docs.doc_provider.clone(),
+            no_llm: config.docs.no_docs,
+            force: false,
+        },
+    )
+    .await;
+    state.status = previous_status;
+    result
+}
+
 fn paths_for_state(state: &PipelineState) -> Result<DeadreckonPaths> {
     let home = state
         .run_root
@@ -773,7 +880,7 @@ mod tests {
     use crate::paths::DeadreckonPaths;
     use crate::state::{RunOptions, RunStatus, create_run};
 
-    use super::{RunLoopConfig, load_or_reconstruct_history, run_turn_loop};
+    use super::{RunLoopConfig, RunLoopDocsConfig, load_or_reconstruct_history, run_turn_loop};
 
     #[tokio::test]
     async fn tui_streams_tool_call_within_250ms() {
@@ -812,6 +919,13 @@ mod tests {
                     from_turn: None,
                     event_sender: Some(bus.sender()),
                     cancellation_token: Some(cancel_for_loop),
+                    docs: RunLoopDocsConfig {
+                        home: paths.home().to_path_buf(),
+                        config_path: None,
+                        doc_provider: None,
+                        doc_skill: "run-narrator".to_string(),
+                        no_docs: true,
+                    },
                 },
             )
             .await;
@@ -868,6 +982,13 @@ mod tests {
                     from_turn: None,
                     event_sender: Some(bus.sender()),
                     cancellation_token: None,
+                    docs: RunLoopDocsConfig {
+                        home: paths.home().to_path_buf(),
+                        config_path: None,
+                        doc_provider: None,
+                        doc_skill: "run-narrator".to_string(),
+                        no_docs: true,
+                    },
                 },
             )
             .await

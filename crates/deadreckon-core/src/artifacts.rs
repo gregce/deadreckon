@@ -179,11 +179,12 @@ mod tests {
 
         let restored = fs::read_to_string(state.working_dir.join("file.txt")).expect("read");
         assert_eq!(restored, "one");
-        assert_eq!(
-            inventory_files(&state.working_dir)
-                .expect("inventory")
-                .len(),
-            2
+        let inventory = inventory_files(&state.working_dir).expect("inventory");
+        assert!(inventory.iter().any(|path| path.ends_with("file.txt")));
+        assert!(
+            inventory
+                .iter()
+                .any(|path| path.ends_with(".deadreckon/docs/RUN-NARRATIVE.md"))
         );
     }
 }
