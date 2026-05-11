@@ -18,6 +18,12 @@ pub enum DeadreckonError {
     InvalidInput(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("lock held for {task_key} by run {run_id} in phase {phase}")]
+    LockHeld {
+        task_key: String,
+        run_id: String,
+        phase: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, DeadreckonError>;
