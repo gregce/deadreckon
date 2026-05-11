@@ -49,6 +49,8 @@ async fn mock_provider_records_three_turns() {
                     model: Some("mock-agent".to_string()),
                     input_cost_per_million: Some(1.0),
                     output_cost_per_million: Some(2.0),
+                    binary: None,
+                    extra_args: Vec::new(),
                 },
             )]
             .into_iter()
@@ -64,6 +66,8 @@ async fn mock_provider_records_three_turns() {
             .complete(&ProviderRequest {
                 prompt: format!("turn {turn}"),
                 max_output_tokens: 1024,
+                cwd: None,
+                output_path: None,
             })
             .await
             .expect("completion");
@@ -95,6 +99,8 @@ async fn mock_provider_supports_error_fixture() {
                     model: Some("mock-agent".to_string()),
                     input_cost_per_million: Some(0.0),
                     output_cost_per_million: Some(0.0),
+                    binary: None,
+                    extra_args: Vec::new(),
                 },
             )]
             .into_iter()
@@ -108,6 +114,8 @@ async fn mock_provider_supports_error_fixture() {
         .complete(&ProviderRequest {
             prompt: "fail".to_string(),
             max_output_tokens: 16,
+            cwd: None,
+            output_path: None,
         })
         .await
         .expect_err("fixture error");

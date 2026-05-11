@@ -1,9 +1,14 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+pub mod cli_claude_code;
+pub mod cli_codex;
+
+use cli_claude_code::CliClaudeCodeProvider;
+use cli_codex::CliCodexProvider;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,6 +37,8 @@ pub enum ProviderError {
     NoRoute(String),
     #[error("HTTP provider error for {provider}: {detail}")]
     Http { provider: String, detail: String },
+    #[error("CLI provider error for {provider}: {detail}")]
+    Cli { provider: String, detail: String },
     #[error("invalid provider configuration: {0}")]
     InvalidConfig(String),
 }
@@ -44,6 +51,8 @@ pub enum ProviderKind {
     Anthropic,
     OpenAi,
     OpenAiCompatible,
+    CliClaudeCode,
+    CliCodex,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,12 +68,18 @@ pub struct SpendEstimate {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
+    #[serde(default)]
+    pub subscription: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_time_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProviderRequest {
     pub prompt: String,
     pub max_output_tokens: u32,
+    pub cwd: Option<PathBuf>,
+    pub output_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,6 +89,8 @@ pub struct ProviderResponse {
     pub content: String,
     pub usage: ProviderUsage,
     pub spend: SpendEstimate,
+    #[serde(default)]
+    pub trace: Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +110,9 @@ pub struct ProviderEntry {
     pub model: Option<String>,
     pub input_cost_per_million: Option<f64>,
     pub output_cost_per_million: Option<f64>,
+    pub binary: Option<String>,
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 pub trait Provider: Send + Sync {
@@ -157,6 +177,7 @@ impl ProviderAdapter {
                     })?;
                 headers.insert(AUTHORIZATION, bearer);
             }
+            ProviderKind::CliClaudeCode | ProviderKind::CliCodex => {}
         }
         Ok(headers)
     }
@@ -168,6 +189,9 @@ impl ProviderAdapter {
             }
             ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => {
                 format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+            }
+            ProviderKind::CliClaudeCode | ProviderKind::CliCodex => {
+                unreachable!("CLI providers do not use HTTP endpoints")
             }
         }
     }
@@ -185,6 +209,9 @@ impl ProviderAdapter {
                 "max_tokens": request.max_output_tokens,
                 "stream": false,
             }),
+            ProviderKind::CliClaudeCode | ProviderKind::CliCodex => {
+                unreachable!("CLI providers do not use HTTP payloads")
+            }
         }
     }
 
@@ -223,6 +250,9 @@ impl ProviderAdapter {
         let (content, usage) = match self.kind {
             ProviderKind::Anthropic => parse_anthropic_response(&value),
             ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => parse_openai_response(&value),
+            ProviderKind::CliClaudeCode | ProviderKind::CliCodex => {
+                unreachable!("CLI providers do not parse HTTP responses")
+            }
         }?;
         let spend = self.estimate_spend(usage.clone());
         Ok(ProviderResponse {
@@ -231,6 +261,7 @@ impl ProviderAdapter {
             content,
             usage,
             spend,
+            trace: json!({"kind": "http_llm"}),
         })
     }
 }
@@ -261,6 +292,8 @@ impl Provider for ProviderAdapter {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cost_usd: round_usd(input + output),
+            subscription: false,
+            wall_time_seconds: None,
         }
     }
 
@@ -270,7 +303,7 @@ impl Provider for ProviderAdapter {
 }
 
 pub struct ProviderRouter {
-    routes: Vec<ProviderAdapter>,
+    routes: Vec<Box<dyn Provider>>,
 }
 
 impl ProviderRouter {
@@ -316,13 +349,13 @@ impl ProviderRouter {
                 .or_else(|| kind_from_name(&name))
                 .ok_or_else(|| ProviderError::InvalidConfig(format!("missing kind for {name}")))?;
             entry.kind = Some(kind);
-            routes.push(ProviderAdapter::new(name, kind, entry));
+            routes.push(build_provider(name, kind, entry));
         }
 
         Ok(Self { routes })
     }
 
-    pub fn routes(&self) -> &[ProviderAdapter] {
+    pub fn routes(&self) -> &[Box<dyn Provider>] {
         &self.routes
     }
 
@@ -375,6 +408,34 @@ pub fn read_config(path: &Path) -> Result<ProviderConfigFile> {
 fn builtin_entries() -> BTreeMap<String, ProviderEntry> {
     BTreeMap::from([
         (
+            "cli:claude-code".to_string(),
+            ProviderEntry {
+                kind: Some(ProviderKind::CliClaudeCode),
+                api_key: None,
+                api_key_env: None,
+                base_url: None,
+                model: Some("cli:claude-code".to_string()),
+                input_cost_per_million: Some(0.0),
+                output_cost_per_million: Some(0.0),
+                binary: Some("claude".to_string()),
+                extra_args: Vec::new(),
+            },
+        ),
+        (
+            "cli:codex".to_string(),
+            ProviderEntry {
+                kind: Some(ProviderKind::CliCodex),
+                api_key: None,
+                api_key_env: None,
+                base_url: None,
+                model: Some("cli:codex".to_string()),
+                input_cost_per_million: Some(0.0),
+                output_cost_per_million: Some(0.0),
+                binary: Some("codex".to_string()),
+                extra_args: Vec::new(),
+            },
+        ),
+        (
             "anthropic".to_string(),
             ProviderEntry {
                 kind: Some(ProviderKind::Anthropic),
@@ -384,6 +445,8 @@ fn builtin_entries() -> BTreeMap<String, ProviderEntry> {
                 model: Some("claude-sonnet-4-5".to_string()),
                 input_cost_per_million: Some(3.0),
                 output_cost_per_million: Some(15.0),
+                binary: None,
+                extra_args: Vec::new(),
             },
         ),
         (
@@ -396,6 +459,8 @@ fn builtin_entries() -> BTreeMap<String, ProviderEntry> {
                 model: Some("gpt-5.1-codex".to_string()),
                 input_cost_per_million: Some(1.25),
                 output_cost_per_million: Some(10.0),
+                binary: None,
+                extra_args: Vec::new(),
             },
         ),
         (
@@ -408,9 +473,21 @@ fn builtin_entries() -> BTreeMap<String, ProviderEntry> {
                 model: env::var("OPENAI_COMPATIBLE_MODEL").ok(),
                 input_cost_per_million: Some(0.0),
                 output_cost_per_million: Some(0.0),
+                binary: None,
+                extra_args: Vec::new(),
             },
         ),
     ])
+}
+
+fn build_provider(name: String, kind: ProviderKind, entry: ProviderEntry) -> Box<dyn Provider> {
+    match kind {
+        ProviderKind::CliClaudeCode => Box::new(CliClaudeCodeProvider::new(name, entry)),
+        ProviderKind::CliCodex => Box::new(CliCodexProvider::new(name, entry)),
+        ProviderKind::Anthropic | ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => {
+            Box::new(ProviderAdapter::new(name, kind, entry))
+        }
+    }
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -422,6 +499,7 @@ fn default_base_url(kind: ProviderKind) -> String {
         ProviderKind::Anthropic => "https://api.anthropic.com".to_string(),
         ProviderKind::OpenAi => "https://api.openai.com/v1".to_string(),
         ProviderKind::OpenAiCompatible => "http://127.0.0.1:11434/v1".to_string(),
+        ProviderKind::CliClaudeCode | ProviderKind::CliCodex => String::new(),
     }
 }
 
@@ -430,6 +508,8 @@ fn default_model(kind: ProviderKind) -> String {
         ProviderKind::Anthropic => "claude-sonnet-4-5".to_string(),
         ProviderKind::OpenAi => "gpt-5.1-codex".to_string(),
         ProviderKind::OpenAiCompatible => "local-model".to_string(),
+        ProviderKind::CliClaudeCode => "cli:claude-code".to_string(),
+        ProviderKind::CliCodex => "cli:codex".to_string(),
     }
 }
 
@@ -438,6 +518,8 @@ fn kind_from_name(name: &str) -> Option<ProviderKind> {
         "anthropic" => Some(ProviderKind::Anthropic),
         "openai" => Some(ProviderKind::OpenAi),
         "openai-compatible" | "openrouter" | "llama-cpp" => Some(ProviderKind::OpenAiCompatible),
+        "cli:claude-code" | "cli-claude-code" => Some(ProviderKind::CliClaudeCode),
+        "cli:codex" | "cli-codex" => Some(ProviderKind::CliCodex),
         _ => None,
     }
 }
@@ -542,6 +624,8 @@ api_key = "test"
                 model: Some("model".to_string()),
                 input_cost_per_million: Some(2.0),
                 output_cost_per_million: Some(8.0),
+                binary: None,
+                extra_args: Vec::new(),
             },
         );
 
@@ -567,6 +651,8 @@ api_key = "test"
             .complete(&super::ProviderRequest {
                 prompt: "hello".to_string(),
                 max_output_tokens: 16,
+                cwd: None,
+                output_path: None,
             })
             .await
             .expect_err("missing credentials");
