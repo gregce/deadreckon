@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
-use deadreckon_core::gate::{ACCEPTANCE_MARKER, AcceptanceMarker};
+use deadreckon_core::gate::{evaluate_acceptance, write_acceptance_marker};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut run_id = None;
@@ -16,37 +15,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let run_id = run_id.ok_or("--run is required")?;
     let working_dir = working_dir.ok_or("--working-dir is required")?;
-    if !working_dir.is_dir() {
-        return Err(format!(
-            "working directory does not exist: {}",
-            working_dir.display()
-        )
-        .into());
-    }
-    if working_dir.join("Cargo.toml").exists() {
-        let status = std::process::Command::new("cargo")
-            .arg("test")
-            .current_dir(&working_dir)
-            .status()?;
-        if !status.success() {
-            return Err("cargo test failed in working directory".into());
-        }
-    }
     let run_root = infer_run_root(&working_dir)?;
-    let proofs = run_root.join("proofs");
-    std::fs::create_dir_all(&proofs)?;
-    let marker = AcceptanceMarker {
-        schema_version: 1,
-        run_id,
-        status: "pass".to_string(),
-        produced_by: "dr-gate".to_string(),
-        checked_at: Utc::now(),
-        working_dir,
-    };
-    std::fs::write(
-        proofs.join(ACCEPTANCE_MARKER),
-        serde_json::to_vec_pretty(&marker)?,
-    )?;
+    let results = evaluate_acceptance(&run_root, &working_dir)?;
+    write_acceptance_marker(&run_root, run_id, working_dir, results.len())?;
     Ok(())
 }
 

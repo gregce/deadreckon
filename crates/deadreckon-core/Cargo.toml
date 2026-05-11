@@ -2,6 +2,8 @@
 name = "deadreckon-core"
 version.workspace = true
 edition.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [dependencies]
 chrono.workspace = true
@@ -11,8 +13,12 @@ fs2.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
 uuid.workspace = true
 walkdir.workspace = true

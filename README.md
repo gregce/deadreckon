@@ -1,6 +1,6 @@
 # deadreckon
 
-Rust agentic CLI harness for unattended long-running coding tasks with local-first run state, BYOK provider routing, disposable sandboxes, durable spend/provenance/traces, and per-turn undo.
+Rust agentic CLI harness for unattended long-running coding tasks. The current maturity tier is alpha: local-first run state, BYOK provider routing, disposable sandboxes, durable spend/provenance/traces, signed acceptance gates, and per-turn undo.
 
 ## Quickstart
 

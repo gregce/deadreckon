@@ -15,6 +15,7 @@ use deadreckon_sandbox::SandboxBackend;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_CONFIG_PATH: &str = "/Users/gdc/.deadreckon/config.toml";
 
@@ -86,6 +87,7 @@ pub struct ProviderRequest {
     pub output_path: Option<PathBuf>,
     pub sandbox_backend: Option<SandboxBackend>,
     pub pid_file: Option<PathBuf>,
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -223,17 +225,29 @@ impl ProviderAdapter {
 
     async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let headers = self.headers()?;
-        let response = self
+        let request_future = self
             .client
             .post(self.endpoint())
             .headers(headers)
             .json(&self.payload(request))
-            .send()
-            .await
-            .map_err(|err| ProviderError::Http {
-                provider: self.name.clone(),
-                detail: err.to_string(),
-            })?;
+            .send();
+        let response = if let Some(token) = request.cancellation_token.as_ref() {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return Err(ProviderError::Http {
+                        provider: self.name.clone(),
+                        detail: "request cancelled".to_string(),
+                    });
+                }
+                response = request_future => response
+            }
+        } else {
+            request_future.await
+        }
+        .map_err(|err| ProviderError::Http {
+            provider: self.name.clone(),
+            detail: err.to_string(),
+        })?;
         let status = response.status();
         let body = response.text().await.map_err(|err| ProviderError::Http {
             provider: self.name.clone(),
@@ -783,6 +797,7 @@ api_key = "test"
                 output_path: None,
                 sandbox_backend: None,
                 pid_file: None,
+                cancellation_token: None,
             })
             .await
             .expect_err("missing credentials");
@@ -800,6 +815,7 @@ api_key = "test"
                 output_path: None,
                 sandbox_backend: None,
                 pid_file: None,
+                cancellation_token: None,
             })
             .await
             .expect("smoke response");

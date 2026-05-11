@@ -19,6 +19,12 @@ pub struct SpendRecord {
     pub cost_usd: f64,
     pub total_cost_usd: f64,
     pub cap_usd: Option<f64>,
+    #[serde(default)]
+    pub subscription: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_time_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_time_cap_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +165,7 @@ mod tests {
                 provider: None,
                 skill_name: "default-coding".to_string(),
                 max_spend_usd: None,
+                max_wall_seconds: None,
             },
         )
         .expect("run");

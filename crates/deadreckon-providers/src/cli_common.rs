@@ -5,6 +5,7 @@ use std::process::Stdio;
 
 use deadreckon_sandbox::{SandboxBackend, SandboxSpec, run as run_sandbox};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::{ProviderError, Result};
 
@@ -25,6 +26,7 @@ pub(crate) async fn run_cli(
     cwd: Option<PathBuf>,
     sandbox_backend: Option<SandboxBackend>,
     pid_file: Option<PathBuf>,
+    cancellation_token: Option<CancellationToken>,
 ) -> Result<CliOutput> {
     if let Some(backend) = sandbox_backend {
         let cwd = cwd.unwrap_or_else(|| {
@@ -38,6 +40,10 @@ pub(crate) async fn run_cli(
             env: BTreeMap::new(),
             allow_network: true,
             pid_file,
+            cancellation_token,
+            profile_dir: None,
+            read_allowlist: Vec::new(),
+            network_allowlist: vec!["*".to_string()],
         })
         .await
         .map_err(|source| ProviderError::Cli {

@@ -93,13 +93,19 @@ pub struct PipelineState {
     pub sandbox: String,
     pub provider: Option<String>,
     pub max_spend_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wall_seconds: Option<f64>,
     pub total_spend_usd: f64,
+    #[serde(default)]
+    pub total_wall_seconds: f64,
     pub turn: u32,
     pub pause_reason: Option<String>,
     pub failure_reason: Option<String>,
     #[serde(default)]
     pub child_pids: Vec<u32>,
     pub killed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_library_dir: Option<PathBuf>,
     pub phases: Vec<PhaseState>,
 }
 
@@ -123,6 +129,7 @@ pub struct RunOptions {
     pub provider: Option<String>,
     pub skill_name: String,
     pub max_spend_usd: Option<f64>,
+    pub max_wall_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +183,10 @@ pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<Pipeli
     let working_dir = run_root.join("working");
     fs::create_dir_all(&working_dir).with_path(&working_dir)?;
     fs::create_dir_all(run_root.join("snapshots")).with_path(run_root.join("snapshots"))?;
+    let gate_dir = run_root.join("gate");
+    fs::create_dir_all(&gate_dir).with_path(&gate_dir)?;
+    fs::write(gate_dir.join("nonce"), Uuid::new_v4().simple().to_string())
+        .with_path(gate_dir.join("nonce"))?;
 
     // AS-BUILT §3: the binary owns deterministic paths while the skill stays a
     // markdown subprocess boundary under the source tree.
@@ -202,12 +213,15 @@ pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<Pipeli
         sandbox: options.sandbox,
         provider: options.provider,
         max_spend_usd: options.max_spend_usd,
+        max_wall_seconds: options.max_wall_seconds,
         total_spend_usd: 0.0,
+        total_wall_seconds: 0.0,
         turn: 0,
         pause_reason: None,
         failure_reason: None,
         child_pids: Vec::new(),
         killed_at: None,
+        promoted_library_dir: None,
         phases: default_phases(now),
     };
     state.set_phase_status(PhaseId(0), PhaseStatus::Planned)?;
@@ -397,6 +411,7 @@ mod tests {
                 provider: None,
                 skill_name: "default-coding".to_string(),
                 max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
             },
         )
         .expect("create run");
@@ -426,6 +441,7 @@ mod tests {
                 provider: Some("openai".to_string()),
                 skill_name: "default-coding".to_string(),
                 max_spend_usd: None,
+                max_wall_seconds: None,
             },
         )
         .expect("create run");

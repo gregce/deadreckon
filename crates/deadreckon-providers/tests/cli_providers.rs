@@ -45,6 +45,7 @@ async fn cli_claude_code_provider_runs_fake_binary_and_captures_output() {
             output_path: Some(output_path.clone()),
             sandbox_backend: None,
             pid_file: None,
+            cancellation_token: None,
         })
         .await
         .expect("completion");
@@ -97,6 +98,7 @@ async fn cli_codex_provider_uses_exec_verb() {
             output_path: None,
             sandbox_backend: None,
             pid_file: None,
+            cancellation_token: None,
         })
         .await
         .expect("completion");
@@ -145,6 +147,7 @@ async fn cli_provider_runs_inside_requested_sandbox_backend() {
             output_path: None,
             sandbox_backend: Some(SandboxBackend::None),
             pid_file: Some(pid_file.clone()),
+            cancellation_token: None,
         })
         .await
         .expect("completion");
@@ -199,6 +202,7 @@ async fn cli_provider_errors_on_nonzero_exit_after_capturing_output() {
             output_path: Some(output_path.clone()),
             sandbox_backend: None,
             pid_file: None,
+            cancellation_token: None,
         })
         .await
         .expect_err("nonzero exit should fail");

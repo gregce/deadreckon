@@ -262,6 +262,287 @@ async fn high_spend_requires_confirmation_flag_in_scripts() {
     assert!(stderr.contains("hint:"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_wall_clock_budget_enforced() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let fake_codex = temp.path().join("fake-codex-sleep");
+    fs::write(
+        &fake_codex,
+        "#!/bin/sh\nprintf \"wall run %s\\n\" \"$(date +%s%N)\" > notes.md\nsleep 1\nprintf 'changed notes\\n'\n",
+    )
+    .expect("fake codex");
+    chmod_exec(&fake_codex);
+    write_cli_config(temp.path(), &fake_codex);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("run")
+        .arg("cli wall budget")
+        .arg("--provider")
+        .arg("cli:codex")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--max-wall-seconds")
+        .arg("0.1")
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("paused run"));
+    let paths = DeadreckonPaths::from_home(&home);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(
+        state.pause_reason.as_deref(),
+        Some("wall-clock cap reached")
+    );
+    let spend = fs::read_to_string(state.run_root.join("spend.jsonl")).expect("spend");
+    assert!(spend.contains("wall_time_seconds"));
+
+    let resume = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("resume")
+        .arg(&run.run_id)
+        .arg("--max-wall-seconds")
+        .arg("10")
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("resume");
+    assert!(
+        resume.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&resume.stdout),
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.status, RunStatus::Completed);
+    assert!(state.working_dir.join("notes.md").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill_storm_no_leaks() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let server = MockServer::start(kill_storm_script(10)).await;
+    write_config(temp.path(), &server.base_url());
+    let mut children = Vec::new();
+    for idx in 0..10 {
+        let scope_root = temp.path().join(format!("scope-{idx}"));
+        fs::create_dir_all(&scope_root).expect("scope root");
+        let child = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+            .arg("run")
+            .arg(format!("mock slow task {idx}"))
+            .arg("--provider")
+            .arg("mock")
+            .arg("--sandbox")
+            .arg("none")
+            .arg("--max-spend")
+            .arg("1")
+            .env("DEADRECKON_HOME", &home)
+            .env("DEADRECKON_SCOPE_ROOT", &scope_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn run");
+        children.push(child);
+    }
+    let paths = DeadreckonPaths::from_home(&home);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut run_ids = Vec::new();
+    while run_ids.len() < 10 {
+        run_ids = list_runs(&paths, None)
+            .expect("runs")
+            .into_iter()
+            .filter_map(|run| {
+                let state = load_run(&paths, &run.run_id).ok()?;
+                if state.child_pids.is_empty() {
+                    None
+                } else {
+                    Some(run.run_id)
+                }
+            })
+            .collect();
+        assert!(Instant::now() < deadline, "all run ids did not appear");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    for run_id in &run_ids {
+        let kill = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+            .arg("kill")
+            .arg(run_id)
+            .env("DEADRECKON_HOME", &home)
+            .output()
+            .expect("kill");
+        assert!(kill.status.success());
+    }
+    for mut child in children {
+        let _ = child.wait();
+    }
+    for run_id in &run_ids {
+        let state = load_run(&paths, run_id).expect("state");
+        assert_ne!(state.status, RunStatus::Executing);
+        for pid in super_pids(&state) {
+            assert!(!deadreckon_core::pid_is_alive(pid), "pid {pid} leaked");
+        }
+    }
+    let lock_count = fs::read_dir(paths.locks_dir())
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(std::result::Result::ok))
+        .count();
+    assert_eq!(lock_count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_fails_actionably() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("doctor")
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("doctor");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("config.toml missing"));
+    assert!(stdout.contains("fix: deadreckon init"));
+    assert!(stdout.contains("disk space"));
+    assert!(stdout.contains("runstate dir"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_claude_code_roundtrip() {
+    import_jsonl_roundtrip("claude-code", "DEADRECKON_IMPORT_CLAUDE_ROOT");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_codex_roundtrip() {
+    import_jsonl_roundtrip("codex", "DEADRECKON_IMPORT_CODEX_ROOT");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_cursor_roundtrip() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("cursor");
+    fs::create_dir_all(&root).expect("cursor root");
+    let db = root.join("chats.db");
+    let status = Command::new("sqlite3")
+        .arg(&db)
+        .arg("create table messages (role text, content text, tool_call_id text, path text); insert into messages values ('assistant','edited','cursor-tool','cursor.md');")
+        .status();
+    if status.is_err() {
+        return;
+    }
+    assert!(status.expect("sqlite status").success());
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("cursor")
+        .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_IMPORT_CURSOR_ROOT", &root)
+        .output()
+        .expect("import");
+    assert!(output.status.success());
+    let run_id = imported_run_id(&output);
+    let show = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("show")
+        .arg(&run_id)
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("show");
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains("import.cursor"));
+    assert!(stdout.contains("cursor.md"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn stress_5_concurrent_10min() {
+    if std::env::var("DEADRECKON_STRESS").ok().as_deref() != Some("1") {
+        return;
+    }
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let seconds = std::env::var("DEADRECKON_STRESS_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(600);
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let fake_codex = temp.path().join("fake-codex-stress");
+    fs::write(
+        &fake_codex,
+        format!(
+            "#!/bin/sh\nprintf 'scope:%s\\n' \"$PWD\" > notes.md\nsleep {seconds}\nprintf 'done\\n'\n"
+        ),
+    )
+    .expect("fake codex");
+    chmod_exec(&fake_codex);
+    write_cli_config(temp.path(), &fake_codex);
+
+    let mut children = Vec::new();
+    for idx in 0..5 {
+        let scope_root = temp.path().join(format!("stress-scope-{idx}"));
+        fs::create_dir_all(&scope_root).expect("scope root");
+        children.push(
+            Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+                .arg("run")
+                .arg(format!("stress run {idx}"))
+                .arg("--provider")
+                .arg("cli:codex")
+                .arg("--sandbox")
+                .arg("none")
+                .arg("--max-spend")
+                .arg("1")
+                .arg("--max-wall-seconds")
+                .arg((seconds + 60).to_string())
+                .env("DEADRECKON_HOME", &home)
+                .env("DEADRECKON_SCOPE_ROOT", &scope_root)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn stress run"),
+        );
+    }
+
+    for child in children {
+        let output = child.wait_with_output().expect("stress wait");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let paths = DeadreckonPaths::from_home(&home);
+    let runs = list_runs(&paths, None).expect("runs");
+    assert_eq!(runs.len(), 5);
+    let mut seen_scopes = std::collections::BTreeSet::new();
+    for run in runs {
+        let state = load_run(&paths, &run.run_id).expect("state");
+        assert_eq!(state.status, RunStatus::Completed);
+        assert!(seen_scopes.insert(state.scope.clone()));
+        let provenance =
+            fs::read_to_string(state.run_root.join("provenance.jsonl")).expect("provenance");
+        assert!(provenance.contains(&state.run_id));
+    }
+    let lock_count = fs::read_dir(paths.locks_dir())
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(std::result::Result::ok))
+        .count();
+    assert_eq!(lock_count, 0);
+}
+
 fn repo_tempdir() -> TempDir {
     let root = std::path::Path::new("/Users/gdc/deadreckon/.test-tmp");
     fs::create_dir_all(root).expect("test tmp root");
@@ -317,6 +598,82 @@ fn chmod_exec(path: &std::path::Path) {
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).expect("chmod");
     }
+}
+
+fn super_pids(state: &deadreckon_core::PipelineState) -> Vec<u32> {
+    let mut pids = state.child_pids.clone();
+    let pid_dir = state.run_root.join("child-pids");
+    if let Ok(entries) = fs::read_dir(pid_dir) {
+        for entry in entries.flatten() {
+            if let Ok(raw) = fs::read_to_string(entry.path()) {
+                for line in raw.lines() {
+                    if let Ok(pid) = line.trim().parse() {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+    }
+    pids
+}
+
+fn import_jsonl_roundtrip(source: &str, env_name: &str) {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join(source);
+    fs::create_dir_all(&root).expect("import root");
+    fs::write(
+        root.join("session.jsonl"),
+        r#"{"role":"assistant","content":"tool call","tool_call_id":"tool-1","path":"notes.md"}
+{"role":"assistant","content":"file edit","tool_call_id":"tool-2","file":"src/main.rs"}
+"#,
+    )
+    .expect("jsonl");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg(source)
+        .env("DEADRECKON_HOME", &home)
+        .env(env_name, &root)
+        .output()
+        .expect("import");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_id = imported_run_id(&output);
+    let show = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("show")
+        .arg(&run_id)
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("show");
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains(&format!("import.{source}")));
+    assert!(stdout.contains("notes.md"));
+    assert!(stdout.contains("src/main.rs"));
+}
+
+fn imported_run_id(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("imported "))
+        .expect("imported id")
+        .to_string()
+}
+
+fn kill_storm_script(count: usize) -> Vec<FixtureResponse> {
+    (0..count)
+        .map(|_| FixtureResponse {
+            content:
+                "{\"action\":\"bash\",\"tool_call_id\":\"tool-slow\",\"command\":\"sleep 30\"}"
+                    .to_string(),
+            delay_ms: Some(30000),
+            prompt_tokens: 100,
+            completion_tokens: 20,
+        })
+        .collect()
 }
 
 fn wait_for_run_id(paths: &DeadreckonPaths) -> String {

@@ -2,10 +2,17 @@
 name = "deadreckon-sandbox"
 version.workspace = true
 edition.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [dependencies]
+nix.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 which.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

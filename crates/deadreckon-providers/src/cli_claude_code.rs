@@ -46,6 +46,7 @@ impl CliClaudeCodeProvider {
             request.cwd.clone(),
             request.sandbox_backend,
             request.pid_file.clone(),
+            request.cancellation_token.clone(),
         )
         .await?;
         write_output(request.output_path.as_ref(), &output).await?;

@@ -2,9 +2,11 @@
 
 pub mod artifacts;
 pub mod error;
+pub mod events;
 pub mod gate;
 pub mod lock;
 pub mod paths;
+pub mod promotion;
 pub mod state;
 pub mod turn_loop;
 
@@ -13,12 +15,20 @@ pub use artifacts::{
     inventory_files, restore_snapshot, snapshot_working,
 };
 pub use error::{DeadreckonError, Result};
-pub use gate::{AcceptanceMarker, validate_acceptance_marker};
+pub use events::{
+    RUN_EVENTS_JSONL, RunEvent, RunEventBus, RunEventKind, emit_event, event_preview,
+};
+pub use gate::{
+    AcceptanceCheck, AcceptanceCheckResult, AcceptanceMarker, AcceptanceSpec,
+    acceptance_spec_path_for_run_root, evaluate_acceptance, gate_nonce_path_for_run_root,
+    marker_path_for_run_root, validate_acceptance_marker, write_acceptance_marker,
+};
 pub use lock::{
     LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,
     terminate_pid,
 };
 pub use paths::{DEFAULT_DEADRECKON_HOME, DeadreckonPaths, SOURCE_ROOT};
+pub use promotion::{PromotionManifest, promote_completed_run, recover_promotion};
 pub use state::{
     CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, RunListEntry, RunOptions,
     RunStatus, create_run, list_runs, load_run, save_state,

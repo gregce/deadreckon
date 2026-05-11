@@ -82,8 +82,8 @@ impl Drop for LockGuard {
     }
 }
 
-pub fn lock_path(paths: &DeadreckonPaths, task_key: &str) -> PathBuf {
-    paths.locks_dir().join(format!("{task_key}.lock"))
+pub fn lock_path(paths: &DeadreckonPaths, scope: &str, task_key: &str) -> PathBuf {
+    paths.locks_dir().join(format!("{scope}--{task_key}.lock"))
 }
 
 pub fn acquire_lock(
@@ -97,7 +97,7 @@ pub fn acquire_lock(
     // REPORT.md: Multi-Agent Worktree Coordination Layer starts with scoped
     // locks so parallel agents do not claim the same task at once.
     fs::create_dir_all(paths.locks_dir()).with_path(paths.locks_dir())?;
-    let path = lock_path(paths, task_key);
+    let path = lock_path(paths, scope, task_key);
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -125,7 +125,7 @@ pub fn acquire_lock(
     if let Some(existing) = existing {
         let stale = lock_is_stale(&existing, stale_after);
         let alive = pid_is_alive(existing.pid);
-        let same_owner = existing.scope == scope || existing.run_id == run_id;
+        let same_owner = existing.run_id == run_id;
         if !same_owner && !stale && alive {
             file.unlock().with_path(&path)?;
             return Err(DeadreckonError::LockHeld {
@@ -159,10 +159,11 @@ pub fn acquire_lock(
 
 pub fn lock_status(
     paths: &DeadreckonPaths,
+    scope: &str,
     task_key: &str,
     stale_after: Duration,
 ) -> Result<LockStatus> {
-    let path = lock_path(paths, task_key);
+    let path = lock_path(paths, scope, task_key);
     let Some(state) = read_lock_state(&path)? else {
         return Ok(LockStatus {
             held: false,
@@ -181,8 +182,8 @@ pub fn lock_status(
     })
 }
 
-pub fn release_lock_file(paths: &DeadreckonPaths, task_key: &str) -> Result<()> {
-    let path = lock_path(paths, task_key);
+pub fn release_lock_file(paths: &DeadreckonPaths, scope: &str, task_key: &str) -> Result<()> {
+    let path = lock_path(paths, scope, task_key);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -292,7 +293,7 @@ mod tests {
     use crate::paths::DeadreckonPaths;
 
     #[test]
-    fn held_file_lock_blocks_second_owner() {
+    fn held_file_lock_blocks_same_scope_second_owner() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path());
         let guard = acquire_lock(
@@ -309,7 +310,7 @@ mod tests {
             &paths,
             "task",
             "run-b",
-            "scope-b",
+            "scope-a",
             "execute",
             Duration::from_secs(60),
         )
@@ -319,11 +320,63 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_runs_no_state_bleed() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path());
+        let guard_a = acquire_lock(
+            &paths,
+            "task",
+            "run-a",
+            "scope-a",
+            "execute",
+            Duration::from_secs(60),
+        )
+        .expect("scope a lock");
+        let guard_b = acquire_lock(
+            &paths,
+            "task",
+            "run-b",
+            "scope-b",
+            "execute",
+            Duration::from_secs(60),
+        )
+        .expect("scope b lock");
+        assert_ne!(guard_a.state().scope, guard_b.state().scope);
+    }
+
+    #[test]
+    fn same_scope_second_run_refused_with_hint() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path());
+        let _guard = acquire_lock(
+            &paths,
+            "task",
+            "run-a",
+            "scope-a",
+            "execute",
+            Duration::from_secs(60),
+        )
+        .expect("first lock");
+        let err = acquire_lock(
+            &paths,
+            "task",
+            "run-b",
+            "scope-a",
+            "execute",
+            Duration::from_secs(60),
+        )
+        .expect_err("same scope refused");
+        let message = err.to_string();
+        assert!(message.contains("lock held"));
+        assert!(message.contains("run-a"));
+    }
+
+    #[test]
     fn stale_lock_reclaims_with_dead_pid() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path());
         fs::create_dir_all(paths.locks_dir()).expect("locks dir");
-        let path = lock_path(&paths, "task");
+        let path = lock_path(&paths, "new-scope", "task");
         let stale = LockState {
             task_key: "task".to_string(),
             run_id: "old-run".to_string(),
@@ -362,7 +415,8 @@ mod tests {
         .expect("lock");
         guard.heartbeat("verify").expect("heartbeat");
 
-        let status = lock_status(&paths, "task", Duration::from_secs(60)).expect("status");
+        let status =
+            lock_status(&paths, "scope-a", "task", Duration::from_secs(60)).expect("status");
         let state = status.state.expect("state");
         assert!(status.held);
         assert!(status.alive);

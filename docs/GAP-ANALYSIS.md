@@ -24,3 +24,8 @@ Audit date: 2026-05-11. Scope: `/Users/gdc/deadreckon/`.
 - Tier C was executed with live `cli:codex` using `codex exec --ephemeral` and deadreckon's outer `sandbox-exec` wrapper. The latest successful run id is `f8be423c3cb14a12869206ae25184377`.
 - `asciinema` is not installed in the current environment. `demo.cast` is therefore generated from captured real command output and kept in asciicast v2 format.
 - Existing untracked `.cursorindexingignore` is outside the task scope and was not created or modified by deadreckon work.
+
+## Alpha Robustness Notes
+
+- Cross-process attach cannot consume an in-memory Tokio broadcast from an already running process, so the loop writes every broadcast event to `events.jsonl`; the TUI replays that durable stream at 100 ms cadence.
+- `doctor` performs exhaustive local checks and actionable provider credential checks. HTTP provider live pings are guarded by `DEADRECKON_DOCTOR_PING=1` to avoid spending user keys during routine local verification.

@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::time::{Duration, sleep};
+use tokio_util::sync::CancellationToken;
 use which::which;
 
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +20,8 @@ pub enum SandboxError {
     Unavailable(String),
     #[error("I/O error while running sandbox command: {0}")]
     Io(#[from] std::io::Error),
+    #[error("sandboxed command cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
@@ -68,6 +73,10 @@ pub struct SandboxSpec {
     pub env: BTreeMap<String, String>,
     pub allow_network: bool,
     pub pid_file: Option<PathBuf>,
+    pub cancellation_token: Option<CancellationToken>,
+    pub profile_dir: Option<PathBuf>,
+    pub read_allowlist: Vec<PathBuf>,
+    pub network_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +109,7 @@ pub struct BackendAvailability {
 
 pub async fn run(spec: SandboxSpec) -> Result<SandboxRunOutput> {
     let command = build_command(&spec)?;
-    let child = Command::new(&command.program)
+    let mut child = Command::new(&command.program)
         .args(&command.args)
         .current_dir(&command.cwd)
         .envs(&command.env)
@@ -108,24 +117,66 @@ pub async fn run(spec: SandboxSpec) -> Result<SandboxRunOutput> {
         .stderr(Stdio::piped())
         .spawn()?;
     let pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_task = tokio::spawn(read_pipe(stdout));
+    let stderr_task = tokio::spawn(read_pipe(stderr));
     if let (Some(pid), Some(pid_file)) = (pid, spec.pid_file.as_ref()) {
         if let Some(parent) = pid_file.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(pid_file, format!("{pid}\n")).await?;
     }
-    let output = child.wait_with_output().await?;
+    let status = if let Some(token) = spec.cancellation_token.as_ref() {
+        tokio::select! {
+            _ = token.cancelled() => {
+                if let Some(pid) = pid {
+                    signal_pid(pid, false);
+                    sleep(Duration::from_secs(2)).await;
+                    if child.try_wait()?.is_none() {
+                        signal_pid(pid, true);
+                    }
+                }
+                let _ = child.wait().await;
+                if let Some(pid_file) = spec.pid_file.as_ref() {
+                    let _ = tokio::fs::remove_file(pid_file).await;
+                }
+                return Err(SandboxError::Cancelled);
+            }
+            status = child.wait() => status
+        }
+    } else {
+        child.wait().await
+    }?;
+    let stdout = stdout_task
+        .await
+        .unwrap_or_else(|err| Ok(format!("stdout join error: {err}")))?;
+    let stderr = stderr_task
+        .await
+        .unwrap_or_else(|err| Ok(format!("stderr join error: {err}")))?;
     if let Some(pid_file) = spec.pid_file.as_ref() {
         let _ = tokio::fs::remove_file(pid_file).await;
     }
     Ok(SandboxRunOutput {
         backend: command.backend,
         pid,
-        status_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        status_code: status.code(),
+        stdout,
+        stderr,
         warning: command.warning,
     })
+}
+
+async fn read_pipe<R>(pipe: Option<R>) -> std::io::Result<String>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let Some(mut pipe) = pipe else {
+        return Ok(String::new());
+    };
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes).await?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 pub fn build_command(spec: &SandboxSpec) -> Result<SandboxCommand> {
@@ -230,7 +281,7 @@ fn require_binary(name: &str, backend: SandboxBackend) -> Result<(SandboxBackend
 }
 
 fn sandbox_exec_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxCommand> {
-    let profile = sandbox_exec_profile(spec.allow_network);
+    let profile = sandbox_exec_profile(spec)?;
     let mut args = vec![
         OsString::from("-p"),
         OsString::from(profile),
@@ -250,14 +301,26 @@ fn sandbox_exec_command(spec: &SandboxSpec, warning: Option<String>) -> Result<S
 
 fn bwrap_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxCommand> {
     let cwd = spec.cwd.to_string_lossy().to_string();
+    let sandbox_home = spec.cwd.join(".deadreckon-home");
+    std::fs::create_dir_all(&sandbox_home)?;
     let mut args = vec![
         "--die-with-parent".into(),
         "--unshare-pid".into(),
         "--unshare-ipc".into(),
         "--unshare-uts".into(),
-        "--ro-bind".into(),
-        "/".into(),
-        "/".into(),
+        "--tmpfs".into(),
+        sandbox_home.to_string_lossy().to_string().into(),
+        "--setenv".into(),
+        "HOME".into(),
+        sandbox_home.to_string_lossy().to_string().into(),
+    ];
+    for path in system_read_allowlist(&spec.cwd, &spec.read_allowlist) {
+        let path = path.to_string_lossy().to_string();
+        args.push("--ro-bind".into());
+        args.push(path.clone().into());
+        args.push(path.into());
+    }
+    args.extend([
         "--bind".into(),
         cwd.clone().into(),
         cwd.clone().into(),
@@ -269,7 +332,7 @@ fn bwrap_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxC
         "/dev".into(),
         "--chdir".into(),
         cwd.into(),
-    ];
+    ]);
     if !spec.allow_network {
         args.push("--unshare-net".into());
     }
@@ -317,21 +380,84 @@ fn docker_command(spec: &SandboxSpec, warning: Option<String>) -> Result<Sandbox
     })
 }
 
-fn sandbox_exec_profile(allow_network: bool) -> String {
-    let network = if allow_network {
-        "(allow network*)"
+fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
+    let network = if spec.allow_network {
+        if spec.network_allowlist.iter().any(|host| host == "*") {
+            "(allow network*)".to_string()
+        } else {
+            "(deny network*)".to_string()
+        }
     } else {
-        "(deny network*)"
+        "(deny network*)".to_string()
     };
-    format!(
+    let mut read_rules = String::new();
+    for path in system_read_allowlist(&spec.cwd, &spec.read_allowlist) {
+        read_rules.push_str(&format!(
+            "    (subpath \"{}\")\n",
+            escape_seatbelt_path(&path)
+        ));
+    }
+    let profile = format!(
         "(version 1)
-(allow default)
+(deny default)
+(allow process*)
+(allow signal (target same-sandbox))
+(allow sysctl-read)
 {network}
-(allow file-read*)
-(allow file-write*)
-"
-    )
+(allow file-read*
+{read_rules})
+(allow file-write*
+    (subpath \"{}\")
+    (subpath \"/private/tmp\")
+    (subpath \"/tmp\"))
+",
+        escape_seatbelt_path(&spec.cwd)
+    );
+    if let Some(profile_dir) = spec.profile_dir.as_ref() {
+        std::fs::create_dir_all(profile_dir)?;
+        std::fs::write(profile_dir.join("profile.sb"), &profile)?;
+    }
+    Ok(profile)
 }
+
+fn system_read_allowlist(cwd: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from("/bin"),
+        PathBuf::from("/sbin"),
+        PathBuf::from("/usr"),
+        PathBuf::from("/System"),
+        PathBuf::from("/Library"),
+        PathBuf::from("/Applications"),
+        PathBuf::from("/dev"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/tmp"),
+        cwd.to_path_buf(),
+    ];
+    paths.extend(extra.iter().cloned());
+    paths
+}
+
+fn escape_seatbelt_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32, force: bool) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let signal = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    let _ = kill(Pid::from_raw(pid as i32), Some(signal));
+}
+
+#[cfg(not(unix))]
+fn signal_pid(_pid: u32, _force: bool) {}
 
 fn missing_hint(backend: SandboxBackend) -> String {
     match backend {
@@ -349,6 +475,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
 
+    use tempfile::TempDir;
+
     use super::{SandboxBackend, SandboxSpec, build_command, run};
 
     fn shell_spec() -> SandboxSpec {
@@ -360,6 +488,10 @@ mod tests {
             env: BTreeMap::new(),
             allow_network: false,
             pid_file: None,
+            cancellation_token: None,
+            profile_dir: None,
+            read_allowlist: Vec::new(),
+            network_allowlist: Vec::new(),
         }
     }
 
@@ -386,5 +518,86 @@ mod tests {
             assert!(command.args.iter().any(|arg| arg == "--network"));
             assert!(command.args.iter().any(|arg| arg == "none"));
         }
+    }
+
+    #[test]
+    fn sandbox_exec_profile_blocks_home_ssh_by_default() {
+        let mut spec = shell_spec();
+        spec.backend = SandboxBackend::SandboxExec;
+        let command = build_command(&spec).unwrap_or_else(|_| {
+            let mut fallback = spec.clone();
+            fallback.backend = SandboxBackend::None;
+            build_command(&fallback).expect("fallback")
+        });
+        if command.backend == SandboxBackend::SandboxExec {
+            let profile = command.args[1].to_string_lossy();
+            assert!(profile.contains("(deny default)"));
+            assert!(!profile.contains("/Users/gdc/.ssh"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_blocks_ssh_read_macos() {
+        if which::which("sandbox-exec").is_err() {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let work = temp.path().join("work");
+        let secret_dir = temp.path().join(".ssh");
+        std::fs::create_dir_all(&work).expect("work");
+        std::fs::create_dir_all(&secret_dir).expect("secret dir");
+        let secret = secret_dir.join("id_rsa");
+        std::fs::write(&secret, "secret").expect("secret");
+        let output = run(SandboxSpec {
+            backend: SandboxBackend::SandboxExec,
+            cwd: work,
+            program: OsString::from("sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from(format!("cat {}", secret.display())),
+            ],
+            env: BTreeMap::new(),
+            allow_network: false,
+            pid_file: None,
+            cancellation_token: None,
+            profile_dir: None,
+            read_allowlist: Vec::new(),
+            network_allowlist: Vec::new(),
+        })
+        .await
+        .expect("sandbox run");
+        assert_ne!(output.status_code, Some(0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_blocks_outbound_to_evil_host() {
+        if which::which("sandbox-exec").is_err() || which::which("curl").is_err() {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let output = run(SandboxSpec {
+            backend: SandboxBackend::SandboxExec,
+            cwd: work,
+            program: OsString::from("curl"),
+            args: vec![
+                OsString::from("--max-time"),
+                OsString::from("2"),
+                OsString::from("https://example.com"),
+            ],
+            env: BTreeMap::new(),
+            allow_network: false,
+            pid_file: None,
+            cancellation_token: None,
+            profile_dir: None,
+            read_allowlist: Vec::new(),
+            network_allowlist: Vec::new(),
+        })
+        .await
+        .expect("sandbox run");
+        assert_ne!(output.status_code, Some(0));
     }
 }

@@ -70,6 +70,7 @@ async fn mock_provider_records_three_turns() {
                 output_path: None,
                 sandbox_backend: None,
                 pid_file: None,
+                cancellation_token: None,
             })
             .await
             .expect("completion");
@@ -120,6 +121,7 @@ async fn mock_provider_supports_error_fixture() {
             output_path: None,
             sandbox_backend: None,
             pid_file: None,
+            cancellation_token: None,
         })
         .await
         .expect_err("fixture error");

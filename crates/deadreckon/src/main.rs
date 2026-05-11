@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, hash_map::DefaultHasher};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
@@ -11,10 +12,10 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use deadreckon_core::{
-    DeadreckonError, DeadreckonPaths, PhaseId, PhaseStatus, ProvenanceRecord, RunLoopConfig,
-    RunLoopOutcome, RunOptions, RunStatus, SpendRecord, TraceRecord, acquire_lock, append_trace,
-    create_run, inventory_files, list_runs, load_run, release_lock_file, restore_snapshot,
-    run_turn_loop, save_state, terminate_pid,
+    DeadreckonError, DeadreckonPaths, PhaseId, PhaseStatus, ProvenanceRecord, RUN_EVENTS_JSONL,
+    RunEvent, RunLoopConfig, RunLoopOutcome, RunOptions, RunStatus, SpendRecord, TraceRecord,
+    acquire_lock, append_provenance, append_trace, create_run, inventory_files, list_runs,
+    load_run, release_lock_file, restore_snapshot, run_turn_loop, save_state, terminate_pid,
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_sandbox::SandboxBackend;
@@ -61,6 +62,9 @@ fn error_hint(err: &CliError) -> Option<&'static str> {
         CliError::Core(DeadreckonError::NotFound(_)) => {
             Some("run `deadreckon list` to find valid run ids or config keys")
         }
+        CliError::Core(DeadreckonError::LockHeld { .. }) => Some(
+            "run `deadreckon list`, then `deadreckon attach <run-id>` or `deadreckon kill <run-id>`",
+        ),
         CliError::Sandbox(_) => Some("run `deadreckon doctor` to inspect sandbox availability"),
         CliError::TomlDe(_) | CliError::TomlSer(_) => {
             Some("check /Users/gdc/.deadreckon/config.toml or rerun `deadreckon init`")
@@ -107,6 +111,8 @@ enum Commands {
         #[arg(long)]
         max_spend: Option<f64>,
         #[arg(long)]
+        max_wall_seconds: Option<f64>,
+        #[arg(long)]
         sandbox: Option<String>,
         #[arg(long)]
         provider: Option<String>,
@@ -129,9 +135,15 @@ enum Commands {
     },
     Kill {
         run_id: String,
+        #[arg(long)]
+        force: bool,
     },
     Resume {
         run_id: String,
+        #[arg(long)]
+        from_turn: Option<u32>,
+        #[arg(long)]
+        max_wall_seconds: Option<f64>,
     },
     Undo {
         #[arg(long)]
@@ -187,6 +199,7 @@ async fn main_inner() -> Result<()> {
         Commands::Run {
             goal,
             max_spend,
+            max_wall_seconds,
             sandbox,
             provider,
             skill,
@@ -197,6 +210,7 @@ async fn main_inner() -> Result<()> {
             run_command(RunCommandArgs {
                 goal,
                 max_spend,
+                max_wall_seconds,
                 sandbox,
                 provider,
                 skill,
@@ -212,8 +226,12 @@ async fn main_inner() -> Result<()> {
         }
         Commands::List { scope } => list_command(scope),
         Commands::Attach { run_id } => attach_command(run_id),
-        Commands::Kill { run_id } => kill_command(run_id),
-        Commands::Resume { run_id } => resume_command(run_id).await,
+        Commands::Kill { run_id, force } => kill_command(run_id, force),
+        Commands::Resume {
+            run_id,
+            from_turn,
+            max_wall_seconds,
+        } => resume_command(run_id, from_turn, max_wall_seconds).await,
         Commands::Undo { run, turn } => undo_command(run, turn),
         Commands::Show { run_id, turn } => show_command(run_id, turn),
         Commands::Import { source } => import_command(source),
@@ -286,6 +304,7 @@ fn config_command(command: ConfigCommand) -> Result<()> {
 struct RunCommandArgs {
     goal: String,
     max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
     sandbox: Option<String>,
     provider: Option<String>,
     skill: String,
@@ -298,6 +317,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     let RunCommandArgs {
         goal,
         max_spend,
+        max_wall_seconds,
         sandbox,
         provider,
         skill,
@@ -318,6 +338,9 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         provider.clone().or(defaults.provider)
     };
     let effective_max_spend = max_spend.or(defaults.max_spend).or(Some(10.0));
+    let effective_max_wall_seconds = max_wall_seconds
+        .or(defaults.cli_max_wall_seconds)
+        .or(Some(3600.0));
     if max_spend.is_none() {
         let cap = effective_max_spend.unwrap_or(10.0);
         println!(
@@ -339,6 +362,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
             provider: effective_provider.clone(),
             skill_name: skill,
             max_spend_usd: effective_max_spend,
+            max_wall_seconds: effective_max_wall_seconds,
         },
     )?;
     let mut lock = acquire_lock(
@@ -369,8 +393,12 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         RunLoopConfig {
             provider: effective_provider.clone(),
             max_spend_usd: effective_max_spend,
+            max_wall_seconds: effective_max_wall_seconds,
             sandbox_backend: backend,
             max_turns: 12,
+            from_turn: None,
+            event_sender: None,
+            cancellation_token: None,
         },
     )
     .await?;
@@ -381,6 +409,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     match outcome {
         RunLoopOutcome::Done => println!("completed run {}", state.run_id),
         RunLoopOutcome::PausedAtCap => println!("paused run {}", state.run_id),
+        RunLoopOutcome::Killed => println!("killed run {}", state.run_id),
         RunLoopOutcome::Failed => println!("failed run {}", state.run_id),
     }
     println!("state {}", state.state_path().display());
@@ -393,6 +422,7 @@ struct ConfigDefaults {
     provider: Option<String>,
     sandbox: Option<String>,
     max_spend: Option<f64>,
+    cli_max_wall_seconds: Option<f64>,
 }
 
 fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
@@ -409,6 +439,13 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
             .and_then(toml::Value::as_float)
             .or_else(|| {
                 get_toml_path(&root, "defaults.max_spend")
+                    .and_then(toml::Value::as_integer)
+                    .map(|value| value as f64)
+            }),
+        cli_max_wall_seconds: get_toml_path(&root, "defaults.cli_max_wall_seconds")
+            .and_then(toml::Value::as_float)
+            .or_else(|| {
+                get_toml_path(&root, "defaults.cli_max_wall_seconds")
                     .and_then(toml::Value::as_integer)
                     .map(|value| value as f64)
             }),
@@ -456,14 +493,29 @@ fn doctor_command() {
                 .as_ref()
                 .map(|path| format!(" at {}", path.display()))
                 .unwrap_or_default();
-            println!("✓ sandbox {} found{}", backend.backend, path);
+            let version = backend
+                .path
+                .as_ref()
+                .and_then(|path| command_version(path))
+                .map(|version| format!(" ({version})"))
+                .unwrap_or_default();
+            println!("✓ sandbox {} found{}{}", backend.backend, path, version);
         } else {
             println!("✗ sandbox {} missing", backend.backend);
             println!("    fix: {}", backend.note);
         }
     }
     if paths.config_path().exists() {
-        println!("✓ {} present", paths.config_path().display());
+        match load_config_value(&paths) {
+            Ok(root) => {
+                println!("✓ {} present and parseable", paths.config_path().display());
+                doctor_providers(&root);
+            }
+            Err(err) => {
+                println!("✗ {} is not parseable", paths.config_path().display());
+                println!("    fix: check TOML syntax or rerun `deadreckon init` ({err})");
+            }
+        }
     } else {
         println!("✗ {} missing", paths.config_path().display());
         println!("    fix: deadreckon init");
@@ -479,6 +531,181 @@ fn doctor_command() {
             "    fix: deadreckon init or deadreckon config set providers.anthropic.api_key <KEY>"
         );
     }
+    doctor_disk_and_permissions(&paths);
+    doctor_os();
+    doctor_subscription_binary("claude");
+    doctor_subscription_binary("codex");
+}
+
+fn doctor_providers(root: &toml::Value) {
+    let Some(providers) = root.get("providers").and_then(toml::Value::as_table) else {
+        println!("✗ providers table missing");
+        println!("    fix: deadreckon init");
+        return;
+    };
+    for (name, entry) in providers {
+        let kind = entry
+            .get("kind")
+            .and_then(toml::Value::as_str)
+            .unwrap_or(name);
+        if kind.contains("cli") || name.starts_with("cli:") {
+            let binary = entry
+                .get("binary")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| {
+                    if name.contains("claude") {
+                        "claude"
+                    } else {
+                        "codex"
+                    }
+                });
+            if command_exists(binary) || PathBuf::from(binary).exists() {
+                println!("✓ provider {name} CLI binary {binary} found");
+            } else {
+                println!("✗ provider {name} CLI binary {binary} missing");
+                println!("    fix: install {binary} or set providers.\"{name}\".binary");
+            }
+        } else if provider_has_key(entry) {
+            if std::env::var_os("DEADRECKON_DOCTOR_PING").is_some() {
+                println!("✓ provider {name} credential present; ping requested");
+            } else {
+                println!("✓ provider {name} credential present");
+            }
+        } else {
+            println!("✗ provider {name} credential missing");
+            println!("    fix: deadreckon config set providers.{name}.api_key <KEY>");
+        }
+    }
+}
+
+fn provider_has_key(entry: &toml::Value) -> bool {
+    entry
+        .get("api_key")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+        || entry
+            .get("api_key_env")
+            .and_then(toml::Value::as_str)
+            .and_then(std::env::var_os)
+            .is_some()
+}
+
+fn doctor_disk_and_permissions(paths: &DeadreckonPaths) {
+    if let Err(err) = fs::create_dir_all(paths.runstate_dir()) {
+        println!(
+            "✗ runstate dir {} not writable",
+            paths.runstate_dir().display()
+        );
+        println!(
+            "    fix: mkdir -p {} && chmod u+w {}",
+            paths.runstate_dir().display(),
+            paths.runstate_dir().display()
+        );
+        println!("    detail: {err}");
+        return;
+    }
+    let probe = paths.runstate_dir().join(".doctor-write-test");
+    match fs::write(&probe, b"ok").and_then(|_| fs::remove_file(&probe)) {
+        Ok(()) => println!("✓ runstate dir {} writable", paths.runstate_dir().display()),
+        Err(err) => {
+            println!(
+                "✗ runstate dir {} not writable",
+                paths.runstate_dir().display()
+            );
+            println!("    fix: chmod u+w {}", paths.runstate_dir().display());
+            println!("    detail: {err}");
+        }
+    }
+    match free_kb(paths.home()) {
+        Some(kb) if kb < 1_048_576 => {
+            println!(
+                "✗ disk space low: {} MB free in {}",
+                kb / 1024,
+                paths.home().display()
+            );
+            println!("    fix: free at least 1 GB or set DEADRECKON_HOME to a larger disk");
+        }
+        Some(kb) => println!(
+            "✓ disk space {} MB free in {}",
+            kb / 1024,
+            paths.home().display()
+        ),
+        None => {
+            println!(
+                "✗ disk space check unavailable for {}",
+                paths.home().display()
+            );
+            println!("    fix: run `df -Pk {}` manually", paths.home().display());
+        }
+    }
+}
+
+fn doctor_os() {
+    #[cfg(target_os = "macos")]
+    {
+        let version = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!("✓ os macOS {version}");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let version = std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!("✓ os Linux kernel {version}");
+    }
+}
+
+fn doctor_subscription_binary(binary: &str) {
+    if command_exists(binary) {
+        println!(
+            "✓ subscription binary {binary} {}",
+            command_version(std::path::Path::new(binary))
+                .unwrap_or_else(|| "version unknown".to_string())
+        );
+    } else {
+        println!("✗ subscription binary {binary} missing");
+        println!(
+            "    fix: install {binary} or choose another provider with `deadreckon config set defaults.provider <name>`"
+        );
+    }
+}
+
+fn command_version(path: &std::path::Path) -> Option<String> {
+    std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            let text = if output.stdout.is_empty() {
+                String::from_utf8_lossy(&output.stderr).to_string()
+            } else {
+                String::from_utf8_lossy(&output.stdout).to_string()
+            };
+            text.lines().next().unwrap_or_default().trim().to_string()
+        })
+        .filter(|line| !line.is_empty())
+}
+
+fn free_kb(path: &std::path::Path) -> Option<u64> {
+    let output = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()
 }
 
 fn prompt_provider() -> Result<String> {
@@ -520,7 +747,7 @@ fn init_config_text(
         _ => "[\"anthropic\", \"openai\", \"cli:claude-code\", \"cli:codex\"]",
     };
     let mut out = format!(
-        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\nmax_spend = {max_spend}\nsandbox = \"{sandbox}\"\n\n"
+        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\nmax_spend = {max_spend}\ncli_max_wall_seconds = 3600\nsandbox = \"{sandbox}\"\n\n"
     );
     match provider {
         "cli:claude-code" => {
@@ -656,11 +883,11 @@ fn attach_command(run_id: String) -> Result<()> {
     Ok(())
 }
 
-fn kill_command(run_id: String) -> Result<()> {
+fn kill_command(run_id: String, force: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = load_run(&paths, &run_id)?;
     let pids = supervised_pids(&state);
-    release_lock_file(&paths, &state.task_key)?;
+    release_lock_file(&paths, &state.scope, &state.task_key)?;
     state.status = RunStatus::Killed;
     state.failure_reason = Some("killed by user".to_string());
     state.killed_at = Some(Utc::now());
@@ -668,8 +895,12 @@ fn kill_command(run_id: String) -> Result<()> {
     save_state(&state)?;
     for pid in &pids {
         if *pid != std::process::id() {
-            let _ = terminate_pid(*pid, false);
+            let _ = terminate_pid(*pid, force);
         }
+    }
+    if force {
+        println!("killed run {} forcefully", state.run_id);
+        return Ok(());
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
     loop {
@@ -707,7 +938,11 @@ fn supervised_pids(state: &deadreckon_core::PipelineState) -> Vec<u32> {
     pids.into_iter().collect()
 }
 
-async fn resume_command(run_id: String) -> Result<()> {
+async fn resume_command(
+    run_id: String,
+    from_turn: Option<u32>,
+    max_wall_seconds: Option<f64>,
+) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = load_run(&paths, &run_id)?;
     if state.status == RunStatus::Completed {
@@ -726,6 +961,9 @@ async fn resume_command(run_id: String) -> Result<()> {
     state.pause_reason = None;
     state.killed_at = None;
     state.status = RunStatus::Planned;
+    if let Some(max_wall_seconds) = max_wall_seconds {
+        state.max_wall_seconds = Some(max_wall_seconds);
+    }
     state.child_pids = vec![std::process::id()];
     state.updated_at = Utc::now();
     save_state(&state)?;
@@ -734,14 +972,19 @@ async fn resume_command(run_id: String) -> Result<()> {
     let backend: SandboxBackend = state.sandbox.parse()?;
     let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
     let max_spend_usd = state.max_spend_usd;
+    let max_wall_seconds = state.max_wall_seconds;
     let outcome = run_turn_loop(
         &mut state,
         &router,
         RunLoopConfig {
             provider,
             max_spend_usd,
+            max_wall_seconds,
             sandbox_backend: backend,
             max_turns: 12,
+            from_turn,
+            event_sender: None,
+            cancellation_token: None,
         },
     )
     .await?;
@@ -751,6 +994,7 @@ async fn resume_command(run_id: String) -> Result<()> {
     match outcome {
         RunLoopOutcome::Done => println!("resumed run {} to completion", state.run_id),
         RunLoopOutcome::PausedAtCap => println!("resumed run {} paused at cap", state.run_id),
+        RunLoopOutcome::Killed => println!("resumed run {} was killed", state.run_id),
         RunLoopOutcome::Failed => println!("resumed run {} failed", state.run_id),
     }
     Ok(())
@@ -795,6 +1039,18 @@ fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&record)?);
         }
     }
+    let traces_path = state.run_root.join("traces.jsonl");
+    if traces_path.exists() {
+        println!("traces:");
+        let raw = std::fs::read_to_string(traces_path)?;
+        for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+            let record: TraceRecord = serde_json::from_str(line)?;
+            if turn.is_some_and(|turn| record.turn != turn) {
+                continue;
+            }
+            println!("{}", serde_json::to_string_pretty(&record)?);
+        }
+    }
     Ok(())
 }
 
@@ -802,23 +1058,174 @@ fn import_command(source: String) -> Result<()> {
     // REPORT.md: Cross-Tool State Sharing (read-only import) never writes into
     // Claude Code, Codex, or Cursor state directories.
     let root = match source.as_str() {
-        "claude-code" => PathBuf::from("/Users/gdc/.claude/projects/"),
-        "codex" => PathBuf::from("/Users/gdc/.codex/sessions/"),
-        "cursor" => PathBuf::from("/Users/gdc/.cursor/chats/"),
+        "claude-code" => std::env::var_os("DEADRECKON_IMPORT_CLAUDE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users/gdc/.claude/projects/")),
+        "codex" => std::env::var_os("DEADRECKON_IMPORT_CODEX_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users/gdc/.codex/sessions/")),
+        "cursor" => std::env::var_os("DEADRECKON_IMPORT_CURSOR_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/Users/gdc/.cursor/chats/")),
         other => {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
                 "unknown import source {other}; expected claude-code, codex, or cursor"
             ))));
         }
     };
+    let paths = DeadreckonPaths::discover();
+    let run_id = normalize_import(&paths, &source, &root)?;
     let files = inventory_files(&root)?;
     println!("source {source}");
     println!("root {}", root.display());
+    println!("imported {run_id}");
     println!("files {}", files.len());
     for file in files.iter().rev().take(10) {
         println!("{}", file.display());
     }
     Ok(())
+}
+
+fn normalize_import(
+    paths: &DeadreckonPaths,
+    source: &str,
+    root: &std::path::Path,
+) -> Result<String> {
+    let cwd = std::env::current_dir()?;
+    let imported_id = format!(
+        "imported-{:016x}",
+        stable_hash(&format!("{source}:{}", root.display()))
+    );
+    let mut state = create_run(
+        paths,
+        RunOptions {
+            goal: format!("imported {source} history"),
+            cwd,
+            sandbox: "none".to_string(),
+            provider: Some(format!("import:{source}")),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: None,
+            max_wall_seconds: None,
+        },
+    )?;
+    let old_root = state.run_root.clone();
+    let new_root = paths.run_root(&state.scope, &imported_id);
+    if new_root.exists() {
+        fs::remove_dir_all(&new_root)?;
+    }
+    if let Some(parent) = new_root.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(&old_root, &new_root)?;
+    state.run_id = imported_id.clone();
+    state.run_root = new_root;
+    state.working_dir = state.run_root.join("working");
+    fs::create_dir_all(&state.working_dir)?;
+
+    let imported = match source {
+        "cursor" => import_cursor_rows(root)?,
+        _ => import_jsonl_rows(root)?,
+    };
+    for (idx, row) in imported.iter().enumerate() {
+        let turn = (idx + 1) as u32;
+        append_trace(
+            &state,
+            &TraceRecord {
+                timestamp: Utc::now(),
+                run_id: state.run_id.clone(),
+                turn,
+                event: format!("import.{source}"),
+                latency_ms: None,
+                detail: row.clone(),
+            },
+        )?;
+        if let Some(path) = row
+            .get("path")
+            .or_else(|| row.get("file"))
+            .and_then(serde_json::Value::as_str)
+        {
+            append_provenance(
+                &state,
+                &ProvenanceRecord {
+                    timestamp: Utc::now(),
+                    prompt_id: format!("turn-{turn}"),
+                    model: format!("import:{source}"),
+                    tool_call_id: row
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("imported-tool")
+                        .to_string(),
+                    session_id: state.run_id.clone(),
+                    files: vec![PathBuf::from(path)],
+                },
+            )?;
+        }
+    }
+    state.turn = imported.len() as u32;
+    state.status = RunStatus::Completed;
+    state.updated_at = Utc::now();
+    save_state(&state)?;
+    Ok(imported_id)
+}
+
+fn import_jsonl_rows(root: &std::path::Path) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for file in inventory_files(root)? {
+        if file.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        for line in fs::read_to_string(&file)?.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("source_path".to_string(), json!(file));
+                }
+                rows.push(value);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn import_cursor_rows(root: &std::path::Path) -> Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    for file in inventory_files(root)? {
+        let extension = file
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default();
+        if !matches!(extension, "sqlite" | "sqlite3" | "db") {
+            continue;
+        }
+        let output = std::process::Command::new("sqlite3")
+            .arg("-json")
+            .arg(&file)
+            .arg("select * from messages")
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let mut values: Vec<serde_json::Value> =
+            serde_json::from_slice(&output.stdout).unwrap_or_default();
+        for value in &mut values {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("source_path".to_string(), json!(file));
+            }
+        }
+        rows.extend(values);
+    }
+    Ok(rows)
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn latest_run(paths: &DeadreckonPaths) -> Result<deadreckon_core::PipelineState> {
@@ -852,9 +1259,10 @@ fn attach_tui(paths: &DeadreckonPaths, run_id: &str) -> Result<()> {
         let state = load_run(paths, run_id)?;
         let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
         let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
-        terminal.draw(|frame| render_attach(frame, &state, &spend, &traces))?;
+        let events = read_jsonl::<RunEvent>(&state.run_root.join(RUN_EVENTS_JSONL))?;
+        terminal.draw(|frame| render_attach(frame, &state, &spend, &traces, &events))?;
 
-        if event::poll(std::time::Duration::from_millis(500))?
+        if event::poll(std::time::Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
                 || (key.code == KeyCode::Char('d')
@@ -875,6 +1283,7 @@ fn render_attach(
     state: &deadreckon_core::PipelineState,
     spend: &[SpendRecord],
     traces: &[TraceRecord],
+    events: &[RunEvent],
 ) {
     let area = frame.area();
     let vertical = Layout::default()
@@ -893,8 +1302,12 @@ fn render_attach(
         .map(|phase| format!("{} {}", phase.id.0, phase.name))
         .unwrap_or_else(|| "-".to_string());
     let header = Paragraph::new(format!(
-        "run {}\nstatus {}  phase {}\ngoal {}",
-        state.run_id, state.status, phase, state.goal
+        "run {}\nstatus {}  phase {}  turn timer {}\ngoal {}",
+        state.run_id,
+        state.status,
+        phase,
+        turn_timer(events),
+        state.goal
     ))
     .block(Block::default().borders(Borders::ALL).title("deadreckon"));
     frame.render_widget(header, vertical[0]);
@@ -952,16 +1365,17 @@ fn render_attach(
         vertical[2],
     );
 
-    let trace_items = traces
+    let trace_items = events
         .iter()
         .rev()
         .take(5)
-        .map(|record| {
+        .map(render_event_item)
+        .chain(traces.iter().rev().take(2).map(|record| {
             ListItem::new(format!(
-                "turn {}  {}  {:?}ms",
+                "trace turn {}  {}  {:?}ms",
                 record.turn, record.event, record.latency_ms
             ))
-        })
+        }))
         .collect::<Vec<_>>();
     frame.render_widget(
         List::new(trace_items).block(Block::default().borders(Borders::ALL).title("tool calls")),
@@ -971,6 +1385,60 @@ fn render_attach(
         Paragraph::new("Ctrl-D detach  q quit  Esc quit"),
         vertical[4],
     );
+}
+
+fn render_event_item(event: &RunEvent) -> ListItem<'static> {
+    let label = match &event.event {
+        deadreckon_core::RunEventKind::TurnStarted { turn } => {
+            format!("turn {turn} started")
+        }
+        deadreckon_core::RunEventKind::ToolCallStarted {
+            turn,
+            tool_call_id,
+            tool_name,
+            ..
+        } => format!("turn {turn} {tool_name} {tool_call_id} started"),
+        deadreckon_core::RunEventKind::ToolCallResult {
+            turn,
+            tool_call_id,
+            status,
+            preview,
+        } => format!("turn {turn} {tool_call_id} {status} {preview}"),
+        deadreckon_core::RunEventKind::TokenUsageDelta {
+            turn,
+            input_tokens,
+            output_tokens,
+        } => format!("turn {turn} tokens +{}", input_tokens + output_tokens),
+        deadreckon_core::RunEventKind::SpendDelta {
+            turn,
+            cost_usd,
+            wall_time_seconds,
+            ..
+        } => format!(
+            "turn {turn} spend +${cost_usd:.6} wall {}s",
+            wall_time_seconds.unwrap_or(0.0)
+        ),
+        deadreckon_core::RunEventKind::Error { turn, message } => {
+            format!("turn {} error {message}", turn.unwrap_or_default())
+        }
+    };
+    ListItem::new(label)
+}
+
+fn turn_timer(events: &[RunEvent]) -> String {
+    let Some(event) = events.iter().rev().find(|event| {
+        matches!(
+            event.event,
+            deadreckon_core::RunEventKind::TurnStarted { .. }
+        )
+    }) else {
+        return "-".to_string();
+    };
+    let elapsed = Utc::now()
+        .signed_duration_since(event.timestamp)
+        .num_seconds()
+        .max(0);
+    format!("{elapsed}s")
 }
 
 fn meter_color(ratio: f64, state: &deadreckon_core::PipelineState) -> Color {
@@ -995,10 +1463,9 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    std::fs::read_to_string(path)?
+    Ok(std::fs::read_to_string(path)?
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(serde_json::from_str)
-        .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
-        .map_err(CliError::from)
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect::<Vec<T>>())
 }

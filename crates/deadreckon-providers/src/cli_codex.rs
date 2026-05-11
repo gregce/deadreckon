@@ -32,7 +32,7 @@ impl CliCodexProvider {
         let started = Instant::now();
         let mut args = vec!["exec".to_string()];
         // `codex --help` on this machine lists `exec` as "Run Codex
-        // non-interactively"; V0 uses that verb for subscription-BYOK turns.
+        // non-interactively"; deadreckon uses that verb for subscription-BYOK turns.
         args.extend(self.extra_args.clone());
         args.push(request.prompt.clone());
         let output = run_cli(
@@ -42,6 +42,7 @@ impl CliCodexProvider {
             request.cwd.clone(),
             request.sandbox_backend,
             request.pid_file.clone(),
+            request.cancellation_token.clone(),
         )
         .await?;
         write_output(request.output_path.as_ref(), &output).await?;

@@ -1,10 +1,10 @@
-# deadreckon V0 Design
+# deadreckon Alpha Design
 
 ## Product
 
 `deadreckon` is a Rust 2024 CLI harness for unattended long-running coding tasks. The default user flow is `deadreckon run <goal>`: create durable run state, select a BYOK provider route, execute turns in a disposable sandbox, write spend/provenance/traces/snapshots after every turn, and make the run attachable, resumable, killable, inspectable, and undoable.
 
-The V0 implementation is intentionally local-first. Runtime state defaults to `/Users/gdc/.deadreckon/`, and tests or explicit smoke runs can override that with `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke` so this build process does not write outside the allowed implementation tree.
+The alpha implementation is intentionally local-first. Runtime state defaults to `/Users/gdc/.deadreckon/`, and tests or explicit smoke runs can override that with `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke` so this build process does not write outside the allowed implementation tree.
 
 ## Reference Patterns
 
@@ -15,7 +15,7 @@ The V0 implementation is intentionally local-first. Runtime state defaults to `/
 - AS-BUILT §9: per-turn snapshots make bounded rollback possible.
 - Claude Code mining:
   - `/Users/gdc/claude-code-source-code/src/tools/BashTool/bashPermissions.ts` and `shouldUseSandbox.ts` inform command side-effect boundaries and sandbox warning posture.
-  - `/Users/gdc/claude-code-source-code/src/tools/shared/spawnMultiAgent.ts` informs inherited run context for future sub-agent work; V0 records scope and session lineage but leaves explicit forks to V1.
+  - `/Users/gdc/claude-code-source-code/src/tools/shared/spawnMultiAgent.ts` informs inherited run context for future sub-agent work; alpha records scope and session lineage but leaves explicit forks to V1.
   - `/Users/gdc/claude-code-source-code/src/upstreamproxy/upstreamproxy.ts` informs fail-open provider/proxy setup and child-process environment merging.
   - `/Users/gdc/claude-code-source-code/src/ink/renderer.ts` informs ratatui attach rendering: bounded frames, no uncontrolled terminal state.
   - `/Users/gdc/claude-code-source-code/docs/prompts/` informs the Markdown skill shape in `skills/default-coding/SKILL.md`.
@@ -44,7 +44,7 @@ Source lives under `/Users/gdc/deadreckon/`:
 9. Provider Routing / BYOK: adapters, CLI sub-agents, `deadreckon init`, `deadreckon config get/set`, and fallback chain configured from TOML.
 10. Workspace Inventory & Run Queue: `list`, `attach`, `kill`, `resume`, and state scan commands.
 
-## V0 Execution Model
+## Execution Model
 
 The primary path is provider-driven: `deadreckon run <goal>` creates state, calls `ProviderRouter::complete`, parses model actions, executes tool calls in the configured sandbox, feeds results into history, and repeats until a provider returns `done`, a spend cap pauses the run, or the run is killed. HTTP providers use user-supplied keys or env vars; CLI providers use local subscription CLIs and run through the deadreckon sandbox wrapper.
 
@@ -55,10 +55,10 @@ The default skill is Markdown and external to the binary. The binary loads it an
 ## Decisions And Conflicts
 
 - Runtime writes during verification: the rider prescribes `/Users/gdc/.deadreckon/`, while the build instruction forbids edits outside `/Users/gdc/deadreckon/` and `/Users/gdc/stoa/docs/goals/`. The binary defaults to `/Users/gdc/.deadreckon/`, but all repository verification uses `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke`.
-- Sub-agent forking: the architecture requires the pattern, but the V1 list explicitly moves `deadreckon fork` to V1. V0 records scope/session lineage and keeps the subprocess skill boundary; explicit multi-agent forks are documented in `docs/V1-CANDIDATES.md`.
+- Sub-agent forking: the architecture requires the pattern, but the V1 list explicitly moves `deadreckon fork` to V1. Alpha records scope/session lineage and keeps the subprocess skill boundary; explicit multi-agent forks are documented in `docs/V1-CANDIDATES.md`.
 - Sandbox fallback: on macOS `auto` selects `sandbox-exec` if available. If not available, or on Linux without `bwrap`, `doctor` reports the missing binary and `run` falls back to `none` with a warning, matching the rider.
 - Live Tier C CLI verification: `codex` was run with `exec --ephemeral --dangerously-bypass-approvals-and-sandbox` inside deadreckon's outer `sandbox-exec` wrapper. Run `59c57e4565704135a9982789d0754803` produced `working/notes.md`, `traces.jsonl`, `provenance.jsonl`, snapshots, and a validated `dr-gate` marker without raw API keys.
-- V0 first-run UX: `deadreckon init` writes `/Users/gdc/.deadreckon/config.toml`, `deadreckon config get/set` performs non-interactive edits, `doctor` prints actionable check/fix lines, and `run` enforces the `$50` confirmation guard for scripts.
+- First-run UX: `deadreckon init` writes `/Users/gdc/.deadreckon/config.toml`, `deadreckon config get/set` performs non-interactive edits, `doctor` prints actionable check/fix lines, and `run` enforces the `$50` confirmation guard for scripts.
 
 ## Verification
 
