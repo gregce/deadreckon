@@ -11,9 +11,11 @@ pub use artifacts::{
     inventory_files, restore_snapshot, snapshot_working,
 };
 pub use error::{DeadreckonError, Result};
-pub use lock::{LockGuard, LockState, LockStatus, acquire_lock, pid_is_alive};
+pub use lock::{
+    LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,
+};
 pub use paths::{DEFAULT_DEADRECKON_HOME, DeadreckonPaths, SOURCE_ROOT};
 pub use state::{
     CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, RunListEntry, RunOptions,
-    RunStatus, create_run, save_state,
+    RunStatus, create_run, list_runs, load_run, save_state,
 };

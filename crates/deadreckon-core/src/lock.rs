@@ -179,6 +179,15 @@ pub fn lock_status(
     })
 }
 
+pub fn release_lock_file(paths: &DeadreckonPaths, task_key: &str) -> Result<()> {
+    let path = lock_path(paths, task_key);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DeadreckonError::Io { path, source }),
+    }
+}
+
 pub fn lock_is_stale(state: &LockState, stale_after: Duration) -> bool {
     let age = Utc::now()
         .signed_duration_since(state.updated_at)

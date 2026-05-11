@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,19 @@ pub enum RunStatus {
     Failed,
 }
 
+impl fmt::Display for RunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            RunStatus::Pending => "pending",
+            RunStatus::Planned => "planned",
+            RunStatus::Executing => "executing",
+            RunStatus::Completed => "completed",
+            RunStatus::Failed => "failed",
+        };
+        f.write_str(value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PhaseId(pub u16);
 
@@ -34,6 +48,19 @@ pub enum PhaseStatus {
     Executing,
     Completed,
     Failed,
+}
+
+impl fmt::Display for PhaseStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            PhaseStatus::Pending => "pending",
+            PhaseStatus::Planned => "planned",
+            PhaseStatus::Executing => "executing",
+            PhaseStatus::Completed => "completed",
+            PhaseStatus::Failed => "failed",
+        };
+        f.write_str(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
