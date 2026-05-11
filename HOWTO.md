@@ -125,15 +125,15 @@ deadreckon attach "$RUN_ID"
 
 ## Normal Coding Run
 
-After `init`, run:
+After `init`, the normal path is just:
 
 ```bash
-deadreckon run "make a small Rust hello-world project"
+deadreckon run "make a full task productivity tracker in nodejs that allows me to manage my day"
 deadreckon list
 deadreckon attach <run-id>
 ```
 
-Useful run flags:
+The default config from `deadreckon init` supplies the provider, sandbox, `$10` spend cap, and `3600` second wall-clock cap. Use flags only when overriding those defaults:
 
 ```bash
 deadreckon run "goal" --provider cli:codex

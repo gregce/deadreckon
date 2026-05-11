@@ -271,8 +271,8 @@ fn init_command(
     );
     fs::write(paths.config_path(), config)?;
     println!("wrote {}", paths.config_path().display());
-    println!("next: deadreckon doctor");
     doctor_command();
+    println!("next: deadreckon run \"describe the coding task\"");
     Ok(())
 }
 
