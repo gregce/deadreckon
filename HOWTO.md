@@ -164,10 +164,13 @@ The TUI shows:
 
 ```text
 run id, status, phase, goal
+working directory
 per-turn timer
 spend meter
 context/token meter
 recent turns
+live files being generated
+supervised process status
 tool-call/event stream
 ```
 

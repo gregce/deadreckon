@@ -2,9 +2,9 @@ use std::collections::{BTreeSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
@@ -1260,9 +1260,10 @@ fn attach_tui(paths: &DeadreckonPaths, run_id: &str) -> Result<()> {
         let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
         let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
         let events = read_jsonl::<RunEvent>(&state.run_root.join(RUN_EVENTS_JSONL))?;
-        terminal.draw(|frame| render_attach(frame, &state, &spend, &traces, &events))?;
+        let live = collect_attach_live(&state);
+        terminal.draw(|frame| render_attach(frame, &state, &spend, &traces, &events, &live))?;
 
-        if event::poll(std::time::Duration::from_millis(100))?
+        if event::poll(std::time::Duration::from_millis(500))?
             && let Event::Key(key) = event::read()?
             && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
                 || (key.code == KeyCode::Char('d')
@@ -1278,21 +1279,110 @@ fn attach_tui(paths: &DeadreckonPaths, run_id: &str) -> Result<()> {
     result
 }
 
+#[derive(Debug, Default)]
+struct AttachLive {
+    file_count: usize,
+    total_bytes: u64,
+    files: Vec<LiveFile>,
+    pids: Vec<LivePid>,
+}
+
+#[derive(Debug)]
+struct LiveFile {
+    path: String,
+    bytes: u64,
+    modified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+struct LivePid {
+    pid: u32,
+    alive: bool,
+    command: String,
+}
+
+fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
+    let mut files = inventory_files(&state.working_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| {
+            !path_has_component(path, "node_modules") && !path_has_component(path, ".git")
+        })
+        .filter_map(|path| live_file(&state.working_dir, path))
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+    let file_count = files.len();
+    let total_bytes = files.iter().map(|file| file.bytes).sum();
+    let pids = supervised_pids(state)
+        .into_iter()
+        .map(live_pid)
+        .collect::<Vec<_>>();
+    AttachLive {
+        file_count,
+        total_bytes,
+        files,
+        pids,
+    }
+}
+
+fn live_file(root: &Path, path: PathBuf) -> Option<LiveFile> {
+    let metadata = fs::metadata(&path).ok()?;
+    let relative = path.strip_prefix(root).unwrap_or(&path);
+    Some(LiveFile {
+        path: relative.display().to_string(),
+        bytes: metadata.len(),
+        modified_at: metadata.modified().ok().map(DateTime::<Utc>::from),
+    })
+}
+
+fn path_has_component(path: &Path, component: &str) -> bool {
+    path.components()
+        .any(|part| part.as_os_str().to_string_lossy() == component)
+}
+
+fn live_pid(pid: u32) -> LivePid {
+    let alive = deadreckon_core::pid_is_alive(pid);
+    let command = if alive {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=,etime=,command=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    String::from_utf8(output.stdout).ok()
+                } else {
+                    None
+                }
+            })
+            .map(|raw| one_line(raw.trim(), 110))
+            .filter(|line| !line.is_empty())
+            .unwrap_or_else(|| "alive".to_string())
+    } else {
+        "not running".to_string()
+    };
+    LivePid {
+        pid,
+        alive,
+        command,
+    }
+}
+
 fn render_attach(
     frame: &mut ratatui::Frame<'_>,
     state: &deadreckon_core::PipelineState,
     spend: &[SpendRecord],
     traces: &[TraceRecord],
     events: &[RunEvent],
+    live: &AttachLive,
 ) {
     let area = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(7),
             Constraint::Length(5),
             Constraint::Min(8),
-            Constraint::Length(6),
+            Constraint::Length(8),
             Constraint::Length(1),
         ])
         .split(area);
@@ -1302,11 +1392,14 @@ fn render_attach(
         .map(|phase| format!("{} {}", phase.id.0, phase.name))
         .unwrap_or_else(|| "-".to_string());
     let header = Paragraph::new(format!(
-        "run {}\nstatus {}  phase {}  turn timer {}\ngoal {}",
+        "run {}\nstatus {}  phase {}  provider {}  sandbox {}  turn timer {}\nworking {}\ngoal {}",
         state.run_id,
         state.status,
         phase,
+        state.provider.as_deref().unwrap_or("-"),
+        state.sandbox,
         turn_timer(events),
+        state.working_dir.display(),
         state.goal
     ))
     .block(Block::default().borders(Borders::ALL).title("deadreckon"));
@@ -1346,29 +1439,22 @@ fn render_attach(
         meters[1],
     );
 
-    let spend_items = spend
+    let live_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(50),
+            Constraint::Percentage(20),
+        ])
+        .split(vertical[2]);
+    render_recent_turns(frame, live_area[0], spend);
+    render_live_files(frame, live_area[1], live);
+    render_processes(frame, live_area[2], live);
+
+    let mut trace_items = events
         .iter()
         .rev()
         .take(8)
-        .map(|record| {
-            ListItem::new(format!(
-                "turn {}  {}  {} tokens  ${:.6}",
-                record.turn,
-                record.model,
-                record.input_tokens + record.output_tokens,
-                record.cost_usd
-            ))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        List::new(spend_items).block(Block::default().borders(Borders::ALL).title("recent turns")),
-        vertical[2],
-    );
-
-    let trace_items = events
-        .iter()
-        .rev()
-        .take(5)
         .map(render_event_item)
         .chain(traces.iter().rev().take(2).map(|record| {
             ListItem::new(format!(
@@ -1377,6 +1463,12 @@ fn render_attach(
             ))
         }))
         .collect::<Vec<_>>();
+    if state.status == RunStatus::Executing && live.file_count > 0 {
+        trace_items.push(ListItem::new(format!(
+            "live working tree: {} files, latest changes visible before provider exit",
+            live.file_count
+        )));
+    }
     frame.render_widget(
         List::new(trace_items).block(Block::default().borders(Borders::ALL).title("tool calls")),
         vertical[3],
@@ -1384,6 +1476,84 @@ fn render_attach(
     frame.render_widget(
         Paragraph::new("Ctrl-D detach  q quit  Esc quit"),
         vertical[4],
+    );
+}
+
+fn render_recent_turns(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    spend: &[SpendRecord],
+) {
+    let items = if spend.is_empty() {
+        vec![
+            ListItem::new("provider turn in progress"),
+            ListItem::new("spend and token rows appear after provider exits"),
+        ]
+    } else {
+        spend
+            .iter()
+            .rev()
+            .take(8)
+            .map(|record| {
+                ListItem::new(format!(
+                    "turn {}  {}  {} tokens  ${:.6}",
+                    record.turn,
+                    record.model,
+                    record.input_tokens + record.output_tokens,
+                    record.cost_usd
+                ))
+            })
+            .collect()
+    };
+    frame.render_widget(
+        List::new(items).block(Block::default().borders(Borders::ALL).title("recent turns")),
+        area,
+    );
+}
+
+fn render_live_files(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    live: &AttachLive,
+) {
+    let mut items = vec![ListItem::new(format!(
+        "{} files  {}",
+        live.file_count,
+        format_bytes(live.total_bytes)
+    ))];
+    items.extend(live.files.iter().take(12).map(|file| {
+        ListItem::new(format!(
+            "{:>7} {:>8}  {}",
+            format_age(file.modified_at),
+            format_bytes(file.bytes),
+            file.path
+        ))
+    }));
+    frame.render_widget(
+        List::new(items).block(Block::default().borders(Borders::ALL).title("live files")),
+        area,
+    );
+}
+
+fn render_processes(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    live: &AttachLive,
+) {
+    let items = if live.pids.is_empty() {
+        vec![ListItem::new("no supervised pids")]
+    } else {
+        live.pids
+            .iter()
+            .map(|pid| {
+                let status = if pid.alive { "alive" } else { "dead" };
+                ListItem::new(format!("{} {} {}", pid.pid, status, pid.command))
+            })
+            .collect()
+    };
+    frame.render_widget(
+        List::new(items).block(Block::default().borders(Borders::ALL).title("processes")),
+        area,
     );
 }
 
@@ -1456,6 +1626,44 @@ fn threshold_color(ratio: f64) -> Color {
         Color::Yellow
     } else {
         Color::Green
+    }
+}
+
+fn format_age(modified_at: Option<DateTime<Utc>>) -> String {
+    let Some(modified_at) = modified_at else {
+        return "-".to_string();
+    };
+    let seconds = Utc::now()
+        .signed_duration_since(modified_at)
+        .num_seconds()
+        .max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / 3600)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn one_line(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let shortened = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{shortened}...")
+    } else {
+        shortened
     }
 }
 
