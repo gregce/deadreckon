@@ -14,6 +14,7 @@ use crate::artifacts::{
     inventory_files, snapshot_working,
 };
 use crate::error::{DeadreckonError, IoContext, Result};
+use crate::gate::validate_acceptance_marker;
 use crate::state::{PhaseId, PhaseStatus, PipelineState, save_state};
 
 #[derive(Debug, Clone)]
@@ -147,6 +148,8 @@ pub async fn run_turn_loop(
             )?;
             append_provenance_for_files(state, turn, &tool_call_id, &response.model, changed)?;
             state.turn = turn;
+            run_acceptance_gate(state)?;
+            validate_acceptance_marker(state)?;
             state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
             save_state(state)?;
             return Ok(RunLoopOutcome::Done);
@@ -230,6 +233,8 @@ pub async fn run_turn_loop(
             }
             Action::Done { summary } => {
                 state.turn = turn;
+                run_acceptance_gate(state)?;
+                validate_acceptance_marker(state)?;
                 state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
                 save_state(state)?;
                 history.push(format!("done: {}", summary.unwrap_or_default()));
@@ -381,4 +386,41 @@ fn provider_output_name(provider: &str) -> &'static str {
         "cli:codex" => "codex.out",
         _ => "provider.out",
     }
+}
+
+fn run_acceptance_gate(state: &PipelineState) -> Result<()> {
+    let gate = gate_binary_path()?;
+    let output = std::process::Command::new(&gate)
+        .arg("--run")
+        .arg(&state.run_id)
+        .arg("--working-dir")
+        .arg(&state.working_dir)
+        .output()
+        .map_err(|source| DeadreckonError::Io {
+            path: gate.clone(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "dr-gate failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+fn gate_binary_path() -> Result<PathBuf> {
+    let current = std::env::current_exe().map_err(|source| DeadreckonError::Io {
+        path: PathBuf::from("/Users/gdc/deadreckon/target"),
+        source,
+    })?;
+    let gate = current.with_file_name("dr-gate");
+    if gate.exists() {
+        return Ok(gate);
+    }
+    Err(DeadreckonError::NotFound(format!(
+        "dr-gate binary next to {}",
+        current.display()
+    )))
 }

@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod error;
+pub mod gate;
 pub mod lock;
 pub mod paths;
 pub mod state;
@@ -12,6 +13,7 @@ pub use artifacts::{
     inventory_files, restore_snapshot, snapshot_working,
 };
 pub use error::{DeadreckonError, Result};
+pub use gate::{AcceptanceMarker, validate_acceptance_marker};
 pub use lock::{
     LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,
     terminate_pid,
