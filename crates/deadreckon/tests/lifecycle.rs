@@ -1,12 +1,22 @@
 use std::fs;
+use std::net::SocketAddr;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::post;
+use axum::{Json, Router};
 use deadreckon_core::{
-    DeadreckonPaths, PhaseId, PhaseStatus, PipelineState, RunOptions, RunStatus, create_run,
-    load_run, promote_completed_run, save_state, write_acceptance_marker,
+    DeadreckonPaths, PhaseId, PhaseStatus, PipelineState, RunOptions, RunStatus, TraceRecord,
+    acquire_lock, append_trace, create_run, list_runs, load_run, promote_completed_run, save_state,
+    write_acceptance_marker,
 };
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::net::TcpListener;
 
 #[test]
 fn materialize_copies_library_to_dest() {
@@ -144,6 +154,165 @@ fn materialize_refuses_dest_inside_runstate() {
     assert!(stderr(&output).contains("refusing to materialize back into runstate"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extend_creates_new_run_with_parent_artifacts() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "extend parent artifacts");
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+
+    let output = extend_command(&paths, &parent, "add child file")
+        .output()
+        .expect("extend");
+
+    assert_success(&output);
+    let child = load_run(&paths, &extended_run_id(&output)).expect("child");
+    assert_eq!(child.status, RunStatus::Completed);
+    assert_eq!(child.scope, parent.scope);
+    assert_eq!(child.task_key, parent.task_key);
+    assert_eq!(
+        fs::read_to_string(child.working_dir.join("app.txt")).expect("parent app"),
+        "parent app"
+    );
+    assert_eq!(
+        fs::read_to_string(child.working_dir.join("child.txt")).expect("child"),
+        "extended child"
+    );
+    assert_eq!(
+        parent_json(&child.working_dir)["kind"]
+            .as_str()
+            .expect("kind"),
+        "extended"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extend_pre_populates_history_with_parent_summary() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "extend history parent");
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+
+    let output = extend_command(&paths, &parent, "add child history")
+        .arg("--max-context-turns")
+        .arg("2")
+        .output()
+        .expect("extend");
+
+    assert_success(&output);
+    let child = load_run(&paths, &extended_run_id(&output)).expect("child");
+    let history = fs::read_to_string(child.run_root.join("history.json")).expect("history");
+    assert!(history.contains("Previous run summary"));
+    assert!(history.contains("extend history parent"));
+    assert!(history.contains("Recent activity"));
+    assert!(history.contains("parent-tool-1"));
+    let traces = fs::read_to_string(child.run_root.join("traces.jsonl")).expect("traces");
+    assert!(traces.contains("extended_from_parent"));
+}
+
+#[test]
+fn extend_refuses_incomplete_parent() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let paths = DeadreckonPaths::from_home(&home);
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("workspace");
+    let parent = create_run(
+        &paths,
+        RunOptions {
+            goal: "incomplete parent".to_string(),
+            cwd,
+            sandbox: "none".to_string(),
+            provider: Some("mock".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(30.0),
+        },
+    )
+    .expect("parent");
+
+    let output = deadreckon(&paths)
+        .arg("extend")
+        .arg(&parent.run_id)
+        .arg("should refuse")
+        .output()
+        .expect("extend");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("use 'deadreckon resume' for incomplete runs"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extend_locks_correctly_against_concurrent_extension() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "extend locked parent");
+    let _lock = acquire_lock(
+        &paths,
+        &parent.task_key,
+        "held-run",
+        &parent.scope,
+        "test-held",
+        deadreckon_core::lock::DEFAULT_STALE_AFTER,
+    )
+    .expect("lock");
+
+    let output = deadreckon(&paths)
+        .arg("extend")
+        .arg(&parent.run_id)
+        .arg("blocked by lock")
+        .output()
+        .expect("extend");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("lock held"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extend_no_context_flag_omits_recent_turns() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "extend no context parent");
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+
+    let output = extend_command(&paths, &parent, "add without context")
+        .arg("--no-context")
+        .output()
+        .expect("extend");
+
+    assert_success(&output);
+    let child = load_run(&paths, &extended_run_id(&output)).expect("child");
+    let history = fs::read_to_string(child.run_root.join("history.json")).expect("history");
+    assert!(history.contains("Previous run summary"));
+    assert!(!history.contains("Recent activity"));
+    assert!(!history.contains("parent-tool-1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_then_extend_roundtrip() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "roundtrip parent");
+    let dest = temp.path().join("roundtrip-materialized");
+    let materialize = deadreckon(&paths)
+        .arg("materialize")
+        .arg(&parent.run_id)
+        .arg("--dest")
+        .arg(&dest)
+        .output()
+        .expect("materialize");
+    assert_success(&materialize);
+    assert!(dest.join("app.txt").exists());
+
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+    let output = extend_command(&paths, &parent, "extend after materialize")
+        .output()
+        .expect("extend");
+    assert_success(&output);
+    let child = load_run(&paths, &extended_run_id(&output)).expect("child");
+    assert!(child.working_dir.join("app.txt").exists());
+    assert!(child.working_dir.join("child.txt").exists());
+}
+
 fn completed_parent(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {
     let home = temp.path().join("home");
     let paths = DeadreckonPaths::from_home(&home);
@@ -164,6 +333,18 @@ fn completed_parent(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineSta
     .expect("run");
     fs::write(state.working_dir.join("app.txt"), "parent app").expect("app");
     fs::write(state.working_dir.join("notes.md"), "parent notes").expect("notes");
+    append_trace(
+        &state,
+        &TraceRecord {
+            timestamp: chrono::Utc::now(),
+            run_id: state.run_id.clone(),
+            turn: 1,
+            event: "tool.write_file".to_string(),
+            latency_ms: None,
+            detail: json!({"tool_call_id": "parent-tool-1", "path": "app.txt"}),
+        },
+    )
+    .expect("trace");
     state.turn = 2;
     state
         .set_phase_status(PhaseId(60), PhaseStatus::Completed)
@@ -199,6 +380,66 @@ fn deadreckon(paths: &DeadreckonPaths) -> Command {
     command
 }
 
+fn extend_command(paths: &DeadreckonPaths, parent: &PipelineState, goal: &str) -> Command {
+    let mut command = deadreckon(paths);
+    command
+        .arg("extend")
+        .arg(&parent.run_id)
+        .arg(goal)
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1");
+    command
+}
+
+fn write_config(home: &std::path::Path, base_url: &str) {
+    fs::create_dir_all(home).expect("home");
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+fallback = ["mock"]
+
+[providers.mock]
+kind = "open-ai-compatible"
+base_url = "{base_url}"
+model = "mock-agent"
+api_key = "test"
+input_cost_per_million = 1.0
+output_cost_per_million = 1.0
+"#
+        ),
+    )
+    .expect("config");
+}
+
+fn extend_script() -> Vec<FixtureResponse> {
+    serde_json::from_value(json!([
+        {
+            "content": "{\"action\":\"write_file\",\"tool_call_id\":\"extend-write\",\"path\":\"child.txt\",\"content\":\"extended child\"}",
+            "prompt_tokens": 120,
+            "completion_tokens": 40
+        },
+        {
+            "content": "{\"action\":\"done\",\"summary\":\"extended complete\"}",
+            "prompt_tokens": 160,
+            "completion_tokens": 40
+        }
+    ]))
+    .expect("script")
+}
+
+fn extended_run_id(output: &std::process::Output) -> String {
+    stdout(output)
+        .lines()
+        .find_map(|line| line.strip_prefix("completed extended run "))
+        .expect("extended run id")
+        .to_string()
+}
+
 fn assert_success(output: &std::process::Output) {
     assert!(
         output.status.success(),
@@ -214,4 +455,79 @@ fn stdout(output: &std::process::Output) -> String {
 
 fn stderr(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+#[derive(Clone)]
+struct MockState {
+    fixtures: Arc<Mutex<Vec<FixtureResponse>>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FixtureResponse {
+    content: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+struct MockServer {
+    addr: SocketAddr,
+}
+
+impl MockServer {
+    async fn start(fixtures: Vec<FixtureResponse>) -> Self {
+        let state = MockState {
+            fixtures: Arc::new(Mutex::new(fixtures)),
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(chat_completions))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        Self { addr }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+async fn chat_completions(
+    State(state): State<MockState>,
+    Json(_request): Json<Value>,
+) -> impl IntoResponse {
+    let fixture = {
+        let mut fixtures = state.fixtures.lock().expect("fixtures");
+        if fixtures.is_empty() {
+            None
+        } else {
+            Some(fixtures.remove(0))
+        }
+    };
+    let Some(fixture) = fixture else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": {"message": "no fixture response left"}})),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": "mock",
+            "object": "chat.completion",
+            "model": "mock-agent",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": fixture.content},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": fixture.prompt_tokens,
+                "completion_tokens": fixture.completion_tokens,
+                "total_tokens": fixture.prompt_tokens + fixture.completion_tokens
+            }
+        })),
+    )
 }

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::artifacts::copy_tree;
 use crate::error::{DeadreckonError, IoContext, Result};
 use crate::gate::validate_acceptance_marker;
 use crate::paths::DeadreckonPaths;
@@ -53,7 +54,11 @@ pub fn promote_completed_run(
             state.working_dir.display()
         )));
     }
-    fs::rename(&state.working_dir, &staging).with_path(&state.working_dir)?;
+    if state.working_dir == state.run_root.join("working") {
+        fs::rename(&state.working_dir, &staging).with_path(&state.working_dir)?;
+    } else {
+        copy_tree(&state.working_dir, &staging)?;
+    }
     write_manifest(state, &staging, state.working_dir.clone())?;
     fs::rename(&staging, &library_dir).with_path(&staging)?;
     state.working_dir = library_dir.clone();

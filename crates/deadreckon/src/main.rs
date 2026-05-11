@@ -140,6 +140,24 @@ enum Commands {
         #[arg(long)]
         include_manifest: bool,
     },
+    Extend {
+        parent_run_id: String,
+        new_goal: String,
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        #[arg(long)]
+        max_context_turns: Option<u32>,
+        #[arg(long)]
+        no_context: bool,
+        #[arg(long)]
+        max_spend: Option<f64>,
+        #[arg(long)]
+        max_wall_seconds: Option<f64>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        sandbox: Option<String>,
+    },
     Attach {
         run_id: String,
     },
@@ -241,6 +259,30 @@ async fn main_inner() -> Result<()> {
             force,
             include_manifest,
         } => materialize_command(run_id, dest, force, include_manifest),
+        Commands::Extend {
+            parent_run_id,
+            new_goal,
+            dest,
+            max_context_turns,
+            no_context,
+            max_spend,
+            max_wall_seconds,
+            provider,
+            sandbox,
+        } => {
+            extend_command(ExtendCommandArgs {
+                parent_run_id,
+                new_goal,
+                dest,
+                max_context_turns,
+                no_context,
+                max_spend,
+                max_wall_seconds,
+                provider,
+                sandbox,
+            })
+            .await
+        }
         Commands::Attach { run_id } => attach_command(run_id),
         Commands::Kill { run_id, force } => kill_command(run_id, force),
         Commands::Resume {
@@ -327,6 +369,18 @@ struct RunCommandArgs {
     smoke: bool,
     i_know_its_a_lot: bool,
     no_confirm: bool,
+}
+
+struct ExtendCommandArgs {
+    parent_run_id: String,
+    new_goal: String,
+    dest: Option<PathBuf>,
+    max_context_turns: Option<u32>,
+    no_context: bool,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    provider: Option<String>,
+    sandbox: Option<String>,
 }
 
 async fn run_command(args: RunCommandArgs) -> Result<()> {
@@ -925,6 +979,309 @@ fn materialize_command(
     println!("source {}", library_dir.display());
     println!("dest {}", dest.display());
     Ok(())
+}
+
+async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
+    let ExtendCommandArgs {
+        parent_run_id,
+        new_goal,
+        dest,
+        max_context_turns,
+        no_context,
+        max_spend,
+        max_wall_seconds,
+        provider,
+        sandbox,
+    } = args;
+    let new_goal = new_goal.trim().to_string();
+    if new_goal.is_empty() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "--goal must be non-empty".to_string(),
+        )));
+    }
+
+    let paths = DeadreckonPaths::discover();
+    let parent = load_run(&paths, &parent_run_id)?;
+    if parent.status != RunStatus::Completed {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "parent {} is {}; use 'deadreckon resume' for incomplete runs",
+            parent.run_id, parent.status
+        ))));
+    }
+    let parent_library = paths.library_dir(&parent.scope, &parent.run_id);
+    if !parent_library.is_dir() {
+        return Err(CliError::Core(DeadreckonError::NotFound(
+            "parent library missing; cannot extend".to_string(),
+        )));
+    }
+
+    let defaults = config_defaults(&paths)?;
+    let effective_provider = provider.or(defaults.provider);
+    let effective_max_spend = max_spend.or(defaults.max_spend).or(Some(10.0));
+    let effective_max_wall_seconds = max_wall_seconds
+        .or(defaults.cli_max_wall_seconds)
+        .or(Some(3600.0));
+    let sandbox = sandbox
+        .or(defaults.sandbox)
+        .unwrap_or_else(|| "auto".to_string());
+    let backend: SandboxBackend = sandbox.parse()?;
+    let cwd = if parent.cwd.exists() {
+        parent.cwd.clone()
+    } else {
+        std::env::current_dir()?
+    };
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: new_goal.clone(),
+            cwd,
+            sandbox: backend.to_string(),
+            provider: effective_provider.clone(),
+            skill_name: parent.skill_name.clone(),
+            max_spend_usd: effective_max_spend,
+            max_wall_seconds: effective_max_wall_seconds,
+        },
+    )?;
+    align_extended_run_with_parent(&paths, &mut state, &parent)?;
+
+    let mut lock = match acquire_lock(
+        &paths,
+        &parent.task_key,
+        &state.run_id,
+        &parent.scope,
+        "extend",
+        deadreckon_core::lock::DEFAULT_STALE_AFTER,
+    ) {
+        Ok(lock) => lock,
+        Err(error) => {
+            cleanup_new_run(&state);
+            return Err(error.into());
+        }
+    };
+    deadreckon_core::state::write_current_pointer(&paths, &state)?;
+
+    if let Some(dest) = dest {
+        let dest = absolute_dest(dest)?;
+        refuse_dest_inside_home(&paths, &dest, "extend")?;
+        prepare_empty_dest(&dest, false)?;
+        remove_if_exists(&state.working_dir)?;
+        state.working_dir = dest;
+    }
+    seed_working_from_library(&parent_library, &state.working_dir)?;
+    let context_turns = context_turns(max_context_turns, no_context);
+    write_parent_marker(
+        &state.working_dir.join(".deadreckon").join("parent.json"),
+        extended_parent_marker(&parent, &new_goal, context_turns),
+    )?;
+    write_parent_history(&state, &parent, context_turns)?;
+    append_trace(
+        &state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn: 0,
+            event: "extended_from_parent".to_string(),
+            latency_ms: None,
+            detail: json!({
+                "parent_run_id": parent.run_id,
+                "parent_scope": parent.scope,
+                "parent_goal": parent.goal,
+                "parent_completed_at": parent.updated_at,
+                "context_turns_included": context_turns,
+            }),
+        },
+    )?;
+    state.child_pids = vec![std::process::id()];
+    state.updated_at = Utc::now();
+    save_state(&state)?;
+
+    state.set_phase_status(PhaseId(20), PhaseStatus::Executing)?;
+    save_state(&state)?;
+    lock.heartbeat("provider")?;
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), effective_provider.as_deref())?;
+    state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
+    save_state(&state)?;
+    lock.heartbeat("turn-loop")?;
+    let outcome = run_turn_loop(
+        &mut state,
+        &router,
+        RunLoopConfig {
+            provider: effective_provider,
+            max_spend_usd: effective_max_spend,
+            max_wall_seconds: effective_max_wall_seconds,
+            sandbox_backend: backend,
+            max_turns: 12,
+            from_turn: None,
+            event_sender: None,
+            cancellation_token: None,
+        },
+    )
+    .await?;
+    state.child_pids.clear();
+    save_state(&state)?;
+    lock.release()?;
+
+    match outcome {
+        RunLoopOutcome::Done => println!("completed extended run {}", state.run_id),
+        RunLoopOutcome::PausedAtCap => println!("paused extended run {}", state.run_id),
+        RunLoopOutcome::Killed => println!("killed extended run {}", state.run_id),
+        RunLoopOutcome::Failed => println!("failed extended run {}", state.run_id),
+    }
+    print_run_locations(&state);
+    Ok(())
+}
+
+fn align_extended_run_with_parent(
+    paths: &DeadreckonPaths,
+    state: &mut deadreckon_core::PipelineState,
+    parent: &deadreckon_core::PipelineState,
+) -> Result<()> {
+    let old_scope = state.scope.clone();
+    let old_task_key = state.task_key.clone();
+    let old_pointer = paths.current_pointer_path(&old_scope, &old_task_key);
+    let desired_root = paths.run_root(&parent.scope, &state.run_id);
+    if state.run_root != desired_root {
+        if let Some(parent_dir) = desired_root.parent() {
+            fs::create_dir_all(parent_dir)?;
+        }
+        fs::rename(&state.run_root, &desired_root)?;
+        state.run_root = desired_root;
+        state.working_dir = state.run_root.join("working");
+        state.scope = parent.scope.clone();
+    }
+    state.task_key = parent.task_key.clone();
+    state.cwd = parent.cwd.clone();
+    state.updated_at = Utc::now();
+    let new_pointer = paths.current_pointer_path(&state.scope, &state.task_key);
+    if old_pointer != new_pointer {
+        remove_if_exists(&old_pointer)?;
+    }
+    save_state(state)?;
+    Ok(())
+}
+
+fn cleanup_new_run(state: &deadreckon_core::PipelineState) {
+    let _ = remove_if_exists(&state.run_root);
+}
+
+fn seed_working_from_library(library_dir: &Path, working_dir: &Path) -> Result<()> {
+    copy_tree(library_dir, working_dir)?;
+    remove_if_exists(&working_dir.join("manifest.json"))?;
+    remove_if_exists(&working_dir.join(".materialized-to"))?;
+    Ok(())
+}
+
+fn context_turns(max_context_turns: Option<u32>, no_context: bool) -> Option<u32> {
+    if no_context {
+        return None;
+    }
+    let turns = max_context_turns.unwrap_or(5);
+    if turns == 0 { None } else { Some(turns) }
+}
+
+fn extended_parent_marker(
+    parent: &deadreckon_core::PipelineState,
+    new_goal: &str,
+    context_turns: Option<u32>,
+) -> ParentMarker {
+    ParentMarker {
+        schema_version: 1,
+        kind: "extended".to_string(),
+        parent_run_id: parent.run_id.clone(),
+        parent_scope: parent.scope.clone(),
+        parent_goal: parent.goal.clone(),
+        parent_completed_at: parent.updated_at,
+        materialized_at: None,
+        extended_at: Some(Utc::now()),
+        new_goal: Some(new_goal.to_string()),
+        context_turns_included: context_turns,
+        deadreckon_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+fn write_parent_history(
+    state: &deadreckon_core::PipelineState,
+    parent: &deadreckon_core::PipelineState,
+    context_turns: Option<u32>,
+) -> Result<()> {
+    let history = vec![parent_summary(parent, context_turns)];
+    fs::write(
+        state.run_root.join("history.json"),
+        serde_json::to_vec_pretty(&history)?,
+    )?;
+    Ok(())
+}
+
+fn parent_summary(parent: &deadreckon_core::PipelineState, context_turns: Option<u32>) -> String {
+    let spend = read_jsonl::<SpendRecord>(&parent.run_root.join("spend.jsonl")).unwrap_or_default();
+    let traces =
+        read_jsonl::<TraceRecord>(&parent.run_root.join("traces.jsonl")).unwrap_or_default();
+    let spend_label = if spend.iter().any(|record| record.subscription)
+        || parent
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider.starts_with("cli:"))
+    {
+        "subscription".to_string()
+    } else {
+        format!("${:.6}", parent.total_spend_usd)
+    };
+    let acceptance = if parent.run_root.join("proofs/turn-acceptance.json").exists() {
+        "dr-gate accepted"
+    } else {
+        "not recorded"
+    };
+    let mut summary = format!(
+        "# Previous run summary ({})\n\n**Original goal.** {}\n**Completed.** {}\n**Total turns.** {}\n**Total spend.** {}\n**Acceptance.** {}\n",
+        parent.run_id,
+        parent.goal,
+        parent.updated_at.to_rfc3339(),
+        parent.turn,
+        spend_label,
+        acceptance
+    );
+    if let Some(max_turns) = context_turns {
+        let mut recent = traces
+            .iter()
+            .filter(|trace| trace.turn > 0)
+            .rev()
+            .take(max_turns as usize)
+            .map(trace_one_liner)
+            .collect::<Vec<_>>();
+        recent.reverse();
+        summary.push_str(&format!(
+            "\n## Recent activity (last {} turns)\n\n",
+            max_turns
+        ));
+        if recent.is_empty() {
+            summary.push_str("- no trace activity recorded\n");
+        } else {
+            for line in recent {
+                summary.push_str(&format!("- {line}\n"));
+            }
+        }
+    }
+    summary
+}
+
+fn trace_one_liner(trace: &TraceRecord) -> String {
+    let detail = trace
+        .detail
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .or_else(|| trace.detail.get("summary").and_then(Value::as_str))
+        .unwrap_or("");
+    if detail.is_empty() {
+        format!("turn {}: {}", trace.turn, trace.event)
+    } else {
+        format!(
+            "turn {}: {} {}",
+            trace.turn,
+            trace.event,
+            one_line(detail, 90)
+        )
+    }
 }
 
 fn ensure_completed_run(state: &deadreckon_core::PipelineState, label: &str) -> Result<()> {
