@@ -16,10 +16,11 @@ Audit date: 2026-05-11. Scope: `/Users/gdc/deadreckon/`.
 | Provenance IDs were not tied to traces. | Resolved. | Tool traces carry `tool_call_id`; provenance records reuse those ids; integration tests assert every provenance id appears in traces. |
 | Demo cast was hand-authored placeholder output. | Resolved. | `demo.cast` now contains asciicast v2 JSON generated from real release-binary `doctor/run --provider cli:codex/list/attach/show/undo` output using `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke`. |
 | Keyless tests did not prove agentic behavior. | Resolved. | `cargo test --workspace` includes mock OpenAI-compatible provider tests, three-turn integration, kill, resume-history, acceptance-marker, and fake CLI-provider tests. |
+| Original V0 first-run UX was incomplete. | Resolved. | `deadreckon init`, `deadreckon config get/set`, actionable `doctor`, config-backed spend defaults, high-spend confirmation guards, TUI Ctrl-D detach, and colored spend/context meters are implemented in `crates/deadreckon/src/main.rs` and covered by integration tests. |
 
 ## Logged Decisions
 
 - API keys are not required for Tier A/B verification. The keyless paths are the OpenAI-compatible mock provider in tests and the explicit `--smoke` scripted provider for local release-binary checks.
-- Tier C was executed with live `cli:codex` using `codex exec --ephemeral` and deadreckon's outer `sandbox-exec` wrapper. The successful run id is `59c57e4565704135a9982789d0754803`.
+- Tier C was executed with live `cli:codex` using `codex exec --ephemeral` and deadreckon's outer `sandbox-exec` wrapper. The latest successful run id is `f8be423c3cb14a12869206ae25184377`.
 - `asciinema` is not installed in the current environment. `demo.cast` is therefore generated from captured real command output and kept in asciicast v2 format.
 - Existing untracked `.cursorindexingignore` is outside the task scope and was not created or modified by deadreckon work.

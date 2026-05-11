@@ -27,7 +27,7 @@ Source lives under `/Users/gdc/deadreckon/`:
 - `crates/deadreckon-core`: run paths, phase machine, JSON state, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports.
 - `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, OpenAI-compatible, `cli:claude-code`, `cli:codex`, and explicit `--smoke` scripted adapters, fallback routing, spend estimates.
 - `crates/deadreckon-sandbox`: `sandbox-exec`, `bwrap`, `docker`, and `none` backends using `tokio::process::Command`; default `auto`.
-- `crates/deadreckon`: clap CLI, ratatui attach UI, run/list/attach/kill/resume/undo/show/import/doctor.
+- `crates/deadreckon`: clap CLI, ratatui attach UI, init/config/run/list/attach/kill/resume/undo/show/import/doctor.
 - `skills/default-coding/SKILL.md`: Markdown skill loaded at runtime.
 - `tests/`: workspace integration tests.
 
@@ -41,7 +41,7 @@ Source lives under `/Users/gdc/deadreckon/`:
 6. Agent Observability: `traces.jsonl` with LLM/tool/sandbox events and latencies.
 7. Disposable Sandboxes: platform-native sandbox backends, Docker opt-in, `none` warning.
 8. Billing Guardrails: `--max-spend <USD>` pauses runs when durable spend reaches cap.
-9. Provider Routing / BYOK: three adapters and fallback chain configured from TOML.
+9. Provider Routing / BYOK: adapters, CLI sub-agents, `deadreckon init`, `deadreckon config get/set`, and fallback chain configured from TOML.
 10. Workspace Inventory & Run Queue: `list`, `attach`, `kill`, `resume`, and state scan commands.
 
 ## V0 Execution Model
@@ -58,6 +58,7 @@ The default skill is Markdown and external to the binary. The binary loads it an
 - Sub-agent forking: the architecture requires the pattern, but the V1 list explicitly moves `deadreckon fork` to V1. V0 records scope/session lineage and keeps the subprocess skill boundary; explicit multi-agent forks are documented in `docs/V1-CANDIDATES.md`.
 - Sandbox fallback: on macOS `auto` selects `sandbox-exec` if available. If not available, or on Linux without `bwrap`, `doctor` reports the missing binary and `run` falls back to `none` with a warning, matching the rider.
 - Live Tier C CLI verification: `codex` was run with `exec --ephemeral --dangerously-bypass-approvals-and-sandbox` inside deadreckon's outer `sandbox-exec` wrapper. Run `59c57e4565704135a9982789d0754803` produced `working/notes.md`, `traces.jsonl`, `provenance.jsonl`, snapshots, and a validated `dr-gate` marker without raw API keys.
+- V0 first-run UX: `deadreckon init` writes `/Users/gdc/.deadreckon/config.toml`, `deadreckon config get/set` performs non-interactive edits, `doctor` prints actionable check/fix lines, and `run` enforces the `$50` confirmation guard for scripts.
 
 ## Verification
 
@@ -70,7 +71,11 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
 DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon run "tiny hello rust" --smoke --sandbox none --max-spend 1
-DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon run "make a 5-line file at notes.md describing dead reckoning" --provider cli:codex --sandbox sandbox-exec --max-spend 5
+DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon init --provider cli:codex --max-spend 5 --sandbox sandbox-exec --no-confirm
+DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon config set providers.cli-codex.kind cli-codex
+DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon config set providers.cli-codex.binary codex
+DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon config set providers.cli-codex.extra_args '["--ephemeral", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "--ignore-rules"]'
+DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon run "make a 5-line file at notes.md describing dead reckoning" --provider cli-codex --sandbox sandbox-exec --max-spend 5
 ```
 
 `demo.cast` records real release-binary output from the live `cli:codex` path without relying on raw provider API keys.
