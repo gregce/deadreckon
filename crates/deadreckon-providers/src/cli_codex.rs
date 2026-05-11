@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use deadreckon_sandbox::SandboxBackend;
 use serde_json::json;
 use which::which;
 
@@ -30,7 +31,14 @@ impl CliCodexProvider {
 
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let started = Instant::now();
-        let mut args = vec!["exec".to_string()];
+        let mut args = vec![
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
+            "exec".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--sandbox".to_string(),
+            codex_sandbox_mode(request.sandbox_backend).to_string(),
+        ];
         // `codex --help` on this machine lists `exec` as "Run Codex
         // non-interactively"; deadreckon uses that verb for subscription-BYOK turns.
         args.extend(self.extra_args.clone());
@@ -107,6 +115,18 @@ impl Provider for CliCodexProvider {
 
     fn complete<'a>(&'a self, request: &'a ProviderRequest) -> ProviderFuture<'a> {
         Box::pin(async move { self.run(request).await })
+    }
+}
+
+fn codex_sandbox_mode(outer_backend: Option<SandboxBackend>) -> &'static str {
+    match outer_backend {
+        Some(SandboxBackend::None) | None => "workspace-write",
+        Some(
+            SandboxBackend::Auto
+            | SandboxBackend::SandboxExec
+            | SandboxBackend::Bwrap
+            | SandboxBackend::Docker,
+        ) => "danger-full-access",
     }
 }
 

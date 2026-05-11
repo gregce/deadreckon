@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use deadreckon_sandbox::{SandboxBackend, SandboxSpec, run as run_sandbox};
@@ -32,17 +32,26 @@ pub(crate) async fn run_cli(
         let cwd = cwd.unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/Users/gdc/deadreckon"))
         });
+        let resolved = resolve_cli_binary(binary);
+        let mut env = BTreeMap::new();
+        if let Some(path) = std::env::var_os("PATH") {
+            env.insert("PATH".to_string(), path.to_string_lossy().to_string());
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            env.insert("HOME".to_string(), home.to_string_lossy().to_string());
+        }
         let output = run_sandbox(SandboxSpec {
             backend,
             cwd,
-            program: OsString::from(binary),
+            program: resolved.program.clone().into_os_string(),
             args: args.iter().map(OsString::from).collect(),
-            env: BTreeMap::new(),
+            env,
             allow_network: true,
             pid_file,
             cancellation_token,
             profile_dir: None,
-            read_allowlist: Vec::new(),
+            read_allowlist: resolved.read_allowlist,
+            write_allowlist: cli_provider_write_allowlist(provider),
             network_allowlist: vec!["*".to_string()],
         })
         .await
@@ -108,6 +117,79 @@ pub(crate) async fn run_cli(
         sandbox_backend: None,
         sandbox_warning: None,
     })
+}
+
+#[derive(Debug)]
+struct ResolvedCliBinary {
+    program: PathBuf,
+    read_allowlist: Vec<PathBuf>,
+}
+
+fn resolve_cli_binary(binary: &str) -> ResolvedCliBinary {
+    let configured = PathBuf::from(binary);
+    let located = if configured.components().count() > 1 || configured.is_absolute() {
+        configured
+    } else {
+        which::which(binary).unwrap_or_else(|_| PathBuf::from(binary))
+    };
+    let canonical = located.canonicalize().unwrap_or_else(|_| located.clone());
+    let mut read_allowlist = Vec::new();
+    push_existing_parent_roots(&mut read_allowlist, &located);
+    push_existing_parent_roots(&mut read_allowlist, &canonical);
+    if let Ok(canonical_parent) = canonical.parent().unwrap_or(&canonical).canonicalize() {
+        push_if_exists(&mut read_allowlist, canonical_parent);
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for root in [".bun", ".local", ".npm-global", ".opencode"] {
+            push_if_exists(&mut read_allowlist, home.join(root));
+        }
+    }
+    dedup_paths(&mut read_allowlist);
+    ResolvedCliBinary {
+        program: canonical,
+        read_allowlist,
+    }
+}
+
+fn cli_provider_write_allowlist(provider: &str) -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    if provider.contains("codex") {
+        paths.push(home.join(".codex"));
+    }
+    if provider.contains("claude") {
+        paths.push(home.join(".claude"));
+    }
+    paths
+}
+
+fn push_existing_parent_roots(paths: &mut Vec<PathBuf>, path: &Path) {
+    push_if_exists(paths, path);
+    if let Some(parent) = path.parent() {
+        push_if_exists(paths, parent);
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for root in [".bun", ".local", ".npm-global", ".opencode"] {
+            let candidate = home.join(root);
+            if path.starts_with(&candidate) {
+                push_if_exists(paths, candidate);
+            }
+        }
+    }
+}
+
+fn push_if_exists(paths: &mut Vec<PathBuf>, path: impl Into<PathBuf>) {
+    let path = path.into();
+    if path.exists() {
+        paths.push(path);
+    }
+}
+
+fn dedup_paths(paths: &mut Vec<PathBuf>) {
+    paths.sort();
+    paths.dedup();
 }
 
 pub(crate) async fn write_output(path: Option<&PathBuf>, output: &CliOutput) -> Result<()> {

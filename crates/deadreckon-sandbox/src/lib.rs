@@ -76,6 +76,7 @@ pub struct SandboxSpec {
     pub cancellation_token: Option<CancellationToken>,
     pub profile_dir: Option<PathBuf>,
     pub read_allowlist: Vec<PathBuf>,
+    pub write_allowlist: Vec<PathBuf>,
     pub network_allowlist: Vec<String>,
 }
 
@@ -320,6 +321,12 @@ fn bwrap_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxC
         args.push(path.clone().into());
         args.push(path.into());
     }
+    for path in &spec.write_allowlist {
+        let path = path.to_string_lossy().to_string();
+        args.push("--bind".into());
+        args.push(path.clone().into());
+        args.push(path.into());
+    }
     args.extend([
         "--bind".into(),
         cwd.clone().into(),
@@ -397,19 +404,32 @@ fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
             escape_seatbelt_path(&path)
         ));
     }
+    let mut write_rules = String::new();
+    for path in &spec.write_allowlist {
+        write_rules.push_str(&format!(
+            "    (subpath \"{}\")\n",
+            escape_seatbelt_path(path)
+        ));
+    }
+    let ssh_deny = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| {
+            let ssh = escape_seatbelt_path(&home.join(".ssh"));
+            format!("(deny file-read* (subpath \"{ssh}\"))\n(deny file-write* (subpath \"{ssh}\"))")
+        })
+        .unwrap_or_default();
     let profile = format!(
         "(version 1)
-(deny default)
-(allow process*)
-(allow signal (target same-sandbox))
-(allow sysctl-read)
+(allow default)
+{ssh_deny}
 {network}
 (allow file-read*
 {read_rules})
 (allow file-write*
     (subpath \"{}\")
     (subpath \"/private/tmp\")
-    (subpath \"/tmp\"))
+    (subpath \"/tmp\")
+{write_rules})
 ",
         escape_seatbelt_path(&spec.cwd)
     );
@@ -428,12 +448,18 @@ fn system_read_allowlist(cwd: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
         PathBuf::from("/System"),
         PathBuf::from("/Library"),
         PathBuf::from("/Applications"),
+        PathBuf::from("/opt/homebrew"),
+        PathBuf::from("/opt/local"),
         PathBuf::from("/dev"),
         PathBuf::from("/private/tmp"),
         PathBuf::from("/tmp"),
         cwd.to_path_buf(),
     ];
+    if let Ok(canonical) = cwd.canonicalize() {
+        paths.push(canonical);
+    }
     paths.extend(extra.iter().cloned());
+    paths.extend(extra.iter().filter_map(|path| path.canonicalize().ok()));
     paths
 }
 
@@ -474,6 +500,7 @@ fn missing_hint(backend: SandboxBackend) -> String {
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+    use std::path::PathBuf;
 
     use tempfile::TempDir;
 
@@ -491,6 +518,7 @@ mod tests {
             cancellation_token: None,
             profile_dir: None,
             read_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
             network_allowlist: Vec::new(),
         }
     }
@@ -531,8 +559,9 @@ mod tests {
         });
         if command.backend == SandboxBackend::SandboxExec {
             let profile = command.args[1].to_string_lossy();
-            assert!(profile.contains("(deny default)"));
-            assert!(!profile.contains("/Users/gdc/.ssh"));
+            assert!(profile.contains("(allow default)"));
+            assert!(profile.contains(".ssh"));
+            assert!(profile.contains("(deny file-read*"));
         }
     }
 
@@ -542,20 +571,28 @@ mod tests {
         if which::which("sandbox-exec").is_err() {
             return;
         }
+        let home_secret = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".ssh/id_rsa"));
+        let Some(home_secret) = home_secret.filter(|path| path.exists()) else {
+            let mut spec = shell_spec();
+            spec.backend = SandboxBackend::SandboxExec;
+            let command = build_command(&spec).expect("profile");
+            let profile = command.args[1].to_string_lossy();
+            assert!(profile.contains(".ssh"));
+            assert!(profile.contains("(deny file-read*"));
+            return;
+        };
         let temp = TempDir::new().expect("tempdir");
         let work = temp.path().join("work");
-        let secret_dir = temp.path().join(".ssh");
         std::fs::create_dir_all(&work).expect("work");
-        std::fs::create_dir_all(&secret_dir).expect("secret dir");
-        let secret = secret_dir.join("id_rsa");
-        std::fs::write(&secret, "secret").expect("secret");
         let output = run(SandboxSpec {
             backend: SandboxBackend::SandboxExec,
             cwd: work,
             program: OsString::from("sh"),
             args: vec![
                 OsString::from("-c"),
-                OsString::from(format!("cat {}", secret.display())),
+                OsString::from(format!("cat {}", home_secret.display())),
             ],
             env: BTreeMap::new(),
             allow_network: false,
@@ -563,6 +600,7 @@ mod tests {
             cancellation_token: None,
             profile_dir: None,
             read_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
             network_allowlist: Vec::new(),
         })
         .await
@@ -594,6 +632,7 @@ mod tests {
             cancellation_token: None,
             profile_dir: None,
             read_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
             network_allowlist: Vec::new(),
         })
         .await

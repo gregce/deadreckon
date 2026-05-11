@@ -104,7 +104,9 @@ async fn cli_codex_provider_uses_exec_verb() {
         .expect("completion");
 
     assert!(response.content.contains("codex-output"));
-    assert!(response.content.contains("args:exec make notes"));
+    assert!(response.content.contains(
+        "args:--ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write make notes"
+    ));
     assert!(response.spend.subscription);
 }
 
@@ -156,6 +158,68 @@ async fn cli_provider_runs_inside_requested_sandbox_backend() {
     assert_eq!(response.trace["sandbox_backend"], "none");
     assert!(response.trace["pid"].as_u64().is_some());
     assert!(!pid_file.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn cli_provider_resolves_user_path_binary_inside_sandbox_exec() {
+    if which::which("sandbox-exec").is_err() {
+        return;
+    }
+    let temp = TempDir::new().expect("tempdir");
+    let bin_dir = temp.path().join("user-bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    let binary = bin_dir.join("fake-codex");
+    write_fake_binary(&binary, "path-resolved-codex-output");
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
+    unsafe {
+        std::env::set_var("PATH", &new_path);
+    }
+    let router = ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:codex".to_string()]),
+            providers: [(
+                "cli:codex".to_string(),
+                ProviderEntry {
+                    kind: Some(ProviderKind::CliCodex),
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: Some("cli:codex".to_string()),
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some("fake-codex".to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router");
+
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "make notes".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: Some(SandboxBackend::SandboxExec),
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("sandboxed completion");
+    unsafe {
+        std::env::set_var("PATH", old_path);
+    }
+
+    assert!(response.content.contains("path-resolved-codex-output"));
+    assert!(response.content.contains("--sandbox danger-full-access"));
+    assert_eq!(response.trace["sandbox_backend"], "sandbox-exec");
 }
 
 #[tokio::test]

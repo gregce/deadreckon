@@ -285,6 +285,7 @@ pub async fn run_turn_loop(
                     cancellation_token: Some(tool_token),
                     profile_dir: Some(state.run_root.join("sandbox")),
                     read_allowlist: vec![state.working_dir.clone()],
+                    write_allowlist: Vec::new(),
                     network_allowlist: Vec::new(),
                 })
                 .await?;
