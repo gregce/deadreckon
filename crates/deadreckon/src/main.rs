@@ -194,7 +194,7 @@ async fn main_inner() -> Result<()> {
             i_know_its_a_lot,
             no_confirm,
         } => {
-            run_command(
+            run_command(RunCommandArgs {
                 goal,
                 max_spend,
                 sandbox,
@@ -203,7 +203,7 @@ async fn main_inner() -> Result<()> {
                 smoke,
                 i_know_its_a_lot,
                 no_confirm,
-            )
+            })
             .await
         }
         Commands::Doctor => {
@@ -283,7 +283,7 @@ fn config_command(command: ConfigCommand) -> Result<()> {
     Ok(())
 }
 
-async fn run_command(
+struct RunCommandArgs {
     goal: String,
     max_spend: Option<f64>,
     sandbox: Option<String>,
@@ -292,7 +292,19 @@ async fn run_command(
     smoke: bool,
     i_know_its_a_lot: bool,
     no_confirm: bool,
-) -> Result<()> {
+}
+
+async fn run_command(args: RunCommandArgs) -> Result<()> {
+    let RunCommandArgs {
+        goal,
+        max_spend,
+        sandbox,
+        provider,
+        skill,
+        smoke,
+        i_know_its_a_lot,
+        no_confirm,
+    } = args;
     if smoke && provider.is_some() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
             "--smoke selects the local scripted provider; omit --provider".to_string(),
