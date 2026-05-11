@@ -412,8 +412,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         RunLoopOutcome::Killed => println!("killed run {}", state.run_id),
         RunLoopOutcome::Failed => println!("failed run {}", state.run_id),
     }
-    println!("state {}", state.state_path().display());
-    println!("working {}", state.working_dir.display());
+    print_run_locations(&state);
     Ok(())
 }
 
@@ -1240,11 +1239,21 @@ fn print_run_summary(state: &deadreckon_core::PipelineState) {
     println!("run {}", state.run_id);
     println!("status {}", state.status);
     println!("goal {}", state.goal);
-    println!("state {}", state.state_path().display());
-    println!("working {}", state.working_dir.display());
+    print_run_locations(state);
     println!("spend {:.6}", state.total_spend_usd);
     if let Some(phase) = state.active_phase() {
         println!("phase {} {}", phase.id.0, phase.name);
+    }
+}
+
+fn print_run_locations(state: &deadreckon_core::PipelineState) {
+    println!("state {}", state.state_path().display());
+    println!("launch-dir {}", state.cwd.display());
+    if let Some(library_dir) = state.promoted_library_dir.as_ref() {
+        println!("artifact {}", library_dir.display());
+        println!("note launch-dir is unchanged; completed output lives in artifact");
+    } else {
+        println!("working {}", state.working_dir.display());
     }
 }
 
@@ -1391,14 +1400,20 @@ fn render_attach(
         .active_phase()
         .map(|phase| format!("{} {}", phase.id.0, phase.name))
         .unwrap_or_else(|| "-".to_string());
+    let path_label = if state.promoted_library_dir.is_some() {
+        "artifact"
+    } else {
+        "working"
+    };
     let header = Paragraph::new(format!(
-        "run {}\nstatus {}  phase {}  provider {}  sandbox {}  turn timer {}\nworking {}\ngoal {}",
+        "run {}\nstatus {}  phase {}  provider {}  sandbox {}  turn timer {}\n{} {}\ngoal {}",
         state.run_id,
         state.status,
         phase,
         state.provider.as_deref().unwrap_or("-"),
         state.sandbox,
         turn_timer(events),
+        path_label,
         state.working_dir.display(),
         state.goal
     ))

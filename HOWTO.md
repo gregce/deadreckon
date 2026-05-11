@@ -72,6 +72,8 @@ Completed accepted runs are promoted to:
 /Users/gdc/.deadreckon/library/<scope>/<run-id>/
 ```
 
+The directory where you launch `deadreckon run` is recorded as `launch-dir` and is left unchanged. The completed code is printed as `artifact`; run or copy from that path when you are ready to use it.
+
 ## First Run
 
 Interactive setup:
