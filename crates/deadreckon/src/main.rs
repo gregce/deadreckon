@@ -14,8 +14,9 @@ use crossterm::terminal::{
 use deadreckon_core::{
     DeadreckonError, DeadreckonPaths, PhaseId, PhaseStatus, ProvenanceRecord, RUN_EVENTS_JSONL,
     RunEvent, RunLoopConfig, RunLoopOutcome, RunOptions, RunStatus, SpendRecord, TraceRecord,
-    acquire_lock, append_provenance, append_trace, create_run, inventory_files, list_runs,
-    load_run, release_lock_file, restore_snapshot, run_turn_loop, save_state, terminate_pid,
+    acquire_lock, append_provenance, append_trace, copy_tree, create_run, inventory_files,
+    list_runs, load_run, release_lock_file, restore_snapshot, run_turn_loop, save_state,
+    terminate_pid,
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_sandbox::SandboxBackend;
@@ -24,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 
@@ -130,6 +131,15 @@ enum Commands {
         #[arg(long)]
         scope: Option<String>,
     },
+    Materialize {
+        run_id: String,
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        include_manifest: bool,
+    },
     Attach {
         run_id: String,
     },
@@ -225,6 +235,12 @@ async fn main_inner() -> Result<()> {
             Ok(())
         }
         Commands::List { scope } => list_command(scope),
+        Commands::Materialize {
+            run_id,
+            dest,
+            force,
+            include_manifest,
+        } => materialize_command(run_id, dest, force, include_manifest),
         Commands::Attach { run_id } => attach_command(run_id),
         Commands::Kill { run_id, force } => kill_command(run_id, force),
         Commands::Resume {
@@ -839,6 +855,25 @@ fn value_to_display(value: &toml::Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ParentMarker {
+    schema_version: u32,
+    kind: String,
+    parent_run_id: String,
+    parent_scope: String,
+    parent_goal: String,
+    parent_completed_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    materialized_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extended_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_goal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_turns_included: Option<u32>,
+    deadreckon_version: String,
+}
+
 fn command_exists(name: &str) -> bool {
     std::env::var_os("PATH")
         .into_iter()
@@ -847,6 +882,173 @@ fn command_exists(name: &str) -> bool {
             let path = dir.join(name);
             path.is_file()
         })
+}
+
+fn materialize_command(
+    run_id: String,
+    dest: Option<PathBuf>,
+    force: bool,
+    include_manifest: bool,
+) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let state = load_run(&paths, &run_id)?;
+    ensure_completed_run(&state, "run")?;
+    let library_dir = paths.library_dir(&state.scope, &state.run_id);
+    if !library_dir.is_dir() {
+        return Err(CliError::Core(DeadreckonError::NotFound(format!(
+            "library missing for run {}; was promotion successful?",
+            state.run_id
+        ))));
+    }
+
+    let dest = absolute_dest(dest.unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(run_prefix(&state.run_id))
+    }))?;
+    refuse_dest_inside_home(&paths, &dest, "materialize")?;
+    prepare_empty_dest(&dest, force)?;
+
+    copy_tree(&library_dir, &dest)?;
+    if !include_manifest {
+        remove_if_exists(&dest.join("manifest.json"))?;
+    }
+    remove_if_exists(&dest.join(".materialized-to"))?;
+    write_parent_marker(
+        &dest.join(".deadreckon").join("parent.json"),
+        materialized_parent_marker(&state),
+    )?;
+    normalize_permissions(&dest)?;
+    append_materialized_marker(&library_dir, &dest)?;
+
+    println!("materialized run {}", state.run_id);
+    println!("source {}", library_dir.display());
+    println!("dest {}", dest.display());
+    Ok(())
+}
+
+fn ensure_completed_run(state: &deadreckon_core::PipelineState, label: &str) -> Result<()> {
+    if state.status != RunStatus::Completed {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "{label} {} is not completed (status={}); use 'deadreckon resume' first",
+            state.run_id, state.status
+        ))));
+    }
+    Ok(())
+}
+
+fn materialized_parent_marker(state: &deadreckon_core::PipelineState) -> ParentMarker {
+    ParentMarker {
+        schema_version: 1,
+        kind: "materialized".to_string(),
+        parent_run_id: state.run_id.clone(),
+        parent_scope: state.scope.clone(),
+        parent_goal: state.goal.clone(),
+        parent_completed_at: state.updated_at,
+        materialized_at: Some(Utc::now()),
+        extended_at: None,
+        new_goal: None,
+        context_turns_included: None,
+        deadreckon_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+fn write_parent_marker(path: &Path, marker: ParentMarker) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(&marker)?)?;
+    Ok(())
+}
+
+fn append_materialized_marker(library_dir: &Path, dest: &Path) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(library_dir.join(".materialized-to"))?;
+    writeln!(file, "{}\t{}", Utc::now().to_rfc3339(), dest.display())?;
+    Ok(())
+}
+
+fn prepare_empty_dest(dest: &Path, force: bool) -> Result<()> {
+    if dest.exists() {
+        let non_empty = if dest.is_dir() {
+            fs::read_dir(dest)?.next().is_some()
+        } else {
+            true
+        };
+        if non_empty && !force {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "dest {} is not empty (use --force to overwrite, or pass a fresh path)",
+                dest.display()
+            ))));
+        }
+        if force {
+            remove_if_exists(dest)?;
+        }
+    }
+    fs::create_dir_all(dest)?;
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path).map_err(CliError::from),
+        Ok(_) => fs::remove_file(path).map_err(CliError::from),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CliError::Io(source)),
+    }
+}
+
+fn absolute_dest(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn refuse_dest_inside_home(paths: &DeadreckonPaths, dest: &Path, verb: &str) -> Result<()> {
+    let home = paths.home();
+    if dest.starts_with(home) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "refusing to {verb} back into runstate (pick a path outside ~/.deadreckon/)"
+        ))));
+    }
+    Ok(())
+}
+
+fn run_prefix(run_id: &str) -> String {
+    run_id.chars().take(8).collect()
+}
+
+fn normalize_permissions(root: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        normalize_permissions_inner(root)?;
+
+        fn normalize_permissions_inner(path: &Path) -> Result<()> {
+            let metadata = fs::symlink_metadata(path)?;
+            let mut permissions = metadata.permissions();
+            if metadata.is_dir() {
+                permissions.set_mode(0o755);
+                fs::set_permissions(path, permissions)?;
+                for entry in fs::read_dir(path)? {
+                    normalize_permissions_inner(&entry?.path())?;
+                }
+            } else if metadata.is_file() {
+                permissions.set_mode(0o644);
+                fs::set_permissions(path, permissions)?;
+            }
+            Ok(())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+    }
+    Ok(())
 }
 
 fn escape_toml_string(value: &str) -> String {

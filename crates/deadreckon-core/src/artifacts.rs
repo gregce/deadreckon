@@ -114,7 +114,7 @@ pub fn inventory_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     fs::create_dir_all(to).with_path(to)?;
     if !from.exists() {
         return Ok(());

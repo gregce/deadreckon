@@ -12,7 +12,7 @@ pub mod turn_loop;
 
 pub use artifacts::{
     ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
-    inventory_files, restore_snapshot, snapshot_working,
+    copy_tree, inventory_files, restore_snapshot, snapshot_working,
 };
 pub use error::{DeadreckonError, Result};
 pub use events::{
