@@ -1295,6 +1295,8 @@ struct AttachLive {
     files: Vec<LiveFile>,
     pids: Vec<LivePid>,
     provider_activity: Vec<String>,
+    provider_context_tokens: Option<u64>,
+    provider_context_window: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -1333,7 +1335,9 @@ fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
         total_bytes,
         files,
         pids,
-        provider_activity,
+        provider_context_tokens: provider_activity.context_tokens,
+        provider_context_window: provider_activity.context_window,
+        provider_activity: provider_activity.lines,
     }
 }
 
@@ -1379,34 +1383,49 @@ fn live_pid(pid: u32) -> LivePid {
     }
 }
 
-fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> Vec<String> {
+#[derive(Debug, Default)]
+struct ProviderActivity {
+    lines: Vec<String>,
+    context_tokens: Option<u64>,
+    context_window: Option<u64>,
+}
+
+fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> ProviderActivity {
     if state.provider.as_deref() != Some("cli:codex") {
-        return Vec::new();
+        return ProviderActivity::default();
     }
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
+        return ProviderActivity::default();
     };
     let sessions_root = home.join(".codex/sessions");
     let since = state.started_at - ChronoDuration::minutes(2);
     let mut candidates = Vec::new();
     collect_recent_jsonl_files(&sessions_root, since, &mut candidates, 0);
     candidates.sort_by(|left, right| right.1.cmp(&left.1));
-    let working_dir = state.working_dir.to_string_lossy().to_string();
+    let working_dirs = [
+        state.working_dir.to_string_lossy().to_string(),
+        state.run_root.join("working").to_string_lossy().to_string(),
+    ];
     for (path, _) in candidates.into_iter().take(12) {
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        if !raw.contains(&working_dir) {
+        if !working_dirs
+            .iter()
+            .any(|working_dir| raw.contains(working_dir))
+        {
             continue;
         }
-        let mut items = raw
-            .lines()
-            .filter_map(codex_activity_line)
-            .collect::<Vec<_>>();
-        if items.is_empty() {
+        let mut activity = ProviderActivity::default();
+        for line in raw.lines() {
+            if let Some(line) = codex_activity_line(line, &mut activity) {
+                activity.lines.push(line);
+            }
+        }
+        if activity.lines.is_empty() {
             continue;
         }
-        items.push(format!(
+        activity.lines.push(format!(
             "{} provider log {}",
             format_age(
                 fs::metadata(&path)
@@ -1416,7 +1435,8 @@ fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> Vec<Stri
             ),
             path.display()
         ));
-        return items
+        activity.lines = activity
+            .lines
             .into_iter()
             .rev()
             .take(12)
@@ -1424,8 +1444,9 @@ fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> Vec<Stri
             .into_iter()
             .rev()
             .collect();
+        return activity;
     }
-    Vec::new()
+    ProviderActivity::default()
 }
 
 fn collect_recent_jsonl_files(
@@ -1461,7 +1482,7 @@ fn collect_recent_jsonl_files(
     }
 }
 
-fn codex_activity_line(line: &str) -> Option<String> {
+fn codex_activity_line(line: &str, activity: &mut ProviderActivity) -> Option<String> {
     let value: Value = serde_json::from_str(line).ok()?;
     let timestamp = short_timestamp(value.get("timestamp").and_then(Value::as_str));
     let payload = value.get("payload")?;
@@ -1482,6 +1503,8 @@ fn codex_activity_line(line: &str) -> Option<String> {
                 .and_then(|info| info.get("model_context_window"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            activity.context_tokens = Some(total);
+            activity.context_window = Some(window);
             let rate = payload
                 .get("rate_limits")
                 .and_then(|limits| limits.get("primary"))
@@ -1564,14 +1587,21 @@ fn render_attach(
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Min(10),
             Constraint::Length(5),
-            Constraint::Min(8),
-            Constraint::Length(8),
             Constraint::Length(1),
         ])
         .split(area);
 
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(58),
+            Constraint::Percentage(21),
+            Constraint::Percentage(21),
+        ])
+        .split(vertical[0]);
     let phase = state
         .active_phase()
         .map(|phase| format!("{} {}", phase.id.0, phase.name))
@@ -1582,24 +1612,19 @@ fn render_attach(
         "working"
     };
     let header = Paragraph::new(format!(
-        "run {}\nstatus {}  phase {}  provider {}  sandbox {}  turn timer {}\n{} {}\ngoal {}",
+        "run {}\nstatus {}  phase {}  provider {}  sandbox {}\nturn {}\n{} {}\ngoal {}",
         state.run_id,
         state.status,
         phase,
         state.provider.as_deref().unwrap_or("-"),
         state.sandbox,
-        turn_timer(events),
+        turn_timer(events, spend, traces, state),
         path_label,
         state.working_dir.display(),
         state.goal
     ))
     .block(Block::default().borders(Borders::ALL).title("deadreckon"));
-    frame.render_widget(header, vertical[0]);
-
-    let meters = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(vertical[1]);
+    frame.render_widget(header, top[0]);
     let cap = state.max_spend_usd.unwrap_or({
         if state.total_spend_usd <= 0.0 {
             1.0
@@ -1608,52 +1633,43 @@ fn render_attach(
         }
     });
     let spend_ratio = (state.total_spend_usd / cap).clamp(0.0, 1.0);
-    let token_total = spend
-        .iter()
-        .map(|record| record.input_tokens + record.output_tokens)
-        .sum::<u64>();
-    let context_ratio = (token_total as f64 / 200_000.0).clamp(0.0, 1.0);
+    let (token_total, context_window) = context_totals(spend, live);
+    let context_ratio = if context_window == 0 {
+        0.0
+    } else {
+        (token_total as f64 / context_window as f64).clamp(0.0, 1.0)
+    };
     frame.render_widget(
         Gauge::default()
             .block(Block::default().borders(Borders::ALL).title("spend"))
             .gauge_style(Style::default().fg(meter_color(spend_ratio, state)))
             .ratio(spend_ratio)
             .label(format!("${:.6} / ${:.6}", state.total_spend_usd, cap)),
-        meters[0],
+        top[1],
     );
     frame.render_widget(
         Gauge::default()
             .block(Block::default().borders(Borders::ALL).title("context"))
             .gauge_style(Style::default().fg(threshold_color(context_ratio)))
             .ratio(context_ratio)
-            .label(format!("{token_total} / 200000 tokens")),
-        meters[1],
+            .label(format!("{token_total} / {context_window} tokens")),
+        top[2],
     );
 
-    let live_area = Layout::default()
+    let center = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(50),
-            Constraint::Percentage(20),
-        ])
-        .split(vertical[2]);
-    render_recent_turns(frame, live_area[0], spend);
-    render_live_files(frame, live_area[1], live);
-    render_processes(frame, live_area[2], live);
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(vertical[1]);
 
-    let mut trace_items = events
-        .iter()
-        .rev()
-        .take(8)
-        .map(render_event_item)
-        .chain(traces.iter().rev().take(2).map(|record| {
+    let mut trace_items = render_turn_summary(spend);
+    trace_items.extend(events.iter().rev().take(8).map(render_event_item).chain(
+        traces.iter().rev().take(2).map(|record| {
             ListItem::new(format!(
                 "trace turn {}  {}  {:?}ms",
                 record.turn, record.event, record.latency_ms
             ))
-        }))
-        .collect::<Vec<_>>();
+        }),
+    ));
     if state.status == RunStatus::Executing && live.file_count > 0 {
         trace_items.push(ListItem::new(format!(
             "live working tree: {} files, latest changes visible before provider exit",
@@ -1673,29 +1689,37 @@ fn render_attach(
                 .borders(Borders::ALL)
                 .title("tool calls / provider activity"),
         ),
-        vertical[3],
+        center[0],
     );
+    render_live_files(frame, center[1], live);
+    render_processes(frame, vertical[2], live);
     frame.render_widget(
         Paragraph::new("Ctrl-D detach  q quit  Esc quit"),
-        vertical[4],
+        vertical[3],
     );
 }
 
-fn render_recent_turns(
-    frame: &mut ratatui::Frame<'_>,
-    area: ratatui::layout::Rect,
-    spend: &[SpendRecord],
-) {
-    let items = if spend.is_empty() {
-        vec![
-            ListItem::new("provider turn in progress"),
-            ListItem::new("spend and token rows appear after provider exits"),
-        ]
+fn context_totals(spend: &[SpendRecord], live: &AttachLive) -> (u64, u64) {
+    let token_total = live.provider_context_tokens.unwrap_or_else(|| {
+        spend
+            .iter()
+            .map(|record| record.input_tokens + record.output_tokens)
+            .sum::<u64>()
+    });
+    let context_window = live.provider_context_window.unwrap_or(200_000).max(1);
+    (token_total, context_window)
+}
+
+fn render_turn_summary(spend: &[SpendRecord]) -> Vec<ListItem<'static>> {
+    if spend.is_empty() {
+        vec![ListItem::new(
+            "provider turn in progress; accounting lands when the provider exits",
+        )]
     } else {
         spend
             .iter()
             .rev()
-            .take(8)
+            .take(3)
             .map(|record| {
                 ListItem::new(format!(
                     "turn {}  {}  {} tokens  ${:.6}",
@@ -1706,11 +1730,7 @@ fn render_recent_turns(
                 ))
             })
             .collect()
-    };
-    frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title("recent turns")),
-        area,
-    );
+    }
 }
 
 fn render_live_files(
@@ -1797,8 +1817,13 @@ fn render_event_item(event: &RunEvent) -> ListItem<'static> {
     ListItem::new(label)
 }
 
-fn turn_timer(events: &[RunEvent]) -> String {
-    let Some(event) = events.iter().rev().find(|event| {
+fn turn_timer(
+    events: &[RunEvent],
+    spend: &[SpendRecord],
+    traces: &[TraceRecord],
+    state: &deadreckon_core::PipelineState,
+) -> String {
+    let Some(started) = events.iter().rev().find(|event| {
         matches!(
             event.event,
             deadreckon_core::RunEventKind::TurnStarted { .. }
@@ -1806,11 +1831,41 @@ fn turn_timer(events: &[RunEvent]) -> String {
     }) else {
         return "-".to_string();
     };
-    let elapsed = Utc::now()
-        .signed_duration_since(event.timestamp)
-        .num_seconds()
-        .max(0);
-    format!("{elapsed}s")
+    if state.status == RunStatus::Executing {
+        let elapsed = Utc::now()
+            .signed_duration_since(started.timestamp)
+            .num_seconds()
+            .max(0);
+        return format!("{elapsed}s running");
+    }
+    if let Some(seconds) = spend
+        .iter()
+        .rev()
+        .find_map(|record| record.wall_time_seconds)
+    {
+        return format!("{:.0}s done", seconds.max(0.0));
+    }
+    if let Some(ms) = traces.iter().rev().find_map(|record| record.latency_ms) {
+        return format!("{:.0}s done", ms as f64 / 1000.0);
+    }
+    if let Some(done_at) = events
+        .iter()
+        .rev()
+        .find(|event| {
+            !matches!(
+                event.event,
+                deadreckon_core::RunEventKind::TurnStarted { .. }
+            )
+        })
+        .map(|event| event.timestamp)
+    {
+        let elapsed = done_at
+            .signed_duration_since(started.timestamp)
+            .num_seconds()
+            .max(0);
+        return format!("{elapsed}s done");
+    }
+    "done".to_string()
 }
 
 fn meter_color(ratio: f64, state: &deadreckon_core::PipelineState) -> Color {
