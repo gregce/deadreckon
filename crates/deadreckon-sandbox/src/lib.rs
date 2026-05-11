@@ -113,6 +113,8 @@ pub async fn run(spec: SandboxSpec) -> Result<SandboxRunOutput> {
 }
 
 pub fn build_command(spec: &SandboxSpec) -> Result<SandboxCommand> {
+    // REPORT.md: Disposable Sandboxes are selected per run and degrade to an
+    // explicit unsafe warning only when requested or unsupported.
     let (backend, warning) = resolve_backend(spec.backend)?;
     match backend {
         SandboxBackend::SandboxExec => sandbox_exec_command(spec, warning),
@@ -143,20 +145,20 @@ pub fn resolve_backend(backend: SandboxBackend) -> Result<(SandboxBackend, Optio
                 if which("sandbox-exec").is_ok() {
                     return Ok((SandboxBackend::SandboxExec, None));
                 }
-                return Ok((
+                Ok((
                     SandboxBackend::None,
                     Some("sandbox-exec not found; auto fell back to none".to_string()),
-                ));
+                ))
             }
             #[cfg(target_os = "linux")]
             {
                 if which("bwrap").is_ok() {
                     return Ok((SandboxBackend::Bwrap, None));
                 }
-                return Ok((
+                Ok((
                     SandboxBackend::None,
                     Some("bwrap not found; auto fell back to none".to_string()),
-                ));
+                ))
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {

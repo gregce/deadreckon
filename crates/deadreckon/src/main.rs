@@ -167,6 +167,8 @@ async fn run_command(
     let usage = estimate_usage(&state.goal);
     let spend = router.estimate_for_route(provider.as_deref(), usage)?;
     let next_total = state.total_spend_usd + spend.cost_usd;
+    // REPORT.md: Billing Guardrails pause before the next turn can exceed the
+    // caller's durable run cap.
     if max_spend.is_some_and(|cap| next_total > cap) {
         state.pause_reason = Some(format!(
             "estimated turn spend ${:.6} would exceed cap ${:.6}",
@@ -411,8 +413,8 @@ fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
 }
 
 fn import_command(source: String) -> Result<()> {
-    // REPORT.md: Cross-Tool State Sharing is V0 read-only; this command never
-    // writes into Claude Code, Codex, or Cursor state directories.
+    // REPORT.md: Cross-Tool State Sharing (read-only import) never writes into
+    // Claude Code, Codex, or Cursor state directories.
     let root = match source.as_str() {
         "claude-code" => PathBuf::from("/Users/gdc/.claude/projects/"),
         "codex" => PathBuf::from("/Users/gdc/.codex/sessions/"),
@@ -466,12 +468,11 @@ fn attach_tui(paths: &DeadreckonPaths, run_id: &str) -> Result<()> {
         let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
         terminal.draw(|frame| render_attach(frame, &state, &spend, &traces))?;
 
-        if event::poll(std::time::Duration::from_millis(500))? {
-            if let Event::Key(key) = event::read()? {
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                    break Ok(());
-                }
-            }
+        if event::poll(std::time::Duration::from_millis(500))?
+            && let Event::Key(key) = event::read()?
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+        {
+            break Ok(());
         }
     };
 
@@ -513,7 +514,7 @@ fn render_attach(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(vertical[1]);
-    let cap = state.max_spend_usd.unwrap_or_else(|| {
+    let cap = state.max_spend_usd.unwrap_or({
         if state.total_spend_usd <= 0.0 {
             1.0
         } else {

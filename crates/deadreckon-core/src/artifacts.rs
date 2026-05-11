@@ -58,6 +58,8 @@ pub fn append_trace(state: &PipelineState, record: &TraceRecord) -> Result<()> {
 }
 
 pub fn snapshot_working(state: &PipelineState, turn: u32) -> Result<PathBuf> {
+    // REPORT.md: Infinite Undo For Agent Edits is implemented as durable
+    // per-turn filesystem snapshots.
     // AS-BUILT §9: every mutation boundary gets a filesystem snapshot so a
     // later bounded fix or undo operation has a concrete rollback target.
     let snapshot_dir = state
@@ -72,6 +74,8 @@ pub fn snapshot_working(state: &PipelineState, turn: u32) -> Result<PathBuf> {
 }
 
 pub fn restore_snapshot(state: &PipelineState, turn: u32) -> Result<()> {
+    // REPORT.md: Infinite Undo For Agent Edits restores files from a selected
+    // turn snapshot rather than only rewinding chat.
     let snapshot_dir = state
         .run_root
         .join("snapshots")

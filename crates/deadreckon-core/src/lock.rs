@@ -94,6 +94,8 @@ pub fn acquire_lock(
     phase: &str,
     stale_after: Duration,
 ) -> Result<LockGuard> {
+    // REPORT.md: Multi-Agent Worktree Coordination Layer starts with scoped
+    // locks so parallel agents do not claim the same task at once.
     fs::create_dir_all(paths.locks_dir()).with_path(paths.locks_dir())?;
     let path = lock_path(paths, task_key);
     let mut file = OpenOptions::new()

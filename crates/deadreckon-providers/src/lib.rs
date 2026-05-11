@@ -275,6 +275,8 @@ pub struct ProviderRouter {
 
 impl ProviderRouter {
     pub fn from_config_path(path: &Path, override_provider: Option<&str>) -> Result<Self> {
+        // REPORT.md: Provider Routing / BYOK keeps credentials in the user's
+        // local config/env and tries the configured fallback chain.
         let config = read_config(path)?;
         Self::from_config(config, override_provider)
     }
