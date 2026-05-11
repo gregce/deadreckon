@@ -313,6 +313,124 @@ async fn materialize_then_extend_roundtrip() {
     assert!(child.working_dir.join("child.txt").exists());
 }
 
+#[test]
+fn list_shows_materialized_status() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "list materialized parent");
+    let dest = temp.path().join("listed-materialized");
+    let materialize = deadreckon(&paths)
+        .arg("materialize")
+        .arg(&parent.run_id)
+        .arg("--dest")
+        .arg(&dest)
+        .output()
+        .expect("materialize");
+    assert_success(&materialize);
+    assert_eq!(list_runs(&paths, None).expect("runs").len(), 1);
+
+    let output = deadreckon(&paths).arg("list").output().expect("list");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("MATERIALIZED"));
+    assert!(stdout.contains("yes (1 time)"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_reveals_parent_lineage() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "show lineage parent");
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+    let output = extend_command(&paths, &parent, "lineage child")
+        .output()
+        .expect("extend");
+    assert_success(&output);
+    let child_id = extended_run_id(&output);
+
+    let show = deadreckon(&paths)
+        .arg("show")
+        .arg(&child_id)
+        .output()
+        .expect("show");
+
+    assert_success(&show);
+    assert!(stdout(&show).contains(&format!("Extended from {}", parent.run_id)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+    let output = deadreckon(&paths)
+        .arg("run")
+        .arg("hinted run")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .output()
+        .expect("run");
+    assert_success(&output);
+    assert!(stdout(&output).contains("materialize:"));
+    assert!(stdout(&output).contains("extend:"));
+    let run_id = run_id_from_stdout(&output);
+    let attach = deadreckon(&paths)
+        .arg("attach")
+        .arg(&run_id)
+        .output()
+        .expect("attach");
+    assert_success(&attach);
+    assert!(stdout(&attach).contains("materialize:"));
+    assert!(stdout(&attach).contains("extend:"));
+
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+    let output = deadreckon(&paths)
+        .arg("run")
+        .arg("quiet hinted run")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--no-hints")
+        .output()
+        .expect("run no hints");
+    assert_success(&output);
+    assert!(!stdout(&output).contains("materialize:"));
+    assert!(!stdout(&output).contains("extend:"));
+    let run_id = run_id_from_stdout(&output);
+    let attach = deadreckon(&paths)
+        .arg("attach")
+        .arg(&run_id)
+        .arg("--no-hints")
+        .output()
+        .expect("attach no hints");
+    assert_success(&attach);
+    assert!(!stdout(&attach).contains("materialize:"));
+    assert!(!stdout(&attach).contains("extend:"));
+}
+
+#[test]
+fn help_lists_lifecycle_verbs() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let output = deadreckon(&paths).arg("--help").output().expect("help");
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("Lifecycle:"));
+    assert!(stdout.contains("materialize <run-id>"));
+    assert!(stdout.contains("extend <run-id>"));
+}
+
 fn completed_parent(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {
     let home = temp.path().join("home");
     let paths = DeadreckonPaths::from_home(&home);
@@ -437,6 +555,14 @@ fn extended_run_id(output: &std::process::Output) -> String {
         .lines()
         .find_map(|line| line.strip_prefix("completed extended run "))
         .expect("extended run id")
+        .to_string()
+}
+
+fn run_id_from_stdout(output: &std::process::Output) -> String {
+    stdout(output)
+        .lines()
+        .find_map(|line| line.strip_prefix("completed run "))
+        .expect("run id")
         .to_string()
 }
 

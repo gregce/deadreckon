@@ -80,7 +80,8 @@ fn error_hint(err: &CliError) -> Option<&'static str> {
 #[command(
     name = "deadreckon",
     version,
-    about = "Unattended agentic coding harness"
+    about = "Unattended agentic coding harness",
+    after_help = "Lifecycle:\n  run <goal>\n  attach <run-id>\n  resume <run-id>\n  undo [--run <run-id>]\n  materialize <run-id> [--dest <path>]\n  extend <run-id> <new-goal>"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -125,6 +126,8 @@ enum Commands {
         i_know_its_a_lot: bool,
         #[arg(long)]
         no_confirm: bool,
+        #[arg(long)]
+        no_hints: bool,
     },
     Doctor,
     List {
@@ -160,6 +163,8 @@ enum Commands {
     },
     Attach {
         run_id: String,
+        #[arg(long)]
+        no_hints: bool,
     },
     Kill {
         run_id: String,
@@ -234,6 +239,7 @@ async fn main_inner() -> Result<()> {
             smoke,
             i_know_its_a_lot,
             no_confirm,
+            no_hints,
         } => {
             run_command(RunCommandArgs {
                 goal,
@@ -245,6 +251,7 @@ async fn main_inner() -> Result<()> {
                 smoke,
                 i_know_its_a_lot,
                 no_confirm,
+                no_hints,
             })
             .await
         }
@@ -283,7 +290,7 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
-        Commands::Attach { run_id } => attach_command(run_id),
+        Commands::Attach { run_id, no_hints } => attach_command(run_id, no_hints),
         Commands::Kill { run_id, force } => kill_command(run_id, force),
         Commands::Resume {
             run_id,
@@ -369,6 +376,7 @@ struct RunCommandArgs {
     smoke: bool,
     i_know_its_a_lot: bool,
     no_confirm: bool,
+    no_hints: bool,
 }
 
 struct ExtendCommandArgs {
@@ -394,6 +402,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         smoke,
         i_know_its_a_lot,
         no_confirm,
+        no_hints,
     } = args;
     if smoke && provider.is_some() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
@@ -476,6 +485,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     save_state(&state)?;
     lock.release()?;
 
+    let completed = outcome == RunLoopOutcome::Done;
     match outcome {
         RunLoopOutcome::Done => println!("completed run {}", state.run_id),
         RunLoopOutcome::PausedAtCap => println!("paused run {}", state.run_id),
@@ -483,6 +493,9 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         RunLoopOutcome::Failed => println!("failed run {}", state.run_id),
     }
     print_run_locations(&state);
+    if completed && !no_hints {
+        print_lifecycle_hints(&state);
+    }
     Ok(())
 }
 
@@ -1421,23 +1434,54 @@ fn list_command(scope: Option<String>) -> Result<()> {
         println!("no runs");
         return Ok(());
     }
+    println!("RUN\tSTATUS\tSCOPE\tUPDATED\tMATERIALIZED\tGOAL");
     for run in runs {
         println!(
-            "{}\t{}\t{}\t{}\t{}",
-            run.run_id, run.status, run.scope, run.updated_at, run.goal
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            run.run_id,
+            run.status,
+            run.scope,
+            run.updated_at,
+            materialized_status(&paths, &run),
+            run.goal
         );
     }
     Ok(())
 }
 
-fn attach_command(run_id: String) -> Result<()> {
+fn materialized_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEntry) -> String {
+    if run.status != RunStatus::Completed {
+        return "n/a".to_string();
+    }
+    let marker = paths
+        .library_dir(&run.scope, &run.run_id)
+        .join(".materialized-to");
+    let count = fs::read_to_string(marker)
+        .ok()
+        .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0);
+    match count {
+        0 => "no".to_string(),
+        1 => "yes (1 time)".to_string(),
+        count => format!("yes ({count} times)"),
+    }
+}
+
+fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     if io::stdout().is_terminal() {
         attach_tui(&paths, &run_id)?;
+        let state = load_run(&paths, &run_id)?;
+        if state.status == RunStatus::Completed && !no_hints {
+            print_lifecycle_hints(&state);
+        }
         return Ok(());
     }
     let state = load_run(&paths, &run_id)?;
     print_run_summary(&state);
+    if state.status == RunStatus::Completed && !no_hints {
+        print_lifecycle_hints(&state);
+    }
     Ok(())
 }
 
@@ -1584,6 +1628,11 @@ fn undo_command(run: Option<String>, turn: Option<u32>) -> Result<()> {
 fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = load_run(&paths, &run_id)?;
+    if let Some(marker) = read_parent_marker(&state.working_dir)?
+        && marker.kind == "extended"
+    {
+        println!("Extended from {}", marker.parent_run_id);
+    }
     println!("{}", serde_json::to_string_pretty(&state)?);
     let provenance_path = state.run_root.join("provenance.jsonl");
     if provenance_path.exists() {
@@ -1610,6 +1659,15 @@ fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn read_parent_marker(root: &Path) -> Result<Option<ParentMarker>> {
+    let path = root.join(".deadreckon/parent.json");
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Io(source)),
+    }
 }
 
 fn import_command(source: String) -> Result<()> {
@@ -1814,6 +1872,18 @@ fn print_run_locations(state: &deadreckon_core::PipelineState) {
     } else {
         println!("working {}", state.working_dir.display());
     }
+}
+
+fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
+    let task_prefix = state.task_key.chars().take(24).collect::<String>();
+    println!(
+        "materialize: deadreckon materialize {} --dest ./{}",
+        state.run_id, task_prefix
+    );
+    println!(
+        "extend:      deadreckon extend {} '<your follow-up goal>'",
+        state.run_id
+    );
 }
 
 fn attach_tui(paths: &DeadreckonPaths, run_id: &str) -> Result<()> {
