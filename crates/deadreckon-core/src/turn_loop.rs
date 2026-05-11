@@ -78,6 +78,13 @@ pub async fn run_turn_loop(
             max_output_tokens: 2048,
             cwd: Some(state.working_dir.clone()),
             output_path: Some(turn_dir.join(stdout_name)),
+            sandbox_backend: Some(config.sandbox_backend),
+            pid_file: Some(
+                state
+                    .run_root
+                    .join("child-pids")
+                    .join(format!("provider-turn-{turn}.pid")),
+            ),
         };
 
         let started = Instant::now();
@@ -169,6 +176,12 @@ pub async fn run_turn_loop(
                     args: vec![OsString::from("-lc"), OsString::from(command.clone())],
                     env: BTreeMap::new(),
                     allow_network: false,
+                    pid_file: Some(
+                        state
+                            .run_root
+                            .join("child-pids")
+                            .join(format!("tool-{tool_call_id}.pid")),
+                    ),
                 })
                 .await?;
                 append_trace(

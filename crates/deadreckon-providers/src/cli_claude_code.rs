@@ -1,14 +1,14 @@
-use std::path::PathBuf;
 use std::time::Instant;
 
 use serde_json::json;
-use tokio::process::Command;
 use which::which;
 
+use crate::cli_common::{run_cli, write_output};
 use crate::{
-    Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
-    ProviderResponse, ProviderUsage, Result, SpendEstimate,
+    Provider, ProviderEntry, ProviderFuture, ProviderKind, ProviderRequest, ProviderResponse,
+    ProviderUsage, Result, SpendEstimate,
 };
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct CliClaudeCodeProvider {
@@ -39,7 +39,15 @@ impl CliClaudeCodeProvider {
             "-p".to_string(),
             request.prompt.clone(),
         ]);
-        let output = run_cli(&self.name, &self.binary, &args, request.cwd.clone()).await?;
+        let output = run_cli(
+            &self.name,
+            &self.binary,
+            &args,
+            request.cwd.clone(),
+            request.sandbox_backend,
+            request.pid_file.clone(),
+        )
+        .await?;
         write_output(request.output_path.as_ref(), &output).await?;
         let wall_time_seconds = started.elapsed().as_secs_f64();
         let usage = ProviderUsage {
@@ -62,6 +70,9 @@ impl CliClaudeCodeProvider {
                 "stdout_path": request.output_path,
                 "duration_ms": (wall_time_seconds * 1000.0).round() as u64,
                 "exit_code": output.status_code,
+                "pid": output.pid,
+                "sandbox_backend": output.sandbox_backend,
+                "sandbox_warning": output.sandbox_warning,
             }),
         })
     }
@@ -99,59 +110,6 @@ impl Provider for CliClaudeCodeProvider {
     fn complete<'a>(&'a self, request: &'a ProviderRequest) -> ProviderFuture<'a> {
         Box::pin(async move { self.run(request).await })
     }
-}
-
-#[derive(Debug)]
-struct CliOutput {
-    stdout: String,
-    stderr: String,
-    status_code: Option<i32>,
-}
-
-async fn run_cli(
-    provider: &str,
-    binary: &str,
-    args: &[String],
-    cwd: Option<PathBuf>,
-) -> Result<CliOutput> {
-    let mut command = Command::new(binary);
-    command.args(args);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    let output = command
-        .output()
-        .await
-        .map_err(|source| ProviderError::Cli {
-            provider: provider.to_string(),
-            detail: source.to_string(),
-        })?;
-    Ok(CliOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        status_code: output.status.code(),
-    })
-}
-
-async fn write_output(path: Option<&PathBuf>, output: &CliOutput) -> Result<()> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|source| ProviderError::Io {
-                path: parent.display().to_string(),
-                source,
-            })?;
-    }
-    let body = format!("{}\n{}", output.stdout, output.stderr);
-    tokio::fs::write(path, body)
-        .await
-        .map_err(|source| ProviderError::Io {
-            path: path.display().to_string(),
-            source,
-        })
 }
 
 trait WithWallTime {

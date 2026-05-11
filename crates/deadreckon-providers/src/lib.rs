@@ -6,9 +6,11 @@ use std::pin::Pin;
 
 pub mod cli_claude_code;
 pub mod cli_codex;
+mod cli_common;
 
 use cli_claude_code::CliClaudeCodeProvider;
 use cli_codex::CliCodexProvider;
+use deadreckon_sandbox::SandboxBackend;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -80,6 +82,8 @@ pub struct ProviderRequest {
     pub max_output_tokens: u32,
     pub cwd: Option<PathBuf>,
     pub output_path: Option<PathBuf>,
+    pub sandbox_backend: Option<SandboxBackend>,
+    pub pid_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -653,6 +657,8 @@ api_key = "test"
                 max_output_tokens: 16,
                 cwd: None,
                 output_path: None,
+                sandbox_backend: None,
+                pid_file: None,
             })
             .await
             .expect_err("missing credentials");

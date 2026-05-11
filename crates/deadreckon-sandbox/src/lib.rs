@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,7 @@ pub struct SandboxSpec {
     pub args: Vec<OsString>,
     pub env: BTreeMap<String, String>,
     pub allow_network: bool,
+    pub pid_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +83,7 @@ pub struct SandboxCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxRunOutput {
     pub backend: SandboxBackend,
+    pub pid: Option<u32>,
     pub status_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
@@ -97,14 +100,27 @@ pub struct BackendAvailability {
 
 pub async fn run(spec: SandboxSpec) -> Result<SandboxRunOutput> {
     let command = build_command(&spec)?;
-    let output = Command::new(&command.program)
+    let child = Command::new(&command.program)
         .args(&command.args)
         .current_dir(&command.cwd)
         .envs(&command.env)
-        .output()
-        .await?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    if let (Some(pid), Some(pid_file)) = (pid, spec.pid_file.as_ref()) {
+        if let Some(parent) = pid_file.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(pid_file, format!("{pid}\n")).await?;
+    }
+    let output = child.wait_with_output().await?;
+    if let Some(pid_file) = spec.pid_file.as_ref() {
+        let _ = tokio::fs::remove_file(pid_file).await;
+    }
     Ok(SandboxRunOutput {
         backend: command.backend,
+        pid,
         status_code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
@@ -128,7 +144,7 @@ pub fn build_command(spec: &SandboxSpec) -> Result<SandboxCommand> {
             cwd: spec.cwd.clone(),
             warning: warning.or_else(|| {
                 Some(
-                    "sandbox backend none is unsafe; V0 permits it only for explicit smoke runs"
+                    "sandbox backend none is unsafe; use only for explicit local verification"
                         .to_string(),
                 )
             }),
@@ -343,6 +359,7 @@ mod tests {
             args: vec![OsString::from("-c"), OsString::from("printf ok")],
             env: BTreeMap::new(),
             allow_network: false,
+            pid_file: None,
         }
     }
 
@@ -351,6 +368,7 @@ mod tests {
         let output = run(shell_spec()).await.expect("run");
         assert_eq!(output.status_code, Some(0));
         assert_eq!(output.stdout, "ok");
+        assert!(output.pid.is_some());
         assert!(output.warning.expect("warning").contains("unsafe"));
     }
 

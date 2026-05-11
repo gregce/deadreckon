@@ -68,6 +68,8 @@ async fn mock_provider_records_three_turns() {
                 max_output_tokens: 1024,
                 cwd: None,
                 output_path: None,
+                sandbox_backend: None,
+                pid_file: None,
             })
             .await
             .expect("completion");
@@ -116,6 +118,8 @@ async fn mock_provider_supports_error_fixture() {
             max_output_tokens: 16,
             cwd: None,
             output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
         })
         .await
         .expect_err("fixture error");

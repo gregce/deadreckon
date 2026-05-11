@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
@@ -252,7 +253,7 @@ fn attach_command(run_id: String) -> Result<()> {
 fn kill_command(run_id: String) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = load_run(&paths, &run_id)?;
-    let pids = state.child_pids.clone();
+    let pids = supervised_pids(&state);
     release_lock_file(&paths, &state.task_key)?;
     state.status = RunStatus::Killed;
     state.failure_reason = Some("killed by user".to_string());
@@ -281,6 +282,23 @@ fn kill_command(run_id: String) -> Result<()> {
     }
     println!("killed run {}", state.run_id);
     Ok(())
+}
+
+fn supervised_pids(state: &deadreckon_core::PipelineState) -> Vec<u32> {
+    let mut pids = state.child_pids.iter().copied().collect::<BTreeSet<_>>();
+    let pid_dir = state.run_root.join("child-pids");
+    if let Ok(entries) = std::fs::read_dir(pid_dir) {
+        for entry in entries.flatten() {
+            if let Ok(raw) = std::fs::read_to_string(entry.path()) {
+                for line in raw.lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        pids.insert(pid);
+                    }
+                }
+            }
+        }
+    }
+    pids.into_iter().collect()
 }
 
 async fn resume_command(run_id: String) -> Result<()> {
