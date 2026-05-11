@@ -4,7 +4,7 @@
 
 `deadreckon` is a Rust 2024 CLI harness for unattended long-running coding tasks. The default user flow is `deadreckon run <goal>`: create durable run state, select a BYOK provider route, execute turns in a disposable sandbox, write spend/provenance/traces/snapshots after every turn, and make the run attachable, resumable, killable, inspectable, and undoable.
 
-The V0 implementation is intentionally local-first. Runtime state defaults to `/Users/gdc/.deadreckon/`, and tests/smoke runs can override that with `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke` so this build process does not write outside the allowed implementation tree.
+The V0 implementation is intentionally local-first. Runtime state defaults to `/Users/gdc/.deadreckon/`, and tests or explicit smoke runs can override that with `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke` so this build process does not write outside the allowed implementation tree.
 
 ## Reference Patterns
 
@@ -25,7 +25,7 @@ The V0 implementation is intentionally local-first. Runtime state defaults to `/
 Source lives under `/Users/gdc/deadreckon/`:
 
 - `crates/deadreckon-core`: run paths, phase machine, JSON state, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports.
-- `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, and OpenAI-compatible adapters, fallback routing, spend estimates.
+- `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, OpenAI-compatible, `cli:claude-code`, `cli:codex`, and explicit `--smoke` scripted adapters, fallback routing, spend estimates.
 - `crates/deadreckon-sandbox`: `sandbox-exec`, `bwrap`, `docker`, and `none` backends using `tokio::process::Command`; default `auto`.
 - `crates/deadreckon`: clap CLI, ratatui attach UI, run/list/attach/kill/resume/undo/show/import/doctor.
 - `skills/default-coding/SKILL.md`: Markdown skill loaded at runtime.
@@ -46,7 +46,9 @@ Source lives under `/Users/gdc/deadreckon/`:
 
 ## V0 Execution Model
 
-V0 uses a deterministic local coding turn for smokeable, keyless development and routes provider calls through the BYOK router when credentials are present. The deterministic turn still writes the same spend, trace, snapshot, and provenance records as a provider-driven turn, so the harness primitives are exercised without requiring this repository to hold user keys.
+The primary path is provider-driven: `deadreckon run <goal>` creates state, calls `ProviderRouter::complete`, parses model actions, executes tool calls in the configured sandbox, feeds results into history, and repeats until a provider returns `done`, a spend cap pauses the run, or the run is killed. HTTP providers use user-supplied keys or env vars; CLI providers use local subscription CLIs and run through the deadreckon sandbox wrapper.
+
+For keyless local verification only, `deadreckon run --smoke <goal>` selects the `smoke` provider explicitly. That scripted provider still goes through the same turn loop, sandbox dispatch, snapshots, spend records, traces, provenance, and external `dr-gate` acceptance marker; it is not the default run path.
 
 The default skill is Markdown and external to the binary. The binary loads it and records the skill name/path in state; it does not parse or mutate skill internals.
 
@@ -55,6 +57,7 @@ The default skill is Markdown and external to the binary. The binary loads it an
 - Runtime writes during verification: the rider prescribes `/Users/gdc/.deadreckon/`, while the build instruction forbids edits outside `/Users/gdc/deadreckon/` and `/Users/gdc/stoa/docs/goals/`. The binary defaults to `/Users/gdc/.deadreckon/`, but all repository verification uses `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke`.
 - Sub-agent forking: the architecture requires the pattern, but the V1 list explicitly moves `deadreckon fork` to V1. V0 records scope/session lineage and keeps the subprocess skill boundary; explicit multi-agent forks are documented in `docs/V1-CANDIDATES.md`.
 - Sandbox fallback: on macOS `auto` selects `sandbox-exec` if available. If not available, or on Linux without `bwrap`, `doctor` reports the missing binary and `run` falls back to `none` with a warning, matching the rider.
+- Live Tier C CLI verification: `claude` and `codex` are present on this machine, but running either can write subscription-tool session state outside `/Users/gdc/deadreckon/`. The checked-in verification therefore uses fake CLI binaries plus sandbox-wrapped provider tests unless the user explicitly approves a live subscription run.
 
 ## Verification
 
@@ -66,7 +69,7 @@ cargo build --release
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
-DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon run "tiny hello rust" --sandbox none --max-spend 1
+DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon run "tiny hello rust" --smoke --sandbox none --max-spend 1
 ```
 
-`demo.cast` records the smoke path without relying on provider credentials.
+`demo.cast` records real release-binary output from the explicit keyless smoke path without relying on provider credentials.

@@ -1,23 +1,25 @@
 # deadreckon Primary Flow Gap Analysis
 
-Audit date: 2026-05-11. Scope: `/Users/gdc/deadreckon/` after commit `bac0337`.
+Audit date: 2026-05-11. Scope: `/Users/gdc/deadreckon/`.
 
-| phase | audited hole | evidence | decision / fix direction |
-|---:|---|---|---|
-| 0 | Default `deadreckon run` is a hardcoded smoke fallback, not a provider-driven agent loop. | `crates/deadreckon/src/main.rs:603` defines `coding_turn_script()`; `crates/deadreckon/src/main.rs:212-219` runs that fixed shell script. | Replace with core turn loop that calls `ProviderRouter::complete`, parses actions, executes sandboxed tools, and only keeps a labeled `--smoke` path. |
-| 0 | Provider router is not used for completions in the run loop. | `crates/deadreckon/src/main.rs:166-168` builds a router but only calls `estimate_for_route`; `ProviderRouter::complete` exists in `crates/deadreckon-providers/src/lib.rs:329`. | Run loop must call `complete()` each turn and record LLM request/response traces. |
-| 0 | No model-to-tool protocol exists. | `crates/deadreckon-providers/src/lib.rs:65-75` has raw text response fields only; no action/tool-call schema in core. | Add JSON action protocol: `bash`, `write_file`, `done`; feed tool results back as conversation history. |
-| 0 | No CLI sub-agent providers exist. | `crates/deadreckon-providers/src/` only has `lib.rs`; no `cli_claude_code.rs` or `cli_codex.rs`; Tier B grep would fail. | Add `cli:claude-code` and `cli:codex` providers implementing `Provider`. |
-| 0 | `kill` does not interrupt live work. | `crates/deadreckon/src/main.rs:337-346` only releases lock and marks failed; no child PID or in-flight HTTP cancellation. | Persist process info and use PID signaling for child work; run loop polls kill marker/cancel status. |
-| 0 | `resume` does not continue a conversation. | `crates/deadreckon/src/main.rs:350-371` only clears failure/pause and marks planned. | Reconstruct history from JSONL and continue from the next turn. |
-| 0 | State cannot represent killed runs or child supervision. | `crates/deadreckon-core/src/state.rs:15-21` has no `Killed`; `PipelineState` has no `child_pids` or `killed_at`. | Extend state schema with `Killed`, `child_pids`, `killed_at`, and history helpers. |
-| 0 | Anti-self-attestation gate is absent. | No `dr-gate` binary in `crates/deadreckon/src/bin/`; no `proofs/turn-acceptance.json` validator. | Add separate `dr-gate` binary and validation before completed status. |
-| 0 | Provenance IDs are not tied to trace IDs. | `crates/deadreckon/src/main.rs:255` generates a UUID for provenance after the sandbox trace at `:227`; no matching trace field is written. | Each tool trace must carry `tool_call_id`; provenance must reuse that ID. |
-| 0 | Demo cast is hand-authored smoke output. | `demo.cast:7-15` contains placeholder run ID `000000...`; `DESIGN.md:72` says it records smoke path. | Replace with an actual recorded or generated cast from real command output after Tier A/B pass. |
-| 0 | Keyless tests do not prove agentic behavior. | Existing tests cover state, locks, provider parsing, sandbox wrapper; no `tests/agentic-loop/` or mock-server recorder. | Add mock OpenAI-compatible provider fixtures and integration tests for ≥3 requests/turns/traces/spend lines. |
-| 0 | Original UX commitments are incomplete. | V0 rider requires `init`, `config get/set`, actionable `doctor`, default max spend; current `Commands` enum lacks `Init` and `Config` and `run` has no default cap. | Track as original-rider invariant debt; implement if needed for final completion audit. |
+## Primary-Flow Findings
 
-Conflicts logged:
+| finding | status | evidence |
+|---|---|---|
+| Default run was a fixed local script instead of a provider-driven loop. | Resolved. | `crates/deadreckon-core/src/turn_loop.rs` calls `ProviderRouter::complete`; Tier B grep confirms no `coding_turn_script`, `hardcoded_smoke`, or `fn smoke_turn` remains under `crates/`. |
+| Provider router existed but was unused by `run`. | Resolved. | `crates/deadreckon/src/main.rs` builds a router for normal runs, and `run_turn_loop` records `llm.complete` traces per turn. |
+| No model-to-tool protocol existed. | Resolved. | `turn_loop.rs` accepts JSON `bash`, `write_file`, and `done` actions and feeds tool results into `history.json`. |
+| CLI sub-agent providers were missing. | Resolved. | `crates/deadreckon-providers/src/cli_claude_code.rs`, `cli_codex.rs`, and `cli_common.rs` implement `cli:claude-code` and `cli:codex`; tests use fake binaries and verify sandbox wrapping. |
+| `kill` could not interrupt live work. | Resolved for the harness process and sandbox child pids. | `state.json` persists `child_pids`; sandbox/provider pid files live under `child-pids/`; `deadreckon kill` signals both sources and marks status `killed`. |
+| `resume` did not continue execution. | Resolved. | `deadreckon resume` reloads state/history and re-enters `run_turn_loop`; integration tests verify history survives. |
+| Anti-self-attestation gate was absent. | Resolved. | `crates/deadreckon/src/bin/dr-gate.rs` writes `proofs/turn-acceptance.json`; core validates `run_id`, producer, and pass status before completion. |
+| Provenance IDs were not tied to traces. | Resolved. | Tool traces carry `tool_call_id`; provenance records reuse those ids; integration tests assert every provenance id appears in traces. |
+| Demo cast was hand-authored placeholder output. | Resolved. | `demo.cast` now contains asciicast v2 JSON generated from real release-binary `doctor/run/list/attach/undo/show` output using `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke`. |
+| Keyless tests did not prove agentic behavior. | Resolved. | `cargo test --workspace` includes mock OpenAI-compatible provider tests, three-turn integration, kill, resume-history, acceptance-marker, and fake CLI-provider tests. |
 
-- `asciinema` is not installed in the current environment. The final demo must still keep `demo.cast` as asciicast v2 JSON; if live `asciinema rec` is unavailable, generate the cast from captured real command output and record that limitation here.
+## Logged Decisions
+
+- API keys are not required for Tier A/B verification. The keyless paths are the OpenAI-compatible mock provider in tests and the explicit `--smoke` scripted provider for local release-binary demos.
+- `claude` and `codex` are present, but live Tier C runs can write their own session state outside `/Users/gdc/deadreckon/`. The implementation path is tested with fake CLI binaries unless the user explicitly approves a live subscription run.
+- `asciinema` is not installed in the current environment. `demo.cast` is therefore generated from captured real command output and kept in asciicast v2 format.
 - Existing untracked `.cursorindexingignore` is outside the task scope and was not created or modified by deadreckon work.

@@ -6,7 +6,10 @@ Rust agentic CLI harness for unattended long-running coding tasks with local-fir
 cd /Users/gdc/deadreckon
 cargo build --release
 DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon doctor
-DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon run "tiny hello rust" --sandbox none --max-spend 1
+DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon run "tiny hello rust" --smoke --sandbox none --max-spend 1
 ```
 
 Runtime state defaults to `/Users/gdc/.deadreckon/`. Set `DEADRECKON_HOME` for tests or isolated local runs.
+
+Normal runs use the configured provider router at `/Users/gdc/.deadreckon/config.toml`.
+The `--smoke` flag is only for keyless local verification.
