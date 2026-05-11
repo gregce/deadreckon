@@ -1651,6 +1651,19 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             parent.run_id, parent.status
         ))));
     }
+    let parent_codebase = read_codebase_record(&parent.working_dir).ok();
+    if parent_codebase
+        .as_ref()
+        .is_some_and(|record| record.mode == CodebaseMode::InPlace)
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "extend is not available for in-place runs",
+            &format!(
+                "deadreckon run --in-place --i-know-its-a-lot {:?}",
+                new_goal
+            ),
+        )));
+    }
     let parent_library = paths.library_dir(&parent.scope, &parent.run_id);
     if !parent_library.is_dir() {
         return Err(CliError::Core(DeadreckonError::NotFound(
@@ -1673,6 +1686,25 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     } else {
         std::env::current_dir()?
     };
+    let context_turns = context_turns(max_context_turns, no_context);
+    if let Some(parent_record) = parent_codebase
+        .as_ref()
+        .filter(|record| record.mode == CodebaseMode::Worktree)
+    {
+        return extend_worktree_command(ExtendWorktreeArgs {
+            paths,
+            parent,
+            parent_record: parent_record.clone(),
+            new_goal,
+            effective_provider,
+            effective_max_spend,
+            effective_max_wall_seconds,
+            backend,
+            post_actions,
+            context_turns,
+        })
+        .await;
+    }
     let mut state = create_run(
         &paths,
         RunOptions {
@@ -1713,7 +1745,6 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         state.working_dir = dest;
     }
     seed_working_from_library(&parent_library, &state.working_dir)?;
-    let context_turns = context_turns(max_context_turns, no_context);
     write_parent_marker(
         &state.working_dir.join(".deadreckon").join("parent.json"),
         extended_parent_marker(&parent, &new_goal, context_turns),
@@ -1733,6 +1764,147 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
                 "parent_goal": parent.goal,
                 "parent_completed_at": parent.updated_at,
                 "context_turns_included": context_turns,
+            }),
+        },
+    )?;
+    state.child_pids = vec![std::process::id()];
+    state.updated_at = Utc::now();
+    save_state(&state)?;
+
+    state.set_phase_status(PhaseId(20), PhaseStatus::Executing)?;
+    save_state(&state)?;
+    lock.heartbeat("provider")?;
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), effective_provider.as_deref())?;
+    state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
+    save_state(&state)?;
+    lock.heartbeat("turn-loop")?;
+    let outcome = run_turn_loop(
+        &mut state,
+        &router,
+        RunLoopConfig {
+            provider: effective_provider,
+            max_spend_usd: effective_max_spend,
+            max_wall_seconds: effective_max_wall_seconds,
+            sandbox_backend: backend,
+            max_turns: 12,
+            from_turn: None,
+            event_sender: None,
+            cancellation_token: None,
+        },
+    )
+    .await?;
+    state.child_pids.clear();
+    save_state(&state)?;
+    lock.release()?;
+
+    let completed = outcome == RunLoopOutcome::Done;
+    match outcome {
+        RunLoopOutcome::Done => println!("completed extended run {}", state.run_id),
+        RunLoopOutcome::PausedAtCap => println!("paused extended run {}", state.run_id),
+        RunLoopOutcome::Killed => println!("killed extended run {}", state.run_id),
+        RunLoopOutcome::Failed => println!("failed extended run {}", state.run_id),
+    }
+    print_run_locations(&state);
+    if completed && post_actions {
+        Box::pin(complete_run_actions(&state, true)).await?;
+    }
+    Ok(())
+}
+
+struct ExtendWorktreeArgs {
+    paths: DeadreckonPaths,
+    parent: deadreckon_core::PipelineState,
+    parent_record: CodebaseRecord,
+    new_goal: String,
+    effective_provider: Option<String>,
+    effective_max_spend: Option<f64>,
+    effective_max_wall_seconds: Option<f64>,
+    backend: SandboxBackend,
+    post_actions: bool,
+    context_turns: Option<u32>,
+}
+
+async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
+    let ExtendWorktreeArgs {
+        paths,
+        parent,
+        parent_record,
+        new_goal,
+        effective_provider,
+        effective_max_spend,
+        effective_max_wall_seconds,
+        backend,
+        post_actions,
+        context_turns,
+    } = args;
+    let parent_branch = parent_record.branch_name.clone().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "parent worktree record missing branch_name".to_string(),
+        ))
+    })?;
+    let source_git_root = parent_record.source_git_root.clone().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "parent worktree record missing source_git_root".to_string(),
+        ))
+    })?;
+    let run_id = Uuid::new_v4().simple().to_string();
+    let mut codebase = prepare_worktree_record(
+        &paths,
+        WorktreeOptions {
+            run_id: run_id.clone(),
+            task_key: deadreckon_core::paths::task_key(&new_goal),
+            source_path: source_git_root.clone(),
+            base_ref: Some(parent_branch.clone()),
+            branch_name: None,
+            allow_dirty: false,
+        },
+    )?;
+    codebase.parent_branch = Some(parent_branch);
+    create_worktree(&codebase)?;
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: new_goal.clone(),
+            cwd: source_git_root,
+            sandbox: backend.to_string(),
+            provider: effective_provider.clone(),
+            skill_name: parent.skill_name.clone(),
+            max_spend_usd: effective_max_spend,
+            max_wall_seconds: effective_max_wall_seconds,
+            run_id: Some(run_id),
+            codebase: Some(codebase),
+        },
+    )?;
+
+    let mut lock = acquire_lock(
+        &paths,
+        &parent.task_key,
+        &state.run_id,
+        &parent.scope,
+        "extend",
+        deadreckon_core::lock::DEFAULT_STALE_AFTER,
+    )?;
+    write_parent_marker(
+        &state.working_dir.join(".deadreckon").join("parent.json"),
+        extended_parent_marker(&parent, &new_goal, context_turns),
+    )?;
+    write_parent_history(&state, &parent, context_turns)?;
+    append_trace(
+        &state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn: 0,
+            event: "extended_from_parent".to_string(),
+            latency_ms: None,
+            detail: json!({
+                "parent_run_id": parent.run_id,
+                "parent_scope": parent.scope,
+                "parent_goal": parent.goal,
+                "parent_completed_at": parent.updated_at,
+                "context_turns_included": context_turns,
+                "mode": "worktree",
             }),
         },
     )?;

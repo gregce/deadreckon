@@ -9,9 +9,9 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use deadreckon_core::{
-    DeadreckonPaths, PhaseId, PhaseStatus, PipelineState, RunOptions, RunStatus, TraceRecord,
-    acquire_lock, append_trace, create_run, list_runs, load_run, promote_completed_run, save_state,
-    write_acceptance_marker,
+    CodebaseMode, DeadreckonPaths, PhaseId, PhaseStatus, PipelineState, RunOptions, RunStatus,
+    TraceRecord, acquire_lock, append_trace, create_run, list_runs, load_run,
+    promote_completed_run, read_codebase_record, save_state, write_acceptance_marker,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -315,6 +315,154 @@ async fn materialize_then_extend_roundtrip() {
     assert!(child.working_dir.join("child.txt").exists());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extend_in_worktree_chains_branches() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let parent_run = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("worktree parent")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .arg("--no-hints")
+        .output()
+        .expect("parent run");
+    assert_success(&parent_run);
+    let parent = load_run(&paths, &run_id_from_stdout(&parent_run)).expect("parent");
+    let parent_record = read_codebase_record(&parent.working_dir).expect("parent codebase");
+    let parent_branch = parent_record.branch_name.clone().expect("parent branch");
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+
+    let output = extend_command(&paths, &parent, "worktree child")
+        .current_dir(&repo)
+        .output()
+        .expect("extend");
+
+    assert_success(&output);
+    let child = load_run(&paths, &extended_run_id(&output)).expect("child");
+    let child_record = read_codebase_record(&child.working_dir).expect("child codebase");
+    assert_eq!(child_record.mode, CodebaseMode::Worktree);
+    assert_eq!(
+        child_record.base_ref.as_deref(),
+        Some(parent_branch.as_str())
+    );
+    assert_eq!(
+        child_record.parent_branch.as_deref(),
+        Some(parent_branch.as_str())
+    );
+    assert_ne!(child_record.branch_name.as_ref(), Some(&parent_branch));
+    assert!(child_record.worktree_path.expect("child worktree").exists());
+    assert!(child.working_dir.join("child.txt").exists());
+    assert_eq!(
+        parent_json(&child.working_dir)["kind"]
+            .as_str()
+            .expect("kind"),
+        "extended"
+    );
+    git(&repo, &["rev-parse", "--verify", &parent_branch]).expect("parent branch");
+    git(
+        &repo,
+        &[
+            "rev-parse",
+            "--verify",
+            child_record.branch_name.as_deref().expect("child branch"),
+        ],
+    )
+    .expect("child branch");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extend_in_copy_unchanged_from_today() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("source");
+    fs::create_dir_all(&source).expect("source");
+    fs::write(source.join("app.txt"), "copy parent").expect("app");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let parent_run = deadreckon(&paths)
+        .current_dir(temp.path())
+        .arg("run")
+        .arg("copy parent")
+        .arg("--from")
+        .arg(&source)
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .arg("--no-hints")
+        .output()
+        .expect("parent run");
+    assert_success(&parent_run);
+    let parent = load_run(&paths, &run_id_from_stdout(&parent_run)).expect("parent");
+    assert_eq!(
+        read_codebase_record(&parent.working_dir)
+            .expect("parent codebase")
+            .mode,
+        CodebaseMode::Copy
+    );
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+
+    let output = extend_command(&paths, &parent, "copy child")
+        .output()
+        .expect("extend");
+
+    assert_success(&output);
+    let child = load_run(&paths, &extended_run_id(&output)).expect("child");
+    assert_eq!(
+        fs::read_to_string(child.working_dir.join("app.txt")).expect("app"),
+        "copy parent"
+    );
+    assert_eq!(
+        fs::read_to_string(child.working_dir.join("child.txt")).expect("child"),
+        "extended child"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extend_in_in_place_refuses_with_run_hint() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("source");
+    fs::create_dir_all(&source).expect("source");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let parent_run = deadreckon(&paths)
+        .current_dir(&source)
+        .arg("run")
+        .arg("in-place parent")
+        .arg("--in-place")
+        .arg("--i-know-its-a-lot")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .arg("--no-hints")
+        .output()
+        .expect("parent run");
+    assert_success(&parent_run);
+    let parent = load_run(&paths, &run_id_from_stdout(&parent_run)).expect("parent");
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+
+    let output = extend_command(&paths, &parent, "in-place child")
+        .output()
+        .expect("extend");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("extend is not available for in-place runs"));
+    assert!(stderr.contains("try: deadreckon run --in-place --i-know-its-a-lot"));
+}
+
 #[test]
 fn list_shows_materialized_status() {
     let temp = repo_tempdir();
@@ -502,6 +650,38 @@ fn repo_tempdir() -> TempDir {
     let root = std::path::Path::new("/Users/gdc/deadreckon/.test-tmp");
     fs::create_dir_all(root).expect("test tmp root");
     TempDir::new_in(root).expect("tempdir")
+}
+
+fn clean_git_repo(temp: &TempDir) -> std::path::PathBuf {
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    git(&repo, &["init"]).expect("git init");
+    fs::write(repo.join("README.md"), "hello").expect("readme");
+    git(&repo, &["add", "-A"]).expect("add");
+    git(&repo, &["commit", "-m", "initial"]).expect("commit");
+    repo
+}
+
+fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
+    let output = Command::new("git").current_dir(cwd).args(args).output()?;
+    if args.first() == Some(&"init") && output.status.success() {
+        let _ = Command::new("git")
+            .current_dir(cwd)
+            .args(["config", "user.email", "deadreckon@example.invalid"])
+            .output();
+        let _ = Command::new("git")
+            .current_dir(cwd)
+            .args(["config", "user.name", "deadreckon"])
+            .output();
+    }
+    assert!(
+        output.status.success(),
+        "git {:?}\nstdout:{}\nstderr:{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }
 
 fn deadreckon(paths: &DeadreckonPaths) -> Command {

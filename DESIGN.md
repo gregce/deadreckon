@@ -76,9 +76,11 @@ unless `--keep-branch` is used, the temporary branch.
 Copy and fresh runs use `deadreckon materialize <run-id> --dest <path>` to copy
 the library artifact to a user-owned path, write `.deadreckon/parent.json`, and
 record the reverse `.materialized-to` marker in the library. `deadreckon extend
-<run-id> "follow-up goal"` creates a fresh run in the parent's scope/task lock,
-seeds the new working tree from the parent library, stores parent lineage in
-`working/.deadreckon/parent.json`, and starts the normal turn loop with reset
+<run-id> "follow-up goal"` preserves the parent's mode semantics: worktree
+parents create a child `dr/...` branch off the parent branch, copy/fresh parents
+seed a new working tree from the parent library, and in-place parents refuse with
+a direct `run --in-place` hint. Extended runs store parent lineage in
+`working/.deadreckon/parent.json` and start the normal turn loop with reset
 resource caps.
 
 Lineage and codebase mode metadata intentionally stay outside `PipelineState`;

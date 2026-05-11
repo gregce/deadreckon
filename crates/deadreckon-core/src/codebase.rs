@@ -46,6 +46,8 @@ pub struct CodebaseRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<PathBuf>,
     pub dirty_files_seeded: bool,
     pub head_was_detached: bool,
@@ -63,6 +65,7 @@ impl CodebaseRecord {
             branch_name: None,
             base_ref: None,
             base_sha: None,
+            parent_branch: None,
             worktree_path: None,
             dirty_files_seeded: false,
             head_was_detached: false,

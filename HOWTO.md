@@ -248,6 +248,14 @@ library artifact into a normal directory, `e` to start a child run from the
 completed artifact, or `s` to inspect state and lineage. Pass `--no-hints` to
 `run` or `attach` when scripting.
 
+`extend` is still available for completed worktree runs from the CLI. It creates
+a new `dr/...` branch from the parent run's branch, so the follow-up keeps the
+parent changes without applying them to your checkout first:
+
+```bash
+deadreckon extend <worktree-run-id> "continue with the next change"
+```
+
 ## List, Show, Kill, Resume
 
 ```bash

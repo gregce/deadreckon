@@ -1,11 +1,12 @@
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use deadreckon_core::{
     CodebaseMode, CodebaseRecord, DeadreckonPaths, ModeFlags, ResolvedMode, RunOptions, RunStatus,
-    WorktreeOptions, create_run, list_runs, load_run, prepare_worktree_record,
-    read_codebase_record, record_for_resolved_mode, resolve_mode, write_codebase_record,
+    WorktreeOptions, create_run, create_worktree, list_runs, load_run, prepare_worktree_record,
+    read_codebase_record, record_for_resolved_mode, resolve_mode, save_state,
+    write_codebase_record,
 };
 use tempfile::TempDir;
 
@@ -533,6 +534,156 @@ fn non_tty_without_yes_refuses() {
 }
 
 #[test]
+fn non_git_interactive_offers_three_choices_with_init_default() {
+    let temp = TempDir::new().expect("tempdir");
+    let source = temp.path().join("plain");
+    fs::create_dir_all(&source).expect("source");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon_pty(
+        &paths,
+        &source,
+        "3\n",
+        &["run", "interactive choices", "--smoke", "--yes"],
+    );
+
+    assert_success(&output);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(text.contains("this is not a git repo. options:"));
+    assert!(text.contains("[1] git init for me"));
+    assert!(text.contains("[2] copy mode"));
+    assert!(text.contains("[3] cancel"));
+    assert!(text.contains("choose [1]:"));
+    assert!(!source.join(".git").exists());
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn non_git_choice_init_runs_git_init_then_worktree() {
+    let temp = TempDir::new().expect("tempdir");
+    let source = temp.path().join("plain");
+    fs::create_dir_all(&source).expect("source");
+    fs::write(source.join("app.txt"), "app").expect("app");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon_pty(
+        &paths,
+        &source,
+        "\n",
+        &[
+            "run",
+            "init default",
+            "--smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "1",
+            "--yes",
+            "--no-hints",
+        ],
+    );
+
+    assert_success(&output);
+    assert!(source.join(".git").exists());
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    assert_eq!(record.mode, CodebaseMode::Worktree);
+    assert_eq!(
+        record.source_git_root.expect("git root"),
+        source.canonicalize().expect("canonical")
+    );
+}
+
+#[test]
+fn non_git_choice_copy_resolves_to_copy_mode() {
+    let temp = TempDir::new().expect("tempdir");
+    let source = temp.path().join("plain");
+    fs::create_dir_all(&source).expect("source");
+    fs::write(source.join("app.txt"), "app").expect("app");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon_pty(
+        &paths,
+        &source,
+        "2\n",
+        &[
+            "run",
+            "copy choice",
+            "--smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "1",
+            "--yes",
+            "--no-hints",
+        ],
+    );
+
+    assert_success(&output);
+    assert!(!source.join(".git").exists());
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    assert_eq!(record.mode, CodebaseMode::Copy);
+    assert_eq!(
+        record.source_path.expect("source"),
+        source.canonicalize().expect("canonical")
+    );
+}
+
+#[test]
+fn non_git_choice_cancel_exits_zero_no_changes() {
+    let temp = TempDir::new().expect("tempdir");
+    let source = temp.path().join("plain");
+    fs::create_dir_all(&source).expect("source");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon_pty(
+        &paths,
+        &source,
+        "3\n",
+        &["run", "cancel choice", "--smoke", "--yes"],
+    );
+
+    assert_success(&output);
+    assert!(stdout(&output).contains("cancelled"));
+    assert!(!source.join(".git").exists());
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn non_git_non_interactive_refuses_with_try_line() {
+    let temp = TempDir::new().expect("tempdir");
+    let source = temp.path().join("plain");
+    fs::create_dir_all(&source).expect("source");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&source)
+        .arg("run")
+        .arg("plain non tty")
+        .arg("--smoke")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("non-interactive without a mode flag"));
+    assert!(stderr.contains("try: --fresh or --from . or git init"));
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
 fn copy_mode_respects_gitignore() {
     let temp = repo_tempdir();
     let source = temp.path().join("source");
@@ -711,7 +862,7 @@ fn in_place_run_edits_source_path_directly() {
 }
 
 #[test]
-fn in_place_undo_restores_source_path_snapshot() {
+fn in_place_undo_reverts_via_runstate_snapshot() {
     let temp = repo_tempdir();
     let source = temp.path().join("in-place-source");
     fs::create_dir_all(&source).expect("source");
@@ -936,6 +1087,47 @@ fn apply_cherry_pick_preserves_turn_commits() {
 }
 
 #[test]
+fn apply_conflict_leaves_markers_and_prints_resolve_hint() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    fs::write(repo.join("conflict.txt"), "base\n").expect("conflict");
+    git(&repo, &["add", "conflict.txt"]).expect("add conflict");
+    git(&repo, &["commit", "-m", "add conflict base"]).expect("commit conflict");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+    let state = load_run(&paths, &run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    let worktree = record.worktree_path.clone().expect("worktree");
+
+    fs::write(worktree.join("conflict.txt"), "branch\n").expect("branch conflict");
+    git(&worktree, &["add", "conflict.txt"]).expect("branch add");
+    git(&worktree, &["commit", "-m", "branch conflict"]).expect("branch commit");
+    fs::write(repo.join("conflict.txt"), "main\n").expect("main conflict");
+    git(&repo, &["add", "conflict.txt"]).expect("main add");
+    git(&repo, &["commit", "-m", "main conflict"]).expect("main commit");
+
+    let apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("apply");
+
+    assert!(!apply.status.success());
+    let stderr = stderr(&apply);
+    assert!(stderr.contains("merge produced conflicts"));
+    assert!(stderr.contains(&format!(
+        "try: resolve, then git commit && deadreckon abandon {run_id}"
+    )));
+    assert!(
+        fs::read_to_string(repo.join("conflict.txt"))
+            .expect("conflict markers")
+            .contains("<<<<<<<")
+    );
+}
+
+#[test]
 fn apply_refuses_non_worktree_with_mode_specific_hint() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1010,6 +1202,29 @@ fn apply_refuses_uncompleted_run() {
 }
 
 #[test]
+fn post_apply_hint_includes_git_log_one_stat() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+
+    let apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("apply");
+
+    assert_success(&apply);
+    let stdout = stdout(&apply);
+    assert!(stdout.contains(&format!("applied {run_id} onto")));
+    assert!(stdout.contains("commit "));
+    assert!(stdout.contains("Cargo.toml"));
+    assert!(stdout.contains(&format!("next: deadreckon abandon {run_id}")));
+}
+
+#[test]
 fn abandon_removes_worktree_and_branch() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -1068,6 +1283,65 @@ fn abandon_keep_branch_keeps_branch() {
 }
 
 #[test]
+fn abandon_force_terminates_running_run_then_cleans() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+    let record = prepare_worktree_record(
+        &paths,
+        WorktreeOptions {
+            run_id: run_id.clone(),
+            task_key: "force-abandon".to_string(),
+            source_path: repo.clone(),
+            base_ref: None,
+            branch_name: Some("dr/force-abandon-bbbbbbbb".to_string()),
+            allow_dirty: false,
+        },
+    )
+    .expect("record");
+    create_worktree(&record).expect("worktree");
+    let worktree = record.worktree_path.clone().expect("worktree");
+    let branch = record.branch_name.clone().expect("branch");
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "force abandon".to_string(),
+            cwd: repo.clone(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            run_id: Some(run_id.clone()),
+            codebase: Some(record),
+        },
+    )
+    .expect("run");
+    let mut child = Command::new("sleep").arg("60").spawn().expect("sleep");
+    state.status = RunStatus::Executing;
+    state.child_pids = vec![child.id()];
+    save_state(&state).expect("save");
+
+    let abandon = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("abandon")
+        .arg(&run_id)
+        .arg("--force")
+        .output()
+        .expect("abandon");
+
+    assert_success(&abandon);
+    let _ = child.wait();
+    assert!(!deadreckon_core::pid_is_alive(state.child_pids[0]));
+    assert!(!worktree.exists());
+    assert!(!git_ref_exists(&repo, &branch));
+    let reloaded = load_run(&paths, &run_id).expect("state");
+    assert_eq!(reloaded.status, RunStatus::Killed);
+    assert!(reloaded.run_root.join("abandoned.json").exists());
+}
+
+#[test]
 fn abandon_idempotent_when_already_abandoned() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -1090,6 +1364,53 @@ fn abandon_idempotent_when_already_abandoned() {
 
     assert_success(&second);
     assert!(stdout(&second).contains(&format!("abandoned {run_id}")));
+}
+
+#[test]
+fn abandon_writes_abandoned_json_for_list_visibility() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+
+    let abandon = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("abandon")
+        .arg(&run_id)
+        .output()
+        .expect("abandon");
+    assert_success(&abandon);
+    let state = load_run(&paths, &run_id).expect("state");
+    assert!(state.run_root.join("abandoned.json").exists());
+
+    let list = deadreckon(&paths).arg("list").output().expect("list");
+    assert_success(&list);
+    assert!(stdout(&list).contains("abandoned"));
+}
+
+#[test]
+fn post_abandon_hint_lists_removed_paths() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+    let state = load_run(&paths, &run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    let worktree = record.worktree_path.clone().expect("worktree");
+    let branch = record.branch_name.clone().expect("branch");
+
+    let abandon = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("abandon")
+        .arg(&run_id)
+        .output()
+        .expect("abandon");
+
+    assert_success(&abandon);
+    let stdout = stdout(&abandon);
+    assert!(stdout.contains(&format!("abandoned {run_id}")));
+    assert!(stdout.contains(&format!("removed: {}", worktree.display())));
+    assert!(stdout.contains(&format!("removed: branch {branch}")));
 }
 
 #[test]
@@ -1265,6 +1586,45 @@ fn deadreckon(paths: &DeadreckonPaths) -> Command {
     command
 }
 
+fn deadreckon_pty(
+    paths: &DeadreckonPaths,
+    cwd: &std::path::Path,
+    input: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let command = std::iter::once(env!("CARGO_BIN_EXE_deadreckon").to_string())
+        .chain(args.iter().map(|arg| arg.to_string()))
+        .map(|part| tcl_brace_quote(&part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let answer = input.trim_end_matches('\n').to_string() + "\r";
+    let script = format!(
+        "set timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\nspawn {}\nexpect \"choose \\[1\\]:\"\nsend -- \"{}\"\nexpect {{\n  \"completed run\" {{ exit 0 }}\n  \"cancelled\" {{ exit 0 }}\n  eof {{ exit 125 }}\n  timeout {{ exit 124 }}\n}}\n",
+        tcl_brace_quote(&cwd.display().to_string()),
+        tcl_brace_quote(&paths.home().display().to_string()),
+        command,
+        tcl_string_escape(&answer)
+    );
+    Command::new("expect")
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("expect")
+}
+
+fn tcl_brace_quote(value: &str) -> String {
+    format!("{{{}}}", value.replace('\\', "\\\\").replace('}', "\\}"))
+}
+
+fn tcl_string_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+}
+
 fn assert_success(output: &std::process::Output) {
     assert!(
         output.status.success(),
@@ -1318,4 +1678,14 @@ fn git_stdout(cwd: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_ref_exists(cwd: &std::path::Path, name: &str) -> bool {
+    Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--verify", name])
+        .output()
+        .expect("git")
+        .status
+        .success()
 }

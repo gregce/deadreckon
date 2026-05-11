@@ -1350,7 +1350,7 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 - Turn loop with action parsing (Bash / WriteFile / Done) and CLI sub-agent path.
 - Codebase-default running: worktree mode, copy mode, in-place mode, fresh-mode preservation, preflight + preview UX, and `codebase.json` files-not-fields metadata.
 - `apply` and `abandon` for worktree rollback/apply lifecycle.
-- `materialize`, `extend`, `undo`, `list`, and `show` integration with codebase mode metadata.
+- `materialize`, `extend`, `undo`, `list`, and `show` integration with codebase mode metadata, including worktree extension branches chained from parent `dr/...` branches.
 - Acceptance gate with signed marker; anti-self-attestation actually enforced.
 - `init`, `config get/set`, `run`, `doctor`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import` verbs.
 - `ratatui` attach TUI with spend meter, context meter, recent activity.
@@ -1448,8 +1448,11 @@ Before file changes, `run` prints a single preview block with goal, source/git s
 `materialize` refuses worktree runs with an `apply` hint and refuses in-place runs
 with an `undo` hint. `list` shows `MODE`. `show` prints mode, branch, worktree,
 and source lines. `undo` restores the original source path for in-place runs.
-`extend` and other lifecycle commands continue to use files-not-fields metadata
-and snapshot semantics.
+`extend` chains worktree children from the parent `dr/...` branch and records
+`parent_branch` in the child's `codebase.json`; copy/fresh extension keeps the
+library-seeding path, and in-place parents refuse with a `run --in-place` hint.
+Other lifecycle commands continue to use files-not-fields metadata and snapshot
+semantics.
 
 ### 24.12 Not Yet Built
 
