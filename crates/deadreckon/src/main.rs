@@ -138,11 +138,19 @@ async fn run_command(
     skill: String,
     smoke: bool,
 ) -> Result<()> {
-    if smoke {
+    if smoke && provider.is_some() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
-            "--smoke is reserved for an explicit labeled fallback; default run is provider-driven"
-                .to_string(),
+            "--smoke selects the local scripted provider; omit --provider".to_string(),
         )));
+    }
+    let effective_provider = if smoke {
+        Some("smoke".to_string())
+    } else {
+        provider.clone()
+    };
+    let effective_max_spend = max_spend.or(Some(10.0));
+    if max_spend.is_none() {
+        println!("using default --max-spend $10 (override with --max-spend)");
     }
     let paths = DeadreckonPaths::discover();
     let cwd = std::env::current_dir()?;
@@ -153,9 +161,9 @@ async fn run_command(
             goal,
             cwd,
             sandbox: backend.to_string(),
-            provider: provider.clone(),
+            provider: effective_provider.clone(),
             skill_name: skill,
-            max_spend_usd: max_spend,
+            max_spend_usd: effective_max_spend,
         },
     )?;
     let mut lock = acquire_lock(
@@ -172,7 +180,11 @@ async fn run_command(
     state.set_phase_status(PhaseId(20), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("provider")?;
-    let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
+    let router = if smoke {
+        ProviderRouter::smoke()
+    } else {
+        ProviderRouter::from_config_path(&paths.config_path(), effective_provider.as_deref())?
+    };
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
@@ -180,8 +192,8 @@ async fn run_command(
         &mut state,
         &router,
         RunLoopConfig {
-            provider: provider.clone(),
-            max_spend_usd: max_spend,
+            provider: effective_provider.clone(),
+            max_spend_usd: effective_max_spend,
             sandbox_backend: backend,
             max_turns: 12,
         },
