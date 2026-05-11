@@ -1035,7 +1035,61 @@ fn apply_refuses_on_dirty_user_tree() {
     assert!(!apply.status.success());
     let stderr = stderr(&apply);
     assert!(stderr.contains("your working tree has uncommitted changes"));
-    assert!(stderr.contains(&format!("try: git stash && deadreckon apply {run_id}")));
+    assert!(stderr.contains(&format!(
+        "try: deadreckon apply {run_id} --autostash --no-confirm"
+    )));
+}
+
+#[test]
+fn apply_autostash_restores_untracked_user_files() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+    fs::write(repo.join(".cursorindexingignore"), "target\n").expect("cursor ignore");
+
+    let apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .arg("--autostash")
+        .output()
+        .expect("apply");
+
+    assert_success(&apply);
+    assert_eq!(
+        fs::read_to_string(repo.join(".cursorindexingignore")).expect("cursor ignore"),
+        "target\n"
+    );
+    assert!(git_stdout(&repo, &["status", "--short"]).contains("?? .cursorindexingignore"));
+    assert!(!git_stdout(&repo, &["stash", "list"]).contains("deadreckon apply"));
+}
+
+#[test]
+fn apply_cleanup_removes_worktree_and_branch_after_success() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+    let state = load_run(&paths, &run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    let worktree = record.worktree_path.clone().expect("worktree");
+    let branch = record.branch_name.clone().expect("branch");
+
+    let apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .arg("--cleanup")
+        .output()
+        .expect("apply");
+
+    assert_success(&apply);
+    assert!(!worktree.exists());
+    assert!(!git_ref_exists(&repo, &branch));
+    assert!(state.run_root.join("abandoned.json").exists());
 }
 
 #[test]
@@ -1489,6 +1543,51 @@ fn list_shows_mode_column() {
     let stdout = stdout(&output);
     assert!(stdout.contains("MODE"));
     assert!(stdout.contains("worktree"));
+}
+
+#[test]
+fn list_default_is_compact_and_full_keeps_full_values() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let goal = "make this exceptionally long paint application goal readable in list output without wrapping every row across the terminal";
+    let state = create_run(
+        &paths,
+        RunOptions {
+            goal: goal.to_string(),
+            cwd: temp.path().to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            run_id: None,
+            codebase: Some(CodebaseRecord::fresh()),
+        },
+    )
+    .expect("run");
+
+    let compact = deadreckon(&paths).arg("list").output().expect("list");
+    assert_success(&compact);
+    let compact_stdout = stdout(&compact);
+    assert!(compact_stdout.contains("AGE"));
+    assert!(compact_stdout.contains(&state.run_id[..8]));
+    assert!(!compact_stdout.contains(&state.run_id));
+    assert!(compact_stdout.contains("..."));
+    assert!(
+        compact_stdout
+            .lines()
+            .all(|line| line.chars().count() <= 180),
+        "{compact_stdout}"
+    );
+
+    let full = deadreckon(&paths)
+        .args(["list", "--full"])
+        .output()
+        .expect("list full");
+    assert_success(&full);
+    let full_stdout = stdout(&full);
+    assert!(full_stdout.contains(&state.run_id));
+    assert!(full_stdout.contains(goal));
 }
 
 #[test]

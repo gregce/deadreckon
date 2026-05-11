@@ -57,6 +57,9 @@ deadreckon attach <run-id>
 `run` prints `started run <run-id>` and `attach: deadreckon attach
 <run-id>` immediately, so you can attach from another terminal without going
 through `list`.
+Most commands accept a unique run-id prefix, so the compact eight-character IDs
+shown by `deadreckon list` are usually enough. Use `deadreckon list --full`
+when you need exact full IDs for scripts.
 
 Apply a completed worktree run back to your current branch:
 
@@ -64,11 +67,12 @@ Apply a completed worktree run back to your current branch:
 deadreckon list
 deadreckon doc <run-id>
 deadreckon apply <run-id>
-deadreckon abandon <run-id>
+deadreckon apply <run-id> --autostash --cleanup --no-confirm
 ```
 
-Use `abandon` after inspection or after a successful apply to remove the
-deadreckon worktree and temporary branch.
+If your checkout has local edits, interactive `apply` can stash and restore
+them; scripts can pass `--autostash`. Use `--cleanup` after inspection or after
+a successful apply to remove the deadreckon worktree and temporary branch.
 
 Materialize a completed copy or fresh artifact into an editable project
 directory:

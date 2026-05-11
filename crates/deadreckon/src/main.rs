@@ -167,6 +167,8 @@ enum Commands {
     List {
         #[arg(long)]
         scope: Option<String>,
+        #[arg(long)]
+        full: bool,
     },
     Materialize {
         run_id: String,
@@ -185,6 +187,10 @@ enum Commands {
         branch: Option<String>,
         #[arg(long)]
         no_confirm: bool,
+        #[arg(long)]
+        autostash: bool,
+        #[arg(long)]
+        cleanup: bool,
         #[arg(long)]
         message: Option<String>,
     },
@@ -375,7 +381,7 @@ async fn main_inner() -> Result<()> {
             doctor_command();
             Ok(())
         }
-        Commands::List { scope } => list_command(scope),
+        Commands::List { scope, full } => list_command(scope, full),
         Commands::Materialize {
             run_id,
             dest,
@@ -387,8 +393,12 @@ async fn main_inner() -> Result<()> {
             strategy,
             branch,
             no_confirm,
+            autostash,
+            cleanup,
             message,
-        } => apply_command(run_id, strategy, branch, no_confirm, message),
+        } => apply_command(
+            run_id, strategy, branch, no_confirm, autostash, cleanup, message,
+        ),
         Commands::Abandon {
             run_id,
             keep_branch,
@@ -1552,6 +1562,8 @@ fn apply_command(
     strategy: String,
     target_branch: Option<String>,
     no_confirm: bool,
+    autostash: bool,
+    cleanup: bool,
     message: Option<String>,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
@@ -1576,15 +1588,6 @@ fn apply_command(
             "missing branch_name".to_string(),
         ))
     })?;
-    if !git_stdout(git_root, &["status", "--porcelain"])?
-        .trim()
-        .is_empty()
-    {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "your working tree has uncommitted changes",
-            &format!("git stash && deadreckon apply {}", state.run_id),
-        )));
-    }
     let target =
         target_branch.unwrap_or(git_stdout(git_root, &["symbolic-ref", "--short", "HEAD"])?);
     let diff_stat = git_stdout(
@@ -1608,6 +1611,8 @@ fn apply_command(
         )));
     }
 
+    let autostash = prepare_apply_autostash(git_root, &state.run_id, autostash, no_confirm)?;
+
     let (commit_subject, commit_body) = match message {
         Some(message) => (message, None),
         None => (
@@ -1627,17 +1632,11 @@ fn apply_command(
         "merge" => git_status(
             git_root,
             &["merge", "--no-ff", branch, "-m", &full_merge_message],
-        )?,
+        )
+        .map_err(|err| apply_merge_error(&state.run_id, &autostash, err))?,
         "squash" => {
-            git_status(git_root, &["merge", "--squash", branch]).map_err(|err| {
-                CliError::Core(deadreckon_core::user_error(
-                    &format!("merge produced conflicts: {err}"),
-                    &format!(
-                        "resolve, then git commit && deadreckon abandon {}",
-                        state.run_id
-                    ),
-                ))
-            })?;
+            git_status(git_root, &["merge", "--squash", branch])
+                .map_err(|err| apply_merge_error(&state.run_id, &autostash, err))?;
             if let Some(body) = commit_body.as_deref() {
                 git_status(git_root, &["commit", "-m", &commit_subject, "-m", body])?;
             } else {
@@ -1646,7 +1645,8 @@ fn apply_command(
         }
         "cherry-pick" => {
             let base = record.base_sha.as_deref().unwrap_or("HEAD");
-            git_status(git_root, &["cherry-pick", &format!("{base}..{branch}")])?;
+            git_status(git_root, &["cherry-pick", &format!("{base}..{branch}")])
+                .map_err(|err| apply_merge_error(&state.run_id, &autostash, err))?;
         }
         other => {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -1654,10 +1654,131 @@ fn apply_command(
             ))));
         }
     }
+    if let Some(stash) = autostash.as_ref() {
+        restore_apply_autostash(git_root, &state.run_id, stash)?;
+    }
     println!("applied {} onto {}:", state.run_id, target);
     println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
-    println!("next: deadreckon abandon {}", state.run_id);
+    let cleanup_now = cleanup || should_prompt_cleanup(no_confirm)?;
+    if cleanup_now {
+        cleanup_worktree_run(&state, &record, false, false)?;
+    } else {
+        println!("next: deadreckon abandon {}", state.run_id);
+    }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ApplyAutoStash {
+    refname: String,
+}
+
+fn prepare_apply_autostash(
+    git_root: &Path,
+    run_id: &str,
+    requested: bool,
+    no_confirm: bool,
+) -> Result<Option<ApplyAutoStash>> {
+    let dirty = git_stdout(git_root, &["status", "--porcelain"])?;
+    if dirty.trim().is_empty() {
+        return Ok(None);
+    }
+
+    eprintln!("working tree has uncommitted changes:");
+    for line in dirty.lines().take(30) {
+        eprintln!("  {line}");
+    }
+    if dirty.lines().count() > 30 {
+        eprintln!("  ...");
+    }
+
+    let mut should_stash = requested;
+    if !should_stash && !no_confirm && io::stdin().is_terminal() {
+        let answer = prompt("stash these changes during apply and restore after? [Y/n]: ")?;
+        should_stash = !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no");
+    }
+
+    if !should_stash {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "your working tree has uncommitted changes",
+            &apply_dirty_hint(run_id, no_confirm),
+        )));
+    }
+
+    let marker = format!(
+        "deadreckon apply {} autostash {}",
+        run_prefix(run_id),
+        Utc::now().timestamp_millis()
+    );
+    git_status(git_root, &["stash", "push", "-u", "-m", &marker])?;
+    let refname = find_stash_by_marker(git_root, &marker)?.ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "git stash succeeded but the new stash could not be found".to_string(),
+        ))
+    })?;
+    eprintln!("stashed local changes as {refname}");
+    Ok(Some(ApplyAutoStash { refname }))
+}
+
+fn apply_dirty_hint(run_id: &str, no_confirm: bool) -> String {
+    let mut hint = format!("deadreckon apply {run_id} --autostash");
+    if no_confirm {
+        hint.push_str(" --no-confirm");
+    }
+    hint
+}
+
+fn find_stash_by_marker(git_root: &Path, marker: &str) -> Result<Option<String>> {
+    let output = git_stdout(git_root, &["stash", "list", "--format=%gd%x00%s"])?;
+    for line in output.lines() {
+        if let Some((refname, subject)) = line.split_once('\0')
+            && subject.contains(marker)
+        {
+            return Ok(Some(refname.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn restore_apply_autostash(git_root: &Path, run_id: &str, stash: &ApplyAutoStash) -> Result<()> {
+    git_status(git_root, &["stash", "pop", &stash.refname]).map_err(|err| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("applied {run_id}, but restoring autostash produced conflicts: {err}"),
+            &format!(
+                "resolve conflicts, then inspect `git stash list` before dropping {}",
+                stash.refname
+            ),
+        ))
+    })
+}
+
+fn apply_merge_error(run_id: &str, autostash: &Option<ApplyAutoStash>, err: CliError) -> CliError {
+    CliError::Core(deadreckon_core::user_error(
+        &format!("merge produced conflicts: {err}"),
+        &apply_conflict_hint(run_id, autostash),
+    ))
+}
+
+fn apply_conflict_hint(run_id: &str, autostash: &Option<ApplyAutoStash>) -> String {
+    let mut hint = format!("resolve, then git commit && deadreckon abandon {run_id}");
+    if let Some(stash) = autostash {
+        hint.push_str(&format!(
+            "; restore local changes with git stash pop {}",
+            stash.refname
+        ));
+    }
+    hint
+}
+
+fn should_prompt_cleanup(no_confirm: bool) -> Result<bool> {
+    if no_confirm || !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    let answer = prompt("remove deadreckon worktree and temporary branch now? [Y/n]: ")?;
+    Ok(!matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "n" | "no"
+    ))
 }
 
 fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()> {
@@ -1685,6 +1806,15 @@ fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()>
         }
         let _ = kill_loaded_run(&paths, &mut state, true);
     }
+    cleanup_worktree_run(&state, &record, keep_branch, force)
+}
+
+fn cleanup_worktree_run(
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
+    keep_branch: bool,
+    force: bool,
+) -> Result<()> {
     let mut removed = Vec::new();
     if record.mode == CodebaseMode::Worktree
         && let (Some(git_root), Some(worktree)) = (
@@ -1709,7 +1839,7 @@ fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()>
             removed.push(format!("branch {branch}"));
         }
     }
-    write_abandoned_marker(&state)?;
+    write_abandoned_marker(state)?;
     println!("abandoned {}", state.run_id);
     for item in removed {
         println!("  removed: {item}");
@@ -2398,7 +2528,7 @@ fn escape_toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn list_command(scope: Option<String>) -> Result<()> {
+fn list_command(scope: Option<String>, full: bool) -> Result<()> {
     // REPORT.md: Workspace Inventory & Run Queue is a local scan over durable
     // runstate, not a live daemon query.
     let paths = DeadreckonPaths::discover();
@@ -2407,21 +2537,70 @@ fn list_command(scope: Option<String>) -> Result<()> {
         println!("no runs");
         return Ok(());
     }
-    println!("RUN\tSTATUS\tSCOPE\tUPDATED\tMODE\tDOCS\tMATERIALIZED\tGOAL");
+    if full {
+        println!("RUN\tSTATUS\tSCOPE\tUPDATED\tMODE\tDOCS\tMATERIALIZED\tGOAL");
+        for run in runs {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                run.run_id,
+                run.status,
+                run.scope,
+                run.updated_at,
+                codebase_mode_status(&paths, &run),
+                docs_status(&paths, &run),
+                materialized_status(&paths, &run),
+                run.goal
+            );
+        }
+        return Ok(());
+    }
+
+    println!(
+        "{:<8}  {:<9}  {:<7}  {:<26}  {:<9}  {:<8}  {:<12}  GOAL",
+        "RUN", "STATUS", "AGE", "SCOPE", "MODE", "DOCS", "MATERIALIZED"
+    );
     for run in runs {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            run.run_id,
-            run.status,
-            run.scope,
-            run.updated_at,
-            codebase_mode_status(&paths, &run),
-            docs_status(&paths, &run),
-            materialized_status(&paths, &run),
-            run.goal
+            "{:<8}  {:<9}  {:<7}  {:<26}  {:<9}  {:<8}  {:<12}  {}",
+            run_prefix(&run.run_id),
+            truncate_text(&run.status.to_string(), 9),
+            relative_age(run.updated_at),
+            truncate_text(&run.scope, 26),
+            truncate_text(&codebase_mode_status(&paths, &run), 9),
+            truncate_text(&docs_status(&paths, &run), 8),
+            truncate_text(&materialized_status(&paths, &run), 12),
+            truncate_text(&one_line(&run.goal, 80), 80)
         );
     }
+    println!(
+        "hint: use `deadreckon show <run-id>` for paths, or `deadreckon list --full` for full values"
+    );
     Ok(())
+}
+
+fn relative_age(updated_at: DateTime<Utc>) -> String {
+    let seconds = (Utc::now() - updated_at).num_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 60 * 60 * 24 {
+        format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+    let prefix = max_chars.saturating_sub(3);
+    format!("{}...", value.chars().take(prefix).collect::<String>())
 }
 
 fn docs_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEntry) -> String {
@@ -3077,6 +3256,8 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
                 "squash".to_string(),
                 None,
                 false,
+                false,
+                false,
                 None,
             )?,
             Some(CompletionAction::Abandon) => abandon_command(state.run_id.clone(), false, false)?,
@@ -3277,6 +3458,8 @@ async fn handle_tui_completion_key(
             state.run_id.clone(),
             "squash".to_string(),
             None,
+            false,
+            false,
             false,
             None,
         ),

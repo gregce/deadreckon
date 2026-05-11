@@ -313,10 +313,17 @@ pub fn load_current_pointer(
 }
 
 pub fn find_run_state_path(paths: &DeadreckonPaths, run_id: &str) -> Result<PathBuf> {
+    let run_id = run_id.trim();
+    if run_id.is_empty() {
+        return Err(DeadreckonError::InvalidInput(
+            "run id prefix cannot be empty".to_string(),
+        ));
+    }
     let root = paths.runstate_dir();
     if !root.exists() {
         return Err(DeadreckonError::NotFound(format!("run {run_id}")));
     }
+    let mut prefix_matches = Vec::new();
     for entry in WalkDir::new(&root)
         .into_iter()
         .filter_map(std::result::Result::ok)
@@ -325,16 +332,34 @@ pub fn find_run_state_path(paths: &DeadreckonPaths, run_id: &str) -> Result<Path
             continue;
         }
         let candidate = entry.path();
-        if candidate
+        let Some(candidate_run_id) = candidate
             .parent()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
-            == Some(run_id)
-        {
+        else {
+            continue;
+        };
+        if candidate_run_id == run_id {
             return Ok(candidate.to_path_buf());
         }
+        if candidate_run_id.starts_with(run_id) {
+            prefix_matches.push((candidate_run_id.to_string(), candidate.to_path_buf()));
+        }
     }
-    Err(DeadreckonError::NotFound(format!("run {run_id}")))
+    match prefix_matches.len() {
+        1 => Ok(prefix_matches.remove(0).1),
+        0 => Err(DeadreckonError::NotFound(format!("run {run_id}"))),
+        _ => {
+            let matches = prefix_matches
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(DeadreckonError::InvalidInput(format!(
+                "ambiguous run id prefix {run_id}; matches {matches}"
+            )))
+        }
+    }
 }
 
 pub fn load_run(paths: &DeadreckonPaths, run_id: &str) -> Result<PipelineState> {
@@ -418,6 +443,7 @@ mod tests {
         PhaseId, PhaseStatus, RunOptions, RunStatus, create_run, load_current_pointer, load_run,
         save_state,
     };
+    use crate::DeadreckonError;
     use crate::paths::{DeadreckonPaths, task_key};
 
     #[test]
@@ -485,5 +511,61 @@ mod tests {
             reloaded.active_phase().map(|phase| phase.status),
             Some(PhaseStatus::Executing)
         );
+    }
+
+    #[test]
+    fn load_run_accepts_unique_prefix() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path());
+        let cwd = std::env::current_dir().expect("cwd");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "prefix load".to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: Some("abcdef1234567890abcdef1234567890".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("create run");
+
+        let reloaded = load_run(&paths, "abcdef12").expect("load prefix");
+        assert_eq!(reloaded.run_id, state.run_id);
+    }
+
+    #[test]
+    fn load_run_rejects_ambiguous_prefix() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path());
+        let cwd = std::env::current_dir().expect("cwd");
+        for (id, goal) in [
+            ("abc11111111111111111111111111111", "prefix one"),
+            ("abc22222222222222222222222222222", "prefix two"),
+        ] {
+            create_run(
+                &paths,
+                RunOptions {
+                    goal: goal.to_string(),
+                    cwd: cwd.clone(),
+                    sandbox: "none".to_string(),
+                    provider: None,
+                    skill_name: "default-coding".to_string(),
+                    max_spend_usd: Some(1.0),
+                    max_wall_seconds: None,
+                    run_id: Some(id.to_string()),
+                    codebase: None,
+                },
+            )
+            .expect("create run");
+        }
+
+        let err = load_run(&paths, "abc").expect_err("ambiguous");
+        assert!(matches!(err, DeadreckonError::InvalidInput(_)));
+        assert!(err.to_string().contains("ambiguous run id prefix abc"));
     }
 }

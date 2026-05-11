@@ -114,10 +114,14 @@ deadreckon run "tiny hello rust" --smoke --sandbox none --max-spend 1
 deadreckon list
 ```
 
-Capture the latest run id:
+The default list is compact and shows eight-character run IDs. Commands accept
+unique prefixes, so `deadreckon show 861c51bf` works when that prefix is unique.
+Use `--full` for scripts or exact-copy output.
+
+Capture the latest full run id:
 
 ```bash
-RUN_ID=$(deadreckon list | awk 'NR==1 {print $1}')
+RUN_ID=$(deadreckon list --full | awk 'NR==2 {print $1}')
 ```
 
 Then inspect it:
@@ -263,6 +267,8 @@ deadreckon extend <worktree-run-id> "continue with the next change"
 deadreckon list
 deadreckon show <run-id>
 deadreckon apply <run-id>
+deadreckon apply <run-id> --autostash
+deadreckon apply <run-id> --cleanup --no-confirm
 deadreckon apply <run-id> --strategy merge
 deadreckon apply <run-id> --strategy cherry-pick --no-confirm
 deadreckon abandon <run-id>

@@ -1,5 +1,11 @@
 # Changelog
 
+## Apply/list usability — 2026-05-11
+
+- Made run-id arguments accept unique prefixes so compact `deadreckon list` IDs can be reused directly.
+- Made `deadreckon list` compact by default with `--full` for scripts and exact full values.
+- Added `deadreckon apply --autostash` for dirty checkouts and `--cleanup` to remove the run worktree/branch after a successful apply.
+
 ## Self-documenting runs (alpha) — 2026-05-11
 
 - Added run-start doc scaffolding under `working/.deadreckon/docs/` with stoa-shaped `RUN-NARRATIVE.md`, `RUN-AS-BUILT.md`, `RUN-DECISIONS.md`, `_incremental.jsonl`, and `polish.json`.
