@@ -1,0 +1,10 @@
+[
+  {
+    "id": "mock-slow",
+    "model": "mock-agent",
+    "content": "{\"action\":\"bash\",\"tool_call_id\":\"tool-slow\",\"command\":\"sleep 30\"}",
+    "delay_ms": 30000,
+    "prompt_tokens": 100,
+    "completion_tokens": 20
+  }
+]

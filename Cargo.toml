@@ -14,6 +14,7 @@ license = "MIT"
 repository = "file:///Users/gdc/deadreckon"
 
 [workspace.dependencies]
+axum = "0.8.7"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.53", features = ["derive", "env"] }
 crossterm = "0.29.0"

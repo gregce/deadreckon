@@ -1,0 +1,23 @@
+[
+  {
+    "id": "mock-1",
+    "model": "mock-agent",
+    "content": "{\"action\":\"bash\",\"tool_call_id\":\"tool-bash-1\",\"command\":\"printf 'turn 1' > turn1.txt\"}",
+    "prompt_tokens": 120,
+    "completion_tokens": 40
+  },
+  {
+    "id": "mock-2",
+    "model": "mock-agent",
+    "content": "{\"action\":\"write_file\",\"tool_call_id\":\"tool-write-2\",\"path\":\"notes.md\",\"content\":\"# Dead Reckoning\\n\\nTurn 2 wrote this file.\\n\"}",
+    "prompt_tokens": 160,
+    "completion_tokens": 60
+  },
+  {
+    "id": "mock-3",
+    "model": "mock-agent",
+    "content": "{\"action\":\"done\",\"summary\":\"mock task complete\"}",
+    "prompt_tokens": 180,
+    "completion_tokens": 30
+  }
+]
