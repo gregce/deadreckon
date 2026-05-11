@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use chrono::Utc;
@@ -93,6 +94,9 @@ enum Commands {
         #[arg(long)]
         turn: Option<u32>,
     },
+    Import {
+        source: String,
+    },
 }
 
 #[tokio::main]
@@ -122,6 +126,7 @@ async fn main() -> Result<()> {
         Commands::Resume { run_id } => resume_command(run_id),
         Commands::Undo { run, turn } => undo_command(run, turn),
         Commands::Show { run_id, turn } => show_command(run_id, turn),
+        Commands::Import { source } => import_command(source),
     }
 }
 
@@ -401,6 +406,29 @@ fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
             }
             println!("{}", serde_json::to_string_pretty(&record)?);
         }
+    }
+    Ok(())
+}
+
+fn import_command(source: String) -> Result<()> {
+    // REPORT.md: Cross-Tool State Sharing is V0 read-only; this command never
+    // writes into Claude Code, Codex, or Cursor state directories.
+    let root = match source.as_str() {
+        "claude-code" => PathBuf::from("/Users/gdc/.claude/projects/"),
+        "codex" => PathBuf::from("/Users/gdc/.codex/sessions/"),
+        "cursor" => PathBuf::from("/Users/gdc/.cursor/chats/"),
+        other => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "unknown import source {other}; expected claude-code, codex, or cursor"
+            ))));
+        }
+    };
+    let files = inventory_files(&root)?;
+    println!("source {source}");
+    println!("root {}", root.display());
+    println!("files {}", files.len());
+    for file in files.iter().rev().take(10) {
+        println!("{}", file.display());
     }
     Ok(())
 }
