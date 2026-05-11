@@ -130,6 +130,52 @@ async fn resume_preserves_history_file() {
     assert!(history.contains("tool-write-2"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_subagent_without_file_changes_fails_run() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let fake_codex = temp.path().join("fake-codex");
+    fs::write(&fake_codex, "#!/bin/sh\nprintf 'Changed files: none.\\n'\n").expect("fake codex");
+    chmod_exec(&fake_codex);
+    write_cli_config(temp.path(), &fake_codex);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("run")
+        .arg("cli no-op")
+        .arg("--provider")
+        .arg("cli:codex")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .env("DEADRECKON_HOME", temp.path().join("home"))
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("failed run"));
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .failure_reason
+            .as_deref()
+            .expect("failure reason")
+            .contains("without file changes")
+    );
+    assert!(!state.run_root.join("proofs/turn-acceptance.json").exists());
+}
+
 fn repo_tempdir() -> TempDir {
     let root = std::path::Path::new("/Users/gdc/deadreckon/.test-tmp");
     fs::create_dir_all(root).expect("test tmp root");
@@ -156,6 +202,35 @@ output_cost_per_million = 1.0
         ),
     )
     .expect("config");
+}
+
+fn write_cli_config(temp: &std::path::Path, binary: &std::path::Path) {
+    let home = temp.join("home");
+    fs::create_dir_all(&home).expect("home");
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+fallback = ["cli:codex"]
+
+[providers."cli:codex"]
+kind = "cli-codex"
+binary = "{}"
+"#,
+            binary.display()
+        ),
+    )
+    .expect("config");
+}
+
+fn chmod_exec(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("chmod");
+    }
 }
 
 fn wait_for_run_id(paths: &DeadreckonPaths) -> String {

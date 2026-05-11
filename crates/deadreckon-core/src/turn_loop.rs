@@ -66,7 +66,11 @@ pub async fn run_turn_loop(
         }
         let turn = state.turn + 1;
         snapshot_working(state, turn.saturating_sub(1))?;
-        let prompt = build_prompt(state, &history);
+        let prompt = if config.provider.as_deref().is_some_and(is_cli_provider_name) {
+            build_cli_subagent_prompt(state, &history)
+        } else {
+            build_prompt(state, &history)
+        };
         let turn_dir = state.run_root.join("turns").join(format!("turn-{turn}"));
         let stdout_name = config
             .provider
@@ -132,6 +136,13 @@ pub async fn run_turn_loop(
 
         if is_cli_subagent(&response) {
             let changed = changed_files_since_snapshot(state, turn.saturating_sub(1))?;
+            if changed.is_empty() {
+                state.failure_reason =
+                    Some("cli subagent completed without file changes".to_string());
+                state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
+                save_state(state)?;
+                return Ok(RunLoopOutcome::Failed);
+            }
             snapshot_working(state, turn)?;
             let tool_call_id = format!("cli-subagent-turn-{turn}");
             append_trace(
@@ -277,6 +288,27 @@ fn build_prompt(state: &PipelineState, history: &[String]) -> String {
         state.goal,
         state.working_dir.display(),
         history_text
+    )
+}
+
+fn build_cli_subagent_prompt(state: &PipelineState, history: &[String]) -> String {
+    let history_text = if history.is_empty() {
+        "none".to_string()
+    } else {
+        history.join("\n")
+    };
+    format!(
+        "You are a deadreckon CLI sub-agent running unattended coding work.\nGoal: {}\nWorking directory: {}\nModify files directly in the working directory. Do not write outside it. Do not ask questions. When finished, print a concise summary of changed files.\nHistory:\n{}",
+        state.goal,
+        state.working_dir.display(),
+        history_text
+    )
+}
+
+fn is_cli_provider_name(provider: &str) -> bool {
+    matches!(
+        provider,
+        "cli:claude-code" | "cli-claude-code" | "cli:codex" | "cli-codex"
     )
 }
 
