@@ -21,7 +21,7 @@ use deadreckon_providers::ProviderRouter;
 use deadreckon_sandbox::SandboxBackend;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
 use serde::de::DeserializeOwned;
@@ -1436,7 +1436,7 @@ fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> Provider
             .lines
             .into_iter()
             .rev()
-            .take(12)
+            .take(240)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -1615,13 +1615,19 @@ fn render_attach(
         ])
         .split(area);
 
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
+    let metered_provider = provider_is_metered(state);
+    let top_constraints = if metered_provider {
+        vec![
             Constraint::Percentage(58),
             Constraint::Percentage(21),
             Constraint::Percentage(21),
-        ])
+        ]
+    } else {
+        vec![Constraint::Percentage(72), Constraint::Percentage(28)]
+    };
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(top_constraints)
         .split(vertical[0]);
     let phase = state
         .active_phase()
@@ -1646,64 +1652,53 @@ fn render_attach(
     ))
     .block(Block::default().borders(Borders::ALL).title("deadreckon"));
     frame.render_widget(header, top[0]);
-    let cap = state.max_spend_usd.unwrap_or({
-        if state.total_spend_usd <= 0.0 {
-            1.0
-        } else {
-            state.total_spend_usd
-        }
-    });
-    let spend_ratio = (state.total_spend_usd / cap).clamp(0.0, 1.0);
-    let (token_total, context_window) = context_totals(spend, live);
-    let context_ratio = if context_window == 0 {
-        0.0
+    if metered_provider {
+        render_spend(frame, top[1], state);
+        render_context(frame, top[2], spend, live);
     } else {
-        (token_total as f64 / context_window as f64).clamp(0.0, 1.0)
-    };
-    frame.render_widget(
-        Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title("spend"))
-            .gauge_style(Style::default().fg(meter_color(spend_ratio, state)))
-            .ratio(spend_ratio)
-            .label(format!("${:.6} / ${:.6}", state.total_spend_usd, cap)),
-        top[1],
-    );
-    frame.render_widget(
-        Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title("context"))
-            .gauge_style(Style::default().fg(threshold_color(context_ratio)))
-            .ratio(context_ratio)
-            .label(format!("{token_total} / {context_window} tokens")),
-        top[2],
-    );
+        render_context(frame, top[1], spend, live);
+    }
 
     let center = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(vertical[1]);
 
-    let mut trace_items = render_turn_summary(spend);
-    trace_items.extend(events.iter().rev().take(8).map(render_event_item).chain(
-        traces.iter().rev().take(2).map(|record| {
-            ListItem::new(format!(
-                "trace turn {}  {}  {:?}ms",
-                record.turn, record.event, record.latency_ms
-            ))
-        }),
-    ));
+    let stream_rows = center[0].height.saturating_sub(2) as usize;
+    let mut trace_items = render_turn_summary(spend, metered_provider);
     if state.status == RunStatus::Executing && live.file_count > 0 {
         trace_items.push(ListItem::new(format!(
             "live working tree: {} files, latest changes visible before provider exit",
             live.file_count
         )));
     }
+    let provider_rows = stream_rows.saturating_sub(trace_items.len());
     trace_items.extend(
         live.provider_activity
             .iter()
             .rev()
-            .take(10)
+            .take(provider_rows)
             .map(|item| ListItem::new(item.clone())),
     );
+    let remaining_rows = stream_rows.saturating_sub(trace_items.len());
+    if remaining_rows > 0 {
+        trace_items.extend(
+            events
+                .iter()
+                .rev()
+                .take(remaining_rows)
+                .map(|event| render_event_item(event, metered_provider)),
+        );
+    }
+    let remaining_rows = stream_rows.saturating_sub(trace_items.len());
+    if remaining_rows > 0 {
+        trace_items.extend(traces.iter().rev().take(remaining_rows).map(|record| {
+            ListItem::new(format!(
+                "trace turn {}  {}  {:?}ms",
+                record.turn, record.event, record.latency_ms
+            ))
+        }));
+    }
     frame.render_widget(
         List::new(trace_items).block(
             Block::default()
@@ -1720,6 +1715,76 @@ fn render_attach(
     );
 }
 
+fn provider_is_metered(state: &deadreckon_core::PipelineState) -> bool {
+    !state
+        .provider
+        .as_deref()
+        .is_some_and(|provider| provider.starts_with("cli:") || provider.starts_with("import:"))
+}
+
+fn render_spend(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    state: &deadreckon_core::PipelineState,
+) {
+    let cap = state.max_spend_usd.unwrap_or({
+        if state.total_spend_usd <= 0.0 {
+            1.0
+        } else {
+            state.total_spend_usd
+        }
+    });
+    let spend_ratio = (state.total_spend_usd / cap).clamp(0.0, 1.0);
+    frame.render_widget(
+        Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title("spend"))
+            .gauge_style(Style::default().fg(meter_color(spend_ratio, state)))
+            .ratio(spend_ratio)
+            .label(format!("${:.6} / ${:.6}", state.total_spend_usd, cap)),
+        area,
+    );
+}
+
+fn render_context(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    spend: &[SpendRecord],
+    live: &AttachLive,
+) {
+    let (token_total, context_window) = context_totals(spend, live);
+    let context_ratio = if context_window == 0 {
+        0.0
+    } else {
+        token_total as f64 / context_window as f64
+    };
+    let detail = if token_total == 0 {
+        format!(
+            "waiting for telemetry\n{} window",
+            format_count(context_window)
+        )
+    } else if context_ratio >= 1.0 {
+        format!(
+            "{} used\n{} window\n{context_ratio:.1}x cumulative",
+            format_count(token_total),
+            format_count(context_window)
+        )
+    } else {
+        format!(
+            "{} used\n{} window\n{:.0}% of window",
+            format_count(token_total),
+            format_count(context_window),
+            context_ratio * 100.0
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(detail)
+            .block(Block::default().borders(Borders::ALL).title("context"))
+            .style(Style::default().fg(threshold_color(context_ratio.clamp(0.0, 1.0))))
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
 fn context_totals(spend: &[SpendRecord], live: &AttachLive) -> (u64, u64) {
     let token_total = live.provider_context_tokens.unwrap_or_else(|| {
         spend
@@ -1731,10 +1796,10 @@ fn context_totals(spend: &[SpendRecord], live: &AttachLive) -> (u64, u64) {
     (token_total, context_window)
 }
 
-fn render_turn_summary(spend: &[SpendRecord]) -> Vec<ListItem<'static>> {
+fn render_turn_summary(spend: &[SpendRecord], show_cost: bool) -> Vec<ListItem<'static>> {
     if spend.is_empty() {
         vec![ListItem::new(
-            "provider turn in progress; accounting lands when the provider exits",
+            "provider turn in progress; results land when the provider exits",
         )]
     } else {
         spend
@@ -1742,13 +1807,26 @@ fn render_turn_summary(spend: &[SpendRecord]) -> Vec<ListItem<'static>> {
             .rev()
             .take(3)
             .map(|record| {
-                ListItem::new(format!(
-                    "turn {}  {}  {} tokens  ${:.6}",
-                    record.turn,
-                    record.model,
-                    record.input_tokens + record.output_tokens,
-                    record.cost_usd
-                ))
+                let tokens = record.input_tokens + record.output_tokens;
+                if show_cost {
+                    ListItem::new(format!(
+                        "turn {}  {}  {} tokens  ${:.6}",
+                        record.turn, record.model, tokens, record.cost_usd
+                    ))
+                } else if let Some(seconds) = record.wall_time_seconds {
+                    ListItem::new(format!(
+                        "turn {}  {}  {} tokens  {:.0}s wall",
+                        record.turn,
+                        record.model,
+                        tokens,
+                        seconds.max(0.0)
+                    ))
+                } else {
+                    ListItem::new(format!(
+                        "turn {}  {}  {} tokens",
+                        record.turn, record.model, tokens
+                    ))
+                }
             })
             .collect()
     }
@@ -1800,7 +1878,7 @@ fn render_processes(
     );
 }
 
-fn render_event_item(event: &RunEvent) -> ListItem<'static> {
+fn render_event_item(event: &RunEvent, show_cost: bool) -> ListItem<'static> {
     let label = match &event.event {
         deadreckon_core::RunEventKind::TurnStarted { turn } => {
             format!("turn {turn} started")
@@ -1827,10 +1905,16 @@ fn render_event_item(event: &RunEvent) -> ListItem<'static> {
             cost_usd,
             wall_time_seconds,
             ..
-        } => format!(
-            "turn {turn} spend +${cost_usd:.6} wall {}s",
-            wall_time_seconds.unwrap_or(0.0)
-        ),
+        } => {
+            if show_cost {
+                format!(
+                    "turn {turn} spend +${cost_usd:.6} wall {}s",
+                    wall_time_seconds.unwrap_or(0.0)
+                )
+            } else {
+                format!("turn {turn} wall {}s", wall_time_seconds.unwrap_or(0.0))
+            }
+        }
         deadreckon_core::RunEventKind::Error { turn, message } => {
             format!("turn {} error {message}", turn.unwrap_or_default())
         }
@@ -1931,6 +2015,16 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1}K", bytes as f64 / 1024.0)
     } else {
         format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn format_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
     }
 }
 
