@@ -377,6 +377,7 @@ dependencies = [
 name = "deadreckon"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "clap",
  "crossterm 0.29.0",
@@ -386,6 +387,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

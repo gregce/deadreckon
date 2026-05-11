@@ -264,7 +264,16 @@ fn kill_command(run_id: String) -> Result<()> {
             let _ = terminate_pid(*pid, false);
         }
     }
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    loop {
+        let any_alive = pids
+            .iter()
+            .any(|pid| *pid != std::process::id() && deadreckon_core::pid_is_alive(*pid));
+        if !any_alive || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     for pid in &pids {
         if *pid != std::process::id() && deadreckon_core::pid_is_alive(*pid) {
             let _ = terminate_pid(*pid, true);
