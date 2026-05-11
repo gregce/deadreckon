@@ -16,8 +16,9 @@ pub use artifacts::{
     copy_tree, inventory_files, restore_snapshot, snapshot_working,
 };
 pub use codebase::{
-    CODEBASE_RECORD_PATH, CodebaseMode, CodebaseRecord, ModeFlags, ResolvedMode,
-    codebase_record_path, find_git_root, read_codebase_record, record_for_resolved_mode,
+    CODEBASE_RECORD_PATH, CodebaseMode, CodebaseRecord, ModeFlags, PreviewGitState, ResolvedMode,
+    WorktreeOptions, codebase_record_path, copy_source_to_working, create_worktree, find_git_root,
+    prepare_worktree_record, preview_git_state, read_codebase_record, record_for_resolved_mode,
     resolve_mode, user_error, write_codebase_record,
 };
 pub use error::{DeadreckonError, Result};

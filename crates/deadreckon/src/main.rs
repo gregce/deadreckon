@@ -15,11 +15,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use deadreckon_core::{
-    DeadreckonError, DeadreckonPaths, PhaseId, PhaseStatus, ProvenanceRecord, RUN_EVENTS_JSONL,
-    RunEvent, RunLoopConfig, RunLoopOutcome, RunOptions, RunStatus, SpendRecord, TraceRecord,
-    acquire_lock, append_provenance, append_trace, copy_tree, create_run, inventory_files,
-    list_runs, load_run, release_lock_file, restore_snapshot, run_turn_loop, save_state,
-    terminate_pid,
+    CodebaseMode, CodebaseRecord, DeadreckonError, DeadreckonPaths, ModeFlags, PhaseId,
+    PhaseStatus, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunLoopConfig,
+    RunLoopOutcome, RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions, acquire_lock,
+    append_provenance, append_trace, copy_source_to_working, copy_tree, create_run,
+    create_worktree, inventory_files, list_runs, load_run, prepare_worktree_record,
+    preview_git_state, read_codebase_record, record_for_resolved_mode, release_lock_file,
+    resolve_mode, restore_snapshot, run_turn_loop, save_state, terminate_pid,
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_sandbox::SandboxBackend;
@@ -31,6 +33,7 @@ use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 enum CliError {
@@ -114,6 +117,28 @@ enum Commands {
     Run {
         goal: String,
         #[arg(long)]
+        fresh: bool,
+        #[arg(long)]
+        worktree: bool,
+        #[arg(long = "from")]
+        from: Option<PathBuf>,
+        #[arg(long)]
+        in_place: bool,
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        allow_dirty: bool,
+        #[arg(long)]
+        init_git: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        preview: bool,
+        #[arg(long)]
+        brief: bool,
+        #[arg(long)]
         max_spend: Option<f64>,
         #[arg(long)]
         max_wall_seconds: Option<f64>,
@@ -145,6 +170,24 @@ enum Commands {
         force: bool,
         #[arg(long)]
         include_manifest: bool,
+    },
+    Apply {
+        run_id: String,
+        #[arg(long, default_value = "squash")]
+        strategy: String,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        no_confirm: bool,
+        #[arg(long)]
+        message: Option<String>,
+    },
+    Abandon {
+        run_id: String,
+        #[arg(long)]
+        keep_branch: bool,
+        #[arg(long)]
+        force: bool,
     },
     Extend {
         parent_run_id: String,
@@ -234,6 +277,17 @@ async fn main_inner() -> Result<()> {
         Commands::Config { command } => config_command(command),
         Commands::Run {
             goal,
+            fresh,
+            worktree,
+            from,
+            in_place,
+            base,
+            branch,
+            allow_dirty,
+            init_git,
+            yes,
+            preview,
+            brief,
             max_spend,
             max_wall_seconds,
             sandbox,
@@ -246,6 +300,17 @@ async fn main_inner() -> Result<()> {
         } => {
             run_command(RunCommandArgs {
                 goal,
+                fresh,
+                worktree,
+                from,
+                in_place,
+                base,
+                branch,
+                allow_dirty,
+                init_git,
+                yes,
+                preview,
+                brief,
                 max_spend,
                 max_wall_seconds,
                 sandbox,
@@ -269,6 +334,18 @@ async fn main_inner() -> Result<()> {
             force,
             include_manifest,
         } => materialize_command(run_id, dest, force, include_manifest),
+        Commands::Apply {
+            run_id,
+            strategy,
+            branch,
+            no_confirm,
+            message,
+        } => apply_command(run_id, strategy, branch, no_confirm, message),
+        Commands::Abandon {
+            run_id,
+            keep_branch,
+            force,
+        } => abandon_command(run_id, keep_branch, force),
         Commands::Extend {
             parent_run_id,
             new_goal,
@@ -372,6 +449,17 @@ fn config_command(command: ConfigCommand) -> Result<()> {
 
 struct RunCommandArgs {
     goal: String,
+    fresh: bool,
+    worktree: bool,
+    from: Option<PathBuf>,
+    in_place: bool,
+    base: Option<String>,
+    branch: Option<String>,
+    allow_dirty: bool,
+    init_git: bool,
+    yes: bool,
+    preview: bool,
+    brief: bool,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
     sandbox: Option<String>,
@@ -399,6 +487,17 @@ struct ExtendCommandArgs {
 async fn run_command(args: RunCommandArgs) -> Result<()> {
     let RunCommandArgs {
         goal,
+        fresh,
+        worktree,
+        from,
+        in_place,
+        base,
+        branch,
+        allow_dirty,
+        init_git,
+        yes,
+        preview,
+        brief,
         max_spend,
         max_wall_seconds,
         sandbox,
@@ -437,6 +536,85 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         .or(defaults.sandbox)
         .unwrap_or_else(|| "auto".to_string());
     let backend: SandboxBackend = sandbox.parse()?;
+    if init_git {
+        init_git_repo(&cwd)?;
+    }
+    let run_id = Uuid::new_v4().simple().to_string();
+    let mut mode_flags = ModeFlags {
+        fresh,
+        worktree,
+        from,
+        in_place,
+        i_know_its_a_lot,
+    };
+    let explicit_mode =
+        mode_flags.fresh || mode_flags.worktree || mode_flags.from.is_some() || mode_flags.in_place;
+    if !explicit_mode
+        && deadreckon_core::find_git_root(&cwd)?.is_none()
+        && io::stdin().is_terminal()
+    {
+        match prompt_non_git_mode()? {
+            NonGitChoice::Init => {
+                init_git_repo(&cwd)?;
+                mode_flags.worktree = true;
+            }
+            NonGitChoice::Copy => mode_flags.from = Some(cwd.clone()),
+            NonGitChoice::Cancel => {
+                println!("cancelled");
+                return Ok(());
+            }
+        }
+    }
+    let resolved_mode = resolve_mode(&mode_flags, &cwd, io::stdin().is_terminal())?;
+    let mut codebase = match &resolved_mode {
+        ResolvedMode::Worktree { source_path, .. } => prepare_worktree_record(
+            &paths,
+            WorktreeOptions {
+                run_id: run_id.clone(),
+                task_key: deadreckon_core::paths::task_key(&goal),
+                source_path: source_path.clone(),
+                base_ref: base,
+                branch_name: branch,
+                allow_dirty,
+            },
+        )?,
+        _ => record_for_resolved_mode(resolved_mode.clone()),
+    };
+    if codebase.mode == CodebaseMode::Fresh {
+        codebase.source_path = None;
+    }
+    let preview_text = run_preview(RunPreview {
+        goal: &goal,
+        cwd: &cwd,
+        codebase: &codebase,
+        provider: effective_provider.as_deref(),
+        sandbox: &backend.to_string(),
+        max_spend: effective_max_spend,
+        max_wall_seconds: effective_max_wall_seconds,
+        brief,
+        run_id: &run_id,
+    });
+    if preview {
+        eprintln!("{preview_text}");
+        return Ok(());
+    }
+    if !yes {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "non-interactive without --yes",
+                "--yes (skip confirm) or run interactively",
+            )));
+        }
+        eprintln!("{preview_text}");
+        let answer = prompt("continue? [Y/n]: ")?;
+        if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
+            println!("cancelled");
+            return Ok(());
+        }
+    }
+    if codebase.mode == CodebaseMode::Worktree {
+        create_worktree(&codebase)?;
+    }
     let mut state = create_run(
         &paths,
         RunOptions {
@@ -447,10 +625,18 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
             skill_name: skill,
             max_spend_usd: effective_max_spend,
             max_wall_seconds: effective_max_wall_seconds,
-            run_id: None,
-            codebase: None,
+            run_id: Some(run_id),
+            codebase: Some(codebase.clone()),
         },
     )?;
+    if let Some(source_path) = codebase
+        .source_path
+        .as_ref()
+        .filter(|_| codebase.mode == CodebaseMode::Copy)
+    {
+        copy_source_to_working(source_path, &state.working_dir)?;
+        deadreckon_core::write_codebase_record(&state.working_dir, &codebase)?;
+    }
     print_run_started(&state);
     let mut lock = acquire_lock(
         &paths,
@@ -785,6 +971,206 @@ fn command_version(path: &std::path::Path) -> Option<String> {
         .filter(|line| !line.is_empty())
 }
 
+fn init_git_repo(cwd: &Path) -> Result<()> {
+    if deadreckon_core::find_git_root(cwd)?.is_some() {
+        return Ok(());
+    }
+    run_git(cwd, &["init", "-b", "main"])?;
+    run_git(cwd, &["config", "user.email", "deadreckon@example.invalid"])?;
+    run_git(cwd, &["config", "user.name", "deadreckon"])?;
+    run_git(cwd, &["add", "-A"])?;
+    run_git(
+        cwd,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial commit (deadreckon init)",
+        ],
+    )
+}
+
+fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(CliError::Core(DeadreckonError::InvalidInput(
+            if stderr.is_empty() {
+                format!("git {:?} failed", args)
+            } else {
+                stderr
+            },
+        )))
+    }
+}
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))))
+    }
+}
+
+fn git_status(cwd: &Path, args: &[&str]) -> Result<()> {
+    git_stdout(cwd, args).map(|_| ())
+}
+
+fn path_to_str(path: &Path) -> Result<&str> {
+    path.to_str().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "path is not valid UTF-8: {}",
+            path.display()
+        )))
+    })
+}
+
+struct RunPreview<'a> {
+    goal: &'a str,
+    cwd: &'a Path,
+    codebase: &'a CodebaseRecord,
+    provider: Option<&'a str>,
+    sandbox: &'a str,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    brief: bool,
+    run_id: &'a str,
+}
+
+fn run_preview(input: RunPreview<'_>) -> String {
+    let RunPreview {
+        goal,
+        cwd,
+        codebase,
+        provider,
+        sandbox,
+        max_spend,
+        max_wall_seconds,
+        brief,
+        run_id,
+    } = input;
+    let mode = codebase.mode.to_string();
+    let agent = provider.unwrap_or("-");
+    let caps = format!(
+        "spend {}, wall {}",
+        max_spend
+            .map(|cap| format!("<= ${cap:.0}"))
+            .unwrap_or_else(|| "uncapped".to_string()),
+        format_wall_cap(max_wall_seconds)
+    );
+    if brief {
+        return format!(
+            "mode={} branch={} base={} wt={} agent={} cap={}/{}",
+            mode,
+            codebase.branch_name.as_deref().unwrap_or("-"),
+            codebase.base_ref.as_deref().unwrap_or("-"),
+            codebase
+                .worktree_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            agent,
+            max_spend
+                .map(|cap| format!("${cap:.0}"))
+                .unwrap_or_else(|| "uncapped".to_string()),
+            format_wall_cap(max_wall_seconds)
+        );
+    }
+
+    let git_label = match preview_git_state(cwd) {
+        Ok(Some(git)) => format!("git: clean, branch={} @ {}", git.branch, git.head_sha),
+        _ => "not git".to_string(),
+    };
+    let mut lines = vec![
+        "deadreckon: ready to run".to_string(),
+        String::new(),
+        format!("  goal:     {goal}"),
+        format!("  source:   {} ({git_label})", cwd.display()),
+        format!("  mode:     {mode}"),
+    ];
+    if codebase.mode == CodebaseMode::Worktree {
+        lines.extend([
+            format!(
+                "    branch:   {}",
+                codebase.branch_name.as_deref().unwrap_or("-")
+            ),
+            format!(
+                "    base:     {} ({})",
+                codebase.base_ref.as_deref().unwrap_or("-"),
+                codebase
+                    .base_sha
+                    .as_deref()
+                    .map(|sha| sha.chars().take(8).collect::<String>())
+                    .unwrap_or_else(|| "-".to_string())
+            ),
+            format!(
+                "    worktree: {}",
+                codebase
+                    .worktree_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            ),
+        ]);
+    } else if let Some(source_path) = codebase.source_path.as_ref() {
+        lines.push(format!("    source-copy: {}", source_path.display()));
+    }
+    if codebase.mode == CodebaseMode::InPlace {
+        lines.push("    warning: SOURCE-IS-USER-TREE; undo uses runstate snapshots".to_string());
+    }
+    lines.extend([
+        format!("  agent:    {agent}"),
+        format!("  sandbox:  {sandbox}"),
+        format!("  caps:     {caps}"),
+    ]);
+    match codebase.mode {
+        CodebaseMode::Worktree => {
+            lines.push(format!("  on success: deadreckon apply {run_id}"));
+            lines.push(format!("  on fail:    deadreckon abandon {run_id}"));
+        }
+        CodebaseMode::Copy | CodebaseMode::Fresh => {
+            lines.push(format!(
+                "  on success: deadreckon materialize {run_id} --dest <path>"
+            ));
+            lines.push(format!("  inspect:    deadreckon show {run_id}"));
+        }
+        CodebaseMode::InPlace => {
+            lines.push(format!("  rollback:   deadreckon undo --run {run_id}"));
+            lines.push(format!("  inspect:    deadreckon show {run_id}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_wall_cap(max_wall_seconds: Option<f64>) -> String {
+    let Some(seconds) = max_wall_seconds else {
+        return "uncapped".to_string();
+    };
+    if seconds >= 3600.0 && seconds % 3600.0 == 0.0 {
+        format!("{:.0}h", seconds / 3600.0)
+    } else if seconds >= 60.0 && seconds % 60.0 == 0.0 {
+        format!("{:.0}m", seconds / 60.0)
+    } else {
+        format!("{seconds:.0}s")
+    }
+}
+
 fn free_kb(path: &std::path::Path) -> Option<u64> {
     let output = std::process::Command::new("df")
         .arg("-Pk")
@@ -811,6 +1197,26 @@ fn prompt_provider() -> Result<String> {
         detected.to_string()
     } else {
         answer.trim().to_string()
+    })
+}
+
+enum NonGitChoice {
+    Init,
+    Copy,
+    Cancel,
+}
+
+fn prompt_non_git_mode() -> Result<NonGitChoice> {
+    eprintln!("deadreckon: this is not a git repo. options:");
+    eprintln!("  [1] git init for me, then run with worktree mode (recommended)");
+    eprintln!("  [2] copy mode - agent works on a copy in ~/.deadreckon/runstate/...");
+    eprintln!("  [3] cancel");
+    let answer = prompt("choose [1]: ")?;
+    Ok(match answer.trim() {
+        "" | "1" => NonGitChoice::Init,
+        "2" => NonGitChoice::Copy,
+        "3" => NonGitChoice::Cancel,
+        _ => NonGitChoice::Cancel,
     })
 }
 
@@ -987,6 +1393,23 @@ fn materialize_completed_run(
     include_manifest: bool,
 ) -> Result<MaterializedRun> {
     ensure_completed_run(state, "run")?;
+    if let Ok(record) = read_codebase_record(&state.working_dir) {
+        match record.mode {
+            CodebaseMode::Worktree => {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "materialize is for copy/fresh runs; run was worktree",
+                    &format!("deadreckon apply {}", state.run_id),
+                )));
+            }
+            CodebaseMode::InPlace => {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "materialize is not needed; run edited the source in-place",
+                    "deadreckon undo",
+                )));
+            }
+            CodebaseMode::Copy | CodebaseMode::Fresh => {}
+        }
+    }
     let library_dir = paths.library_dir(&state.scope, &state.run_id);
     if !library_dir.is_dir() {
         return Err(CliError::Core(DeadreckonError::NotFound(format!(
@@ -1026,6 +1449,178 @@ fn print_materialized(materialized: &MaterializedRun) {
     println!("materialized run {}", materialized.run_id);
     println!("source {}", materialized.source.display());
     println!("dest {}", materialized.dest.display());
+}
+
+fn apply_command(
+    run_id: String,
+    strategy: String,
+    target_branch: Option<String>,
+    no_confirm: bool,
+    message: Option<String>,
+) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let state = load_run(&paths, &run_id)?;
+    if state.status != RunStatus::Completed {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("run {} is {}", state.run_id, state.status),
+            &format!("deadreckon resume {}", state.run_id),
+        )));
+    }
+    let record = read_codebase_record(&state.working_dir)?;
+    if record.mode != CodebaseMode::Worktree {
+        return Err(CliError::Core(apply_mode_error(&state.run_id, record.mode)));
+    }
+    let git_root = record.source_git_root.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "missing source_git_root".to_string(),
+        ))
+    })?;
+    let branch = record.branch_name.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "missing branch_name".to_string(),
+        ))
+    })?;
+    if !git_stdout(git_root, &["status", "--porcelain"])?
+        .trim()
+        .is_empty()
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "your working tree has uncommitted changes",
+            &format!("git stash && deadreckon apply {}", state.run_id),
+        )));
+    }
+    let target =
+        target_branch.unwrap_or(git_stdout(git_root, &["symbolic-ref", "--short", "HEAD"])?);
+    let diff_stat = git_stdout(
+        git_root,
+        &["diff", "--stat", &format!("{target}..{branch}")],
+    )
+    .unwrap_or_default();
+    if !diff_stat.trim().is_empty() {
+        eprintln!("{diff_stat}");
+    }
+    if !no_confirm && io::stdin().is_terminal() {
+        let answer = prompt("apply these changes? [Y/n]: ")?;
+        if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
+            println!("cancelled");
+            return Ok(());
+        }
+    } else if !no_confirm && !io::stdin().is_terminal() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "non-interactive apply requires --no-confirm",
+            &format!("deadreckon apply {} --no-confirm", state.run_id),
+        )));
+    }
+
+    let commit_message = message.unwrap_or_else(|| {
+        format!(
+            "{} (deadreckon run {})",
+            state.goal.lines().next().unwrap_or("deadreckon run"),
+            state.run_id.chars().take(8).collect::<String>()
+        )
+    });
+    match strategy.as_str() {
+        "merge" => git_status(
+            git_root,
+            &["merge", "--no-ff", branch, "-m", &commit_message],
+        )?,
+        "squash" => {
+            git_status(git_root, &["merge", "--squash", branch]).map_err(|err| {
+                CliError::Core(deadreckon_core::user_error(
+                    &format!("merge produced conflicts: {err}"),
+                    &format!(
+                        "resolve, then git commit && deadreckon abandon {}",
+                        state.run_id
+                    ),
+                ))
+            })?;
+            git_status(git_root, &["commit", "-m", &commit_message])?;
+        }
+        "cherry-pick" => {
+            let base = record.base_sha.as_deref().unwrap_or("HEAD");
+            git_status(git_root, &["cherry-pick", &format!("{base}..{branch}")])?;
+        }
+        other => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "unknown apply strategy {other}"
+            ))));
+        }
+    }
+    println!("applied {} onto {}:", state.run_id, target);
+    println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
+    println!("next: deadreckon abandon {}", state.run_id);
+    Ok(())
+}
+
+fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let mut state = load_run(&paths, &run_id)?;
+    let record = match read_codebase_record(&state.working_dir) {
+        Ok(record) => record,
+        Err(_) => {
+            println!("nothing to abandon for run {}", state.run_id);
+            return Ok(());
+        }
+    };
+    if record.mode == CodebaseMode::InPlace {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "cannot abandon in-place edits",
+            "deadreckon undo",
+        )));
+    }
+    if state.status == RunStatus::Executing {
+        if !force {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("run {} is executing", state.run_id),
+                &format!("deadreckon kill {} --force", state.run_id),
+            )));
+        }
+        let _ = kill_loaded_run(&paths, &mut state, true);
+    }
+    let mut removed = Vec::new();
+    if record.mode == CodebaseMode::Worktree
+        && let (Some(git_root), Some(worktree)) = (
+            record.source_git_root.as_ref(),
+            record.worktree_path.as_ref(),
+        )
+    {
+        if worktree.exists() {
+            let mut args = vec!["worktree", "remove"];
+            if force {
+                args.push("--force");
+            }
+            args.push(path_to_str(worktree)?);
+            let _ = git_status(git_root, &args);
+            removed.push(worktree.display().to_string());
+        }
+        if !keep_branch
+            && let Some(branch) = record.branch_name.as_deref()
+            && git_stdout(git_root, &["rev-parse", "--verify", branch]).is_ok()
+        {
+            let _ = git_status(git_root, &["branch", "-D", branch]);
+            removed.push(format!("branch {branch}"));
+        }
+    }
+    write_abandoned_marker(&state)?;
+    println!("abandoned {}", state.run_id);
+    for item in removed {
+        println!("  removed: {item}");
+    }
+    Ok(())
+}
+
+fn apply_mode_error(run_id: &str, mode: CodebaseMode) -> DeadreckonError {
+    let hint = match mode {
+        CodebaseMode::Copy | CodebaseMode::Fresh => {
+            format!("deadreckon materialize {run_id} --dest <path>")
+        }
+        CodebaseMode::InPlace => "deadreckon undo to revert if needed".to_string(),
+        CodebaseMode::Worktree => format!("deadreckon apply {run_id}"),
+    };
+    deadreckon_core::user_error(
+        &format!("apply requires worktree mode; run was {mode}"),
+        &hint,
+    )
 }
 
 async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
@@ -1381,6 +1976,19 @@ fn append_materialized_marker(library_dir: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_abandoned_marker(state: &deadreckon_core::PipelineState) -> Result<()> {
+    let path = state.run_root.join("abandoned.json");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "run_id": state.run_id,
+            "abandoned_at": Utc::now(),
+        }))?,
+    )?;
+    Ok(())
+}
+
 fn prepare_empty_dest(dest: &Path, force: bool) -> Result<()> {
     if dest.exists() {
         let non_empty = !path_is_empty_dir(dest)?;
@@ -1485,19 +2093,33 @@ fn list_command(scope: Option<String>) -> Result<()> {
         println!("no runs");
         return Ok(());
     }
-    println!("RUN\tSTATUS\tSCOPE\tUPDATED\tMATERIALIZED\tGOAL");
+    println!("RUN\tSTATUS\tSCOPE\tUPDATED\tMODE\tMATERIALIZED\tGOAL");
     for run in runs {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             run.run_id,
             run.status,
             run.scope,
             run.updated_at,
+            codebase_mode_status(&paths, &run),
             materialized_status(&paths, &run),
             run.goal
         );
     }
     Ok(())
+}
+
+fn codebase_mode_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEntry) -> String {
+    let state = match load_run(paths, &run.run_id) {
+        Ok(state) => state,
+        Err(_) => return "-".to_string(),
+    };
+    if state.run_root.join("abandoned.json").exists() {
+        return "abandoned".to_string();
+    }
+    read_codebase_record(&state.working_dir)
+        .map(|record| record.mode.to_string())
+        .unwrap_or_else(|_| "-".to_string())
 }
 
 fn materialized_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEntry) -> String {
@@ -1539,20 +2161,33 @@ async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
 fn kill_command(run_id: String, force: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = load_run(&paths, &run_id)?;
-    let pids = supervised_pids(&state);
-    release_lock_file(&paths, &state.scope, &state.task_key)?;
+    kill_loaded_run(&paths, &mut state, force)?;
+    if force {
+        println!("killed run {} forcefully", state.run_id);
+    } else {
+        println!("killed run {}", state.run_id);
+    }
+    Ok(())
+}
+
+fn kill_loaded_run(
+    paths: &DeadreckonPaths,
+    state: &mut deadreckon_core::PipelineState,
+    force: bool,
+) -> Result<()> {
+    let pids = supervised_pids(state);
+    release_lock_file(paths, &state.scope, &state.task_key)?;
     state.status = RunStatus::Killed;
     state.failure_reason = Some("killed by user".to_string());
     state.killed_at = Some(Utc::now());
     state.updated_at = Utc::now();
-    save_state(&state)?;
+    save_state(state)?;
     for pid in &pids {
         if *pid != std::process::id() {
             let _ = terminate_pid(*pid, force);
         }
     }
     if force {
-        println!("killed run {} forcefully", state.run_id);
         return Ok(());
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
@@ -1570,7 +2205,6 @@ fn kill_command(run_id: String, force: bool) -> Result<()> {
             let _ = terminate_pid(*pid, true);
         }
     }
-    println!("killed run {}", state.run_id);
     Ok(())
 }
 
@@ -1660,7 +2294,8 @@ fn undo_command(run: Option<String>, turn: Option<u32>) -> Result<()> {
         None => latest_run(&paths)?,
     };
     let target_turn = turn.unwrap_or_else(|| state.turn.saturating_sub(1));
-    restore_snapshot(&state, target_turn)?;
+    let restore_state = undo_restore_state(&state)?;
+    restore_snapshot(&restore_state, target_turn)?;
     append_trace(
         &state,
         &TraceRecord {
@@ -1676,6 +2311,25 @@ fn undo_command(run: Option<String>, turn: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+fn undo_restore_state(
+    state: &deadreckon_core::PipelineState,
+) -> Result<deadreckon_core::PipelineState> {
+    let Ok(record) = read_codebase_record(&state.working_dir) else {
+        return Ok(state.clone());
+    };
+    if record.mode != CodebaseMode::InPlace {
+        return Ok(state.clone());
+    }
+    let source_path = record.source_path.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "in-place codebase record missing source_path".to_string(),
+        ))
+    })?;
+    let mut restore_state = state.clone();
+    restore_state.working_dir = source_path.clone();
+    Ok(restore_state)
+}
+
 fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = load_run(&paths, &run_id)?;
@@ -1683,6 +2337,18 @@ fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
         && marker.kind == "extended"
     {
         println!("Extended from {}", marker.parent_run_id);
+    }
+    if let Ok(record) = read_codebase_record(&state.working_dir) {
+        println!("Mode {}", record.mode);
+        if let Some(branch) = record.branch_name.as_deref() {
+            println!("Branch {branch}");
+        }
+        if let Some(worktree) = record.worktree_path.as_ref() {
+            println!("Worktree {}", worktree.display());
+        }
+        if let Some(source) = record.source_path.as_ref() {
+            println!("Source {}", source.display());
+        }
     }
     println!("{}", serde_json::to_string_pretty(&state)?);
     let provenance_path = state.run_root.join("provenance.jsonl");
@@ -1934,6 +2600,17 @@ fn print_run_started(state: &deadreckon_core::PipelineState) {
 }
 
 fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
+    if let Ok(record) = read_codebase_record(&state.working_dir)
+        && record.mode == CodebaseMode::Worktree
+    {
+        println!("next actions:");
+        if let Some(worktree) = record.worktree_path.as_ref() {
+            println!("  inspect: cd {} && git status", worktree.display());
+        }
+        println!("  apply:   deadreckon apply {}", state.run_id);
+        println!("  abandon: deadreckon abandon {}", state.run_id);
+        return;
+    }
     let task_prefix = state.task_key.chars().take(24).collect::<String>();
     println!("next actions:");
     println!(
@@ -1961,10 +2638,23 @@ async fn complete_run_actions(
 async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     loop {
-        let answer = prompt("completed action [m materialize, e extend, s show, q quit]: ")?;
+        let prompt_text = if is_worktree_run(state) {
+            "completed action [a apply, b abandon, s show, q quit]: "
+        } else {
+            "completed action [m materialize, e extend, s show, q quit]: "
+        };
+        let answer = prompt(prompt_text)?;
         match completion_action_from_input(&answer) {
             Some(CompletionAction::Materialize) => prompt_materialize_action(&paths, state)?,
             Some(CompletionAction::Extend) => prompt_extend_action(state).await?,
+            Some(CompletionAction::Apply) => apply_command(
+                state.run_id.clone(),
+                "squash".to_string(),
+                None,
+                false,
+                None,
+            )?,
+            Some(CompletionAction::Abandon) => abandon_command(state.run_id.clone(), false, false)?,
             Some(CompletionAction::Show) => show_command(state.run_id.clone(), None)?,
             Some(CompletionAction::Quit) | None => break,
         }
@@ -1976,6 +2666,8 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
 enum CompletionAction {
     Materialize,
     Extend,
+    Apply,
+    Abandon,
     Show,
     Quit,
 }
@@ -1984,6 +2676,8 @@ fn completion_action_from_input(input: &str) -> Option<CompletionAction> {
     match input.trim().to_ascii_lowercase().as_str() {
         "m" | "materialize" => Some(CompletionAction::Materialize),
         "e" | "extend" => Some(CompletionAction::Extend),
+        "a" | "apply" => Some(CompletionAction::Apply),
+        "b" | "abandon" => Some(CompletionAction::Abandon),
         "s" | "show" => Some(CompletionAction::Show),
         "q" | "quit" | "" => Some(CompletionAction::Quit),
         _ => None,
@@ -2038,6 +2732,12 @@ async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<
         post_actions: false,
     })
     .await
+}
+
+fn is_worktree_run(state: &deadreckon_core::PipelineState) -> bool {
+    read_codebase_record(&state.working_dir)
+        .map(|record| record.mode == CodebaseMode::Worktree)
+        .unwrap_or(false)
 }
 
 async fn attach_tui(
@@ -2121,6 +2821,8 @@ async fn handle_tui_completion_key(
     let action = match key.code {
         KeyCode::Char('m') => CompletionAction::Materialize,
         KeyCode::Char('e') => CompletionAction::Extend,
+        KeyCode::Char('a') => CompletionAction::Apply,
+        KeyCode::Char('b') => CompletionAction::Abandon,
         KeyCode::Char('s') => CompletionAction::Show,
         _ => return Ok(false),
     };
@@ -2129,6 +2831,14 @@ async fn handle_tui_completion_key(
     let action_result = match action {
         CompletionAction::Materialize => prompt_materialize_action(paths, state),
         CompletionAction::Extend => prompt_extend_action(state).await,
+        CompletionAction::Apply => apply_command(
+            state.run_id.clone(),
+            "squash".to_string(),
+            None,
+            false,
+            None,
+        ),
+        CompletionAction::Abandon => abandon_command(state.run_id.clone(), false, false),
         CompletionAction::Show => show_command(state.run_id.clone(), None),
         CompletionAction::Quit => Ok(()),
     };
@@ -2789,7 +3499,12 @@ fn render_attach(
     );
     render_live_files(frame, center[1], live, tui_state);
     render_processes(frame, vertical[2], live, tui_state);
-    let footer = if tui_state.show_completion_actions && state.status == RunStatus::Completed {
+    let footer = if tui_state.show_completion_actions
+        && state.status == RunStatus::Completed
+        && is_worktree_run(state)
+    {
+        "completed: a apply  b abandon  s show  Tab focus  j/k scroll  q/Esc quit"
+    } else if tui_state.show_completion_actions && state.status == RunStatus::Completed {
         "completed: m materialize  e extend  s show  Tab focus  j/k scroll  q/Esc quit"
     } else {
         "Tab focus  ↑/↓ j/k scroll  PgUp/PgDn  Home/End  mouse wheel  Ctrl-D detach  q/Esc quit"

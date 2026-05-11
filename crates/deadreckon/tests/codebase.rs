@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use deadreckon_core::{
-    CodebaseMode, CodebaseRecord, DeadreckonPaths, ModeFlags, ResolvedMode, RunOptions, create_run,
+    CodebaseMode, CodebaseRecord, DeadreckonPaths, ModeFlags, ResolvedMode, RunOptions, RunStatus,
+    WorktreeOptions, create_run, list_runs, load_run, prepare_worktree_record,
     read_codebase_record, record_for_resolved_mode, resolve_mode, write_codebase_record,
 };
 use tempfile::TempDir;
@@ -101,14 +102,1198 @@ fn create_run_writes_fresh_codebase_json_by_default() {
     assert!(record.source_path.is_none());
 }
 
+#[test]
+fn worktree_run_creates_dr_prefixed_branch_in_worktrees_dir() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("worktree smoke")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.status, RunStatus::Completed);
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    assert_eq!(record.mode, CodebaseMode::Worktree);
+    let branch = record.branch_name.expect("branch");
+    assert!(branch.starts_with("dr/worktree-smoke-"));
+    let worktree = record.worktree_path.expect("worktree");
+    assert!(worktree.starts_with(paths.home().join("worktrees")));
+    assert!(worktree.exists());
+    git(&repo, &["rev-parse", "--verify", &branch]).expect("branch exists");
+}
+
+#[test]
+fn worktree_run_sets_working_dir_to_worktree_path() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let worktree = temp.path().join("worktree");
+    let mut record = CodebaseRecord::fresh();
+    record.mode = CodebaseMode::Worktree;
+    record.worktree_path = Some(worktree.clone());
+
+    let state = create_run(
+        &paths,
+        RunOptions {
+            goal: "worktree dir".to_string(),
+            cwd: temp.path().to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            run_id: None,
+            codebase: Some(record),
+        },
+    )
+    .expect("run");
+
+    assert_eq!(state.working_dir, worktree);
+    assert_eq!(
+        read_codebase_record(&state.working_dir)
+            .expect("codebase")
+            .mode,
+        CodebaseMode::Worktree
+    );
+}
+
+#[test]
+fn dirty_repo_refused_with_stash_hint() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    fs::write(repo.join("dirty.txt"), "dirty").expect("dirty");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("dirty run")
+        .arg("--smoke")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("working tree has uncommitted changes"));
+    assert!(stderr.contains("try: git stash && deadreckon run"));
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn no_commits_refused_with_initial_commit_hint() {
+    let temp = repo_tempdir();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    git(&repo, &["init"]).expect("git init");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("no commits")
+        .arg("--smoke")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("git repo has no commits"));
+    assert!(stderr.contains("try: git commit -m initial"));
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn detached_head_refused_with_switch_hint() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    git(&repo, &["checkout", "--detach"]).expect("detach");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("detached")
+        .arg("--smoke")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("HEAD is detached"));
+    assert!(stderr.contains("try: git switch -c <branch>"));
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn mid_merge_refused_with_abort_hint() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    fs::write(repo.join(".git/MERGE_HEAD"), "deadbeef\n").expect("merge head");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("mid merge")
+        .arg("--smoke")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("git is in the middle of a merge"));
+    assert!(stderr.contains("try: git merge --abort"));
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn mid_rebase_refused_with_abort_hint() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    fs::create_dir_all(repo.join(".git/rebase-merge")).expect("rebase dir");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("mid rebase")
+        .arg("--smoke")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("git is in the middle of a rebase"));
+    assert!(stderr.contains("try: git rebase --abort"));
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn allow_dirty_seeds_uncommitted_into_worktree() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    fs::write(repo.join("keep.txt"), "clean").expect("keep");
+    git(&repo, &["add", "keep.txt"]).expect("add keep");
+    git(&repo, &["commit", "-m", "add keep"]).expect("commit keep");
+    fs::write(repo.join("keep.txt"), "dirty keep").expect("dirty keep");
+    fs::write(repo.join("untracked.txt"), "dirty untracked").expect("untracked");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("allow dirty")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--allow-dirty")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    let worktree = record.worktree_path.expect("worktree");
+    assert!(record.dirty_files_seeded);
+    assert_eq!(
+        fs::read_to_string(worktree.join("keep.txt")).expect("keep"),
+        "dirty keep"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("untracked.txt")).expect("untracked"),
+        "dirty untracked"
+    );
+}
+
+#[test]
+fn branch_collision_refused_with_branch_hint() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("branch collision")
+        .arg("--smoke")
+        .arg("--branch")
+        .arg("main")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("branch main already exists"));
+    assert!(stderr.contains("try: pass --branch <other-name>"));
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn worktree_path_collision_appends_suffix() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    let options = WorktreeOptions {
+        run_id: run_id.clone(),
+        task_key: "collision".to_string(),
+        source_path: repo.clone(),
+        base_ref: None,
+        branch_name: Some("dr/collision-a".to_string()),
+        allow_dirty: false,
+    };
+    let first = prepare_worktree_record(&paths, options.clone()).expect("first");
+    fs::create_dir_all(first.worktree_path.as_ref().expect("worktree")).expect("worktree");
+    fs::write(
+        first
+            .worktree_path
+            .as_ref()
+            .expect("worktree")
+            .join("occupied"),
+        "occupied",
+    )
+    .expect("occupied");
+
+    let second = prepare_worktree_record(&paths, options).expect("second");
+
+    assert!(
+        second
+            .worktree_path
+            .expect("worktree")
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .ends_with("-2")
+    );
+}
+
+#[test]
+fn preview_flag_exits_zero_without_state_change() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("preview run")
+        .arg("--smoke")
+        .arg("--preview")
+        .output()
+        .expect("preview");
+
+    assert_success(&output);
+    let stderr = stderr(&output);
+    assert!(stderr.contains("deadreckon: ready to run"));
+    assert!(stderr.contains("  goal:     preview run"));
+    assert!(stderr.contains("  mode:     worktree"));
+    assert!(stderr.contains("  on success: deadreckon apply "));
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn preview_block_contains_required_fields_in_order() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("ordered preview")
+        .arg("--smoke")
+        .arg("--preview")
+        .output()
+        .expect("preview");
+
+    assert_success(&output);
+    let stderr = stderr(&output);
+    let fields = [
+        "deadreckon: ready to run",
+        "  goal:",
+        "  source:",
+        "  mode:",
+        "    branch:",
+        "    base:",
+        "    worktree:",
+        "  agent:",
+        "  sandbox:",
+        "  caps:",
+        "  on success:",
+        "  on fail:",
+    ];
+    let mut cursor = 0;
+    for field in fields {
+        let offset = stderr[cursor..]
+            .find(field)
+            .unwrap_or_else(|| panic!("missing {field} in {stderr}"));
+        cursor += offset + field.len();
+    }
+}
+
+#[test]
+fn brief_mode_is_one_line() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("brief preview")
+        .arg("--smoke")
+        .arg("--preview")
+        .arg("--brief")
+        .output()
+        .expect("preview");
+
+    assert_success(&output);
+    let stderr = stderr(&output);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.starts_with("mode=worktree branch=dr/brief-preview-"));
+    assert!(stderr.contains(" cap=$10/1h"));
+}
+
+#[test]
+fn yes_flag_skips_confirm_prompt() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("yes run")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .arg("--no-hints")
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("started run "));
+    assert!(stdout.contains("completed run "));
+    assert!(!stderr(&output).contains("continue?"));
+}
+
+#[test]
+fn non_tty_without_yes_refuses() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("needs yes")
+        .arg("--smoke")
+        .output()
+        .expect("run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("non-interactive without --yes"));
+    assert!(stderr.contains("try: --yes (skip confirm) or run interactively"));
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn copy_mode_respects_gitignore() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("source");
+    fs::create_dir_all(&source).expect("source");
+    fs::write(source.join(".gitignore"), "ignored.txt\n").expect("ignore");
+    fs::write(source.join("kept.txt"), "keep").expect("kept");
+    fs::write(source.join("ignored.txt"), "ignore").expect("ignored");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .arg("run")
+        .arg("copy mode")
+        .arg("--from")
+        .arg(&source)
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    assert_eq!(record.mode, CodebaseMode::Copy);
+    assert!(state.working_dir.join("kept.txt").exists());
+    assert!(!state.working_dir.join("ignored.txt").exists());
+}
+
+#[test]
+fn copy_mode_succeeds_in_non_git_dir() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("plain-source");
+    fs::create_dir_all(&source).expect("source");
+    fs::write(source.join("hello.txt"), "hello").expect("hello");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .arg("run")
+        .arg("copy non git")
+        .arg("--from")
+        .arg(&source)
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert!(state.working_dir.join("hello.txt").exists());
+}
+
+#[test]
+fn copy_mode_materialize_writes_dest_unchanged_from_today() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("copy-source");
+    fs::create_dir_all(&source).expect("source");
+    fs::write(source.join("hello.txt"), "hello").expect("hello");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .arg("run")
+        .arg("copy materialize")
+        .arg("--from")
+        .arg(&source)
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .arg("--no-hints")
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let dest = temp.path().join("materialized");
+    let materialize = deadreckon(&paths)
+        .current_dir(temp.path())
+        .arg("materialize")
+        .arg(&run.run_id)
+        .arg("--dest")
+        .arg(&dest)
+        .output()
+        .expect("materialize");
+
+    assert_success(&materialize);
+    assert_eq!(
+        fs::read_to_string(dest.join("hello.txt")).expect("hello"),
+        "hello"
+    );
+    assert!(dest.join(".deadreckon/parent.json").exists());
+}
+
+#[test]
+fn in_place_requires_double_confirm_or_i_know_flag() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("in-place-source");
+    fs::create_dir_all(&source).expect("source");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&source)
+        .arg("run")
+        .arg("in-place refused")
+        .arg("--in-place")
+        .arg("--smoke")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("--in-place requires --i-know-its-a-lot"));
+    assert!(stderr.contains("try: add --i-know-its-a-lot or run in a TTY"));
+}
+
+#[test]
+fn in_place_run_edits_source_path_directly() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("in-place-source");
+    fs::create_dir_all(&source).expect("source");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&source)
+        .arg("run")
+        .arg("in-place smoke")
+        .arg("--in-place")
+        .arg("--i-know-its-a-lot")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    assert!(source.join("Cargo.toml").exists());
+    assert!(source.join("README.md").exists());
+    assert!(source.join(".deadreckon/codebase.json").exists());
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    assert_eq!(record.mode, CodebaseMode::InPlace);
+}
+
+#[test]
+fn in_place_undo_restores_source_path_snapshot() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("in-place-source");
+    fs::create_dir_all(&source).expect("source");
+    fs::write(source.join("keep.txt"), "before").expect("keep");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&source)
+        .arg("run")
+        .arg("in-place undo")
+        .arg("--in-place")
+        .arg("--i-know-its-a-lot")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    assert!(source.join("Cargo.toml").exists());
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+
+    let undo = deadreckon(&paths)
+        .arg("undo")
+        .arg("--run")
+        .arg(&run.run_id)
+        .arg("--turn")
+        .arg("0")
+        .output()
+        .expect("undo");
+
+    assert_success(&undo);
+    assert!(!source.join("Cargo.toml").exists());
+    assert_eq!(
+        fs::read_to_string(source.join("keep.txt")).expect("keep"),
+        "before"
+    );
+    assert!(source.join(".deadreckon/codebase.json").exists());
+}
+
+#[test]
+fn materialize_in_place_refuses_with_undo_hint() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("in-place-source");
+    fs::create_dir_all(&source).expect("source");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&source)
+        .arg("run")
+        .arg("in-place materialize")
+        .arg("--in-place")
+        .arg("--i-know-its-a-lot")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .expect("run");
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+
+    let materialize = deadreckon(&paths)
+        .current_dir(temp.path())
+        .arg("materialize")
+        .arg(&run.run_id)
+        .arg("--dest")
+        .arg(temp.path().join("dest"))
+        .output()
+        .expect("materialize");
+
+    assert!(!materialize.status.success());
+    let stderr = stderr(&materialize);
+    assert!(stderr.contains("materialize is not needed; run edited the source in-place"));
+    assert!(stderr.contains("try: deadreckon undo"));
+}
+
+#[test]
+fn in_place_refuses_apply_with_try_undo_hint() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("in-place-source");
+    fs::create_dir_all(&source).expect("source");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&source)
+        .arg("run")
+        .arg("in-place apply")
+        .arg("--in-place")
+        .arg("--i-know-its-a-lot")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .arg("--no-hints")
+        .output()
+        .expect("run");
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+
+    let apply = deadreckon(&paths)
+        .arg("apply")
+        .arg(&run.run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("apply");
+
+    assert!(!apply.status.success());
+    let stderr = stderr(&apply);
+    assert!(stderr.contains("apply requires worktree mode; run was in-place"));
+    assert!(stderr.contains("try: deadreckon undo to revert if needed"));
+}
+
+#[test]
+fn apply_squash_creates_commit_on_user_branch() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+
+    let apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("apply");
+
+    assert_success(&apply);
+    assert!(repo.join("Cargo.toml").exists());
+    let log = git_stdout(&repo, &["log", "-1", "--oneline"]);
+    assert!(log.contains("worktree smoke"));
+}
+
+#[test]
+fn apply_refuses_on_dirty_user_tree() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+    fs::write(repo.join("local-dirty.txt"), "dirty").expect("dirty");
+
+    let apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("apply");
+
+    assert!(!apply.status.success());
+    let stderr = stderr(&apply);
+    assert!(stderr.contains("your working tree has uncommitted changes"));
+    assert!(stderr.contains(&format!("try: git stash && deadreckon apply {run_id}")));
+}
+
+#[test]
+fn apply_merge_no_ff_creates_merge_commit() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+
+    let apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--strategy")
+        .arg("merge")
+        .arg("--no-confirm")
+        .output()
+        .expect("apply");
+
+    assert_success(&apply);
+    assert_eq!(
+        git_stdout(&repo, &["rev-list", "--parents", "-n", "1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn apply_cherry_pick_preserves_turn_commits() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+
+    let apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--strategy")
+        .arg("cherry-pick")
+        .arg("--no-confirm")
+        .output()
+        .expect("apply");
+
+    assert_success(&apply);
+    let log = git_stdout(&repo, &["log", "-1", "--pretty=%s"]);
+    assert!(log.starts_with("turn "), "{log}");
+}
+
+#[test]
+fn apply_refuses_non_worktree_with_mode_specific_hint() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .arg("run")
+        .arg("fresh apply")
+        .arg("--fresh")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .arg("--no-hints")
+        .output()
+        .expect("run");
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+
+    let apply = deadreckon(&paths)
+        .arg("apply")
+        .arg(&run.run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("apply");
+
+    assert!(!apply.status.success());
+    let stderr = stderr(&apply);
+    assert!(stderr.contains("apply requires worktree mode; run was fresh"));
+    assert!(stderr.contains(&format!(
+        "try: deadreckon materialize {} --dest <path>",
+        run.run_id
+    )));
+}
+
+#[test]
+fn apply_refuses_uncompleted_run() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let state = create_run(
+        &paths,
+        RunOptions {
+            goal: "planned only".to_string(),
+            cwd: temp.path().to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+
+    let apply = deadreckon(&paths)
+        .arg("apply")
+        .arg(&state.run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("apply");
+
+    assert!(!apply.status.success());
+    let stderr = stderr(&apply);
+    assert!(stderr.contains(&format!("run {} is planned", state.run_id)));
+    assert!(stderr.contains(&format!("try: deadreckon resume {}", state.run_id)));
+}
+
+#[test]
+fn abandon_removes_worktree_and_branch() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+    let state = load_run(&paths, &run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    let worktree = record.worktree_path.clone().expect("worktree");
+    let branch = record.branch_name.clone().expect("branch");
+
+    let abandon = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("abandon")
+        .arg(&run_id)
+        .output()
+        .expect("abandon");
+
+    assert_success(&abandon);
+    assert!(!worktree.exists());
+    assert!(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "--verify", &branch])
+            .output()
+            .expect("branch check")
+            .status
+            .code()
+            .is_some_and(|code| code != 0)
+    );
+    assert!(state.run_root.join("abandoned.json").exists());
+}
+
+#[test]
+fn abandon_keep_branch_keeps_branch() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+    let state = load_run(&paths, &run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    let worktree = record.worktree_path.clone().expect("worktree");
+    let branch = record.branch_name.clone().expect("branch");
+
+    let abandon = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("abandon")
+        .arg(&run_id)
+        .arg("--keep-branch")
+        .output()
+        .expect("abandon");
+
+    assert_success(&abandon);
+    assert!(!worktree.exists());
+    git(&repo, &["rev-parse", "--verify", &branch]).expect("branch kept");
+    assert!(state.run_root.join("abandoned.json").exists());
+}
+
+#[test]
+fn abandon_idempotent_when_already_abandoned() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+
+    let first = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("abandon")
+        .arg(&run_id)
+        .output()
+        .expect("abandon first");
+    assert_success(&first);
+    let second = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("abandon")
+        .arg(&run_id)
+        .output()
+        .expect("abandon second");
+
+    assert_success(&second);
+    assert!(stdout(&second).contains(&format!("abandoned {run_id}")));
+}
+
+#[test]
+fn abandon_in_place_refuses_with_undo_hint() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("in-place-source");
+    fs::create_dir_all(&source).expect("source");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&source)
+        .arg("run")
+        .arg("in-place abandon")
+        .arg("--in-place")
+        .arg("--i-know-its-a-lot")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .arg("--no-hints")
+        .output()
+        .expect("run");
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+
+    let abandon = deadreckon(&paths)
+        .arg("abandon")
+        .arg(&run.run_id)
+        .output()
+        .expect("abandon");
+
+    assert!(!abandon.status.success());
+    let stderr = stderr(&abandon);
+    assert!(stderr.contains("cannot abandon in-place edits"));
+    assert!(stderr.contains("try: deadreckon undo"));
+}
+
+#[test]
+fn materialize_in_worktree_refuses_with_apply_hint() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+
+    let materialize = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("materialize")
+        .arg(&run_id)
+        .arg("--dest")
+        .arg(temp.path().join("dest"))
+        .output()
+        .expect("materialize");
+
+    assert!(!materialize.status.success());
+    let stderr = stderr(&materialize);
+    assert!(stderr.contains("materialize is for copy/fresh runs; run was worktree"));
+    assert!(stderr.contains(&format!("try: deadreckon apply {run_id}")));
+}
+
+#[test]
+fn list_shows_mode_column() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    run_worktree_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths).arg("list").output().expect("list");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("MODE"));
+    assert!(stdout.contains("worktree"));
+}
+
+#[test]
+fn show_reveals_codebase_lineage() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .arg("show")
+        .arg(&run_id)
+        .output()
+        .expect("show");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("Mode worktree"));
+    assert!(stdout.contains("Branch dr/worktree-smoke-"));
+    assert!(stdout.contains("Worktree "));
+}
+
+#[test]
+fn post_run_hint_lists_apply_and_abandon_lines() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("hinted run")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let stdout = stdout(&output);
+    assert!(stdout.contains("next actions:"));
+    assert!(stdout.contains(&format!("apply:   deadreckon apply {}", run.run_id)));
+    assert!(stdout.contains(&format!("abandon: deadreckon abandon {}", run.run_id)));
+}
+
 fn repo_tempdir() -> TempDir {
     let root = PathBuf::from("/Users/gdc/deadreckon/.test-tmp");
     fs::create_dir_all(&root).expect("test tmp root");
     TempDir::new_in(root).expect("tempdir")
 }
 
+fn run_worktree_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> String {
+    let output = deadreckon(paths)
+        .current_dir(repo)
+        .arg("run")
+        .arg("worktree smoke")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .output()
+        .expect("run");
+    assert_success(&output);
+    list_runs(paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run")
+        .run_id
+}
+
+fn clean_git_repo(temp: &TempDir) -> PathBuf {
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    git(&repo, &["init"]).expect("git init");
+    fs::write(repo.join("README.md"), "hello").expect("readme");
+    git(&repo, &["add", "-A"]).expect("add");
+    git(&repo, &["commit", "-m", "initial"]).expect("commit");
+    repo
+}
+
+fn deadreckon(paths: &DeadreckonPaths) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
+    command.env("DEADRECKON_HOME", paths.home());
+    command
+}
+
+fn assert_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(output),
+        stderr(output)
+    );
+}
+
+fn stdout(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
 fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
     let output = Command::new("git").current_dir(cwd).args(args).output()?;
+    if args.first() == Some(&"init") && output.status.success() {
+        let _ = Command::new("git")
+            .current_dir(cwd)
+            .args(["config", "user.email", "deadreckon@example.invalid"])
+            .output();
+        let _ = Command::new("git")
+            .current_dir(cwd)
+            .args(["config", "user.name", "deadreckon"])
+            .output();
+    }
     assert!(
         output.status.success(),
         "git {:?}\nstdout:{}\nstderr:{}",
@@ -117,4 +1302,20 @@ fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
+}
+
+fn git_stdout(cwd: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(
+        output.status.success(),
+        "git {:?}\nstdout:{}\nstderr:{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }

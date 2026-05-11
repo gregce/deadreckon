@@ -3,6 +3,11 @@
 ## Codebase modes (alpha) — 2026-05-11
 
 - P1: Added codebase mode records, fresh-mode metadata, and deterministic mode resolution plumbing without changing `PipelineState`.
+- Added codebase-aware `run` defaults: clean git repos now run in an isolated `git worktree` on a `dr/...` branch, while the old empty-working-dir behavior remains behind `--fresh`.
+- Added explicit copy (`--from`), worktree (`--worktree`, `--base`, `--branch`, `--allow-dirty`), and in-place (`--in-place --i-know-its-a-lot`) modes with single-screen preview and `--preview` / `--yes` scripting paths.
+- Added worktree lifecycle verbs: `deadreckon apply <run-id>` with squash/merge/cherry-pick strategies and `deadreckon abandon <run-id>` with branch/worktree cleanup.
+- Integrated codebase modes into `list`, `show`, `materialize`, `undo`, run completion prompts, and TUI completion actions. Worktree runs now hint apply/abandon; copy/fresh runs continue to hint materialize/extend.
+- Added depth coverage for worktree creation, dirty-refusal hints, preview no-op behavior, non-TTY confirmation refusal, copy-mode ignore handling, in-place edits and undo, apply, abandon, materialize refusal, list, and show.
 
 ## Lifecycle ergonomics
 

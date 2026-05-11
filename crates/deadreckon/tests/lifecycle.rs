@@ -368,6 +368,8 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
     write_config(paths.home(), &server.base_url());
     let output = deadreckon(&paths)
         .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
         .arg("hinted run")
         .arg("--provider")
         .arg("mock")
@@ -400,6 +402,8 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
     write_config(paths.home(), &server.base_url());
     let output = deadreckon(&paths)
         .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
         .arg("quiet hinted run")
         .arg("--provider")
         .arg("mock")

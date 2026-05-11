@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use chrono::Utc;
@@ -15,6 +16,7 @@ use crate::artifacts::{
     ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
     inventory_files, snapshot_working,
 };
+use crate::codebase::{CodebaseMode, read_codebase_record};
 use crate::error::{DeadreckonError, IoContext, Result};
 use crate::events::{RunEvent, RunEventKind, emit_event, event_preview, tool_args_json};
 use crate::gate::validate_acceptance_marker;
@@ -232,6 +234,7 @@ pub async fn run_turn_loop(
                 },
             )?;
             append_provenance_for_files(state, turn, &tool_call_id, &response.model, changed)?;
+            commit_worktree_turn(state, turn, "cli_subagent")?;
             emit_event(
                 state,
                 config.event_sender.as_ref(),
@@ -310,6 +313,7 @@ pub async fn run_turn_loop(
                 let changed = changed_files_since_snapshot(state, turn.saturating_sub(1))?;
                 snapshot_working(state, turn)?;
                 append_provenance_for_files(state, turn, &tool_call_id, &response.model, changed)?;
+                commit_worktree_turn(state, turn, &format!("bash {tool_call_id}"))?;
                 emit_event(
                     state,
                     config.event_sender.as_ref(),
@@ -367,6 +371,7 @@ pub async fn run_turn_loop(
                     &response.model,
                     vec![target],
                 )?;
+                commit_worktree_turn(state, turn, &format!("write_file {tool_call_id}"))?;
                 emit_event(
                     state,
                     config.event_sender.as_ref(),
@@ -664,6 +669,8 @@ fn run_acceptance_gate(state: &PipelineState) -> Result<()> {
     let output = std::process::Command::new(&gate)
         .arg("--run")
         .arg(&state.run_id)
+        .arg("--run-root")
+        .arg(&state.run_root)
         .arg("--working-dir")
         .arg(&state.working_dir)
         .output()
@@ -679,6 +686,64 @@ fn run_acceptance_gate(state: &PipelineState) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn commit_worktree_turn(state: &PipelineState, turn: u32, label: &str) -> Result<()> {
+    let record = match read_codebase_record(&state.working_dir) {
+        Ok(record) => record,
+        Err(_) => return Ok(()),
+    };
+    if record.mode != CodebaseMode::Worktree {
+        return Ok(());
+    }
+    git_status(
+        &state.working_dir,
+        &["config", "user.email", "deadreckon@example.invalid"],
+    )?;
+    git_status(&state.working_dir, &["config", "user.name", "deadreckon"])?;
+    git_status(&state.working_dir, &["add", "-A"])?;
+    if git_quiet(&state.working_dir, &["diff", "--cached", "--quiet"])? {
+        return Ok(());
+    }
+    git_status(
+        &state.working_dir,
+        &["commit", "-m", &format!("turn {turn}: {label}")],
+    )
+}
+
+fn git_quiet(cwd: &Path, args: &[&str]) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .map_err(|source| DeadreckonError::Io {
+            path: PathBuf::from("git"),
+            source,
+        })?;
+    Ok(output.status.success())
+}
+
+fn git_status(cwd: &Path, args: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .map_err(|source| DeadreckonError::Io {
+            path: PathBuf::from("git"),
+            source,
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(DeadreckonError::InvalidInput(format!(
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
 }
 
 fn gate_binary_path() -> Result<PathBuf> {

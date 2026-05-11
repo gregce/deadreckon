@@ -34,6 +34,7 @@ This document captures the system as built today — what's wired, what's load-b
 21. [Key Design Decisions](#21-key-design-decisions)
 22. [What's Built vs Scaffolding-Thin](#22-whats-built-vs-scaffolding-thin)
 23. [Glossary](#23-glossary)
+24. [Codebase Modes](#24-codebase-modes)
 
 ---
 
@@ -1145,7 +1146,7 @@ The handler creates an `imported-<hash>` run, parses the source, appends entries
 
 ## 17. CLI Surface
 
-Twelve verbs are defined in `crates/deadreckon/src/main.rs:89-162` (`Commands` enum). Handlers and roles:
+The `Commands` enum in `crates/deadreckon/src/main.rs` defines the CLI surface. Handlers and roles:
 
 | Verb | Handler | Role |
 |---|---|---|
@@ -1154,6 +1155,8 @@ Twelve verbs are defined in `crates/deadreckon/src/main.rs:89-162` (`Commands` e
 | `run` | `main.rs:316` | Create + enter turn loop |
 | `doctor` | `main.rs:484` | 8-point actionable preflight |
 | `list` | `main.rs:856` | Run inventory (run_id / status / scope / updated_at / goal) |
+| `apply` | `main.rs` | Apply a completed worktree run to the user's current branch |
+| `abandon` | `main.rs` | Remove a run's worktree branch/path or mark no-op modes abandoned |
 | `attach` | `main.rs:874` | TUI on a live or completed run |
 | `kill` | `main.rs:885` | Lock release + child PID termination |
 | `resume` | `main.rs:940` | Re-enter the loop on a non-Completed run |
@@ -1163,7 +1166,7 @@ Twelve verbs are defined in `crates/deadreckon/src/main.rs:89-162` (`Commands` e
 
 The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defaults to `$10` (with a confirmation gate above `$50`), `--provider` defaults to the highest-credentialed entry per the fallback chain, `--skill` defaults to `default-coding`.
 
-`run` and `attach` do **not** currently print lifecycle hints (`materialize:` / `extend:` on a completed run). Those are scheduled by the usability rider (`docs/goals/2026-05-11-deadreckon-usability-rider.md`).
+`run` now starts codebase-aware by default. In a git repo it previews and then creates a `git worktree` on a `dr/...` branch; `--fresh` preserves the old empty-working-dir behavior, `--from <path>` uses copy mode, and `--in-place --i-know-its-a-lot` edits the source tree directly. Completed worktree runs hint `apply` / `abandon`; copy and fresh runs hint `materialize` / `extend`.
 
 ---
 
@@ -1345,6 +1348,9 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 - CLI providers (`cli:claude-code`, `cli:codex`) with wall-clock subscription spend.
 - Smoke provider (deterministic) for keyless tests.
 - Turn loop with action parsing (Bash / WriteFile / Done) and CLI sub-agent path.
+- Codebase-default running: worktree mode, copy mode, in-place mode, fresh-mode preservation, preflight + preview UX, and `codebase.json` files-not-fields metadata.
+- `apply` and `abandon` for worktree rollback/apply lifecycle.
+- `materialize`, `extend`, `undo`, `list`, and `show` integration with codebase mode metadata.
 - Acceptance gate with signed marker; anti-self-attestation actually enforced.
 - `init`, `config get/set`, `run`, `doctor`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import` verbs.
 - `ratatui` attach TUI with spend meter, context meter, recent activity.
@@ -1366,9 +1372,6 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 
 ### Not yet built (V1+ candidates per `docs/goals/2026-05-11-deadreckon-usability-rider.md` and the V1 list in the robust rider)
 
-- `materialize <run-id>` (copy library artifacts to a user dest).
-- `extend <run-id> "<new-goal>"` (continue a completed run with a new prompt).
-- Lifecycle hints printed after run completion / attach landing.
 - Sub-agent forking as a user-facing CLI verb.
 - Hook system (pre/post tool call).
 - MCP client surface.
@@ -1376,6 +1379,8 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 - Cloud sync of histories.
 - Voice / meeting capture.
 - Real-time multi-cursor TUI presence.
+
+The codebase-mode rider adds capability; it does not close the robust-rider thin items above.
 
 ---
 
@@ -1393,6 +1398,62 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 - **Acceptance marker** — a signed JSON file (`proofs/turn-acceptance.json`) written by `dr-gate`. Its signature is tied to a per-run nonce only `dr-gate` reads.
 - **Spend** — a record of LLM cost per turn. USD for HTTP providers; wall-clock seconds + `subscription: true` for CLI providers.
 - **Provenance** — per-file attribution: which `tool_call_id` produced which file in which turn under which model.
+
+---
+
+## 24. Codebase Modes
+
+### 24.1 Why Codebase-Aware Running Is The Default
+
+The default `run` flow now gives the agent the user's project instead of an empty directory. This directly addresses the "agent never sees my repo" failure mode while preserving isolation: in git repos, deadreckon edits a new worktree and branch, not the user's checkout.
+
+### 24.2 Mode Resolution
+
+`run` resolves modes before state is written: `--fresh` keeps the old empty directory, `--in-place` requires explicit danger acknowledgement, `--worktree` forces git worktree mode, `--from <path>` forces copy mode, and a clean git repo defaults to worktree mode. Non-git interactive runs offer init/copy/cancel; non-interactive runs require an explicit mode or `--yes`.
+
+### 24.3 Worktree Mode
+
+Worktree mode creates branch `dr/<task-slug>-<run-id-prefix>` at `~/.deadreckon/worktrees/<scope>-<run-id-prefix>`. The branch is based on `--base` or the current branch. The source checkout is not touched until `deadreckon apply`.
+
+### 24.4 Copy Mode
+
+Copy mode seeds `runstate/<scope>/runs/<id>/working` from `--from <path>` using the `ignore` crate so `.gitignore`, `.ignore`, global gitignore, `.git`, `target`, and `node_modules` are not copied.
+
+### 24.5 In-Place Mode
+
+In-place mode sets `working_dir` to the source path and writes `.deadreckon/codebase.json` there. It requires `--in-place --i-know-its-a-lot` in non-interactive use. The user tree is edited directly; `undo` is the rollback tool.
+
+### 24.6 Fresh Mode
+
+Fresh mode is the previous empty-working-directory behavior behind `--fresh`. It records `mode: "fresh"` in `working/.deadreckon/codebase.json` and keeps existing smoke tests honest.
+
+### 24.7 `codebase.json`
+
+Mode metadata lives in `working/.deadreckon/codebase.json`, not `PipelineState`. Fields include `mode`, `source_path`, `source_git_root`, `branch_name`, `base_ref`, `base_sha`, `worktree_path`, dirty seeding flags, timestamp, and deadreckon version.
+
+### 24.8 Worktree Preflight
+
+Worktree preflight refuses non-git sources, repos with no commits, detached HEAD, mid-merge, mid-rebase, dirty trees unless `--allow-dirty`, branch collisions, and occupied worktree paths. Errors include `try:` lines.
+
+### 24.9 Preview Block
+
+Before file changes, `run` prints a single preview block with goal, source/git state, mode, branch/base/worktree when relevant, provider, sandbox, caps, and next verbs. `--preview` exits after printing; `--yes` skips confirmation.
+
+### 24.10 `apply` / `abandon`
+
+`apply` supports `squash` (default), `merge`, and `cherry-pick`. It refuses non-worktree runs and dirty user checkouts, then prints `git log -1 --stat`. `abandon` removes the worktree and branch when safe, supports `--keep-branch`, and writes `abandoned.json`.
+
+### 24.11 Integration With Existing Verbs
+
+`materialize` refuses worktree runs with an `apply` hint and refuses in-place runs
+with an `undo` hint. `list` shows `MODE`. `show` prints mode, branch, worktree,
+and source lines. `undo` restores the original source path for in-place runs.
+`extend` and other lifecycle commands continue to use files-not-fields metadata
+and snapshot semantics.
+
+### 24.12 Not Yet Built
+
+V1 candidates remain in `docs/V1-CANDIDATES.md`: richer apply targets, remote-aware refresh, multi-repo orchestration, and conflict-resolution assistance. This section does not remove any robust-rider thin items.
 - **Trace** — every LLM call and every tool dispatch, with latency + structured detail.
 - **CLI sub-agent** — a `cli:*` provider whose `complete()` invocation is one whole turn (the sub-agent does its own tool calls inside). Detected by `response.trace["kind"] == "cli_subagent"`.
 - **dr-gate** — the standalone binary at `crates/deadreckon/src/bin/dr-gate.rs` that owns acceptance verification. The agent cannot impersonate it.

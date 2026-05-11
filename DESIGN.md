@@ -24,7 +24,7 @@ The alpha implementation is intentionally local-first. Runtime state defaults to
 
 Source lives under `/Users/gdc/deadreckon/`:
 
-- `crates/deadreckon-core`: run paths, phase machine, JSON state, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports.
+- `crates/deadreckon-core`: run paths, phase machine, JSON state, codebase mode records, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports.
 - `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, OpenAI-compatible, `cli:claude-code`, `cli:codex`, and explicit `--smoke` scripted adapters, fallback routing, spend estimates.
 - `crates/deadreckon-sandbox`: `sandbox-exec`, `bwrap`, `docker`, and `none` backends using `tokio::process::Command`; default `auto`.
 - `crates/deadreckon`: clap CLI, ratatui attach UI, init/config/run/list/attach/kill/resume/undo/show/import/materialize/extend/doctor.
@@ -46,7 +46,20 @@ Source lives under `/Users/gdc/deadreckon/`:
 
 ## Execution Model
 
-The primary path is provider-driven: `deadreckon run <goal>` creates state, calls `ProviderRouter::complete`, parses model actions, executes tool calls in the configured sandbox, feeds results into history, and repeats until a provider returns `done`, a spend cap pauses the run, or the run is killed. HTTP providers use user-supplied keys or env vars; CLI providers use local subscription CLIs and run through the deadreckon sandbox wrapper.
+The primary path is provider-driven: `deadreckon run <goal>` resolves the
+codebase mode, previews the plan, creates state, calls `ProviderRouter::complete`,
+parses model actions, executes tool calls in the configured sandbox, feeds
+results into history, and repeats until a provider returns `done`, a spend cap
+pauses the run, or the run is killed. HTTP providers use user-supplied keys or
+env vars; CLI providers use local subscription CLIs and run through the
+deadreckon sandbox wrapper.
+
+In a git repo, the default codebase mode is `worktree`: deadreckon creates
+`~/.deadreckon/worktrees/<scope>-<run-id>` on a `dr/...` branch, runs the agent
+there, and leaves the user's checkout untouched until `deadreckon apply`. Outside
+git, interactive users can initialize git, copy the directory, or cancel.
+Non-interactive users must pass `--fresh`, `--from`, or initialize git first.
+The former empty working directory path remains available as `--fresh`.
 
 For keyless local verification only, `deadreckon run --smoke <goal>` selects the `smoke` provider explicitly. That scripted provider still goes through the same turn loop, sandbox dispatch, snapshots, spend records, traces, provenance, and external `dr-gate` acceptance marker; it is not the default run path.
 
@@ -55,16 +68,22 @@ The default skill is Markdown and external to the binary. The binary loads it an
 ## CLI Lifecycle
 
 Completed artifacts are promoted into `/Users/gdc/.deadreckon/library/<scope>/<run-id>/`.
-`deadreckon materialize <run-id> --dest <path>` copies that library artifact to
-a user-owned path, writes `.deadreckon/parent.json`, and records the reverse
-`.materialized-to` marker in the library. `deadreckon extend <run-id>
-"follow-up goal"` creates a fresh run in the parent's scope/task lock, seeds the
-new working tree from the parent library, stores parent lineage in
+Worktree runs keep their `dr/...` branch available for review and finish with
+`deadreckon apply <run-id>` or `deadreckon abandon <run-id>`. `apply` supports
+squash, merge, and cherry-pick strategies; `abandon` removes the worktree and,
+unless `--keep-branch` is used, the temporary branch.
+
+Copy and fresh runs use `deadreckon materialize <run-id> --dest <path>` to copy
+the library artifact to a user-owned path, write `.deadreckon/parent.json`, and
+record the reverse `.materialized-to` marker in the library. `deadreckon extend
+<run-id> "follow-up goal"` creates a fresh run in the parent's scope/task lock,
+seeds the new working tree from the parent library, stores parent lineage in
 `working/.deadreckon/parent.json`, and starts the normal turn loop with reset
 resource caps.
 
-Lineage intentionally stays outside `PipelineState`; show/list/hints derive it
-from marker files so the state schema remains stable.
+Lineage and codebase mode metadata intentionally stay outside `PipelineState`;
+show/list/hints derive them from marker files and `working/.deadreckon/codebase.json`
+so the state schema remains stable.
 
 ## Decisions And Conflicts
 
@@ -73,6 +92,10 @@ from marker files so the state schema remains stable.
 - Sandbox fallback: on macOS `auto` selects `sandbox-exec` if available. If not available, or on Linux without `bwrap`, `doctor` reports the missing binary and `run` falls back to `none` with a warning, matching the rider.
 - Live Tier C CLI verification: `codex` was run with `exec --ephemeral --dangerously-bypass-approvals-and-sandbox` inside deadreckon's outer `sandbox-exec` wrapper. Run `59c57e4565704135a9982789d0754803` produced `working/notes.md`, `traces.jsonl`, `provenance.jsonl`, snapshots, and a validated `dr-gate` marker without raw API keys.
 - First-run UX: `deadreckon init` writes `/Users/gdc/.deadreckon/config.toml`, `deadreckon config get/set` performs non-interactive edits, `doctor` prints actionable check/fix lines, and `run` enforces the `$50` confirmation guard for scripts.
+- Codebase modes: the architecture keeps mode metadata in
+  `working/.deadreckon/codebase.json` rather than extending `PipelineState`.
+  This preserves existing runstate readers while allowing worktree, copy,
+  in-place, and fresh flows to evolve independently.
 
 ## Verification
 

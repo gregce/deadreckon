@@ -72,7 +72,9 @@ Completed accepted runs are promoted to:
 /Users/gdc/.deadreckon/library/<scope>/<run-id>/
 ```
 
-The directory where you launch `deadreckon run` is recorded as `launch-dir` and is left unchanged. The completed code is printed as `artifact`; run or copy from that path when you are ready to use it.
+The directory where you launch `deadreckon run` is recorded as `launch-dir`.
+In a git repo, the normal default is a separate worktree on a `dr/...` branch.
+Your checkout is left unchanged until `deadreckon apply <run-id>`.
 
 ## First Run
 
@@ -127,12 +129,13 @@ deadreckon attach "$RUN_ID"
 
 ## Normal Coding Run
 
-After `init`, the normal path is just:
+After `init`, the normal path in a git repo is:
 
 ```bash
 deadreckon run "make a full task productivity tracker in nodejs that allows me to manage my day"
-deadreckon list
 deadreckon attach <run-id>
+deadreckon apply <run-id>
+deadreckon abandon <run-id>
 ```
 
 `run` prints the run id and attach command as soon as state is created:
@@ -140,6 +143,31 @@ deadreckon attach <run-id>
 ```text
 started run <run-id>
 attach: deadreckon attach <run-id>
+```
+
+Before it creates state or files, `run` prints a preview. In a clean git repo,
+the preview shows `mode: worktree`, the `dr/...` branch, the base ref, and the
+worktree path. Use `--yes` to skip the confirmation in scripts or `--preview`
+to print the block and exit.
+
+Mode overrides:
+
+```bash
+deadreckon run "goal" --fresh                         # old empty working dir
+deadreckon run "goal" --from .                        # gitignore-aware copy
+deadreckon run "goal" --worktree                      # force git worktree
+deadreckon run "goal" --base main --branch dr/my-task # customize worktree branch
+deadreckon run "goal" --allow-dirty                   # seed dirty files into worktree
+deadreckon run "goal" --in-place --i-know-its-a-lot   # edit current dir directly
+```
+
+Outside git, interactive `run` offers git init, copy mode, or cancel.
+Non-interactive runs outside git need an explicit mode:
+
+```bash
+deadreckon run "goal" --from . --yes
+deadreckon run "goal" --fresh --yes
+git init && deadreckon run "goal" --yes
 ```
 
 The default config from `deadreckon init` supplies the provider, sandbox, `$10` spend cap, and `3600` second wall-clock cap. Use flags only when overriding those defaults:
@@ -196,8 +224,10 @@ PgUp/PgDn scroll focused panel by a page
 After a run completes, the TUI footer adds lifecycle actions:
 
 ```text
-m        materialize the completed artifact
-e        extend the completed run with a follow-up goal
+a        apply a completed worktree run
+b        abandon a completed worktree run
+m        materialize a completed copy/fresh artifact
+e        extend a completed copy/fresh run with a follow-up goal
 s        show run details
 ```
 
@@ -208,18 +238,26 @@ The TUI does not start, kill, resume, or undo runs. Use CLI commands for those c
 Completed `run` and `extend` commands show the same lifecycle actions in the CLI:
 
 ```text
+completed action [a apply, b abandon, s show, q quit]:
 completed action [m materialize, e extend, s show, q quit]:
 ```
 
-Use `m` to copy the library artifact into a normal directory, `e` to start a
-fresh child run from the completed artifact, or `s` to inspect state and
-lineage. Pass `--no-hints` to `run` or `attach` when scripting.
+Worktree runs use `a` to squash-apply changes to the current branch or `b` to
+discard the worktree and temporary branch. Copy/fresh runs use `m` to copy the
+library artifact into a normal directory, `e` to start a child run from the
+completed artifact, or `s` to inspect state and lineage. Pass `--no-hints` to
+`run` or `attach` when scripting.
 
 ## List, Show, Kill, Resume
 
 ```bash
 deadreckon list
 deadreckon show <run-id>
+deadreckon apply <run-id>
+deadreckon apply <run-id> --strategy merge
+deadreckon apply <run-id> --strategy cherry-pick --no-confirm
+deadreckon abandon <run-id>
+deadreckon abandon <run-id> --keep-branch
 deadreckon kill <run-id>
 deadreckon kill <run-id> --force
 deadreckon resume <run-id>
@@ -243,7 +281,9 @@ Restore a specific turn:
 deadreckon undo --run <run-id> --turn 1
 ```
 
-Undo restores the run working directory from `snapshots/turn-<N>/` and records an undo trace.
+Undo restores the run working directory from `snapshots/turn-<N>/` and records
+an undo trace. For in-place runs, undo restores the original source path because
+the agent edited that directory directly.
 
 ## Acceptance Gates
 

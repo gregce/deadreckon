@@ -10,6 +10,7 @@ chrono.workspace = true
 deadreckon-providers = { path = "../deadreckon-providers" }
 deadreckon-sandbox = { path = "../deadreckon-sandbox" }
 fs2.workspace = true
+ignore.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

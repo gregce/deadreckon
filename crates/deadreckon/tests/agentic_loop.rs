@@ -24,6 +24,8 @@ async fn mock_provider_records_three_turns_and_artifacts_match() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
         .arg("mock three turn task")
         .arg("--provider")
         .arg("mock")
@@ -70,6 +72,8 @@ async fn kill_mid_turn_sets_killed_and_stops_process() {
     let home = temp.path().join("home");
     let mut child = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
         .arg("mock slow task")
         .arg("--provider")
         .arg("mock")
@@ -107,6 +111,8 @@ async fn resume_preserves_history_file() {
     write_config(temp.path(), &server.base_url());
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
         .arg("mock resume history")
         .arg("--provider")
         .arg("mock")
@@ -141,6 +147,8 @@ async fn cli_subagent_without_file_changes_fails_run() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
         .arg("cli no-op")
         .arg("--provider")
         .arg("cli:codex")
@@ -219,6 +227,8 @@ async fn init_config_and_default_spend_work() {
 
     let run = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
         .arg("tiny hello rust")
         .arg("--smoke")
         .arg("--sandbox")
@@ -247,6 +257,8 @@ async fn high_spend_requires_confirmation_flag_in_scripts() {
     let temp = repo_tempdir();
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
         .arg("too much")
         .arg("--smoke")
         .arg("--sandbox")
@@ -278,6 +290,8 @@ async fn cli_wall_clock_budget_enforced() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
         .arg("cli wall budget")
         .arg("--provider")
         .arg("cli:codex")
@@ -343,6 +357,8 @@ async fn kill_storm_no_leaks() {
         fs::create_dir_all(&scope_root).expect("scope root");
         let child = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
             .arg("run")
+            .arg("--fresh")
+            .arg("--yes")
             .arg(format!("mock slow task {idx}"))
             .arg("--provider")
             .arg("mock")
@@ -496,6 +512,8 @@ async fn stress_5_concurrent_10min() {
         children.push(
             Command::new(env!("CARGO_BIN_EXE_deadreckon"))
                 .arg("run")
+                .arg("--fresh")
+                .arg("--yes")
                 .arg(format!("stress run {idx}"))
                 .arg("--provider")
                 .arg("cli:codex")

@@ -22,6 +22,9 @@ next: deadreckon run "describe the coding task"
 Runtime state defaults to `/Users/gdc/.deadreckon/`. Set `DEADRECKON_HOME` for tests or isolated local runs.
 
 Normal runs use the configured provider router, sandbox, spend cap, and wall-clock cap at `/Users/gdc/.deadreckon/config.toml`.
+In a git repo, the default working mode is a new `git worktree` on a `dr/...`
+branch under `/Users/gdc/.deadreckon/worktrees/`; the launch checkout is left
+unchanged until you run `deadreckon apply`.
 After `init`, provider/sandbox/caps are defaults; flags are only overrides:
 
 ```bash
@@ -39,10 +42,8 @@ DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadrec
 ## Lifecycle
 
 ```text
-init -> run -> list -> attach -> materialize -> extend
-                                  |
-                                  v
-                           users' working dir
+git repo: init -> run -> attach -> apply | abandon
+copy/fresh:       run -> attach -> materialize -> extend
 ```
 
 Start an unattended run:
@@ -57,10 +58,22 @@ deadreckon attach <run-id>
 <run-id>` immediately, so you can attach from another terminal without going
 through `list`.
 
-Materialize a completed artifact into an editable project directory:
+Apply a completed worktree run back to your current branch:
 
 ```bash
 deadreckon list
+deadreckon apply <run-id>
+deadreckon abandon <run-id>
+```
+
+Use `abandon` after inspection or after a successful apply to remove the
+deadreckon worktree and temporary branch.
+
+Materialize a completed copy or fresh artifact into an editable project
+directory:
+
+```bash
+deadreckon run "make a realtime chess app" --fresh
 deadreckon materialize <run-id> --dest ./realtime-chess
 cd ./realtime-chess
 ```
@@ -72,7 +85,8 @@ deadreckon extend <run-id> "add spectator mode and rematch support"
 deadreckon show <new-run-id>
 ```
 
-Completed runs print a next-action menu by default. In an interactive CLI,
-choose `m` to materialize, `e` to extend, `s` to show details, or `q` to quit.
-In the TUI, the same keys are available after completion. Use `--no-hints` on
-`run` or `attach` to suppress completion guidance.
+Completed runs print a next-action menu by default. Worktree runs offer
+`a` apply, `b` abandon, and `s` show. Copy/fresh runs offer `m` materialize,
+`e` extend, and `s` show. In the TUI, the same keys are available after
+completion. Use `--no-hints` on `run` or `attach` to suppress completion
+guidance.
