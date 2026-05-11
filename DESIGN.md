@@ -57,7 +57,7 @@ The default skill is Markdown and external to the binary. The binary loads it an
 - Runtime writes during verification: the rider prescribes `/Users/gdc/.deadreckon/`, while the build instruction forbids edits outside `/Users/gdc/deadreckon/` and `/Users/gdc/stoa/docs/goals/`. The binary defaults to `/Users/gdc/.deadreckon/`, but all repository verification uses `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke`.
 - Sub-agent forking: the architecture requires the pattern, but the V1 list explicitly moves `deadreckon fork` to V1. V0 records scope/session lineage and keeps the subprocess skill boundary; explicit multi-agent forks are documented in `docs/V1-CANDIDATES.md`.
 - Sandbox fallback: on macOS `auto` selects `sandbox-exec` if available. If not available, or on Linux without `bwrap`, `doctor` reports the missing binary and `run` falls back to `none` with a warning, matching the rider.
-- Live Tier C CLI verification: `claude` and `codex` are present on this machine, but running either can write subscription-tool session state outside `/Users/gdc/deadreckon/`. The checked-in verification therefore uses fake CLI binaries plus sandbox-wrapped provider tests unless the user explicitly approves a live subscription run.
+- Live Tier C CLI verification: `codex` was run with `exec --ephemeral --dangerously-bypass-approvals-and-sandbox` inside deadreckon's outer `sandbox-exec` wrapper. Run `59c57e4565704135a9982789d0754803` produced `working/notes.md`, `traces.jsonl`, `provenance.jsonl`, snapshots, and a validated `dr-gate` marker without raw API keys.
 
 ## Verification
 
@@ -70,6 +70,7 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
 DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon run "tiny hello rust" --smoke --sandbox none --max-spend 1
+DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon run "make a 5-line file at notes.md describing dead reckoning" --provider cli:codex --sandbox sandbox-exec --max-spend 5
 ```
 
-`demo.cast` records real release-binary output from the explicit keyless smoke path without relying on provider credentials.
+`demo.cast` records real release-binary output from the live `cli:codex` path without relying on raw provider API keys.
