@@ -1,0 +1,18 @@
+[package]
+name = "deadreckon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+deadreckon-core = { path = "../deadreckon-core" }
+deadreckon-providers = { path = "../deadreckon-providers" }
+deadreckon-sandbox = { path = "../deadreckon-sandbox" }
+ratatui.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
