@@ -176,6 +176,92 @@ async fn cli_subagent_without_file_changes_fails_run() {
     assert!(!state.run_root.join("proofs/turn-acceptance.json").exists());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn init_config_and_default_spend_work() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let init = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("init")
+        .arg("--provider")
+        .arg("cli:codex")
+        .arg("--max-spend")
+        .arg("14")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--no-confirm")
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("init");
+    assert!(
+        init.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let get = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("config")
+        .arg("get")
+        .arg("defaults.max_spend")
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("config get");
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "14");
+    let set = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("config")
+        .arg("set")
+        .arg("defaults.max_spend")
+        .arg("15")
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("config set");
+    assert!(set.status.success());
+
+    let run = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("run")
+        .arg("tiny hello rust")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("run");
+    assert!(
+        run.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let paths = DeadreckonPaths::from_home(&home);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.max_spend_usd, Some(15.0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn high_spend_requires_confirmation_flag_in_scripts() {
+    let temp = repo_tempdir();
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("run")
+        .arg("too much")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("51")
+        .env("DEADRECKON_HOME", temp.path().join("home"))
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("max spend above $50"));
+    assert!(stderr.contains("hint:"));
+}
+
 fn repo_tempdir() -> TempDir {
     let root = std::path::Path::new("/Users/gdc/deadreckon/.test-tmp");
     fs::create_dir_all(root).expect("test tmp root");

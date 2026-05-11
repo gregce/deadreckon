@@ -438,6 +438,8 @@ impl ProviderRouter {
             vec![default_provider]
         } else {
             vec![
+                "cli:claude-code".to_string(),
+                "cli:codex".to_string(),
                 "anthropic".to_string(),
                 "openai".to_string(),
                 "openai-compatible".to_string(),

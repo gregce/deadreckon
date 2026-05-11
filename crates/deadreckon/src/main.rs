@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
-use std::io::{self, IsTerminal};
+use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -38,9 +39,37 @@ enum CliError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("TOML decode error: {0}")]
+    TomlDe(#[from] toml::de::Error),
+    #[error("TOML encode error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
 }
 
 type Result<T> = std::result::Result<T, CliError>;
+
+fn error_hint(err: &CliError) -> Option<&'static str> {
+    match err {
+        CliError::Provider(deadreckon_providers::ProviderError::MissingCredential(_))
+        | CliError::Provider(deadreckon_providers::ProviderError::NoRoute(_)) => Some(
+            "run `deadreckon init` or `deadreckon config set providers.anthropic.api_key <KEY>`",
+        ),
+        CliError::Core(DeadreckonError::InvalidInput(message))
+            if message.contains("max spend above $50") =>
+        {
+            Some("rerun with `--i-know-its-a-lot` or lower `--max-spend`")
+        }
+        CliError::Core(DeadreckonError::NotFound(_)) => {
+            Some("run `deadreckon list` to find valid run ids or config keys")
+        }
+        CliError::Sandbox(_) => Some("run `deadreckon doctor` to inspect sandbox availability"),
+        CliError::TomlDe(_) | CliError::TomlSer(_) => {
+            Some("check /Users/gdc/.deadreckon/config.toml or rerun `deadreckon init`")
+        }
+        CliError::Io(_) => Some("check that the referenced path exists and is writable"),
+        CliError::Json(_) => Some("inspect the referenced JSON file for invalid syntax"),
+        CliError::Core(_) | CliError::Provider(_) => None,
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -55,18 +84,40 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Init {
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long, default_value_t = 10.0)]
+        max_spend: f64,
+        #[arg(long, default_value = "auto")]
+        sandbox: String,
+        #[arg(long)]
+        no_confirm: bool,
+    },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     Run {
         goal: String,
         #[arg(long)]
         max_spend: Option<f64>,
-        #[arg(long, default_value = "auto")]
-        sandbox: String,
+        #[arg(long)]
+        sandbox: Option<String>,
         #[arg(long)]
         provider: Option<String>,
         #[arg(long, default_value = "default-coding")]
         skill: String,
         #[arg(long)]
         smoke: bool,
+        #[arg(long)]
+        i_know_its_a_lot: bool,
+        #[arg(long)]
+        no_confirm: bool,
     },
     Doctor,
     List {
@@ -98,8 +149,24 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum ConfigCommand {
+    Get { key: String },
+    Set { key: String, value: String },
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(err) = main_inner().await {
+        eprintln!("error: {err}");
+        if let Some(hint) = error_hint(&err) {
+            eprintln!("  hint: {hint}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn main_inner() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
@@ -108,6 +175,15 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::Init {
+            provider,
+            api_key,
+            base_url,
+            max_spend,
+            sandbox,
+            no_confirm,
+        } => init_command(provider, api_key, base_url, max_spend, sandbox, no_confirm),
+        Commands::Config { command } => config_command(command),
         Commands::Run {
             goal,
             max_spend,
@@ -115,7 +191,21 @@ async fn main() -> Result<()> {
             provider,
             skill,
             smoke,
-        } => run_command(goal, max_spend, sandbox, provider, skill, smoke).await,
+            i_know_its_a_lot,
+            no_confirm,
+        } => {
+            run_command(
+                goal,
+                max_spend,
+                sandbox,
+                provider,
+                skill,
+                smoke,
+                i_know_its_a_lot,
+                no_confirm,
+            )
+            .await
+        }
         Commands::Doctor => {
             doctor_command();
             Ok(())
@@ -130,30 +220,103 @@ async fn main() -> Result<()> {
     }
 }
 
+fn init_command(
+    provider: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    max_spend: f64,
+    sandbox: String,
+    no_confirm: bool,
+) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    fs::create_dir_all(paths.home())?;
+    let provider = match provider {
+        Some(provider) => provider,
+        None if no_confirm && command_exists("claude") => "cli:claude-code".to_string(),
+        None if no_confirm && command_exists("codex") => "cli:codex".to_string(),
+        None if no_confirm => "anthropic".to_string(),
+        None => prompt_provider()?,
+    };
+    let api_key = api_key.or_else(|| {
+        if provider.starts_with("cli:") {
+            None
+        } else {
+            prompt("provider API key (leave blank to use env var): ").ok()
+        }
+    });
+    let config = init_config_text(
+        &provider,
+        api_key.as_deref(),
+        base_url.as_deref(),
+        max_spend,
+        &sandbox,
+    );
+    fs::write(paths.config_path(), config)?;
+    println!("wrote {}", paths.config_path().display());
+    println!("next: deadreckon doctor");
+    doctor_command();
+    Ok(())
+}
+
+fn config_command(command: ConfigCommand) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    match command {
+        ConfigCommand::Get { key } => {
+            let root = load_config_value(&paths)?;
+            match get_toml_path(&root, &key) {
+                Some(value) => println!("{}", value_to_display(value)),
+                None => {
+                    return Err(CliError::Core(DeadreckonError::NotFound(format!(
+                        "config key {key}"
+                    ))));
+                }
+            }
+        }
+        ConfigCommand::Set { key, value } => {
+            fs::create_dir_all(paths.home())?;
+            let mut root = load_config_value(&paths)?;
+            set_toml_path(&mut root, &key, parse_config_value(&value));
+            fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
+            println!("set {key}");
+        }
+    }
+    Ok(())
+}
+
 async fn run_command(
     goal: String,
     max_spend: Option<f64>,
-    sandbox: String,
+    sandbox: Option<String>,
     provider: Option<String>,
     skill: String,
     smoke: bool,
+    i_know_its_a_lot: bool,
+    no_confirm: bool,
 ) -> Result<()> {
     if smoke && provider.is_some() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
             "--smoke selects the local scripted provider; omit --provider".to_string(),
         )));
     }
+    let paths = DeadreckonPaths::discover();
+    let defaults = config_defaults(&paths)?;
     let effective_provider = if smoke {
         Some("smoke".to_string())
     } else {
-        provider.clone()
+        provider.clone().or(defaults.provider)
     };
-    let effective_max_spend = max_spend.or(Some(10.0));
+    let effective_max_spend = max_spend.or(defaults.max_spend).or(Some(10.0));
     if max_spend.is_none() {
-        println!("using default --max-spend $10 (override with --max-spend)");
+        let cap = effective_max_spend.unwrap_or(10.0);
+        println!(
+            "using default --max-spend ${cap:.0} (override with --max-spend or in config defaults.max_spend)"
+        );
     }
-    let paths = DeadreckonPaths::discover();
+    confirm_spend_cap(effective_max_spend, i_know_its_a_lot, no_confirm)?;
     let cwd = std::env::current_dir()?;
+    let sandbox = sandbox
+        .or(defaults.sandbox)
+        .unwrap_or_else(|| "auto".to_string());
     let backend: SandboxBackend = sandbox.parse()?;
     let mut state = create_run(
         &paths,
@@ -213,24 +376,243 @@ async fn run_command(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct ConfigDefaults {
+    provider: Option<String>,
+    sandbox: Option<String>,
+    max_spend: Option<f64>,
+}
+
+fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
+    let root = load_config_value(paths)?;
+    Ok(ConfigDefaults {
+        provider: get_toml_path(&root, "defaults.provider")
+            .or_else(|| get_toml_path(&root, "default_provider"))
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string),
+        sandbox: get_toml_path(&root, "defaults.sandbox")
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string),
+        max_spend: get_toml_path(&root, "defaults.max_spend")
+            .and_then(toml::Value::as_float)
+            .or_else(|| {
+                get_toml_path(&root, "defaults.max_spend")
+                    .and_then(toml::Value::as_integer)
+                    .map(|value| value as f64)
+            }),
+    })
+}
+
+fn confirm_spend_cap(
+    max_spend: Option<f64>,
+    i_know_its_a_lot: bool,
+    no_confirm: bool,
+) -> Result<()> {
+    let Some(max_spend) = max_spend else {
+        return Ok(());
+    };
+    if max_spend <= 50.0 || i_know_its_a_lot || no_confirm {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "max spend above $50 requires --i-know-its-a-lot or --no-confirm in scripts"
+                .to_string(),
+        )));
+    }
+    print!("--max-spend is ${max_spend:.2}. Continue? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+        Ok(())
+    } else {
+        Err(CliError::Core(DeadreckonError::InvalidInput(
+            "run cancelled by spend confirmation".to_string(),
+        )))
+    }
+}
+
 fn doctor_command() {
-    println!("deadreckon source /Users/gdc/deadreckon");
-    println!(
-        "deadreckon home {}",
-        DeadreckonPaths::discover().home().display()
-    );
+    let paths = DeadreckonPaths::discover();
+    println!("✓ source /Users/gdc/deadreckon");
+    println!("✓ home {}", paths.home().display());
     for backend in deadreckon_sandbox::doctor() {
-        let status = if backend.available { "ok" } else { "missing" };
-        let path = backend
-            .path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "-".to_string());
+        if backend.available {
+            let path = backend
+                .path
+                .as_ref()
+                .map(|path| format!(" at {}", path.display()))
+                .unwrap_or_default();
+            println!("✓ sandbox {} found{}", backend.backend, path);
+        } else {
+            println!("✗ sandbox {} missing", backend.backend);
+            println!("    fix: {}", backend.note);
+        }
+    }
+    if paths.config_path().exists() {
+        println!("✓ {} present", paths.config_path().display());
+    } else {
+        println!("✗ {} missing", paths.config_path().display());
+        println!("    fix: deadreckon init");
+    }
+    let defaults = config_defaults(&paths).unwrap_or_default();
+    if defaults.provider.is_some() || paths.config_path().exists() {
+        println!("✓ provider defaults configured");
+    } else if command_exists("claude") || command_exists("codex") {
+        println!("✓ cli subscription provider available");
+    } else {
+        println!("✗ no provider configured");
         println!(
-            "sandbox {:<12} {:<8} {:<32} {}",
-            backend.backend, status, path, backend.note
+            "    fix: deadreckon init or deadreckon config set providers.anthropic.api_key <KEY>"
         );
     }
+}
+
+fn prompt_provider() -> Result<String> {
+    let detected = if command_exists("claude") {
+        "cli:claude-code"
+    } else if command_exists("codex") {
+        "cli:codex"
+    } else {
+        "anthropic"
+    };
+    let answer = prompt(&format!("provider [{detected}]: "))?;
+    Ok(if answer.trim().is_empty() {
+        detected.to_string()
+    } else {
+        answer.trim().to_string()
+    })
+}
+
+fn prompt(message: &str) -> Result<String> {
+    print!("{message}");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().to_string())
+}
+
+fn init_config_text(
+    provider: &str,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+    max_spend: f64,
+    sandbox: &str,
+) -> String {
+    let fallback = match provider {
+        "cli:claude-code" => "[\"cli:claude-code\", \"cli:codex\", \"anthropic\", \"openai\"]",
+        "cli:codex" => "[\"cli:codex\", \"cli:claude-code\", \"anthropic\", \"openai\"]",
+        "openai" => "[\"openai\", \"anthropic\", \"cli:codex\", \"cli:claude-code\"]",
+        "openai-compatible" => "[\"openai-compatible\", \"openai\", \"anthropic\"]",
+        _ => "[\"anthropic\", \"openai\", \"cli:claude-code\", \"cli:codex\"]",
+    };
+    let mut out = format!(
+        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\nmax_spend = {max_spend}\nsandbox = \"{sandbox}\"\n\n"
+    );
+    match provider {
+        "cli:claude-code" => {
+            out.push_str("[providers.\"cli:claude-code\"]\nkind = \"cli-claude-code\"\nbinary = \"claude\"\nextra_args = []\n");
+        }
+        "cli:codex" => {
+            out.push_str("[providers.\"cli:codex\"]\nkind = \"cli-codex\"\nbinary = \"codex\"\nextra_args = []\n");
+        }
+        "openai" => {
+            out.push_str("[providers.openai]\nkind = \"open-ai\"\n");
+            if let Some(key) = api_key.filter(|key| !key.is_empty()) {
+                out.push_str(&format!("api_key = \"{}\"\n", escape_toml_string(key)));
+            } else {
+                out.push_str("api_key_env = \"OPENAI_API_KEY\"\n");
+            }
+        }
+        "openai-compatible" => {
+            out.push_str("[providers.openai-compatible]\nkind = \"open-ai-compatible\"\n");
+            if let Some(url) = base_url.filter(|url| !url.is_empty()) {
+                out.push_str(&format!("base_url = \"{}\"\n", escape_toml_string(url)));
+            }
+            if let Some(key) = api_key.filter(|key| !key.is_empty()) {
+                out.push_str(&format!("api_key = \"{}\"\n", escape_toml_string(key)));
+            } else {
+                out.push_str("api_key_env = \"OPENAI_COMPATIBLE_API_KEY\"\n");
+            }
+        }
+        _ => {
+            out.push_str("[providers.anthropic]\nkind = \"anthropic\"\n");
+            if let Some(key) = api_key.filter(|key| !key.is_empty()) {
+                out.push_str(&format!("api_key = \"{}\"\n", escape_toml_string(key)));
+            } else {
+                out.push_str("api_key_env = \"ANTHROPIC_API_KEY\"\n");
+            }
+        }
+    }
+    out
+}
+
+fn load_config_value(paths: &DeadreckonPaths) -> Result<toml::Value> {
+    match fs::read_to_string(paths.config_path()) {
+        Ok(raw) => Ok(toml::from_str(&raw)?),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            Ok(toml::Value::Table(Default::default()))
+        }
+        Err(source) => Err(source.into()),
+    }
+}
+
+fn get_toml_path<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
+    let mut cursor = root;
+    for part in key.split('.') {
+        cursor = cursor.get(part)?;
+    }
+    Some(cursor)
+}
+
+fn set_toml_path(root: &mut toml::Value, key: &str, value: toml::Value) {
+    let parts = key.split('.').collect::<Vec<_>>();
+    let mut cursor = root;
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        if !cursor.is_table() {
+            *cursor = toml::Value::Table(Default::default());
+        }
+        let table = cursor.as_table_mut().expect("table after initialization");
+        cursor = table
+            .entry((*part).to_string())
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+    }
+    if !cursor.is_table() {
+        *cursor = toml::Value::Table(Default::default());
+    }
+    let table = cursor.as_table_mut().expect("table after initialization");
+    if let Some(last) = parts.last() {
+        table.insert((*last).to_string(), value);
+    }
+}
+
+fn parse_config_value(value: &str) -> toml::Value {
+    toml::from_str::<toml::Value>(&format!("value = {value}"))
+        .ok()
+        .and_then(|mut doc| doc.as_table_mut().and_then(|table| table.remove("value")))
+        .unwrap_or_else(|| toml::Value::String(value.to_string()))
+}
+
+fn value_to_display(value: &toml::Value) -> String {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn command_exists(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .any(|dir| {
+            let path = dir.join(name);
+            path.is_file()
+        })
+}
+
+fn escape_toml_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn list_command(scope: Option<String>) -> Result<()> {
@@ -462,7 +844,9 @@ fn attach_tui(paths: &DeadreckonPaths, run_id: &str) -> Result<()> {
 
         if event::poll(std::time::Duration::from_millis(500))?
             && let Event::Key(key) = event::read()?
-            && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+            && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                || (key.code == KeyCode::Char('d')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
         {
             break Ok(());
         }
@@ -487,7 +871,8 @@ fn render_attach(
             Constraint::Length(5),
             Constraint::Length(5),
             Constraint::Min(8),
-            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -522,7 +907,7 @@ fn render_attach(
     frame.render_widget(
         Gauge::default()
             .block(Block::default().borders(Borders::ALL).title("spend"))
-            .gauge_style(Style::default().fg(Color::Green))
+            .gauge_style(Style::default().fg(meter_color(spend_ratio, state)))
             .ratio(spend_ratio)
             .label(format!("${:.6} / ${:.6}", state.total_spend_usd, cap)),
         meters[0],
@@ -530,7 +915,7 @@ fn render_attach(
     frame.render_widget(
         Gauge::default()
             .block(Block::default().borders(Borders::ALL).title("context"))
-            .gauge_style(Style::default().fg(Color::Cyan))
+            .gauge_style(Style::default().fg(threshold_color(context_ratio)))
             .ratio(context_ratio)
             .label(format!("{token_total} / 200000 tokens")),
         meters[1],
@@ -570,6 +955,28 @@ fn render_attach(
         List::new(trace_items).block(Block::default().borders(Borders::ALL).title("tool calls")),
         vertical[3],
     );
+    frame.render_widget(
+        Paragraph::new("Ctrl-D detach  q quit  Esc quit"),
+        vertical[4],
+    );
+}
+
+fn meter_color(ratio: f64, state: &deadreckon_core::PipelineState) -> Color {
+    if state.pause_reason.as_deref() == Some("spend cap reached") {
+        Color::Magenta
+    } else {
+        threshold_color(ratio)
+    }
+}
+
+fn threshold_color(ratio: f64) -> Color {
+    if ratio >= 0.8 {
+        Color::Red
+    } else if ratio >= 0.5 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
 }
 
 fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
