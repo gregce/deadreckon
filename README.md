@@ -53,6 +53,10 @@ deadreckon run "make a realtime chess app"
 deadreckon attach <run-id>
 ```
 
+`run` prints `started run <run-id>` and `attach: deadreckon attach
+<run-id>` immediately, so you can attach from another terminal without going
+through `list`.
+
 Materialize a completed artifact into an editable project directory:
 
 ```bash
@@ -68,5 +72,7 @@ deadreckon extend <run-id> "add spectator mode and rematch support"
 deadreckon show <new-run-id>
 ```
 
-Completed runs print `materialize:` and `extend:` hint lines by default. Use
-`--no-hints` on `run` or `attach` to suppress them.
+Completed runs print a next-action menu by default. In an interactive CLI,
+choose `m` to materialize, `e` to extend, `s` to show details, or `q` to quit.
+In the TUI, the same keys are available after completion. Use `--no-hints` on
+`run` or `attach` to suppress completion guidance.

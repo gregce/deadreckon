@@ -376,9 +376,13 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .output()
         .expect("run");
     assert_success(&output);
-    assert!(stdout(&output).contains("materialize:"));
-    assert!(stdout(&output).contains("extend:"));
+    let run_stdout = stdout(&output);
+    assert!(run_stdout.contains("started run "));
+    assert!(run_stdout.contains("attach: deadreckon attach "));
+    assert!(run_stdout.contains("materialize:"));
+    assert!(run_stdout.contains("extend:"));
     let run_id = run_id_from_stdout(&output);
+    assert!(run_stdout.contains(&format!("attach: deadreckon attach {run_id}")));
     let attach = deadreckon(&paths)
         .arg("attach")
         .arg(&run_id)

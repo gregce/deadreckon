@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -287,10 +290,11 @@ async fn main_inner() -> Result<()> {
                 max_wall_seconds,
                 provider,
                 sandbox,
+                post_actions: true,
             })
             .await
         }
-        Commands::Attach { run_id, no_hints } => attach_command(run_id, no_hints),
+        Commands::Attach { run_id, no_hints } => attach_command(run_id, no_hints).await,
         Commands::Kill { run_id, force } => kill_command(run_id, force),
         Commands::Resume {
             run_id,
@@ -389,6 +393,7 @@ struct ExtendCommandArgs {
     max_wall_seconds: Option<f64>,
     provider: Option<String>,
     sandbox: Option<String>,
+    post_actions: bool,
 }
 
 async fn run_command(args: RunCommandArgs) -> Result<()> {
@@ -444,6 +449,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
             max_wall_seconds: effective_max_wall_seconds,
         },
     )?;
+    print_run_started(&state);
     let mut lock = acquire_lock(
         &paths,
         &state.task_key,
@@ -494,7 +500,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     }
     print_run_locations(&state);
     if completed && !no_hints {
-        print_lifecycle_hints(&state);
+        complete_run_actions(&state, !no_confirm).await?;
     }
     Ok(())
 }
@@ -959,7 +965,26 @@ fn materialize_command(
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = load_run(&paths, &run_id)?;
-    ensure_completed_run(&state, "run")?;
+    let materialized = materialize_completed_run(&paths, &state, dest, force, include_manifest)?;
+    print_materialized(&materialized);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct MaterializedRun {
+    run_id: String,
+    source: PathBuf,
+    dest: PathBuf,
+}
+
+fn materialize_completed_run(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    dest: Option<PathBuf>,
+    force: bool,
+    include_manifest: bool,
+) -> Result<MaterializedRun> {
+    ensure_completed_run(state, "run")?;
     let library_dir = paths.library_dir(&state.scope, &state.run_id);
     if !library_dir.is_dir() {
         return Err(CliError::Core(DeadreckonError::NotFound(format!(
@@ -973,7 +998,7 @@ fn materialize_command(
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(run_prefix(&state.run_id))
     }))?;
-    refuse_dest_inside_home(&paths, &dest, "materialize")?;
+    refuse_dest_inside_home(paths, &dest, "materialize")?;
     prepare_empty_dest(&dest, force)?;
 
     copy_tree(&library_dir, &dest)?;
@@ -983,15 +1008,22 @@ fn materialize_command(
     remove_if_exists(&dest.join(".materialized-to"))?;
     write_parent_marker(
         &dest.join(".deadreckon").join("parent.json"),
-        materialized_parent_marker(&state),
+        materialized_parent_marker(state),
     )?;
     normalize_permissions(&dest)?;
     append_materialized_marker(&library_dir, &dest)?;
 
-    println!("materialized run {}", state.run_id);
-    println!("source {}", library_dir.display());
-    println!("dest {}", dest.display());
-    Ok(())
+    Ok(MaterializedRun {
+        run_id: state.run_id.clone(),
+        source: library_dir,
+        dest,
+    })
+}
+
+fn print_materialized(materialized: &MaterializedRun) {
+    println!("materialized run {}", materialized.run_id);
+    println!("source {}", materialized.source.display());
+    println!("dest {}", materialized.dest.display());
 }
 
 async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
@@ -1005,6 +1037,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         max_wall_seconds,
         provider,
         sandbox,
+        post_actions,
     } = args;
     let new_goal = new_goal.trim().to_string();
     if new_goal.is_empty() {
@@ -1135,6 +1168,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     save_state(&state)?;
     lock.release()?;
 
+    let completed = outcome == RunLoopOutcome::Done;
     match outcome {
         RunLoopOutcome::Done => println!("completed extended run {}", state.run_id),
         RunLoopOutcome::PausedAtCap => println!("paused extended run {}", state.run_id),
@@ -1142,6 +1176,9 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         RunLoopOutcome::Failed => println!("failed extended run {}", state.run_id),
     }
     print_run_locations(&state);
+    if completed && post_actions {
+        Box::pin(complete_run_actions(&state, true)).await?;
+    }
     Ok(())
 }
 
@@ -1342,11 +1379,7 @@ fn append_materialized_marker(library_dir: &Path, dest: &Path) -> Result<()> {
 
 fn prepare_empty_dest(dest: &Path, force: bool) -> Result<()> {
     if dest.exists() {
-        let non_empty = if dest.is_dir() {
-            fs::read_dir(dest)?.next().is_some()
-        } else {
-            true
-        };
+        let non_empty = !path_is_empty_dir(dest)?;
         if non_empty && !force {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
                 "dest {} is not empty (use --force to overwrite, or pass a fresh path)",
@@ -1359,6 +1392,20 @@ fn prepare_empty_dest(dest: &Path, force: bool) -> Result<()> {
     }
     fs::create_dir_all(dest)?;
     Ok(())
+}
+
+fn path_is_empty_dir(path: &Path) -> Result<bool> {
+    if path.is_dir() {
+        Ok(fs::read_dir(path)?.next().is_none())
+    } else {
+        Ok(false)
+    }
+}
+
+fn default_materialize_dest(state: &deadreckon_core::PipelineState) -> PathBuf {
+    state
+        .cwd
+        .join(state.task_key.chars().take(24).collect::<String>())
 }
 
 fn remove_if_exists(path: &Path) -> Result<()> {
@@ -1467,10 +1514,10 @@ fn materialized_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEn
     }
 }
 
-fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
+async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     if io::stdout().is_terminal() {
-        attach_tui(&paths, &run_id)?;
+        attach_tui(&paths, &run_id, !no_hints).await?;
         let state = load_run(&paths, &run_id)?;
         if state.status == RunStatus::Completed && !no_hints {
             print_lifecycle_hints(&state);
@@ -1874,24 +1921,133 @@ fn print_run_locations(state: &deadreckon_core::PipelineState) {
     }
 }
 
+fn print_run_started(state: &deadreckon_core::PipelineState) {
+    println!("started run {}", state.run_id);
+    println!("attach: deadreckon attach {}", state.run_id);
+    println!("state {}", state.state_path().display());
+}
+
 fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
     let task_prefix = state.task_key.chars().take(24).collect::<String>();
+    println!("next actions:");
     println!(
-        "materialize: deadreckon materialize {} --dest ./{}",
+        "  materialize: deadreckon materialize {} --dest ./{}",
         state.run_id, task_prefix
     );
     println!(
-        "extend:      deadreckon extend {} '<your follow-up goal>'",
+        "  extend:      deadreckon extend {} '<your follow-up goal>'",
         state.run_id
     );
+    println!("  show:        deadreckon show {}", state.run_id);
 }
 
-fn attach_tui(paths: &DeadreckonPaths, run_id: &str) -> Result<()> {
+async fn complete_run_actions(
+    state: &deadreckon_core::PipelineState,
+    allow_prompt: bool,
+) -> Result<()> {
+    print_lifecycle_hints(state);
+    if allow_prompt && io::stdin().is_terminal() && io::stdout().is_terminal() {
+        completion_action_loop(state).await?;
+    }
+    Ok(())
+}
+
+async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    loop {
+        let answer = prompt("completed action [m materialize, e extend, s show, q quit]: ")?;
+        match completion_action_from_input(&answer) {
+            Some(CompletionAction::Materialize) => prompt_materialize_action(&paths, state)?,
+            Some(CompletionAction::Extend) => prompt_extend_action(state).await?,
+            Some(CompletionAction::Show) => show_command(state.run_id.clone(), None)?,
+            Some(CompletionAction::Quit) | None => break,
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionAction {
+    Materialize,
+    Extend,
+    Show,
+    Quit,
+}
+
+fn completion_action_from_input(input: &str) -> Option<CompletionAction> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "m" | "materialize" => Some(CompletionAction::Materialize),
+        "e" | "extend" => Some(CompletionAction::Extend),
+        "s" | "show" => Some(CompletionAction::Show),
+        "q" | "quit" | "" => Some(CompletionAction::Quit),
+        _ => None,
+    }
+}
+
+fn prompt_materialize_action(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+) -> Result<()> {
+    let default_dest = default_materialize_dest(state);
+    let answer = prompt(&format!("materialize dest [{}]: ", default_dest.display()))?;
+    let dest = if answer.trim().is_empty() {
+        default_dest
+    } else {
+        PathBuf::from(answer.trim())
+    };
+    let dest = absolute_dest(dest)?;
+    let force = if dest.exists() && !path_is_empty_dir(&dest)? {
+        let overwrite = prompt("destination is not empty; overwrite? [y/N]: ")?;
+        matches!(overwrite.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    } else {
+        false
+    };
+    let materialized = materialize_completed_run(paths, state, Some(dest), force, false)?;
+    print_materialized(&materialized);
+    Ok(())
+}
+
+async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<()> {
+    let goal = prompt("follow-up goal: ")?;
+    if goal.trim().is_empty() {
+        println!("extend skipped; follow-up goal was empty");
+        return Ok(());
+    }
+    let dest = prompt("extension working dest [runstate working dir]: ")?;
+    let dest = if dest.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(dest.trim()))
+    };
+    extend_command(ExtendCommandArgs {
+        parent_run_id: state.run_id.clone(),
+        new_goal: goal,
+        dest,
+        max_context_turns: None,
+        no_context: false,
+        max_spend: state.max_spend_usd,
+        max_wall_seconds: state.max_wall_seconds,
+        provider: state.provider.clone(),
+        sandbox: Some(state.sandbox.clone()),
+        post_actions: false,
+    })
+    .await
+}
+
+async fn attach_tui(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+    show_completion_actions: bool,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    let mut tui_state = AttachTuiState {
+        show_completion_actions,
+        ..AttachTuiState::default()
+    };
 
     let result = loop {
         let state = load_run(paths, run_id)?;
@@ -1899,22 +2055,332 @@ fn attach_tui(paths: &DeadreckonPaths, run_id: &str) -> Result<()> {
         let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
         let events = read_jsonl::<RunEvent>(&state.run_root.join(RUN_EVENTS_JSONL))?;
         let live = collect_attach_live(&state);
-        terminal.draw(|frame| render_attach(frame, &state, &spend, &traces, &events, &live))?;
+        let terminal_size = terminal.size()?;
+        let terminal_area =
+            ratatui::layout::Rect::new(0, 0, terminal_size.width, terminal_size.height);
+        let panel_layout = attach_panel_layout(terminal_area);
+        let panel_counts = attach_panel_counts(&state, &spend, &traces, &events, &live);
+        tui_state.clamp(panel_counts, panel_layout.rows);
+        terminal.draw(|frame| {
+            render_attach(frame, &state, &spend, &traces, &events, &live, &tui_state)
+        })?;
 
-        if event::poll(std::time::Duration::from_millis(500))?
-            && let Event::Key(key) = event::read()?
-            && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                || (key.code == KeyCode::Char('d')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)))
-        {
-            break Ok(());
+        if event::poll(std::time::Duration::from_millis(500))? {
+            match event::read()? {
+                Event::Key(key) if attach_should_quit(key) => break Ok(()),
+                Event::Key(key)
+                    if tui_state.show_completion_actions
+                        && state.status == RunStatus::Completed =>
+                {
+                    if !handle_tui_completion_key(&mut terminal, paths, &state, key).await? {
+                        tui_state.handle_key(key, panel_counts, panel_layout.rows);
+                    }
+                }
+                Event::Key(key) => tui_state.handle_key(key, panel_counts, panel_layout.rows),
+                Event::Mouse(mouse) => {
+                    if let Some(panel) = panel_layout.panel_at(mouse.column, mouse.row) {
+                        tui_state.focused_panel = panel;
+                    }
+                    match mouse.kind {
+                        MouseEventKind::ScrollDown => {
+                            tui_state.scroll_focused(3, panel_counts, panel_layout.rows)
+                        }
+                        MouseEventKind::ScrollUp => {
+                            tui_state.scroll_focused(-3, panel_counts, panel_layout.rows)
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
         }
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     result
+}
+
+async fn handle_tui_completion_key(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    key: KeyEvent,
+) -> Result<bool> {
+    let action = match key.code {
+        KeyCode::Char('m') => CompletionAction::Materialize,
+        KeyCode::Char('e') => CompletionAction::Extend,
+        KeyCode::Char('s') => CompletionAction::Show,
+        _ => return Ok(false),
+    };
+
+    suspend_tui(terminal)?;
+    let action_result = match action {
+        CompletionAction::Materialize => prompt_materialize_action(paths, state),
+        CompletionAction::Extend => prompt_extend_action(state).await,
+        CompletionAction::Show => show_command(state.run_id.clone(), None),
+        CompletionAction::Quit => Ok(()),
+    };
+    if let Err(err) = &action_result {
+        eprintln!("error: {err}");
+        if let Some(hint) = error_hint(err) {
+            eprintln!("  hint: {hint}");
+        }
+    }
+    let _ = prompt("press Enter to return to attach...");
+    resume_tui(terminal)?;
+    Ok(true)
+}
+
+fn suspend_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+fn resume_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    Ok(())
+}
+
+fn attach_should_quit(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+        || (key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachPanel {
+    Activity,
+    Files,
+    Processes,
+}
+
+impl AttachPanel {
+    fn next(self) -> Self {
+        match self {
+            Self::Activity => Self::Files,
+            Self::Files => Self::Processes,
+            Self::Processes => Self::Activity,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Activity => Self::Processes,
+            Self::Files => Self::Activity,
+            Self::Processes => Self::Files,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AttachTuiState {
+    focused_panel: AttachPanel,
+    activity_scroll: usize,
+    files_scroll: usize,
+    processes_scroll: usize,
+    show_completion_actions: bool,
+}
+
+impl Default for AttachTuiState {
+    fn default() -> Self {
+        Self {
+            focused_panel: AttachPanel::Activity,
+            activity_scroll: 0,
+            files_scroll: 0,
+            processes_scroll: 0,
+            show_completion_actions: true,
+        }
+    }
+}
+
+impl AttachTuiState {
+    fn handle_key(&mut self, key: KeyEvent, counts: AttachPanelCounts, rows: AttachPanelRows) {
+        match key.code {
+            KeyCode::Tab => self.focused_panel = self.focused_panel.next(),
+            KeyCode::BackTab => self.focused_panel = self.focused_panel.previous(),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_focused(-1, counts, rows),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_focused(1, counts, rows),
+            KeyCode::PageUp => {
+                self.scroll_focused(-page_delta(self.focused_panel, rows), counts, rows)
+            }
+            KeyCode::PageDown => {
+                self.scroll_focused(page_delta(self.focused_panel, rows), counts, rows)
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.set_focused_scroll(0),
+            KeyCode::End | KeyCode::Char('G') => {
+                self.set_focused_scroll(max_panel_scroll(self.focused_panel, counts, rows))
+            }
+            _ => {}
+        }
+        self.clamp(counts, rows);
+    }
+
+    fn scroll_focused(&mut self, delta: isize, counts: AttachPanelCounts, rows: AttachPanelRows) {
+        let current = self.focused_scroll();
+        let max = max_panel_scroll(self.focused_panel, counts, rows);
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize)
+        };
+        self.set_focused_scroll(next.min(max));
+    }
+
+    fn clamp(&mut self, counts: AttachPanelCounts, rows: AttachPanelRows) {
+        self.activity_scroll =
+            self.activity_scroll
+                .min(max_panel_scroll(AttachPanel::Activity, counts, rows));
+        self.files_scroll =
+            self.files_scroll
+                .min(max_panel_scroll(AttachPanel::Files, counts, rows));
+        self.processes_scroll =
+            self.processes_scroll
+                .min(max_panel_scroll(AttachPanel::Processes, counts, rows));
+    }
+
+    fn focused_scroll(&self) -> usize {
+        match self.focused_panel {
+            AttachPanel::Activity => self.activity_scroll,
+            AttachPanel::Files => self.files_scroll,
+            AttachPanel::Processes => self.processes_scroll,
+        }
+    }
+
+    fn set_focused_scroll(&mut self, offset: usize) {
+        match self.focused_panel {
+            AttachPanel::Activity => self.activity_scroll = offset,
+            AttachPanel::Files => self.files_scroll = offset,
+            AttachPanel::Processes => self.processes_scroll = offset,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachPanelCounts {
+    activity: usize,
+    files: usize,
+    processes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachPanelRows {
+    activity: usize,
+    files: usize,
+    processes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachPanelLayout {
+    activity: ratatui::layout::Rect,
+    files: ratatui::layout::Rect,
+    processes: ratatui::layout::Rect,
+    rows: AttachPanelRows,
+}
+
+impl AttachPanelLayout {
+    fn panel_at(&self, column: u16, row: u16) -> Option<AttachPanel> {
+        if rect_contains(self.activity, column, row) {
+            Some(AttachPanel::Activity)
+        } else if rect_contains(self.files, column, row) {
+            Some(AttachPanel::Files)
+        } else if rect_contains(self.processes, column, row) {
+            Some(AttachPanel::Processes)
+        } else {
+            None
+        }
+    }
+}
+
+fn attach_panel_layout(area: ratatui::layout::Rect) -> AttachPanelLayout {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(10),
+            Constraint::Length(5),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let center = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(vertical[1]);
+    AttachPanelLayout {
+        activity: center[0],
+        files: center[1],
+        processes: vertical[2],
+        rows: AttachPanelRows {
+            activity: panel_inner_rows(center[0]),
+            files: panel_inner_rows(center[1]),
+            processes: panel_inner_rows(vertical[2]),
+        },
+    }
+}
+
+fn attach_panel_counts(
+    state: &deadreckon_core::PipelineState,
+    spend: &[SpendRecord],
+    traces: &[TraceRecord],
+    events: &[RunEvent],
+    live: &AttachLive,
+) -> AttachPanelCounts {
+    AttachPanelCounts {
+        activity: attach_activity_lines(state, spend, traces, events, live).len(),
+        files: live_file_lines(live).len(),
+        processes: process_lines(live).len(),
+    }
+}
+
+fn panel_inner_rows(area: ratatui::layout::Rect) -> usize {
+    area.height.saturating_sub(2) as usize
+}
+
+fn rect_contains(rect: ratatui::layout::Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+fn page_delta(panel: AttachPanel, rows: AttachPanelRows) -> isize {
+    let rows = panel_rows(panel, rows).max(1);
+    rows.saturating_sub(1).max(1) as isize
+}
+
+fn max_panel_scroll(panel: AttachPanel, counts: AttachPanelCounts, rows: AttachPanelRows) -> usize {
+    panel_count(panel, counts).saturating_sub(panel_rows(panel, rows))
+}
+
+fn panel_count(panel: AttachPanel, counts: AttachPanelCounts) -> usize {
+    match panel {
+        AttachPanel::Activity => counts.activity,
+        AttachPanel::Files => counts.files,
+        AttachPanel::Processes => counts.processes,
+    }
+}
+
+fn panel_rows(panel: AttachPanel, rows: AttachPanelRows) -> usize {
+    match panel {
+        AttachPanel::Activity => rows.activity,
+        AttachPanel::Files => rows.files,
+        AttachPanel::Processes => rows.processes,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2232,6 +2698,7 @@ fn render_attach(
     traces: &[TraceRecord],
     events: &[RunEvent],
     live: &AttachLive,
+    tui_state: &AttachTuiState,
 ) {
     let area = frame.area();
     let vertical = Layout::default()
@@ -2294,54 +2761,34 @@ fn render_attach(
         .split(vertical[1]);
 
     let stream_rows = center[0].height.saturating_sub(2) as usize;
-    let mut trace_items = render_turn_summary(spend, metered_provider);
-    if state.status == RunStatus::Executing && live.file_count > 0 {
-        trace_items.push(ListItem::new(format!(
-            "live working tree: {} files, latest changes visible before provider exit",
-            live.file_count
-        )));
-    }
-    let provider_rows = stream_rows.saturating_sub(trace_items.len());
-    trace_items.extend(
-        live.provider_activity
-            .iter()
-            .rev()
-            .take(provider_rows)
-            .map(|item| ListItem::new(item.clone())),
-    );
-    let remaining_rows = stream_rows.saturating_sub(trace_items.len());
-    if remaining_rows > 0 {
-        trace_items.extend(
-            events
-                .iter()
-                .rev()
-                .take(remaining_rows)
-                .map(|event| render_event_item(event, metered_provider)),
-        );
-    }
-    let remaining_rows = stream_rows.saturating_sub(trace_items.len());
-    if remaining_rows > 0 {
-        trace_items.extend(traces.iter().rev().take(remaining_rows).map(|record| {
-            ListItem::new(format!(
-                "trace turn {}  {}  {:?}ms",
-                record.turn, record.event, record.latency_ms
-            ))
-        }));
-    }
+    let trace_lines = attach_activity_lines(state, spend, traces, events, live);
+    let trace_items = visible_items(&trace_lines, tui_state.activity_scroll, stream_rows);
     frame.render_widget(
         List::new(trace_items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("tool calls / provider activity"),
+                .border_style(panel_border_style(
+                    tui_state.focused_panel,
+                    AttachPanel::Activity,
+                ))
+                .title(panel_title(
+                    "tool calls / provider activity",
+                    tui_state.focused_panel == AttachPanel::Activity,
+                    tui_state.activity_scroll,
+                    stream_rows,
+                    trace_lines.len(),
+                )),
         ),
         center[0],
     );
-    render_live_files(frame, center[1], live);
-    render_processes(frame, vertical[2], live);
-    frame.render_widget(
-        Paragraph::new("Ctrl-D detach  q quit  Esc quit"),
-        vertical[3],
-    );
+    render_live_files(frame, center[1], live, tui_state);
+    render_processes(frame, vertical[2], live, tui_state);
+    let footer = if tui_state.show_completion_actions && state.status == RunStatus::Completed {
+        "completed: m materialize  e extend  s show  Tab focus  j/k scroll  q/Esc quit"
+    } else {
+        "Tab focus  ↑/↓ j/k scroll  PgUp/PgDn  Home/End  mouse wheel  Ctrl-D detach  q/Esc quit"
+    };
+    frame.render_widget(Paragraph::new(footer), vertical[3]);
 }
 
 fn provider_is_metered(state: &deadreckon_core::PipelineState) -> bool {
@@ -2425,11 +2872,9 @@ fn context_totals(spend: &[SpendRecord], live: &AttachLive) -> (u64, u64) {
     (token_total, context_window)
 }
 
-fn render_turn_summary(spend: &[SpendRecord], show_cost: bool) -> Vec<ListItem<'static>> {
+fn render_turn_summary(spend: &[SpendRecord], show_cost: bool) -> Vec<String> {
     if spend.is_empty() {
-        vec![ListItem::new(
-            "provider turn in progress; results land when the provider exits",
-        )]
+        vec!["provider turn in progress; results land when the provider exits".to_string()]
     } else {
         spend
             .iter()
@@ -2438,77 +2883,176 @@ fn render_turn_summary(spend: &[SpendRecord], show_cost: bool) -> Vec<ListItem<'
             .map(|record| {
                 let tokens = record.input_tokens + record.output_tokens;
                 if show_cost {
-                    ListItem::new(format!(
+                    format!(
                         "turn {}  {}  {} tokens  ${:.6}",
                         record.turn, record.model, tokens, record.cost_usd
-                    ))
+                    )
                 } else if let Some(seconds) = record.wall_time_seconds {
-                    ListItem::new(format!(
+                    format!(
                         "turn {}  {}  {} tokens  {:.0}s wall",
                         record.turn,
                         record.model,
                         tokens,
                         seconds.max(0.0)
-                    ))
+                    )
                 } else {
-                    ListItem::new(format!(
-                        "turn {}  {}  {} tokens",
-                        record.turn, record.model, tokens
-                    ))
+                    format!("turn {}  {}  {} tokens", record.turn, record.model, tokens)
                 }
             })
             .collect()
     }
 }
 
+fn attach_activity_lines(
+    state: &deadreckon_core::PipelineState,
+    spend: &[SpendRecord],
+    traces: &[TraceRecord],
+    events: &[RunEvent],
+    live: &AttachLive,
+) -> Vec<String> {
+    let metered_provider = provider_is_metered(state);
+    let mut lines = render_turn_summary(spend, metered_provider);
+    if state.status == RunStatus::Executing && live.file_count > 0 {
+        lines.push(format!(
+            "live working tree: {} files, latest changes visible before provider exit",
+            live.file_count
+        ));
+    }
+    lines.extend(live.provider_activity.iter().rev().cloned());
+    lines.extend(
+        events
+            .iter()
+            .rev()
+            .map(|event| event_line(event, metered_provider)),
+    );
+    lines.extend(traces.iter().rev().map(|record| {
+        format!(
+            "trace turn {}  {}  {:?}ms",
+            record.turn, record.event, record.latency_ms
+        )
+    }));
+    lines
+}
+
 fn render_live_files(
     frame: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
     live: &AttachLive,
+    tui_state: &AttachTuiState,
 ) {
-    let mut items = vec![ListItem::new(format!(
+    let lines = live_file_lines(live);
+    let rows = area.height.saturating_sub(2) as usize;
+    let items = visible_items(&lines, tui_state.files_scroll, rows);
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(panel_border_style(
+                    tui_state.focused_panel,
+                    AttachPanel::Files,
+                ))
+                .title(panel_title(
+                    "live files",
+                    tui_state.focused_panel == AttachPanel::Files,
+                    tui_state.files_scroll,
+                    rows,
+                    lines.len(),
+                )),
+        ),
+        area,
+    );
+}
+
+fn live_file_lines(live: &AttachLive) -> Vec<String> {
+    let mut lines = vec![format!(
         "{} files  {}",
         live.file_count,
         format_bytes(live.total_bytes)
-    ))];
-    items.extend(live.files.iter().take(12).map(|file| {
-        ListItem::new(format!(
+    )];
+    lines.extend(live.files.iter().map(|file| {
+        format!(
             "{:>7} {:>8}  {}",
             format_age(file.modified_at),
             format_bytes(file.bytes),
             file.path
-        ))
+        )
     }));
-    frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title("live files")),
-        area,
-    );
+    lines
 }
 
 fn render_processes(
     frame: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
     live: &AttachLive,
+    tui_state: &AttachTuiState,
 ) {
-    let items = if live.pids.is_empty() {
-        vec![ListItem::new("no supervised pids")]
+    let lines = process_lines(live);
+    let rows = area.height.saturating_sub(2) as usize;
+    let items = visible_items(&lines, tui_state.processes_scroll, rows);
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(panel_border_style(
+                    tui_state.focused_panel,
+                    AttachPanel::Processes,
+                ))
+                .title(panel_title(
+                    "processes",
+                    tui_state.focused_panel == AttachPanel::Processes,
+                    tui_state.processes_scroll,
+                    rows,
+                    lines.len(),
+                )),
+        ),
+        area,
+    );
+}
+
+fn process_lines(live: &AttachLive) -> Vec<String> {
+    if live.pids.is_empty() {
+        vec!["no supervised pids".to_string()]
     } else {
         live.pids
             .iter()
             .map(|pid| {
                 let status = if pid.alive { "alive" } else { "dead" };
-                ListItem::new(format!("{} {} {}", pid.pid, status, pid.command))
+                format!("{} {} {}", pid.pid, status, pid.command)
             })
             .collect()
-    };
-    frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title("processes")),
-        area,
-    );
+    }
 }
 
-fn render_event_item(event: &RunEvent, show_cost: bool) -> ListItem<'static> {
-    let label = match &event.event {
+fn visible_items(lines: &[String], offset: usize, rows: usize) -> Vec<ListItem<'static>> {
+    lines
+        .iter()
+        .skip(offset.min(lines.len()))
+        .take(rows)
+        .map(|line| ListItem::new(line.clone()))
+        .collect()
+}
+
+fn panel_border_style(focused: AttachPanel, panel: AttachPanel) -> Style {
+    if focused == panel {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    }
+}
+
+fn panel_title(title: &str, focused: bool, offset: usize, rows: usize, total: usize) -> String {
+    let marker = if focused { "*" } else { " " };
+    if total <= rows || total == 0 {
+        format!("{marker}{title}")
+    } else {
+        let first = offset.saturating_add(1).min(total);
+        let last = offset.saturating_add(rows).min(total);
+        format!("{marker}{title} {first}-{last}/{total}")
+    }
+}
+
+fn event_line(event: &RunEvent, show_cost: bool) -> String {
+    match &event.event {
         deadreckon_core::RunEventKind::TurnStarted { turn } => {
             format!("turn {turn} started")
         }
@@ -2547,8 +3091,7 @@ fn render_event_item(event: &RunEvent, show_cost: bool) -> ListItem<'static> {
         deadreckon_core::RunEventKind::Error { turn, message } => {
             format!("turn {} error {message}", turn.unwrap_or_default())
         }
-    };
-    ListItem::new(label)
+    }
 }
 
 fn turn_timer(
@@ -2677,4 +3220,100 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect::<Vec<T>>())
+}
+
+#[cfg(test)]
+mod tui_tests {
+    use super::{
+        AttachPanel, AttachPanelCounts, AttachPanelRows, AttachTuiState, CompletionAction,
+        completion_action_from_input, max_panel_scroll,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn counts() -> AttachPanelCounts {
+        AttachPanelCounts {
+            activity: 20,
+            files: 10,
+            processes: 3,
+        }
+    }
+
+    fn rows() -> AttachPanelRows {
+        AttachPanelRows {
+            activity: 5,
+            files: 4,
+            processes: 4,
+        }
+    }
+
+    #[test]
+    fn tui_scroll_offsets_clamp_to_panel_content() {
+        let mut state = AttachTuiState::default();
+        state.scroll_focused(100, counts(), rows());
+        assert_eq!(state.activity_scroll, 15);
+
+        state.scroll_focused(-100, counts(), rows());
+        assert_eq!(state.activity_scroll, 0);
+
+        state.focused_panel = AttachPanel::Processes;
+        state.scroll_focused(10, counts(), rows());
+        assert_eq!(state.processes_scroll, 0);
+    }
+
+    #[test]
+    fn tui_focus_and_page_keys_move_active_panel_only() {
+        let mut state = AttachTuiState::default();
+        state.handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            counts(),
+            rows(),
+        );
+        assert_eq!(state.focused_panel, AttachPanel::Files);
+
+        state.handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            counts(),
+            rows(),
+        );
+        assert_eq!(state.files_scroll, 3);
+        assert_eq!(state.activity_scroll, 0);
+
+        state.handle_key(
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            counts(),
+            rows(),
+        );
+        assert_eq!(
+            state.files_scroll,
+            max_panel_scroll(AttachPanel::Files, counts(), rows())
+        );
+
+        state.handle_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            counts(),
+            rows(),
+        );
+        assert_eq!(state.focused_panel, AttachPanel::Activity);
+    }
+
+    #[test]
+    fn completion_action_parser_accepts_short_and_long_forms() {
+        assert_eq!(
+            completion_action_from_input("m"),
+            Some(CompletionAction::Materialize)
+        );
+        assert_eq!(
+            completion_action_from_input("extend"),
+            Some(CompletionAction::Extend)
+        );
+        assert_eq!(
+            completion_action_from_input("S"),
+            Some(CompletionAction::Show)
+        );
+        assert_eq!(
+            completion_action_from_input(""),
+            Some(CompletionAction::Quit)
+        );
+        assert_eq!(completion_action_from_input("wat"), None);
+    }
 }

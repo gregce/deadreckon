@@ -135,6 +135,13 @@ deadreckon list
 deadreckon attach <run-id>
 ```
 
+`run` prints the run id and attach command as soon as state is created:
+
+```text
+started run <run-id>
+attach: deadreckon attach <run-id>
+```
+
 The default config from `deadreckon init` supplies the provider, sandbox, `$10` spend cap, and `3600` second wall-clock cap. Use flags only when overriding those defaults:
 
 ```bash
@@ -181,9 +188,32 @@ Keys:
 Ctrl-D   detach without killing the run
 q        quit
 Esc      quit
+Tab      move focus between panels
+j/k      scroll focused panel
+PgUp/PgDn scroll focused panel by a page
 ```
 
-The TUI does not start, kill, resume, or undo runs. Use CLI commands for control.
+After a run completes, the TUI footer adds lifecycle actions:
+
+```text
+m        materialize the completed artifact
+e        extend the completed run with a follow-up goal
+s        show run details
+```
+
+The TUI does not start, kill, resume, or undo runs. Use CLI commands for those controls.
+
+## Completion Actions
+
+Completed `run` and `extend` commands show the same lifecycle actions in the CLI:
+
+```text
+completed action [m materialize, e extend, s show, q quit]:
+```
+
+Use `m` to copy the library artifact into a normal directory, `e` to start a
+fresh child run from the completed artifact, or `s` to inspect state and
+lineage. Pass `--no-hints` to `run` or `attach` when scripting.
 
 ## List, Show, Kill, Resume
 
