@@ -332,6 +332,7 @@ dependencies = [
  "deadreckon-providers",
  "deadreckon-sandbox",
  "ratatui",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

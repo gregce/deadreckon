@@ -1,9 +1,15 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io::{self, IsTerminal};
 use std::time::Instant;
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use deadreckon_core::{
     DeadreckonError, DeadreckonPaths, PhaseId, PhaseStatus, ProvenanceRecord, RunOptions,
     RunStatus, SpendRecord, TraceRecord, acquire_lock, append_provenance, append_spend,
@@ -12,6 +18,12 @@ use deadreckon_core::{
 };
 use deadreckon_providers::{ProviderRouter, ProviderUsage};
 use deadreckon_sandbox::{SandboxBackend, SandboxSpec, run as run_sandbox};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -307,6 +319,10 @@ fn list_command(scope: Option<String>) -> Result<()> {
 
 fn attach_command(run_id: String) -> Result<()> {
     let paths = DeadreckonPaths::discover();
+    if io::stdout().is_terminal() {
+        attach_tui(&paths, &run_id)?;
+        return Ok(());
+    }
     let state = load_run(&paths, &run_id)?;
     print_run_summary(&state);
     Ok(())
@@ -407,6 +423,144 @@ fn print_run_summary(state: &deadreckon_core::PipelineState) {
     if let Some(phase) = state.active_phase() {
         println!("phase {} {}", phase.id.0, phase.name);
     }
+}
+
+fn attach_tui(paths: &DeadreckonPaths, run_id: &str) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = loop {
+        let state = load_run(paths, run_id)?;
+        let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
+        let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
+        terminal.draw(|frame| render_attach(frame, &state, &spend, &traces))?;
+
+        if event::poll(std::time::Duration::from_millis(500))? {
+            if let Event::Key(key) = event::read()? {
+                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                    break Ok(());
+                }
+            }
+        }
+    };
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result
+}
+
+fn render_attach(
+    frame: &mut ratatui::Frame<'_>,
+    state: &deadreckon_core::PipelineState,
+    spend: &[SpendRecord],
+    traces: &[TraceRecord],
+) {
+    let area = frame.area();
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Min(8),
+            Constraint::Length(7),
+        ])
+        .split(area);
+
+    let phase = state
+        .active_phase()
+        .map(|phase| format!("{} {}", phase.id.0, phase.name))
+        .unwrap_or_else(|| "-".to_string());
+    let header = Paragraph::new(format!(
+        "run {}\nstatus {}  phase {}\ngoal {}",
+        state.run_id, state.status, phase, state.goal
+    ))
+    .block(Block::default().borders(Borders::ALL).title("deadreckon"));
+    frame.render_widget(header, vertical[0]);
+
+    let meters = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(vertical[1]);
+    let cap = state.max_spend_usd.unwrap_or_else(|| {
+        if state.total_spend_usd <= 0.0 {
+            1.0
+        } else {
+            state.total_spend_usd
+        }
+    });
+    let spend_ratio = (state.total_spend_usd / cap).clamp(0.0, 1.0);
+    let token_total = spend
+        .iter()
+        .map(|record| record.input_tokens + record.output_tokens)
+        .sum::<u64>();
+    let context_ratio = (token_total as f64 / 200_000.0).clamp(0.0, 1.0);
+    frame.render_widget(
+        Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title("spend"))
+            .gauge_style(Style::default().fg(Color::Green))
+            .ratio(spend_ratio)
+            .label(format!("${:.6} / ${:.6}", state.total_spend_usd, cap)),
+        meters[0],
+    );
+    frame.render_widget(
+        Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title("context"))
+            .gauge_style(Style::default().fg(Color::Cyan))
+            .ratio(context_ratio)
+            .label(format!("{token_total} / 200000 tokens")),
+        meters[1],
+    );
+
+    let spend_items = spend
+        .iter()
+        .rev()
+        .take(8)
+        .map(|record| {
+            ListItem::new(format!(
+                "turn {}  {}  {} tokens  ${:.6}",
+                record.turn,
+                record.model,
+                record.input_tokens + record.output_tokens,
+                record.cost_usd
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(spend_items).block(Block::default().borders(Borders::ALL).title("recent turns")),
+        vertical[2],
+    );
+
+    let trace_items = traces
+        .iter()
+        .rev()
+        .take(5)
+        .map(|record| {
+            ListItem::new(format!(
+                "turn {}  {}  {:?}ms",
+                record.turn, record.event, record.latency_ms
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(trace_items).block(Block::default().borders(Borders::ALL).title("tool calls")),
+        vertical[3],
+    );
+}
+
+fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    std::fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
+        .map_err(CliError::from)
 }
 
 fn estimate_usage(goal: &str) -> ProviderUsage {
