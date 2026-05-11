@@ -27,7 +27,7 @@ Source lives under `/Users/gdc/deadreckon/`:
 - `crates/deadreckon-core`: run paths, phase machine, JSON state, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports.
 - `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, OpenAI-compatible, `cli:claude-code`, `cli:codex`, and explicit `--smoke` scripted adapters, fallback routing, spend estimates.
 - `crates/deadreckon-sandbox`: `sandbox-exec`, `bwrap`, `docker`, and `none` backends using `tokio::process::Command`; default `auto`.
-- `crates/deadreckon`: clap CLI, ratatui attach UI, init/config/run/list/attach/kill/resume/undo/show/import/doctor.
+- `crates/deadreckon`: clap CLI, ratatui attach UI, init/config/run/list/attach/kill/resume/undo/show/import/materialize/extend/doctor.
 - `skills/default-coding/SKILL.md`: Markdown skill loaded at runtime.
 - `tests/`: workspace integration tests.
 
@@ -51,6 +51,20 @@ The primary path is provider-driven: `deadreckon run <goal>` creates state, call
 For keyless local verification only, `deadreckon run --smoke <goal>` selects the `smoke` provider explicitly. That scripted provider still goes through the same turn loop, sandbox dispatch, snapshots, spend records, traces, provenance, and external `dr-gate` acceptance marker; it is not the default run path.
 
 The default skill is Markdown and external to the binary. The binary loads it and records the skill name/path in state; it does not parse or mutate skill internals.
+
+## CLI Lifecycle
+
+Completed artifacts are promoted into `/Users/gdc/.deadreckon/library/<scope>/<run-id>/`.
+`deadreckon materialize <run-id> --dest <path>` copies that library artifact to
+a user-owned path, writes `.deadreckon/parent.json`, and records the reverse
+`.materialized-to` marker in the library. `deadreckon extend <run-id>
+"follow-up goal"` creates a fresh run in the parent's scope/task lock, seeds the
+new working tree from the parent library, stores parent lineage in
+`working/.deadreckon/parent.json`, and starts the normal turn loop with reset
+resource caps.
+
+Lineage intentionally stays outside `PipelineState`; show/list/hints derive it
+from marker files so the state schema remains stable.
 
 ## Decisions And Conflicts
 

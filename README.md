@@ -35,3 +35,38 @@ Keyless local verification:
 ```bash
 DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadreckon run "tiny hello rust" --smoke --sandbox none --max-spend 1
 ```
+
+## Lifecycle
+
+```text
+init -> run -> list -> attach -> materialize -> extend
+                                  |
+                                  v
+                           users' working dir
+```
+
+Start an unattended run:
+
+```bash
+deadreckon init --provider cli:codex --sandbox auto --no-confirm
+deadreckon run "make a realtime chess app"
+deadreckon attach <run-id>
+```
+
+Materialize a completed artifact into an editable project directory:
+
+```bash
+deadreckon list
+deadreckon materialize <run-id> --dest ./realtime-chess
+cd ./realtime-chess
+```
+
+Extend a completed run with a follow-up goal while preserving parent lineage:
+
+```bash
+deadreckon extend <run-id> "add spectator mode and rematch support"
+deadreckon show <new-run-id>
+```
+
+Completed runs print `materialize:` and `extend:` hint lines by default. Use
+`--no-hints` on `run` or `attach` to suppress them.

@@ -1,5 +1,14 @@
 # Changelog
 
+## Lifecycle ergonomics
+
+Phase commits: `4481617`, `556897d`, `91ab9a6`.
+
+- Added `deadreckon materialize <run-id> [--dest <path>] [--force] [--include-manifest]` to copy completed library artifacts to user-owned paths with `.deadreckon/parent.json` provenance and library `.materialized-to` reverse markers.
+- Added `deadreckon extend <run-id> "<new-goal>"` to create a fresh run from a completed parent artifact, seed the working tree, prepend a parent summary into `history.json`, and record lineage through marker files plus a synthetic trace.
+- Added lifecycle hints after completed `run`/`attach`, `--no-hints` suppression, `list` materialization status, and `show` parent-lineage output.
+- Kept `PipelineState` unchanged; lifecycle lineage lives in marker files.
+
 ## 0.1.0 - Robustness Milestone (alpha)
 
 Implementation commit: `cec49f3`.
