@@ -206,6 +206,31 @@ pub fn pid_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
+pub fn terminate_pid(pid: u32, force: bool) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let signal = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    match kill(Pid::from_raw(pid as i32), Some(signal)) {
+        Ok(()) => Ok(()),
+        Err(Errno::ESRCH) => Ok(()),
+        Err(err) => Err(DeadreckonError::InvalidInput(format!(
+            "failed to signal pid {pid}: {err}"
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn terminate_pid(_pid: u32, _force: bool) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn pid_is_alive_platform(pid: u32) -> bool {
     use nix::errno::Errno;
     use nix::sys::signal::kill;

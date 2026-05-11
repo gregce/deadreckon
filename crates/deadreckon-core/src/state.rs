@@ -22,6 +22,7 @@ pub enum RunStatus {
     Executing,
     Completed,
     Failed,
+    Killed,
 }
 
 impl fmt::Display for RunStatus {
@@ -32,6 +33,7 @@ impl fmt::Display for RunStatus {
             RunStatus::Executing => "executing",
             RunStatus::Completed => "completed",
             RunStatus::Failed => "failed",
+            RunStatus::Killed => "killed",
         };
         f.write_str(value)
     }
@@ -95,6 +97,9 @@ pub struct PipelineState {
     pub turn: u32,
     pub pause_reason: Option<String>,
     pub failure_reason: Option<String>,
+    #[serde(default)]
+    pub child_pids: Vec<u32>,
+    pub killed_at: Option<DateTime<Utc>>,
     pub phases: Vec<PhaseState>,
 }
 
@@ -201,6 +206,8 @@ pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<Pipeli
         turn: 0,
         pause_reason: None,
         failure_reason: None,
+        child_pids: Vec::new(),
+        killed_at: None,
         phases: default_phases(now),
     };
     state.set_phase_status(PhaseId(0), PhaseStatus::Planned)?;

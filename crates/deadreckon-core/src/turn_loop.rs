@@ -60,6 +60,9 @@ pub async fn run_turn_loop(
     save_state(state)?;
 
     for _ in 0..config.max_turns {
+        if state.status == crate::state::RunStatus::Killed {
+            return Ok(RunLoopOutcome::Failed);
+        }
         let turn = state.turn + 1;
         snapshot_working(state, turn.saturating_sub(1))?;
         let prompt = build_prompt(state, &history);

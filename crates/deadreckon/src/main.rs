@@ -12,7 +12,7 @@ use deadreckon_core::{
     DeadreckonError, DeadreckonPaths, PhaseId, PhaseStatus, ProvenanceRecord, RunLoopConfig,
     RunLoopOutcome, RunOptions, RunStatus, SpendRecord, TraceRecord, acquire_lock, append_trace,
     create_run, inventory_files, list_runs, load_run, release_lock_file, restore_snapshot,
-    run_turn_loop, save_state,
+    run_turn_loop, save_state, terminate_pid,
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_sandbox::SandboxBackend;
@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
         Commands::List { scope } => list_command(scope),
         Commands::Attach { run_id } => attach_command(run_id),
         Commands::Kill { run_id } => kill_command(run_id),
-        Commands::Resume { run_id } => resume_command(run_id),
+        Commands::Resume { run_id } => resume_command(run_id).await,
         Commands::Undo { run, turn } => undo_command(run, turn),
         Commands::Show { run_id, turn } => show_command(run_id, turn),
         Commands::Import { source } => import_command(source),
@@ -165,6 +165,8 @@ async fn run_command(
         "run",
         deadreckon_core::lock::DEFAULT_STALE_AFTER,
     )?;
+    state.child_pids = vec![std::process::id()];
+    save_state(&state)?;
 
     state.set_phase_status(PhaseId(20), PhaseStatus::Executing)?;
     save_state(&state)?;
@@ -184,6 +186,8 @@ async fn run_command(
         },
     )
     .await?;
+    state.child_pids.clear();
+    save_state(&state)?;
     lock.release()?;
 
     match outcome {
@@ -248,19 +252,36 @@ fn attach_command(run_id: String) -> Result<()> {
 fn kill_command(run_id: String) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = load_run(&paths, &run_id)?;
+    let pids = state.child_pids.clone();
     release_lock_file(&paths, &state.task_key)?;
-    state.status = RunStatus::Failed;
+    state.status = RunStatus::Killed;
     state.failure_reason = Some("killed by user".to_string());
+    state.killed_at = Some(Utc::now());
     state.updated_at = Utc::now();
     save_state(&state)?;
+    for pid in &pids {
+        if *pid != std::process::id() {
+            let _ = terminate_pid(*pid, false);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    for pid in &pids {
+        if *pid != std::process::id() && deadreckon_core::pid_is_alive(*pid) {
+            let _ = terminate_pid(*pid, true);
+        }
+    }
     println!("killed run {}", state.run_id);
     Ok(())
 }
 
-fn resume_command(run_id: String) -> Result<()> {
+async fn resume_command(run_id: String) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = load_run(&paths, &run_id)?;
-    let lock = acquire_lock(
+    if state.status == RunStatus::Completed {
+        println!("run {} is already completed", state.run_id);
+        return Ok(());
+    }
+    let mut lock = acquire_lock(
         &paths,
         &state.task_key,
         &state.run_id,
@@ -268,15 +289,37 @@ fn resume_command(run_id: String) -> Result<()> {
         "resume",
         deadreckon_core::lock::DEFAULT_STALE_AFTER,
     )?;
-    if state.status != RunStatus::Completed {
-        state.failure_reason = None;
-        state.pause_reason = None;
-        state.status = RunStatus::Planned;
-        state.updated_at = Utc::now();
-        save_state(&state)?;
-    }
+    state.failure_reason = None;
+    state.pause_reason = None;
+    state.killed_at = None;
+    state.status = RunStatus::Planned;
+    state.child_pids = vec![std::process::id()];
+    state.updated_at = Utc::now();
+    save_state(&state)?;
+    lock.heartbeat("resume-turn-loop")?;
+    let provider = state.provider.clone();
+    let backend: SandboxBackend = state.sandbox.parse()?;
+    let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
+    let max_spend_usd = state.max_spend_usd;
+    let outcome = run_turn_loop(
+        &mut state,
+        &router,
+        RunLoopConfig {
+            provider,
+            max_spend_usd,
+            sandbox_backend: backend,
+            max_turns: 12,
+        },
+    )
+    .await?;
+    state.child_pids.clear();
+    save_state(&state)?;
     lock.release()?;
-    println!("resumed run {}", state.run_id);
+    match outcome {
+        RunLoopOutcome::Done => println!("resumed run {} to completion", state.run_id),
+        RunLoopOutcome::PausedAtCap => println!("resumed run {} paused at cap", state.run_id),
+        RunLoopOutcome::Failed => println!("resumed run {} failed", state.run_id),
+    }
     Ok(())
 }
 

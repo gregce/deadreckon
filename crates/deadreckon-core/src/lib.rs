@@ -14,6 +14,7 @@ pub use artifacts::{
 pub use error::{DeadreckonError, Result};
 pub use lock::{
     LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,
+    terminate_pid,
 };
 pub use paths::{DEFAULT_DEADRECKON_HOME, DeadreckonPaths, SOURCE_ROOT};
 pub use state::{
