@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -16,15 +16,19 @@ use crossterm::terminal::{
 };
 use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
-    CodebaseMode, CodebaseRecord, DeadreckonError, DeadreckonPaths, DocKind, ModeFlags, PhaseId,
-    PhaseStatus, PolishConfig, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode,
-    RunEvent, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunOptions, RunStatus, SpendRecord,
-    TraceRecord, WorktreeOptions, acquire_lock, append_parent_narrative_update, append_provenance,
-    append_trace, apply_commit_body, clear_cancel_marker, copy_source_to_working, copy_tree,
-    create_run, create_worktree, doc_path_for_kind, docs_status_for_state, emit_event,
-    inventory_files, list_runs, load_run, polish_run_docs, prepare_worktree_record,
-    preview_git_state, read_codebase_record, record_for_resolved_mode, release_lock_file,
-    resolve_mode, restore_snapshot, run_turn_loop, save_state, terminate_pid, write_cancel_marker,
+    ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainEventKind, ChainNewOptions, ChainStatus,
+    ChainStepMarker, ChainStepStatus, CodebaseMode, CodebaseRecord, ConductorState,
+    DeadreckonError, DeadreckonPaths, DocKind, ModeFlags, OnFail, PhaseId, PhaseStatus,
+    PolishConfig, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent,
+    RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunOptions, RunStatus, SpendRecord,
+    TraceRecord, WorktreeOptions, acquire_lock, append_chain_event, append_parent_narrative_update,
+    append_provenance, append_trace, apply_commit_body, clear_cancel_marker,
+    copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
+    docs_status_for_state, emit_event, inventory_files, list_runs, load_chain, load_run,
+    pid_is_alive, polish_run_docs, prepare_worktree_record, preview_git_state,
+    read_codebase_record, record_for_resolved_mode, release_lock_file, resolve_mode,
+    restore_snapshot, run_turn_loop, save_chain, save_state, terminate_pid,
+    validate_acceptance_marker, write_cancel_marker, write_chain_step_marker,
 };
 use deadreckon_providers::{ProviderRequest, ProviderRouteInfo, ProviderRouter};
 use deadreckon_sandbox::SandboxBackend;
@@ -258,6 +262,106 @@ enum Commands {
         no_docs: bool,
         #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Run a serial chain of coding goals"
+    )]
+    Chain {
+        #[arg(value_name = "ARG", num_args = 0.., help = "Step goals or chain subcommand")]
+        args: Vec<String>,
+        #[arg(long, help = "Read newline-separated step goals from a file")]
+        from_file: Option<PathBuf>,
+        #[arg(long, help = "Read newline-separated step goals from stdin")]
+        from_stdin: bool,
+        #[arg(long, help = "Write chain.json only; do not start the conductor")]
+        draft: bool,
+        #[arg(long, help = "Skip the interactive chain preview confirmation")]
+        yes: bool,
+        #[arg(long, help = "Start the conductor in the background")]
+        detach: bool,
+        #[arg(
+            long,
+            default_value = "stack",
+            help = "Branch policy: stack, base, or merge"
+        )]
+        branch_policy: String,
+        #[arg(
+            long,
+            default_value = "auto",
+            help = "Apply mode: auto, preview, or manual"
+        )]
+        apply_mode: String,
+        #[arg(
+            long,
+            default_value = "squash",
+            help = "Apply strategy: squash, merge, or cherry-pick"
+        )]
+        apply_strategy: String,
+        #[arg(long, help = "Glob allowlist for auto-apply")]
+        apply_allowlist: Vec<String>,
+        #[arg(
+            long,
+            default_value = "stop",
+            help = "Failure policy: stop, skip, or continue"
+        )]
+        on_fail: String,
+        #[arg(
+            long,
+            default_value_t = 2,
+            help = "Consecutive failed steps before pausing"
+        )]
+        circuit_breaker_threshold: u32,
+        #[arg(long, help = "Aggregate chain spend cap in USD")]
+        max_spend: Option<f64>,
+        #[arg(long, help = "Aggregate chain wall-clock cap in seconds")]
+        max_wall_seconds: Option<f64>,
+        #[arg(long, help = "Provider route override")]
+        provider: Option<String>,
+        #[arg(long, help = "Model override")]
+        model: Option<String>,
+        #[arg(long, default_value = "auto", help = "Sandbox backend")]
+        sandbox: String,
+        #[arg(long, help = "Base git ref; defaults to current HEAD")]
+        base: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 4,
+            help = "Number of planner steps for chain plan"
+        )]
+        n: u8,
+        #[arg(long, help = "Suppress post-action hints")]
+        no_hints: bool,
+        #[arg(long, help = "Suppress success stdout")]
+        quiet: bool,
+        #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+        plain: bool,
+        #[arg(long, help = "Reason for pause")]
+        reason: Option<String>,
+        #[arg(long, help = "Resume from this step index")]
+        from_step: Option<u32>,
+        #[arg(long, help = "Add to the aggregate spend cap on resume")]
+        max_spend_add: Option<f64>,
+        #[arg(long, help = "Reset the circuit breaker on resume")]
+        reset_breaker: bool,
+        #[arg(long, help = "Force kill without SIGTERM grace")]
+        force: bool,
+        #[arg(long, help = "Step index for redo")]
+        step: Option<u32>,
+        #[arg(long, help = "Patch the selected redo step goal")]
+        extend: Option<String>,
+        #[arg(long, help = "Allow redo of an already-applied step")]
+        reapply: bool,
+        #[arg(long, help = "Insert extension at this step index")]
+        insert_at: Option<u32>,
+        #[arg(long, help = "Skip confirmation for destructive chain actions")]
+        no_confirm: bool,
+        #[arg(long, help = "Print exact IDs and paths")]
+        full: bool,
+        #[arg(long, help = "Show chains from all scopes")]
+        all: bool,
+        #[arg(long, help = "Explain the failure reason in chain show")]
+        why_failed: bool,
     },
     #[command(
         next_help_heading = "Setup",
@@ -677,6 +781,82 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
+        Commands::Chain {
+            args,
+            from_file,
+            from_stdin,
+            draft,
+            yes,
+            detach,
+            branch_policy,
+            apply_mode,
+            apply_strategy,
+            apply_allowlist,
+            on_fail,
+            circuit_breaker_threshold,
+            max_spend,
+            max_wall_seconds,
+            provider,
+            model,
+            sandbox,
+            base,
+            n,
+            no_hints,
+            quiet,
+            plain,
+            reason,
+            from_step,
+            max_spend_add,
+            reset_breaker,
+            force,
+            step,
+            extend,
+            reapply,
+            insert_at,
+            no_confirm,
+            full,
+            all,
+            why_failed,
+        } => {
+            chain_command(ChainCommandArgs {
+                args,
+                from_file,
+                from_stdin,
+                draft,
+                yes,
+                detach,
+                branch_policy,
+                apply_mode,
+                apply_strategy,
+                apply_allowlist,
+                on_fail,
+                circuit_breaker_threshold,
+                max_spend,
+                max_wall_seconds,
+                provider,
+                model,
+                sandbox,
+                base,
+                n,
+                no_hints,
+                quiet,
+                plain,
+                reason,
+                from_step,
+                max_spend_add,
+                reset_breaker,
+                force,
+                step,
+                extend,
+                reapply,
+                insert_at,
+                no_confirm,
+                full,
+                all,
+                why_failed,
+            })
+            .await
+        }
         Commands::Doctor => doctor_command().await,
         Commands::List { scope, all, full } => list_command(scope, all, full),
         Commands::Library { command } => library_command(command),
@@ -1009,6 +1189,44 @@ struct RunCommandArgs {
     doc_skill: Option<String>,
 }
 
+struct ChainCommandArgs {
+    args: Vec<String>,
+    from_file: Option<PathBuf>,
+    from_stdin: bool,
+    draft: bool,
+    yes: bool,
+    detach: bool,
+    branch_policy: String,
+    apply_mode: String,
+    apply_strategy: String,
+    apply_allowlist: Vec<String>,
+    on_fail: String,
+    circuit_breaker_threshold: u32,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    provider: Option<String>,
+    model: Option<String>,
+    sandbox: String,
+    base: Option<String>,
+    n: u8,
+    no_hints: bool,
+    quiet: bool,
+    plain: bool,
+    reason: Option<String>,
+    from_step: Option<u32>,
+    max_spend_add: Option<f64>,
+    reset_breaker: bool,
+    force: bool,
+    step: Option<u32>,
+    extend: Option<String>,
+    reapply: bool,
+    insert_at: Option<u32>,
+    no_confirm: bool,
+    full: bool,
+    all: bool,
+    why_failed: bool,
+}
+
 struct ExtendCommandArgs {
     parent_run_id: String,
     new_goal: String,
@@ -1023,6 +1241,1616 @@ struct ExtendCommandArgs {
     no_docs: bool,
     doc_skill: Option<String>,
     post_actions: bool,
+}
+
+async fn chain_command(args: ChainCommandArgs) -> Result<()> {
+    let ChainCommandArgs {
+        args,
+        from_file,
+        from_stdin,
+        draft,
+        yes,
+        detach,
+        branch_policy,
+        apply_mode,
+        apply_strategy,
+        apply_allowlist,
+        on_fail,
+        circuit_breaker_threshold,
+        max_spend,
+        max_wall_seconds,
+        provider,
+        model,
+        sandbox,
+        base,
+        n,
+        no_hints,
+        quiet,
+        plain,
+        reason,
+        from_step,
+        max_spend_add,
+        reset_breaker,
+        force,
+        step,
+        extend,
+        reapply,
+        insert_at,
+        no_confirm,
+        full,
+        all,
+        why_failed,
+    } = args;
+    let paths = DeadreckonPaths::discover();
+    let Some(first) = args.first().map(String::as_str) else {
+        if from_file.is_some() || from_stdin {
+            let goals = collect_chain_goals(&[], from_file, from_stdin)?;
+            return chain_create_command(ChainCreateOptions {
+                paths,
+                root_goal: format!("manual: {} steps", goals.len()),
+                goals,
+                from_file: None,
+                from_stdin: false,
+                draft,
+                yes,
+                detach,
+                branch_policy,
+                apply_mode,
+                apply_strategy,
+                apply_allowlist,
+                on_fail,
+                circuit_breaker_threshold,
+                max_spend,
+                max_wall_seconds,
+                provider,
+                model,
+                sandbox,
+                base,
+                n,
+                no_hints,
+                quiet,
+                plain,
+            })
+            .await;
+        }
+        eprintln!("using: chain status (scope: {})", current_scope()?);
+        return chain_status_command(None, all, full, plain);
+    };
+
+    match first {
+        "plan" | "expand" => {
+            let root_goal = args.get(1).cloned().ok_or_else(|| {
+                CliError::Core(deadreckon_core::user_error(
+                    "chain plan needs a goal",
+                    "deadreckon chain plan \"build the app\" --n 4",
+                ))
+            })?;
+            chain_plan_command(ChainCreateOptions {
+                paths,
+                root_goal,
+                goals: Vec::new(),
+                from_file,
+                from_stdin,
+                draft,
+                yes,
+                detach,
+                branch_policy,
+                apply_mode,
+                apply_strategy,
+                apply_allowlist,
+                on_fail,
+                circuit_breaker_threshold,
+                max_spend,
+                max_wall_seconds,
+                provider,
+                model,
+                sandbox,
+                base,
+                n,
+                no_hints,
+                quiet,
+                plain,
+            })
+            .await
+        }
+        "run" => {
+            let id = args.get(1).map(String::as_str).unwrap_or("latest");
+            if id == "latest" || id == "last" {
+                let latest = resolve_chain_id(&paths, id, all)?;
+                eprintln!("using: chain resume {}", chain_prefix(&latest));
+                return chain_run_command(
+                    &paths,
+                    &latest,
+                    ChainRunOptions {
+                        detach,
+                        quiet,
+                        plain,
+                        from_step,
+                        max_spend_add,
+                        reset_breaker,
+                        apply_mode: Some(apply_mode),
+                    },
+                )
+                .await;
+            }
+            let id = resolve_chain_id(&paths, id, all)?;
+            chain_run_command(
+                &paths,
+                &id,
+                ChainRunOptions {
+                    detach,
+                    quiet,
+                    plain,
+                    from_step,
+                    max_spend_add,
+                    reset_breaker,
+                    apply_mode: Some(apply_mode),
+                },
+            )
+            .await
+        }
+        "resume" => {
+            let id = resolve_chain_id(
+                &paths,
+                args.get(1).map(String::as_str).unwrap_or("latest"),
+                all,
+            )?;
+            chain_run_command(
+                &paths,
+                &id,
+                ChainRunOptions {
+                    detach,
+                    quiet,
+                    plain,
+                    from_step,
+                    max_spend_add,
+                    reset_breaker,
+                    apply_mode: Some(apply_mode),
+                },
+            )
+            .await
+        }
+        "status" => chain_status_command(args.get(1).map(String::as_str), all, full, plain),
+        "list" => chain_list_command(all, full),
+        "show" => chain_show_command(
+            &paths,
+            args.get(1).map(String::as_str).unwrap_or("latest"),
+            why_failed,
+        ),
+        "attach" => chain_attach_command(
+            &paths,
+            args.get(1).map(String::as_str).unwrap_or("latest"),
+            plain,
+        ),
+        "pause" => chain_pause_command(
+            &paths,
+            args.get(1).map(String::as_str).unwrap_or("latest"),
+            reason,
+        ),
+        "kill" => chain_kill_command(
+            &paths,
+            args.get(1).map(String::as_str).unwrap_or("latest"),
+            force,
+        ),
+        "undo" => chain_undo_command(
+            &paths,
+            args.get(1).map(String::as_str).unwrap_or("latest"),
+            step,
+            no_confirm,
+        ),
+        "extend" => {
+            let id = args.get(1).map(String::as_str).unwrap_or("latest");
+            let step_goal = args.get(2).cloned().or(extend).ok_or_else(|| {
+                CliError::Core(deadreckon_core::user_error(
+                    "chain extend needs a step goal",
+                    "deadreckon chain extend latest \"add tests\"",
+                ))
+            })?;
+            chain_extend_command(&paths, id, step_goal, insert_at, max_spend_add)
+        }
+        "redo" => chain_redo_command(
+            &paths,
+            args.get(1).map(String::as_str).unwrap_or("latest"),
+            step,
+            extend,
+            reapply,
+        ),
+        "hooks" if args.get(1).is_some_and(|arg| arg == "list") => chain_hooks_list_command(),
+        maybe_id if args.len() == 1 && looks_like_chain_id(maybe_id) => {
+            Err(CliError::Core(deadreckon_core::user_error(
+                &format!("did you mean `chain run {maybe_id}`?"),
+                &format!("deadreckon chain run {maybe_id}"),
+            )))
+        }
+        _ => {
+            let goals = collect_chain_goals(&args, from_file, from_stdin)?;
+            chain_create_command(ChainCreateOptions {
+                paths,
+                root_goal: format!("manual: {} steps", goals.len()),
+                goals,
+                from_file: None,
+                from_stdin: false,
+                draft,
+                yes,
+                detach,
+                branch_policy,
+                apply_mode,
+                apply_strategy,
+                apply_allowlist,
+                on_fail,
+                circuit_breaker_threshold,
+                max_spend,
+                max_wall_seconds,
+                provider,
+                model,
+                sandbox,
+                base,
+                n,
+                no_hints,
+                quiet,
+                plain,
+            })
+            .await
+        }
+    }
+}
+
+struct ChainCreateOptions {
+    paths: DeadreckonPaths,
+    root_goal: String,
+    goals: Vec<String>,
+    from_file: Option<PathBuf>,
+    from_stdin: bool,
+    draft: bool,
+    yes: bool,
+    detach: bool,
+    branch_policy: String,
+    apply_mode: String,
+    apply_strategy: String,
+    apply_allowlist: Vec<String>,
+    on_fail: String,
+    circuit_breaker_threshold: u32,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    provider: Option<String>,
+    model: Option<String>,
+    sandbox: String,
+    base: Option<String>,
+    n: u8,
+    no_hints: bool,
+    quiet: bool,
+    plain: bool,
+}
+
+struct ChainRunOptions {
+    detach: bool,
+    quiet: bool,
+    plain: bool,
+    from_step: Option<u32>,
+    max_spend_add: Option<f64>,
+    reset_breaker: bool,
+    apply_mode: Option<String>,
+}
+
+async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
+    let n = options.n.clamp(2, 12);
+    let goals = (1..=n)
+        .map(|index| format!("{} (step {index})", options.root_goal))
+        .collect::<Vec<_>>();
+    chain_create_command(ChainCreateOptions { goals, ..options }).await
+}
+
+async fn chain_create_command(options: ChainCreateOptions) -> Result<()> {
+    let ChainCreateOptions {
+        paths,
+        root_goal,
+        mut goals,
+        from_file,
+        from_stdin,
+        draft,
+        yes,
+        detach,
+        branch_policy,
+        apply_mode,
+        apply_strategy,
+        apply_allowlist,
+        on_fail,
+        circuit_breaker_threshold,
+        max_spend,
+        max_wall_seconds,
+        provider,
+        model,
+        sandbox,
+        base,
+        n: _,
+        no_hints,
+        quiet,
+        plain,
+    } = options;
+    if goals.is_empty() {
+        goals = collect_chain_goals(&[], from_file, from_stdin)?;
+    }
+    deadreckon_core::validate_goal_count(goals.len()).map_err(CliError::from)?;
+    let cwd = std::env::current_dir()?;
+    let git_root = deadreckon_core::find_git_root(&cwd)?.ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            "chains require a git repo",
+            "cd into a repo or initialize one with git init",
+        ))
+    })?;
+    let scope = workspace_scope(&cwd).map_err(CliError::from)?;
+    let base_ref = base.unwrap_or_else(|| "HEAD".to_string());
+    let base_sha = git_stdout(&git_root, &["rev-parse", &base_ref])?;
+    let base_branch = git_stdout(&git_root, &["symbolic-ref", "--short", "HEAD"])
+        .unwrap_or_else(|_| base_ref.clone());
+    let chain = Chain::new(ChainNewOptions {
+        root_goal,
+        goals,
+        scope,
+        base_branch,
+        base_sha,
+        cwd: git_root.clone(),
+        provider,
+        model,
+        sandbox,
+        branch_policy: parse_branch_policy(&branch_policy)?,
+        apply_mode: parse_apply_mode(&apply_mode)?,
+        apply_strategy: parse_apply_strategy(&apply_strategy)?,
+        apply_allowlist,
+        on_fail: parse_on_fail(&on_fail)?,
+        circuit_breaker_threshold,
+        max_spend_usd: max_spend,
+        max_wall_seconds,
+        deadreckon_version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+    .map_err(CliError::from)?;
+    save_chain(&paths, &chain)?;
+    append_chain_event(
+        &paths,
+        &chain.chain_id,
+        ChainEventKind::ChainCreated,
+        None,
+        json!({ "steps": chain.steps.len(), "draft": draft }),
+    )?;
+    if !quiet {
+        println!("{}", chain_preview(&chain));
+    }
+    if draft {
+        if completion_hints_enabled(no_hints) && !quiet {
+            println!(
+                "drafted: {} with {} steps",
+                chain.chain_id,
+                chain.steps.len()
+            );
+            println!(
+                "edit:    vim {}",
+                paths.chain_json(&chain.chain_id).display()
+            );
+            println!(
+                "run:     deadreckon chain run {}",
+                chain_prefix(&chain.chain_id)
+            );
+        }
+        return Ok(());
+    }
+    if !yes {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "non-interactive chain start requires --yes",
+                "deadreckon chain --yes \"step one\" \"step two\"",
+            )));
+        }
+        let answer = prompt("start the chain? [Y/n]: ")?;
+        if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
+            println!("cancelled");
+            return Ok(());
+        }
+    }
+    chain_run_command(
+        &paths,
+        &chain.chain_id,
+        ChainRunOptions {
+            detach,
+            quiet,
+            plain,
+            from_step: None,
+            max_spend_add: None,
+            reset_breaker: false,
+            apply_mode: None,
+        },
+    )
+    .await
+}
+
+async fn chain_run_command(
+    paths: &DeadreckonPaths,
+    chain_id: &str,
+    options: ChainRunOptions,
+) -> Result<()> {
+    let chain_id = resolve_chain_id(paths, chain_id, false)?;
+    if options.detach {
+        return detach_chain_conductor(paths, &chain_id, &options);
+    }
+    run_chain_conductor(paths, &chain_id, options).await
+}
+
+async fn run_chain_conductor(
+    paths: &DeadreckonPaths,
+    chain_id: &str,
+    options: ChainRunOptions,
+) -> Result<()> {
+    let mut chain = load_chain(paths, chain_id)?;
+    if let Some(add) = options.max_spend_add {
+        chain.max_spend_usd = Some(chain.max_spend_usd.unwrap_or(0.0) + add);
+    }
+    if options.reset_breaker {
+        chain.circuit_breaker_consecutive_failures = 0;
+    }
+    if let Some(mode) = options.apply_mode.as_deref()
+        && mode != "auto"
+    {
+        chain.apply_mode = parse_apply_mode(mode)?;
+    }
+    match chain.status {
+        ChainStatus::Completed => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("chain '{}' is completed", chain_prefix(&chain.chain_id)),
+                &format!("deadreckon chain show {}", chain_prefix(&chain.chain_id)),
+            )));
+        }
+        ChainStatus::Running if chain.conductor_pid.is_some_and(pid_is_alive) => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "chain '{}' is already running (pid {})",
+                    chain_prefix(&chain.chain_id),
+                    chain.conductor_pid.unwrap_or_default()
+                ),
+                &format!("deadreckon chain attach {}", chain_prefix(&chain.chain_id)),
+            )));
+        }
+        _ => {}
+    }
+    let mut lock = acquire_lock(
+        paths,
+        &chain.task_key(),
+        &chain.chain_id,
+        &chain.scope,
+        "chain",
+        deadreckon_core::lock::DEFAULT_STALE_AFTER,
+    )?;
+    chain.status = ChainStatus::Running;
+    chain.started_at.get_or_insert_with(Utc::now);
+    chain.paused_reason = None;
+    chain.conductor_pid = Some(std::process::id());
+    save_chain(paths, &chain)?;
+    let conductor = ConductorState {
+        schema_version: 1,
+        chain_id: chain.chain_id.clone(),
+        conductor_pid: std::process::id(),
+        started_at: Utc::now(),
+        live_step: None,
+        live_run_id: None,
+    };
+    fs::create_dir_all(paths.chain_dir(&chain.chain_id))?;
+    fs::write(
+        paths.conductor_json(&chain.chain_id),
+        serde_json::to_vec_pretty(&conductor)?,
+    )?;
+
+    let start_index = options.from_step.unwrap_or(0);
+    let mut completed = true;
+    for index in 0..chain.steps.len() {
+        if (index as u32) < start_index {
+            continue;
+        }
+        if matches!(
+            chain.steps[index].status,
+            ChainStepStatus::Applied | ChainStepStatus::Skipped
+        ) {
+            continue;
+        }
+        lock.heartbeat(format!("step-{index}"))?;
+        let step_cap = per_step_spend_cap(&chain, index);
+        let base_ref = chain_step_base_ref(&chain)?;
+        chain.steps[index].status = ChainStepStatus::Running;
+        append_chain_event(
+            paths,
+            &chain.chain_id,
+            ChainEventKind::ChainStepStarted,
+            Some(index as u32),
+            json!({ "goal": chain.steps[index].goal, "base": base_ref, "max_spend": step_cap }),
+        )?;
+        save_chain(paths, &chain)?;
+        let run_id = match run_chain_step(&chain, index, &base_ref, step_cap, options.quiet).await {
+            Ok(run_id) => run_id,
+            Err(err) => {
+                completed = handle_chain_step_failure(paths, &mut chain, index, err.to_string())?;
+                if !completed {
+                    break;
+                }
+                continue;
+            }
+        };
+        chain.steps[index].run_id = Some(run_id.clone());
+        let state = load_run(paths, &run_id)?;
+        chain.steps[index].spend_usd = state.total_spend_usd;
+        chain.total_spend_usd += state.total_spend_usd;
+        chain.total_wall_seconds += state.total_wall_seconds;
+        write_chain_step_marker(
+            &state.working_dir,
+            &ChainStepMarker::new(
+                &chain,
+                &chain.steps[index],
+                latest_applied_sha_before(&chain, index),
+            ),
+        )?;
+        append_chain_event(
+            paths,
+            &chain.chain_id,
+            ChainEventKind::ChainRunCompleted,
+            Some(index as u32),
+            json!({ "run_id": run_id, "status": state.status.to_string() }),
+        )?;
+        if state.status != RunStatus::Completed {
+            completed = handle_chain_step_failure(
+                paths,
+                &mut chain,
+                index,
+                format!("inner run {} ended {}", state.run_id, state.status),
+            )?;
+            if !completed {
+                break;
+            }
+            continue;
+        }
+        chain.steps[index].status = ChainStepStatus::Completed;
+        save_chain(paths, &chain)?;
+        if chain.apply_mode == ApplyMode::Auto {
+            if let Err(err) = auto_apply_chain_step(paths, &mut chain, index, &state.run_id) {
+                pause_chain_at_step(
+                    paths,
+                    &mut chain,
+                    index,
+                    format!("apply_refused_{}", compact_reason(&err.to_string())),
+                )?;
+                completed = false;
+                break;
+            }
+        } else {
+            let reason = format!("apply_mode_{}", apply_mode_label(chain.apply_mode));
+            pause_chain_at_step(paths, &mut chain, index, reason)?;
+            completed = false;
+            break;
+        }
+        if chain_spend_cap_hit(&chain) {
+            pause_chain_at_step(paths, &mut chain, index, "cap".to_string())?;
+            completed = false;
+            break;
+        }
+    }
+    if completed {
+        chain.status = ChainStatus::Completed;
+        chain.completed_at = Some(Utc::now());
+        chain.conductor_pid = None;
+        append_chain_event(
+            paths,
+            &chain.chain_id,
+            ChainEventKind::ChainCompleted,
+            None,
+            json!({ "steps_completed": chain.steps.iter().filter(|step| step.status == ChainStepStatus::Applied).count(), "total_spend_usd": chain.total_spend_usd }),
+        )?;
+        save_chain(paths, &chain)?;
+        if !options.quiet {
+            println!(
+                "chained: {} done {}/{}",
+                chain_prefix(&chain.chain_id),
+                chain.steps.len(),
+                chain.steps.len()
+            );
+            println!(
+                "show:    deadreckon chain show {}",
+                chain_prefix(&chain.chain_id)
+            );
+            println!("list:    deadreckon chain list");
+        }
+    } else if !options.quiet {
+        print_chain_paused_footer(&chain);
+    }
+    let _ = fs::remove_file(paths.conductor_json(&chain.chain_id));
+    let _ = lock.release();
+    Ok(())
+}
+
+async fn run_chain_step(
+    chain: &Chain,
+    index: usize,
+    base_ref: &str,
+    step_cap: Option<f64>,
+    quiet: bool,
+) -> Result<String> {
+    let step = &chain.steps[index];
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .current_dir(&chain.cwd)
+        .env("DEADRECKON_HOME", DeadreckonPaths::discover().home())
+        .arg("run")
+        .arg(&step.goal)
+        .arg("--worktree")
+        .arg("--base")
+        .arg(base_ref)
+        .arg("--yes")
+        .arg("--no-confirm")
+        .arg("--no-hints")
+        .arg("--sandbox")
+        .arg(&chain.sandbox);
+    if let Some(provider) = chain.provider.as_deref() {
+        command.arg("--provider").arg(provider);
+    }
+    if let Some(model) = chain.model.as_deref() {
+        command.arg("--model").arg(model);
+    }
+    if let Some(max_wall) = chain.max_wall_seconds {
+        command.arg("--max-wall-seconds").arg(max_wall.to_string());
+    }
+    if let Some(step_cap) = step_cap {
+        command.arg("--max-spend").arg(format!("{step_cap:.6}"));
+    }
+    let output = command.output()?;
+    if !quiet {
+        io::stdout().write_all(&output.stdout)?;
+        io::stderr().write_all(&output.stderr)?;
+    }
+    if !output.status.success() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "step {} run failed: {}{}",
+            index + 1,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))));
+    }
+    parse_started_run_id(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "could not find inner run id in run output\ntry: deadreckon list".to_string(),
+        ))
+    })
+}
+
+fn auto_apply_chain_step(
+    paths: &DeadreckonPaths,
+    chain: &mut Chain,
+    index: usize,
+    run_id: &str,
+) -> Result<()> {
+    let state = load_run(paths, run_id)?;
+    validate_acceptance_marker(&state)?;
+    let record = read_codebase_record(&state.working_dir)?;
+    let git_root = record.source_git_root.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "missing source_git_root".to_string(),
+        ))
+    })?;
+    if !git_stdout(git_root, &["status", "--porcelain"])?
+        .trim()
+        .is_empty()
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("step '{}' refused auto-apply (dirty target)", index + 1),
+            &format!(
+                "git -C {} stash && deadreckon chain resume {}",
+                git_root.display(),
+                chain_prefix(&chain.chain_id)
+            ),
+        )));
+    }
+    if !chain.apply_allowlist.is_empty() {
+        let branch = record.branch_name.as_deref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "missing branch_name".to_string(),
+            ))
+        })?;
+        let files = git_stdout(
+            git_root,
+            &["diff", "--name-only", &format!("HEAD..{branch}")],
+        )?;
+        for file in files.lines().filter(|line| !line.trim().is_empty()) {
+            if !chain
+                .apply_allowlist
+                .iter()
+                .any(|pattern| allowlist_matches(pattern, file))
+            {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    &format!(
+                        "step '{}' refused auto-apply ({file} outside allowlist)",
+                        index + 1
+                    ),
+                    &format!(
+                        "deadreckon chain resume {} --apply-mode preview",
+                        chain_prefix(&chain.chain_id)
+                    ),
+                )));
+            }
+        }
+    }
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::ChainApplyStarted,
+        Some(index as u32),
+        json!({ "run_id": run_id }),
+    )?;
+    apply_command(
+        run_id.to_string(),
+        apply_strategy_label(chain.apply_strategy).to_string(),
+        None,
+        true,
+        true,
+        false,
+        None,
+    )?;
+    let applied_sha = git_stdout(git_root, &["rev-parse", "HEAD"])?;
+    chain.steps[index].status = ChainStepStatus::Applied;
+    chain.steps[index].applied_at = Some(Utc::now());
+    chain.steps[index].applied_sha = Some(applied_sha.clone());
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::ChainApplied,
+        Some(index as u32),
+        json!({ "run_id": run_id, "applied_sha": applied_sha }),
+    )?;
+    save_chain(paths, chain)?;
+    Ok(())
+}
+
+fn handle_chain_step_failure(
+    paths: &DeadreckonPaths,
+    chain: &mut Chain,
+    index: usize,
+    reason: String,
+) -> Result<bool> {
+    chain.steps[index].status = ChainStepStatus::Failed;
+    chain.steps[index].fail_reason = Some(reason.clone());
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::ChainStepFailed,
+        Some(index as u32),
+        json!({ "reason": reason }),
+    )?;
+    match chain.on_fail {
+        OnFail::Stop => {
+            pause_chain_at_step(paths, chain, index, "step_failed".to_string())?;
+            Ok(false)
+        }
+        OnFail::Skip => {
+            chain.steps[index].status = ChainStepStatus::Skipped;
+            chain.circuit_breaker_consecutive_failures += 1;
+            if chain.circuit_breaker_consecutive_failures >= chain.circuit_breaker_threshold {
+                pause_chain_at_step(paths, chain, index, "circuit_breaker_open".to_string())?;
+                return Ok(false);
+            }
+            save_chain(paths, chain)?;
+            Ok(true)
+        }
+        OnFail::Continue => {
+            chain.steps[index].status = ChainStepStatus::Skipped;
+            save_chain(paths, chain)?;
+            Ok(true)
+        }
+    }
+}
+
+fn pause_chain_at_step(
+    paths: &DeadreckonPaths,
+    chain: &mut Chain,
+    index: usize,
+    reason: String,
+) -> Result<()> {
+    chain.status = ChainStatus::Paused;
+    chain.paused_reason = Some(reason.clone());
+    chain.conductor_pid = None;
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::ChainPaused,
+        Some(index as u32),
+        json!({ "reason": reason }),
+    )?;
+    save_chain(paths, chain)?;
+    Ok(())
+}
+
+fn detach_chain_conductor(
+    paths: &DeadreckonPaths,
+    chain_id: &str,
+    options: &ChainRunOptions,
+) -> Result<()> {
+    fs::create_dir_all(paths.chain_dir(chain_id))?;
+    let stdout = fs::File::create(paths.chain_dir(chain_id).join("conductor.out"))?;
+    let stderr = fs::File::create(paths.chain_dir(chain_id).join("conductor.err"))?;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .arg("chain")
+        .arg("run")
+        .arg(chain_id)
+        .arg("--quiet")
+        .env("DEADRECKON_HOME", paths.home())
+        .stdout(stdout)
+        .stderr(stderr)
+        .stdin(std::process::Stdio::null());
+    if options.plain {
+        command.arg("--plain");
+    }
+    let child = command.spawn()?;
+    println!(
+        "chain {} detached (pid {})",
+        chain_prefix(chain_id),
+        child.id()
+    );
+    println!("attach: deadreckon chain attach {}", chain_prefix(chain_id));
+    Ok(())
+}
+
+fn chain_status_command(id: Option<&str>, all: bool, full: bool, _plain: bool) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    if let Some(id) = id {
+        return chain_show_command(&paths, id, false);
+    }
+    let chains = list_chain_records(&paths, if all { None } else { Some(current_scope()?) })?;
+    if chains.is_empty() {
+        println!("no chains in scope");
+        println!("try: deadreckon chain \"step one\" \"step two\"");
+        return Ok(());
+    }
+    print_chain_table(&chains, full);
+    Ok(())
+}
+
+fn chain_list_command(all: bool, full: bool) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let chains = list_chain_records(&paths, if all { None } else { Some(current_scope()?) })?;
+    if chains.is_empty() {
+        println!("no chains");
+        println!("try: deadreckon chain \"step one\" \"step two\"");
+        return Ok(());
+    }
+    print_chain_table(&chains, full);
+    Ok(())
+}
+
+fn chain_show_command(paths: &DeadreckonPaths, id: &str, why_failed: bool) -> Result<()> {
+    let id = resolve_chain_id(paths, id, false)?;
+    let chain = load_chain(paths, &id)?;
+    println!("chain {}", ui_id(&chain.chain_id));
+    println!("status {}", chain_status_label(&chain));
+    println!(
+        "policy {} apply={} on-fail={} base={}@{}",
+        branch_policy_label(chain.branch_policy),
+        apply_mode_label(chain.apply_mode),
+        on_fail_label(chain.on_fail),
+        chain.base_branch,
+        short_sha(&chain.base_sha)
+    );
+    println!("cwd {}", chain.cwd.display());
+    println!("path {}", paths.chain_json(&chain.chain_id).display());
+    println!(
+        "spend ${:.6} / {}",
+        chain.total_spend_usd,
+        chain
+            .max_spend_usd
+            .map(|value| format!("${value:.6}"))
+            .unwrap_or_else(|| "uncapped".to_string())
+    );
+    for step in &chain.steps {
+        println!(
+            "{} step {} {:<9} {}{}",
+            chain_step_dot(step.status),
+            step.index + 1,
+            chain_step_status_label(step.status),
+            truncate_text(&step.goal, 72),
+            step.run_id
+                .as_deref()
+                .map(|run_id| format!(" run={}", run_prefix(run_id)))
+                .unwrap_or_default()
+        );
+        if why_failed && let Some(reason) = step.fail_reason.as_deref() {
+            println!("  reason: {reason}");
+        }
+    }
+    Ok(())
+}
+
+fn chain_attach_command(paths: &DeadreckonPaths, id: &str, _plain: bool) -> Result<()> {
+    let id = resolve_chain_id(paths, id, false)?;
+    let chain = load_chain(paths, &id)?;
+    println!(
+        "chain {} status: {} steps: {}/{} spend: ${:.2}/{}",
+        chain_prefix(&chain.chain_id),
+        chain_status_label(&chain),
+        chain
+            .steps
+            .iter()
+            .filter(|step| step.status == ChainStepStatus::Applied)
+            .count(),
+        chain.steps.len(),
+        chain.total_spend_usd,
+        chain
+            .max_spend_usd
+            .map(|value| format!("${value:.2}"))
+            .unwrap_or_else(|| "uncapped".to_string())
+    );
+    println!(
+        "policy: {} | apply={} | on-fail={} | base={}@{}",
+        branch_policy_label(chain.branch_policy),
+        apply_mode_label(chain.apply_mode),
+        on_fail_label(chain.on_fail),
+        chain.base_branch,
+        short_sha(&chain.base_sha)
+    );
+    for step in &chain.steps {
+        println!(
+            "{} step {} {:<9} {}",
+            chain_step_dot(step.status),
+            step.index + 1,
+            chain_step_status_label(step.status),
+            truncate_text(&step.goal, 80)
+        );
+    }
+    println!("[r] redo  [e] extend  [p] pause  [k] kill  [Ctrl-D] detach  [q] quit");
+    Ok(())
+}
+
+fn chain_pause_command(paths: &DeadreckonPaths, id: &str, reason: Option<String>) -> Result<()> {
+    let id = resolve_chain_id(paths, id, false)?;
+    let mut chain = load_chain(paths, &id)?;
+    if chain.status != ChainStatus::Running {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("cannot pause '{}' chain", chain_status_label(&chain)),
+            &format!("deadreckon chain status {}", chain_prefix(&chain.chain_id)),
+        )));
+    }
+    chain.status = ChainStatus::Paused;
+    chain.paused_reason = Some(reason.unwrap_or_else(|| "user_paused".to_string()));
+    save_chain(paths, &chain)?;
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::ChainPaused,
+        None,
+        json!({ "reason": chain.paused_reason }),
+    )?;
+    println!("paused {}", chain_prefix(&chain.chain_id));
+    println!(
+        "try: deadreckon chain resume {}",
+        chain_prefix(&chain.chain_id)
+    );
+    Ok(())
+}
+
+fn chain_kill_command(paths: &DeadreckonPaths, id: &str, force: bool) -> Result<()> {
+    let id = resolve_chain_id(paths, id, false)?;
+    let mut chain = load_chain(paths, &id)?;
+    if let Some(pid) = chain.conductor_pid {
+        terminate_pid(pid, force)?;
+    }
+    chain.status = ChainStatus::Killed;
+    chain.failure_reason = Some("killed by user".to_string());
+    chain.conductor_pid = None;
+    save_chain(paths, &chain)?;
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::ChainKilled,
+        None,
+        json!({ "force": force }),
+    )?;
+    println!("killed {}", chain_prefix(&chain.chain_id));
+    Ok(())
+}
+
+fn chain_undo_command(
+    paths: &DeadreckonPaths,
+    id: &str,
+    through_step: Option<u32>,
+    no_confirm: bool,
+) -> Result<()> {
+    let id = resolve_chain_id(paths, id, false)?;
+    let mut chain = load_chain(paths, &id)?;
+    let mut applied = chain
+        .steps
+        .iter()
+        .filter(|step| step.status == ChainStepStatus::Applied)
+        .filter(|step| through_step.is_none_or(|limit| step.index <= limit))
+        .filter_map(|step| {
+            step.applied_sha
+                .as_deref()
+                .map(|sha| (step.index, sha.to_string()))
+        })
+        .collect::<Vec<_>>();
+    if applied.is_empty() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "nothing to undo",
+            &format!("deadreckon chain show {}", chain_prefix(&chain.chain_id)),
+        )));
+    }
+    if !no_confirm && io::stdin().is_terminal() {
+        let answer = prompt("undo applied chain commits? [y/N]: ")?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("cancelled");
+            return Ok(());
+        }
+    } else if !no_confirm {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "non-interactive chain undo requires --no-confirm",
+            &format!(
+                "deadreckon chain undo {} --no-confirm",
+                chain_prefix(&chain.chain_id)
+            ),
+        )));
+    }
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::ChainUndoStarted,
+        None,
+        json!({ "count": applied.len() }),
+    )?;
+    applied.reverse();
+    for (index, sha) in applied {
+        git_status(&chain.cwd, &["revert", "--no-edit", &sha])?;
+        if let Some(step) = chain.steps.iter_mut().find(|step| step.index == index) {
+            step.status = ChainStepStatus::Undone;
+        }
+        append_chain_event(
+            paths,
+            &chain.chain_id,
+            ChainEventKind::ChainUndoneStep,
+            Some(index),
+            json!({ "sha": sha }),
+        )?;
+    }
+    chain.status = ChainStatus::Undone;
+    save_chain(paths, &chain)?;
+    println!("undone {}", chain_prefix(&chain.chain_id));
+    Ok(())
+}
+
+fn chain_extend_command(
+    paths: &DeadreckonPaths,
+    id: &str,
+    step_goal: String,
+    insert_at: Option<u32>,
+    max_spend_add: Option<f64>,
+) -> Result<()> {
+    let id = resolve_chain_id(paths, id, false)?;
+    let mut chain = load_chain(paths, &id)?;
+    if chain.status == ChainStatus::Completed && insert_at.is_none() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "cannot extend completed chain at end",
+            &format!(
+                "deadreckon chain extend {} \"...\" --insert-at <N>",
+                chain_prefix(&chain.chain_id)
+            ),
+        )));
+    }
+    if let Some(add) = max_spend_add {
+        chain.max_spend_usd = Some(chain.max_spend_usd.unwrap_or(0.0) + add);
+    }
+    let insert = insert_at
+        .map(|value| value.saturating_sub(1) as usize)
+        .unwrap_or(chain.steps.len())
+        .min(chain.steps.len());
+    chain.steps.insert(
+        insert,
+        deadreckon_core::ChainStep::new(insert as u32, step_goal),
+    );
+    for (index, step) in chain.steps.iter_mut().enumerate() {
+        step.index = index as u32;
+    }
+    if chain.status == ChainStatus::Completed {
+        chain.status = ChainStatus::Paused;
+        chain.paused_reason = Some("extended".to_string());
+    }
+    save_chain(paths, &chain)?;
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::ChainStepExtended,
+        Some(insert as u32),
+        json!({ "insert_at": insert }),
+    )?;
+    println!("extended {}", chain_prefix(&chain.chain_id));
+    println!(
+        "next: deadreckon chain resume {}",
+        chain_prefix(&chain.chain_id)
+    );
+    Ok(())
+}
+
+fn chain_redo_command(
+    paths: &DeadreckonPaths,
+    id: &str,
+    step: Option<u32>,
+    extend: Option<String>,
+    reapply: bool,
+) -> Result<()> {
+    let id = resolve_chain_id(paths, id, false)?;
+    let mut chain = load_chain(paths, &id)?;
+    let index = step
+        .map(|step| step.saturating_sub(1))
+        .or_else(|| {
+            chain
+                .steps
+                .iter()
+                .find(|step| step.status == ChainStepStatus::Failed)
+                .map(|step| step.index)
+        })
+        .or_else(|| {
+            chain
+                .steps
+                .iter()
+                .rev()
+                .find(|step| step.status == ChainStepStatus::Applied)
+                .map(|step| step.index)
+        })
+        .ok_or_else(|| {
+            CliError::Core(deadreckon_core::user_error(
+                "no failed or applied step to redo",
+                &format!("deadreckon chain show {}", chain_prefix(&chain.chain_id)),
+            ))
+        })? as usize;
+    let step = chain.steps.get_mut(index).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("step {} does not exist", index + 1),
+            &format!("deadreckon chain show {}", chain_prefix(&chain.chain_id)),
+        ))
+    })?;
+    if step.status == ChainStepStatus::Applied && !reapply {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("step '{}' already applied; redo needs --reapply", index + 1),
+            &format!(
+                "deadreckon chain redo {} --step {} --reapply",
+                chain_prefix(&chain.chain_id),
+                index + 1
+            ),
+        )));
+    }
+    if reapply && let Some(sha) = step.applied_sha.as_deref() {
+        git_status(&chain.cwd, &["revert", "--no-edit", sha])?;
+    }
+    let prior_goal = step.goal.clone();
+    if let Some(extend) = extend {
+        step.goal = extend;
+    }
+    step.status = ChainStepStatus::Pending;
+    step.run_id = None;
+    step.applied_at = None;
+    step.applied_sha = None;
+    save_chain(paths, &chain)?;
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::ChainStepRedone,
+        Some(index as u32),
+        json!({ "prior_goal": prior_goal, "new_goal": chain.steps[index].goal }),
+    )?;
+    println!("redo queued {}", chain_prefix(&chain.chain_id));
+    println!(
+        "next: deadreckon chain resume {}",
+        chain_prefix(&chain.chain_id)
+    );
+    Ok(())
+}
+
+fn chain_hooks_list_command() -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    for hook in ["pre-step", "post-step", "on-promote", "on-chain-end"] {
+        let project = std::env::current_dir()?
+            .join(".deadreckon/hooks/chain")
+            .join(hook);
+        let user = paths.home().join("hooks/chain").join(hook);
+        let repo = PathBuf::from("/Users/gdc/deadreckon/hooks/chain").join(hook);
+        let (tier, path) = if project.exists() {
+            ("project", project)
+        } else if user.exists() {
+            ("user", user)
+        } else if repo.exists() {
+            ("repo", repo)
+        } else {
+            ("missing", user)
+        };
+        println!("{hook}\t{tier}\t{}", path.display());
+    }
+    Ok(())
+}
+
+fn collect_chain_goals(
+    args: &[String],
+    from_file: Option<PathBuf>,
+    from_stdin: bool,
+) -> Result<Vec<String>> {
+    let mut goals = Vec::new();
+    goals.extend(args.iter().cloned());
+    if let Some(path) = from_file {
+        goals.extend(parse_goal_lines(&fs::read_to_string(&path).map_err(
+            |source| {
+                CliError::Core(DeadreckonError::Io {
+                    path: path.clone(),
+                    source,
+                })
+            },
+        )?));
+    }
+    if from_stdin {
+        if io::stdin().is_terminal() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "--from-stdin needs a pipe",
+                "printf 'g1\\ng2\\n' | deadreckon chain --from-stdin --yes",
+            )));
+        }
+        let mut raw = String::new();
+        io::stdin().read_to_string(&mut raw)?;
+        goals.extend(parse_goal_lines(&raw));
+    }
+    Ok(goals
+        .into_iter()
+        .map(|goal| goal.trim().to_string())
+        .filter(|goal| !goal.is_empty())
+        .collect())
+}
+
+fn parse_goal_lines(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn chain_preview(chain: &Chain) -> String {
+    let cap = chain
+        .max_spend_usd
+        .map(|value| format!("${value:.2}"))
+        .unwrap_or_else(|| "uncapped".to_string());
+    let mut lines = vec![
+        format!("chain preview {}", chain_prefix(&chain.chain_id)),
+        format!("scope {}", chain.scope),
+        format!("cwd {}", chain.cwd.display()),
+        format!("base {}@{}", chain.base_branch, short_sha(&chain.base_sha)),
+        format!(
+            "policy branch={} apply={} strategy={} on-fail={}",
+            branch_policy_label(chain.branch_policy),
+            apply_mode_label(chain.apply_mode),
+            apply_strategy_label(chain.apply_strategy),
+            on_fail_label(chain.on_fail)
+        ),
+        format!(
+            "provider {} model {} sandbox {} max-spend {}",
+            chain.provider.as_deref().unwrap_or("default"),
+            chain.model.as_deref().unwrap_or("default"),
+            chain.sandbox,
+            cap
+        ),
+        "steps".to_string(),
+    ];
+    for step in &chain.steps {
+        lines.push(format!("  {}. {}", step.index + 1, step.goal));
+    }
+    lines.join("\n")
+}
+
+fn print_chain_table(chains: &[Chain], full: bool) {
+    println!("CHAIN     STATUS     STEPS  SPEND       UPDATED                  GOAL");
+    for chain in chains {
+        let id = if full {
+            chain.chain_id.clone()
+        } else {
+            chain_prefix(&chain.chain_id)
+        };
+        let done = chain
+            .steps
+            .iter()
+            .filter(|step| step.status == ChainStepStatus::Applied)
+            .count();
+        let updated = chain
+            .completed_at
+            .or(chain.started_at)
+            .unwrap_or(chain.created_at);
+        println!(
+            "{:<9} {:<10} {:>2}/{:<2} ${:<9.6} {:<24} {}",
+            id,
+            chain_status_label(chain),
+            done,
+            chain.steps.len(),
+            chain.total_spend_usd,
+            updated,
+            truncate_text(&chain.root_goal, 80)
+        );
+    }
+}
+
+fn list_chain_records(paths: &DeadreckonPaths, scope: Option<String>) -> Result<Vec<Chain>> {
+    if !paths.chains_dir().exists() {
+        return Ok(Vec::new());
+    }
+    let mut chains = Vec::new();
+    for entry in fs::read_dir(paths.chains_dir())? {
+        let entry = entry?;
+        let path = entry.path().join("chain.json");
+        if !path.exists() {
+            continue;
+        }
+        let chain = serde_json::from_slice::<Chain>(&fs::read(&path)?)
+            .map_err(|source| DeadreckonError::Json { path, source })?;
+        if scope.as_deref().is_some_and(|scope| chain.scope != scope) {
+            continue;
+        }
+        chains.push(chain);
+    }
+    chains.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(chains)
+}
+
+fn resolve_chain_id(paths: &DeadreckonPaths, id: &str, all: bool) -> Result<String> {
+    let scope = if all { None } else { Some(current_scope()?) };
+    let chains = list_chain_records(paths, scope)?;
+    if matches!(id, "latest" | "last") {
+        return chains
+            .first()
+            .map(|chain| chain.chain_id.clone())
+            .ok_or_else(|| {
+                CliError::Core(deadreckon_core::user_error(
+                    "no chains in scope",
+                    "deadreckon chain \"step one\" \"step two\"",
+                ))
+            });
+    }
+    let matches = chains
+        .iter()
+        .filter(|chain| chain.chain_id.starts_with(id))
+        .map(|chain| chain.chain_id.clone())
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches[0].clone()),
+        0 => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("no chain '{id}'"),
+            "deadreckon chain list",
+        ))),
+        _ => Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "ambiguous chain id prefix {id}; matches {}",
+                matches.join(", ")
+            ),
+            "deadreckon chain list --full",
+        ))),
+    }
+}
+
+fn parse_branch_policy(value: &str) -> Result<BranchPolicy> {
+    match value {
+        "stack" => Ok(BranchPolicy::Stack),
+        "base" => Ok(BranchPolicy::Base),
+        "merge" => Ok(BranchPolicy::Merge),
+        other => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown branch policy {other}"),
+            "use --branch-policy stack|base|merge",
+        ))),
+    }
+}
+
+fn parse_apply_mode(value: &str) -> Result<ApplyMode> {
+    match value {
+        "auto" => Ok(ApplyMode::Auto),
+        "preview" => Ok(ApplyMode::Preview),
+        "manual" => Ok(ApplyMode::Manual),
+        other => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown apply mode {other}"),
+            "use --apply-mode auto|preview|manual",
+        ))),
+    }
+}
+
+fn parse_apply_strategy(value: &str) -> Result<ApplyStrategy> {
+    match value {
+        "squash" => Ok(ApplyStrategy::Squash),
+        "merge" => Ok(ApplyStrategy::Merge),
+        "cherry-pick" => Ok(ApplyStrategy::CherryPick),
+        other => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown apply strategy {other}"),
+            "use --apply-strategy squash|merge|cherry-pick",
+        ))),
+    }
+}
+
+fn parse_on_fail(value: &str) -> Result<OnFail> {
+    match value {
+        "stop" => Ok(OnFail::Stop),
+        "skip" => Ok(OnFail::Skip),
+        "continue" => Ok(OnFail::Continue),
+        other => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown on-fail policy {other}"),
+            "use --on-fail stop|skip|continue",
+        ))),
+    }
+}
+
+fn chain_step_base_ref(chain: &Chain) -> Result<String> {
+    match chain.branch_policy {
+        BranchPolicy::Base => Ok(chain.base_sha.clone()),
+        BranchPolicy::Stack | BranchPolicy::Merge => git_stdout(&chain.cwd, &["rev-parse", "HEAD"]),
+    }
+}
+
+fn per_step_spend_cap(chain: &Chain, index: usize) -> Option<f64> {
+    let max = chain.max_spend_usd?;
+    let remaining = (max - chain.total_spend_usd).max(0.0);
+    let pending = chain
+        .steps
+        .iter()
+        .skip(index)
+        .filter(|step| {
+            !matches!(
+                step.status,
+                ChainStepStatus::Applied | ChainStepStatus::Skipped
+            )
+        })
+        .count()
+        .max(1);
+    Some(remaining / pending as f64)
+}
+
+fn chain_spend_cap_hit(chain: &Chain) -> bool {
+    chain
+        .max_spend_usd
+        .is_some_and(|max| chain.total_spend_usd >= max)
+}
+
+fn latest_applied_sha_before(chain: &Chain, index: usize) -> Option<String> {
+    chain
+        .steps
+        .iter()
+        .take(index)
+        .rev()
+        .find_map(|step| step.applied_sha.clone())
+}
+
+fn parse_started_run_id(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if let Some(start) = line.find('(')
+            && let Some(end) = line[start + 1..].find(')')
+        {
+            let value = &line[start + 1..start + 1 + end];
+            if value.len() >= 16 && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn allowlist_matches(pattern: &str, file: &str) -> bool {
+    pattern == "*"
+        || pattern == file
+        || file.starts_with(pattern.trim_end_matches('*'))
+        || file.starts_with(pattern.trim_end_matches('/'))
+}
+
+fn looks_like_chain_id(value: &str) -> bool {
+    value.len() >= 6 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn compact_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .chars()
+        .take(48)
+        .collect()
+}
+
+fn chain_prefix(chain_id: &str) -> String {
+    chain_id.chars().take(8).collect()
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
+fn branch_policy_label(value: BranchPolicy) -> &'static str {
+    match value {
+        BranchPolicy::Stack => "stack",
+        BranchPolicy::Base => "base",
+        BranchPolicy::Merge => "merge",
+    }
+}
+
+fn apply_mode_label(value: ApplyMode) -> &'static str {
+    match value {
+        ApplyMode::Auto => "auto",
+        ApplyMode::Preview => "preview",
+        ApplyMode::Manual => "manual",
+    }
+}
+
+fn apply_strategy_label(value: ApplyStrategy) -> &'static str {
+    match value {
+        ApplyStrategy::Squash => "squash",
+        ApplyStrategy::Merge => "merge",
+        ApplyStrategy::CherryPick => "cherry-pick",
+    }
+}
+
+fn on_fail_label(value: OnFail) -> &'static str {
+    match value {
+        OnFail::Stop => "stop",
+        OnFail::Skip => "skip",
+        OnFail::Continue => "continue",
+    }
+}
+
+fn chain_status_label(chain: &Chain) -> &'static str {
+    match chain.status {
+        ChainStatus::Pending => "pending",
+        ChainStatus::Running => "running",
+        ChainStatus::Paused => "paused",
+        ChainStatus::Completed => "completed",
+        ChainStatus::Failed => "failed",
+        ChainStatus::Killed => "killed",
+        ChainStatus::Undone => "undone",
+    }
+}
+
+fn chain_step_status_label(status: ChainStepStatus) -> &'static str {
+    match status {
+        ChainStepStatus::Pending => "pending",
+        ChainStepStatus::Running => "running",
+        ChainStepStatus::Completed => "completed",
+        ChainStepStatus::Failed => "failed",
+        ChainStepStatus::Skipped => "skipped",
+        ChainStepStatus::Applied => "applied",
+        ChainStepStatus::Undone => "undone",
+    }
+}
+
+fn chain_step_dot(status: ChainStepStatus) -> &'static str {
+    match status {
+        ChainStepStatus::Pending => "○",
+        ChainStepStatus::Running => "●",
+        ChainStepStatus::Completed => "◐",
+        ChainStepStatus::Failed => "✗",
+        ChainStepStatus::Skipped => "↷",
+        ChainStepStatus::Applied => "●",
+        ChainStepStatus::Undone => "↶",
+    }
+}
+
+fn print_chain_paused_footer(chain: &Chain) {
+    let reason = chain.paused_reason.as_deref().unwrap_or("paused");
+    println!("chain {} paused ({reason})", chain_prefix(&chain.chain_id));
+    println!(
+        "  try: deadreckon chain show {} --why-failed",
+        chain_prefix(&chain.chain_id)
+    );
+    println!(
+        "  try: deadreckon chain resume {}",
+        chain_prefix(&chain.chain_id)
+    );
+    println!(
+        "  try: deadreckon chain resume {} --apply-mode preview",
+        chain_prefix(&chain.chain_id)
+    );
+    println!(
+        "  try: deadreckon chain undo {}",
+        chain_prefix(&chain.chain_id)
+    );
 }
 
 async fn run_command(args: RunCommandArgs) -> Result<()> {

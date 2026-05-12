@@ -3,6 +3,7 @@
 ## Autonomous chaining (alpha) — 2026-05-11
 
 - Added the chain data model foundation: `chain.json`, `chain-events.jsonl`, chain path helpers, chain lock task-key convention, and `RunPromoted` events after promotion.
+- Added the first user-facing chain flow: `chain "..."`, `--from-file`, `--from-stdin`, `--draft`, preview/confirm, `chain run`, `chain list/status/show/attach`, and a foreground conductor that runs sequential steps through existing run/apply paths.
 
 ## Hardening v2 (alpha) — 2026-05-11
 
