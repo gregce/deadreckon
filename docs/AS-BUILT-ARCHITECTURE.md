@@ -1375,11 +1375,11 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Event-backed TUI attach: same-process attaches use `RunEventBus`; cross-process attaches replay `events.jsonl` incrementally.
 - Cross-process cancellation: `kill` writes a durable cancel marker before signaling; the run loop observes it while provider calls are in flight and reports killed status through events.
 - Partial-trace resume: resume reconstructs only completed tool boundaries and `resume --from-turn` truncates traces, spend records, and future snapshots together.
-- Per-tool sandbox policy: bash/provider/write-file paths get specific filesystem and network permissions; refused writes are recorded in traces and provenance.
+- Durable per-run `sandbox.toml` plus per-tool sandbox policy: bash/write-file paths get specific filesystem and network permissions; refusals include `try:` and are recorded in traces and provenance.
 - YAML acceptance specs: `dr-gate` evaluates required/optional tests, file existence, content matches, shell commands, and build checks, then signs check-level proof results.
 - Exhaustive local doctor: OS, sandbox binaries, provider binaries, config, runstate permissions, disk, and opt-in provider pings all produce actionable `try:` hints.
-- Promoted library query surface: `deadreckon library list|search|show` reads library manifests and reverse materialization markers.
-- Import parity hardening: Claude Code/Codex JSONL and Cursor SQLite imports preserve source metadata, deterministic run IDs, stable row ordering, and provenance paths.
+- Promoted library query surface: `deadreckon library list|search|show` reads library manifests and reverse materialization markers, filters by goal/date, and searches promoted run docs.
+- Import parity hardening: Claude Code/Codex JSONL and Cursor SQLite imports preserve source metadata, deterministic run IDs, stable row ordering, and provenance paths; committed goldens cover normalized `show` output.
 - CLI usability polish: root help includes command groups, `status` includes run health/library/disk blocks, and `DEADRECKON_HINTS=0` suppresses post-completion prompts.
 - Mock HTTP server for tests; CLI provider tests with fake binaries; integration coverage for stress, import round-trips, lifecycle, codebase modes, docs, sandbox policy, and gate proof.
 
@@ -1391,12 +1391,12 @@ The previously named thin areas now have code paths and depth tests:
 2. **Resume from partial trace.** `turn_loop` tests cover mid-tool-call truncation and `--from-turn` cleanup.
 3. **Cancellation model.** `kill` writes a cancel marker before signals; tests cover cross-process marker semantics, HTTP aborts, and kill storms.
 4. **Wall-clock spend for CLI providers.** CLI providers accumulate wall time and caps; richer subscription-to-budget policy remains a future routing concern.
-5. **Sandbox profiles.** Per-tool policy blocks disallowed filesystem/network access and records refusals.
+5. **Sandbox profiles.** `sandbox.toml` drives per-tool policy; policy blocks disallowed filesystem/network access and records refusals.
 6. **Doctor.** Local setup checks are actionable and exhaustive for alpha; provider network pings are opt-in.
-7. **Import normalization.** JSONL/SQLite imports now carry source path/line/row metadata and deterministic imported run IDs.
+7. **Import normalization.** JSONL/SQLite imports now carry source path/line/row metadata and deterministic imported run IDs, with golden-file `show` round trips.
 8. **Acceptance gate.** `acceptance.yaml` supports structured checks and signed per-check results.
 9. **Multi-run coordination.** Scope-qualified locks, stale reclaim, and same-scope refusal tests are in place; a scheduler remains out of scope.
-10. **Promotion / library workflow.** Promotion is atomic and `library list|search|show` makes artifacts discoverable.
+10. **Promotion / library workflow.** Promotion is atomic and `library list|search|show` makes artifacts discoverable by scope, goal, date, and promoted-doc content.
 
 ### Not yet built (V1+ candidates per `docs/goals/2026-05-11-1400-deadreckon-usability-rider.md` and the V1 list in the robust rider)
 

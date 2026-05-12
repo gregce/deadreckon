@@ -554,6 +554,66 @@ fn library_defaults_to_current_scope_unless_all() {
     assert!(all_stdout.contains(&second.run_id[..8]));
 }
 
+#[test]
+fn library_list_filters_goal_and_dates() {
+    let temp = TempDir::new().expect("tempdir");
+    let (paths, first) = completed_parent_at(&temp, "old gallery artifact", "workspace-one");
+    let (_, second) = completed_parent_at(&temp, "new gallery artifact", "workspace-two");
+    let (_, third) = completed_parent_at(&temp, "future gallery artifact", "workspace-three");
+    rewrite_manifest_promoted_at(&first, "2026-05-10T00:00:00Z");
+    rewrite_manifest_promoted_at(&second, "2026-05-11T23:30:00Z");
+    rewrite_manifest_promoted_at(&third, "2026-05-12T00:00:00Z");
+
+    let goal_and_since = deadreckon(&paths)
+        .args([
+            "library",
+            "list",
+            "--all",
+            "--goal",
+            "new gallery",
+            "--since",
+            "2026-05-11",
+        ])
+        .output()
+        .expect("library list filtered");
+    assert_success(&goal_and_since);
+    let goal_since_stdout = stdout(&goal_and_since);
+    assert!(goal_since_stdout.contains(&second.run_id[..8]));
+    assert!(!goal_since_stdout.contains(&first.run_id[..8]));
+
+    let until = deadreckon(&paths)
+        .args(["library", "list", "--all", "--until", "2026-05-11"])
+        .output()
+        .expect("library list until");
+    assert_success(&until);
+    let until_stdout = stdout(&until);
+    assert!(until_stdout.contains(&first.run_id[..8]));
+    assert!(until_stdout.contains(&second.run_id[..8]));
+    assert!(!until_stdout.contains(&third.run_id[..8]));
+}
+
+#[test]
+fn library_search_greps_promoted_run_docs() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "ordinary searchable parent");
+    let docs_dir = parent.working_dir.join(".deadreckon/docs");
+    fs::create_dir_all(&docs_dir).expect("docs dir");
+    fs::write(
+        docs_dir.join("RUN-NARRATIVE.md"),
+        "This promoted artifact mentions calibrate-hyperdrive in docs only.",
+    )
+    .expect("doc");
+
+    let search = deadreckon(&paths)
+        .current_dir(&parent.cwd)
+        .args(["library", "search", "calibrate-hyperdrive"])
+        .output()
+        .expect("library search docs");
+
+    assert_success(&search);
+    assert!(stdout(&search).contains(&parent.run_id[..8]));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn show_reveals_parent_lineage() {
     let temp = repo_tempdir();
@@ -802,6 +862,18 @@ fn completed_parent_at(
     let state = load_run(&paths, &state.run_id).expect("reload");
     assert_eq!(state.status, RunStatus::Completed);
     (paths, state)
+}
+
+fn rewrite_manifest_promoted_at(state: &PipelineState, promoted_at: &str) {
+    let path = state.working_dir.join("manifest.json");
+    let mut value: Value =
+        serde_json::from_slice(&fs::read(&path).expect("manifest")).expect("manifest json");
+    value["promoted_at"] = Value::String(promoted_at.to_string());
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&value).expect("manifest bytes"),
+    )
+    .expect("write manifest");
 }
 
 fn parent_json(dest: &std::path::Path) -> Value {

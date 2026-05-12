@@ -547,6 +547,18 @@ enum LibraryCommand {
         scope: Option<String>,
         #[arg(long, help = "Show artifacts from all projects")]
         all: bool,
+        #[arg(long, help = "Filter promoted goals by case-insensitive text")]
+        goal: Option<String>,
+        #[arg(
+            long,
+            help = "Only show artifacts promoted on or after YYYY-MM-DD or RFC3339"
+        )]
+        since: Option<String>,
+        #[arg(
+            long,
+            help = "Only show artifacts promoted on or before YYYY-MM-DD or RFC3339"
+        )]
+        until: Option<String>,
         #[arg(long, help = "Print full TSV-style values for scripts")]
         full: bool,
     },
@@ -558,6 +570,16 @@ enum LibraryCommand {
         scope: Option<String>,
         #[arg(long, help = "Search artifacts from all projects")]
         all: bool,
+        #[arg(
+            long,
+            help = "Only search artifacts promoted on or after YYYY-MM-DD or RFC3339"
+        )]
+        since: Option<String>,
+        #[arg(
+            long,
+            help = "Only search artifacts promoted on or before YYYY-MM-DD or RFC3339"
+        )]
+        until: Option<String>,
     },
     #[command(about = "Show manifest and materialization details for one artifact")]
     Show {
@@ -3376,25 +3398,37 @@ struct LibraryEntry {
 fn library_command(command: LibraryCommand) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     match command {
-        LibraryCommand::List { scope, all, full } => {
-            let entries = library_entries(&paths, scope.clone(), all)?;
+        LibraryCommand::List {
+            scope,
+            all,
+            goal,
+            since,
+            until,
+            full,
+        } => {
+            let filter = LibraryFilter::new(goal, since, until)?;
+            let entries =
+                filter_library_entries(library_entries(&paths, scope.clone(), all)?, &filter);
             if entries.is_empty() {
                 print_empty_library_hint(scope.as_deref(), all);
                 return Ok(());
             }
             print_library_table(&entries, full);
         }
-        LibraryCommand::Search { query, scope, all } => {
+        LibraryCommand::Search {
+            query,
+            scope,
+            all,
+            since,
+            until,
+        } => {
+            let filter = LibraryFilter::new(None, since, until)?;
             let needle = query.to_lowercase();
-            let entries = library_entries(&paths, scope.clone(), all)?
-                .into_iter()
-                .filter(|entry| {
-                    let manifest = &entry.manifest;
-                    manifest.run_id.to_lowercase().contains(&needle)
-                        || manifest.scope.to_lowercase().contains(&needle)
-                        || manifest.goal.to_lowercase().contains(&needle)
-                })
-                .collect::<Vec<_>>();
+            let entries =
+                filter_library_entries(library_entries(&paths, scope.clone(), all)?, &filter)
+                    .into_iter()
+                    .filter(|entry| library_entry_matches_query(entry, &needle))
+                    .collect::<Vec<_>>();
             if entries.is_empty() {
                 println!("no library artifacts matched {query:?}");
                 println!(
@@ -3412,6 +3446,91 @@ fn library_command(command: LibraryCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+struct LibraryFilter {
+    goal: Option<String>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+}
+
+impl LibraryFilter {
+    fn new(goal: Option<String>, since: Option<String>, until: Option<String>) -> Result<Self> {
+        Ok(Self {
+            goal: goal.map(|goal| goal.to_lowercase()),
+            since: parse_library_date_filter("--since", since)?,
+            until: parse_library_date_filter("--until", until)?,
+        })
+    }
+}
+
+fn filter_library_entries(entries: Vec<LibraryEntry>, filter: &LibraryFilter) -> Vec<LibraryEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let manifest = &entry.manifest;
+            filter
+                .goal
+                .as_ref()
+                .is_none_or(|goal| manifest.goal.to_lowercase().contains(goal))
+                && filter
+                    .since
+                    .is_none_or(|since| manifest.promoted_at >= since)
+                && filter
+                    .until
+                    .is_none_or(|until| manifest.promoted_at <= until)
+        })
+        .collect()
+}
+
+fn library_entry_matches_query(entry: &LibraryEntry, needle: &str) -> bool {
+    let manifest = &entry.manifest;
+    manifest.run_id.to_lowercase().contains(needle)
+        || manifest.scope.to_lowercase().contains(needle)
+        || manifest.goal.to_lowercase().contains(needle)
+        || library_docs_contain(&entry.path, needle)
+}
+
+fn library_docs_contain(path: &Path, needle: &str) -> bool {
+    inventory_files(path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|file| {
+            matches!(
+                file.extension().and_then(|ext| ext.to_str()),
+                Some("md" | "txt" | "json" | "jsonl" | "toml")
+            )
+        })
+        .any(|file| {
+            fs::read_to_string(file)
+                .ok()
+                .is_some_and(|raw| raw.to_lowercase().contains(needle))
+        })
+}
+
+fn parse_library_date_filter(label: &str, value: Option<String>) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if let Ok(date_time) = DateTime::parse_from_rfc3339(&value) {
+        return Ok(Some(date_time.with_timezone(&Utc)));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d") {
+        let date_time = if label == "--until" {
+            date.and_hms_nano_opt(23, 59, 59, 999_999_999)
+        } else {
+            date.and_hms_opt(0, 0, 0)
+        };
+        let Some(date_time) = date_time else {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "invalid {label} date {value:?}\ntry: deadreckon library list {label} 2026-05-11"
+            ))));
+        };
+        return Ok(Some(date_time.and_utc()));
+    }
+    Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+        "invalid {label} date {value:?}\ntry: deadreckon library list {label} 2026-05-11"
+    ))))
 }
 
 fn library_entries(

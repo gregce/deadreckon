@@ -1,5 +1,6 @@
 use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +18,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+
+const IMPORT_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/import");
+const IMPORT_GOLDENS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/goldens/import");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_provider_records_three_turns_and_artifacts_match() {
@@ -543,6 +547,33 @@ async fn import_cursor_roundtrip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_claude_code_fixture_round_trips_to_golden() {
+    import_fixture_roundtrip_golden(
+        "claude-code",
+        "DEADRECKON_IMPORT_CLAUDE_ROOT",
+        "claude-code.show.golden",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_codex_fixture_round_trips_to_golden() {
+    import_fixture_roundtrip_golden("codex", "DEADRECKON_IMPORT_CODEX_ROOT", "codex.show.golden");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_cursor_fixture_round_trips_to_golden() {
+    if !command_available("sqlite3") {
+        eprintln!("skipping Cursor golden import test because sqlite3 is unavailable");
+        return;
+    }
+    import_fixture_roundtrip_golden(
+        "cursor",
+        "DEADRECKON_IMPORT_CURSOR_ROOT",
+        "cursor.show.golden",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn import_jsonl_golden_normalizes_order_and_metadata() {
     let temp = repo_tempdir();
     let home = temp.path().join("home");
@@ -604,6 +635,73 @@ async fn import_jsonl_golden_normalizes_order_and_metadata() {
     assert!(provenance.contains("src/b.rs"));
     assert!(provenance.contains("src/c.rs"));
     assert!(provenance.contains("README.md"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_renders_provenance_lines_for_each_file_change() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let root = temp.path().join("import-root");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&root).expect("root");
+    fs::create_dir_all(&cwd).expect("workspace");
+    fs::write(
+        root.join("session.jsonl"),
+        r#"{"tool_call_id":"multi-file","files":["one.md","two.md","three.md"]}
+"#,
+    )
+    .expect("jsonl");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("import")
+        .arg("codex")
+        .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .output()
+        .expect("import");
+    assert!(output.status.success());
+    let run_id = imported_run_id(&output);
+    let show = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("show")
+        .arg(&run_id)
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("show");
+    assert!(show.status.success());
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains("\"tool_call_id\": \"multi-file\""));
+    assert!(stdout.contains("\"one.md\""));
+    assert!(stdout.contains("\"two.md\""));
+    assert!(stdout.contains("\"three.md\""));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_normalizes_timestamps_to_rfc3339() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let root = temp.path().join("import-root");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&root).expect("root");
+    fs::create_dir_all(&cwd).expect("workspace");
+    fs::write(root.join("session.jsonl"), "{\"path\":\"timed.md\"}\n").expect("jsonl");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("import")
+        .arg("codex")
+        .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .output()
+        .expect("import");
+    assert!(output.status.success());
+    let run_id = imported_run_id(&output);
+    let paths = DeadreckonPaths::from_home(&home);
+    let state = load_run(&paths, &run_id).expect("state");
+    let traces = jsonl_values(&state.run_root.join("traces.jsonl"));
+    let timestamp = traces[0]["timestamp"].as_str().expect("timestamp");
+    chrono::DateTime::parse_from_rfc3339(timestamp).expect("RFC3339 timestamp");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -888,6 +986,146 @@ fn import_jsonl_roundtrip(source: &str, env_name: &str) {
     assert!(stdout.contains(&format!("import.{source}")));
     assert!(stdout.contains("notes.md"));
     assert!(stdout.contains("src/main.rs"));
+}
+
+fn import_fixture_roundtrip_golden(source: &str, env_name: &str, golden_name: &str) {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let root = temp.path().join("import-root");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("workspace");
+    if source == "cursor" {
+        fs::create_dir_all(&root).expect("cursor root");
+        let sql = fs::read_to_string(Path::new(IMPORT_FIXTURES).join(source).join("messages.sql"))
+            .expect("cursor sql fixture");
+        let status = Command::new("sqlite3")
+            .arg(root.join("chats.db"))
+            .arg(sql)
+            .status()
+            .expect("sqlite3 cursor fixture");
+        assert!(status.success());
+    } else {
+        copy_test_dir(&Path::new(IMPORT_FIXTURES).join(source), &root);
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("import")
+        .arg(source)
+        .env("DEADRECKON_HOME", &home)
+        .env(env_name, &root)
+        .output()
+        .expect("import");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_id = imported_run_id(&output);
+    let paths = DeadreckonPaths::from_home(&home);
+    let state = load_run(&paths, &run_id).expect("state");
+    let show = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("show")
+        .arg(&run_id)
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("show");
+    assert!(
+        show.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&show.stdout),
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let actual = normalize_import_show(
+        &String::from_utf8_lossy(&show.stdout),
+        temp.path(),
+        &home,
+        &root,
+        &cwd,
+        &run_id,
+        &state.scope,
+    );
+    let golden_path = Path::new(IMPORT_GOLDENS).join(golden_name);
+    let expected = fs::read_to_string(&golden_path).unwrap_or_default();
+    assert_eq!(
+        actual,
+        expected,
+        "golden mismatch for {}\npath: {}\n--- actual ---\n{}\n--- expected ---\n{}",
+        source,
+        golden_path.display(),
+        actual,
+        expected
+    );
+}
+
+fn copy_test_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("copy dest");
+    for entry in fs::read_dir(from).expect("fixture dir") {
+        let entry = entry.expect("fixture entry");
+        let source = entry.path();
+        let dest = to.join(entry.file_name());
+        if source.is_dir() {
+            copy_test_dir(&source, &dest);
+        } else {
+            fs::copy(&source, &dest).expect("copy fixture file");
+        }
+    }
+}
+
+fn normalize_import_show(
+    raw: &str,
+    temp: &Path,
+    home: &Path,
+    root: &Path,
+    cwd: &Path,
+    run_id: &str,
+    scope: &str,
+) -> String {
+    let mut text = raw.to_string();
+    for (from, to) in [
+        (root, "<IMPORT_ROOT>"),
+        (home, "<HOME>"),
+        (cwd, "<CWD>"),
+        (temp, "<TEMP>"),
+    ] {
+        if let Ok(canonical) = from.canonicalize() {
+            text = text.replace(&canonical.display().to_string(), to);
+        }
+        text = text.replace(&from.display().to_string(), to);
+    }
+    text = text.replace(run_id, "<RUN_ID>");
+    text = text.replace(scope, "<SCOPE>");
+    let mut normalized = text
+        .lines()
+        .map(normalize_import_show_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalized.push('\n');
+    normalized
+}
+
+fn normalize_import_show_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    for key in ["started_at", "updated_at", "timestamp"] {
+        let quoted = format!("\"{key}\":");
+        if trimmed.starts_with(&quoted) {
+            let indent = &line[..line.len() - trimmed.len()];
+            let comma = if trimmed.ends_with(',') { "," } else { "" };
+            return format!("{indent}\"{key}\": \"<TIMESTAMP>\"{comma}");
+        }
+    }
+    line.to_string()
+}
+
+fn command_available(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn imported_run_id(output: &std::process::Output) -> String {

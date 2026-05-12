@@ -1,0 +1,2 @@
+{"role":"assistant","content":"codex edit","tool_call_id":"codex-tool-1","file":"src/main.rs"}
+{"role":"assistant","content":"codex multi","tool_call_id":"codex-tool-2","files":["Cargo.toml","src/main.rs"]}

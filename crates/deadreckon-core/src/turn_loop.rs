@@ -7,7 +7,7 @@ use std::time::Instant;
 use chrono::Utc;
 use deadreckon_providers::{ProviderRequest, ProviderResponse, ProviderRouter};
 use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as run_sandbox};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -74,6 +74,22 @@ enum Action {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SandboxToml {
+    version: u32,
+    tools: BTreeMap<String, SandboxTomlTool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SandboxTomlTool {
+    #[serde(default)]
+    read: Vec<PathBuf>,
+    #[serde(default)]
+    write: Vec<PathBuf>,
+    #[serde(default)]
+    network: Vec<String>,
+}
+
 pub async fn run_turn_loop(
     state: &mut PipelineState,
     router: &ProviderRouter,
@@ -82,6 +98,7 @@ pub async fn run_turn_loop(
     // AS-BUILT §9: the harness, not the model, owns the bounded mutation loop
     // and writes state after every turn boundary.
     let mut history = load_or_reconstruct_history(state, config.from_turn)?;
+    ensure_sandbox_toml(state)?;
     state.set_phase_status(PhaseId(40), PhaseStatus::Executing)?;
     save_state(state)?;
     let run_token = config.cancellation_token.clone().unwrap_or_default();
@@ -338,7 +355,23 @@ pub async fn run_turn_loop(
                     },
                 )?;
                 let started = Instant::now();
-                let policy = ToolSandboxPolicy::bash(state.working_dir.clone());
+                let policy = load_tool_policy_from_sandbox_toml(state, "bash")?;
+                if let Some(reason) = bash_policy_refusal(state, &command, &policy) {
+                    append_tool_refusal(
+                        state,
+                        turn,
+                        &tool_call_id,
+                        "bash",
+                        &response.model,
+                        &reason,
+                        config.event_sender.as_ref(),
+                    )?;
+                    history.push(format!("tool {tool_call_id} refused: {reason}"));
+                    state.turn = turn;
+                    save_history(state, &history)?;
+                    save_state(state)?;
+                    continue;
+                }
                 let output = match run_sandbox(SandboxSpec {
                     backend: config.sandbox_backend,
                     cwd: state.working_dir.clone(),
@@ -445,26 +478,28 @@ pub async fn run_turn_loop(
                         args: tool_args_json(path.display().to_string()),
                     },
                 )?;
-                let target = match safe_working_path(&state.working_dir, &path) {
-                    Ok(target) => target,
-                    Err(err) => {
-                        let reason = err.to_string();
-                        append_tool_refusal(
-                            state,
-                            turn,
-                            &tool_call_id,
-                            "write_file",
-                            &response.model,
-                            &reason,
-                            config.event_sender.as_ref(),
-                        )?;
-                        history.push(format!("tool {tool_call_id} refused: {reason}"));
-                        state.turn = turn;
-                        save_history(state, &history)?;
-                        save_state(state)?;
-                        continue;
-                    }
-                };
+                let write_policy = load_tool_policy_from_sandbox_toml(state, "write_file")?;
+                let target =
+                    match safe_working_path_with_policy(&state.working_dir, &path, &write_policy) {
+                        Ok(target) => target,
+                        Err(err) => {
+                            let reason = err.to_string();
+                            append_tool_refusal(
+                                state,
+                                turn,
+                                &tool_call_id,
+                                "write_file",
+                                &response.model,
+                                &reason,
+                                config.event_sender.as_ref(),
+                            )?;
+                            history.push(format!("tool {tool_call_id} refused: {reason}"));
+                            state.turn = turn;
+                            save_history(state, &history)?;
+                            save_state(state)?;
+                            continue;
+                        }
+                    };
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent).with_path(parent)?;
                 }
@@ -663,11 +698,112 @@ fn safe_working_path(root: &Path, relative: &Path) -> Result<PathBuf> {
             .any(|part| matches!(part, std::path::Component::ParentDir))
     {
         return Err(DeadreckonError::InvalidInput(format!(
-            "unsafe write path {}",
+            "unsafe write path {}\ntry: write inside the run working directory or edit sandbox.toml [tools.write_file].write",
             relative.display()
         )));
     }
     Ok(root.join(relative))
+}
+
+fn safe_working_path_with_policy(
+    root: &Path,
+    relative: &Path,
+    policy: &ToolSandboxPolicy,
+) -> Result<PathBuf> {
+    let target = safe_working_path(root, relative)?;
+    if policy
+        .write_allowlist
+        .iter()
+        .any(|allowed| target.starts_with(allowed))
+    {
+        return Ok(target);
+    }
+    Err(DeadreckonError::InvalidInput(format!(
+        "write_file denied by sandbox.toml for {}\ntry: edit sandbox.toml [tools.write_file].write or choose an allowed project-local path",
+        relative.display()
+    )))
+}
+
+fn sandbox_toml_path(state: &PipelineState) -> PathBuf {
+    state.run_root.join("sandbox.toml")
+}
+
+fn ensure_sandbox_toml(state: &PipelineState) -> Result<()> {
+    let path = sandbox_toml_path(state);
+    if path.exists() {
+        return Ok(());
+    }
+    let mut tools = BTreeMap::new();
+    tools.insert(
+        "bash".to_string(),
+        SandboxTomlTool {
+            read: vec![state.working_dir.clone()],
+            write: vec![state.working_dir.clone()],
+            network: Vec::new(),
+        },
+    );
+    tools.insert(
+        "write_file".to_string(),
+        SandboxTomlTool {
+            read: vec![state.working_dir.clone()],
+            write: vec![state.working_dir.clone()],
+            network: Vec::new(),
+        },
+    );
+    let config = SandboxToml { version: 1, tools };
+    let raw = toml::to_string_pretty(&config).map_err(|err| {
+        DeadreckonError::InvalidInput(format!("sandbox.toml encode error: {err}"))
+    })?;
+    std::fs::write(&path, raw).with_path(&path)
+}
+
+fn load_tool_policy_from_sandbox_toml(
+    state: &PipelineState,
+    tool_name: &str,
+) -> Result<ToolSandboxPolicy> {
+    ensure_sandbox_toml(state)?;
+    let path = sandbox_toml_path(state);
+    let raw = std::fs::read_to_string(&path).with_path(&path)?;
+    let config = toml::from_str::<SandboxToml>(&raw).map_err(|err| {
+        DeadreckonError::InvalidInput(format!(
+            "invalid sandbox.toml: {err}\ntry: fix {}",
+            path.display()
+        ))
+    })?;
+    let tool = config
+        .tools
+        .get(tool_name)
+        .cloned()
+        .unwrap_or(SandboxTomlTool {
+            read: vec![state.working_dir.clone()],
+            write: vec![state.working_dir.clone()],
+            network: Vec::new(),
+        });
+    Ok(ToolSandboxPolicy {
+        allow_network: !tool.network.is_empty(),
+        read_allowlist: tool.read,
+        write_allowlist: tool.write,
+        network_allowlist: tool.network,
+    })
+}
+
+fn bash_policy_refusal(
+    state: &PipelineState,
+    command: &str,
+    policy: &ToolSandboxPolicy,
+) -> Option<String> {
+    if command.contains(".ssh")
+        && !policy
+            .read_allowlist
+            .iter()
+            .any(|allowed| allowed.to_string_lossy().contains(".ssh"))
+    {
+        return Some(format!(
+            "bash denied by sandbox.toml: ~/.ssh is outside the read allowlist\ntry: edit {} [tools.bash].read or choose a project-local path",
+            sandbox_toml_path(state).display()
+        ));
+    }
+    None
 }
 
 fn changed_files_since_snapshot(state: &PipelineState, snapshot_turn: u32) -> Result<Vec<PathBuf>> {
@@ -1119,8 +1255,9 @@ mod tests {
     use crate::state::{RunOptions, RunStatus, create_run};
 
     use super::{
-        RunLoopConfig, RunLoopDocsConfig, append_tool_refusal, load_or_reconstruct_history,
-        run_turn_loop, safe_working_path,
+        RunLoopConfig, RunLoopDocsConfig, append_tool_refusal, bash_policy_refusal,
+        ensure_sandbox_toml, load_or_reconstruct_history, load_tool_policy_from_sandbox_toml,
+        run_turn_loop, safe_working_path, safe_working_path_with_policy,
     };
 
     #[tokio::test]
@@ -1398,7 +1535,95 @@ mod tests {
             safe_working_path(&root, Path::new("../outside.txt")).expect_err("parent path refused");
 
         assert!(absolute.to_string().contains("unsafe write path"));
+        assert!(absolute.to_string().contains("try:"));
         assert!(parent.to_string().contains("unsafe write path"));
+        assert!(parent.to_string().contains("try:"));
+    }
+
+    #[test]
+    fn sandbox_toml_gates_write_file_policy() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "sandbox toml".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        ensure_sandbox_toml(&state).expect("sandbox.toml");
+        let policy =
+            load_tool_policy_from_sandbox_toml(&state, "write_file").expect("write policy");
+        let ok = safe_working_path_with_policy(&state.working_dir, Path::new("ok.txt"), &policy)
+            .expect("allowed");
+        assert!(ok.starts_with(&state.working_dir));
+
+        std::fs::write(
+            state.run_root.join("sandbox.toml"),
+            r#"
+version = 1
+
+[tools.write_file]
+read = []
+write = []
+network = []
+"#,
+        )
+        .expect("sandbox override");
+        let policy =
+            load_tool_policy_from_sandbox_toml(&state, "write_file").expect("write policy");
+        let err =
+            safe_working_path_with_policy(&state.working_dir, Path::new("blocked.txt"), &policy)
+                .expect_err("blocked by sandbox.toml");
+        assert!(err.to_string().contains("sandbox.toml"));
+        assert!(err.to_string().contains("try:"));
+    }
+
+    #[test]
+    fn bash_ssh_policy_refusal_contains_try_and_records_provenance() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "bash ssh refusal".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let policy = load_tool_policy_from_sandbox_toml(&state, "bash").expect("bash policy");
+        let reason = bash_policy_refusal(&state, "cat ~/.ssh/id_rsa", &policy).expect("refused");
+        assert!(reason.contains("try:"));
+        append_tool_refusal(
+            &state,
+            1,
+            "bash-refused",
+            "bash",
+            "mock-agent",
+            &reason,
+            None,
+        )
+        .expect("refusal");
+        let provenance =
+            std::fs::read_to_string(state.run_root.join("provenance.jsonl")).expect("provenance");
+        assert!(provenance.contains(r#""event":"tool.refused""#));
+        assert!(provenance.contains("bash denied by sandbox.toml"));
+        assert!(provenance.contains("try:"));
     }
 
     #[test]

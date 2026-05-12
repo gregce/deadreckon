@@ -1,0 +1,134 @@
+Mode fresh
+{
+  "version": 1,
+  "goal": "imported claude-code history",
+  "task_key": "imported-claude-code-history-29806911",
+  "run_id": "<RUN_ID>",
+  "scope": "<SCOPE>",
+  "status": "completed",
+  "current_phase_id": 0,
+  "started_at": "<TIMESTAMP>",
+  "updated_at": "<TIMESTAMP>",
+  "cwd": "<CWD>",
+  "run_root": "<HOME>/runstate/<SCOPE>/runs/<RUN_ID>",
+  "working_dir": "<HOME>/runstate/<SCOPE>/runs/<RUN_ID>/working",
+  "skill_name": "default-coding",
+  "skill_path": "/Users/gdc/deadreckon/skills/default-coding/SKILL.md",
+  "sandbox": "none",
+  "provider": "import:claude-code",
+  "max_spend_usd": null,
+  "total_spend_usd": 0.0,
+  "total_wall_seconds": 0.0,
+  "turn": 2,
+  "pause_reason": null,
+  "failure_reason": null,
+  "child_pids": [],
+  "killed_at": null,
+  "phases": [
+    {
+      "id": 0,
+      "name": "init",
+      "status": "planned",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 10,
+      "name": "plan",
+      "status": "pending",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 20,
+      "name": "provider",
+      "status": "pending",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 30,
+      "name": "sandbox",
+      "status": "pending",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 40,
+      "name": "execute",
+      "status": "pending",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 50,
+      "name": "verify",
+      "status": "pending",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 60,
+      "name": "complete",
+      "status": "pending",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    }
+  ]
+}
+provenance:
+{
+  "timestamp": "<TIMESTAMP>",
+  "prompt_id": "turn-1",
+  "model": "import:claude-code",
+  "tool_call_id": "claude-tool-1",
+  "session_id": "<RUN_ID>",
+  "files": [
+    "notes/claude.md"
+  ]
+}
+{
+  "timestamp": "<TIMESTAMP>",
+  "prompt_id": "turn-2",
+  "model": "import:claude-code",
+  "tool_call_id": "claude-tool-2",
+  "session_id": "<RUN_ID>",
+  "files": [
+    "README.md",
+    "src/lib.rs"
+  ]
+}
+traces:
+{
+  "timestamp": "<TIMESTAMP>",
+  "run_id": "<RUN_ID>",
+  "turn": 1,
+  "event": "import.claude-code",
+  "latency_ms": null,
+  "detail": {
+    "content": "created note",
+    "path": "notes/claude.md",
+    "role": "assistant",
+    "source_line": 1,
+    "source_path": "<IMPORT_ROOT>/session.jsonl",
+    "tool_call_id": "claude-tool-1"
+  }
+}
+{
+  "timestamp": "<TIMESTAMP>",
+  "run_id": "<RUN_ID>",
+  "turn": 2,
+  "event": "import.claude-code",
+  "latency_ms": null,
+  "detail": {
+    "content": "updated plan",
+    "files": [
+      "src/lib.rs",
+      "README.md"
+    ],
+    "role": "assistant",
+    "source_line": 2,
+    "source_path": "<IMPORT_ROOT>/session.jsonl",
+    "tool_call_id": "claude-tool-2"
+  }
+}

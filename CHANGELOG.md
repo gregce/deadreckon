@@ -6,11 +6,11 @@
 - Replaced TUI polling-only attach with event-backed attach: same-process broadcast plus cross-process `events.jsonl` replay.
 - Hardened cross-process cancellation with durable cancel markers, provider abort coverage, and kill-storm tests.
 - Hardened partial-trace resume and `resume --from-turn` so trace, spend, and snapshot tails are truncated together.
-- Added per-tool sandbox policy and refusal provenance for disallowed filesystem/network actions.
+- Added durable `sandbox.toml` per run, per-tool sandbox policy, and refusal provenance for disallowed filesystem/network actions.
 - Expanded `acceptance.yaml` support with required/optional checks, file/content/build/shell checks, and signed per-check proof results.
 - Made `doctor` more actionable across providers, sandboxes, OS, permissions, disk, and opt-in provider pings.
-- Added `deadreckon library list|search|show` for promoted artifacts.
-- Hardened Claude Code/Codex/Cursor import normalization with source metadata, deterministic imported run IDs, stable Cursor ordering, and malformed JSONL errors.
+- Added `deadreckon library list|search|show` for promoted artifacts, including goal/date filters and promoted-doc grep.
+- Hardened Claude Code/Codex/Cursor import normalization with source metadata, deterministic imported run IDs, stable Cursor ordering, malformed JSONL errors, and committed show-output golden tests.
 - Polished CLI help/status/completion UX, including command groups, run health/library/disk status blocks, and `DEADRECKON_HINTS=0`.
 - Updated `docs/AS-BUILT-ARCHITECTURE.md` and `docs/AUDIT-2026-05-11.md` with the Hardening v2 closure evidence.
 
