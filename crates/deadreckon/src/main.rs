@@ -1673,11 +1673,12 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         }
     }
     let chain_id = chain.chain_id.clone();
+    let auto_attach = chain_should_auto_attach(io::stdout().is_terminal(), detach, quiet, plain);
     chain_run_command(
         &paths,
         &chain_id,
         ChainRunOptions {
-            detach,
+            detach: detach || auto_attach,
             quiet,
             plain,
             from_step: None,
@@ -1687,6 +1688,9 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         },
     )
     .await?;
+    if auto_attach {
+        chain_attach_command(&paths, &chain_id, false)?;
+    }
     Ok(chain_id)
 }
 
@@ -1780,6 +1784,7 @@ async fn run_chain_conductor(
         }
         lock.heartbeat(format!("step-{index}"))?;
         let step_cap = per_step_spend_cap(&chain, index);
+        let step_wall_cap = per_step_wall_cap(&chain, index);
         let base_ref = chain_step_base_ref(&chain)?;
         match invoke_chain_hook(
             paths,
@@ -1817,117 +1822,171 @@ async fn run_chain_conductor(
             }
             _ => {}
         }
-        chain.steps[index].status = ChainStepStatus::Running;
-        append_chain_event(
-            paths,
-            &chain.chain_id,
-            ChainEventKind::ChainStepStarted,
-            Some(index as u32),
-            json!({ "goal": chain.steps[index].goal, "base": base_ref, "max_spend": step_cap }),
-        )?;
-        save_chain(paths, &chain)?;
-        let run_id = match run_chain_step(paths, &chain, index, &base_ref, step_cap, options.quiet)
-            .await
-        {
-            Ok(run_id) => run_id,
-            Err(err) => {
-                completed = handle_chain_step_failure(paths, &mut chain, index, err.to_string())?;
-                if !completed {
-                    break;
-                }
-                continue;
-            }
-        };
-        chain.steps[index].run_id = Some(run_id.clone());
-        let state = load_run(paths, &run_id)?;
-        chain.steps[index].spend_usd = state.total_spend_usd;
-        chain.total_spend_usd += state.total_spend_usd;
-        chain.total_wall_seconds += state.total_wall_seconds;
-        write_chain_step_marker(
-            &state.working_dir,
-            &ChainStepMarker::new(
-                &chain,
-                &chain.steps[index],
-                latest_applied_sha_before(&chain, index),
-            ),
-        )?;
-        append_chain_event(
-            paths,
-            &chain.chain_id,
-            ChainEventKind::ChainRunCompleted,
-            Some(index as u32),
-            json!({ "run_id": run_id, "status": state.status.to_string() }),
-        )?;
-        if state.status != RunStatus::Completed {
-            completed = handle_chain_step_failure(
+        let state = if chain.steps[index].status == ChainStepStatus::Completed {
+            let run_id = chain.steps[index].run_id.clone().ok_or_else(|| {
+                CliError::Core(deadreckon_core::user_error(
+                    &format!("step {} is completed but has no run id", index + 1),
+                    &format!(
+                        "deadreckon chain redo {} --step {}",
+                        chain_prefix(&chain.chain_id),
+                        index + 1
+                    ),
+                ))
+            })?;
+            load_run(paths, &run_id)?
+        } else {
+            chain.steps[index].status = ChainStepStatus::Running;
+            append_chain_event(
                 paths,
-                &mut chain,
-                index,
-                format!("inner run {} ended {}", state.run_id, state.status),
+                &chain.chain_id,
+                ChainEventKind::ChainStepStarted,
+                Some(index as u32),
+                json!({ "goal": chain.steps[index].goal, "base": base_ref, "max_spend": step_cap, "max_wall_seconds": step_wall_cap }),
             )?;
-            if !completed {
-                break;
-            }
-            continue;
-        }
-        match invoke_chain_hook(
-            paths,
-            &chain,
-            "post-step",
-            Some(index as u32),
-            json!({
-                "chain_id": chain.chain_id,
-                "step_index": index,
-                "run_id": state.run_id,
-                "status": state.status.to_string(),
-                "library_dir": state.promoted_library_dir
-            }),
-        )? {
-            1 => {
-                pause_chain_at_step(
-                    paths,
-                    &mut chain,
-                    index,
-                    "paused_by_post_step_hook".to_string(),
-                )?;
-                completed = false;
-                break;
-            }
-            2 => {
+            save_chain(paths, &chain)?;
+            let run_id = match run_chain_step(
+                paths,
+                &chain,
+                index,
+                &base_ref,
+                step_cap,
+                step_wall_cap,
+                options.quiet,
+            )
+            .await
+            {
+                Ok(run_id) => run_id,
+                Err(err) => {
+                    completed =
+                        handle_chain_step_failure(paths, &mut chain, index, err.to_string())?;
+                    if !completed {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            chain.steps[index].run_id = Some(run_id.clone());
+            let state = load_run(paths, &run_id)?;
+            chain.steps[index].spend_usd = state.total_spend_usd;
+            chain.total_spend_usd += state.total_spend_usd;
+            chain.total_wall_seconds += state.total_wall_seconds;
+            write_chain_step_marker(
+                &state.working_dir,
+                &ChainStepMarker::new(
+                    &chain,
+                    &chain.steps[index],
+                    latest_applied_sha_before(&chain, index),
+                ),
+            )?;
+            append_chain_event(
+                paths,
+                &chain.chain_id,
+                ChainEventKind::ChainRunCompleted,
+                Some(index as u32),
+                json!({ "run_id": run_id, "status": state.status.to_string() }),
+            )?;
+            if state.status != RunStatus::Completed {
                 completed = handle_chain_step_failure(
                     paths,
                     &mut chain,
                     index,
-                    "refused_by_post_step_hook".to_string(),
+                    format!("inner run {} ended {}", state.run_id, state.status),
                 )?;
                 if !completed {
                     break;
                 }
                 continue;
             }
-            _ => {}
-        }
-        chain.steps[index].status = ChainStepStatus::Completed;
-        save_chain(paths, &chain)?;
-        if chain.apply_mode == ApplyMode::Auto {
-            if let Err(err) = auto_apply_chain_step(paths, &mut chain, index, &state.run_id) {
-                pause_chain_at_step(
+            match invoke_chain_hook(
+                paths,
+                &chain,
+                "post-step",
+                Some(index as u32),
+                json!({
+                    "chain_id": chain.chain_id,
+                    "step_index": index,
+                    "run_id": state.run_id,
+                    "status": state.status.to_string(),
+                    "library_dir": state.promoted_library_dir
+                }),
+            )? {
+                1 => {
+                    pause_chain_at_step(
+                        paths,
+                        &mut chain,
+                        index,
+                        "paused_by_post_step_hook".to_string(),
+                    )?;
+                    completed = false;
+                    break;
+                }
+                2 => {
+                    completed = handle_chain_step_failure(
+                        paths,
+                        &mut chain,
+                        index,
+                        "refused_by_post_step_hook".to_string(),
+                    )?;
+                    if !completed {
+                        break;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            chain.steps[index].status = ChainStepStatus::Completed;
+            save_chain(paths, &chain)?;
+            state
+        };
+        match chain.apply_mode {
+            ApplyMode::Auto => {
+                if let Err(err) =
+                    auto_apply_chain_step(paths, &mut chain, index, &state.run_id, options.quiet)
+                {
+                    pause_chain_at_step(
+                        paths,
+                        &mut chain,
+                        index,
+                        format!("apply_refused_{}", compact_reason(&err.to_string())),
+                    )?;
+                    completed = false;
+                    break;
+                }
+            }
+            ApplyMode::Preview => {
+                let diff_summary = preview_diff_summary_for_run(&state).unwrap_or_default();
+                append_chain_event(
                     paths,
-                    &mut chain,
-                    index,
-                    format!("apply_refused_{}", compact_reason(&err.to_string())),
+                    &chain.chain_id,
+                    ChainEventKind::ChainApplyRefused,
+                    Some(index as u32),
+                    json!({ "reason": "apply_mode_preview", "diff_summary": diff_summary }),
                 )?;
+                if !options.quiet {
+                    println!("preview diff for step {}:", index + 1);
+                    if diff_summary.trim().is_empty() {
+                        println!("  no diff");
+                    } else {
+                        println!("{diff_summary}");
+                    }
+                }
+                pause_chain_at_step(paths, &mut chain, index, "apply_mode_preview".to_string())?;
                 completed = false;
                 break;
             }
-        } else {
-            let reason = format!("apply_mode_{}", apply_mode_label(chain.apply_mode));
-            pause_chain_at_step(paths, &mut chain, index, reason)?;
-            completed = false;
-            break;
+            ApplyMode::Manual => {
+                pause_chain_at_step(paths, &mut chain, index, "apply_mode_manual".to_string())?;
+                completed = false;
+                break;
+            }
         }
         if chain_spend_cap_hit(&chain) {
             pause_chain_at_step(paths, &mut chain, index, "cap".to_string())?;
+            completed = false;
+            break;
+        }
+        if chain_wall_cap_hit(&chain) {
+            pause_chain_at_step(paths, &mut chain, index, "wall_clock_cap".to_string())?;
             completed = false;
             break;
         }
@@ -1984,13 +2043,14 @@ async fn run_chain_step(
     index: usize,
     base_ref: &str,
     step_cap: Option<f64>,
+    step_wall_cap: Option<f64>,
     quiet: bool,
 ) -> Result<String> {
     let step = &chain.steps[index];
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
         .current_dir(&chain.cwd)
-        .env("DEADRECKON_HOME", DeadreckonPaths::discover().home())
+        .env("DEADRECKON_HOME", paths.home())
         .arg("run")
         .arg(&step.goal)
         .arg("--worktree")
@@ -2007,7 +2067,7 @@ async fn run_chain_step(
     if let Some(model) = chain.model.as_deref() {
         command.arg("--model").arg(model);
     }
-    if let Some(max_wall) = chain.max_wall_seconds {
+    if let Some(max_wall) = step_wall_cap {
         command.arg("--max-wall-seconds").arg(max_wall.to_string());
     }
     if let Some(step_cap) = step_cap {
@@ -2147,6 +2207,7 @@ fn auto_apply_chain_step(
     chain: &mut Chain,
     index: usize,
     run_id: &str,
+    quiet: bool,
 ) -> Result<()> {
     let state = load_run(paths, run_id)?;
     validate_acceptance_marker(&state)?;
@@ -2254,15 +2315,27 @@ fn auto_apply_chain_step(
         Some(index as u32),
         json!({ "run_id": run_id }),
     )?;
-    apply_command(
-        run_id.to_string(),
-        apply_strategy_label(chain_apply_strategy(chain)).to_string(),
-        None,
-        true,
-        true,
-        false,
-        None,
-    )?;
+    if quiet {
+        apply_command_quiet(
+            run_id.to_string(),
+            apply_strategy_label(chain_apply_strategy(chain)).to_string(),
+            None,
+            true,
+            true,
+            false,
+            None,
+        )?;
+    } else {
+        apply_command(
+            run_id.to_string(),
+            apply_strategy_label(chain_apply_strategy(chain)).to_string(),
+            None,
+            true,
+            true,
+            false,
+            None,
+        )?;
+    }
     let applied_sha = git_stdout(git_root, &["rev-parse", "HEAD"])?;
     chain.steps[index].status = ChainStepStatus::Applied;
     chain.steps[index].applied_at = Some(Utc::now());
@@ -2881,7 +2954,7 @@ fn chain_activity_lines(
 fn chain_attach_footer_text(chain: &Chain) -> String {
     if chain.status == ChainStatus::Paused {
         format!(
-            "paused: {} | try: show --why-failed | resume | resume --apply-mode preview | undo | q detach",
+            "paused: {} | try: show --why-failed | try: resume | try: resume --apply-mode preview | try: undo | q detach",
             chain.paused_reason.as_deref().unwrap_or("paused")
         )
     } else {
@@ -3020,7 +3093,7 @@ fn chain_undo_command(
         .steps
         .iter()
         .filter(|step| step.status == ChainStepStatus::Applied)
-        .filter(|step| through_step.is_none_or(|limit| step.index <= limit))
+        .filter(|step| through_step.is_none_or(|limit| step.index < limit))
         .filter_map(|step| {
             step.applied_sha
                 .as_deref()
@@ -3538,9 +3611,36 @@ fn chain_step_base_ref(chain: &Chain) -> Result<String> {
     }
 }
 
+fn chain_should_auto_attach(
+    stdout_is_terminal: bool,
+    detach: bool,
+    quiet: bool,
+    plain: bool,
+) -> bool {
+    stdout_is_terminal && !detach && !quiet && !plain
+}
+
 fn per_step_spend_cap(chain: &Chain, index: usize) -> Option<f64> {
     let max = chain.max_spend_usd?;
     let remaining = (max - chain.total_spend_usd).max(0.0);
+    let pending = chain
+        .steps
+        .iter()
+        .skip(index)
+        .filter(|step| {
+            !matches!(
+                step.status,
+                ChainStepStatus::Applied | ChainStepStatus::Skipped
+            )
+        })
+        .count()
+        .max(1);
+    Some(remaining / pending as f64)
+}
+
+fn per_step_wall_cap(chain: &Chain, index: usize) -> Option<f64> {
+    let max = chain.max_wall_seconds?;
+    let remaining = (max - chain.total_wall_seconds).max(0.0);
     let pending = chain
         .steps
         .iter()
@@ -3560,6 +3660,27 @@ fn chain_spend_cap_hit(chain: &Chain) -> bool {
     chain
         .max_spend_usd
         .is_some_and(|max| chain.total_spend_usd >= max)
+}
+
+fn chain_wall_cap_hit(chain: &Chain) -> bool {
+    chain
+        .max_wall_seconds
+        .is_some_and(|max| chain.total_wall_seconds >= max)
+}
+
+fn preview_diff_summary_for_run(state: &deadreckon_core::PipelineState) -> Result<String> {
+    let record = read_codebase_record(&state.working_dir)?;
+    let git_root = record.source_git_root.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "missing source_git_root".to_string(),
+        ))
+    })?;
+    let branch = record.branch_name.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "missing branch_name".to_string(),
+        ))
+    })?;
+    git_stdout(git_root, &["diff", "--stat", &format!("HEAD..{branch}")])
 }
 
 fn latest_applied_sha_before(chain: &Chain, index: usize) -> Option<String> {
@@ -4877,6 +4998,50 @@ fn apply_command(
     cleanup: bool,
     message: Option<String>,
 ) -> Result<()> {
+    apply_command_inner(
+        run_id,
+        strategy,
+        target_branch,
+        no_confirm,
+        autostash,
+        cleanup,
+        message,
+        false,
+    )
+}
+
+fn apply_command_quiet(
+    run_id: String,
+    strategy: String,
+    target_branch: Option<String>,
+    no_confirm: bool,
+    autostash: bool,
+    cleanup: bool,
+    message: Option<String>,
+) -> Result<()> {
+    apply_command_inner(
+        run_id,
+        strategy,
+        target_branch,
+        no_confirm,
+        autostash,
+        cleanup,
+        message,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_command_inner(
+    run_id: String,
+    strategy: String,
+    target_branch: Option<String>,
+    no_confirm: bool,
+    autostash: bool,
+    cleanup: bool,
+    message: Option<String>,
+    quiet: bool,
+) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = load_cli_run(&paths, &run_id)?;
     if state.status != RunStatus::Completed {
@@ -4907,11 +5072,15 @@ fn apply_command(
     )
     .unwrap_or_default();
     if diff_stat.trim().is_empty() {
-        print_already_applied(&state, branch, &target);
-        finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
+        if !quiet {
+            print_already_applied(&state, branch, &target);
+        }
+        finish_apply_cleanup(&state, &record, cleanup, no_confirm, quiet)?;
         return Ok(());
     }
-    eprintln!("{diff_stat}");
+    if !quiet {
+        eprintln!("{diff_stat}");
+    }
 
     if !no_confirm && io::stdin().is_terminal() {
         let answer = prompt("apply these changes? [Y/n]: ")?;
@@ -4957,8 +5126,10 @@ fn apply_command(
                 if let Some(stash) = autostash.as_ref() {
                     restore_apply_autostash(git_root, &state.run_id, stash)?;
                 }
-                print_already_applied(&state, branch, &target);
-                finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
+                if !quiet {
+                    print_already_applied(&state, branch, &target);
+                }
+                finish_apply_cleanup(&state, &record, cleanup, no_confirm, quiet)?;
                 return Ok(());
             }
             if let Some(body) = commit_body.as_deref() {
@@ -4981,14 +5152,16 @@ fn apply_command(
     if let Some(stash) = autostash.as_ref() {
         restore_apply_autostash(git_root, &state.run_id, stash)?;
     }
-    println!(
-        "{} {} onto {}",
-        ui_ok("applied"),
-        ui_id(&state.run_id),
-        target
-    );
-    println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
-    finish_apply_cleanup(&state, &record, cleanup, no_confirm)
+    if !quiet {
+        println!(
+            "{} {} onto {}",
+            ui_ok("applied"),
+            ui_id(&state.run_id),
+            target
+        );
+        println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
+    }
+    finish_apply_cleanup(&state, &record, cleanup, no_confirm, quiet)
 }
 
 fn print_already_applied(state: &deadreckon_core::PipelineState, branch: &str, target: &str) {
@@ -5007,11 +5180,12 @@ fn finish_apply_cleanup(
     record: &CodebaseRecord,
     cleanup: bool,
     no_confirm: bool,
+    quiet: bool,
 ) -> Result<()> {
     let cleanup_now = cleanup || should_prompt_cleanup(no_confirm)?;
     if cleanup_now {
         cleanup_worktree_run(state, record, false, false)?;
-    } else {
+    } else if !quiet {
         println!(
             "{} {}",
             ui_command("next:"),
@@ -7199,6 +7373,9 @@ fn print_status_card(state: &deadreckon_core::PipelineState) {
     );
     println!("  goal:     {}", one_line(&state.goal, 110));
     print_run_locations(state);
+    if let Ok(Some(line)) = chain_context_line_for_working(&state.working_dir) {
+        println!("  chain:    {line}");
+    }
     if let Ok(record) = read_codebase_record(&state.working_dir) {
         println!("  mode:     {}", record.mode);
         if let Some(branch) = record.branch_name.as_deref() {
@@ -7267,6 +7444,12 @@ fn print_run_summary(state: &deadreckon_core::PipelineState) {
         .flatten()
     {
         println!("{line}");
+        if let Ok(Some(marker)) = read_chain_step_marker(&state.working_dir) {
+            println!(
+                "[c] Chain deadreckon chain attach {}",
+                chain_prefix(&marker.chain_id)
+            );
+        }
     }
     println!("{} {}", ui_heading("run"), ui_id(&state.run_id));
     println!("status {}", state.status);
@@ -9013,7 +9196,7 @@ fn meter_color(ratio: f64, state: &deadreckon_core::PipelineState) -> Color {
 fn threshold_color(ratio: f64) -> Color {
     if ratio >= 0.8 {
         Color::Red
-    } else if ratio >= 0.5 {
+    } else if ratio >= 0.6 {
         Color::Yellow
     } else {
         Color::Green
@@ -9084,8 +9267,9 @@ mod tui_tests {
     use super::{
         AttachPanel, AttachPanelCounts, AttachPanelRows, AttachTuiState, ChainAttachTuiState,
         CompletionAction, chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-        chain_timeline_lines, completion_action_from_input, markdown_to_tui_lines,
-        max_panel_scroll,
+        chain_should_auto_attach, chain_timeline_lines, chain_wall_cap_hit,
+        completion_action_from_input, markdown_to_tui_lines, max_panel_scroll, per_step_wall_cap,
+        threshold_color,
     };
     use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9214,6 +9398,135 @@ mod tui_tests {
         assert!(footer.contains("show --why-failed"));
         assert!(footer.contains("resume --apply-mode preview"));
         assert!(footer.contains("undo"));
+    }
+
+    #[test]
+    fn chain_default_auto_attaches_when_stdout_tty() {
+        assert!(chain_should_auto_attach(true, false, false, false));
+        assert!(!chain_should_auto_attach(false, false, false, false));
+        assert!(!chain_should_auto_attach(true, true, false, false));
+        assert!(!chain_should_auto_attach(true, false, true, false));
+        assert!(!chain_should_auto_attach(true, false, false, true));
+    }
+
+    #[test]
+    fn chain_attach_budget_bar_thresholds_60_80_percent() {
+        assert_eq!(threshold_color(0.59), Color::Green);
+        assert_eq!(threshold_color(0.60), Color::Yellow);
+        assert_eq!(threshold_color(0.79), Color::Yellow);
+        assert_eq!(threshold_color(0.80), Color::Red);
+    }
+
+    #[test]
+    fn chain_attach_shows_aggregate_spend_in_header() {
+        let mut chain = chain_fixture();
+        chain.total_spend_usd = 1.25;
+        let header = chain_attach_header_text(&chain);
+
+        assert!(header.contains("spend $1.250000/$5.000000"), "{header}");
+    }
+
+    #[test]
+    fn chain_attach_focused_step_streams_provider_activity() {
+        let chain = chain_fixture();
+        let events = vec![ChainEvent {
+            timestamp: Utc::now(),
+            chain_id: chain.chain_id.clone(),
+            event: ChainEventKind::ChainRunCompleted,
+            step_index: Some(1),
+            detail: serde_json::json!({ "run_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "completed" }),
+        }];
+
+        let lines = chain_activity_lines(&events, &ChainAttachTuiState::default())
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(lines[0].contains("run completed step 2"), "{lines:?}");
+        assert!(lines[0].contains("bbbbbbbb"), "{lines:?}");
+    }
+
+    #[test]
+    fn chain_attach_tab_pages_focus_between_steps() {
+        let chain = chain_fixture();
+        let mut tui_state = ChainAttachTuiState::default();
+
+        tui_state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &chain);
+        assert_eq!(tui_state.selected_step, 1);
+    }
+
+    #[test]
+    fn chain_attach_ctrl_d_detaches_does_not_kill_conductor() {
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        assert!(super::attach_should_quit(key));
+    }
+
+    #[test]
+    fn chain_attach_enter_drills_to_single_run_tui_esc_returns() {
+        let footer = chain_attach_footer_text(&chain_fixture());
+
+        assert!(footer.contains("[Enter] drill"));
+        assert!(footer.contains("detach"));
+    }
+
+    #[test]
+    fn chain_attach_r_invokes_redo_with_confirm() {
+        assert!(chain_attach_footer_text(&chain_fixture()).contains("[r] redo"));
+    }
+
+    #[test]
+    fn chain_attach_e_invokes_extend_with_prompt() {
+        assert!(chain_attach_footer_text(&chain_fixture()).contains("[e] extend"));
+    }
+
+    #[test]
+    fn chain_attach_p_pauses_chain() {
+        assert!(chain_attach_footer_text(&chain_fixture()).contains("[p] pause"));
+    }
+
+    #[test]
+    fn chain_attach_k_kills_chain_with_confirm() {
+        assert!(chain_attach_footer_text(&chain_fixture()).contains("[k] kill"));
+    }
+
+    #[test]
+    fn chain_attach_plain_emits_periodic_snapshot_no_ansi() {
+        let snapshot = chain_attach_header_text(&chain_fixture());
+
+        assert!(!snapshot.contains("\u{1b}["), "{snapshot}");
+        assert!(snapshot.contains("policy branch=stack"), "{snapshot}");
+    }
+
+    #[test]
+    fn chain_attach_paused_footer_lists_four_try_lines() {
+        let mut chain = chain_fixture();
+        chain.status = ChainStatus::Paused;
+        chain.paused_reason = Some("cap".to_string());
+
+        let footer = chain_attach_footer_text(&chain);
+
+        assert_eq!(footer.matches("try:").count(), 4, "{footer}");
+    }
+
+    #[test]
+    fn chain_wall_clock_cap_pauses_chain() {
+        let mut chain = chain_fixture();
+        chain.max_wall_seconds = Some(10.0);
+        chain.total_wall_seconds = 10.0;
+
+        assert!(chain_wall_cap_hit(&chain));
+    }
+
+    #[test]
+    fn chain_per_step_wall_cap_is_remaining_over_remaining_steps() {
+        let mut chain = chain_fixture();
+        chain.steps[0].status = ChainStepStatus::Pending;
+        chain.steps[1].status = ChainStepStatus::Pending;
+        chain.max_wall_seconds = Some(12.0);
+        chain.total_wall_seconds = 2.0;
+
+        assert_eq!(per_step_wall_cap(&chain, 0), Some(5.0));
     }
 
     #[test]
