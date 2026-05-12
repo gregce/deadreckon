@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -377,6 +379,208 @@ fn chain_yes_runs_smoke_steps_and_auto_applies() {
     assert!(log.contains("add goodbye"));
 }
 
+#[test]
+fn chain_pre_step_hook_can_skip_step() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_hook(
+        &repo,
+        "pre-step",
+        "#!/bin/sh\npayload=$(cat)\necho \"$payload\" | grep -q '\"step_index\":0' && exit 1\nexit 0\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "4",
+            "skip this",
+            "run this",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.status, ChainStatus::Completed);
+    assert_eq!(chain.steps[0].status, ChainStepStatus::Skipped);
+    assert_eq!(chain.steps[1].status, ChainStepStatus::Applied);
+    let events = fs::read_to_string(paths.chain_events(&chain.chain_id)).expect("events");
+    assert!(events.contains(r#""hook":"pre-step""#));
+}
+
+#[test]
+fn chain_on_promote_hook_refuse_blocks_apply() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_hook(&repo, "on-promote", "#!/bin/sh\necho no promote\nexit 2\n");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "2",
+            "blocked promote",
+            "never reached",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.status, ChainStatus::Paused);
+    assert!(
+        chain
+            .paused_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("apply_refused")
+    );
+    assert_ne!(chain.steps[0].status, ChainStepStatus::Applied);
+    let events = fs::read_to_string(paths.chain_events(&chain.chain_id)).expect("events");
+    assert!(events.contains("refused_by_hook_on_promote"));
+}
+
+#[test]
+fn branch_policy_stack_chains_branches_off_prior_head() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "4",
+            "stack one",
+            "stack two",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    let first_sha = chain.steps[0].applied_sha.as_deref().expect("sha");
+    let second_run = chain.steps[1].run_id.as_deref().expect("run");
+    let second_state = deadreckon_core::load_run(&paths, second_run).expect("state");
+    let second_record =
+        deadreckon_core::read_codebase_record(&second_state.working_dir).expect("record");
+    assert_eq!(second_record.base_sha.as_deref(), Some(first_sha));
+}
+
+#[test]
+fn branch_policy_base_each_step_off_chain_base() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--branch-policy",
+            "base",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "4",
+            "base one",
+            "base two",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    let second_run = chain.steps[1].run_id.as_deref().expect("run");
+    let second_state = deadreckon_core::load_run(&paths, second_run).expect("state");
+    let second_record =
+        deadreckon_core::read_codebase_record(&second_state.working_dir).expect("record");
+    assert_eq!(
+        second_record.base_sha.as_deref(),
+        Some(chain.base_sha.as_str())
+    );
+}
+
+#[test]
+fn chain_per_step_cap_is_remaining_over_remaining_steps() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "4",
+            "budget one",
+            "budget two",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    let first_state =
+        deadreckon_core::load_run(&paths, chain.steps[0].run_id.as_deref().expect("first run"))
+            .expect("state");
+    let second_state = deadreckon_core::load_run(
+        &paths,
+        chain.steps[1].run_id.as_deref().expect("second run"),
+    )
+    .expect("state");
+    assert_eq!(first_state.max_spend_usd, Some(2.0));
+    assert!(second_state.max_spend_usd.unwrap_or_default() > 1.99);
+}
+
+#[test]
+fn chain_hooks_list_emits_resolution_tiers() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_hook(&repo, "pre-step", "#!/bin/sh\nexit 0\n");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "hooks", "list"])
+        .output()
+        .expect("hooks list");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("pre-step\tproject"));
+    assert!(stdout.contains("post-step\tmissing"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_plan_writes_chain_json_with_n_steps() {
     let temp = repo_tempdir();
@@ -500,6 +704,21 @@ fn clean_git_repo(temp: &TempDir) -> PathBuf {
     git(&repo, &["add", "-A"]).expect("add");
     git(&repo, &["commit", "-m", "initial"]).expect("commit");
     repo
+}
+
+fn write_hook(repo: &std::path::Path, name: &str, body: &str) {
+    let dir = repo.join(".deadreckon/hooks/chain");
+    fs::create_dir_all(&dir).expect("hook dir");
+    let path = dir.join(name);
+    fs::write(&path, body).expect("hook");
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("permissions");
+    }
+    git(repo, &["add", ".deadreckon/hooks/chain"]).expect("add hook");
+    git(repo, &["commit", "-m", &format!("add {name} hook")]).expect("commit hook");
 }
 
 fn newest_chain(paths: &DeadreckonPaths) -> Chain {

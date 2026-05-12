@@ -1780,6 +1780,42 @@ async fn run_chain_conductor(
         lock.heartbeat(format!("step-{index}"))?;
         let step_cap = per_step_spend_cap(&chain, index);
         let base_ref = chain_step_base_ref(&chain)?;
+        match invoke_chain_hook(
+            paths,
+            &chain,
+            "pre-step",
+            Some(index as u32),
+            json!({
+                "chain_id": chain.chain_id,
+                "step_index": index,
+                "step_goal": chain.steps[index].goal,
+                "base_ref": base_ref
+            }),
+        )? {
+            1 => {
+                chain.steps[index].status = ChainStepStatus::Skipped;
+                append_chain_event(
+                    paths,
+                    &chain.chain_id,
+                    ChainEventKind::ChainStepFailed,
+                    Some(index as u32),
+                    json!({ "reason": "skipped_by_pre_step_hook" }),
+                )?;
+                save_chain(paths, &chain)?;
+                continue;
+            }
+            2 => {
+                pause_chain_at_step(
+                    paths,
+                    &mut chain,
+                    index,
+                    "paused_by_pre_step_hook".to_string(),
+                )?;
+                completed = false;
+                break;
+            }
+            _ => {}
+        }
         chain.steps[index].status = ChainStepStatus::Running;
         append_chain_event(
             paths,
@@ -1831,6 +1867,43 @@ async fn run_chain_conductor(
             }
             continue;
         }
+        match invoke_chain_hook(
+            paths,
+            &chain,
+            "post-step",
+            Some(index as u32),
+            json!({
+                "chain_id": chain.chain_id,
+                "step_index": index,
+                "run_id": state.run_id,
+                "status": state.status.to_string(),
+                "library_dir": state.promoted_library_dir
+            }),
+        )? {
+            1 => {
+                pause_chain_at_step(
+                    paths,
+                    &mut chain,
+                    index,
+                    "paused_by_post_step_hook".to_string(),
+                )?;
+                completed = false;
+                break;
+            }
+            2 => {
+                completed = handle_chain_step_failure(
+                    paths,
+                    &mut chain,
+                    index,
+                    "refused_by_post_step_hook".to_string(),
+                )?;
+                if !completed {
+                    break;
+                }
+                continue;
+            }
+            _ => {}
+        }
         chain.steps[index].status = ChainStepStatus::Completed;
         save_chain(paths, &chain)?;
         if chain.apply_mode == ApplyMode::Auto {
@@ -1857,6 +1930,19 @@ async fn run_chain_conductor(
         }
     }
     if completed {
+        let hook_status = invoke_chain_hook(
+            paths,
+            &chain,
+            "on-chain-end",
+            None,
+            json!({
+                "chain_id": chain.chain_id,
+                "status": "completed",
+                "steps_completed": chain.steps.iter().filter(|step| step.status == ChainStepStatus::Applied).count(),
+                "total_spend_usd": chain.total_spend_usd
+            }),
+        )
+        .unwrap_or_default();
         chain.status = ChainStatus::Completed;
         chain.completed_at = Some(Utc::now());
         chain.conductor_pid = None;
@@ -1865,7 +1951,7 @@ async fn run_chain_conductor(
             &chain.chain_id,
             ChainEventKind::ChainCompleted,
             None,
-            json!({ "steps_completed": chain.steps.iter().filter(|step| step.status == ChainStepStatus::Applied).count(), "total_spend_usd": chain.total_spend_usd }),
+            json!({ "steps_completed": chain.steps.iter().filter(|step| step.status == ChainStepStatus::Applied).count(), "total_spend_usd": chain.total_spend_usd, "on_chain_end_status": hook_status }),
         )?;
         save_chain(paths, &chain)?;
         if !options.quiet {
@@ -1999,6 +2085,55 @@ fn auto_apply_chain_step(
             }
         }
     }
+    let branch = record.branch_name.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "missing branch_name".to_string(),
+        ))
+    })?;
+    let files_changed = git_stdout(
+        git_root,
+        &["diff", "--name-only", &format!("HEAD..{branch}")],
+    )?
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+    let diff_stat =
+        git_stdout(git_root, &["diff", "--stat", &format!("HEAD..{branch}")]).unwrap_or_default();
+    match invoke_chain_hook(
+        paths,
+        chain,
+        "on-promote",
+        Some(index as u32),
+        json!({
+            "chain_id": chain.chain_id,
+            "step_index": index,
+            "run_id": run_id,
+            "diff_stat": diff_stat,
+            "files_changed": files_changed
+        }),
+    )? {
+        1 => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("step '{}' paused by hook on-promote", index + 1),
+                &format!("deadreckon chain resume {}", chain_prefix(&chain.chain_id)),
+            )));
+        }
+        2 => {
+            append_chain_event(
+                paths,
+                &chain.chain_id,
+                ChainEventKind::ChainApplyRefused,
+                Some(index as u32),
+                json!({ "reason": "refused_by_hook_on_promote" }),
+            )?;
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("step '{}' refused by hook on-promote", index + 1),
+                "inspect ~/.deadreckon/hooks/chain/on-promote",
+            )));
+        }
+        _ => {}
+    }
     append_chain_event(
         paths,
         &chain.chain_id,
@@ -2008,7 +2143,7 @@ fn auto_apply_chain_step(
     )?;
     apply_command(
         run_id.to_string(),
-        apply_strategy_label(chain.apply_strategy).to_string(),
+        apply_strategy_label(chain_apply_strategy(chain)).to_string(),
         None,
         true,
         true,
@@ -2117,6 +2252,63 @@ fn detach_chain_conductor(
     );
     println!("attach: deadreckon chain attach {}", chain_prefix(chain_id));
     Ok(())
+}
+
+fn invoke_chain_hook(
+    paths: &DeadreckonPaths,
+    chain: &Chain,
+    hook: &str,
+    step_index: Option<u32>,
+    payload: Value,
+) -> Result<i32> {
+    let Some(path) = resolve_chain_hook(paths, &chain.cwd, hook) else {
+        return Ok(0);
+    };
+    let mut child = std::process::Command::new(&path)
+        .env("DEADRECKON_CHAIN_ID", &chain.chain_id)
+        .env("DEADRECKON_HOME", paths.home())
+        .env(
+            "DEADRECKON_STEP_INDEX",
+            step_index
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        serde_json::to_writer(&mut *stdin, &payload)?;
+        stdin.write_all(b"\n")?;
+    }
+    let output = child.wait_with_output()?;
+    let stdout = truncate_text(&String::from_utf8_lossy(&output.stdout), 4096);
+    let stderr = truncate_text(&String::from_utf8_lossy(&output.stderr), 4096);
+    let code = output.status.code().unwrap_or(1);
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::ChainHookInvoked,
+        step_index,
+        json!({
+            "hook": hook,
+            "path": path,
+            "status": code,
+            "stdout": stdout,
+            "stderr": stderr
+        }),
+    )?;
+    Ok(code)
+}
+
+fn resolve_chain_hook(paths: &DeadreckonPaths, cwd: &Path, hook: &str) -> Option<PathBuf> {
+    [
+        cwd.join(".deadreckon/hooks/chain").join(hook),
+        paths.home().join("hooks/chain").join(hook),
+        PathBuf::from("/Users/gdc/deadreckon/hooks/chain").join(hook),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
 }
 
 fn chain_status_command(id: Option<&str>, all: bool, full: bool, _plain: bool) -> Result<()> {
@@ -2910,6 +3102,14 @@ fn apply_strategy_label(value: ApplyStrategy) -> &'static str {
         ApplyStrategy::Squash => "squash",
         ApplyStrategy::Merge => "merge",
         ApplyStrategy::CherryPick => "cherry-pick",
+    }
+}
+
+fn chain_apply_strategy(chain: &Chain) -> ApplyStrategy {
+    if chain.branch_policy == BranchPolicy::Merge {
+        ApplyStrategy::Merge
+    } else {
+        chain.apply_strategy
     }
 }
 
