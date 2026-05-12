@@ -4087,10 +4087,20 @@ fn normalize_import(
     root: &std::path::Path,
 ) -> Result<String> {
     let cwd = std::env::current_dir()?;
+    let scope = workspace_scope(&cwd).map_err(CliError::from)?;
+    let hash_root = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .display()
+        .to_string();
     let imported_id = format!(
         "imported-{:016x}",
-        stable_hash(&format!("{source}:{}", root.display()))
+        stable_hash(&format!("{source}:{hash_root}"))
     );
+    let existing_root = paths.run_root(&scope, &imported_id);
+    if existing_root.exists() {
+        fs::remove_dir_all(&existing_root)?;
+    }
     let mut state = create_run(
         paths,
         RunOptions {
@@ -4101,23 +4111,10 @@ fn normalize_import(
             skill_name: "default-coding".to_string(),
             max_spend_usd: None,
             max_wall_seconds: None,
-            run_id: None,
+            run_id: Some(imported_id.clone()),
             codebase: None,
         },
     )?;
-    let old_root = state.run_root.clone();
-    let new_root = paths.run_root(&state.scope, &imported_id);
-    if new_root.exists() {
-        fs::remove_dir_all(&new_root)?;
-    }
-    if let Some(parent) = new_root.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::rename(&old_root, &new_root)?;
-    state.run_id = imported_id.clone();
-    state.run_root = new_root;
-    state.working_dir = state.run_root.join("working");
-    fs::create_dir_all(&state.working_dir)?;
 
     let imported = match source {
         "cursor" => import_cursor_rows(root)?,
@@ -4136,24 +4133,17 @@ fn normalize_import(
                 detail: row.clone(),
             },
         )?;
-        if let Some(path) = row
-            .get("path")
-            .or_else(|| row.get("file"))
-            .and_then(serde_json::Value::as_str)
-        {
+        let imported_paths = import_provenance_paths(row);
+        if !imported_paths.is_empty() {
             append_provenance(
                 &state,
                 &ProvenanceRecord {
                     timestamp: Utc::now(),
                     prompt_id: format!("turn-{turn}"),
                     model: format!("import:{source}"),
-                    tool_call_id: row
-                        .get("tool_call_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("imported-tool")
-                        .to_string(),
+                    tool_call_id: import_tool_call_id(row),
                     session_id: state.run_id.clone(),
-                    files: vec![PathBuf::from(path)],
+                    files: imported_paths,
                 },
             )?;
         }
@@ -4171,16 +4161,18 @@ fn import_jsonl_rows(root: &std::path::Path) -> Result<Vec<serde_json::Value>> {
         if file.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
             continue;
         }
-        for line in fs::read_to_string(&file)?.lines() {
+        for (line_idx, line) in fs::read_to_string(&file)?.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("source_path".to_string(), json!(file));
-                }
-                rows.push(value);
-            }
+            let value = serde_json::from_str::<serde_json::Value>(line).map_err(|err| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "malformed JSONL at {}:{}: {err}",
+                    file.display(),
+                    line_idx + 1
+                )))
+            })?;
+            rows.push(import_row_with_metadata(value, &file, Some(line_idx + 1)));
         }
     }
     Ok(rows)
@@ -4199,16 +4191,28 @@ fn import_cursor_rows(root: &std::path::Path) -> Result<Vec<serde_json::Value>> 
         let output = std::process::Command::new("sqlite3")
             .arg("-json")
             .arg(&file)
-            .arg("select * from messages")
+            .arg("select rowid as source_rowid, * from messages order by rowid")
             .output();
-        let Ok(output) = output else {
-            continue;
-        };
+        let output = output.map_err(|err| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "sqlite3 is required to import Cursor history from {}: {err}",
+                file.display()
+            )))
+        })?;
         if !output.status.success() {
-            continue;
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "failed to query Cursor database {}: {}",
+                file.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))));
         }
         let mut values: Vec<serde_json::Value> =
-            serde_json::from_slice(&output.stdout).unwrap_or_default();
+            serde_json::from_slice(&output.stdout).map_err(|err| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "sqlite3 returned invalid JSON for {}: {err}",
+                    file.display()
+                )))
+            })?;
         for value in &mut values {
             if let Some(object) = value.as_object_mut() {
                 object.insert("source_path".to_string(), json!(file));
@@ -4217,6 +4221,56 @@ fn import_cursor_rows(root: &std::path::Path) -> Result<Vec<serde_json::Value>> 
         rows.extend(values);
     }
     Ok(rows)
+}
+
+fn import_row_with_metadata(
+    mut value: serde_json::Value,
+    file: &Path,
+    line: Option<usize>,
+) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("source_path".to_string(), json!(file));
+        if let Some(line) = line {
+            object.insert("source_line".to_string(), json!(line));
+        }
+        return value;
+    }
+    let mut object = serde_json::Map::new();
+    object.insert("value".to_string(), value);
+    object.insert("source_path".to_string(), json!(file));
+    if let Some(line) = line {
+        object.insert("source_line".to_string(), json!(line));
+    }
+    serde_json::Value::Object(object)
+}
+
+fn import_tool_call_id(row: &serde_json::Value) -> String {
+    row.get("tool_call_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| row.get("id").and_then(serde_json::Value::as_str))
+        .unwrap_or("imported-tool")
+        .to_string()
+}
+
+fn import_provenance_paths(row: &serde_json::Value) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    for key in ["path", "file"] {
+        if let Some(path) = row.get(key).and_then(serde_json::Value::as_str)
+            && !path.trim().is_empty()
+        {
+            paths.insert(PathBuf::from(path));
+        }
+    }
+    if let Some(files) = row.get("files").and_then(serde_json::Value::as_array) {
+        for file in files {
+            if let Some(path) = file.as_str()
+                && !path.trim().is_empty()
+            {
+                paths.insert(PathBuf::from(path));
+            }
+        }
+    }
+    paths.into_iter().collect()
 }
 
 fn stable_hash(value: &str) -> u64 {

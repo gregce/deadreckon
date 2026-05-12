@@ -509,9 +509,10 @@ async fn import_cursor_roundtrip() {
     let db = root.join("chats.db");
     let status = Command::new("sqlite3")
         .arg(&db)
-        .arg("create table messages (role text, content text, tool_call_id text, path text); insert into messages values ('assistant','edited','cursor-tool','cursor.md');")
+        .arg("create table messages (role text, content text, tool_call_id text, path text); insert into messages values ('assistant','edited first','cursor-tool-1','cursor-one.md'); insert into messages values ('assistant','edited second','cursor-tool-2','cursor-two.md');")
         .status();
     if status.is_err() {
+        eprintln!("skipping Cursor import test because sqlite3 is unavailable");
         return;
     }
     assert!(status.expect("sqlite status").success());
@@ -532,7 +533,170 @@ async fn import_cursor_roundtrip() {
         .expect("show");
     let stdout = String::from_utf8_lossy(&show.stdout);
     assert!(stdout.contains("import.cursor"));
-    assert!(stdout.contains("cursor.md"));
+    assert!(stdout.contains("cursor-one.md"));
+    assert!(stdout.contains("cursor-two.md"));
+    assert!(stdout.contains("\"source_rowid\": 1"));
+    assert!(stdout.contains("\"source_rowid\": 2"));
+    let paths = DeadreckonPaths::from_home(&home);
+    let state = load_run(&paths, &run_id).expect("state");
+    assert_eq!(state.turn, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_jsonl_golden_normalizes_order_and_metadata() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("codex");
+    fs::create_dir_all(root.join("nested")).expect("import root");
+    fs::write(
+        root.join("a.jsonl"),
+        r#"{"role":"assistant","tool_call_id":"tool-1","files":["src/a.rs","src/b.rs"]}
+"#,
+    )
+    .expect("a jsonl");
+    fs::write(
+        root.join("nested/z.jsonl"),
+        r#"{"role":"assistant","tool_call_id":"tool-2","path":"src/c.rs"}
+{"role":"assistant","tool_call_id":"tool-3","file":"README.md"}
+"#,
+    )
+    .expect("z jsonl");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .output()
+        .expect("import");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_id = imported_run_id(&output);
+    let paths = DeadreckonPaths::from_home(&home);
+    let state = load_run(&paths, &run_id).expect("state");
+    assert_eq!(state.turn, 3);
+    let traces = jsonl_values(&state.run_root.join("traces.jsonl"));
+    assert_eq!(traces.len(), 3);
+    assert_eq!(traces[0]["turn"], 1);
+    assert_eq!(traces[0]["detail"]["source_line"], 1);
+    assert!(
+        traces[0]["detail"]["source_path"]
+            .as_str()
+            .expect("source_path")
+            .ends_with("a.jsonl")
+    );
+    assert_eq!(traces[1]["turn"], 2);
+    assert_eq!(traces[1]["detail"]["source_line"], 1);
+    assert!(
+        traces[1]["detail"]["source_path"]
+            .as_str()
+            .expect("source_path")
+            .ends_with("nested/z.jsonl")
+    );
+    assert_eq!(traces[2]["detail"]["source_line"], 2);
+    let provenance =
+        fs::read_to_string(state.run_root.join("provenance.jsonl")).expect("provenance");
+    assert!(provenance.contains("src/a.rs"));
+    assert!(provenance.contains("src/b.rs"));
+    assert!(provenance.contains("src/c.rs"));
+    assert!(provenance.contains("README.md"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_jsonl_malformed_line_fails_actionably() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("codex");
+    fs::create_dir_all(&root).expect("import root");
+    fs::write(root.join("bad.jsonl"), "{\"ok\":true}\n{not-json}\n").expect("bad jsonl");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .output()
+        .expect("import");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("malformed JSONL"), "{stderr}");
+    assert!(stderr.contains("bad.jsonl:2"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_current_pointer_uses_imported_run_id() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let root = temp.path().join("codex");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&root).expect("import root");
+    fs::create_dir_all(&cwd).expect("workspace");
+    fs::write(root.join("session.jsonl"), "{\"path\":\"current.md\"}\n").expect("jsonl");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("import")
+        .arg("codex")
+        .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .output()
+        .expect("import");
+    assert!(output.status.success());
+    let run_id = imported_run_id(&output);
+    let status = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("status")
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("status");
+    assert!(status.status.success());
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains(&run_id[..8]),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reimport_overwrites_deterministic_import_run() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("codex");
+    fs::create_dir_all(&root).expect("import root");
+    let session = root.join("session.jsonl");
+    fs::write(&session, "{\"path\":\"first.md\"}\n").expect("first jsonl");
+    let first = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .output()
+        .expect("first import");
+    assert!(first.status.success());
+    let first_id = imported_run_id(&first);
+
+    fs::write(&session, "{\"path\":\"second.md\"}\n").expect("second jsonl");
+    let second = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .output()
+        .expect("second import");
+    assert!(second.status.success());
+    let second_id = imported_run_id(&second);
+    assert_eq!(first_id, second_id);
+
+    let paths = DeadreckonPaths::from_home(&home);
+    let runs = list_runs(&paths, None).expect("runs");
+    assert_eq!(runs.len(), 1);
+    let state = load_run(&paths, &second_id).expect("state");
+    let traces = fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
+    assert!(!traces.contains("first.md"));
+    assert!(traces.contains("second.md"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -791,6 +955,15 @@ fn assert_jsonl_count(path: &std::path::Path, min: usize) {
         "{} has {count} lines, expected >= {min}",
         path.display()
     );
+}
+
+fn jsonl_values(path: &std::path::Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("jsonl")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("json line"))
+        .collect()
 }
 
 fn assert_provenance_ids_match_traces(run_root: &std::path::Path) {
