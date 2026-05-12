@@ -490,6 +490,70 @@ fn list_shows_materialized_status() {
     assert!(stdout.contains("yes (1 time)"));
 }
 
+#[test]
+fn library_list_search_show_reads_promoted_manifests() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "gallery provenance search target");
+
+    let list = deadreckon(&paths)
+        .current_dir(&parent.cwd)
+        .args(["library", "list"])
+        .output()
+        .expect("library list");
+    assert_success(&list);
+    let list_stdout = stdout(&list);
+    assert!(list_stdout.contains("RUN"));
+    assert!(list_stdout.contains(&parent.run_id[..8]));
+    assert!(list_stdout.contains("gallery provenance search target"));
+
+    let search = deadreckon(&paths)
+        .current_dir(&parent.cwd)
+        .args(["library", "search", "provenance"])
+        .output()
+        .expect("library search");
+    assert_success(&search);
+    assert!(stdout(&search).contains(&parent.run_id[..8]));
+
+    let show = deadreckon(&paths)
+        .current_dir(&parent.cwd)
+        .args(["library", "show", &parent.run_id])
+        .output()
+        .expect("library show");
+    assert_success(&show);
+    let show_stdout = stdout(&show);
+    assert!(show_stdout.contains("library artifact"));
+    assert!(show_stdout.contains(&parent.run_id));
+    assert!(show_stdout.contains("provenance:"));
+    assert!(show_stdout.contains("gallery provenance search target"));
+}
+
+#[test]
+fn library_defaults_to_current_scope_unless_all() {
+    let temp = TempDir::new().expect("tempdir");
+    let (paths, first) = completed_parent_at(&temp, "scope one artifact", "workspace-one");
+    let (_, second) = completed_parent_at(&temp, "scope two artifact", "workspace-two");
+
+    let scoped = deadreckon(&paths)
+        .current_dir(&first.cwd)
+        .args(["library", "list"])
+        .output()
+        .expect("library list scoped");
+    assert_success(&scoped);
+    let scoped_stdout = stdout(&scoped);
+    assert!(scoped_stdout.contains(&first.run_id[..8]));
+    assert!(!scoped_stdout.contains(&second.run_id[..8]));
+
+    let all = deadreckon(&paths)
+        .current_dir(&first.cwd)
+        .args(["library", "list", "--all"])
+        .output()
+        .expect("library list all");
+    assert_success(&all);
+    let all_stdout = stdout(&all);
+    assert!(all_stdout.contains(&first.run_id[..8]));
+    assert!(all_stdout.contains(&second.run_id[..8]));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn show_reveals_parent_lineage() {
     let temp = repo_tempdir();
@@ -595,9 +659,17 @@ fn help_lists_lifecycle_verbs() {
 }
 
 fn completed_parent(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {
+    completed_parent_at(temp, goal, "workspace")
+}
+
+fn completed_parent_at(
+    temp: &TempDir,
+    goal: &str,
+    workspace_name: &str,
+) -> (DeadreckonPaths, PipelineState) {
     let home = temp.path().join("home");
     let paths = DeadreckonPaths::from_home(&home);
-    let cwd = temp.path().join("workspace");
+    let cwd = temp.path().join(workspace_name);
     fs::create_dir_all(&cwd).expect("workspace");
     let mut state = create_run(
         &paths,

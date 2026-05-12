@@ -17,8 +17,8 @@ use crossterm::terminal::{
 use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
     CodebaseMode, CodebaseRecord, DeadreckonError, DeadreckonPaths, DocKind, ModeFlags, PhaseId,
-    PhaseStatus, PolishConfig, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent,
-    RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunOptions, RunStatus, SpendRecord,
+    PhaseStatus, PolishConfig, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode,
+    RunEvent, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunOptions, RunStatus, SpendRecord,
     TraceRecord, WorktreeOptions, acquire_lock, append_parent_narrative_update, append_provenance,
     append_trace, apply_commit_body, clear_cancel_marker, copy_source_to_working, copy_tree,
     create_run, create_worktree, doc_path_for_kind, docs_status_for_state, emit_event,
@@ -261,6 +261,11 @@ enum Commands {
         #[arg(long, help = "Print full TSV-style values for scripts")]
         full: bool,
     },
+    #[command(about = "Inspect promoted run artifacts in the deadreckon library")]
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommand,
+    },
     #[command(
         visible_alias = "export",
         about = "Copy a completed fresh/copy run into a chosen directory"
@@ -488,6 +493,35 @@ enum ConfigCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum LibraryCommand {
+    #[command(about = "List promoted artifacts for the current project")]
+    List {
+        #[arg(long, help = "Filter to a specific scope key")]
+        scope: Option<String>,
+        #[arg(long, help = "Show artifacts from all projects")]
+        all: bool,
+        #[arg(long, help = "Print full TSV-style values for scripts")]
+        full: bool,
+    },
+    #[command(about = "Search promoted artifact goals, scopes, and run ids")]
+    Search {
+        #[arg(help = "Case-insensitive search text")]
+        query: String,
+        #[arg(long, help = "Filter to a specific scope key")]
+        scope: Option<String>,
+        #[arg(long, help = "Search artifacts from all projects")]
+        all: bool,
+    },
+    #[command(about = "Show manifest and materialization details for one artifact")]
+    Show {
+        #[arg(help = "Run id, unique prefix, or latest")]
+        run_id: String,
+        #[arg(long, help = "Filter to a specific scope key")]
+        scope: Option<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = main_inner().await {
@@ -577,6 +611,7 @@ async fn main_inner() -> Result<()> {
         }
         Commands::Doctor => doctor_command().await,
         Commands::List { scope, all, full } => list_command(scope, all, full),
+        Commands::Library { command } => library_command(command),
         Commands::Materialize {
             run_id,
             dest,
@@ -3283,6 +3318,247 @@ fn list_command(scope: Option<String>, all: bool, full: bool) -> Result<()> {
         ui_command("deadreckon list --full")
     );
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct LibraryEntry {
+    manifest: PromotionManifest,
+    path: PathBuf,
+    materialized_count: usize,
+}
+
+fn library_command(command: LibraryCommand) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    match command {
+        LibraryCommand::List { scope, all, full } => {
+            let entries = library_entries(&paths, scope.clone(), all)?;
+            if entries.is_empty() {
+                print_empty_library_hint(scope.as_deref(), all);
+                return Ok(());
+            }
+            print_library_table(&entries, full);
+        }
+        LibraryCommand::Search { query, scope, all } => {
+            let needle = query.to_lowercase();
+            let entries = library_entries(&paths, scope.clone(), all)?
+                .into_iter()
+                .filter(|entry| {
+                    let manifest = &entry.manifest;
+                    manifest.run_id.to_lowercase().contains(&needle)
+                        || manifest.scope.to_lowercase().contains(&needle)
+                        || manifest.goal.to_lowercase().contains(&needle)
+                })
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                println!("no library artifacts matched {query:?}");
+                println!(
+                    "{} try `{}`",
+                    ui_muted("hint:"),
+                    ui_command("deadreckon library list --all")
+                );
+                return Ok(());
+            }
+            print_library_table(&entries, false);
+        }
+        LibraryCommand::Show { run_id, scope } => {
+            let entry = resolve_library_entry(&paths, &run_id, scope)?;
+            print_library_entry(&entry);
+        }
+    }
+    Ok(())
+}
+
+fn library_entries(
+    paths: &DeadreckonPaths,
+    scope: Option<String>,
+    all: bool,
+) -> Result<Vec<LibraryEntry>> {
+    let mut entries = Vec::new();
+    let library_root = paths.home().join("library");
+    if let Some(scope) = scope {
+        scan_library_scope(paths, &scope, &mut entries)?;
+    } else if all {
+        if library_root.exists() {
+            for scope_entry in fs::read_dir(&library_root)? {
+                let scope_entry = scope_entry?;
+                if !scope_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let scope_name = scope_entry.file_name().to_string_lossy().to_string();
+                if scope_name.starts_with('.') {
+                    continue;
+                }
+                scan_library_scope(paths, &scope_name, &mut entries)?;
+            }
+        }
+    } else {
+        scan_library_scope(paths, &current_scope()?, &mut entries)?;
+    }
+    entries.sort_by(|left, right| {
+        right
+            .manifest
+            .promoted_at
+            .cmp(&left.manifest.promoted_at)
+            .then_with(|| left.manifest.run_id.cmp(&right.manifest.run_id))
+    });
+    Ok(entries)
+}
+
+fn scan_library_scope(
+    paths: &DeadreckonPaths,
+    scope: &str,
+    entries: &mut Vec<LibraryEntry>,
+) -> Result<()> {
+    let scope_dir = paths.home().join("library").join(scope);
+    if !scope_dir.exists() {
+        return Ok(());
+    }
+    for run_entry in fs::read_dir(scope_dir)? {
+        let run_entry = run_entry?;
+        if !run_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = run_entry.path();
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+        let manifest: PromotionManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        entries.push(LibraryEntry {
+            materialized_count: materialized_marker_count(&path),
+            manifest,
+            path,
+        });
+    }
+    Ok(())
+}
+
+fn materialized_marker_count(library_dir: &Path) -> usize {
+    fs::read_to_string(library_dir.join(".materialized-to"))
+        .ok()
+        .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn resolve_library_entry(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+    scope: Option<String>,
+) -> Result<LibraryEntry> {
+    let entries = library_entries(paths, scope, false)?;
+    if matches!(run_id, "latest" | "last") {
+        return entries.into_iter().next().ok_or_else(|| {
+            CliError::Core(DeadreckonError::NotFound(
+                "no library artifacts for this project".to_string(),
+            ))
+        });
+    }
+    let matches = entries
+        .into_iter()
+        .filter(|entry| entry.manifest.run_id.starts_with(run_id))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err(CliError::Core(DeadreckonError::NotFound(format!(
+            "library artifact {run_id}"
+        )))),
+        [entry] => Ok(entry.clone()),
+        many => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "run id prefix {run_id:?} matched {} library artifacts; use more characters",
+            many.len()
+        )))),
+    }
+}
+
+fn print_empty_library_hint(scope: Option<&str>, all: bool) {
+    match scope {
+        Some(scope) => println!("no library artifacts for scope {scope}"),
+        None if all => println!("no library artifacts"),
+        None => println!("no library artifacts for current project"),
+    }
+    println!(
+        "{} completed fresh/copy runs are promoted automatically; use `{}` to inspect all scopes",
+        ui_muted("hint:"),
+        ui_command("deadreckon library list --all")
+    );
+}
+
+fn print_library_table(entries: &[LibraryEntry], full: bool) {
+    if full {
+        println!(
+            "{}",
+            ui_heading("RUN\tSCOPE\tPROMOTED\tMATERIALIZED\tPATH\tGOAL")
+        );
+        for entry in entries {
+            let manifest = &entry.manifest;
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                manifest.run_id,
+                manifest.scope,
+                manifest.promoted_at,
+                entry.materialized_count,
+                entry.path.display(),
+                manifest.goal
+            );
+        }
+        return;
+    }
+
+    println!(
+        "{}",
+        ui_heading(format!(
+            "{:<8}  {:<7}  {:<26}  {:<12}  GOAL",
+            "RUN", "AGE", "SCOPE", "EXPORTED"
+        ))
+    );
+    for entry in entries {
+        let manifest = &entry.manifest;
+        println!(
+            "{:<8}  {:<7}  {:<26}  {:<12}  {}",
+            ui_id(run_prefix(&manifest.run_id)),
+            relative_age(manifest.promoted_at),
+            truncate_text(&manifest.scope, 26),
+            materialized_count_label(entry.materialized_count),
+            truncate_text(&one_line(&manifest.goal, 88), 88)
+        );
+    }
+    println!(
+        "{} use `{}` or `{}`",
+        ui_muted("hint:"),
+        ui_command("deadreckon library show <run-id>"),
+        ui_command("deadreckon materialize <run-id> --dest <path>")
+    );
+}
+
+fn materialized_count_label(count: usize) -> String {
+    match count {
+        0 => "no".to_string(),
+        1 => "yes (1)".to_string(),
+        count => format!("yes ({count})"),
+    }
+}
+
+fn print_library_entry(entry: &LibraryEntry) {
+    let manifest = &entry.manifest;
+    println!("{}", ui_heading("library artifact"));
+    println!("run:        {}", ui_id(&manifest.run_id));
+    println!("scope:      {}", manifest.scope);
+    println!("promoted:   {}", manifest.promoted_at);
+    println!(
+        "exported:   {}",
+        materialized_count_label(entry.materialized_count)
+    );
+    println!("path:       {}", entry.path.display());
+    println!("source:     {}", manifest.source_working_dir.display());
+    println!("provenance: {}", manifest.provenance_hash);
+    println!("goal:       {}", manifest.goal);
+    println!();
+    println!(
+        "next:       {}",
+        ui_command(format!(
+            "deadreckon materialize {}",
+            run_prefix(&manifest.run_id)
+        ))
+    );
 }
 
 fn current_scope() -> Result<String> {
