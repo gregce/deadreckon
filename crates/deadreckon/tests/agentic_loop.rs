@@ -482,6 +482,12 @@ async fn doctor_fails_actionably() {
     assert!(stdout.contains("fix: deadreckon init"));
     assert!(stdout.contains("disk space"));
     assert!(stdout.contains("runstate dir"));
+    for line in stdout.lines().filter(|line| line.contains("✓")) {
+        assert!(
+            line.contains("try:"),
+            "doctor success line is not actionable: {line}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

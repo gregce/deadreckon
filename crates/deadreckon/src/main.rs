@@ -26,7 +26,7 @@ use deadreckon_core::{
     preview_git_state, read_codebase_record, record_for_resolved_mode, release_lock_file,
     resolve_mode, restore_snapshot, run_turn_loop, save_state, terminate_pid, write_cancel_marker,
 };
-use deadreckon_providers::{ProviderRouteInfo, ProviderRouter};
+use deadreckon_providers::{ProviderRequest, ProviderRouteInfo, ProviderRouter};
 use deadreckon_sandbox::SandboxBackend;
 use pulldown_cmark::{
     CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions,
@@ -519,7 +519,7 @@ async fn main_inner() -> Result<()> {
             max_spend,
             sandbox,
             no_confirm,
-        } => init_command(provider, api_key, base_url, max_spend, sandbox, no_confirm),
+        } => init_command(provider, api_key, base_url, max_spend, sandbox, no_confirm).await,
         Commands::Config { command } => config_command(command),
         Commands::Run {
             goal,
@@ -575,10 +575,7 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
-        Commands::Doctor => {
-            doctor_command();
-            Ok(())
-        }
+        Commands::Doctor => doctor_command().await,
         Commands::List { scope, all, full } => list_command(scope, all, full),
         Commands::Materialize {
             run_id,
@@ -684,7 +681,7 @@ async fn main_inner() -> Result<()> {
     }
 }
 
-fn init_command(
+async fn init_command(
     provider: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
@@ -717,7 +714,7 @@ fn init_command(
     );
     fs::write(paths.config_path(), config)?;
     println!("{} {}", ui_ok("wrote"), paths.config_path().display());
-    doctor_command();
+    doctor_command().await?;
     println!(
         "{} {}",
         ui_command("next:"),
@@ -1235,11 +1232,21 @@ fn confirm_spend_cap(
     }
 }
 
-fn doctor_command() {
+async fn doctor_command() -> Result<()> {
     let paths = DeadreckonPaths::discover();
     println!("{}", ui_heading("deadreckon doctor"));
-    println!("{} source /Users/gdc/deadreckon", ui_ok("✓"));
-    println!("{} home {}", ui_ok("✓"), paths.home().display());
+    println!(
+        "{} source /Users/gdc/deadreckon | {} cd /Users/gdc/deadreckon",
+        ui_ok("✓"),
+        ui_command("try:")
+    );
+    println!(
+        "{} home {} | {} DEADRECKON_HOME={}",
+        ui_ok("✓"),
+        paths.home().display(),
+        ui_command("try:"),
+        paths.home().display()
+    );
     for backend in deadreckon_sandbox::doctor() {
         if backend.available {
             let path = backend
@@ -1254,11 +1261,13 @@ fn doctor_command() {
                 .map(|version| format!(" ({version})"))
                 .unwrap_or_default();
             println!(
-                "{} sandbox {} found{}{}",
+                "{} sandbox {} found{}{} | {} deadreckon run \"goal\" --sandbox {} --preview",
                 ui_ok("✓"),
                 backend.backend,
                 path,
-                version
+                version,
+                ui_command("try:"),
+                backend.backend
             );
         } else {
             println!("{} sandbox {} missing", ui_warn("✗"), backend.backend);
@@ -1269,11 +1278,12 @@ fn doctor_command() {
         match load_config_value(&paths) {
             Ok(root) => {
                 println!(
-                    "{} {} present and parseable",
+                    "{} {} present and parseable | {} deadreckon config provider",
                     ui_ok("✓"),
-                    paths.config_path().display()
+                    paths.config_path().display(),
+                    ui_command("try:")
                 );
-                doctor_providers(&root);
+                doctor_providers(&paths, &root).await?;
             }
             Err(err) => {
                 println!(
@@ -1293,9 +1303,17 @@ fn doctor_command() {
     }
     let defaults = config_defaults(&paths).unwrap_or_default();
     if defaults.provider.is_some() || paths.config_path().exists() {
-        println!("{} provider defaults configured", ui_ok("✓"));
+        println!(
+            "{} provider defaults configured | {} deadreckon config provider",
+            ui_ok("✓"),
+            ui_command("try:")
+        );
     } else if command_exists("claude") || command_exists("codex") {
-        println!("{} cli subscription provider available", ui_ok("✓"));
+        println!(
+            "{} cli subscription provider available | {} deadreckon init --no-confirm",
+            ui_ok("✓"),
+            ui_command("try:")
+        );
     } else {
         println!("{} no provider configured", ui_warn("✗"));
         println!(
@@ -1307,13 +1325,14 @@ fn doctor_command() {
     doctor_os();
     doctor_subscription_binary("claude");
     doctor_subscription_binary("codex");
+    Ok(())
 }
 
-fn doctor_providers(root: &toml::Value) {
+async fn doctor_providers(paths: &DeadreckonPaths, root: &toml::Value) -> Result<()> {
     let Some(providers) = root.get("providers").and_then(toml::Value::as_table) else {
         println!("{} providers table missing", ui_warn("✗"));
         println!("    {} deadreckon init", ui_command("fix:"));
-        return;
+        return Ok(());
     };
     for (name, entry) in providers {
         let kind = entry
@@ -1332,7 +1351,11 @@ fn doctor_providers(root: &toml::Value) {
                     }
                 });
             if command_exists(binary) || PathBuf::from(binary).exists() {
-                println!("{} provider {name} CLI binary {binary} found", ui_ok("✓"));
+                println!(
+                    "{} provider {name} CLI binary {binary} found | {} deadreckon run \"goal\" --provider {name} --preview",
+                    ui_ok("✓"),
+                    ui_command("try:")
+                );
             } else {
                 println!(
                     "{} provider {name} CLI binary {binary} missing",
@@ -1345,12 +1368,13 @@ fn doctor_providers(root: &toml::Value) {
             }
         } else if provider_has_key(entry) {
             if std::env::var_os("DEADRECKON_DOCTOR_PING").is_some() {
-                println!(
-                    "{} provider {name} credential present; ping requested",
-                    ui_ok("✓")
-                );
+                doctor_provider_ping(paths, name).await?;
             } else {
-                println!("{} provider {name} credential present", ui_ok("✓"));
+                println!(
+                    "{} provider {name} credential present; ping skipped | {} DEADRECKON_DOCTOR_PING=1 deadreckon doctor",
+                    ui_ok("✓"),
+                    ui_command("try:")
+                );
             }
         } else {
             println!("{} provider {name} credential missing", ui_warn("✗"));
@@ -1360,6 +1384,48 @@ fn doctor_providers(root: &toml::Value) {
             );
         }
     }
+    Ok(())
+}
+
+async fn doctor_provider_ping(paths: &DeadreckonPaths, name: &str) -> Result<()> {
+    let router = ProviderRouter::from_config_path(&paths.config_path(), Some(name))?;
+    let request = ProviderRequest {
+        prompt: "Reply with OK only.".to_string(),
+        max_output_tokens: 8,
+        cwd: None,
+        output_path: None,
+        sandbox_backend: None,
+        pid_file: None,
+        cancellation_token: None,
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        router.complete(&request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => println!(
+            "{} provider {name} ping ok model {} | {} deadreckon run \"goal\" --provider {name} --preview",
+            ui_ok("✓"),
+            response.model,
+            ui_command("try:")
+        ),
+        Ok(Err(err)) => {
+            println!("{} provider {name} ping failed", ui_warn("✗"));
+            println!(
+                "    {} check credentials or set a fallback provider ({err})",
+                ui_command("fix:")
+            );
+        }
+        Err(_) => {
+            println!("{} provider {name} ping timed out", ui_warn("✗"));
+            println!(
+                "    {} check network/provider status or unset DEADRECKON_DOCTOR_PING",
+                ui_command("fix:")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn provider_has_key(entry: &toml::Value) -> bool {
@@ -1393,9 +1459,10 @@ fn doctor_disk_and_permissions(paths: &DeadreckonPaths) {
     let probe = paths.runstate_dir().join(".doctor-write-test");
     match fs::write(&probe, b"ok").and_then(|_| fs::remove_file(&probe)) {
         Ok(()) => println!(
-            "{} runstate dir {} writable",
+            "{} runstate dir {} writable | {} deadreckon run \"goal\" --preview",
             ui_ok("✓"),
-            paths.runstate_dir().display()
+            paths.runstate_dir().display(),
+            ui_command("try:")
         ),
         Err(err) => {
             println!(
@@ -1425,10 +1492,11 @@ fn doctor_disk_and_permissions(paths: &DeadreckonPaths) {
             );
         }
         Some(kb) => println!(
-            "{} disk space {} MB free in {}",
+            "{} disk space {} MB free in {} | {} deadreckon status",
             ui_ok("✓"),
             kb / 1024,
-            paths.home().display()
+            paths.home().display(),
+            ui_command("try:")
         ),
         None => {
             println!(
@@ -1454,7 +1522,11 @@ fn doctor_os() {
             .ok()
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        println!("{} os macOS {version}", ui_ok("✓"));
+        println!(
+            "{} os macOS {version} | {} sw_vers -productVersion",
+            ui_ok("✓"),
+            ui_command("try:")
+        );
     }
     #[cfg(target_os = "linux")]
     {
@@ -1464,17 +1536,27 @@ fn doctor_os() {
             .ok()
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        println!("{} os Linux kernel {version}", ui_ok("✓"));
+        println!(
+            "{} os Linux kernel {version} | {} uname -r",
+            ui_ok("✓"),
+            ui_command("try:")
+        );
     }
 }
 
 fn doctor_subscription_binary(binary: &str) {
     if command_exists(binary) {
+        let provider = if binary == "claude" {
+            "cli:claude-code"
+        } else {
+            "cli:codex"
+        };
         println!(
-            "{} subscription binary {binary} {}",
+            "{} subscription binary {binary} {} | {} deadreckon config provider {provider}",
             ui_ok("✓"),
             command_version(std::path::Path::new(binary))
-                .unwrap_or_else(|| "version unknown".to_string())
+                .unwrap_or_else(|| "version unknown".to_string()),
+            ui_command("try:")
         );
     } else {
         println!("{} subscription binary {binary} missing", ui_warn("✗"));
