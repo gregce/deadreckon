@@ -1,4 +1,5 @@
 Mode fresh
+Acceptance default dr-gate behavior
 {
   "version": 1,
   "goal": "imported codex history",

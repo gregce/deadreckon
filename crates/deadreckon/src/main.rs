@@ -16,18 +16,20 @@ use crossterm::terminal::{
 };
 use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
-    ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainEvent, ChainEventKind, ChainNewOptions,
-    ChainStatus, ChainStepMarker, ChainStepStatus, CodebaseMode, CodebaseRecord, ConductorState,
-    DeadreckonError, DeadreckonPaths, DocKind, ModeFlags, OnFail, PhaseId, PhaseStatus,
-    PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunOptions,
-    RunStatus, SpendRecord, TraceRecord, WorktreeOptions, acquire_lock, append_chain_event,
+    AcceptanceMarker, ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainEvent, ChainEventKind,
+    ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus, CodebaseMode, CodebaseRecord,
+    ConductorState, DeadreckonError, DeadreckonPaths, DocKind, ModeFlags, OnFail, PhaseId,
+    PhaseStatus, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent,
+    RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions,
+    acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
     append_parent_narrative_update, append_provenance, append_trace, apply_commit_body,
     clear_cancel_marker, copy_source_to_working, copy_tree, create_run, create_worktree,
-    doc_path_for_kind, docs_status_for_state, emit_event, inventory_files, list_runs, load_chain,
-    load_run, pid_is_alive, prepare_worktree_record, preview_git_state, read_chain_step_marker,
-    read_codebase_record, record_for_resolved_mode, release_lock_file, resolve_mode,
-    restore_snapshot, save_chain, save_state, terminate_pid, validate_acceptance_marker,
-    write_cancel_marker, write_chain_step_marker,
+    doc_path_for_kind, docs_status_for_state, emit_event, evaluate_acceptance, inventory_files,
+    list_runs, load_chain, load_run, marker_path_for_run_root, pid_is_alive,
+    prepare_worktree_record, preview_git_state, read_chain_step_marker, read_codebase_record,
+    record_for_resolved_mode, release_lock_file, resolve_mode, restore_snapshot, save_chain,
+    save_state, terminate_pid, validate_acceptance_marker, write_cancel_marker,
+    write_chain_step_marker,
 };
 use deadreckon_providers::{ProviderRequest, ProviderRouteInfo, ProviderRouter};
 use deadreckon_runtime::{
@@ -53,8 +55,8 @@ mod cli;
 mod tui_events;
 
 use crate::cli::{
-    CHAIN_HELP, ChainCommandArgs, Cli, Commands, ConfigCommand, ExtendCommandArgs, LibraryCommand,
-    RunCommandArgs,
+    AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, Commands,
+    ConfigCommand, ExtendCommandArgs, LibraryCommand, RunCommandArgs,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -193,6 +195,7 @@ async fn main_inner() -> Result<()> {
             no_confirm,
         } => init_command(provider, api_key, base_url, max_spend, sandbox, no_confirm).await,
         Commands::Config { command } => config_command(command),
+        Commands::Acceptance { command } => acceptance_command(command).await,
         Commands::Run {
             goal,
             fresh,
@@ -211,6 +214,7 @@ async fn main_inner() -> Result<()> {
             sandbox,
             provider,
             model,
+            acceptance,
             skill,
             smoke,
             i_know_its_a_lot,
@@ -237,6 +241,7 @@ async fn main_inner() -> Result<()> {
                 sandbox,
                 provider,
                 model,
+                acceptance,
                 skill,
                 smoke,
                 i_know_its_a_lot,
@@ -3377,6 +3382,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         sandbox,
         provider,
         model,
+        acceptance,
         skill,
         smoke,
         i_know_its_a_lot,
@@ -3431,6 +3437,8 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     }
     confirm_spend_cap(effective_max_spend, i_know_its_a_lot, no_confirm)?;
     let cwd = std::env::current_dir()?;
+    let acceptance_source = resolve_acceptance_source(&cwd, acceptance.as_deref())?;
+    let acceptance_preview = acceptance_preview(&acceptance_source)?;
     let sandbox = sandbox
         .or(defaults.sandbox)
         .unwrap_or_else(|| "auto".to_string());
@@ -3491,6 +3499,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         sandbox: &backend.to_string(),
         max_spend: effective_max_spend,
         max_wall_seconds: effective_max_wall_seconds,
+        acceptance: &acceptance_preview,
         brief,
         run_id: &run_id,
     });
@@ -3537,6 +3546,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         copy_source_to_working(source_path, &state.working_dir)?;
         deadreckon_core::write_codebase_record(&state.working_dir, &codebase)?;
     }
+    copy_acceptance_into_run(&state, &acceptance_source)?;
     let mut lock = acquire_lock(
         &paths,
         &state.task_key,
@@ -3593,6 +3603,823 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         complete_run_actions(&state, !no_confirm).await?;
     }
     Ok(())
+}
+
+const PROJECT_ACCEPTANCE_DIR: &str = ".deadreckon";
+const PROJECT_ACCEPTANCE_YAML: &str = "acceptance.yaml";
+const PROJECT_ACCEPTANCE_MD: &str = "acceptance.md";
+
+#[derive(Clone, Debug)]
+struct AcceptanceSource {
+    path: PathBuf,
+    label: String,
+    companion_doc: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct AcceptancePreview {
+    source: String,
+    path: Option<PathBuf>,
+    checks: Option<usize>,
+}
+
+impl AcceptancePreview {
+    fn full_label(&self) -> String {
+        let mut label = self.source.clone();
+        if let Some(checks) = self.checks {
+            label.push_str(&format!(" ({checks} checks)"));
+        }
+        if let Some(path) = self.path.as_ref() {
+            label.push_str(&format!(" from {}", path.display()));
+        }
+        label
+    }
+
+    fn brief_label(&self) -> String {
+        match self.checks {
+            Some(checks) => format!("{}:{checks}", self.source),
+            None => self.source.clone(),
+        }
+    }
+}
+
+async fn acceptance_command(command: AcceptanceCommand) -> Result<()> {
+    match command {
+        AcceptanceCommand::Init { preset, force } => acceptance_init_command(preset, force),
+        AcceptanceCommand::Draft {
+            request,
+            provider,
+            model,
+            force,
+        } => {
+            acceptance_agent_command(AcceptanceAgentMode::Draft, request, provider, model, force)
+                .await
+        }
+        AcceptanceCommand::Refine {
+            request,
+            provider,
+            model,
+            force,
+        } => {
+            acceptance_agent_command(AcceptanceAgentMode::Refine, request, provider, model, force)
+                .await
+        }
+        AcceptanceCommand::Explain { spec } => acceptance_explain_command(spec),
+        AcceptanceCommand::Check { spec, against } => acceptance_check_command(spec, against),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AcceptanceAgentMode {
+    Draft,
+    Refine,
+}
+
+fn acceptance_init_command(preset: AcceptancePreset, force: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let preset = match preset {
+        AcceptancePreset::Auto => detect_acceptance_preset(&cwd),
+        other => other,
+    };
+    let (yaml, markdown) = acceptance_template_for_preset(preset, &cwd);
+    write_project_acceptance(&cwd, &yaml, &markdown, force)?;
+    print_acceptance_written(&cwd, "template", acceptance_check_count(&yaml)?);
+    Ok(())
+}
+
+async fn acceptance_agent_command(
+    mode: AcceptanceAgentMode,
+    request: Vec<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    force: bool,
+) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let yaml_path = project_acceptance_yaml(&cwd);
+    let md_path = project_acceptance_md(&cwd);
+    let existing_yaml = read_optional_text(&yaml_path)?;
+    let existing_md = read_optional_text(&md_path)?;
+    if matches!(mode, AcceptanceAgentMode::Refine) && existing_yaml.is_none() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "no project acceptance spec found",
+            "deadreckon acceptance draft \"what should count as done\"",
+        )));
+    }
+    let request = acceptance_request_text(request, mode)?;
+    if !force && yaml_path.exists() && matches!(mode, AcceptanceAgentMode::Draft) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            ".deadreckon/acceptance.yaml already exists",
+            "deadreckon acceptance refine \"change the criteria\" or rerun with --force",
+        )));
+    }
+    let paths = DeadreckonPaths::discover();
+    let defaults = config_defaults(&paths)?;
+    let selected_provider = provider.or(defaults.doc_provider).or(defaults.provider);
+    let router = ProviderRouter::from_config_path_with_model(
+        &paths.config_path(),
+        selected_provider.as_deref(),
+        model.as_deref(),
+    )?;
+    let route = router.selected_route_info();
+    let prompt = acceptance_agent_prompt(
+        mode,
+        &request,
+        &cwd,
+        existing_yaml.as_deref(),
+        existing_md.as_deref(),
+    )?;
+    let response = router
+        .complete(&ProviderRequest {
+            prompt,
+            max_output_tokens: 6_000,
+            cwd: Some(cwd.clone()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .map_err(|err| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!("acceptance provider failed: {err}"),
+                "deadreckon acceptance init --preset auto",
+            ))
+        })?;
+    let (yaml, markdown) = parse_acceptance_agent_response(&response.content)?;
+    acceptance_check_count(&yaml)?;
+    write_project_acceptance(&cwd, &yaml, &markdown, true)?;
+    let route_label = route
+        .map(|route| format!("{} / {}", route.name, route.model))
+        .unwrap_or_else(|| "configured provider".to_string());
+    print_acceptance_written(
+        &cwd,
+        &format!("agent draft via {route_label}"),
+        acceptance_check_count(&yaml)?,
+    );
+    Ok(())
+}
+
+fn acceptance_explain_command(spec: Option<PathBuf>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let path = resolve_acceptance_path_for_command(&cwd, spec.as_deref())?;
+    match path {
+        Some(path) => {
+            let raw = fs::read_to_string(&path)?;
+            let count = acceptance_check_count(&raw)?;
+            println!("{}", ui_heading("acceptance"));
+            println!("  spec:   {}", path.display());
+            println!("  checks: {count}");
+            if path == project_acceptance_yaml(&cwd)
+                && let Some(markdown) = read_optional_text(&project_acceptance_md(&cwd))?
+            {
+                println!();
+                println!("{}", markdown.trim());
+            }
+            println!();
+            print_acceptance_yaml_summary(&raw)?;
+        }
+        None => {
+            println!("{}", ui_heading("acceptance"));
+            println!("  spec:   default dr-gate behavior");
+            println!(
+                "  checks: working directory exists, or cargo test when Cargo.toml is present"
+            );
+            println!();
+            println!(
+                "{}",
+                ui_command("deadreckon acceptance draft \"what should count as done\"")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let working_dir = against.unwrap_or(cwd.clone());
+    let spec_path = resolve_acceptance_path_for_command(&cwd, spec.as_deref())?;
+    let temp_root = std::env::temp_dir().join(format!(
+        "deadreckon-acceptance-check-{}",
+        Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(&temp_root)?;
+    if let Some(spec_path) = spec_path.as_ref() {
+        fs::copy(spec_path, acceptance_spec_path_for_run_root(&temp_root))?;
+    }
+    let result = evaluate_acceptance(&temp_root, &working_dir);
+    let _ = fs::remove_dir_all(&temp_root);
+    match result {
+        Ok(results) => {
+            println!("{}", ui_ok("acceptance check passed"));
+            println!("working {}", working_dir.display());
+            if let Some(spec_path) = spec_path {
+                println!("spec    {}", spec_path.display());
+            } else {
+                println!("spec    default dr-gate behavior");
+            }
+            for result in results {
+                let mark = if result.passed {
+                    ui_ok("✓")
+                } else {
+                    ui_warn("!")
+                };
+                let requirement = if result.must_pass {
+                    "required"
+                } else {
+                    "optional"
+                };
+                println!(
+                    "  {mark} {:<13} {:<14} {}",
+                    result.kind, requirement, result.detail
+                );
+            }
+            Ok(())
+        }
+        Err(err) => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("acceptance check failed: {err}"),
+            "fix the project or edit .deadreckon/acceptance.yaml, then rerun `deadreckon acceptance check`",
+        ))),
+    }
+}
+
+fn acceptance_request_text(request: Vec<String>, mode: AcceptanceAgentMode) -> Result<String> {
+    let joined = request.join(" ").trim().to_string();
+    if !joined.is_empty() {
+        return Ok(joined);
+    }
+    if io::stdin().is_terminal() {
+        let prompt_text = match mode {
+            AcceptanceAgentMode::Draft => "what should count as done? ",
+            AcceptanceAgentMode::Refine => "how should acceptance change? ",
+        };
+        let answer = prompt(prompt_text)?;
+        if !answer.trim().is_empty() {
+            return Ok(answer.trim().to_string());
+        }
+    }
+    match mode {
+        AcceptanceAgentMode::Draft => Ok(
+            "Draft practical acceptance criteria for this project and its likely build/test flow."
+                .to_string(),
+        ),
+        AcceptanceAgentMode::Refine => Err(CliError::Core(deadreckon_core::user_error(
+            "refine needs a requested change",
+            "deadreckon acceptance refine \"also require tests for the gallery\"",
+        ))),
+    }
+}
+
+fn acceptance_agent_prompt(
+    mode: AcceptanceAgentMode,
+    request: &str,
+    cwd: &Path,
+    existing_yaml: Option<&str>,
+    existing_md: Option<&str>,
+) -> Result<String> {
+    let mode_label = match mode {
+        AcceptanceAgentMode::Draft => "draft",
+        AcceptanceAgentMode::Refine => "refine",
+    };
+    let project = acceptance_project_summary(cwd)?;
+    Ok(format!(
+        "\
+You are helping configure deadreckon acceptance criteria for an unattended coding run.
+
+Return JSON only, with exactly these keys:
+{{\"acceptance_yaml\":\"...\",\"acceptance_md\":\"...\"}}
+
+The YAML must be valid deadreckon acceptance.yaml. Use only these check kinds:
+- file_exists with path
+- content_match with path and pattern
+- shell with command and optional cwd
+- cargo_test
+
+Use {{working_dir}} for paths inside the run. Prefer stable, automatable checks over subjective claims.
+Do not include self-attestation checks, provider-output checks, or instructions that the agent can satisfy by writing a marker.
+For Node projects, prefer `npm run build --if-present` and `npm test --if-present` shell checks.
+For static apps, require the main HTML/CSS/JS files and one or two content_match checks for requested behavior.
+Keep the YAML concise and include at least one required check.
+
+Mode: {mode_label}
+User request: {request}
+
+Project summary:
+{project}
+
+Existing acceptance.yaml:
+{existing_yaml}
+
+Existing acceptance.md:
+{existing_md}
+",
+        existing_yaml = existing_yaml.unwrap_or("(none)"),
+        existing_md = existing_md.unwrap_or("(none)")
+    ))
+}
+
+fn acceptance_project_summary(cwd: &Path) -> Result<String> {
+    let mut lines = vec![format!("root: {}", cwd.display())];
+    if cwd.join("Cargo.toml").exists() {
+        lines.push("stack: rust".to_string());
+    }
+    if cwd.join("package.json").exists() {
+        lines.push("stack: node".to_string());
+        if let Ok(package) = fs::read_to_string(cwd.join("package.json"))
+            && let Ok(value) = serde_json::from_str::<Value>(&package)
+            && let Some(scripts) = value.get("scripts").and_then(Value::as_object)
+        {
+            let mut script_names = scripts.keys().cloned().collect::<Vec<_>>();
+            script_names.sort();
+            lines.push(format!("package scripts: {}", script_names.join(", ")));
+        }
+    }
+    let files = project_file_sample(cwd, 80)?;
+    lines.push("files:".to_string());
+    for file in files {
+        lines.push(format!("  - {}", file.display()));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn project_file_sample(cwd: &Path, limit: usize) -> Result<Vec<PathBuf>> {
+    fn walk(
+        root: &Path,
+        current: &Path,
+        depth: usize,
+        out: &mut Vec<PathBuf>,
+        limit: usize,
+    ) -> io::Result<()> {
+        if depth > 3 || out.len() >= limit {
+            return Ok(());
+        }
+        let mut entries = fs::read_dir(current)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if out.len() >= limit {
+                break;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                ".git" | "target" | "node_modules" | ".deadreckon" | "dist" | "build"
+            ) {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, depth + 1, out, limit)?;
+            } else if let Ok(relative) = path.strip_prefix(root) {
+                out.push(relative.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(cwd, cwd, 0, &mut files, limit)?;
+    Ok(files)
+}
+
+fn parse_acceptance_agent_response(content: &str) -> Result<(String, String)> {
+    let cleaned = strip_code_fence(content.trim());
+    if let Ok(value) = serde_json::from_str::<Value>(&cleaned)
+        && let Some(parsed) = acceptance_json_payload(&value)?
+    {
+        return Ok(parsed);
+    }
+    if let Some(json) = extract_json_object(&cleaned)
+        && let Ok(value) = serde_json::from_str::<Value>(&json)
+        && let Some(parsed) = acceptance_json_payload(&value)?
+    {
+        return Ok(parsed);
+    }
+    if let Some(yaml) = extract_fenced_block(&cleaned, &["yaml", "yml"]).or_else(|| {
+        if cleaned.contains("checks:") {
+            Some(cleaned.clone())
+        } else {
+            None
+        }
+    }) {
+        let markdown = extract_fenced_block(&cleaned, &["markdown", "md"])
+            .unwrap_or_else(|| acceptance_markdown_from_yaml(&yaml));
+        acceptance_check_count(&yaml)?;
+        return Ok((yaml, markdown));
+    }
+    Err(CliError::Core(deadreckon_core::user_error(
+        "provider did not return acceptance JSON or YAML",
+        "rerun `deadreckon acceptance draft ...` or use `deadreckon acceptance init --preset auto`",
+    )))
+}
+
+fn acceptance_json_payload(value: &Value) -> Result<Option<(String, String)>> {
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    let yaml = object
+        .get("acceptance_yaml")
+        .or_else(|| object.get("yaml"))
+        .and_then(Value::as_str);
+    let Some(yaml) = yaml else {
+        return Ok(None);
+    };
+    let markdown = object
+        .get("acceptance_md")
+        .or_else(|| object.get("markdown"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| acceptance_markdown_from_yaml(yaml));
+    acceptance_check_count(yaml)?;
+    Ok(Some((yaml.to_string(), markdown)))
+}
+
+fn strip_code_fence(value: &str) -> String {
+    let trimmed = value.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
+    }
+    let mut lines = trimmed.lines().collect::<Vec<_>>();
+    if lines.len() >= 2 && lines.last().is_some_and(|line| line.trim() == "```") {
+        lines.remove(0);
+        lines.pop();
+        return lines.join("\n");
+    }
+    trimmed.to_string()
+}
+
+fn extract_json_object(value: &str) -> Option<String> {
+    let start = value.find('{')?;
+    let end = value.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(value[start..=end].to_string())
+}
+
+fn extract_fenced_block(value: &str, languages: &[&str]) -> Option<String> {
+    let mut in_block = false;
+    let mut capture = false;
+    let mut lines = Vec::new();
+    for line in value.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("```") {
+            if in_block {
+                if capture {
+                    return Some(lines.join("\n"));
+                }
+                in_block = false;
+                continue;
+            }
+            in_block = true;
+            capture = languages
+                .iter()
+                .any(|language| rest.trim().eq_ignore_ascii_case(language));
+            lines.clear();
+            continue;
+        }
+        if in_block && capture {
+            lines.push(line);
+        }
+    }
+    None
+}
+
+fn resolve_acceptance_source(
+    cwd: &Path,
+    override_path: Option<&Path>,
+) -> Result<Option<AcceptanceSource>> {
+    if let Some(path) = override_path {
+        let path = absolute_from(cwd, path);
+        if !path.is_file() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("acceptance spec not found: {}", path.display()),
+                "deadreckon acceptance init --preset auto",
+            )));
+        }
+        return Ok(Some(AcceptanceSource {
+            path,
+            label: "explicit".to_string(),
+            companion_doc: None,
+        }));
+    }
+    let project_yaml = project_acceptance_yaml(cwd);
+    if project_yaml.is_file() {
+        let project_md = project_acceptance_md(cwd);
+        return Ok(Some(AcceptanceSource {
+            path: project_yaml,
+            label: "project".to_string(),
+            companion_doc: project_md.is_file().then_some(project_md),
+        }));
+    }
+    Ok(None)
+}
+
+fn acceptance_preview(source: &Option<AcceptanceSource>) -> Result<AcceptancePreview> {
+    match source {
+        Some(source) => {
+            let raw = fs::read_to_string(&source.path)?;
+            Ok(AcceptancePreview {
+                source: source.label.clone(),
+                path: Some(source.path.clone()),
+                checks: Some(acceptance_check_count(&raw)?),
+            })
+        }
+        None => Ok(AcceptancePreview {
+            source: "default".to_string(),
+            path: None,
+            checks: None,
+        }),
+    }
+}
+
+fn copy_acceptance_into_run(
+    state: &deadreckon_core::PipelineState,
+    source: &Option<AcceptanceSource>,
+) -> Result<()> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    fs::copy(
+        &source.path,
+        acceptance_spec_path_for_run_root(&state.run_root),
+    )?;
+    if let Some(doc) = source.companion_doc.as_ref() {
+        fs::copy(doc, state.run_root.join(PROJECT_ACCEPTANCE_MD))?;
+    }
+    Ok(())
+}
+
+fn resolve_acceptance_path_for_command(cwd: &Path, spec: Option<&Path>) -> Result<Option<PathBuf>> {
+    if let Some(spec) = spec {
+        let path = absolute_from(cwd, spec);
+        if !path.is_file() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("acceptance spec not found: {}", path.display()),
+                "deadreckon acceptance init --preset auto",
+            )));
+        }
+        return Ok(Some(path));
+    }
+    let project = project_acceptance_yaml(cwd);
+    Ok(project.is_file().then_some(project))
+}
+
+fn absolute_from(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn project_acceptance_yaml(cwd: &Path) -> PathBuf {
+    cwd.join(PROJECT_ACCEPTANCE_DIR)
+        .join(PROJECT_ACCEPTANCE_YAML)
+}
+
+fn project_acceptance_md(cwd: &Path) -> PathBuf {
+    cwd.join(PROJECT_ACCEPTANCE_DIR).join(PROJECT_ACCEPTANCE_MD)
+}
+
+fn write_project_acceptance(cwd: &Path, yaml: &str, markdown: &str, force: bool) -> Result<()> {
+    let dir = cwd.join(PROJECT_ACCEPTANCE_DIR);
+    let yaml_path = project_acceptance_yaml(cwd);
+    let md_path = project_acceptance_md(cwd);
+    if !force && (yaml_path.exists() || md_path.exists()) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            ".deadreckon/acceptance files already exist",
+            "deadreckon acceptance refine \"change the criteria\" or rerun with --force",
+        )));
+    }
+    fs::create_dir_all(&dir)?;
+    fs::write(&yaml_path, ensure_trailing_newline(yaml))?;
+    fs::write(&md_path, ensure_trailing_newline(markdown))?;
+    Ok(())
+}
+
+fn print_acceptance_written(cwd: &Path, source: &str, checks: usize) {
+    println!("{}", ui_ok("acceptance configured"));
+    println!("source  {source}");
+    println!("checks  {checks}");
+    println!("yaml    {}", project_acceptance_yaml(cwd).display());
+    println!("notes   {}", project_acceptance_md(cwd).display());
+    println!();
+    println!(
+        "{} {}",
+        ui_command("next:"),
+        ui_command("deadreckon acceptance check")
+    );
+    println!(
+        "{} {}",
+        ui_command("run: "),
+        ui_command("deadreckon run \"goal\"")
+    );
+}
+
+fn detect_acceptance_preset(cwd: &Path) -> AcceptancePreset {
+    if cwd.join("Cargo.toml").exists() {
+        AcceptancePreset::Rust
+    } else if cwd.join("package.json").exists() {
+        AcceptancePreset::Node
+    } else if cwd.join("index.html").exists() || cwd.join("public/index.html").exists() {
+        AcceptancePreset::StaticSite
+    } else {
+        AcceptancePreset::Basic
+    }
+}
+
+fn acceptance_template_for_preset(preset: AcceptancePreset, cwd: &Path) -> (String, String) {
+    let yaml = match preset {
+        AcceptancePreset::Auto => unreachable!("auto is resolved before template generation"),
+        AcceptancePreset::Rust => {
+            "\
+name: rust project acceptance
+checks:
+  - kind: file_exists
+    path: \"{working_dir}/Cargo.toml\"
+  - kind: cargo_test
+"
+        }
+        AcceptancePreset::Node => {
+            "\
+name: node project acceptance
+checks:
+  - kind: file_exists
+    path: \"{working_dir}/package.json\"
+  - kind: shell
+    command: \"npm run build --if-present\"
+    cwd: \"{working_dir}\"
+  - kind: shell
+    command: \"npm test --if-present\"
+    cwd: \"{working_dir}\"
+    must_pass: false
+"
+        }
+        AcceptancePreset::StaticSite => {
+            if cwd.join("public/index.html").exists() && !cwd.join("index.html").exists() {
+                "\
+name: static site acceptance
+checks:
+  - kind: file_exists
+    path: \"{working_dir}/public/index.html\"
+  - kind: shell
+    command: \"test -s public/index.html\"
+    cwd: \"{working_dir}\"
+"
+            } else {
+                "\
+name: static site acceptance
+checks:
+  - kind: file_exists
+    path: \"{working_dir}/index.html\"
+  - kind: shell
+    command: \"test -s index.html\"
+    cwd: \"{working_dir}\"
+"
+            }
+        }
+        AcceptancePreset::Basic => {
+            "\
+name: basic project acceptance
+checks:
+  - kind: shell
+    command: \"test -d .\"
+    cwd: \"{working_dir}\"
+"
+        }
+    }
+    .to_string();
+    let markdown = format!(
+        "\
+# Acceptance Criteria
+
+These checks define what `deadreckon` should verify before promoting a completed run.
+
+{}
+",
+        acceptance_markdown_from_yaml(&yaml)
+    );
+    (yaml, markdown)
+}
+
+fn acceptance_markdown_from_yaml(raw: &str) -> String {
+    match acceptance_check_count(raw) {
+        Ok(count) => format!(
+            "Configured checks: {count}. Run `deadreckon acceptance check` before starting long work."
+        ),
+        Err(_) => "Run `deadreckon acceptance check` before starting long work.".to_string(),
+    }
+}
+
+fn print_acceptance_yaml_summary(raw: &str) -> Result<()> {
+    let root = acceptance_yaml_value(raw)?;
+    println!("{}", ui_heading("checks"));
+    for line in acceptance_summary_lines(&root) {
+        println!("  {line}");
+    }
+    Ok(())
+}
+
+fn acceptance_summary_lines(root: &serde_yaml::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for key in [
+        "checks",
+        "required",
+        "optional",
+        "tests",
+        "file-exists",
+        "content-match",
+        "build-success",
+    ] {
+        if let Some(value) = yaml_mapping_get(root, key) {
+            for item in yaml_items(value) {
+                lines.push(format!("{key}: {}", one_line(&format!("{item:?}"), 120)));
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push("no recognized checks".to_string());
+    }
+    lines
+}
+
+fn acceptance_check_count(raw: &str) -> Result<usize> {
+    let root = acceptance_yaml_value(raw)?;
+    let mut count = 0;
+    for key in [
+        "checks",
+        "required",
+        "optional",
+        "tests",
+        "file-exists",
+        "content-match",
+        "build-success",
+    ] {
+        if let Some(value) = yaml_mapping_get(&root, key) {
+            count += yaml_items(value).len();
+        }
+    }
+    if count == 0 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "acceptance.yaml does not contain any recognized checks",
+            "add a checks: list with file_exists, shell, content_match, or cargo_test entries",
+        )));
+    }
+    Ok(count)
+}
+
+fn acceptance_yaml_value(raw: &str) -> Result<serde_yaml::Value> {
+    serde_yaml::from_str(raw).map_err(|source| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("invalid acceptance.yaml: {source}"),
+            "deadreckon acceptance init --preset auto",
+        ))
+    })
+}
+
+fn yaml_mapping_get<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
+    value
+        .as_mapping()?
+        .get(serde_yaml::Value::String(key.to_string()))
+}
+
+fn yaml_items(value: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
+    match value {
+        serde_yaml::Value::Sequence(items) => items.iter().collect(),
+        serde_yaml::Value::Null => Vec::new(),
+        value => vec![value],
+    }
+}
+
+fn read_optional_text(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(Some(value)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Io(source)),
+    }
+}
+
+fn ensure_trailing_newline(value: &str) -> String {
+    let mut value = value.trim().to_string();
+    value.push('\n');
+    value
+}
+
+fn acceptance_status_line(state: &deadreckon_core::PipelineState) -> String {
+    let marker_path = marker_path_for_run_root(&state.run_root);
+    if marker_path.exists()
+        && let Ok(bytes) = fs::read(&marker_path)
+        && let Ok(marker) = serde_json::from_slice::<AcceptanceMarker>(&bytes)
+    {
+        return format!("passed by dr-gate ({} checks)", marker.check_count);
+    }
+    let spec_path = acceptance_spec_path_for_run_root(&state.run_root);
+    if spec_path.exists()
+        && let Ok(raw) = fs::read_to_string(&spec_path)
+        && let Ok(count) = acceptance_check_count(&raw)
+    {
+        return format!("configured ({count} checks)");
+    }
+    "default dr-gate behavior".to_string()
 }
 
 #[derive(Debug, Default)]
@@ -4099,6 +4926,7 @@ struct RunPreview<'a> {
     sandbox: &'a str,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
+    acceptance: &'a AcceptancePreview,
     brief: bool,
     run_id: &'a str,
 }
@@ -4113,6 +4941,7 @@ fn run_preview(input: RunPreview<'_>) -> String {
         sandbox,
         max_spend,
         max_wall_seconds,
+        acceptance,
         brief,
         run_id,
     } = input;
@@ -4131,7 +4960,7 @@ fn run_preview(input: RunPreview<'_>) -> String {
     );
     if brief {
         return format!(
-            "mode={} branch={} base={} wt={} provider={} model={} cap={}/{}",
+            "mode={} branch={} base={} wt={} provider={} model={} cap={}/{} acceptance={}",
             mode,
             codebase.branch_name.as_deref().unwrap_or("-"),
             codebase.base_ref.as_deref().unwrap_or("-"),
@@ -4145,7 +4974,8 @@ fn run_preview(input: RunPreview<'_>) -> String {
             max_spend
                 .map(|cap| format!("${cap:.0}"))
                 .unwrap_or_else(|| "uncapped".to_string()),
-            format_wall_cap(max_wall_seconds)
+            format_wall_cap(max_wall_seconds),
+            acceptance.brief_label()
         );
     }
 
@@ -4195,6 +5025,7 @@ fn run_preview(input: RunPreview<'_>) -> String {
         format!("  model:    {model}"),
         format!("  sandbox:  {sandbox}"),
         format!("  caps:     {caps}"),
+        format!("  gate:     {}", acceptance.full_label()),
     ]);
     match codebase.mode {
         CodebaseMode::Worktree => {
@@ -6655,6 +7486,11 @@ fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
             println!("Source {}", source.display());
         }
     }
+    println!("Acceptance {}", acceptance_status_line(&state));
+    let run_acceptance = acceptance_spec_path_for_run_root(&state.run_root);
+    if run_acceptance.exists() {
+        println!("AcceptanceSpec {}", run_acceptance.display());
+    }
     println!("{}", serde_json::to_string_pretty(&state)?);
     let provenance_path = state.run_root.join("provenance.jsonl");
     if provenance_path.exists() {
@@ -7003,6 +7839,7 @@ fn print_status_card(state: &deadreckon_core::PipelineState) {
     if let Some(reason) = state.failure_reason.as_deref() {
         println!("  failure:  {}", one_line(reason, 100));
     }
+    println!("  gate:     {}", acceptance_status_line(state));
     println!("  docs:     {}", docs_status_for_state(state));
 
     println!();

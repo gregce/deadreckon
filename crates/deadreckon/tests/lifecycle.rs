@@ -772,6 +772,7 @@ fn every_top_level_help_shows_lifecycle_usage() {
     for command in [
         "init",
         "config",
+        "acceptance",
         "run",
         "chain",
         "doctor",
@@ -827,6 +828,129 @@ fn chain_help_lists_real_subcommands() {
         .expect("chain help redo");
     assert_success(&redo);
     assert!(stdout(&redo).contains("deadreckon chain undo/redo"));
+}
+
+#[test]
+fn acceptance_init_writes_project_spec() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("node-app");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(
+        workspace.join("package.json"),
+        r#"{"scripts":{"build":"node -e \"process.exit(0)\""}}"#,
+    )
+    .expect("package");
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args(["acceptance", "init", "--preset", "node"])
+        .output()
+        .expect("acceptance init");
+
+    assert_success(&output);
+    let yaml = fs::read_to_string(workspace.join(".deadreckon/acceptance.yaml")).expect("yaml");
+    assert!(yaml.contains("npm run build --if-present"));
+    assert!(workspace.join(".deadreckon/acceptance.md").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acceptance_draft_uses_configured_provider() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("draft-app");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(workspace.join("README.md"), "draft app").expect("readme");
+    let response = json!({
+        "acceptance_yaml": "name: drafted\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        "acceptance_md": "# Acceptance\n\nREADME must exist."
+    })
+    .to_string();
+    let server = MockServer::start(vec![FixtureResponse {
+        content: response,
+        prompt_tokens: 20,
+        completion_tokens: 20,
+    }])
+    .await;
+    write_config(paths.home(), &server.base_url());
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args([
+            "acceptance",
+            "draft",
+            "require README",
+            "--provider",
+            "mock",
+        ])
+        .output()
+        .expect("acceptance draft");
+
+    assert_success(&output);
+    let yaml = fs::read_to_string(workspace.join(".deadreckon/acceptance.yaml")).expect("yaml");
+    assert!(yaml.contains("README.md"));
+    assert!(stdout(&output).contains("agent draft via mock / mock-agent"));
+}
+
+#[test]
+fn acceptance_check_dry_runs_project_spec() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("checked-app");
+    fs::create_dir_all(workspace.join(".deadreckon")).expect("workspace");
+    fs::write(
+        workspace.join(".deadreckon/acceptance.yaml"),
+        "name: check\nchecks:\n  - kind: shell\n    command: \"test -d .\"\n    cwd: \"{working_dir}\"\n",
+    )
+    .expect("yaml");
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args(["acceptance", "check"])
+        .output()
+        .expect("acceptance check");
+
+    assert_success(&output);
+    assert!(stdout(&output).contains("acceptance check passed"));
+}
+
+#[test]
+fn run_copies_project_acceptance_spec_into_run_root() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("run-acceptance");
+    fs::create_dir_all(workspace.join(".deadreckon")).expect("workspace");
+    fs::write(
+        workspace.join(".deadreckon/acceptance.yaml"),
+        "name: run acceptance\nchecks:\n  - kind: shell\n    command: \"test -d .\"\n    cwd: \"{working_dir}\"\n",
+    )
+    .expect("yaml");
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args([
+            "run",
+            "create hello.txt containing exactly hello",
+            "--fresh",
+            "--smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "1",
+            "--yes",
+            "--no-hints",
+            "--no-docs",
+        ])
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    let run_id = run_id_from_stdout(&output);
+    let state = load_run(&paths, &run_id).expect("state");
+    assert!(state.run_root.join("acceptance.yaml").exists());
+    let marker =
+        fs::read_to_string(state.run_root.join("proofs/turn-acceptance.json")).expect("marker");
+    assert!(marker.contains("\"kind\": \"shell\""));
 }
 
 #[test]

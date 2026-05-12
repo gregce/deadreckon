@@ -23,7 +23,7 @@ use deadreckon_core::codebase::{CodebaseMode, read_codebase_record};
 use deadreckon_core::docs::{TurnDocInput, append_turn_doc};
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::events::{RunEvent, RunEventKind, emit_event, event_preview, tool_args_json};
-use deadreckon_core::gate::validate_acceptance_marker;
+use deadreckon_core::gate::{acceptance_spec_path_for_run_root, validate_acceptance_marker};
 use deadreckon_core::paths::DeadreckonPaths;
 use deadreckon_core::promotion::promote_completed_run;
 use deadreckon_core::state::{
@@ -663,10 +663,12 @@ fn build_prompt(state: &PipelineState, history: &[String]) -> String {
     } else {
         history.join("\n")
     };
+    let acceptance_text = acceptance_prompt_text(state);
     format!(
-        "You are deadreckon running unattended coding work.\nGoal: {}\nWorking directory: {}\nReturn exactly one JSON object with action bash, write_file, or done.\nHistory:\n{}",
+        "You are deadreckon running unattended coding work.\nGoal: {}\nWorking directory: {}\nAcceptance criteria:\n{}\nReturn exactly one JSON object with action bash, write_file, or done.\nHistory:\n{}",
         state.goal,
         state.working_dir.display(),
+        acceptance_text,
         history_text
     )
 }
@@ -677,12 +679,32 @@ fn build_cli_subagent_prompt(state: &PipelineState, history: &[String]) -> Strin
     } else {
         history.join("\n")
     };
+    let acceptance_text = acceptance_prompt_text(state);
     format!(
-        "You are a deadreckon CLI sub-agent running unattended coding work.\nGoal: {}\nWorking directory: {}\nModify files directly in the working directory. Do not write outside it. Do not ask questions. When finished, print a concise summary of changed files.\nHistory:\n{}",
+        "You are a deadreckon CLI sub-agent running unattended coding work.\nGoal: {}\nWorking directory: {}\nAcceptance criteria:\n{}\nModify files directly in the working directory. Do not write outside it. Do not ask questions. When finished, print a concise summary of changed files.\nHistory:\n{}",
         state.goal,
         state.working_dir.display(),
+        acceptance_text,
         history_text
     )
+}
+
+fn acceptance_prompt_text(state: &PipelineState) -> String {
+    let yaml_path = acceptance_spec_path_for_run_root(&state.run_root);
+    let yaml = std::fs::read_to_string(&yaml_path).ok();
+    let markdown = std::fs::read_to_string(state.run_root.join("acceptance.md")).ok();
+    match (yaml, markdown) {
+        (Some(yaml), Some(markdown)) => format!(
+            "{}\n\nacceptance.yaml:\n{}",
+            markdown.trim(),
+            yaml.trim()
+        ),
+        (Some(yaml), None) => format!("acceptance.yaml:\n{}", yaml.trim()),
+        (None, _) => {
+            "default dr-gate behavior: working directory exists, or cargo test when Cargo.toml exists"
+                .to_string()
+        }
+    }
 }
 
 fn is_cli_provider_name(provider: &str) -> bool {
@@ -1267,8 +1289,9 @@ mod tests {
 
     use super::{
         RunLoopConfig, RunLoopDocsConfig, append_tool_refusal, bash_policy_refusal,
-        ensure_sandbox_toml, load_or_reconstruct_history, load_tool_policy_from_sandbox_toml,
-        run_turn_loop, safe_working_path, safe_working_path_with_policy,
+        build_cli_subagent_prompt, ensure_sandbox_toml, load_or_reconstruct_history,
+        load_tool_policy_from_sandbox_toml, run_turn_loop, safe_working_path,
+        safe_working_path_with_policy,
     };
 
     #[tokio::test]
@@ -1674,5 +1697,37 @@ network = []
         assert!(provenance.contains(r#""event":"tool.refused""#));
         assert!(provenance.contains("unsafe write path"));
         assert!(traces.contains(r#""event":"tool.refused""#));
+    }
+
+    #[test]
+    fn provider_prompt_includes_run_acceptance_spec() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "use acceptance".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "checks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("acceptance");
+
+        let prompt = build_cli_subagent_prompt(&state, &[]);
+
+        assert!(prompt.contains("Acceptance criteria:"));
+        assert!(prompt.contains("acceptance.yaml:"));
+        assert!(prompt.contains("README.md"));
     }
 }

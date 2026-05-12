@@ -24,6 +24,7 @@ Lifecycle:
 
 Command groups:
   Setup: init/setup, config/settings, doctor/check
+  Acceptance: acceptance
   Run Lifecycle: run, attach/watch, status/next, list/runs, kill/stop, resume/continue
   Completed Run Actions: finish, apply/keep, materialize/export, extend/follow-up, doc/docs, library/artifacts
   Cleanup And Recovery: abandon/discard, cleanup/prune, undo/restore
@@ -64,9 +65,27 @@ Common provider/model changes:
   deadreckon config provider cli:codex
   deadreckon config model gpt-5.1-codex --provider cli:codex
 
+Acceptance:
+  deadreckon acceptance init --preset node
+  deadreckon acceptance draft \"what should count as done\"
+  deadreckon run \"goal\" --acceptance .deadreckon/acceptance.yaml
+
 Modes:
   In a git repo, the default is an isolated worktree.
   Use `--fresh`, `--from <dir>`, `--worktree`, or `--in-place --i-know-its-a-lot` to force a mode.";
+
+const ACCEPTANCE_HELP: &str = "\
+Subcommands:
+  deadreckon acceptance init --preset auto
+  deadreckon acceptance draft \"generate acceptance for this app\"
+  deadreckon acceptance refine \"also require websocket reconnect tests\"
+  deadreckon acceptance explain
+  deadreckon acceptance check
+
+Lifecycle:
+  Create `.deadreckon/acceptance.yaml` before a run.
+  `deadreckon run` automatically uses it, or pass `--acceptance <path>`.
+  `dr-gate` remains the pass/fail authority at completion.";
 
 pub(crate) const CHAIN_HELP: &str = "\
 Chain subcommands:
@@ -284,6 +303,15 @@ pub(crate) enum Commands {
         command: ConfigCommand,
     },
     #[command(
+        next_help_heading = "Acceptance",
+        about = "Create, refine, explain, and check project acceptance criteria",
+        after_help = ACCEPTANCE_HELP
+    )]
+    Acceptance {
+        #[command(subcommand)]
+        command: AcceptanceCommand,
+    },
+    #[command(
         next_help_heading = "Run Lifecycle",
         about = "Start an unattended coding run",
         after_help = RUN_HELP
@@ -332,6 +360,12 @@ pub(crate) enum Commands {
         provider: Option<String>,
         #[arg(long, help = "Model override for this run")]
         model: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Acceptance spec for this run; defaults to .deadreckon/acceptance.yaml when present"
+        )]
+        acceptance: Option<PathBuf>,
         #[arg(
             long,
             default_value = "default-coding",
@@ -770,6 +804,77 @@ impl From<CliDocKind> for DocKind {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum AcceptanceCommand {
+    #[command(about = "Write a local acceptance template", after_help = ACCEPTANCE_HELP)]
+    Init {
+        #[arg(
+            long,
+            default_value = "auto",
+            help = "Template: auto, rust, node, static-site, or basic"
+        )]
+        preset: AcceptancePreset,
+        #[arg(long, help = "Overwrite existing .deadreckon/acceptance files")]
+        force: bool,
+    },
+    #[command(
+        about = "Ask the configured provider to draft acceptance criteria",
+        after_help = ACCEPTANCE_HELP
+    )]
+    Draft {
+        #[arg(value_name = "REQUEST", num_args = 0.., help = "What should count as done")]
+        request: Vec<String>,
+        #[arg(long, help = "Provider route override for drafting")]
+        provider: Option<String>,
+        #[arg(long, help = "Model override for drafting")]
+        model: Option<String>,
+        #[arg(long, help = "Overwrite existing .deadreckon/acceptance files")]
+        force: bool,
+    },
+    #[command(
+        about = "Ask the configured provider to improve existing acceptance criteria",
+        after_help = ACCEPTANCE_HELP
+    )]
+    Refine {
+        #[arg(value_name = "REQUEST", num_args = 0.., help = "Requested acceptance change")]
+        request: Vec<String>,
+        #[arg(long, help = "Provider route override for drafting")]
+        provider: Option<String>,
+        #[arg(long, help = "Model override for drafting")]
+        model: Option<String>,
+        #[arg(long, help = "Overwrite existing .deadreckon/acceptance files")]
+        force: bool,
+    },
+    #[command(about = "Explain the active acceptance criteria", after_help = ACCEPTANCE_HELP)]
+    Explain {
+        #[arg(long, value_name = "PATH", help = "Acceptance spec to explain")]
+        spec: Option<PathBuf>,
+    },
+    #[command(
+        about = "Dry-run acceptance checks against a working directory",
+        after_help = ACCEPTANCE_HELP
+    )]
+    Check {
+        #[arg(long, value_name = "PATH", help = "Acceptance spec to check")]
+        spec: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Working directory to evaluate; defaults to current directory"
+        )]
+        against: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum AcceptancePreset {
+    Auto,
+    Rust,
+    Node,
+    StaticSite,
+    Basic,
+}
+
+#[derive(Subcommand)]
 pub(crate) enum ConfigCommand {
     #[command(about = "Print one config value")]
     Get {
@@ -869,6 +974,7 @@ pub(crate) struct RunCommandArgs {
     pub(crate) sandbox: Option<String>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
+    pub(crate) acceptance: Option<PathBuf>,
     pub(crate) skill: String,
     pub(crate) smoke: bool,
     pub(crate) i_know_its_a_lot: bool,
