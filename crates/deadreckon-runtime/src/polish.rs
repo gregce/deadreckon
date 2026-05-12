@@ -8,15 +8,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::codebase::{read_codebase_record, write_codebase_record};
-use crate::docs::{
+use crate::error::IoContext;
+use deadreckon_core::codebase::{read_codebase_record, write_codebase_record};
+use deadreckon_core::docs::{
     AS_BUILT_DELTA, RUN_AS_BUILT, RUN_DECISIONS, RUN_NARRATIVE, append_docs_warning, as_built_path,
     changed_doc_files, decisions_path, delta_path, docs_dir, missing_files_in_narrative,
     narrative_path, polish_path, publish_docs_for_promotion, rewrite_templated_docs,
 };
-use crate::error::{DeadreckonError, IoContext, Result};
-use crate::paths::SOURCE_ROOT;
-use crate::state::PipelineState;
+use deadreckon_core::error::{DeadreckonError, Result};
+use deadreckon_core::paths::SOURCE_ROOT;
+use deadreckon_core::state::PipelineState;
 
 #[derive(Debug, Clone)]
 pub struct PolishConfig {

@@ -24,10 +24,6 @@ pub enum DeadreckonError {
         run_id: String,
         phase: String,
     },
-    #[error("provider error: {0}")]
-    Provider(#[from] deadreckon_providers::ProviderError),
-    #[error("sandbox error: {0}")]
-    Sandbox(#[from] deadreckon_sandbox::SandboxError),
 }
 
 pub type Result<T> = std::result::Result<T, DeadreckonError>;

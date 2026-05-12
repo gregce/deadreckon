@@ -2,6 +2,7 @@
 members = [
   "crates/deadreckon",
   "crates/deadreckon-core",
+  "crates/deadreckon-runtime",
   "crates/deadreckon-providers",
   "crates/deadreckon-sandbox",
 ]
@@ -33,7 +34,7 @@ serde_yaml = "0.9.34"
 sha2 = "0.10.9"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1.17"
 tokio-util = "0.7.17"
 toml = "0.9.8"

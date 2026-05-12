@@ -12,20 +12,23 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::artifacts::{
+use crate::error::IoContext;
+use crate::polish::{PolishConfig, polish_run_docs};
+use deadreckon_core::artifacts::{
     ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
     inventory_files, snapshot_working,
 };
-use crate::cancel::{cancel_marker_path_for_run_root, cancel_marker_present};
-use crate::codebase::{CodebaseMode, read_codebase_record};
-use crate::docs::{TurnDocInput, append_turn_doc};
-use crate::error::{DeadreckonError, IoContext, Result};
-use crate::events::{RunEvent, RunEventKind, emit_event, event_preview, tool_args_json};
-use crate::gate::validate_acceptance_marker;
-use crate::paths::DeadreckonPaths;
-use crate::polish::{PolishConfig, polish_run_docs};
-use crate::promotion::promote_completed_run;
-use crate::state::{PhaseId, PhaseStatus, PipelineState, RunStatus, append_json_line, save_state};
+use deadreckon_core::cancel::{cancel_marker_path_for_run_root, cancel_marker_present};
+use deadreckon_core::codebase::{CodebaseMode, read_codebase_record};
+use deadreckon_core::docs::{TurnDocInput, append_turn_doc};
+use deadreckon_core::error::{DeadreckonError, Result};
+use deadreckon_core::events::{RunEvent, RunEventKind, emit_event, event_preview, tool_args_json};
+use deadreckon_core::gate::validate_acceptance_marker;
+use deadreckon_core::paths::DeadreckonPaths;
+use deadreckon_core::promotion::promote_completed_run;
+use deadreckon_core::state::{
+    PhaseId, PhaseStatus, PipelineState, RunStatus, append_json_line, save_state,
+};
 
 #[derive(Debug, Clone)]
 pub struct RunLoopConfig {
@@ -110,7 +113,7 @@ pub async fn run_turn_loop(
 
     for _ in 0..config.max_turns {
         if should_cancel_run(state, &run_token) {
-            state.status = crate::state::RunStatus::Killed;
+            state.status = deadreckon_core::state::RunStatus::Killed;
             state.failure_reason = Some("run cancelled".to_string());
             save_state(state)?;
             emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
@@ -154,16 +157,16 @@ pub async fn run_turn_loop(
         let response = match router.complete(&request).await {
             Ok(response) => response,
             Err(err) if should_cancel_run(state, &run_token) => {
-                state.status = crate::state::RunStatus::Killed;
+                state.status = deadreckon_core::state::RunStatus::Killed;
                 state.failure_reason = Some(format!("run cancelled during provider call: {err}"));
                 save_state(state)?;
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
                 return Ok(RunLoopOutcome::Killed);
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(provider_error(err)),
         };
         if should_cancel_run(state, &run_token) {
-            state.status = crate::state::RunStatus::Killed;
+            state.status = deadreckon_core::state::RunStatus::Killed;
             state.failure_reason = Some("run cancelled after provider call".to_string());
             save_state(state)?;
             emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
@@ -397,7 +400,7 @@ pub async fn run_turn_loop(
                     Err(deadreckon_sandbox::SandboxError::Cancelled)
                         if should_cancel_run(state, &run_token) =>
                     {
-                        state.status = crate::state::RunStatus::Killed;
+                        state.status = deadreckon_core::state::RunStatus::Killed;
                         state.failure_reason = Some("run cancelled during tool call".to_string());
                         save_state(state)?;
                         emit_run_completed(
@@ -407,7 +410,7 @@ pub async fn run_turn_loop(
                         )?;
                         return Ok(RunLoopOutcome::Killed);
                     }
-                    Err(err) => return Err(err.into()),
+                    Err(err) => return Err(sandbox_error(err)),
                 };
                 append_trace(
                     state,
@@ -590,6 +593,14 @@ pub async fn run_turn_loop(
 
 fn should_cancel_run(state: &PipelineState, token: &CancellationToken) -> bool {
     state.status == RunStatus::Killed || token.is_cancelled() || cancel_marker_present(state)
+}
+
+fn provider_error(err: deadreckon_providers::ProviderError) -> DeadreckonError {
+    DeadreckonError::InvalidInput(format!("provider error: {err}"))
+}
+
+fn sandbox_error(err: deadreckon_sandbox::SandboxError) -> DeadreckonError {
+    DeadreckonError::InvalidInput(format!("sandbox error: {err}"))
 }
 
 struct CancelMarkerGuard {
@@ -1250,9 +1261,9 @@ mod tests {
     use deadreckon_sandbox::SandboxBackend;
     use tempfile::TempDir;
 
-    use crate::events::{RunEventBus, RunEventKind};
-    use crate::paths::DeadreckonPaths;
-    use crate::state::{RunOptions, RunStatus, create_run};
+    use deadreckon_core::events::{RunEventBus, RunEventKind};
+    use deadreckon_core::paths::DeadreckonPaths;
+    use deadreckon_core::state::{RunOptions, RunStatus, create_run};
 
     use super::{
         RunLoopConfig, RunLoopDocsConfig, append_tool_refusal, bash_policy_refusal,

@@ -10,10 +10,8 @@ pub mod events;
 pub mod gate;
 pub mod lock;
 pub mod paths;
-pub mod polish;
 pub mod promotion;
 pub mod state;
-pub mod turn_loop;
 
 pub use artifacts::{
     ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
@@ -61,14 +59,8 @@ pub use lock::{
     terminate_pid,
 };
 pub use paths::{DEFAULT_DEADRECKON_HOME, DeadreckonPaths, SOURCE_ROOT};
-pub use polish::{
-    PolishConfig, PolishRecord, PolishedDocs, ResolvedSkill, SkillSource,
-    default_polished_json_for_tests, inputs_hash, polish_run_docs, read_polish_record,
-    resolve_skill, substitute_placeholders, templated_docs_json,
-};
 pub use promotion::{PromotionManifest, promote_completed_run, recover_promotion};
 pub use state::{
     CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, RunListEntry, RunOptions,
     RunStatus, create_run, list_runs, load_run, save_state,
 };
-pub use turn_loop::{RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, run_turn_loop};

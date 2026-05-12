@@ -7,8 +7,6 @@ keywords.workspace = true
 
 [dependencies]
 chrono.workspace = true
-deadreckon-providers = { path = "../deadreckon-providers" }
-deadreckon-sandbox = { path = "../deadreckon-sandbox" }
 fs2.workspace = true
 ignore.workspace = true
 nix.workspace = true
@@ -16,13 +14,10 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
-sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
-tokio-util.workspace = true
 toml.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
