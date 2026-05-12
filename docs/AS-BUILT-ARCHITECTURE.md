@@ -1255,6 +1255,7 @@ sandbox = "auto"
 binary = "codex"
 extra_args = []
 kind = "cli-codex"
+model = "gpt-5.1-codex" # optional; omitted means provider default
 
 [providers.anthropic]
 api_key_env = "ANTHROPIC_API_KEY"
@@ -1263,6 +1264,14 @@ model = "claude-sonnet-4-5"
 input_cost_per_million = 3.0
 output_cost_per_million = 15.0
 ```
+
+Operator affordances: `deadreckon run --preview "goal"` renders the selected
+provider route and model before state is created; `run --model <model>` and
+`extend --model <model>` override one run; `deadreckon config provider
+<route>` and `deadreckon config model <model> --provider <route>` persist the
+defaults. CLI providers pass explicit model overrides through to the underlying
+tool (`codex exec --model ...`, `claude --model ...`) and otherwise display
+`provider default`.
 
 ### 19.2 BYOK posture
 

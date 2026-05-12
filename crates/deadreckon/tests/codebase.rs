@@ -447,7 +447,8 @@ fn preview_block_contains_required_fields_in_order() {
         "    branch:",
         "    base:",
         "    worktree:",
-        "  agent:",
+        "  provider:",
+        "  model:",
         "  sandbox:",
         "  caps:",
         "  on success:",
@@ -482,7 +483,87 @@ fn brief_mode_is_one_line() {
     let stderr = stderr(&output);
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(stderr.starts_with("mode=worktree branch=dr/brief-preview-"));
+    assert!(stderr.contains(" provider=smoke model=local-scripted-smoke"));
     assert!(stderr.contains(" cap=$10/1h"));
+}
+
+#[test]
+fn run_preview_shows_provider_and_model_override() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(
+        paths.config_path(),
+        r#"
+default_provider = "openai"
+fallback = ["openai"]
+
+[defaults]
+provider = "openai"
+sandbox = "none"
+max_spend = 10
+
+[providers.openai]
+kind = "open-ai"
+api_key = "test"
+model = "configured-model"
+"#,
+    )
+    .expect("config");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("model preview")
+        .arg("--preview")
+        .arg("--model")
+        .arg("override-model")
+        .output()
+        .expect("preview");
+
+    assert_success(&output);
+    let stderr = stderr(&output);
+    assert!(stderr.contains("  provider: openai"), "{stderr}");
+    assert!(stderr.contains("  model:    override-model"), "{stderr}");
+}
+
+#[test]
+fn config_provider_and_model_are_user_friendly_shortcuts() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let provider = deadreckon(&paths)
+        .arg("config")
+        .arg("provider")
+        .arg("cli:codex")
+        .output()
+        .expect("provider");
+    assert_success(&provider);
+
+    let model = deadreckon(&paths)
+        .arg("config")
+        .arg("model")
+        .arg("gpt-5.1-codex")
+        .output()
+        .expect("model");
+    assert_success(&model);
+
+    let raw = fs::read_to_string(paths.config_path()).expect("config");
+    assert!(raw.contains("provider = \"cli:codex\""), "{raw}");
+    assert!(raw.contains("\"cli:codex\""), "{raw}");
+    assert!(raw.contains("model = \"gpt-5.1-codex\""), "{raw}");
+
+    let show = deadreckon(&paths)
+        .arg("config")
+        .arg("model")
+        .output()
+        .expect("show model");
+    assert_success(&show);
+    let stdout = stdout(&show);
+    assert!(stdout.contains("cli:codex"), "{stdout}");
+    assert!(stdout.contains("gpt-5.1-codex"), "{stdout}");
+    assert!(stdout.contains("deadreckon run \"goal\""), "{stdout}");
 }
 
 #[test]

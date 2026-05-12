@@ -362,9 +362,21 @@ Inspect or edit config:
 
 ```bash
 deadreckon config get defaults.provider
+deadreckon config provider
+deadreckon config provider cli:codex
+deadreckon config model
+deadreckon config model gpt-5.1-codex --provider cli:codex
 deadreckon config set defaults.max_spend 15
 deadreckon config set defaults.sandbox auto
 deadreckon config set providers.anthropic.api_key "$ANTHROPIC_API_KEY"
+```
+
+Before a run, `deadreckon run --preview "goal"` shows the provider route and
+model that will be used. For one run, override both directly:
+
+```bash
+deadreckon run "goal" --provider cli:codex --model gpt-5.1-codex
+deadreckon run "goal" --provider cli:claude-code --model sonnet
 ```
 
 Runtime config defaults to:

@@ -26,7 +26,7 @@ use deadreckon_core::{
     record_for_resolved_mode, release_lock_file, resolve_mode, restore_snapshot, run_turn_loop,
     save_state, terminate_pid,
 };
-use deadreckon_providers::ProviderRouter;
+use deadreckon_providers::{ProviderRouteInfo, ProviderRouter};
 use deadreckon_sandbox::SandboxBackend;
 use pulldown_cmark::{
     CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions,
@@ -227,6 +227,8 @@ enum Commands {
         sandbox: Option<String>,
         #[arg(long, help = "Provider route override")]
         provider: Option<String>,
+        #[arg(long, help = "Model override for this run")]
+        model: Option<String>,
         #[arg(
             long,
             default_value = "default-coding",
@@ -348,6 +350,8 @@ enum Commands {
         max_wall_seconds: Option<f64>,
         #[arg(long, help = "Provider route override")]
         provider: Option<String>,
+        #[arg(long, help = "Model override for this extended run")]
+        model: Option<String>,
         #[arg(long, help = "Sandbox backend override")]
         sandbox: Option<String>,
         #[arg(long, help = "Skip generated run documentation")]
@@ -465,6 +469,21 @@ enum ConfigCommand {
         #[arg(help = "TOML value or plain string")]
         value: String,
     },
+    #[command(about = "Show or set the default provider route")]
+    Provider {
+        #[arg(help = "Provider route to make default, for example cli:codex")]
+        provider: Option<String>,
+    },
+    #[command(about = "Show or set the model for a provider route")]
+    Model {
+        #[arg(help = "Model to set; omit to show the active route/model")]
+        model: Option<String>,
+        #[arg(
+            long,
+            help = "Provider route to update; defaults to the active provider"
+        )]
+        provider: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -517,6 +536,7 @@ async fn main_inner() -> Result<()> {
             max_wall_seconds,
             sandbox,
             provider,
+            model,
             skill,
             smoke,
             i_know_its_a_lot,
@@ -542,6 +562,7 @@ async fn main_inner() -> Result<()> {
                 max_wall_seconds,
                 sandbox,
                 provider,
+                model,
                 skill,
                 smoke,
                 i_know_its_a_lot,
@@ -605,6 +626,7 @@ async fn main_inner() -> Result<()> {
             max_spend,
             max_wall_seconds,
             provider,
+            model,
             sandbox,
             no_docs,
             doc_skill,
@@ -618,6 +640,7 @@ async fn main_inner() -> Result<()> {
                 max_spend,
                 max_wall_seconds,
                 provider,
+                model,
                 sandbox,
                 no_docs,
                 doc_skill,
@@ -722,8 +745,139 @@ fn config_command(command: ConfigCommand) -> Result<()> {
             fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
             println!("{} {key}", ui_ok("set"));
         }
+        ConfigCommand::Provider { provider } => match provider {
+            Some(provider) => {
+                fs::create_dir_all(paths.home())?;
+                let mut root = load_config_value(&paths)?;
+                set_toml_path(
+                    &mut root,
+                    "defaults.provider",
+                    toml::Value::String(provider.clone()),
+                );
+                set_toml_path(
+                    &mut root,
+                    "default_provider",
+                    toml::Value::String(provider.clone()),
+                );
+                fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
+                println!("{} default provider {}", ui_ok("set"), ui_id(provider));
+            }
+            None => print_provider_selection(&paths, None)?,
+        },
+        ConfigCommand::Model { model, provider } => match model {
+            Some(model) => {
+                fs::create_dir_all(paths.home())?;
+                let mut root = load_config_value(&paths)?;
+                let provider = provider
+                    .or_else(|| active_provider_from_config(&root))
+                    .ok_or_else(|| {
+                        CliError::Core(deadreckon_core::user_error(
+                            "no active provider configured",
+                            "deadreckon config provider cli:codex",
+                        ))
+                    })?;
+                set_provider_model(&mut root, &provider, &model);
+                fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
+                println!(
+                    "{} model for {} -> {}",
+                    ui_ok("set"),
+                    ui_id(provider),
+                    ui_id(model)
+                );
+            }
+            None => print_provider_selection(&paths, provider.as_deref())?,
+        },
     }
     Ok(())
+}
+
+fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> Result<()> {
+    let router = ProviderRouter::from_config_path(&paths.config_path(), provider)?;
+    let routes = router.route_info();
+    let selected = router.selected_route_info();
+    println!("{}", ui_heading("provider selection"));
+    for route in routes {
+        let marker = if selected
+            .as_ref()
+            .is_some_and(|selected| selected.name == route.name)
+        {
+            "*"
+        } else {
+            " "
+        };
+        let credential = if route.has_credential {
+            "ready"
+        } else {
+            "missing"
+        };
+        println!(
+            "{marker} {}  kind={}  model={}  credential={credential}",
+            ui_id(route.name),
+            format_provider_kind(route.kind),
+            route.model
+        );
+    }
+    if let Some(selected) = selected {
+        println!(
+            "{} {}",
+            ui_command("try:"),
+            ui_command(format!(
+                "deadreckon run \"goal\" --provider {} --model <model>",
+                selected.name
+            ))
+        );
+        println!(
+            "{} {}",
+            ui_command("default model:"),
+            ui_command(format!(
+                "deadreckon config model <model> --provider {}",
+                selected.name
+            ))
+        );
+    }
+    Ok(())
+}
+
+fn active_provider_from_config(root: &toml::Value) -> Option<String> {
+    get_toml_path(root, "defaults.provider")
+        .or_else(|| get_toml_path(root, "default_provider"))
+        .and_then(toml::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn set_provider_model(root: &mut toml::Value, provider: &str, model: &str) {
+    if !root.is_table() {
+        *root = toml::Value::Table(Default::default());
+    }
+    let root_table = root.as_table_mut().expect("table after initialization");
+    let providers = root_table
+        .entry("providers".to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    if !providers.is_table() {
+        *providers = toml::Value::Table(Default::default());
+    }
+    let providers_table = providers.as_table_mut().expect("providers table");
+    let provider_entry = providers_table
+        .entry(provider.to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    if !provider_entry.is_table() {
+        *provider_entry = toml::Value::Table(Default::default());
+    }
+    provider_entry
+        .as_table_mut()
+        .expect("provider table")
+        .insert("model".to_string(), toml::Value::String(model.to_string()));
+}
+
+fn format_provider_kind(kind: deadreckon_providers::ProviderKind) -> &'static str {
+    match kind {
+        deadreckon_providers::ProviderKind::Anthropic => "anthropic",
+        deadreckon_providers::ProviderKind::OpenAi => "openai",
+        deadreckon_providers::ProviderKind::OpenAiCompatible => "openai-compatible",
+        deadreckon_providers::ProviderKind::CliClaudeCode => "cli-claude-code",
+        deadreckon_providers::ProviderKind::CliCodex => "cli-codex",
+        deadreckon_providers::ProviderKind::ScriptedSmoke => "smoke",
+    }
 }
 
 struct RunCommandArgs {
@@ -743,6 +897,7 @@ struct RunCommandArgs {
     max_wall_seconds: Option<f64>,
     sandbox: Option<String>,
     provider: Option<String>,
+    model: Option<String>,
     skill: String,
     smoke: bool,
     i_know_its_a_lot: bool,
@@ -761,6 +916,7 @@ struct ExtendCommandArgs {
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
     provider: Option<String>,
+    model: Option<String>,
     sandbox: Option<String>,
     no_docs: bool,
     doc_skill: Option<String>,
@@ -785,6 +941,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         max_wall_seconds,
         sandbox,
         provider,
+        model,
         skill,
         smoke,
         i_know_its_a_lot,
@@ -798,6 +955,11 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
             "--smoke selects the local scripted provider; omit --provider".to_string(),
         )));
     }
+    if smoke && model.is_some() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "--smoke selects the local scripted provider; omit --model".to_string(),
+        )));
+    }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
     let effective_provider = if smoke {
@@ -805,6 +967,20 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     } else {
         provider.clone().or(defaults.provider)
     };
+    let router = if smoke {
+        ProviderRouter::smoke()
+    } else {
+        ProviderRouter::from_config_path_with_model(
+            &paths.config_path(),
+            effective_provider.as_deref(),
+            model.as_deref(),
+        )?
+    };
+    let selected_route = router.selected_route_info();
+    let effective_provider = selected_route
+        .as_ref()
+        .map(|route| route.name.clone())
+        .or(effective_provider);
     let effective_max_spend = max_spend.or(defaults.max_spend).or(Some(10.0));
     let effective_max_wall_seconds = max_wall_seconds
         .or(defaults.cli_max_wall_seconds)
@@ -876,6 +1052,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         cwd: &cwd,
         codebase: &codebase,
         provider: effective_provider.as_deref(),
+        route: selected_route.as_ref(),
         sandbox: &backend.to_string(),
         max_spend: effective_max_spend,
         max_wall_seconds: effective_max_wall_seconds,
@@ -925,7 +1102,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         copy_source_to_working(source_path, &state.working_dir)?;
         deadreckon_core::write_codebase_record(&state.working_dir, &codebase)?;
     }
-    print_run_started(&state);
+    print_run_started(&state, selected_route.as_ref());
     let mut lock = acquire_lock(
         &paths,
         &state.task_key,
@@ -940,11 +1117,6 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     state.set_phase_status(PhaseId(20), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("provider")?;
-    let router = if smoke {
-        ProviderRouter::smoke()
-    } else {
-        ProviderRouter::from_config_path(&paths.config_path(), effective_provider.as_deref())?
-    };
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
@@ -1403,6 +1575,7 @@ struct RunPreview<'a> {
     cwd: &'a Path,
     codebase: &'a CodebaseRecord,
     provider: Option<&'a str>,
+    route: Option<&'a ProviderRouteInfo>,
     sandbox: &'a str,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
@@ -1416,6 +1589,7 @@ fn run_preview(input: RunPreview<'_>) -> String {
         cwd,
         codebase,
         provider,
+        route,
         sandbox,
         max_spend,
         max_wall_seconds,
@@ -1423,7 +1597,11 @@ fn run_preview(input: RunPreview<'_>) -> String {
         run_id,
     } = input;
     let mode = codebase.mode.to_string();
-    let agent = provider.unwrap_or("-");
+    let agent = route
+        .map(|route| route.name.as_str())
+        .or(provider)
+        .unwrap_or("-");
+    let model = route.map(|route| route.model.as_str()).unwrap_or("unknown");
     let caps = format!(
         "spend {}, wall {}",
         max_spend
@@ -1433,7 +1611,7 @@ fn run_preview(input: RunPreview<'_>) -> String {
     );
     if brief {
         return format!(
-            "mode={} branch={} base={} wt={} agent={} cap={}/{}",
+            "mode={} branch={} base={} wt={} provider={} model={} cap={}/{}",
             mode,
             codebase.branch_name.as_deref().unwrap_or("-"),
             codebase.base_ref.as_deref().unwrap_or("-"),
@@ -1443,6 +1621,7 @@ fn run_preview(input: RunPreview<'_>) -> String {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "-".to_string()),
             agent,
+            model,
             max_spend
                 .map(|cap| format!("${cap:.0}"))
                 .unwrap_or_else(|| "uncapped".to_string()),
@@ -1492,7 +1671,8 @@ fn run_preview(input: RunPreview<'_>) -> String {
         lines.push("    warning: SOURCE-IS-USER-TREE; undo uses runstate snapshots".to_string());
     }
     lines.extend([
-        format!("  agent:    {agent}"),
+        format!("  provider: {agent}"),
+        format!("  model:    {model}"),
         format!("  sandbox:  {sandbox}"),
         format!("  caps:     {caps}"),
     ]);
@@ -2283,6 +2463,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         max_spend,
         max_wall_seconds,
         provider,
+        model,
         sandbox,
         no_docs,
         doc_skill,
@@ -2325,6 +2506,16 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
 
     let defaults = config_defaults(&paths)?;
     let effective_provider = provider.or(defaults.provider);
+    let router = ProviderRouter::from_config_path_with_model(
+        &paths.config_path(),
+        effective_provider.as_deref(),
+        model.as_deref(),
+    )?;
+    let selected_route = router.selected_route_info();
+    let effective_provider = selected_route
+        .as_ref()
+        .map(|route| route.name.clone())
+        .or(effective_provider);
     let effective_max_spend = max_spend.or(defaults.max_spend).or(Some(10.0));
     let effective_max_wall_seconds = max_wall_seconds
         .or(defaults.cli_max_wall_seconds)
@@ -2358,6 +2549,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             doc_skill: effective_doc_skill,
             no_docs,
             backend,
+            router,
             post_actions,
             context_turns,
         })
@@ -2432,8 +2624,6 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     state.set_phase_status(PhaseId(20), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("provider")?;
-    let router =
-        ProviderRouter::from_config_path(&paths.config_path(), effective_provider.as_deref())?;
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
@@ -2494,6 +2684,7 @@ struct ExtendWorktreeArgs {
     doc_skill: String,
     no_docs: bool,
     backend: SandboxBackend,
+    router: ProviderRouter,
     post_actions: bool,
     context_turns: Option<u32>,
 }
@@ -2511,6 +2702,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         doc_skill,
         no_docs,
         backend,
+        router,
         post_actions,
         context_turns,
     } = args;
@@ -2591,8 +2783,6 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     state.set_phase_status(PhaseId(20), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("provider")?;
-    let router =
-        ProviderRouter::from_config_path(&paths.config_path(), effective_provider.as_deref())?;
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
@@ -3744,12 +3934,18 @@ fn print_run_locations(state: &deadreckon_core::PipelineState) {
     }
 }
 
-fn print_run_started(state: &deadreckon_core::PipelineState) {
+fn print_run_started(state: &deadreckon_core::PipelineState, route: Option<&ProviderRouteInfo>) {
     println!(
         "{} {}",
         ui_ok("started run"),
         ui_id(format!("{} ({})", run_prefix(&state.run_id), state.run_id))
     );
+    if let Some(route) = route {
+        println!("provider {}", route.name);
+        println!("model {}", route.model);
+    } else if let Some(provider) = state.provider.as_deref() {
+        println!("provider {provider}");
+    }
     println!(
         "{} {}",
         ui_command("attach:"),
@@ -3934,6 +4130,7 @@ async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<
         max_spend: state.max_spend_usd,
         max_wall_seconds: state.max_wall_seconds,
         provider: state.provider.clone(),
+        model: None,
         sandbox: Some(state.sandbox.clone()),
         no_docs: false,
         doc_skill: None,

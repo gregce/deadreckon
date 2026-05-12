@@ -132,6 +132,14 @@ pub trait Provider: Send + Sync {
     fn complete<'a>(&'a self, request: &'a ProviderRequest) -> ProviderFuture<'a>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRouteInfo {
+    pub name: String,
+    pub kind: ProviderKind,
+    pub model: String,
+    pub has_credential: bool,
+}
+
 #[derive(Clone)]
 pub struct ProviderAdapter {
     name: String,
@@ -429,19 +437,39 @@ impl ProviderRouter {
     }
 
     pub fn from_config_path(path: &Path, override_provider: Option<&str>) -> Result<Self> {
+        Self::from_config_path_with_model(path, override_provider, None)
+    }
+
+    pub fn from_config_path_with_model(
+        path: &Path,
+        override_provider: Option<&str>,
+        override_model: Option<&str>,
+    ) -> Result<Self> {
         // REPORT.md: Provider Routing / BYOK keeps credentials in the user's
         // local config/env and tries the configured fallback chain.
         let config = read_config(path)?;
-        Self::from_config(config, override_provider)
+        Self::from_config_with_model(config, override_provider, override_model)
     }
 
     pub fn from_config(
         config: ProviderConfigFile,
         override_provider: Option<&str>,
     ) -> Result<Self> {
+        Self::from_config_with_model(config, override_provider, None)
+    }
+
+    pub fn from_config_with_model(
+        config: ProviderConfigFile,
+        override_provider: Option<&str>,
+        override_model: Option<&str>,
+    ) -> Result<Self> {
         let mut providers = builtin_entries();
         for (name, entry) in config.providers {
-            providers.insert(name, entry);
+            if let Some(base) = providers.get_mut(&name) {
+                merge_provider_entry(base, entry);
+            } else {
+                providers.insert(name, entry);
+            }
         }
 
         let route_names = if let Some(provider) = override_provider {
@@ -467,6 +495,9 @@ impl ProviderRouter {
                     "unknown provider route {name}"
                 )));
             };
+            if let Some(model) = override_model {
+                entry.model = Some(model.to_string());
+            }
             let kind = entry
                 .kind
                 .or_else(|| kind_from_name(&name))
@@ -480,6 +511,27 @@ impl ProviderRouter {
 
     pub fn routes(&self) -> &[Box<dyn Provider>] {
         &self.routes
+    }
+
+    pub fn route_info(&self) -> Vec<ProviderRouteInfo> {
+        self.routes
+            .iter()
+            .map(|route| ProviderRouteInfo {
+                name: route.name().to_string(),
+                kind: route.kind(),
+                model: route.model().to_string(),
+                has_credential: route.has_credential(),
+            })
+            .collect()
+    }
+
+    pub fn selected_route_info(&self) -> Option<ProviderRouteInfo> {
+        let routes = self.route_info();
+        routes
+            .iter()
+            .find(|route| route.has_credential)
+            .cloned()
+            .or_else(|| routes.into_iter().next())
     }
 
     pub async fn complete(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
@@ -551,7 +603,7 @@ fn builtin_entries() -> BTreeMap<String, ProviderEntry> {
                 api_key: None,
                 api_key_env: None,
                 base_url: None,
-                model: Some("cli:claude-code".to_string()),
+                model: None,
                 input_cost_per_million: Some(0.0),
                 output_cost_per_million: Some(0.0),
                 binary: Some("claude".to_string()),
@@ -565,7 +617,7 @@ fn builtin_entries() -> BTreeMap<String, ProviderEntry> {
                 api_key: None,
                 api_key_env: None,
                 base_url: None,
-                model: Some("cli:codex".to_string()),
+                model: None,
                 input_cost_per_million: Some(0.0),
                 output_cost_per_million: Some(0.0),
                 binary: Some("codex".to_string()),
@@ -615,6 +667,36 @@ fn builtin_entries() -> BTreeMap<String, ProviderEntry> {
             },
         ),
     ])
+}
+
+fn merge_provider_entry(base: &mut ProviderEntry, entry: ProviderEntry) {
+    if entry.kind.is_some() {
+        base.kind = entry.kind;
+    }
+    if entry.api_key.is_some() {
+        base.api_key = entry.api_key;
+    }
+    if entry.api_key_env.is_some() {
+        base.api_key_env = entry.api_key_env;
+    }
+    if entry.base_url.is_some() {
+        base.base_url = entry.base_url;
+    }
+    if entry.model.is_some() {
+        base.model = entry.model;
+    }
+    if entry.input_cost_per_million.is_some() {
+        base.input_cost_per_million = entry.input_cost_per_million;
+    }
+    if entry.output_cost_per_million.is_some() {
+        base.output_cost_per_million = entry.output_cost_per_million;
+    }
+    if entry.binary.is_some() {
+        base.binary = entry.binary;
+    }
+    if !entry.extra_args.is_empty() {
+        base.extra_args = entry.extra_args;
+    }
 }
 
 fn build_provider(name: String, kind: ProviderKind, entry: ProviderEntry) -> Box<dyn Provider> {
@@ -751,6 +833,48 @@ api_key = "test"
         assert_eq!(router.routes().len(), 2);
         assert_eq!(router.routes()[0].kind(), ProviderKind::OpenAiCompatible);
         assert!(router.routes()[0].has_credential());
+    }
+
+    #[test]
+    fn partial_provider_entry_merges_with_builtin_defaults() {
+        let router = ProviderRouter::from_config(
+            ProviderConfigFile {
+                default_provider: None,
+                fallback: Some(vec!["openai".to_string()]),
+                providers: [(
+                    "openai".to_string(),
+                    ProviderEntry {
+                        kind: None,
+                        api_key: None,
+                        api_key_env: None,
+                        base_url: None,
+                        model: Some("custom-openai-model".to_string()),
+                        input_cost_per_million: None,
+                        output_cost_per_million: None,
+                        binary: None,
+                        extra_args: Vec::new(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+            None,
+        )
+        .expect("router");
+
+        let route = router.selected_route_info().expect("route");
+        assert_eq!(route.name, "openai");
+        assert_eq!(route.model, "custom-openai-model");
+        let spend = router
+            .estimate_for_route(
+                Some("openai"),
+                ProviderUsage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                },
+            )
+            .expect("spend");
+        assert_eq!(spend.cost_usd, 11.25);
     }
 
     #[test]

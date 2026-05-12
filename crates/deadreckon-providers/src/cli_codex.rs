@@ -17,15 +17,18 @@ pub struct CliCodexProvider {
     binary: String,
     extra_args: Vec<String>,
     model: String,
+    model_arg: Option<String>,
 }
 
 impl CliCodexProvider {
     pub fn new(name: impl Into<String>, entry: ProviderEntry) -> Self {
+        let (model, model_arg) = cli_model(entry.model, "cli:codex");
         Self {
             name: name.into(),
             binary: entry.binary.unwrap_or_else(|| "codex".to_string()),
             extra_args: entry.extra_args,
-            model: entry.model.unwrap_or_else(|| "cli:codex".to_string()),
+            model,
+            model_arg,
         }
     }
 
@@ -35,10 +38,15 @@ impl CliCodexProvider {
             "--ask-for-approval".to_string(),
             "never".to_string(),
             "exec".to_string(),
+        ];
+        if let Some(model) = self.model_arg.as_deref() {
+            args.extend(["--model".to_string(), model.to_string()]);
+        }
+        args.extend([
             "--skip-git-repo-check".to_string(),
             "--sandbox".to_string(),
             codex_sandbox_mode(request.sandbox_backend).to_string(),
-        ];
+        ]);
         // `codex --help` on this machine lists `exec` as "Run Codex
         // non-interactively"; deadreckon uses that verb for subscription-BYOK turns.
         args.extend(self.extra_args.clone());
@@ -81,6 +89,16 @@ impl CliCodexProvider {
                 "sandbox_warning": output.sandbox_warning,
             }),
         })
+    }
+}
+
+fn cli_model(model: Option<String>, legacy_label: &str) -> (String, Option<String>) {
+    match model {
+        Some(model) if model.trim().is_empty() || model == legacy_label => {
+            ("provider default".to_string(), None)
+        }
+        Some(model) => (model.clone(), Some(model)),
+        None => ("provider default".to_string(), None),
     }
 }
 

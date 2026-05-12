@@ -111,6 +111,105 @@ async fn cli_codex_provider_uses_exec_verb() {
 }
 
 #[tokio::test]
+async fn cli_codex_model_override_passes_model_flag() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    write_fake_binary(&binary, "codex-output");
+    let router = ProviderRouter::from_config_with_model(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:codex".to_string()]),
+            providers: [(
+                "cli:codex".to_string(),
+                ProviderEntry {
+                    kind: Some(ProviderKind::CliCodex),
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: None,
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        Some("cli:codex"),
+        Some("gpt-5.1-codex"),
+    )
+    .expect("router");
+
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "make notes".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(response.content.contains("exec --model gpt-5.1-codex"));
+    assert_eq!(response.model, "gpt-5.1-codex");
+    assert_eq!(
+        router.selected_route_info().expect("route").model,
+        "gpt-5.1-codex"
+    );
+}
+
+#[tokio::test]
+async fn cli_claude_model_config_passes_model_flag() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-claude");
+    write_fake_binary(&binary, "claude-output");
+    let router = ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:claude-code".to_string()]),
+            providers: [(
+                "cli:claude-code".to_string(),
+                ProviderEntry {
+                    kind: Some(ProviderKind::CliClaudeCode),
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: Some("sonnet".to_string()),
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router");
+
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "make notes".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(response.content.contains("--model sonnet"));
+    assert_eq!(response.model, "sonnet");
+}
+
+#[tokio::test]
 async fn cli_provider_runs_inside_requested_sandbox_backend() {
     let temp = TempDir::new().expect("tempdir");
     let binary = temp.path().join("fake-claude");

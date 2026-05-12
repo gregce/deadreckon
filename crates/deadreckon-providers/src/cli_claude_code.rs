@@ -16,21 +16,27 @@ pub struct CliClaudeCodeProvider {
     binary: String,
     extra_args: Vec<String>,
     model: String,
+    model_arg: Option<String>,
 }
 
 impl CliClaudeCodeProvider {
     pub fn new(name: impl Into<String>, entry: ProviderEntry) -> Self {
+        let (model, model_arg) = cli_model(entry.model, "cli:claude-code");
         Self {
             name: name.into(),
             binary: entry.binary.unwrap_or_else(|| "claude".to_string()),
             extra_args: entry.extra_args,
-            model: entry.model.unwrap_or_else(|| "cli:claude-code".to_string()),
+            model,
+            model_arg,
         }
     }
 
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let started = Instant::now();
         let mut args = self.extra_args.clone();
+        if let Some(model) = self.model_arg.as_deref() {
+            args.extend(["--model".to_string(), model.to_string()]);
+        }
         // `claude --help` on this machine documents `-p, --print` for
         // non-interactive output and `--dangerously-skip-permissions` for
         // bypassing Claude Code prompts inside an outer sandbox.
@@ -77,6 +83,16 @@ impl CliClaudeCodeProvider {
                 "sandbox_warning": output.sandbox_warning,
             }),
         })
+    }
+}
+
+fn cli_model(model: Option<String>, legacy_label: &str) -> (String, Option<String>) {
+    match model {
+        Some(model) if model.trim().is_empty() || model == legacy_label => {
+            ("provider default".to_string(), None)
+        }
+        Some(model) => (model.clone(), Some(model)),
+        None => ("provider default".to_string(), None),
     }
 }
 

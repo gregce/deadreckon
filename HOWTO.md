@@ -97,6 +97,10 @@ Inspect or edit config:
 
 ```bash
 deadreckon config get defaults.provider
+deadreckon config provider
+deadreckon config provider cli:codex
+deadreckon config model
+deadreckon config model gpt-5.1-codex --provider cli:codex
 deadreckon config set defaults.max_spend 15
 deadreckon config set defaults.sandbox auto
 deadreckon config set providers.anthropic.api_key "$ANTHROPIC_API_KEY"
@@ -181,7 +185,9 @@ The default config from `deadreckon init` supplies the provider, sandbox, `$10` 
 
 ```bash
 deadreckon run "goal" --provider cli:codex
+deadreckon run "goal" --provider cli:codex --model gpt-5.1-codex
 deadreckon run "goal" --provider cli:claude-code
+deadreckon run "goal" --provider cli:claude-code --model sonnet
 deadreckon run "goal" --provider anthropic
 deadreckon run "goal" --provider openai
 deadreckon run "goal" --sandbox sandbox-exec
@@ -189,6 +195,12 @@ deadreckon run "goal" --sandbox none
 deadreckon run "goal" --max-spend 5
 deadreckon run "goal" --max-wall-seconds 1800
 ```
+
+`deadreckon run --preview "goal"` prints the provider and model before creating
+state. `--model` is per-run; `deadreckon config model ...` makes the model
+default for that provider. For CLI providers, `provider default` means
+deadreckon delegates model choice to Codex or Claude Code unless you pass
+`--model`.
 
 Spend above `$50` requires confirmation:
 
