@@ -8,10 +8,26 @@ It is not trying to out-code Amp, Rovo Dev, Cursor CLI, Codex, Claude Code, Aide
 
 ```bash
 deadreckon run "replace the legacy billing flow with Stripe Checkout"
-deadreckon attach <run-id>
-deadreckon doc <run-id>
-deadreckon apply <run-id>
+deadreckon attach latest
+deadreckon status
+deadreckon doc latest
+deadreckon apply latest --autostash --cleanup
 ```
+
+## Why "deadreckon"?
+
+Dead reckoning is navigation without perfect visibility: start from a known
+position, keep a continuous record of movement, and use that record to know
+where you are now.
+
+That is the problem with unattended coding agents. The model is probabilistic,
+the task can run for a long time, context is partial, and the terminal may be
+gone by the time you inspect the result. deadreckon keeps the course anyway:
+every turn writes state, spend, traces, provenance, snapshots, docs, and
+acceptance evidence.
+
+The name is the contract: do not trust a final answer alone. Navigate agent work
+by evidence.
 
 ## Why This Exists
 
@@ -33,6 +49,19 @@ The painful part of unattended coding is different:
 
 deadreckon is built around those questions. It treats an agentic CLI as the worker, then adds the control plane that makes unattended work reviewable, recoverable, auditable, and safe to apply.
 
+## The Printing Press Contract
+
+deadreckon borrows a simple idea from the CLI Printing Press pattern: split
+judgment from enforcement.
+
+The agentic CLI and Markdown skills own the judgment layer: what to inspect,
+what to try, what to edit, and when to say the work is done. The Rust binary owns
+the enforcement layer: state, locks, sandboxes, provider routing, cancellation,
+snapshots, provenance, spend, traces, gates, promotion, and recovery.
+
+That split matters. The agent can write code, but it cannot forge completion,
+skip the audit trail, bypass run state, or silently publish its own work.
+
 ## The Unique Feature Set
 
 ### Isolated Worktrees By Default
@@ -42,6 +71,9 @@ In a git repo, `deadreckon run` creates a separate `git worktree` on a `dr/...` 
 ```bash
 deadreckon apply <run-id>
 ```
+
+Run ids accept unique prefixes, and most commands also accept `latest` for the
+newest run in the current project.
 
 You can also run in copy mode, fresh mode, or explicit in-place mode:
 
@@ -90,10 +122,12 @@ If the terminal dies, the run state is still there. If a provider call completes
 Start a run, walk away, then attach from another terminal:
 
 ```bash
-deadreckon attach <run-id>
+deadreckon attach latest
 ```
 
-The TUI shows the run id, phase, goal, working directory, per-turn timer, spend and context meters, provider/tool activity, generated files, and process status.
+The TUI shows compact run status, phase, goal, working directory, per-turn timer,
+spend or context telemetry, provider/tool activity, generated files, process
+status, and completion actions.
 
 Detach without killing the run:
 
@@ -163,7 +197,17 @@ deadreckon doc <run-id> --kind decisions
 deadreckon doc <run-id> --kind delta
 ```
 
-Public copies are promoted with the run artifact under the local library.
+Each accepted run produces a review packet:
+
+- `RUN-NARRATIVE.md` explains what happened.
+- `RUN-AS-BUILT.md` captures the subsystem shape after the run.
+- `RUN-DECISIONS.md` records meaningful decisions.
+- `AS-BUILT-DELTA.md` proposes architecture-doc updates when the run is broad enough.
+- `manifest.json` records the promoted artifact identity and provenance hash.
+
+Agentic CLIs usually leave you with a patch and a transcript. deadreckon turns
+the session into a local published artifact you can inspect, materialize, extend,
+or apply.
 
 ### Resume, Kill, Extend, Materialize
 
@@ -171,12 +215,14 @@ Runs are lifecycle objects, not one terminal session:
 
 ```bash
 deadreckon list
-deadreckon show <run-id>
-deadreckon kill <run-id>
-deadreckon resume <run-id>
-deadreckon resume <run-id> --from-turn 2
-deadreckon extend <run-id> "add tests and polish the UI"
-deadreckon materialize <run-id> --dest ./finished-project
+deadreckon status
+deadreckon show latest
+deadreckon kill latest
+deadreckon resume latest
+deadreckon resume latest --from-turn 2
+deadreckon extend latest "add tests and polish the UI"
+deadreckon export latest --dest ./finished-project
+deadreckon cleanup --completed
 ```
 
 Resume reconstructs history from durable traces and ignores incomplete trailing trace entries.
@@ -198,7 +244,7 @@ sandboxed turn loop
   v
 signed acceptance gate
   |
-  | inspect, doc, apply, abandon, extend, materialize
+  | inspect, doc, apply, discard, extend, export, cleanup
   v
 your branch or artifact
 ```
@@ -206,6 +252,21 @@ your branch or artifact
 deadreckon owns the boring but load-bearing parts: state, locks, sandboxes, provider routing, cancellation, snapshots, provenance, gates, and promotion.
 
 The agent owns the coding work.
+
+## The Trust Contract
+
+With deadreckon, `completed` means more than "the agent stopped." It means:
+
+- the run state was persisted
+- the work happened in an isolated workspace
+- spend and traces were written
+- file provenance was recorded
+- snapshots exist for rollback
+- run docs were generated
+- `dr-gate` signed acceptance
+- the artifact was promoted atomically
+
+That is the difference between an agent transcript and an auditable run.
 
 ## Quickstart
 
@@ -243,7 +304,7 @@ Inspect the result:
 Apply a completed worktree run:
 
 ```bash
-./target/release/deadreckon apply <run-id>
+./target/release/deadreckon apply latest --autostash --cleanup
 ```
 
 ## Keyless Smoke Test
@@ -266,16 +327,17 @@ After `init`, the default path in a git repo is:
 
 ```bash
 deadreckon run "make a full task productivity tracker in nodejs that allows me to manage my day"
-deadreckon attach <run-id>
-deadreckon doc <run-id>
-deadreckon apply <run-id>
+deadreckon attach latest
+deadreckon status
+deadreckon doc latest
+deadreckon apply latest --autostash --cleanup
 ```
 
 `run` prints the run id and attach command immediately:
 
 ```text
-started run <run-id>
-attach: deadreckon attach <run-id>
+started run <short-id> (<full-id>)
+attach: deadreckon attach <short-id>
 ```
 
 Before creating state or files, `run` prints a preview showing the mode, branch, base ref, and worktree path. Use `--preview` to print the preview and exit.
@@ -342,7 +404,7 @@ deadreckon is not a replacement for agentic CLIs like Amp, Rovo Dev, Cursor CLI,
 | Provenance | Conversation history may not map cleanly to file changes | Records model/tool/file linkage in `provenance.jsonl` |
 | Observability | Tool logs are tool-specific | Writes normalized `events.jsonl`, `traces.jsonl`, spend, docs, and run state |
 | Acceptance | The agent may declare itself done | Requires a signed `dr-gate` marker before promotion |
-| Applying work | Patch review/apply flow is tool-specific | `apply`, `abandon`, `materialize`, and `extend` are first-class lifecycle actions |
+| Applying work | Patch review/apply flow is tool-specific | `apply`, `discard`, `export`, `extend`, and `cleanup` are first-class lifecycle actions |
 | Multi-run coordination | Usually left to the operator | Scope/task locks prevent conflicting same-task runs |
 
 Use the agentic CLI for intelligence. Use deadreckon for isolation, supervision, evidence, recovery, and promotion.
@@ -354,12 +416,17 @@ init          create local config
 config        inspect or edit config keys
 run           start an unattended coding run
 attach        open the live dashboard
-list          show known runs
+status/next   show the current project's latest run and next action
+list          show current-project runs by default; --all shows every scope
 show          inspect state, lineage, spend, files
 doc           print or export run documentation
 apply         apply a completed worktree run to your branch
 abandon       remove a worktree run and temporary branch
+discard       alias for abandon
 materialize   copy a completed artifact to a normal directory
+export        alias for materialize
+cleanup       clean abandoned, stale, or completed worktrees
+prune         alias for cleanup
 extend        continue from a completed run
 resume        continue an interrupted run
 kill          stop a live run and child processes
