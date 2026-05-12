@@ -750,6 +750,7 @@ fn load_or_reconstruct_history(
     if let Some(from_turn) = from_turn {
         history.truncate(from_turn as usize);
         state.turn = from_turn;
+        truncate_run_artifacts_after_turn(state, from_turn)?;
         save_history(state, &history)?;
         save_state(state)?;
     } else if !history_exists && trace_reconstruction.last_complete_turn > state.turn {
@@ -790,11 +791,11 @@ fn reconstruct_history_from_traces(state: &PipelineState) -> Result<Reconstructe
             .get("turn")
             .and_then(Value::as_u64)
             .unwrap_or_default() as u32;
-        if event.starts_with("tool.") {
-            let tool_call_id = value
+        if is_completed_tool_trace(event)
+            && let Some(tool_call_id) = value
                 .pointer("/detail/tool_call_id")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown");
+        {
             history.push(format!(
                 "tool {tool_call_id} result: reconstructed from trace"
             ));
@@ -817,6 +818,63 @@ fn reconstruct_history_from_traces(state: &PipelineState) -> Result<Reconstructe
         history,
         last_complete_turn,
     })
+}
+
+fn is_completed_tool_trace(event: &str) -> bool {
+    matches!(event, "tool.bash" | "tool.write_file" | "tool.cli_subagent")
+}
+
+fn truncate_run_artifacts_after_turn(state: &PipelineState, from_turn: u32) -> Result<()> {
+    for name in ["traces.jsonl", "spend.jsonl"] {
+        truncate_jsonl_after_turn(&state.run_root.join(name), from_turn)?;
+    }
+    let snapshots = state.run_root.join("snapshots");
+    if let Ok(entries) = std::fs::read_dir(&snapshots) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(turn) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("turn-"))
+                .and_then(|turn| turn.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if turn > from_turn {
+                std::fs::remove_dir_all(&path).with_path(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn truncate_jsonl_after_turn(path: &Path, from_turn: u32) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(path).with_path(path)?;
+    let mut kept = Vec::new();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            break;
+        };
+        if value
+            .get("turn")
+            .and_then(Value::as_u64)
+            .is_none_or(|turn| turn <= u64::from(from_turn))
+        {
+            kept.push(line.to_string());
+        }
+    }
+    std::fs::write(
+        path,
+        if kept.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", kept.join("\n"))
+        },
+    )
+    .with_path(path)
 }
 
 fn promote_if_ready(state: &mut PipelineState) -> Result<()> {
@@ -1145,6 +1203,41 @@ mod tests {
     }
 
     #[test]
+    fn resume_partial_trace_ignores_mid_tool_call_trace() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "mid-tool".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(
+            state.run_root.join("traces.jsonl"),
+            r#"{"timestamp":"2026-05-11T00:00:00Z","run_id":"r","turn":1,"event":"tool.bash.started","latency_ms":null,"detail":{"tool_call_id":"tool-open"}}
+{"timestamp":"2026-05-11T00:00:01Z","run_id":"r","turn":1,"event":"tool.bash","latency_ms":1,"detail":{"tool_call_id":"tool-done"}}
+"#,
+        )
+        .expect("trace");
+
+        let history = load_or_reconstruct_history(&mut state, None).expect("history");
+
+        assert_eq!(history.len(), 1);
+        assert!(history[0].contains("tool-done"));
+        assert!(!history[0].contains("tool-open"));
+        assert_eq!(state.turn, 1);
+    }
+
+    #[test]
     fn resume_from_turn_override() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1174,5 +1267,51 @@ mod tests {
         let history = load_or_reconstruct_history(&mut state, Some(2)).expect("history");
         assert_eq!(history, vec!["one".to_string(), "two".to_string()]);
         assert_eq!(state.turn, 2);
+    }
+
+    #[test]
+    fn from_turn_override_truncates_trace_tail_and_future_snapshots() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "from-turn-artifacts".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(
+            state.run_root.join("history.json"),
+            serde_json::to_vec_pretty(&vec!["one", "two", "three"]).expect("json"),
+        )
+        .expect("history");
+        std::fs::write(
+            state.run_root.join("traces.jsonl"),
+            r#"{"timestamp":"2026-05-11T00:00:00Z","run_id":"r","turn":1,"event":"tool.bash","latency_ms":1,"detail":{"tool_call_id":"tool-1"}}
+{"timestamp":"2026-05-11T00:00:01Z","run_id":"r","turn":3,"event":"tool.bash","latency_ms":1,"detail":{"tool_call_id":"tool-3"}}
+"#,
+        )
+        .expect("trace");
+        let future_snapshot = state.run_root.join("snapshots/turn-3");
+        std::fs::create_dir_all(&future_snapshot).expect("snapshot");
+        std::fs::write(future_snapshot.join("future.txt"), "future").expect("future");
+        state.turn = 3;
+
+        let history = load_or_reconstruct_history(&mut state, Some(1)).expect("history");
+        let trace = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("trace");
+
+        assert_eq!(history, vec!["one".to_string()]);
+        assert!(trace.contains("tool-1"));
+        assert!(!trace.contains("tool-3"));
+        assert!(!future_snapshot.exists());
+        assert_eq!(state.turn, 1);
     }
 }
