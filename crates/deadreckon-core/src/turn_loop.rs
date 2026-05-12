@@ -94,6 +94,7 @@ pub async fn run_turn_loop(
             state.status = crate::state::RunStatus::Killed;
             state.failure_reason = Some("run cancelled".to_string());
             save_state(state)?;
+            emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
             return Ok(RunLoopOutcome::Killed);
         }
         let turn_token = run_token.child_token();
@@ -193,6 +194,11 @@ pub async fn run_turn_loop(
         {
             state.pause_reason = Some("spend cap reached".to_string());
             save_state(state)?;
+            emit_run_completed(
+                state,
+                config.event_sender.as_ref(),
+                RunLoopOutcome::PausedAtCap,
+            )?;
             return Ok(RunLoopOutcome::PausedAtCap);
         }
         if response.spend.subscription
@@ -202,6 +208,11 @@ pub async fn run_turn_loop(
         {
             state.pause_reason = Some("wall-clock cap reached".to_string());
             save_state(state)?;
+            emit_run_completed(
+                state,
+                config.event_sender.as_ref(),
+                RunLoopOutcome::PausedAtCap,
+            )?;
             return Ok(RunLoopOutcome::PausedAtCap);
         }
 
@@ -223,6 +234,7 @@ pub async fn run_turn_loop(
                     Some("cli subagent completed without file changes".to_string());
                 state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
                 save_state(state)?;
+                emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
                 return Ok(RunLoopOutcome::Failed);
             }
             snapshot_working(state, turn)?;
@@ -285,6 +297,7 @@ pub async fn run_turn_loop(
             promote_if_ready(state)?;
             state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
             save_state(state)?;
+            emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Done)?;
             return Ok(RunLoopOutcome::Done);
         }
 
@@ -468,6 +481,7 @@ pub async fn run_turn_loop(
                 save_state(state)?;
                 history.push(format!("done: {}", summary.unwrap_or_default()));
                 save_history(state, &history)?;
+                emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Done)?;
                 return Ok(RunLoopOutcome::Done);
             }
         }
@@ -479,7 +493,28 @@ pub async fn run_turn_loop(
     state.failure_reason = Some("max turn budget exhausted".to_string());
     state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
     save_state(state)?;
+    emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
     Ok(RunLoopOutcome::Failed)
+}
+
+fn emit_run_completed(
+    state: &PipelineState,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+    outcome: RunLoopOutcome,
+) -> Result<()> {
+    let status = match outcome {
+        RunLoopOutcome::Done => "completed",
+        RunLoopOutcome::PausedAtCap => "paused",
+        RunLoopOutcome::Killed => "killed",
+        RunLoopOutcome::Failed => "failed",
+    };
+    emit_event(
+        state,
+        sender,
+        RunEventKind::RunCompleted {
+            status: status.to_string(),
+        },
+    )
 }
 
 fn build_prompt(state: &PipelineState, history: &[String]) -> String {

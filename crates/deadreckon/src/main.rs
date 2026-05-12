@@ -43,6 +43,8 @@ use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+mod tui_events;
+
 #[derive(Debug, thiserror::Error)]
 enum CliError {
     #[error(transparent)]
@@ -4150,6 +4152,10 @@ async fn attach_tui(
     run_id: &str,
     show_completion_actions: bool,
 ) -> Result<()> {
+    let initial_state = load_run(paths, run_id)?;
+    let mut event_feed =
+        tui_events::TuiEventFeed::file_tail(initial_state.run_root.join(RUN_EVENTS_JSONL));
+    let mut events = event_feed.refresh(std::time::Duration::ZERO).await?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -4164,7 +4170,7 @@ async fn attach_tui(
         let state = load_run(paths, run_id)?;
         let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
         let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
-        let events = read_jsonl::<RunEvent>(&state.run_root.join(RUN_EVENTS_JSONL))?;
+        events.extend(event_feed.refresh(std::time::Duration::ZERO).await?);
         let live = collect_attach_live(&state);
         let terminal_size = terminal.size()?;
         let terminal_area =
@@ -4176,7 +4182,7 @@ async fn attach_tui(
             render_attach(frame, &state, &spend, &traces, &events, &live, &tui_state)
         })?;
 
-        if event::poll(std::time::Duration::from_millis(500))? {
+        if event::poll(std::time::Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key)
@@ -5496,6 +5502,9 @@ fn event_line(event: &RunEvent, show_cost: bool) -> String {
                 format!("turn {turn} wall {}s", wall_time_seconds.unwrap_or(0.0))
             }
         }
+        deadreckon_core::RunEventKind::RunCompleted { status } => {
+            format!("run {status}")
+        }
         deadreckon_core::RunEventKind::Error { turn, message } => {
             format!("turn {} error {message}", turn.unwrap_or_default())
         }
@@ -5522,6 +5531,16 @@ fn turn_timer(
             .num_seconds()
             .max(0);
         return format!("{elapsed}s running");
+    }
+    if let Some(done_at) = events.iter().rev().find_map(|event| match event.event {
+        deadreckon_core::RunEventKind::RunCompleted { .. } => Some(event.timestamp),
+        _ => None,
+    }) {
+        let elapsed = done_at
+            .signed_duration_since(started.timestamp)
+            .num_seconds()
+            .max(0);
+        return format!("{elapsed}s done");
     }
     if let Some(seconds) = spend
         .iter()

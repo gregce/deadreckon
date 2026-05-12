@@ -37,6 +37,9 @@ pub enum RunEventKind {
         total_cost_usd: f64,
         wall_time_seconds: Option<f64>,
     },
+    RunCompleted {
+        status: String,
+    },
     Error {
         turn: Option<u32>,
         message: String,
