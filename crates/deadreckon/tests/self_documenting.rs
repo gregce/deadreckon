@@ -10,11 +10,11 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use deadreckon_core::{
-    CodebaseMode, CodebaseRecord, DeadreckonPaths, FrontmatterFields, RunOptions, RunStatus,
-    TurnDocInput, TurnRecord, append_parent_narrative_update, append_turn_doc, apply_commit_body,
-    as_built_path, auto_title, coalesce_into_phases, decisions_path, docs_dir, frontmatter,
-    is_decision_candidate, missing_files_in_narrative, narrative_path, publish_docs_for_promotion,
-    rewrite_templated_docs, save_state, should_emit_delta,
+    CodebaseMode, CodebaseRecord, DeadreckonPaths, FileChange, FrontmatterFields, RunOptions,
+    RunStatus, TurnDocInput, TurnRecord, append_parent_narrative_update, append_turn_doc,
+    apply_commit_body, as_built_path, auto_title, coalesce_into_phases, decisions_path, docs_dir,
+    frontmatter, is_decision_candidate, missing_files_in_narrative, narrative_path,
+    publish_docs_for_promotion, rewrite_templated_docs, save_state, should_emit_delta,
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_runtime::{
@@ -512,7 +512,7 @@ async fn still_missing_after_two_retries_logs_warning_but_promotes() {
 fn apply_commit_body_contains_executive_summary() {
     let (_temp, _paths, state) = fresh_state("apply summary");
     append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
-    assert!(apply_commit_body(&state).contains("deadreckon progressed"));
+    assert!(apply_commit_body(&state).contains("The run advanced"));
 }
 
 #[test]
@@ -813,6 +813,8 @@ fn append_sample_turn(
             files: file_paths,
             outcome: outcome.to_string(),
             response_text: outcome.to_string(),
+            tool_stdout: None,
+            tool_stderr: None,
         },
     )
     .expect("append docs")
@@ -832,8 +834,15 @@ fn turn_record(turn: u32, tool: &str, files: &[&str]) -> TurnRecord {
         ),
         tool_kind: tool.to_string(),
         latency_ms: Some(1),
-        files: files.iter().map(|file| file.to_string()).collect(),
+        files: files
+            .iter()
+            .map(|file| FileChange::for_path(file.to_string()))
+            .collect(),
         outcome: "ok".to_string(),
+        response_full: "ok".to_string(),
+        response_summary: "ok".to_string(),
+        tool_stdout: None,
+        tool_stderr: None,
         trace_link: format!("../traces.jsonl#turn-{turn}"),
         snapshot_link: format!("../../snapshots/turn-{turn}/"),
         commit_sha: None,

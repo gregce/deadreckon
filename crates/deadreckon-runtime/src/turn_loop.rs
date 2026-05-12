@@ -315,8 +315,18 @@ pub async fn run_turn_loop(
                         .and_then(Value::as_u64)
                         .map(u128::from),
                     files: changed,
-                    outcome: event_preview(&response.content),
+                    outcome: response.content.clone(),
                     response_text: response.content.clone(),
+                    tool_stdout: response
+                        .trace
+                        .get("stdout")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    tool_stderr: response
+                        .trace
+                        .get("stderr")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
                 },
             )?;
             emit_event(
@@ -449,6 +459,8 @@ pub async fn run_turn_loop(
                         files: changed,
                         outcome: format!("status={:?}", output.status_code),
                         response_text: response.content.clone(),
+                        tool_stdout: Some(output.stdout.clone()),
+                        tool_stderr: Some(output.stderr.clone()),
                     },
                 )?;
                 emit_event(
@@ -540,6 +552,8 @@ pub async fn run_turn_loop(
                         files: changed,
                         outcome: "ok".to_string(),
                         response_text: response.content.clone(),
+                        tool_stdout: None,
+                        tool_stderr: None,
                     },
                 )?;
                 emit_event(
@@ -565,6 +579,8 @@ pub async fn run_turn_loop(
                         files: Vec::new(),
                         outcome: summary.clone().unwrap_or_else(|| "done".to_string()),
                         response_text: response.content.clone(),
+                        tool_stdout: None,
+                        tool_stderr: None,
                     },
                 )?;
                 complete_run_docs(state, router, &config).await?;

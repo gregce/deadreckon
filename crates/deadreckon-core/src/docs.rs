@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -38,6 +39,8 @@ pub struct TurnDocInput {
     pub files: Vec<PathBuf>,
     pub outcome: String,
     pub response_text: String,
+    pub tool_stdout: Option<String>,
+    pub tool_stderr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,13 +49,87 @@ pub struct TurnRecord {
     pub title: String,
     pub tool_kind: String,
     pub latency_ms: Option<u128>,
-    pub files: Vec<String>,
+    pub files: Vec<FileChange>,
     pub outcome: String,
+    #[serde(default)]
+    pub response_full: String,
+    #[serde(default)]
+    pub response_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_stderr: Option<String>,
     pub trace_link: String,
     pub snapshot_link: String,
     pub commit_sha: Option<String>,
+    #[serde(default)]
     pub response_text: String,
     pub decision_candidate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileChange {
+    pub path: String,
+    pub adds: u32,
+    pub dels: u32,
+    pub largest_hunk_excerpt: String,
+    pub is_new: bool,
+    pub is_binary: bool,
+}
+
+impl<'de> Deserialize<'de> for FileChange {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(path) = value.as_str() {
+            return Ok(Self::for_path(path.to_string()));
+        }
+        #[derive(Deserialize)]
+        struct FileChangeObject {
+            path: String,
+            #[serde(default)]
+            adds: u32,
+            #[serde(default)]
+            dels: u32,
+            #[serde(default)]
+            largest_hunk_excerpt: String,
+            #[serde(default)]
+            is_new: bool,
+            #[serde(default)]
+            is_binary: bool,
+        }
+        let object: FileChangeObject =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            path: object.path,
+            adds: object.adds,
+            dels: object.dels,
+            largest_hunk_excerpt: object.largest_hunk_excerpt,
+            is_new: object.is_new,
+            is_binary: object.is_binary,
+        })
+    }
+}
+
+impl FileChange {
+    pub fn for_path(path: String) -> Self {
+        Self {
+            path,
+            adds: 0,
+            dels: 0,
+            largest_hunk_excerpt: String::new(),
+            is_new: false,
+            is_binary: false,
+        }
+    }
+}
+
+impl TurnRecord {
+    pub fn file_paths(&self) -> Vec<String> {
+        self.files.iter().map(|file| file.path.clone()).collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,15 +239,27 @@ pub fn frontmatter(state: &PipelineState, fields: &FrontmatterFields) -> String 
 
 pub fn append_turn_doc(state: &PipelineState, input: TurnDocInput) -> Result<TurnRecord> {
     ensure_docs_started(state)?;
-    let files = normalize_files(state, &input.files);
-    let title = auto_title(&input.response_text, &input.tool_kind, &files, input.turn);
+    let normalized_files = normalize_files(state, &input.files);
+    let file_changes = capture_diff_samples(state, input.turn, &input.files)?;
+    let title = auto_title(
+        &input.response_text,
+        &input.tool_kind,
+        &normalized_files,
+        input.turn,
+    );
+    let response_full = capture_response_full(&input.response_text);
+    let response_summary = capture_response_summary(&response_full);
     let record = TurnRecord {
         turn: input.turn,
         title,
         tool_kind: input.tool_kind,
         latency_ms: input.latency_ms,
-        files,
+        files: file_changes,
         outcome: input.outcome,
+        response_full,
+        response_summary,
+        tool_stdout: input.tool_stdout.as_deref().map(capture_tool_stdio),
+        tool_stderr: input.tool_stderr.as_deref().map(capture_tool_stdio),
         trace_link: format!("../traces.jsonl#turn-{}", input.turn),
         snapshot_link: format!("../../snapshots/turn-{}/", input.turn),
         commit_sha: current_worktree_sha(state)?,
@@ -180,6 +269,52 @@ pub fn append_turn_doc(state: &PipelineState, input: TurnDocInput) -> Result<Tur
     append_json_line(&incremental_path(&state.working_dir), &record)?;
     rewrite_templated_docs(state, "templated only")?;
     Ok(record)
+}
+
+pub fn capture_response_full(response: &str) -> String {
+    cap_utf8(response, 50 * 1024)
+}
+
+pub fn capture_response_summary(response: &str) -> String {
+    let paragraph = response
+        .split("\n\n")
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or(response)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    cap_on_word_boundary(&paragraph, 280)
+}
+
+pub fn capture_tool_stdio(value: &str) -> String {
+    cap_utf8(value, 10 * 1024)
+}
+
+pub fn capture_diff_samples(
+    state: &PipelineState,
+    turn: u32,
+    files: &[PathBuf],
+) -> Result<Vec<FileChange>> {
+    let normalized = normalize_files(state, files);
+    let previous_root = state
+        .run_root
+        .join("snapshots")
+        .join(format!("turn-{}", turn.saturating_sub(1)));
+    let mut changes = Vec::new();
+    for (idx, path) in files.iter().enumerate() {
+        let relative = normalized
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
+        let current = if path.is_absolute() {
+            path.clone()
+        } else {
+            state.working_dir.join(path)
+        };
+        let previous = previous_root.join(&relative);
+        changes.push(diff_sample_for_file(&relative, &previous, &current)?);
+    }
+    Ok(changes)
 }
 
 pub fn read_turn_records(working_dir: &Path) -> Result<Vec<TurnRecord>> {
@@ -369,7 +504,7 @@ pub fn changed_doc_files(state: &PipelineState) -> Result<Vec<String>> {
     let records = read_turn_records(&state.working_dir)?;
     Ok(records
         .iter()
-        .flat_map(|record| record.files.iter().cloned())
+        .flat_map(TurnRecord::file_paths)
         .filter(|file| !file.starts_with(".deadreckon/") && !file.starts_with("docs/"))
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -390,6 +525,90 @@ pub fn missing_files_in_narrative(state: &PipelineState) -> Result<Vec<String>> 
             !narrative.contains(file) && !narrative.contains(basename)
         })
         .collect())
+}
+
+pub fn source_layout(records: &[TurnRecord], working_dir: &Path) -> String {
+    let files = all_files(records);
+    let mut out = String::new();
+    out.push_str("| Layer | Responsibilities | Key entrypoints |\n| --- | --- | --- |\n");
+    let component_rows = component_rows(records);
+    if component_rows.is_empty() {
+        out.push_str("| (none inferred) | No mapped component paths changed | - |\n");
+    } else {
+        for row in component_rows {
+            out.push_str(&format!(
+                "| {} | {} | `{}` |\n",
+                row.layer, row.responsibility, row.entrypoint
+            ));
+        }
+    }
+    if let Some(topology) = topology_for_files(working_dir, &files) {
+        out.push_str("\n```text\n");
+        out.push_str(&topology);
+        out.push_str("\n```\n");
+    }
+    out
+}
+
+pub fn diff_samples_markdown(records: &[TurnRecord]) -> String {
+    let mut out = String::new();
+    for record in records {
+        if record.files.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("### Turn {}\n\n", record.turn));
+        for file in &record.files {
+            out.push_str(&format!(
+                "- `{}`: +{}/-{}{}\n",
+                file.path,
+                file.adds,
+                file.dels,
+                if file.is_binary { " (binary)" } else { "" }
+            ));
+            if !file.largest_hunk_excerpt.trim().is_empty() {
+                out.push_str("  ```diff\n");
+                out.push_str(&file.largest_hunk_excerpt);
+                out.push_str("\n  ```\n");
+            }
+        }
+    }
+    if out.trim().is_empty() {
+        "No diff samples recorded.".to_string()
+    } else {
+        out
+    }
+}
+
+pub fn tool_stdio_markdown(records: &[TurnRecord]) -> String {
+    let mut out = String::new();
+    for record in records {
+        if record.tool_stdout.is_none() && record.tool_stderr.is_none() {
+            continue;
+        }
+        out.push_str(&format!(
+            "### Turn {} `{}`\n\n",
+            record.turn, record.tool_kind
+        ));
+        if let Some(stdout) = record.tool_stdout.as_deref()
+            && !stdout.trim().is_empty()
+        {
+            out.push_str("stdout:\n\n```text\n");
+            out.push_str(stdout.trim());
+            out.push_str("\n```\n\n");
+        }
+        if let Some(stderr) = record.tool_stderr.as_deref()
+            && !stderr.trim().is_empty()
+        {
+            out.push_str("stderr:\n\n```text\n");
+            out.push_str(stderr.trim());
+            out.push_str("\n```\n\n");
+        }
+    }
+    if out.trim().is_empty() {
+        "No bash stdout/stderr captured.".to_string()
+    } else {
+        out
+    }
 }
 
 pub fn append_docs_warning(state: &PipelineState, message: &str) -> Result<()> {
@@ -463,20 +682,22 @@ fn render_narrative(
                     .map(|sha| format!("commit `{sha}`"))
                     .unwrap_or_else(|| "commit `-`".to_string())
             ));
-            let files = if phase.files.is_empty() {
-                "no file changes recorded".to_string()
-            } else {
-                phase
-                    .files
-                    .iter()
-                    .map(|file| format!("`{file}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            out.push_str(&format!(
-                "- Turns {}-{} changed {}.\n",
-                phase.start_turn, phase.end_turn, files
-            ));
+            out.push_str(&phase_paragraph(&phase));
+            out.push_str("\n\n");
+            out.push_str("| File | Change | Largest hunk |\n| --- | ---: | --- |\n");
+            for file in phase_file_changes(&phase) {
+                out.push_str(&format!(
+                    "| `{}` | +{} / -{} | {} |\n",
+                    file.path,
+                    file.adds,
+                    file.dels,
+                    hunk_inline(&file.largest_hunk_excerpt)
+                ));
+            }
+            if phase.files.is_empty() {
+                out.push_str("| - | +0 / -0 | no file changes recorded |\n");
+            }
+            out.push('\n');
             for turn in &phase.turns {
                 out.push_str(&render_turn_section(turn));
             }
@@ -487,7 +708,7 @@ fn render_narrative(
         out.push_str("## Updates since the parent run\n\n");
         let files = records
             .iter()
-            .flat_map(|record| record.files.iter())
+            .flat_map(TurnRecord::file_paths)
             .collect::<BTreeSet<_>>();
         if files.is_empty() {
             out.push_str(&format!(
@@ -505,7 +726,15 @@ fn render_narrative(
         }
     }
     out.push_str("## Open threads\n\n");
-    out.push_str("- No open threads recorded by deadreckon.\n\n");
+    let open_threads = open_threads(records);
+    if open_threads.is_empty() {
+        out.push_str("- No open threads recorded by deadreckon.\n\n");
+    } else {
+        for thread in open_threads {
+            out.push_str(&format!("- {thread}\n"));
+        }
+        out.push('\n');
+    }
     out.push_str("## Cross-references\n\n");
     out.push_str(&format!(
         "- Traces: `traces.jsonl` ({} turns)\n",
@@ -559,10 +788,28 @@ fn render_turn_section(record: &TurnRecord) -> String {
             record
                 .files
                 .iter()
-                .map(|file| format!("`{file}`"))
+                .map(|file| format!("`{}`", file.path))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+        for file in &record.files {
+            out.push_str(&format!(
+                "  - `{}`: +{} / -{}{}\n",
+                file.path,
+                file.adds,
+                file.dels,
+                if file.is_binary { " (binary)" } else { "" }
+            ));
+            if !file.largest_hunk_excerpt.trim().is_empty() {
+                out.push_str("    ```diff\n");
+                for line in file.largest_hunk_excerpt.lines().take(3) {
+                    out.push_str("    ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                out.push_str("    ```\n");
+            }
+        }
     }
     out.push_str(&format!("- Outcome: {}\n", record.outcome));
     out.push_str(&format!(
@@ -601,23 +848,30 @@ fn render_as_built(
     out.push_str("This document describes the subsystem changed by this run. For chronology, see [`RUN-NARRATIVE.md`](./RUN-NARRATIVE.md).\n\n");
     out.push_str("## System overview\n\n");
     out.push_str(&high_level_approach(records));
-    out.push_str("\n\n## Components (changed in this run)\n\n");
+    out.push_str("\n\n**What's load-bearing:** The changed entrypoints listed below are the files future maintainers should inspect first; they are the run's concrete handoff from prompt to code.\n\n");
+    out.push_str("**Where the seams are:** The boundaries are inferred from paths, manifests, tests, and docs so unmapped files are omitted instead of hidden under a generic bucket.\n\n");
+    out.push_str("## Components (changed in this run)\n\n");
     out.push_str("| Layer | Responsibilities | Key entrypoints |\n| --- | --- | --- |\n");
     let files = all_files(records);
-    if files.is_empty() {
-        out.push_str("| Working tree | No files recorded yet | - |\n");
+    let rows = component_rows(records);
+    if rows.is_empty() {
+        out.push_str("| (none inferred) | No mapped component paths changed | - |\n");
     } else {
-        for file in &files {
+        for row in rows {
             out.push_str(&format!(
-                "| {} | Changed during run `{}` | `{}` |\n",
-                layer_for_file(file),
-                short_id(&state.run_id),
-                file
+                "| {} | {} | `{}` |\n",
+                row.layer, row.responsibility, row.entrypoint
             ));
         }
     }
     out.push_str("\n## Process / data flow\n\n");
-    out.push_str("```text\nGoal -> provider turn -> tool call -> snapshot/provenance -> docs -> gate -> promotion\n```\n\n");
+    if let Some(topology) = topology_for_files(&state.working_dir, &files) {
+        out.push_str("```text\n");
+        out.push_str(&topology);
+        out.push_str("\n```\n\n");
+    } else {
+        out.push_str("No multi-directory process topology was inferred for this run.\n\n");
+    }
     out.push_str("## File-system layout (changed/added paths)\n\n```text\n");
     if files.is_empty() {
         out.push_str("(no changed paths recorded)\n");
@@ -685,7 +939,7 @@ fn render_decisions(
                 record
                     .files
                     .iter()
-                    .map(|file| format!("`{file}`"))
+                    .map(|file| format!("`{}`", file.path))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -769,11 +1023,10 @@ fn source_has_as_built(working_dir: &Path, files: &[String]) -> bool {
 
 fn title_from_goal(goal: &str) -> String {
     let first = goal.lines().next().unwrap_or("deadreckon run").trim();
-    let words = first.split_whitespace().take(10).collect::<Vec<_>>();
-    if words.is_empty() {
+    if first.is_empty() {
         "deadreckon run".to_string()
     } else {
-        words.join(" ")
+        first.to_string()
     }
 }
 
@@ -861,10 +1114,86 @@ fn normalize_files(state: &PipelineState, files: &[PathBuf]) -> Vec<String> {
     normalized
 }
 
+fn diff_sample_for_file(relative: &str, previous: &Path, current: &Path) -> Result<FileChange> {
+    if current.exists() && is_binary_file(current)? {
+        return Ok(FileChange {
+            path: relative.to_string(),
+            adds: 0,
+            dels: 0,
+            largest_hunk_excerpt: String::new(),
+            is_new: !previous.exists(),
+            is_binary: true,
+        });
+    }
+    let before = fs::read_to_string(previous).unwrap_or_default();
+    let after = fs::read_to_string(current).unwrap_or_default();
+    let before_lines = before.lines().collect::<Vec<_>>();
+    let after_lines = after.lines().collect::<Vec<_>>();
+    let common_prefix = before_lines
+        .iter()
+        .zip(after_lines.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let common_suffix = before_lines[common_prefix..]
+        .iter()
+        .rev()
+        .zip(after_lines[common_prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let before_end = before_lines.len().saturating_sub(common_suffix);
+    let after_end = after_lines.len().saturating_sub(common_suffix);
+    let removed = &before_lines[common_prefix..before_end];
+    let added = &after_lines[common_prefix..after_end];
+    let adds = added.len() as u32;
+    let dels = removed.len() as u32;
+    let old_start = common_prefix + 1;
+    let new_start = common_prefix + 1;
+    let header = format!(
+        "@@ -{},{} +{},{} @@",
+        old_start.max(1),
+        removed.len(),
+        new_start.max(1),
+        added.len()
+    );
+    let mut excerpt_lines = vec![header];
+    for line in removed.iter().take(5) {
+        excerpt_lines.push(format!("-{line}"));
+    }
+    for line in added
+        .iter()
+        .take(5usize.saturating_sub(excerpt_lines.len().saturating_sub(1)))
+    {
+        excerpt_lines.push(format!("+{line}"));
+    }
+    Ok(FileChange {
+        path: relative.to_string(),
+        adds,
+        dels,
+        largest_hunk_excerpt: if adds == 0 && dels == 0 {
+            String::new()
+        } else {
+            excerpt_lines.join("\n")
+        },
+        is_new: !previous.exists() && current.exists(),
+        is_binary: false,
+    })
+}
+
+fn is_binary_file(path: &Path) -> Result<bool> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(bytes.contains(&0) || std::str::from_utf8(&bytes).is_err()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 fn all_files(records: &[TurnRecord]) -> Vec<String> {
     records
         .iter()
-        .flat_map(|record| record.files.iter().cloned())
+        .flat_map(TurnRecord::file_paths)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -874,32 +1203,282 @@ fn high_level_approach(records: &[TurnRecord]) -> String {
     if records.is_empty() {
         return "No completed turns have been recorded yet.".to_string();
     }
-    let mut parts = records
+    let summaries = records
         .iter()
         .take(3)
-        .map(|record| format!("turn {} used {}", record.turn, record.tool_kind))
+        .map(|record| {
+            let summary = if record.response_summary.trim().is_empty() {
+                capture_response_summary(&record.outcome)
+            } else {
+                record.response_summary.clone()
+            };
+            format!(
+                "turn {} used `{}` and reported {}",
+                record.turn, record.tool_kind, summary
+            )
+        })
         .collect::<Vec<_>>();
-    if parts.is_empty() {
-        parts.push("the run has not yet mutated files".to_string());
+    if summaries.is_empty() {
+        return "The run has not yet mutated files.".to_string();
     }
     format!(
-        "deadreckon progressed through {} and tracked the resulting files, traces, snapshots, and provenance.",
-        parts.join(", ")
+        "The run advanced through {}. Each turn is tied to trace, snapshot, provenance, and diff evidence so the narrative can be audited without replaying the provider session.",
+        summaries.join("; ")
     )
 }
 
-fn layer_for_file(file: &str) -> &'static str {
-    if file.ends_with(".rs") {
-        "Rust"
-    } else if file.ends_with(".js") || file.ends_with(".ts") {
-        "Frontend/runtime"
-    } else if file.ends_with(".md") {
-        "Documentation"
-    } else if file.contains("test") {
-        "Tests"
+fn phase_paragraph(phase: &Phase) -> String {
+    let summaries = phase
+        .turns
+        .iter()
+        .map(|turn| {
+            let summary = if turn.response_summary.trim().is_empty() {
+                capture_response_summary(&turn.outcome)
+            } else {
+                turn.response_summary.clone()
+            };
+            format!(
+                "turn {} used `{}` to {}",
+                turn.turn, turn.tool_kind, summary
+            )
+        })
+        .collect::<Vec<_>>();
+    let files = if phase.files.is_empty() {
+        "no files".to_string()
     } else {
-        "Project files"
+        phase
+            .files
+            .iter()
+            .map(|file| format!("`{file}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if summaries.is_empty() {
+        format!(
+            "Turns {}-{} recorded no provider summary but touched {files}.",
+            phase.start_turn, phase.end_turn
+        )
+    } else {
+        format!(
+            "Turns {}-{} focused on {files}. {}.",
+            phase.start_turn,
+            phase.end_turn,
+            summaries.join("; ")
+        )
     }
+}
+
+fn phase_file_changes(phase: &Phase) -> Vec<FileChange> {
+    let mut by_path = BTreeMap::<String, FileChange>::new();
+    for turn in &phase.turns {
+        for file in &turn.files {
+            by_path
+                .entry(file.path.clone())
+                .and_modify(|existing| {
+                    existing.adds += file.adds;
+                    existing.dels += file.dels;
+                    if existing.largest_hunk_excerpt.lines().count()
+                        < file.largest_hunk_excerpt.lines().count()
+                    {
+                        existing.largest_hunk_excerpt = file.largest_hunk_excerpt.clone();
+                    }
+                    existing.is_new |= file.is_new;
+                    existing.is_binary |= file.is_binary;
+                })
+                .or_insert_with(|| file.clone());
+        }
+    }
+    by_path.into_values().collect()
+}
+
+fn hunk_inline(excerpt: &str) -> String {
+    if excerpt.trim().is_empty() {
+        "no textual hunk captured".to_string()
+    } else {
+        format!(
+            "`{}`",
+            excerpt
+                .lines()
+                .take(3)
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(" / ")
+                .replace('|', "\\|")
+        )
+    }
+}
+
+fn open_threads(records: &[TurnRecord]) -> Vec<String> {
+    let markers = [
+        "TODO",
+        "out of scope",
+        "follow-up",
+        "noted but not implemented",
+    ];
+    let mut threads = BTreeSet::new();
+    for record in records {
+        for line in record.response_full.lines() {
+            if markers.iter().any(|marker| {
+                line.to_ascii_lowercase()
+                    .contains(&marker.to_ascii_lowercase())
+            }) {
+                threads.insert(format!("turn {}: {}", record.turn, one_line(line, 180)));
+            }
+        }
+    }
+    threads.into_iter().collect()
+}
+
+#[derive(Debug, Clone)]
+struct ComponentRow {
+    layer: String,
+    responsibility: String,
+    entrypoint: String,
+}
+
+fn component_rows(records: &[TurnRecord]) -> Vec<ComponentRow> {
+    let mut rows = BTreeMap::<String, ComponentRow>::new();
+    for record in records {
+        for file in &record.files {
+            let Some(layer) = layer_for_path(&file.path) else {
+                continue;
+            };
+            rows.entry(format!("{layer}:{}", file.path))
+                .or_insert_with(|| ComponentRow {
+                    layer: layer.to_string(),
+                    responsibility: responsibility_for_layer(&layer).to_string(),
+                    entrypoint: entrypoint_for_change(file),
+                });
+        }
+    }
+    rows.into_values().collect()
+}
+
+fn layer_for_path(file: &str) -> Option<String> {
+    let path = Path::new(file);
+    let first = file.split('/').next().unwrap_or(file);
+    if let Some(crate_name) = file
+        .strip_prefix("crates/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|name| !name.is_empty())
+    {
+        return Some(format!("Crate {crate_name} (Rust)"));
+    }
+    if matches!(file, "Cargo.toml" | "Cargo.lock") {
+        return Some("Workspace manifest".to_string());
+    }
+    if let Some(component) = file
+        .strip_prefix("src/components/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|name| !name.is_empty())
+    {
+        return Some(format!("Frontend component ({component})"));
+    }
+    if matches!(first, "src" | "app" | "pages")
+        && (file.starts_with("src/pages/")
+            || file.starts_with("src/routes/")
+            || matches!(first, "app" | "pages"))
+    {
+        return Some("Frontend route".to_string());
+    }
+    if file.contains(".test.") || first == "tests" || first == "__tests__" {
+        return Some("Tests".to_string());
+    }
+    if first == "docs" || path.parent().is_none() && file.ends_with(".md") {
+        return Some("Documentation".to_string());
+    }
+    if first == "migrations" || file.ends_with(".sql") {
+        return Some("Database migration".to_string());
+    }
+    if file.starts_with(".github/workflows/") {
+        return Some("CI".to_string());
+    }
+    if matches!(file, "Makefile" | "Justfile") {
+        return Some("Build script".to_string());
+    }
+    if matches!(file, "package.json" | "pnpm-lock.yaml" | "yarn.lock") {
+        return Some("Frontend manifest".to_string());
+    }
+    if file == "pyproject.toml" || file.starts_with("requirements") && file.ends_with(".txt") {
+        return Some("Python manifest".to_string());
+    }
+    if matches!(file, "go.mod" | "go.sum") {
+        return Some("Go module".to_string());
+    }
+    None
+}
+
+fn responsibility_for_layer(layer: &str) -> &'static str {
+    if layer.starts_with("Crate ") {
+        "Rust crate touched by this run"
+    } else if layer.starts_with("Frontend component") {
+        "User-facing component implementation"
+    } else if layer == "Frontend route" {
+        "Routable frontend surface"
+    } else if layer == "Tests" {
+        "Verification surface"
+    } else if layer == "Documentation" {
+        "Project documentation and run handoff"
+    } else if layer.contains("manifest") {
+        "Dependency, script, or workspace metadata"
+    } else {
+        "Changed subsystem surface"
+    }
+}
+
+fn entrypoint_for_change(file: &FileChange) -> String {
+    let line = largest_hunk_new_line(&file.largest_hunk_excerpt).unwrap_or(1);
+    format!("{}:{line}", file.path)
+}
+
+fn topology_for_files(working_dir: &Path, files: &[String]) -> Option<String> {
+    let dirs = files
+        .iter()
+        .filter_map(|file| file.split_once('/').map(|(dir, _)| dir))
+        .filter(|dir| !dir.is_empty())
+        .collect::<BTreeSet<_>>();
+    if dirs.len() < 3 {
+        return None;
+    }
+    let dirs = dirs.into_iter().take(6).collect::<Vec<_>>();
+    let mut out = String::new();
+    for dir in &dirs {
+        out.push_str("+-----------+   ");
+        let _ = dir;
+    }
+    out.push('\n');
+    for dir in &dirs {
+        out.push_str(&format!("| {:<9} |-->", format!("{dir}/")));
+    }
+    out.push('\n');
+    for _ in &dirs {
+        out.push_str("+-----------+   ");
+    }
+    out.push('\n');
+    for (left_idx, left) in dirs.iter().enumerate() {
+        for right in dirs.iter().skip(left_idx + 1) {
+            if directory_mentions(working_dir, left, right) {
+                out.push_str(&format!("{left}/ -> {right}/\n"));
+            }
+            if directory_mentions(working_dir, right, left) {
+                out.push_str(&format!("{right}/ -> {left}/\n"));
+            }
+        }
+    }
+    Some(out.trim_end().to_string())
+}
+
+fn directory_mentions(working_dir: &Path, left: &str, right: &str) -> bool {
+    let root = working_dir.join(left);
+    if !root.is_dir() {
+        return false;
+    }
+    let needle = format!("{right}/");
+    inventory_files(&root)
+        .unwrap_or_default()
+        .into_iter()
+        .take(200)
+        .any(|path| fs::read_to_string(path).is_ok_and(|raw| raw.contains(&needle)))
 }
 
 fn current_worktree_sha(state: &PipelineState) -> Result<Option<String>> {
@@ -1063,12 +1642,12 @@ fn file_overlap(current: &[TurnRecord], turn: &TurnRecord) -> f64 {
     }
     let current_files = current
         .iter()
-        .flat_map(|record| record.files.iter())
+        .flat_map(TurnRecord::file_paths)
         .collect::<BTreeSet<_>>();
     let overlap = turn
         .files
         .iter()
-        .filter(|file| current_files.contains(file))
+        .filter(|file| current_files.contains(&file.path))
         .count();
     overlap as f64 / turn.files.len() as f64
 }
@@ -1100,7 +1679,7 @@ fn phase_from_group(index: usize, turns: Vec<TurnRecord>) -> Phase {
     let commit_sha = turns.iter().find_map(|turn| turn.commit_sha.clone());
     let files = turns
         .iter()
-        .flat_map(|turn| turn.files.iter().cloned())
+        .flat_map(TurnRecord::file_paths)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -1171,6 +1750,42 @@ fn one_line(value: &str, limit: usize) -> String {
     } else {
         format!("{}...", collapsed.chars().take(limit).collect::<String>())
     }
+}
+
+fn cap_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_string()
+}
+
+fn cap_on_word_boundary(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    if let Some(idx) = out.rfind(char::is_whitespace) {
+        out.truncate(idx);
+    }
+    out.trim_end_matches(|ch: char| ch.is_ascii_punctuation() && ch != '.')
+        .trim()
+        .to_string()
+}
+
+fn largest_hunk_new_line(excerpt: &str) -> Option<usize> {
+    let header = excerpt.lines().next()?.trim();
+    let plus = header
+        .split_whitespace()
+        .find(|part| part.starts_with('+'))?;
+    plus.trim_start_matches('+')
+        .split(',')
+        .next()?
+        .parse::<usize>()
+        .ok()
 }
 
 pub fn apply_commit_body(state: &PipelineState) -> String {
