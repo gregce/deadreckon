@@ -602,6 +602,196 @@ fn single_run_show_renders_chain_banner_when_step_json_present() {
 }
 
 #[test]
+fn chain_latest_alias_resolves_to_most_recent_in_scope() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    assert_success(
+        &deadreckon(&paths)
+            .current_dir(&repo)
+            .args(["chain", "--draft", "older one", "older two"])
+            .output()
+            .expect("older"),
+    );
+    assert_success(
+        &deadreckon(&paths)
+            .current_dir(&repo)
+            .args(["chain", "--draft", "newer one", "newer two"])
+            .output()
+            .expect("newer"),
+    );
+    let latest = newest_chain(&paths);
+
+    let show = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "show", "latest"])
+        .output()
+        .expect("show");
+
+    assert_success(&show);
+    assert!(stdout(&show).contains(&latest.chain_id));
+}
+
+#[test]
+fn chain_resume_runs_pending_draft() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    assert_success(
+        &deadreckon(&paths)
+            .current_dir(&repo)
+            .args([
+                "chain",
+                "--draft",
+                "--provider",
+                "smoke",
+                "--sandbox",
+                "none",
+                "--max-spend",
+                "4",
+                "resume one",
+                "resume two",
+            ])
+            .output()
+            .expect("draft"),
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "resume", "latest"])
+        .output()
+        .expect("resume");
+
+    assert_success(&output);
+    assert_eq!(newest_chain(&paths).status, ChainStatus::Completed);
+}
+
+#[test]
+fn chain_extend_appends_step_and_writes_event() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    assert_success(
+        &deadreckon(&paths)
+            .current_dir(&repo)
+            .args(["chain", "--draft", "one", "two"])
+            .output()
+            .expect("draft"),
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "extend", "latest", "three"])
+        .output()
+        .expect("extend");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.steps.len(), 3);
+    assert_eq!(chain.steps[2].goal, "three");
+    let events = fs::read_to_string(paths.chain_events(&chain.chain_id)).expect("events");
+    assert!(events.contains("chain_step_extended"));
+}
+
+#[test]
+fn chain_redo_applied_step_requires_reapply_flag() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    assert_success(
+        &deadreckon(&paths)
+            .current_dir(&repo)
+            .args([
+                "chain",
+                "--yes",
+                "--provider",
+                "smoke",
+                "--sandbox",
+                "none",
+                "--max-spend",
+                "2",
+                "redo one",
+                "redo two",
+            ])
+            .output()
+            .expect("run"),
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "redo", "latest", "--step", "1"])
+        .output()
+        .expect("redo");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("redo needs --reapply"));
+    assert!(stderr.contains("try:"));
+}
+
+#[test]
+fn chain_undo_records_undone_step_events() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    assert_success(
+        &deadreckon(&paths)
+            .current_dir(&repo)
+            .args([
+                "chain",
+                "--yes",
+                "--provider",
+                "smoke",
+                "--sandbox",
+                "none",
+                "--max-spend",
+                "2",
+                "undo one",
+                "undo two",
+            ])
+            .output()
+            .expect("run"),
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "undo", "latest", "--no-confirm"])
+        .output()
+        .expect("undo");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.status, ChainStatus::Undone);
+    let events = fs::read_to_string(paths.chain_events(&chain.chain_id)).expect("events");
+    assert!(events.contains("chain_undone_step"));
+}
+
+#[test]
+fn chain_pause_refuses_when_status_not_running_with_try() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    assert_success(
+        &deadreckon(&paths)
+            .current_dir(&repo)
+            .args(["chain", "--draft", "one", "two"])
+            .output()
+            .expect("draft"),
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "pause", "latest"])
+        .output()
+        .expect("pause");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("cannot pause 'pending' chain"));
+    assert!(stderr.contains("try:"));
+}
+
+#[test]
 fn chain_hooks_list_emits_resolution_tiers() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
