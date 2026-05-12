@@ -2187,7 +2187,7 @@ fn auto_apply_chain_step(
             {
                 return Err(CliError::Core(deadreckon_core::user_error(
                     &format!(
-                        "step '{}' refused auto-apply ({file} outside allowlist)",
+                        "step '{}' refused auto-apply (outside_allowlist {file})",
                         index + 1
                     ),
                     &format!(
@@ -3609,7 +3609,7 @@ fn compact_reason(reason: &str) -> String {
         .collect::<String>()
         .trim_matches('_')
         .chars()
-        .take(48)
+        .take(96)
         .collect()
 }
 

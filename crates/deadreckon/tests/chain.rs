@@ -526,6 +526,224 @@ fn branch_policy_base_each_step_off_chain_base() {
 }
 
 #[test]
+fn apply_mode_auto_refuses_when_file_outside_allowlist() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--apply-allowlist",
+            "src/",
+            "--max-spend",
+            "2",
+            "allow one",
+            "allow two",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.status, ChainStatus::Paused);
+    assert_eq!(chain.steps[0].status, ChainStepStatus::Completed);
+    assert_ne!(chain.steps[0].status, ChainStepStatus::Applied);
+    assert!(
+        chain
+            .paused_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("outside_allowlist"),
+        "{:?}",
+        chain.paused_reason
+    );
+}
+
+#[test]
+fn apply_mode_manual_pauses_chain_after_inner_completion() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--apply-mode",
+            "manual",
+            "--max-spend",
+            "2",
+            "manual one",
+            "manual two",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.status, ChainStatus::Paused);
+    assert_eq!(chain.steps[0].status, ChainStepStatus::Completed);
+    assert_eq!(chain.paused_reason.as_deref(), Some("apply_mode_manual"));
+}
+
+#[test]
+fn branch_policy_merge_writes_merge_commit_between_steps() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--branch-policy",
+            "merge",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "4",
+            "merge one",
+            "merge two",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    let first_sha = chain.steps[0].applied_sha.as_deref().expect("sha");
+    let second_run = chain.steps[1].run_id.as_deref().expect("run");
+    let second_state = deadreckon_core::load_run(&paths, second_run).expect("state");
+    let second_record =
+        deadreckon_core::read_codebase_record(&second_state.working_dir).expect("record");
+    assert_eq!(second_record.base_sha.as_deref(), Some(first_sha));
+    let merges = git_stdout(&repo, &["log", "--merges", "--oneline"]);
+    assert!(merges.contains("deadreckon run"), "{merges}");
+}
+
+#[test]
+fn on_fail_stop_pauses_at_first_red() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_hook(&repo, "post-step", "#!/bin/sh\nexit 2\n");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "2",
+            "stop one",
+            "stop two",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.status, ChainStatus::Paused);
+    assert_eq!(chain.steps[0].status, ChainStepStatus::Failed);
+    assert_eq!(chain.paused_reason.as_deref(), Some("step_failed"));
+}
+
+#[test]
+fn on_fail_skip_advances_past_failed_step() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let marker = temp.path().join("fail-once-marker");
+    write_hook(
+        &repo,
+        "post-step",
+        &format!(
+            "#!/bin/sh\nif [ ! -f '{}' ]; then touch '{}'; exit 2; fi\nexit 0\n",
+            marker.display(),
+            marker.display()
+        ),
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--on-fail",
+            "skip",
+            "--max-spend",
+            "4",
+            "skip one",
+            "skip two",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.status, ChainStatus::Completed);
+    assert_eq!(chain.steps[0].status, ChainStepStatus::Skipped);
+    assert_eq!(chain.steps[1].status, ChainStepStatus::Applied);
+}
+
+#[test]
+fn circuit_breaker_threshold_configurable_via_flag() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_hook(&repo, "post-step", "#!/bin/sh\nexit 2\n");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--on-fail",
+            "skip",
+            "--circuit-breaker-threshold",
+            "1",
+            "--max-spend",
+            "4",
+            "breaker one",
+            "breaker two",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.status, ChainStatus::Paused);
+    assert_eq!(chain.circuit_breaker_consecutive_failures, 1);
+    assert_eq!(chain.paused_reason.as_deref(), Some("circuit_breaker_open"));
+}
+
+#[test]
 fn chain_per_step_cap_is_remaining_over_remaining_steps() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
