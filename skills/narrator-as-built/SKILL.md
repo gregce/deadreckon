@@ -13,6 +13,7 @@ inputs:
 # narrator-as-built
 
 You are writing an as-built document for the subsystem changed by a deadreckon run.
+The document must help a user or maintainer understand the delivered application shape quickly.
 
 Return exactly one JSON object:
 
@@ -59,3 +60,5 @@ Return exactly one JSON object:
 - Include process/data topology ASCII when the seed has one; omit rather than emit a generic placeholder.
 - Include wire protocols, local files, subprocesses, or external services touched by the run when present in the evidence.
 - Link to `RUN-NARRATIVE.md`, `RUN-DECISIONS.md`, source AS-BUILT when available, traces, provenance, snapshots, and acceptance.
+- Exclude generated, vendor, cache, dependency, build-output, trace, snapshot, source-map, and run-artifact paths from components, topology, and file layout. Examples: `.next/`, `node_modules/`, `dist/`, `build/`, `target/`, `.turbo/`, `.cache/`, `.deadreckon/`, `*.map`, and `docs/RUN-*.md`.
+- If generated artifacts mattered, summarize them once in `external_interactions`; never produce a giant inventory of them.

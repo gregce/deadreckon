@@ -43,10 +43,10 @@ pub use docs::{
     capture_response_summary, capture_tool_stdio, changed_doc_files, coalesce_into_phases,
     copy_public_docs_from_internal, decisions_path, delta_path, diff_samples_markdown,
     doc_path_for_kind, docs_dir, docs_inventory, docs_status_for_state, ensure_docs_started,
-    frontmatter, incremental_path, is_decision_candidate, missing_files_in_narrative,
-    narrative_path, polish_path, public_doc_path, public_docs_dir, publish_docs_for_promotion,
-    read_turn_records, rewrite_templated_docs, should_emit_delta, source_layout,
-    tool_stdio_markdown,
+    frontmatter, incremental_path, is_decision_candidate, is_documentable_path,
+    missing_files_in_narrative, narrative_path, polish_path, public_doc_path, public_docs_dir,
+    publish_docs_for_promotion, read_turn_records, rewrite_templated_docs, should_emit_delta,
+    source_layout, tool_stdio_markdown,
 };
 pub use error::{DeadreckonError, Result};
 pub use events::{

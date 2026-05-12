@@ -56,5 +56,7 @@ Return `{ "decisions": [] }` when no real multi-alternative decision appears.
 
 - Inspect only turns with `decision_candidate: true`; filter false positives.
 - A real decision must include alternatives considered, the chosen path, why it was chosen, files affected, and citations.
+- `files_affected` must name only documentable user-authored source, config, manifest, test, asset, or project-doc files.
+- Omit generated/vendor/cache/build-output paths such as `.next/`, `node_modules/`, `dist/`, `build/`, `target/`, `.turbo/`, `.cache/`, source maps, traces, snapshots, and run artifacts.
 - Do not invent decisions from ordinary implementation summaries.
 - If the evidence is ambiguous, omit the entry rather than overstate it.

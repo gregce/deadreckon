@@ -15,8 +15,9 @@ use deadreckon_core::codebase::{read_codebase_record, write_codebase_record};
 use deadreckon_core::docs::{
     AS_BUILT_DELTA, RUN_AS_BUILT, RUN_DECISIONS, RUN_NARRATIVE, append_docs_warning, as_built_path,
     changed_doc_files, decisions_path, delta_path, diff_samples_markdown, docs_dir,
-    missing_files_in_narrative, narrative_path, polish_path, publish_docs_for_promotion,
-    read_turn_records, rewrite_templated_docs, source_layout, tool_stdio_markdown,
+    is_documentable_path, missing_files_in_narrative, narrative_path, polish_path,
+    publish_docs_for_promotion, read_turn_records, rewrite_templated_docs, source_layout,
+    tool_stdio_markdown,
 };
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::paths::SOURCE_ROOT;
@@ -260,7 +261,7 @@ async fn polish_run_docs_legacy(
                 if !missing.is_empty() && retries < 2 {
                     retries += 1;
                     prompt_suffix = format!(
-                        "\nYour previous output omitted these files; revise to include them with citations: {}",
+                        "\nYour previous output omitted these documentable files; revise to include them with citations: {}",
                         missing.join(", ")
                     );
                     continue;
@@ -392,7 +393,7 @@ async fn polish_run_docs_split(
         };
         coverage_retries += 1;
         let suffix = format!(
-            "\nYour previous phase output omitted these changed files; revise only the phases JSON so every one is cited by path: {}",
+            "\nYour previous phase output omitted these documentable changed files; revise only the phases JSON so each one is cited by path: {}",
             missing.join(", ")
         );
         let result = run_polish_subcall(
@@ -776,6 +777,9 @@ fn render_phases_value(value: &Value) -> Option<String> {
         } else {
             for file in file_changes {
                 if let Some(text) = file.as_str() {
+                    if !looks_documentable_phase_line(text) {
+                        continue;
+                    }
                     out.push_str(&format!(
                         "| {} | - | evidence returned as prose |\n",
                         text.replace('|', "\\|")
@@ -783,6 +787,9 @@ fn render_phases_value(value: &Value) -> Option<String> {
                     continue;
                 }
                 let path = string_field(&file, "path").unwrap_or_else(|| file.to_string());
+                if !is_documentable_path(path.trim_matches('"')) {
+                    continue;
+                }
                 let adds = u64_field(&file, "adds");
                 let dels = u64_field(&file, "dels");
                 let hunk = string_field(&file, "largest_hunk_excerpt")
@@ -807,6 +814,17 @@ fn render_phases_value(value: &Value) -> Option<String> {
         }
     }
     Some(out)
+}
+
+fn looks_documentable_phase_line(line: &str) -> bool {
+    let candidate = line
+        .trim()
+        .trim_start_matches("- ")
+        .trim_start_matches('`')
+        .split(['`', ':', ' '])
+        .next()
+        .unwrap_or_default();
+    candidate.is_empty() || is_documentable_path(candidate)
 }
 
 fn render_split_as_built(
@@ -1088,7 +1106,7 @@ fn run_summary(
     records: &[deadreckon_core::docs::TurnRecord],
 ) -> Result<String> {
     Ok(format!(
-        "run_id: {}\nstatus: {}\ngoal: {}\nprovider: {}\nsandbox: {}\nturns: {}\nchanged_files: {}",
+        "run_id: {}\nstatus: {}\ngoal: {}\nprovider: {}\nsandbox: {}\nturns: {}\ndocumentable_changed_files: {}",
         state.run_id,
         state.status,
         state.goal,

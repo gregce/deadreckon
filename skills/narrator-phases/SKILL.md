@@ -11,6 +11,7 @@ inputs:
 # narrator-phases
 
 You are writing the phase body for a deadreckon run narrative.
+Write for a maintainer trying to understand the delivered project, not for someone auditing every temporary path.
 
 Return exactly one JSON object:
 
@@ -54,5 +55,8 @@ Return exactly one JSON object:
 - Reuse templated `auto_title` when no better title is supported by evidence.
 - Cite `[turn N]` for every non-frontmatter claim.
 - Quote a 1-3 line excerpt from the largest diff hunk inline.
-- Include each changed file in `file_changes` with `+adds/-dels`.
-- Do not omit changed files; if a file is unclear, say what evidence exists instead of inventing a role.
+- Include each documentable changed file in `file_changes` with `+adds/-dels`.
+- Documentable files are user-authored source, config, manifests, tests, assets, and project docs that someone would intentionally maintain.
+- Omit generated, vendor, cache, dependency, build-output, trace, snapshot, source-map, and run-artifact paths. Examples: `.next/`, `node_modules/`, `dist/`, `build/`, `target/`, `.turbo/`, `.cache/`, `.deadreckon/`, `*.map`, and `docs/RUN-*.md`.
+- Do not omit documentable changed files; if a file is unclear, say what evidence exists instead of inventing a role.
+- Keep phases compact. Large generated inventories are a documentation failure, not useful completeness.

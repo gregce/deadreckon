@@ -2,8 +2,9 @@ use std::fs;
 
 use deadreckon_core::{
     DeadreckonPaths, RunOptions, TurnDocInput, append_turn_doc, as_built_path,
-    capture_response_full, capture_response_summary, diff_samples_markdown, narrative_path,
-    read_turn_records, rewrite_templated_docs, snapshot_working, source_layout,
+    capture_response_full, capture_response_summary, changed_doc_files, diff_samples_markdown,
+    is_documentable_path, narrative_path, read_turn_records, rewrite_templated_docs,
+    snapshot_working, source_layout,
 };
 use tempfile::TempDir;
 
@@ -78,6 +79,78 @@ fn binary_files_marked_is_binary_no_excerpt() {
     let records = read_turn_records(&state.working_dir).expect("records");
     assert!(records[0].files[0].is_binary);
     assert!(records[0].files[0].largest_hunk_excerpt.is_empty());
+}
+
+#[test]
+fn generated_artifacts_are_omitted_from_doc_inputs() {
+    let (_temp, state) = fresh_state("generated docs");
+    for dir in ["src", "docs", "node_modules/pkg", ".next/server", "dist"] {
+        fs::create_dir_all(state.working_dir.join(dir)).expect("dir");
+    }
+    for (path, body) in [
+        ("src/main.js", "console.log('ok');\n"),
+        ("docs/guide.md", "# Guide\n"),
+        ("package-lock.json", "{}\n"),
+        ("node_modules/pkg/index.js", "module.exports = 1;\n"),
+        (".next/server/app.js", "generated();\n"),
+        ("dist/bundle.js", "generated();\n"),
+    ] {
+        fs::write(state.working_dir.join(path), body).expect("file");
+    }
+
+    append_turn_doc(
+        &state,
+        TurnDocInput {
+            turn: 1,
+            tool_kind: "cli_subagent".to_string(),
+            latency_ms: Some(1),
+            files: [
+                "src/main.js",
+                "docs/guide.md",
+                "package-lock.json",
+                "node_modules/pkg/index.js",
+                ".next/server/app.js",
+                "dist/bundle.js",
+            ]
+            .into_iter()
+            .map(|path| state.working_dir.join(path))
+            .collect(),
+            outcome: "built app".to_string(),
+            response_text: "built app".to_string(),
+            tool_stdout: None,
+            tool_stderr: None,
+        },
+    )
+    .expect("turn");
+
+    let records = read_turn_records(&state.working_dir).expect("records");
+    assert!(is_documentable_path("docs/guide.md"));
+    let mut paths = records[0].file_paths();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            "docs/guide.md".to_string(),
+            "package-lock.json".to_string(),
+            "src/main.js".to_string()
+        ]
+    );
+    assert_eq!(
+        changed_doc_files(&state).expect("changed"),
+        vec![
+            "docs/guide.md".to_string(),
+            "package-lock.json".to_string(),
+            "src/main.js".to_string()
+        ]
+    );
+    let diff_samples = diff_samples_markdown(&records);
+    assert!(diff_samples.contains("src/main.js"));
+    assert!(!diff_samples.contains("node_modules"));
+    assert!(!diff_samples.contains(".next"));
+    assert!(!diff_samples.contains("dist/bundle.js"));
+    assert!(is_documentable_path("src/main.js"));
+    assert!(!is_documentable_path("node_modules/pkg/index.js"));
+    assert!(!is_documentable_path(".next/server/app.js"));
 }
 
 #[test]
@@ -426,6 +499,8 @@ fn narrator_overview_prompt_asks_for_reading_order_and_why_now() {
     let overview = repo_skill("narrator-overview");
     assert!(overview.contains("reading_order"));
     assert!(overview.contains("why_now"));
+    assert!(overview.contains("practical project handoff"));
+    assert!(overview.contains("generated/vendor/cache/build artifacts"));
 }
 
 #[test]
@@ -433,6 +508,8 @@ fn narrator_phases_prompt_requires_per_phase_paragraph_and_diff_quote() {
     let phases = repo_skill("narrator-phases");
     assert!(phases.contains("prose paragraph per phase"));
     assert!(phases.contains("largest diff hunk"));
+    assert!(phases.contains("documentable changed file"));
+    assert!(phases.contains("node_modules/"));
 }
 
 #[test]
@@ -446,6 +523,7 @@ fn narrator_as_built_prompt_requires_load_bearing_and_seams() {
     let as_built = repo_skill("narrator-as-built");
     assert!(as_built.contains("load-bearing"));
     assert!(as_built.contains("seams"));
+    assert!(as_built.contains("Exclude generated"));
 }
 
 #[test]
@@ -458,6 +536,9 @@ fn narrator_decisions_prompt_filters_false_positive_candidates() {
 #[test]
 fn legacy_run_narrator_skill_still_present() {
     assert!(repo_skill_path("run-narrator").exists());
+    let skill = repo_skill("run-narrator");
+    assert!(skill.contains("useful handoff"));
+    assert!(skill.contains("Every documentable changed file"));
 }
 
 #[test]
@@ -467,16 +548,19 @@ fn narrator_subskill_prompts_require_doc_depth_contracts() {
         fs::read_to_string(root.join("narrator-overview/SKILL.md")).expect("overview skill");
     assert!(overview.contains("reading_order"));
     assert!(overview.contains("why_now"));
+    assert!(overview.contains("practical project handoff"));
 
     let phases = fs::read_to_string(root.join("narrator-phases/SKILL.md")).expect("phases skill");
     assert!(phases.contains("prose paragraph per phase"));
     assert!(phases.contains("largest diff hunk"));
+    assert!(phases.contains("documentable changed file"));
 
     let as_built =
         fs::read_to_string(root.join("narrator-as-built/SKILL.md")).expect("as-built skill");
     assert!(as_built.contains("Project files"));
     assert!(as_built.contains("load-bearing"));
     assert!(as_built.contains("seams"));
+    assert!(as_built.contains("Exclude generated"));
 
     let decisions =
         fs::read_to_string(root.join("narrator-decisions/SKILL.md")).expect("decisions skill");

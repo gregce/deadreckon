@@ -14,6 +14,7 @@ inputs:
 # narrator-overview
 
 You are writing the overview material for a deadreckon run narrative. Use newsroom voice: concrete, specific, no filler.
+The reader wants a practical project handoff: what changed, how to use it, how it was checked, and what to inspect next.
 
 Return exactly one JSON object:
 
@@ -61,6 +62,8 @@ Return exactly one JSON object:
 - `reading_order`: emit only when the parent narrative is non-empty; point the reader to the parent and to what changed since.
 - `why_now`: synthesize the goal and run context; do not say "the user asked".
 - `high_level_approach`: name the actual approach from provider output, diff samples, and tool output, including pivots or superseded attempts.
+- Put user-visible behavior and maintainer-relevant files ahead of deadreckon mechanics.
 - `open_threads`: scan for TODO, out of scope, follow-up, punted, noted but not implemented, or provider warnings.
-- `cross_references`: include traces, provenance, snapshots, branch/library artifacts, acceptance, and parent narrative when present.
+- `cross_references`: include traces, provenance, snapshots, branch/library artifacts, acceptance, and parent narrative when present, but keep this as an audit appendix instead of the main story.
+- Do not mention generated/vendor/cache/build artifacts except as one concise verification note when relevant. Examples to omit: `.next/`, `node_modules/`, `dist/`, `build/`, `target/`, `.turbo/`, `.cache/`, source maps, traces, snapshots, and run artifacts.
 - Every non-frontmatter claim about work done must cite `[turn N]`.
