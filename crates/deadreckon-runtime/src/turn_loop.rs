@@ -20,7 +20,7 @@ use deadreckon_core::artifacts::{
 };
 use deadreckon_core::cancel::{cancel_marker_path_for_run_root, cancel_marker_present};
 use deadreckon_core::codebase::{CodebaseMode, read_codebase_record};
-use deadreckon_core::docs::{TurnDocInput, append_turn_doc};
+use deadreckon_core::docs::{TurnDocInput, append_turn_doc, incremental_path};
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::events::{RunEvent, RunEventKind, emit_event, event_preview, tool_args_json};
 use deadreckon_core::gate::{acceptance_spec_path_for_run_root, validate_acceptance_marker};
@@ -48,6 +48,10 @@ pub struct RunLoopDocsConfig {
     pub home: PathBuf,
     pub config_path: Option<PathBuf>,
     pub doc_provider: Option<String>,
+    pub doc_provider_source: Option<String>,
+    pub doc_subskills: Vec<String>,
+    pub token_budget: u32,
+    pub budget_cap_usd: Option<f64>,
     pub doc_skill: String,
     pub no_docs: bool,
 }
@@ -304,8 +308,9 @@ pub async fn run_turn_loop(
                 changed.clone(),
             )?;
             commit_worktree_turn(state, turn, "cli_subagent")?;
-            append_turn_doc(
+            append_turn_doc_checkpoint(
                 state,
+                config.event_sender.as_ref(),
                 TurnDocInput {
                     turn,
                     tool_kind: "cli_subagent".to_string(),
@@ -450,8 +455,9 @@ pub async fn run_turn_loop(
                     changed.clone(),
                 )?;
                 commit_worktree_turn(state, turn, &format!("bash {tool_call_id}"))?;
-                append_turn_doc(
+                append_turn_doc_checkpoint(
                     state,
+                    config.event_sender.as_ref(),
                     TurnDocInput {
                         turn,
                         tool_kind: "bash".to_string(),
@@ -543,8 +549,9 @@ pub async fn run_turn_loop(
                     changed.clone(),
                 )?;
                 commit_worktree_turn(state, turn, &format!("write_file {tool_call_id}"))?;
-                append_turn_doc(
+                append_turn_doc_checkpoint(
                     state,
+                    config.event_sender.as_ref(),
                     TurnDocInput {
                         turn,
                         tool_kind: "write_file".to_string(),
@@ -570,8 +577,9 @@ pub async fn run_turn_loop(
             }
             Action::Done { summary } => {
                 state.turn = turn;
-                append_turn_doc(
+                append_turn_doc_checkpoint(
                     state,
+                    config.event_sender.as_ref(),
                     TurnDocInput {
                         turn,
                         tool_kind: "done".to_string(),
@@ -1160,6 +1168,10 @@ async fn complete_run_docs(
             home: config.docs.home.clone(),
             doc_skill: config.docs.doc_skill.clone(),
             doc_provider: config.docs.doc_provider.clone(),
+            doc_provider_source: config.docs.doc_provider_source.clone(),
+            doc_subskills: config.docs.doc_subskills.clone(),
+            token_budget: config.docs.token_budget,
+            budget_cap_usd: config.docs.budget_cap_usd,
             no_llm: config.docs.no_docs,
             force: false,
         },
@@ -1167,6 +1179,24 @@ async fn complete_run_docs(
     .await;
     state.status = previous_status;
     result
+}
+
+fn append_turn_doc_checkpoint(
+    state: &PipelineState,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+    input: TurnDocInput,
+) -> Result<()> {
+    let turn = input.turn;
+    append_turn_doc(state, input)?;
+    emit_event(
+        state,
+        sender,
+        RunEventKind::DocsCheckpoint {
+            turn,
+            path: incremental_path(&state.working_dir),
+            status: "turn-end".to_string(),
+        },
+    )
 }
 
 fn paths_for_state(state: &PipelineState) -> Result<DeadreckonPaths> {
@@ -1351,6 +1381,10 @@ mod tests {
                         home: paths.home().to_path_buf(),
                         config_path: None,
                         doc_provider: None,
+                        doc_provider_source: None,
+                        doc_subskills: Vec::new(),
+                        token_budget: 0,
+                        budget_cap_usd: None,
                         doc_skill: "run-narrator".to_string(),
                         no_docs: true,
                     },
@@ -1414,6 +1448,10 @@ mod tests {
                         home: paths.home().to_path_buf(),
                         config_path: None,
                         doc_provider: None,
+                        doc_provider_source: None,
+                        doc_subskills: Vec::new(),
+                        token_budget: 0,
+                        budget_cap_usd: None,
                         doc_skill: "run-narrator".to_string(),
                         no_docs: true,
                     },
@@ -1427,6 +1465,59 @@ mod tests {
         let outcome = handle.await.expect("join").expect("loop");
         assert_ne!(outcome.status, RunStatus::Killed);
         assert!(outcome.run_root.join("events.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn turn_end_docs_checkpoint_is_explicit_event() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "docs checkpoint".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let bus = RunEventBus::new(32);
+        let router = ProviderRouter::smoke();
+        run_turn_loop(
+            &mut state,
+            &router,
+            RunLoopConfig {
+                provider: Some("smoke".to_string()),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                sandbox_backend: SandboxBackend::None,
+                max_turns: 1,
+                from_turn: None,
+                event_sender: Some(bus.sender()),
+                cancellation_token: None,
+                docs: RunLoopDocsConfig {
+                    home: paths.home().to_path_buf(),
+                    config_path: None,
+                    doc_provider: None,
+                    doc_provider_source: None,
+                    doc_subskills: Vec::new(),
+                    token_budget: 0,
+                    budget_cap_usd: None,
+                    doc_skill: "run-narrator".to_string(),
+                    no_docs: true,
+                },
+            },
+        )
+        .await
+        .expect("loop");
+        let events = std::fs::read_to_string(state.run_root.join("events.jsonl")).expect("events");
+        assert!(events.contains("\"kind\":\"docs_checkpoint\""));
+        assert!(events.contains("\"status\":\"turn-end\""));
     }
 
     #[test]

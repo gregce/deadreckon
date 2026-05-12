@@ -18,7 +18,8 @@ use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
     AcceptanceMarker, ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainEvent, ChainEventKind,
     ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus, CodebaseMode, CodebaseRecord,
-    ConductorState, DeadreckonError, DeadreckonPaths, DocKind, ModeFlags, OnFail, PhaseId,
+    ConductorState, DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DeadreckonError,
+    DeadreckonPaths, DocKind, DocProviderSelection, DocProviderSource, ModeFlags, OnFail, PhaseId,
     PhaseStatus, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent,
     RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions,
     acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
@@ -158,6 +159,15 @@ fn ui_warn(text: impl AsRef<str>) -> String {
     ui_style(text, "1;33", UiStream::Stdout)
 }
 
+fn ui_status(text: impl AsRef<str>) -> String {
+    let text = text.as_ref();
+    if text == "ok" || text == "polished" {
+        ui_ok(text)
+    } else {
+        ui_warn(text)
+    }
+}
+
 fn ui_error(text: impl AsRef<str>) -> String {
     ui_style(text, "1;31", UiStream::Stderr)
 }
@@ -214,6 +224,7 @@ async fn main_inner() -> Result<()> {
             sandbox,
             provider,
             model,
+            doc_provider,
             acceptance,
             skill,
             smoke,
@@ -241,6 +252,7 @@ async fn main_inner() -> Result<()> {
                 sandbox,
                 provider,
                 model,
+                doc_provider,
                 acceptance,
                 skill,
                 smoke,
@@ -432,16 +444,20 @@ async fn main_inner() -> Result<()> {
             no_confirm,
             force,
             doc_skill,
+            doc_provider,
+            budget_cap,
         } => {
-            doc_command(
+            doc_command(DocCommandArgs {
                 run_id,
-                kind.into(),
+                kind: kind.into(),
                 export,
                 polish,
                 no_confirm,
                 force,
                 doc_skill,
-            )
+                doc_provider,
+                budget_cap,
+            })
             .await
         }
         Commands::Attach { run_id, no_hints } => attach_command(run_id, no_hints).await,
@@ -3382,6 +3398,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         sandbox,
         provider,
         model,
+        doc_provider,
         acceptance,
         skill,
         smoke,
@@ -3406,7 +3423,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     let effective_provider = if smoke {
         Some("smoke".to_string())
     } else {
-        provider.clone().or(defaults.provider)
+        provider.clone().or(defaults.provider.clone())
     };
     let router = if smoke {
         ProviderRouter::smoke()
@@ -3429,6 +3446,11 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     let effective_doc_skill = doc_skill
         .or(defaults.doc_skill.clone())
         .unwrap_or_else(|| "run-narrator".to_string());
+    let doc_provider_selection = resolve_doc_provider(
+        doc_provider.as_deref(),
+        &defaults,
+        effective_provider.as_deref(),
+    );
     if max_spend.is_none() {
         let cap = effective_max_spend.unwrap_or(10.0);
         println!(
@@ -3440,7 +3462,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     let acceptance_source = resolve_acceptance_source(&cwd, acceptance.as_deref())?;
     let acceptance_preview = acceptance_preview(&acceptance_source)?;
     let sandbox = sandbox
-        .or(defaults.sandbox)
+        .or(defaults.sandbox.clone())
         .unwrap_or_else(|| "auto".to_string());
     let backend: SandboxBackend = sandbox.parse()?;
     if init_git {
@@ -3497,6 +3519,8 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         provider: effective_provider.as_deref(),
         route: selected_route.as_ref(),
         sandbox: &backend.to_string(),
+        doc_provider: doc_provider_selection.provider.as_deref(),
+        doc_provider_source: doc_provider_selection.source.as_str(),
         max_spend: effective_max_spend,
         max_wall_seconds: effective_max_wall_seconds,
         acceptance: &acceptance_preview,
@@ -3564,7 +3588,12 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
-    print_run_started(&state, selected_route.as_ref());
+    print_run_started(
+        &state,
+        selected_route.as_ref(),
+        doc_provider_selection.provider.as_deref(),
+        doc_provider_selection.source.as_str(),
+    );
     let outcome = run_turn_loop(
         &mut state,
         &router,
@@ -3580,7 +3609,13 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
             docs: RunLoopDocsConfig {
                 home: paths.home().to_path_buf(),
                 config_path: Some(paths.config_path()),
-                doc_provider: defaults.doc_provider.clone(),
+                doc_provider: doc_provider_selection.provider.clone(),
+                doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
+                doc_subskills: effective_doc_subskills(&defaults),
+                token_budget: defaults
+                    .doc_polish_token_budget
+                    .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
+                budget_cap_usd: defaults.doc_polish_budget_cap_usd,
                 doc_skill: effective_doc_skill,
                 no_docs,
             },
@@ -4430,6 +4465,9 @@ struct ConfigDefaults {
     cli_max_wall_seconds: Option<f64>,
     doc_provider: Option<String>,
     doc_skill: Option<String>,
+    doc_subskills: Option<Vec<String>>,
+    doc_polish_token_budget: Option<u32>,
+    doc_polish_budget_cap_usd: Option<f64>,
 }
 
 fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
@@ -4462,6 +4500,75 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
         doc_skill: get_toml_path(&root, "defaults.doc_skill")
             .and_then(toml::Value::as_str)
             .map(ToString::to_string),
+        doc_subskills: get_toml_path(&root, "defaults.doc_subskills")
+            .and_then(toml::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            }),
+        doc_polish_token_budget: get_toml_path(&root, "defaults.doc_polish_token_budget")
+            .and_then(toml::Value::as_integer)
+            .and_then(|value| u32::try_from(value).ok()),
+        doc_polish_budget_cap_usd: get_toml_path(&root, "defaults.doc_polish_budget_cap_usd")
+            .and_then(toml::Value::as_float)
+            .or_else(|| {
+                get_toml_path(&root, "defaults.doc_polish_budget_cap_usd")
+                    .and_then(toml::Value::as_integer)
+                    .map(|value| value as f64)
+            }),
+    })
+}
+
+fn resolve_doc_provider(
+    flag: Option<&str>,
+    defaults: &ConfigDefaults,
+    run_provider: Option<&str>,
+) -> DocProviderSelection {
+    if let Some(provider) = flag.filter(|provider| !provider.trim().is_empty()) {
+        return DocProviderSelection {
+            provider: Some(provider.to_string()),
+            source: DocProviderSource::Flag,
+        };
+    }
+    if let Some(provider) = defaults.doc_provider.as_deref() {
+        return DocProviderSelection {
+            provider: Some(provider.to_string()),
+            source: DocProviderSource::Config,
+        };
+    }
+    if command_exists("codex") {
+        return DocProviderSelection {
+            provider: Some("cli:codex".to_string()),
+            source: DocProviderSource::AutoSubscription,
+        };
+    }
+    if command_exists("claude") {
+        return DocProviderSelection {
+            provider: Some("cli:claude-code".to_string()),
+            source: DocProviderSource::AutoSubscription,
+        };
+    }
+    if let Some(provider) = run_provider {
+        return DocProviderSelection {
+            provider: Some(provider.to_string()),
+            source: DocProviderSource::RunProvider,
+        };
+    }
+    DocProviderSelection {
+        provider: None,
+        source: DocProviderSource::None,
+    }
+}
+
+fn effective_doc_subskills(defaults: &ConfigDefaults) -> Vec<String> {
+    defaults.doc_subskills.clone().unwrap_or_else(|| {
+        DEFAULT_DOC_SUBSKILLS
+            .iter()
+            .map(|skill| (*skill).to_string())
+            .collect()
     })
 }
 
@@ -4924,6 +5031,8 @@ struct RunPreview<'a> {
     provider: Option<&'a str>,
     route: Option<&'a ProviderRouteInfo>,
     sandbox: &'a str,
+    doc_provider: Option<&'a str>,
+    doc_provider_source: &'a str,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
     acceptance: &'a AcceptancePreview,
@@ -4939,6 +5048,8 @@ fn run_preview(input: RunPreview<'_>) -> String {
         provider,
         route,
         sandbox,
+        doc_provider,
+        doc_provider_source,
         max_spend,
         max_wall_seconds,
         acceptance,
@@ -4960,7 +5071,7 @@ fn run_preview(input: RunPreview<'_>) -> String {
     );
     if brief {
         return format!(
-            "mode={} branch={} base={} wt={} provider={} model={} cap={}/{} acceptance={}",
+            "mode={} branch={} base={} wt={} provider={} model={} docs={} cap={}/{} acceptance={}",
             mode,
             codebase.branch_name.as_deref().unwrap_or("-"),
             codebase.base_ref.as_deref().unwrap_or("-"),
@@ -4971,6 +5082,7 @@ fn run_preview(input: RunPreview<'_>) -> String {
                 .unwrap_or_else(|| "-".to_string()),
             agent,
             model,
+            doc_provider.unwrap_or("templated"),
             max_spend
                 .map(|cap| format!("${cap:.0}"))
                 .unwrap_or_else(|| "uncapped".to_string()),
@@ -5023,6 +5135,10 @@ fn run_preview(input: RunPreview<'_>) -> String {
     lines.extend([
         format!("  provider: {agent}"),
         format!("  model:    {model}"),
+        format!(
+            "  docs:     {} ({doc_provider_source})",
+            doc_provider.unwrap_or("templated only")
+        ),
         format!("  sandbox:  {sandbox}"),
         format!("  caps:     {caps}"),
         format!("  gate:     {}", acceptance.full_label()),
@@ -5131,7 +5247,7 @@ fn init_config_text(
         _ => "[\"anthropic\", \"openai\", \"cli:claude-code\", \"cli:codex\"]",
     };
     let mut out = format!(
-        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\ndoc_provider = \"{provider}\"\ndoc_skill = \"run-narrator\"\nmax_spend = {max_spend}\ncli_max_wall_seconds = 3600\nsandbox = \"{sandbox}\"\n\n"
+        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\ndoc_provider = \"{provider}\"\ndoc_skill = \"run-narrator\"\ndoc_subskills = [\"narrator-overview\", \"narrator-phases\", \"narrator-as-built\", \"narrator-decisions\"]\ndoc_polish_token_budget = 16384\nmax_spend = {max_spend}\ncli_max_wall_seconds = 3600\nsandbox = \"{sandbox}\"\n\n"
     );
     match provider {
         "cli:claude-code" => {
@@ -5997,7 +6113,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     }
 
     let defaults = config_defaults(&paths)?;
-    let effective_provider = provider.or(defaults.provider);
+    let effective_provider = provider.or(defaults.provider.clone());
     let router = ProviderRouter::from_config_path_with_model(
         &paths.config_path(),
         effective_provider.as_deref(),
@@ -6015,8 +6131,15 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     let effective_doc_skill = doc_skill
         .or(defaults.doc_skill.clone())
         .unwrap_or_else(|| "run-narrator".to_string());
+    let doc_provider_selection =
+        resolve_doc_provider(None, &defaults, effective_provider.as_deref());
+    let doc_subskills = effective_doc_subskills(&defaults);
+    let doc_token_budget = defaults
+        .doc_polish_token_budget
+        .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET);
+    let doc_budget_cap = defaults.doc_polish_budget_cap_usd;
     let sandbox = sandbox
-        .or(defaults.sandbox)
+        .or(defaults.sandbox.clone())
         .unwrap_or_else(|| "auto".to_string());
     let backend: SandboxBackend = sandbox.parse()?;
     let cwd = if parent.cwd.exists() {
@@ -6037,7 +6160,11 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             effective_provider,
             effective_max_spend,
             effective_max_wall_seconds,
-            doc_provider: defaults.doc_provider.clone(),
+            doc_provider: doc_provider_selection.provider.clone(),
+            doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
+            doc_subskills: doc_subskills.clone(),
+            doc_token_budget,
+            doc_budget_cap,
             doc_skill: effective_doc_skill,
             no_docs,
             backend,
@@ -6134,7 +6261,11 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             docs: RunLoopDocsConfig {
                 home: paths.home().to_path_buf(),
                 config_path: Some(paths.config_path()),
-                doc_provider: defaults.doc_provider.clone(),
+                doc_provider: doc_provider_selection.provider.clone(),
+                doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
+                doc_subskills,
+                token_budget: doc_token_budget,
+                budget_cap_usd: doc_budget_cap,
                 doc_skill: effective_doc_skill,
                 no_docs,
             },
@@ -6173,6 +6304,10 @@ struct ExtendWorktreeArgs {
     effective_max_spend: Option<f64>,
     effective_max_wall_seconds: Option<f64>,
     doc_provider: Option<String>,
+    doc_provider_source: Option<String>,
+    doc_subskills: Vec<String>,
+    doc_token_budget: u32,
+    doc_budget_cap: Option<f64>,
     doc_skill: String,
     no_docs: bool,
     backend: SandboxBackend,
@@ -6191,6 +6326,10 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         effective_max_spend,
         effective_max_wall_seconds,
         doc_provider,
+        doc_provider_source,
+        doc_subskills,
+        doc_token_budget,
+        doc_budget_cap,
         doc_skill,
         no_docs,
         backend,
@@ -6294,6 +6433,10 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
                 home: paths.home().to_path_buf(),
                 config_path: Some(paths.config_path()),
                 doc_provider,
+                doc_provider_source,
+                doc_subskills,
+                token_budget: doc_token_budget,
+                budget_cap_usd: doc_budget_cap,
                 doc_skill,
                 no_docs,
             },
@@ -7144,7 +7287,7 @@ fn materialized_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEn
     }
 }
 
-async fn doc_command(
+struct DocCommandArgs {
     run_id: String,
     kind: DocKind,
     export: Option<PathBuf>,
@@ -7152,7 +7295,22 @@ async fn doc_command(
     no_confirm: bool,
     force: bool,
     doc_skill: Option<String>,
-) -> Result<()> {
+    doc_provider: Option<String>,
+    budget_cap: Option<f64>,
+}
+
+async fn doc_command(args: DocCommandArgs) -> Result<()> {
+    let DocCommandArgs {
+        run_id,
+        kind,
+        export,
+        polish,
+        no_confirm,
+        force,
+        doc_skill,
+        doc_provider,
+        budget_cap,
+    } = args;
     let paths = DeadreckonPaths::discover();
     let mut state = load_cli_run(&paths, &run_id)?;
     if polish {
@@ -7166,18 +7324,32 @@ async fn doc_command(
             )));
         }
         let defaults = config_defaults(&paths)?;
-        let doc_provider = defaults
-            .doc_provider
-            .clone()
-            .or_else(|| state.provider.clone());
-        let Some(provider) = doc_provider.clone() else {
+        let selection = resolve_doc_provider(
+            doc_provider.as_deref(),
+            &defaults,
+            state.provider.as_deref(),
+        );
+        let Some(provider) = selection.provider.clone() else {
             return Err(CliError::Core(deadreckon_core::user_error(
-                "no doc provider configured",
-                "deadreckon init or set defaults.doc_provider",
+                "deadreckon: no doc provider available",
+                "deadreckon config set defaults.doc_provider cli:codex\ntry: install codex or claude; deadreckon auto-detects subscription CLIs on the next run",
             )));
         };
-        if !no_confirm && io::stdin().is_terminal() {
-            let answer = prompt("doc polish may use one provider turn; continue? [y/N]: ")?;
+        let subskills = effective_doc_subskills(&defaults);
+        let token_budget = defaults
+            .doc_polish_token_budget
+            .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET);
+        let budget_cap = budget_cap.or(defaults.doc_polish_budget_cap_usd);
+        if !no_confirm && completion_hints_enabled(false) && io::stdin().is_terminal() {
+            print_doc_polish_preview(
+                &state,
+                &provider,
+                selection.source.as_str(),
+                &subskills,
+                token_budget,
+                budget_cap,
+            )?;
+            let answer = prompt("polish docs now? [Y/n]: ")?;
             if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
                 println!("cancelled");
                 return Ok(());
@@ -7198,11 +7370,20 @@ async fn doc_command(
                     .or(defaults.doc_skill)
                     .unwrap_or_else(|| "run-narrator".to_string()),
                 doc_provider: Some(provider),
+                doc_provider_source: Some(selection.source.as_str().to_string()),
+                doc_subskills: subskills,
+                token_budget,
+                budget_cap_usd: budget_cap,
                 no_llm: false,
                 force,
             },
         )
         .await?;
+        if completion_hints_enabled(false)
+            && let Some(record) = deadreckon_runtime::read_polish_record(&state)?
+        {
+            print_doc_polish_summary(&record);
+        }
         save_state(&state)?;
     }
     let Some(path) = doc_path_for_kind(&state.working_dir, kind) else {
@@ -7234,6 +7415,51 @@ async fn doc_command(
         print!("{}", fs::read_to_string(&path)?);
     }
     Ok(())
+}
+
+fn print_doc_polish_preview(
+    state: &deadreckon_core::PipelineState,
+    provider: &str,
+    provider_source: &str,
+    subskills: &[String],
+    token_budget: u32,
+    budget_cap: Option<f64>,
+) -> Result<()> {
+    let hash = deadreckon_runtime::inputs_hash(state)?;
+    println!("{}", ui_heading("polish preview:"));
+    println!("  provider:  {} ({provider_source})", ui_id(provider));
+    println!("  subskills: {}", subskills.join(", "));
+    println!("  budget:    {} tokens per subcall", token_budget);
+    println!(
+        "  cost cap:  {}",
+        budget_cap
+            .map(|cap| format!("${cap:.2}"))
+            .unwrap_or_else(|| "provider/account default".to_string())
+    );
+    println!("  inputs:    {}", &hash[..hash.len().min(12)]);
+    Ok(())
+}
+
+fn print_doc_polish_summary(record: &deadreckon_runtime::PolishRecord) {
+    println!("{}", ui_heading("doc polish:"));
+    println!("  status:   {}", record.status);
+    if let Some(provider) = record.provider.as_deref() {
+        println!("  provider: {provider}");
+    }
+    println!("  cost:     ${:.6}", record.cost_usd);
+    if !record.subcalls.is_empty() {
+        println!("  subcalls:");
+        for subcall in &record.subcalls {
+            println!(
+                "    {} {:<18} {} in / {} out ${:.6}",
+                ui_status(&subcall.status),
+                subcall.skill,
+                subcall.tokens_in,
+                subcall.tokens_out,
+                subcall.cost_usd
+            );
+        }
+    }
 }
 
 async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
@@ -7382,6 +7608,7 @@ async fn resume_command(
     let backend: SandboxBackend = state.sandbox.parse()?;
     let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
     let defaults = config_defaults(&paths)?;
+    let doc_provider_selection = resolve_doc_provider(None, &defaults, provider.as_deref());
     let max_spend_usd = state.max_spend_usd;
     let max_wall_seconds = state.max_wall_seconds;
     let outcome = run_turn_loop(
@@ -7399,7 +7626,13 @@ async fn resume_command(
             docs: RunLoopDocsConfig {
                 home: paths.home().to_path_buf(),
                 config_path: Some(paths.config_path()),
-                doc_provider: defaults.doc_provider,
+                doc_provider: doc_provider_selection.provider,
+                doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
+                doc_subskills: effective_doc_subskills(&defaults),
+                token_budget: defaults
+                    .doc_polish_token_budget
+                    .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
+                budget_cap_usd: defaults.doc_polish_budget_cap_usd,
                 doc_skill: defaults
                     .doc_skill
                     .unwrap_or_else(|| "run-narrator".to_string()),
@@ -7947,7 +8180,12 @@ fn chain_context_line_for_working(working_dir: &Path) -> Result<Option<String>> 
     )))
 }
 
-fn print_run_started(state: &deadreckon_core::PipelineState, route: Option<&ProviderRouteInfo>) {
+fn print_run_started(
+    state: &deadreckon_core::PipelineState,
+    route: Option<&ProviderRouteInfo>,
+    doc_provider: Option<&str>,
+    doc_provider_source: &str,
+) {
     println!(
         "{} {}",
         ui_ok("started run"),
@@ -7959,6 +8197,10 @@ fn print_run_started(state: &deadreckon_core::PipelineState, route: Option<&Prov
     } else if let Some(provider) = state.provider.as_deref() {
         println!("provider {provider}");
     }
+    println!(
+        "docs {} ({doc_provider_source})",
+        doc_provider.unwrap_or("templated only")
+    );
     println!(
         "{} {}",
         ui_command("attach:"),
@@ -8085,15 +8327,17 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
             )?,
             Some(CompletionAction::Abandon) => abandon_command(state.run_id.clone(), false, false)?,
             Some(CompletionAction::Docs) => {
-                Box::pin(doc_command(
-                    state.run_id.clone(),
-                    DocKind::Narrative,
-                    None,
-                    false,
-                    true,
-                    false,
-                    None,
-                ))
+                Box::pin(doc_command(DocCommandArgs {
+                    run_id: state.run_id.clone(),
+                    kind: DocKind::Narrative,
+                    export: None,
+                    polish: false,
+                    no_confirm: true,
+                    force: false,
+                    doc_skill: None,
+                    doc_provider: None,
+                    budget_cap: None,
+                }))
                 .await?
             }
             Some(CompletionAction::Show) => show_command(state.run_id.clone(), None)?,
@@ -8309,15 +8553,17 @@ async fn handle_tui_completion_key(
         ),
         CompletionAction::Abandon => abandon_command(state.run_id.clone(), false, false),
         CompletionAction::Docs => {
-            Box::pin(doc_command(
-                state.run_id.clone(),
-                DocKind::Narrative,
-                None,
-                false,
-                true,
-                false,
-                None,
-            ))
+            Box::pin(doc_command(DocCommandArgs {
+                run_id: state.run_id.clone(),
+                kind: DocKind::Narrative,
+                export: None,
+                polish: false,
+                no_confirm: true,
+                force: false,
+                doc_skill: None,
+                doc_provider: None,
+                budget_cap: None,
+            }))
             .await
         }
         CompletionAction::Show => show_command(state.run_id.clone(), None),
@@ -9570,6 +9816,9 @@ fn event_line(event: &RunEvent, show_cost: bool) -> String {
             } else {
                 format!("turn {turn} wall {}s", wall_time_seconds.unwrap_or(0.0))
             }
+        }
+        deadreckon_core::RunEventKind::DocsCheckpoint { turn, path, status } => {
+            format!("turn {turn} docs {status} {}", path.display())
         }
         deadreckon_core::RunEventKind::RunCompleted { status } => {
             format!("run {status}")

@@ -141,6 +141,50 @@ fn topology_emitted_only_when_three_or_more_top_dirs() {
     assert!(layout.contains("| crates/"));
 }
 
+#[test]
+fn four_narrator_subskill_files_present() {
+    for skill in [
+        "narrator-overview",
+        "narrator-phases",
+        "narrator-as-built",
+        "narrator-decisions",
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills")
+            .join(skill)
+            .join("SKILL.md");
+        assert!(path.exists(), "{} missing", path.display());
+        let raw = fs::read_to_string(&path).expect("skill");
+        assert!(raw.starts_with("---\n"));
+        assert!(raw.contains("output: json"));
+        assert!(raw.contains("inputs:"));
+    }
+}
+
+#[test]
+fn narrator_subskill_prompts_require_doc_depth_contracts() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills");
+    let overview =
+        fs::read_to_string(root.join("narrator-overview/SKILL.md")).expect("overview skill");
+    assert!(overview.contains("reading_order"));
+    assert!(overview.contains("why_now"));
+
+    let phases = fs::read_to_string(root.join("narrator-phases/SKILL.md")).expect("phases skill");
+    assert!(phases.contains("prose paragraph per phase"));
+    assert!(phases.contains("largest diff hunk"));
+
+    let as_built =
+        fs::read_to_string(root.join("narrator-as-built/SKILL.md")).expect("as-built skill");
+    assert!(as_built.contains("Project files"));
+    assert!(as_built.contains("load-bearing"));
+    assert!(as_built.contains("seams"));
+
+    let decisions =
+        fs::read_to_string(root.join("narrator-decisions/SKILL.md")).expect("decisions skill");
+    assert!(decisions.contains("false positives"));
+    assert!(decisions.contains("decisions"));
+}
+
 fn fresh_state(goal: &str) -> (TempDir, deadreckon_core::PipelineState) {
     let temp = TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("tempdir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));

@@ -1,22 +1,28 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use chrono::Utc;
 use deadreckon_providers::{ProviderRequest, ProviderRouter};
 use deadreckon_sandbox::SandboxBackend;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::error::IoContext;
 use deadreckon_core::codebase::{read_codebase_record, write_codebase_record};
 use deadreckon_core::docs::{
     AS_BUILT_DELTA, RUN_AS_BUILT, RUN_DECISIONS, RUN_NARRATIVE, append_docs_warning, as_built_path,
-    changed_doc_files, decisions_path, delta_path, docs_dir, missing_files_in_narrative,
-    narrative_path, polish_path, publish_docs_for_promotion, rewrite_templated_docs,
+    changed_doc_files, decisions_path, delta_path, diff_samples_markdown, docs_dir,
+    missing_files_in_narrative, narrative_path, polish_path, publish_docs_for_promotion,
+    read_turn_records, rewrite_templated_docs, source_layout, tool_stdio_markdown,
 };
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::paths::SOURCE_ROOT;
+use deadreckon_core::polish_subcalls::{
+    DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, PolishDiffCoverage, PolishSubcallRecord,
+};
 use deadreckon_core::state::PipelineState;
 
 #[derive(Debug, Clone)]
@@ -24,6 +30,10 @@ pub struct PolishConfig {
     pub home: PathBuf,
     pub doc_skill: String,
     pub doc_provider: Option<String>,
+    pub doc_provider_source: Option<String>,
+    pub doc_subskills: Vec<String>,
+    pub token_budget: u32,
+    pub budget_cap_usd: Option<f64>,
     pub no_llm: bool,
     pub force: bool,
 }
@@ -52,9 +62,13 @@ pub struct PolishedDocs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolishRecord {
+    #[serde(default = "default_polish_schema_version")]
+    pub schema_version: u32,
     pub status: String,
     pub inputs_hash: String,
     pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_provider_source: Option<String>,
     pub skill_path: Option<PathBuf>,
     pub skill_source: Option<String>,
     pub completed_at: String,
@@ -62,6 +76,16 @@ pub struct PolishRecord {
     pub retries: u32,
     pub missing_files: Vec<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub subcalls: Vec<PolishSubcallRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_coverage: Option<PolishDiffCoverage>,
+}
+
+fn default_polish_schema_version() -> u32 {
+    1
 }
 
 pub async fn polish_run_docs(
@@ -69,15 +93,17 @@ pub async fn polish_run_docs(
     router: &ProviderRouter,
     config: &PolishConfig,
 ) -> Result<()> {
-    rewrite_templated_docs(state, "templated only")?;
+    rewrite_templated_docs(state, &doc_writer_label(config))?;
     if config.no_llm {
         let hash = inputs_hash(state)?;
         write_polish_record(
             state,
             PolishRecord {
+                schema_version: 2,
                 status: "incremental".to_string(),
                 inputs_hash: hash,
                 provider: config.doc_provider.clone(),
+                doc_provider_source: config.doc_provider_source.clone(),
                 skill_path: None,
                 skill_source: None,
                 completed_at: Utc::now().to_rfc3339(),
@@ -85,6 +111,9 @@ pub async fn polish_run_docs(
                 retries: 0,
                 missing_files: Vec::new(),
                 error: None,
+                subcalls: Vec::new(),
+                merged_at: None,
+                diff_coverage: None,
             },
         )?;
         publish_docs_for_promotion(state)?;
@@ -101,15 +130,62 @@ pub async fn polish_run_docs(
         return Ok(());
     }
 
+    let requested_subskills = doc_subskills(config);
+    if should_use_split_polish(config) {
+        match resolve_doc_subskills(&requested_subskills, state, &config.home) {
+            Ok(resolved) => {
+                return polish_run_docs_split(state, router, config, &hash, resolved).await;
+            }
+            Err(err) if !config.doc_subskills.is_empty() => {
+                write_polish_record(
+                    state,
+                    PolishRecord {
+                        schema_version: 2,
+                        status: "no_skill".to_string(),
+                        inputs_hash: hash,
+                        provider: config.doc_provider.clone(),
+                        doc_provider_source: config.doc_provider_source.clone(),
+                        skill_path: None,
+                        skill_source: None,
+                        completed_at: Utc::now().to_rfc3339(),
+                        cost_usd: 0.0,
+                        retries: 0,
+                        missing_files: Vec::new(),
+                        error: Some(err.to_string()),
+                        subcalls: Vec::new(),
+                        merged_at: None,
+                        diff_coverage: None,
+                    },
+                )?;
+                publish_docs_for_promotion(state)?;
+                return Ok(());
+            }
+            Err(_) => {
+                // Fall through to the legacy single-skill path for older custom installs.
+            }
+        }
+    }
+
+    polish_run_docs_legacy(state, router, config, &hash).await
+}
+
+async fn polish_run_docs_legacy(
+    state: &mut PipelineState,
+    router: &ProviderRouter,
+    config: &PolishConfig,
+    hash: &str,
+) -> Result<()> {
     let resolved = match resolve_skill(&config.doc_skill, state, &config.home) {
         Ok(skill) => skill,
         Err(err) => {
             write_polish_record(
                 state,
                 PolishRecord {
+                    schema_version: 1,
                     status: "no_skill".to_string(),
-                    inputs_hash: hash,
+                    inputs_hash: hash.to_string(),
                     provider: config.doc_provider.clone(),
+                    doc_provider_source: config.doc_provider_source.clone(),
                     skill_path: None,
                     skill_source: None,
                     completed_at: Utc::now().to_rfc3339(),
@@ -117,6 +193,9 @@ pub async fn polish_run_docs(
                     retries: 0,
                     missing_files: Vec::new(),
                     error: Some(err.to_string()),
+                    subcalls: Vec::new(),
+                    merged_at: None,
+                    diff_coverage: None,
                 },
             )?;
             publish_docs_for_promotion(state)?;
@@ -152,9 +231,11 @@ pub async fn polish_run_docs(
                 write_polish_record(
                     state,
                     PolishRecord {
+                        schema_version: 1,
                         status: "provider_error".to_string(),
-                        inputs_hash: hash,
+                        inputs_hash: hash.to_string(),
                         provider: config.doc_provider.clone(),
+                        doc_provider_source: config.doc_provider_source.clone(),
                         skill_path: Some(resolved.path.clone()),
                         skill_source: Some(skill_source_label(&resolved.source).to_string()),
                         completed_at: Utc::now().to_rfc3339(),
@@ -162,6 +243,9 @@ pub async fn polish_run_docs(
                         retries,
                         missing_files: Vec::new(),
                         error: Some(err.to_string()),
+                        subcalls: Vec::new(),
+                        merged_at: None,
+                        diff_coverage: None,
                     },
                 )?;
                 publish_docs_for_promotion(state)?;
@@ -193,9 +277,11 @@ pub async fn polish_run_docs(
                 write_polish_record(
                     state,
                     PolishRecord {
+                        schema_version: 1,
                         status: "polished".to_string(),
-                        inputs_hash: hash.clone(),
+                        inputs_hash: hash.to_string(),
                         provider: Some(response.provider),
+                        doc_provider_source: config.doc_provider_source.clone(),
                         skill_path: Some(resolved.path.clone()),
                         skill_source: Some(skill_source_label(&resolved.source).to_string()),
                         completed_at: Utc::now().to_rfc3339(),
@@ -203,9 +289,16 @@ pub async fn polish_run_docs(
                         retries,
                         missing_files: missing,
                         error: None,
+                        subcalls: Vec::new(),
+                        merged_at: Some(Utc::now().to_rfc3339()),
+                        diff_coverage: Some(PolishDiffCoverage {
+                            changed_files: changed_doc_files(state)?.len(),
+                            missing_files: missing_files_in_narrative(state)?,
+                            retries,
+                        }),
                     },
                 )?;
-                write_hash_to_codebase(state, &hash)?;
+                write_hash_to_codebase(state, hash)?;
                 publish_docs_for_promotion(state)?;
                 return Ok(());
             }
@@ -221,9 +314,11 @@ pub async fn polish_run_docs(
                 write_polish_record(
                     state,
                     PolishRecord {
+                        schema_version: 1,
                         status: "json_parse".to_string(),
-                        inputs_hash: hash,
+                        inputs_hash: hash.to_string(),
                         provider: Some(response.provider),
+                        doc_provider_source: config.doc_provider_source.clone(),
                         skill_path: Some(resolved.path.clone()),
                         skill_source: Some(skill_source_label(&resolved.source).to_string()),
                         completed_at: Utc::now().to_rfc3339(),
@@ -231,12 +326,660 @@ pub async fn polish_run_docs(
                         retries,
                         missing_files: Vec::new(),
                         error: Some(error_message),
+                        subcalls: Vec::new(),
+                        merged_at: None,
+                        diff_coverage: None,
                     },
                 )?;
                 publish_docs_for_promotion(state)?;
                 return Ok(());
             }
         }
+    }
+}
+
+type ResolvedDocSubskill = (String, ResolvedSkill);
+
+struct SubcallResult {
+    name: String,
+    output: Option<Value>,
+    record: PolishSubcallRecord,
+}
+
+async fn polish_run_docs_split(
+    state: &mut PipelineState,
+    router: &ProviderRouter,
+    config: &PolishConfig,
+    hash: &str,
+    resolved: Vec<ResolvedDocSubskill>,
+) -> Result<()> {
+    let mut outputs = BTreeMap::new();
+    let mut subcalls = Vec::new();
+    let mut total_cost = 0.0;
+    let mut first_failed_skill = None;
+
+    for (name, skill) in &resolved {
+        let result = run_polish_subcall(state, router, config, name, skill, "").await;
+        total_cost += result.record.cost_usd;
+        if result.record.status != "ok" && first_failed_skill.is_none() {
+            first_failed_skill = Some(name.clone());
+        }
+        if let Some(output) = result.output {
+            outputs.insert(result.name.clone(), output);
+        }
+        subcalls.push(result.record);
+        if config
+            .budget_cap_usd
+            .is_some_and(|cap| total_cost > cap && first_failed_skill.is_none())
+        {
+            first_failed_skill = Some("budget_cap".to_string());
+            break;
+        }
+    }
+
+    let mut docs = merge_split_docs(state, &outputs)?;
+    write_polished_docs(state, &docs)?;
+
+    let mut coverage_retries = 0;
+    let mut missing = missing_files_in_narrative(state)?;
+    while !missing.is_empty() && coverage_retries < 2 {
+        let Some((_, phases_skill)) = resolved
+            .iter()
+            .find(|(name, _)| name == "narrator-phases")
+            .cloned()
+        else {
+            break;
+        };
+        coverage_retries += 1;
+        let suffix = format!(
+            "\nYour previous phase output omitted these changed files; revise only the phases JSON so every one is cited by path: {}",
+            missing.join(", ")
+        );
+        let result = run_polish_subcall(
+            state,
+            router,
+            config,
+            "narrator-phases",
+            &phases_skill,
+            &suffix,
+        )
+        .await;
+        if result.record.status != "ok" && first_failed_skill.is_none() {
+            first_failed_skill = Some("narrator-phases".to_string());
+        }
+        if let Some(output) = result.output {
+            outputs.insert(result.name.clone(), output);
+        }
+        subcalls.push(result.record);
+        docs = merge_split_docs(state, &outputs)?;
+        write_polished_docs(state, &docs)?;
+        missing = missing_files_in_narrative(state)?;
+    }
+
+    if !missing.is_empty() {
+        append_docs_warning(
+            state,
+            &format!(
+                "polished narrative still omitted files after retries: {}",
+                missing.join(", ")
+            ),
+        )?;
+    }
+
+    let status = first_failed_skill
+        .as_deref()
+        .map(|name| format!("failed_subcall:{name}"))
+        .unwrap_or_else(|| "polished".to_string());
+    let provider = subcalls
+        .iter()
+        .find_map(|subcall| subcall.provider.clone())
+        .or_else(|| config.doc_provider.clone());
+    let coverage = PolishDiffCoverage {
+        changed_files: changed_doc_files(state)?.len(),
+        missing_files: missing.clone(),
+        retries: coverage_retries,
+    };
+    write_polish_record(
+        state,
+        PolishRecord {
+            schema_version: 2,
+            status: status.clone(),
+            inputs_hash: hash.to_string(),
+            provider,
+            doc_provider_source: config.doc_provider_source.clone(),
+            skill_path: None,
+            skill_source: None,
+            completed_at: Utc::now().to_rfc3339(),
+            cost_usd: subcalls.iter().map(|subcall| subcall.cost_usd).sum(),
+            retries: coverage_retries,
+            missing_files: missing,
+            error: first_failed_skill
+                .as_ref()
+                .map(|name| format!("subcall {name} did not complete cleanly")),
+            subcalls,
+            merged_at: Some(Utc::now().to_rfc3339()),
+            diff_coverage: Some(coverage),
+        },
+    )?;
+    if status == "polished" {
+        write_hash_to_codebase(state, hash)?;
+    }
+    publish_docs_for_promotion(state)?;
+    Ok(())
+}
+
+async fn run_polish_subcall(
+    state: &PipelineState,
+    router: &ProviderRouter,
+    config: &PolishConfig,
+    name: &str,
+    skill: &ResolvedSkill,
+    suffix: &str,
+) -> SubcallResult {
+    let mut retries = 0;
+    let mut prompt_suffix = suffix.to_string();
+    loop {
+        let started = Instant::now();
+        let prompt = match polish_prompt(state, &skill.path, &prompt_suffix) {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                return failed_subcall(
+                    name,
+                    skill,
+                    "prompt_error",
+                    retries,
+                    Some(started.elapsed().as_millis()),
+                    err.to_string(),
+                );
+            }
+        };
+        let response = router
+            .complete(&ProviderRequest {
+                prompt,
+                max_output_tokens: polish_token_budget(config),
+                cwd: Some(state.working_dir.clone()),
+                output_path: Some(
+                    state
+                        .run_root
+                        .join("turns")
+                        .join("docs-polish")
+                        .join(name)
+                        .join("provider.out"),
+                ),
+                sandbox_backend: Some(SandboxBackend::None),
+                pid_file: None,
+                cancellation_token: None,
+            })
+            .await;
+        let duration_ms = Some(started.elapsed().as_millis());
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                return failed_subcall(
+                    name,
+                    skill,
+                    "provider_error",
+                    retries,
+                    duration_ms,
+                    err.to_string(),
+                );
+            }
+        };
+        match serde_json::from_str::<Value>(&response.content) {
+            Ok(value) => {
+                return SubcallResult {
+                    name: name.to_string(),
+                    output: Some(value),
+                    record: PolishSubcallRecord {
+                        skill: name.to_string(),
+                        status: "ok".to_string(),
+                        provider: Some(response.provider),
+                        skill_path: Some(skill.path.clone()),
+                        skill_source: Some(skill_source_label(&skill.source).to_string()),
+                        tokens_in: response.usage.input_tokens,
+                        tokens_out: response.usage.output_tokens,
+                        cost_usd: response.spend.cost_usd,
+                        retries,
+                        duration_ms,
+                        error: None,
+                    },
+                };
+            }
+            Err(err) if retries == 0 => {
+                retries += 1;
+                prompt_suffix = format!(
+                    "{}\nYour last reply for `{name}` was not valid JSON: {err}. Reproduce only the requested JSON object.",
+                    suffix
+                );
+            }
+            Err(err) => {
+                return SubcallResult {
+                    name: name.to_string(),
+                    output: None,
+                    record: PolishSubcallRecord {
+                        skill: name.to_string(),
+                        status: "json_parse".to_string(),
+                        provider: Some(response.provider),
+                        skill_path: Some(skill.path.clone()),
+                        skill_source: Some(skill_source_label(&skill.source).to_string()),
+                        tokens_in: response.usage.input_tokens,
+                        tokens_out: response.usage.output_tokens,
+                        cost_usd: response.spend.cost_usd,
+                        retries,
+                        duration_ms,
+                        error: Some(err.to_string()),
+                    },
+                };
+            }
+        }
+    }
+}
+
+fn failed_subcall(
+    name: &str,
+    skill: &ResolvedSkill,
+    status: &str,
+    retries: u32,
+    duration_ms: Option<u128>,
+    error: String,
+) -> SubcallResult {
+    SubcallResult {
+        name: name.to_string(),
+        output: None,
+        record: PolishSubcallRecord {
+            skill: name.to_string(),
+            status: status.to_string(),
+            provider: None,
+            skill_path: Some(skill.path.clone()),
+            skill_source: Some(skill_source_label(&skill.source).to_string()),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            retries,
+            duration_ms,
+            error: Some(error),
+        },
+    }
+}
+
+fn resolve_doc_subskills(
+    names: &[String],
+    state: &PipelineState,
+    home: &Path,
+) -> Result<Vec<ResolvedDocSubskill>> {
+    names
+        .iter()
+        .map(|name| resolve_skill(name, state, home).map(|skill| (name.clone(), skill)))
+        .collect()
+}
+
+fn doc_subskills(config: &PolishConfig) -> Vec<String> {
+    if config.doc_subskills.is_empty() {
+        DEFAULT_DOC_SUBSKILLS
+            .iter()
+            .map(|skill| (*skill).to_string())
+            .collect()
+    } else {
+        config.doc_subskills.clone()
+    }
+}
+
+fn should_use_split_polish(config: &PolishConfig) -> bool {
+    !config.doc_subskills.is_empty()
+}
+
+fn polish_token_budget(config: &PolishConfig) -> u32 {
+    if config.token_budget == 0 {
+        DEFAULT_DOC_POLISH_TOKEN_BUDGET
+    } else {
+        config.token_budget
+    }
+}
+
+fn doc_writer_label(config: &PolishConfig) -> String {
+    if config.no_llm {
+        return "templated only".to_string();
+    }
+    let provider = config
+        .doc_provider
+        .as_deref()
+        .unwrap_or("unconfigured doc provider");
+    if should_use_split_polish(config) {
+        format!("{} via {}", provider, doc_subskills(config).join(", "))
+    } else {
+        provider.to_string()
+    }
+}
+
+fn merge_split_docs(
+    state: &PipelineState,
+    outputs: &BTreeMap<String, Value>,
+) -> Result<PolishedDocs> {
+    let fallback = templated_docs_json(state);
+    Ok(PolishedDocs {
+        narrative: render_split_narrative(
+            state,
+            outputs.get("narrator-overview"),
+            outputs.get("narrator-phases"),
+            &fallback.narrative,
+        )?,
+        as_built: render_split_as_built(
+            state,
+            outputs.get("narrator-as-built"),
+            &fallback.as_built,
+        )?,
+        decisions: render_split_decisions(outputs.get("narrator-decisions"), &fallback.decisions),
+        delta: fallback.delta,
+    })
+}
+
+fn render_split_narrative(
+    state: &PipelineState,
+    overview: Option<&Value>,
+    phases: Option<&Value>,
+    fallback: &str,
+) -> Result<String> {
+    if let Some(narrative) = overview.and_then(|value| string_field(value, "narrative")) {
+        return Ok(narrative);
+    }
+    let mut out = frontmatter_prefix(fallback);
+    if let Some(reading_order) = overview.and_then(|value| string_field(value, "reading_order"))
+        && !reading_order.trim().is_empty()
+    {
+        out.push_str("## Reading order\n\n");
+        out.push_str(reading_order.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str("## Goal\n\n");
+    out.push_str(&state.goal);
+    out.push_str("\n\n## Why now\n\n");
+    out.push_str(
+        &overview
+            .and_then(|value| string_field(value, "why_now"))
+            .unwrap_or_else(|| fallback_section(fallback, "## Why now", "## High-level approach")),
+    );
+    out.push_str("\n\n## High-level approach\n\n");
+    out.push_str(
+        &overview
+            .and_then(|value| string_field(value, "high_level_approach"))
+            .unwrap_or_else(|| {
+                fallback_section(
+                    fallback,
+                    "## High-level approach",
+                    "## What shipped in this run",
+                )
+            }),
+    );
+    out.push_str("\n\n## What shipped in this run\n\n");
+    out.push_str(&phases.and_then(render_phases_value).unwrap_or_else(|| {
+        fallback_section(fallback, "## What shipped in this run", "## Open threads")
+    }));
+    out.push_str("\n\n## Open threads\n\n");
+    let threads = overview
+        .and_then(|value| string_array_field(value, "open_threads"))
+        .unwrap_or_default();
+    if threads.is_empty() {
+        out.push_str("- No open threads recorded by deadreckon.\n");
+    } else {
+        for thread in threads {
+            out.push_str(&format!("- {thread}\n"));
+        }
+    }
+    out.push_str("\n## Cross-references\n\n");
+    let refs = overview
+        .and_then(|value| string_array_field(value, "cross_references"))
+        .unwrap_or_default();
+    if refs.is_empty() {
+        out.push_str(&fallback_section(fallback, "## Cross-references", ""));
+    } else {
+        for item in refs {
+            out.push_str(&format!("- {item}\n"));
+        }
+    }
+    Ok(out.trim_end().to_string() + "\n")
+}
+
+fn render_phases_value(value: &Value) -> Option<String> {
+    if let Some(markdown) = string_field(value, "phases_markdown") {
+        return Some(markdown);
+    }
+    let phases = value.get("phases")?.as_array()?;
+    if phases.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (idx, phase) in phases.iter().enumerate() {
+        let title = string_field(phase, "title").unwrap_or_else(|| format!("Phase {}", idx + 1));
+        let commit = string_field(phase, "commit")
+            .or_else(|| string_field(phase, "commit_sha"))
+            .unwrap_or_else(|| "-".to_string());
+        out.push_str(&format!(
+            "### Phase {} - {} (commit `{}`)\n\n",
+            idx + 1,
+            title.trim(),
+            commit.trim()
+        ));
+        let prose = string_field(phase, "paragraph")
+            .or_else(|| string_field(phase, "prose"))
+            .or_else(|| string_field(phase, "summary"))
+            .unwrap_or_else(|| "No phase prose returned by doc provider.".to_string());
+        out.push_str(prose.trim());
+        out.push_str("\n\n| File | Change | Largest hunk |\n| --- | ---: | --- |\n");
+        let file_changes = phase
+            .get("file_changes")
+            .or_else(|| phase.get("files"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if file_changes.is_empty() {
+            out.push_str("| - | +0 / -0 | no file changes returned |\n\n");
+        } else {
+            for file in file_changes {
+                if let Some(text) = file.as_str() {
+                    out.push_str(&format!(
+                        "| {} | - | evidence returned as prose |\n",
+                        text.replace('|', "\\|")
+                    ));
+                    continue;
+                }
+                let path = string_field(&file, "path").unwrap_or_else(|| file.to_string());
+                let adds = u64_field(&file, "adds");
+                let dels = u64_field(&file, "dels");
+                let hunk = string_field(&file, "largest_hunk_excerpt")
+                    .or_else(|| string_field(&file, "diff_quote"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "| `{}` | +{} / -{} | {} |\n",
+                    path.trim_matches('"'),
+                    adds,
+                    dels,
+                    inline_hunk(&hunk)
+                ));
+            }
+            out.push('\n');
+        }
+        let citations = string_array_field(phase, "citations").unwrap_or_default();
+        for citation in citations {
+            out.push_str(&format!("- Trace: {citation}\n"));
+        }
+        if !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
+fn render_split_as_built(
+    state: &PipelineState,
+    as_built: Option<&Value>,
+    fallback: &str,
+) -> Result<String> {
+    if let Some(markdown) = as_built.and_then(|value| string_field(value, "as_built")) {
+        return Ok(markdown);
+    }
+    let Some(value) = as_built else {
+        return Ok(fallback.to_string());
+    };
+    let mut out = frontmatter_prefix(fallback);
+    out.push_str("## System overview\n\n");
+    out.push_str(
+        value
+            .get("system_overview")
+            .and_then(Value::as_str)
+            .unwrap_or("The run produced or changed the components listed below."),
+    );
+    out.push_str("\n\n## Source layout\n\n");
+    let records = read_turn_records(&state.working_dir)?;
+    let layout = value
+        .get("source_layout")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| source_layout(&records, &state.working_dir));
+    out.push_str(&layout);
+    if !layout.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("\n## Components\n\n");
+    if let Some(components) = value.get("components").and_then(Value::as_array) {
+        out.push_str("| Layer | Responsibilities | Key entrypoints |\n| --- | --- | --- |\n");
+        for component in components {
+            let layer = string_field(component, "layer").unwrap_or_else(|| "Component".to_string());
+            let responsibilities =
+                string_field(component, "responsibilities").unwrap_or_else(|| "-".to_string());
+            let entrypoints =
+                string_field(component, "key_entrypoints").unwrap_or_else(|| "-".to_string());
+            if layer != "Project files" {
+                out.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    layer, responsibilities, entrypoints
+                ));
+            }
+        }
+    } else if let Some(components) = value.get("components").and_then(Value::as_str) {
+        out.push_str(components);
+        if !components.ends_with('\n') {
+            out.push('\n');
+        }
+    } else {
+        out.push_str(&fallback_section(
+            fallback,
+            "## Components",
+            "## File layout",
+        ));
+    }
+    out.push_str("\n## Load-bearing paths\n\n");
+    out.push_str(
+        value
+            .get("load_bearing_paths")
+            .and_then(Value::as_str)
+            .unwrap_or("See the component table above for the files that carry runtime behavior."),
+    );
+    out.push_str("\n\n## Seams\n\n");
+    out.push_str(
+        value
+            .get("seams")
+            .and_then(Value::as_str)
+            .unwrap_or("External and internal seams are listed in the trace-backed source layout."),
+    );
+    out.push('\n');
+    Ok(out)
+}
+
+fn render_split_decisions(decisions: Option<&Value>, fallback: &str) -> String {
+    if let Some(markdown) = decisions.and_then(|value| string_field(value, "decisions_markdown")) {
+        return markdown;
+    }
+    let frontmatter = frontmatter_prefix(fallback);
+    let Some(value) = decisions else {
+        return fallback.to_string();
+    };
+    let Some(items) = value.get("decisions").and_then(Value::as_array) else {
+        return fallback.to_string();
+    };
+    if items.is_empty() {
+        return format!("{frontmatter}No multi-alternative decisions detected in this run.\n");
+    }
+    let mut out = frontmatter;
+    for (idx, item) in items.iter().enumerate() {
+        out.push_str(&format!("## Decision {}\n\n", idx + 1));
+        out.push_str(&format!(
+            "- **Context:** {}\n",
+            string_field(item, "context").unwrap_or_else(|| "-".to_string())
+        ));
+        out.push_str(&format!(
+            "- **Options considered:** {}\n",
+            string_array_field(item, "options")
+                .unwrap_or_default()
+                .join("; ")
+        ));
+        out.push_str(&format!(
+            "- **Chosen:** {}\n",
+            string_field(item, "chosen").unwrap_or_else(|| "-".to_string())
+        ));
+        out.push_str(&format!(
+            "- **Rationale:** {}\n\n",
+            string_field(item, "rationale").unwrap_or_else(|| "-".to_string())
+        ));
+    }
+    out
+}
+
+fn frontmatter_prefix(markdown: &str) -> String {
+    markdown
+        .find("## ")
+        .map(|idx| markdown[..idx].to_string())
+        .filter(|prefix| !prefix.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn fallback_section(markdown: &str, start: &str, end: &str) -> String {
+    let Some(start_idx) = markdown.find(start) else {
+        return String::new();
+    };
+    let body_start = start_idx + start.len();
+    let body_end = if end.is_empty() {
+        markdown.len()
+    } else {
+        markdown[body_start..]
+            .find(end)
+            .map(|idx| body_start + idx)
+            .unwrap_or(markdown.len())
+    };
+    markdown[body_start..body_end].trim().to_string()
+}
+
+fn string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn string_array_field(value: &Value, field: &str) -> Option<Vec<String>> {
+    value.get(field).and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| string_field(item, "text"))
+            })
+            .filter(|item| !item.trim().is_empty())
+            .collect()
+    })
+}
+
+fn u64_field(value: &Value, field: &str) -> u64 {
+    value.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn inline_hunk(hunk: &str) -> String {
+    let trimmed = hunk.trim();
+    if trimmed.is_empty() {
+        "no hunk returned".to_string()
+    } else {
+        format!("`{}`", trimmed.replace('\n', " / ").replace('|', "\\|"))
     }
 }
 
@@ -317,6 +1060,7 @@ fn polish_prompt(state: &PipelineState, skill_path: &Path, suffix: &str) -> Resu
         .unwrap_or_default();
     let narrative = fs::read_to_string(narrative_path(&state.working_dir)).unwrap_or_default();
     let files = changed_doc_files(state)?.join("\n");
+    let records = read_turn_records(&state.working_dir)?;
     let prompt = substitute_placeholders(
         &skill,
         &[
@@ -325,13 +1069,70 @@ fn polish_prompt(state: &PipelineState, skill_path: &Path, suffix: &str) -> Resu
             ("status", state.status.to_string()),
             ("provider", state.provider.clone().unwrap_or_default()),
             ("sandbox", state.sandbox.clone()),
+            ("run_summary", run_summary(state, &records)?),
             ("trace_jsonl", traces),
             ("incremental_jsonl", incremental),
             ("current_narrative", narrative),
             ("changed_files", files),
+            ("diff_samples", diff_samples_markdown(&records)),
+            ("tool_stdout", tool_stdio_markdown(&records)),
+            ("source_layout", source_layout(&records, &state.working_dir)),
+            ("parent_narrative", parent_narrative(state)),
         ],
     );
     Ok(format!("{prompt}\n{suffix}"))
+}
+
+fn run_summary(
+    state: &PipelineState,
+    records: &[deadreckon_core::docs::TurnRecord],
+) -> Result<String> {
+    Ok(format!(
+        "run_id: {}\nstatus: {}\ngoal: {}\nprovider: {}\nsandbox: {}\nturns: {}\nchanged_files: {}",
+        state.run_id,
+        state.status,
+        state.goal,
+        state
+            .provider
+            .clone()
+            .unwrap_or_else(|| "unconfigured".to_string()),
+        state.sandbox,
+        records.len(),
+        changed_doc_files(state)?.join(", ")
+    ))
+}
+
+fn parent_narrative(state: &PipelineState) -> String {
+    let marker_path = state.working_dir.join(".deadreckon/parent.json");
+    let Ok(raw) = fs::read_to_string(marker_path) else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return String::new();
+    };
+    let Some(parent_run_id) = value.get("parent_run_id").and_then(Value::as_str) else {
+        return String::new();
+    };
+    let parent_scope = value
+        .get("parent_scope")
+        .and_then(Value::as_str)
+        .unwrap_or(&state.scope);
+    let Some(home) = state
+        .run_root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    else {
+        return String::new();
+    };
+    let path = home
+        .join("library")
+        .join(parent_scope)
+        .join(parent_run_id)
+        .join("docs")
+        .join(RUN_NARRATIVE);
+    fs::read_to_string(path).unwrap_or_default()
 }
 
 fn write_polished_docs(state: &PipelineState, docs: &PolishedDocs) -> Result<()> {

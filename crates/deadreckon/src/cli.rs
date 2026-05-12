@@ -62,6 +62,7 @@ Lifecycle:
 Common provider/model changes:
   deadreckon run \"goal\" --provider cli:codex
   deadreckon run \"goal\" --provider cli:codex --model gpt-5.1-codex
+  deadreckon run \"goal\" --doc-provider cli:codex
   deadreckon config provider cli:codex
   deadreckon config model gpt-5.1-codex --provider cli:codex
 
@@ -196,7 +197,11 @@ Lifecycle:
   deadreckon doc latest --kind decisions
   deadreckon doc latest --export ./RUN-NARRATIVE.md
 
-Docs are generated as part of accepted runs and are also shown in the TUI after completion.";
+Docs are generated as part of accepted runs and are also shown in the TUI after completion.
+Docs can be regenerated with a provider-backed polish pass:
+  deadreckon doc latest --polish
+  deadreckon doc latest --polish --doc-provider cli:codex --force
+  deadreckon doc latest --polish --budget-cap 0.25 --no-confirm";
 
 const ATTACH_HELP: &str = "\
 Lifecycle:
@@ -360,6 +365,8 @@ pub(crate) enum Commands {
         provider: Option<String>,
         #[arg(long, help = "Model override for this run")]
         model: Option<String>,
+        #[arg(long, help = "Provider route for generated documentation polish")]
+        doc_provider: Option<String>,
         #[arg(
             long,
             value_name = "PATH",
@@ -692,6 +699,10 @@ pub(crate) enum Commands {
         force: bool,
         #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
+        #[arg(long, help = "Provider route for documentation polish")]
+        doc_provider: Option<String>,
+        #[arg(long, help = "Budget cap in USD for documentation polish")]
+        budget_cap: Option<f64>,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -974,6 +985,7 @@ pub(crate) struct RunCommandArgs {
     pub(crate) sandbox: Option<String>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
+    pub(crate) doc_provider: Option<String>,
     pub(crate) acceptance: Option<PathBuf>,
     pub(crate) skill: String,
     pub(crate) smoke: bool,

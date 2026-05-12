@@ -357,6 +357,111 @@ async fn polish_uses_doc_provider_override_when_configured() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_polish_runs_four_subskills_with_16k_budget() {
+    let (_temp, paths, mut state) = fresh_state("split polish");
+    append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    polish_run_docs(
+        &mut state,
+        &router,
+        &split_polish_config(paths.home(), false),
+    )
+    .await
+    .expect("polish");
+
+    let journal = server.journal();
+    assert_eq!(journal.len(), 4);
+    for request in &journal {
+        assert_eq!(request["max_tokens"].as_u64(), Some(16_384));
+    }
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert_eq!(record.schema_version, 2);
+    assert_eq!(record.status, "polished");
+    assert_eq!(record.doc_provider_source.as_deref(), Some("config"));
+    assert_eq!(
+        record
+            .subcalls
+            .iter()
+            .map(|subcall| subcall.skill.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "narrator-overview",
+            "narrator-phases",
+            "narrator-as-built",
+            "narrator-decisions"
+        ]
+    );
+    assert!(record.merged_at.is_some());
+    assert!(record.diff_coverage.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_polish_cost_sums_subcalls() {
+    let (_temp, paths, mut state) = fresh_state("split cost");
+    append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    polish_run_docs(
+        &mut state,
+        &router,
+        &split_polish_config(paths.home(), false),
+    )
+    .await
+    .expect("polish");
+    let record = read_polish_record(&state).unwrap().unwrap();
+    let summed = record
+        .subcalls
+        .iter()
+        .map(|subcall| subcall.cost_usd)
+        .sum::<f64>();
+    assert_eq!(record.cost_usd, summed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_polish_retries_only_phases_for_missing_file_coverage() {
+    let (_temp, paths, mut state) = fresh_state("split coverage");
+    append_sample_turn(&state, 1, "write_file", &["a.txt", "b.txt"], "ok");
+    let server = MockServer::start(vec![
+        FixtureResponse::json(overview_json_for_tests()),
+        FixtureResponse::json(phases_json(&["a.txt"])),
+        FixtureResponse::json(as_built_json(&["a.txt", "b.txt"])),
+        FixtureResponse::json(decisions_json()),
+        FixtureResponse::json(phases_json(&["a.txt", "b.txt"])),
+    ])
+    .await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    polish_run_docs(
+        &mut state,
+        &router,
+        &split_polish_config(paths.home(), false),
+    )
+    .await
+    .expect("polish");
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert_eq!(server.journal().len(), 5);
+    assert_eq!(record.retries, 1);
+    assert_eq!(
+        record.subcalls.last().map(|subcall| subcall.skill.as_str()),
+        Some("narrator-phases")
+    );
+    assert!(
+        record
+            .diff_coverage
+            .as_ref()
+            .expect("coverage")
+            .missing_files
+            .is_empty()
+    );
+}
+
 #[test]
 fn polish_resolves_project_skill_before_user_before_repo() {
     let (temp, paths, state) = copy_state_with_source("skill precedence");
@@ -618,18 +723,15 @@ fn doc_export_refuses_existing_path_unless_force() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doc_polish_triggers_fresh_call_with_confirm() {
     let (_temp, paths, state) = completed_state_with_docs("doc polish");
-    let server = MockServer::start(vec![FixtureResponse::json(valid_docs_json(
-        &state,
-        &["a.txt"],
-    ))])
-    .await;
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
     write_config(paths.home(), &server.base_url(), "docmock");
     let output = deadreckon(paths.home())
         .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
         .output()
         .expect("doc");
     assert_success(&output);
-    assert_eq!(server.journal().len(), 1);
+    assert_eq!(server.journal().len(), 4);
+    assert!(stdout(&output).contains("doc polish:"));
 }
 
 #[test]
@@ -856,7 +958,30 @@ fn polish_config(home: &Path, no_llm: bool, force: bool) -> PolishConfig {
         home: home.to_path_buf(),
         doc_skill: "run-narrator".to_string(),
         doc_provider: Some("docmock".to_string()),
+        doc_provider_source: Some("config".to_string()),
+        doc_subskills: Vec::new(),
+        token_budget: 0,
+        budget_cap_usd: None,
         no_llm,
+        force,
+    }
+}
+
+fn split_polish_config(home: &Path, force: bool) -> PolishConfig {
+    PolishConfig {
+        home: home.to_path_buf(),
+        doc_skill: "run-narrator".to_string(),
+        doc_provider: Some("docmock".to_string()),
+        doc_provider_source: Some("config".to_string()),
+        doc_subskills: vec![
+            "narrator-overview".to_string(),
+            "narrator-phases".to_string(),
+            "narrator-as-built".to_string(),
+            "narrator-decisions".to_string(),
+        ],
+        token_budget: 0,
+        budget_cap_usd: None,
+        no_llm: false,
         force,
     }
 }
@@ -872,6 +997,59 @@ fn valid_docs_json(state: &deadreckon_core::PipelineState, files: &[&str]) -> St
         "as_built": format!("# as built\n\n## System overview\n\n{}", file_lines),
         "decisions": "No multi-alternative decisions detected in this run.\n",
         "delta": ""
+    }).to_string()
+}
+
+fn phases_json(files: &[&str]) -> String {
+    json!({
+        "phases": [{
+            "title": "Documented Work",
+            "paragraph": format!("The provider completed the turn and changed {}.", files.join(", ")),
+            "commit": "-",
+            "file_changes": files.iter().map(|file| json!({
+                "path": file,
+                "adds": 3,
+                "dels": 1,
+                "largest_hunk_excerpt": format!("@@ -1,1 +1,3 @@\n+{}", file)
+            })).collect::<Vec<_>>(),
+            "citations": ["[turn 1](../traces.jsonl#turn-1)"]
+        }]
+    }).to_string()
+}
+
+fn as_built_json(files: &[&str]) -> String {
+    json!({
+        "system_overview": format!("The run produced trace-backed files: {}.", files.join(", ")),
+        "components": files.iter().map(|file| json!({
+            "layer": format!("{} layer", file),
+            "responsibilities": "Carries the implemented behavior.",
+            "key_entrypoints": format!("`{}:1`", file)
+        })).collect::<Vec<_>>(),
+        "load_bearing_paths": files.iter().map(|file| format!("`{}:1`", file)).collect::<Vec<_>>().join(", "),
+        "seams": "The provider boundary is captured in traces and run provenance."
+    }).to_string()
+}
+
+fn decisions_json() -> String {
+    json!({ "decisions": [] }).to_string()
+}
+
+fn split_docs_fixtures(files: &[&str]) -> Vec<FixtureResponse> {
+    vec![
+        FixtureResponse::json(overview_json_for_tests()),
+        FixtureResponse::json(phases_json(files)),
+        FixtureResponse::json(as_built_json(files)),
+        FixtureResponse::json(decisions_json()),
+    ]
+}
+
+fn overview_json_for_tests() -> String {
+    json!({
+        "reading_order": "Read the narrative first, then the as-built map and decisions.",
+        "why_now": "This run needs durable documentation at the same boundary as the completed turn.",
+        "high_level_approach": "deadreckon captured the completed turn and summarized the work from traces.",
+        "open_threads": [],
+        "cross_references": ["Trace: `traces.jsonl`", "Incremental docs: `.deadreckon/docs/_incremental.jsonl`"]
     }).to_string()
 }
 

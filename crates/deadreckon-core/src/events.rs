@@ -38,6 +38,11 @@ pub enum RunEventKind {
         total_cost_usd: f64,
         wall_time_seconds: Option<f64>,
     },
+    DocsCheckpoint {
+        turn: u32,
+        path: PathBuf,
+        status: String,
+    },
     RunCompleted {
         status: String,
     },

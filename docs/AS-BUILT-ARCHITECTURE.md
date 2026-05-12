@@ -1379,8 +1379,8 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - `apply` and `abandon` for worktree rollback/apply lifecycle.
 - `materialize`, `extend`, `undo`, `list`, and `show` integration with codebase mode metadata, including worktree extension branches chained from parent `dr/...` branches.
 - UX consolidation: project-scoped `list`, `latest` run aliases, `status`/`next`, `cleanup`/`prune`, `export`/`discard` aliases, and TTY-aware formatted output.
-- Self-documenting run artifacts in stoa shape: `RUN-NARRATIVE.md`, `RUN-AS-BUILT.md`, `RUN-DECISIONS.md`, optional `AS-BUILT-DELTA.md`, per-turn `_incremental.jsonl`, and `polish.json`.
-- `deadreckon doc`, `list` DOCS status, doc-aware `apply` commit bodies, extend-parent narrative updates, diff coverage retry, and the repo/user/project `run-narrator` skill mechanism.
+- Self-documenting run artifacts in stoa shape: `RUN-NARRATIVE.md`, `RUN-AS-BUILT.md`, `RUN-DECISIONS.md`, optional `AS-BUILT-DELTA.md`, per-turn `_incremental.jsonl`, explicit `docs_checkpoint` run events, and `polish.json` schema v2.
+- `deadreckon doc`, `list` DOCS status, doc-aware `apply` commit bodies, extend-parent narrative updates, diff coverage retry, the legacy repo/user/project `run-narrator` skill mechanism, and default split polish skills (`narrator-overview`, `narrator-phases`, `narrator-as-built`, `narrator-decisions`).
 - Acceptance gate with signed marker; anti-self-attestation actually enforced.
 - `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import`, `cleanup`/`prune` verbs.
 - `ratatui` attach TUI with spend/context telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer.
@@ -1533,11 +1533,15 @@ The docs use stoa-style bold frontmatter: Date, Last updated, Status, Run ID, Go
 
 ### 25.3 Per-Turn Templating
 
-After every successful tool/provider turn, `crates/deadreckon-runtime/src/turn_loop.rs` calls `append_turn_doc`. The deterministic record lands in `_incremental.jsonl` and rewrites the Markdown drafts with turn sections containing tool kind, latency, files, outcome, trace citation, snapshot reference, and worktree commit SHA when available.
+After every successful tool/provider turn, `crates/deadreckon-runtime/src/turn_loop.rs` calls the turn-end documentation checkpoint. The deterministic record lands in `_incremental.jsonl`, rewrites the Markdown drafts, and emits a `docs_checkpoint` run event before the loop advances. This happens for both CLI sub-agent turns that complete in one provider process and JSON-action providers that may take many Bash/WriteFile/Done turns.
+
+Each turn record carries the full provider response capped at 50 KB, a short response summary, per-file add/delete counts, largest diff-hunk excerpts, binary markers, optional stdout/stderr samples, trace citation, snapshot reference, and worktree commit SHA when available.
 
 ### 25.4 End-of-Run Polish Pass
 
-Before acceptance/promotion, `polish_run_docs` resolves `run-narrator` in project, user, then repo order. It substitutes run placeholders, sends one doc-provider completion unless `--no-docs` is set, parses JSON into the three docs plus optional delta, retries once on malformed JSON, and records status/cost/hash/provider in `polish.json`. Provider, JSON, or skill failures are nonfatal; templated docs remain.
+Before acceptance/promotion, `polish_run_docs` first writes deterministic docs, then optionally runs provider-backed polish unless `--no-docs` is set. The default path resolves four repo/user/project skills in order: `narrator-overview`, `narrator-phases`, `narrator-as-built`, and `narrator-decisions`. Each subcall receives the same run evidence plus a focused prompt, uses a 16K output-token budget by default, retries once on malformed JSON, and contributes to the merged docs.
+
+The legacy `run-narrator` single-call path remains available for custom installs that do not opt into split `doc_subskills`. Provider, JSON, or skill failures are nonfatal; templated docs remain and `polish.json` records `failed_subcall:<name>` when a split subcall failed.
 
 ### 25.5 Phase And Decision Detection
 
@@ -1545,7 +1549,7 @@ Before acceptance/promotion, `polish_run_docs` resolves `run-narrator` in projec
 
 ### 25.6 Diff Coverage And Retry
 
-After polish, deadreckon verifies every changed file appears in `RUN-NARRATIVE.md` by relative path or basename. Missing files trigger up to two polish retries with an explicit omission list. Remaining omissions are logged as `docs.warning` traces and do not fail the run.
+After polish, deadreckon verifies every changed file appears in `RUN-NARRATIVE.md` by relative path or basename. Missing files trigger up to two targeted `narrator-phases` retries with an explicit omission list; other subskills are not re-run for phase coverage misses. Remaining omissions are logged as `docs.warning` traces and do not fail the run.
 
 ### 25.7 AS-BUILT-DELTA
 
@@ -1557,11 +1561,11 @@ When `deadreckon apply` builds the default squash or merge message, it reads `RU
 
 ### 25.9 `deadreckon doc`
 
-`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another artifact, `--export <path>` writes it to disk, `--force` overwrites exports, and `--polish --no-confirm` requests a fresh doc polish turn.
+`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another artifact, `--export <path>` writes it to disk, and `--force` overwrites exports or a prior polish result. `--polish` prints a preview listing provider, provider source, subskills, token budget, budget cap, and inputs hash before it calls the doc provider; `--no-confirm` skips the prompt for scripts. `--doc-provider <route>` overrides the automatic doc provider and `--budget-cap <usd>` limits the polish pass.
 
 ### 25.10 Cost And Idempotency
 
-`polish.json` stores a SHA-256 inputs hash over goal, traces, provenance, spend, incremental records, changed files, and source AS-BUILT content. A matching polished hash skips duplicate provider calls unless forced. CLI subscription providers report wall time rather than USD cost.
+`polish.json` stores a SHA-256 inputs hash over goal, traces, provenance, spend, incremental records, changed files, and source AS-BUILT content. Schema v2 records `doc_provider_source`, `subcalls[]` with skill/status/provider/tokens/cost/duration/retries, `merged_at`, and `diff_coverage`. A matching polished hash skips duplicate provider calls unless forced. CLI subscription providers report wall time rather than USD cost, but the doc-provider resolver still records whether the route came from a flag, config, auto-detected subscription CLI, run provider fallback, or no provider.
 
 ---
 

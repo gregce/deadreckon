@@ -203,6 +203,15 @@ default for that provider. For CLI providers, `provider default` means
 deadreckon delegates model choice to Codex or Claude Code unless you pass
 `--model`.
 
+Run docs use their own provider route. By default deadreckon uses
+`defaults.doc_provider`, then an installed subscription CLI (`cli:codex` before
+`cli:claude-code`), then the run provider. Override it per run when needed:
+
+```bash
+deadreckon run "goal" --doc-provider cli:codex
+deadreckon config set defaults.doc_provider cli:codex
+```
+
 Spend above `$50` requires confirmation:
 
 ```bash
@@ -257,6 +266,25 @@ The docs view uses a Markdown parser and ratatui styles for headings, bullets,
 inline code, fenced code blocks, links, horizontal rules, and task lists. Press
 `d` again to return to provider activity. Scroll it with the same `j/k`,
 arrow-key, page-key, and mouse-wheel bindings.
+
+## Generated Docs
+
+Every run writes `.deadreckon/docs/_incremental.jsonl` at turn boundaries and
+emits a `docs_checkpoint` event. Completion then runs the doc polish step unless
+you passed `--no-docs`.
+
+```bash
+deadreckon doc latest
+deadreckon doc latest --kind as-built
+deadreckon doc latest --kind decisions
+deadreckon doc latest --polish --force
+deadreckon doc latest --polish --doc-provider cli:codex --budget-cap 0.25
+```
+
+The polish preview lists the provider, why it was selected, the four narrator
+subskills, token budget, budget cap, and inputs hash. `--no-confirm` skips the
+prompt for scripts. Results are recorded in `polish.json` with one status line
+per subskill.
 
 The TUI does not start, kill, resume, or undo runs. Use CLI commands for those controls.
 

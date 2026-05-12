@@ -10,6 +10,7 @@ pub mod events;
 pub mod gate;
 pub mod lock;
 pub mod paths;
+pub mod polish_subcalls;
 pub mod promotion;
 pub mod state;
 
@@ -62,6 +63,10 @@ pub use lock::{
     terminate_pid,
 };
 pub use paths::{DEFAULT_DEADRECKON_HOME, DeadreckonPaths, SOURCE_ROOT};
+pub use polish_subcalls::{
+    DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DocProviderSelection,
+    DocProviderSource, PolishDiffCoverage, PolishSubcallRecord,
+};
 pub use promotion::{PromotionManifest, promote_completed_run, recover_promotion};
 pub use state::{
     CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, RunListEntry, RunOptions,
