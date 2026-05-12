@@ -1,5 +1,9 @@
 # Changelog
 
+## Hardening v2 (alpha) — 2026-05-11
+
+- Added `docs/AUDIT-2026-05-11.md` mapping the original 25 unmet needs to current evidence and the P2-P10 closure plan.
+
 ## UX consolidation — 2026-05-11
 
 - Added an in-TUI Markdown docs view for completed runs. Press `d` in `attach` to toggle a styled `RUN-NARRATIVE.md` rendering instead of dropping to plain terminal output.
