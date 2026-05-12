@@ -16,11 +16,24 @@ It supersedes nothing in prior riders
 invariants, sandbox defaults, files-not-fields posture, error-footer
 convention, existing verbs, codebase-mode resolution, doc polish,
 provider registry, and acceptance gate still apply. This rider adds:
-a serial `chain` mechanism with provider-decomposable plans, a
-foreground conductor process, green-policy auto-apply between steps,
-chain-level spend caps, multi-step attach TUI, chain-level hooks at
-`~/.deadreckon/hooks/chain/`, and `pause`/`resume`/`undo`/`kill`
-semantics that compose with single-run semantics.
+
+- a serial `chain` mechanism with provider-decomposable plans;
+- **one-command create + preview + confirm + run + auto-attach**
+  (mirrors `deadreckon run`'s shape — no separate "create then start"
+  step for the common case), `--draft` for two-step;
+- bare-verb defaults (`chain` → status; `chain run` → resume latest
+  paused) and `latest`/`last` accepted as chain-id everywhere;
+- `chain extend <id> "follow-up"` to append a step, `chain redo
+  <id> --step N [--extend "..."]` to re-run one step with an
+  optional goal patch;
+- a foreground conductor process; green-policy auto-apply between
+  steps; chain-level spend caps;
+- a **multi-step attach TUI** (`chain attach <id>`) **and** chain-
+  context banner in the existing single-run `attach <run-id>` when
+  the run's working dir carries a `chain-step.json`;
+- chain-level hooks at `~/.deadreckon/hooks/chain/`;
+- `pause`/`resume`/`undo`/`kill` that compose with single-run
+  semantics.
 
 **All paths absolute.** Source `/Users/gdc/deadreckon/`, runtime
 `/Users/gdc/.deadreckon/`.
@@ -309,16 +322,18 @@ user `~/.deadreckon/hooks/chain/`, repo `/Users/gdc/deadreckon/hooks/chain/`).
 
 ## Verb signatures
 
-```
-deadreckon chain plan <goal>
-    [--n <2..=12>]                # default 4
-    [--provider <id>]             # decomposition provider (defaults to default)
-    [--model <id>]                # decomposition model
-    [--out <path>]                # default ~/.deadreckon/chains/<chain-id>/chain.json
-    [--no-hints]
+The one-command create + run shape mirrors `deadreckon run`'s shape:
+the verb itself starts the work. `--draft` is the explicit two-step
+escape hatch for users who want to edit `chain.json` before running.
 
+```
+# One-command create + preview + confirm + run + auto-attach.
 deadreckon chain <goal>...        # explicit, positional steps
-    [--from-file <path>]          # alternative: newline-separated goals
+    [--from-file <path>]          # newline-separated goals
+    [--from-stdin]                # read goals from stdin (newline-separated)
+    [--draft]                     # write chain.json only; do not run
+    [--yes]                       # skip the interactive preview confirm
+    [--detach]                    # do not auto-attach after starting
     [--branch-policy stack|base|merge]
     [--apply-mode auto|preview|manual]
     [--apply-strategy squash|merge|cherry-pick]
@@ -328,37 +343,64 @@ deadreckon chain <goal>...        # explicit, positional steps
     [--max-wall-seconds <N>]      # chain aggregate
     [--provider <id>] [--model <id>]
     [--sandbox auto|sandbox-exec|bwrap|docker|none]
-    [--base <ref>]                # base branch / commit; default current HEAD
-    [--preview]                   # render plan + caps + DAG, do not run
-    [--yes]                       # skip preview confirm in interactive
+    [--base <ref>]                # default current HEAD
     [--no-hints]
-
-deadreckon chain run <chain-id>
-    [--detach]                    # background; conductor prints chain id and exits 0
     [--quiet] [--plain]
 
-deadreckon chain attach <chain-id>
-    [--quiet] [--plain]
+# Provider-decomposed creation; same one-command flow.
+deadreckon chain plan <goal>      # alias: `chain expand <goal>`
+    [--n <2..=12>]                # default 4
+    [--provider <id>] [--model <id>]
+    [--draft] [--yes] [--detach]
+    [--branch-policy ...] [--apply-mode ...] [--max-spend ...] # forwarded
+    [--no-hints] [--quiet] [--plain]
 
-deadreckon chain pause <chain-id>
+# Bare-verb defaults (no chain-id).
+deadreckon chain                  # = `chain status` over current scope
+deadreckon chain run              # = `chain run latest` (resume latest paused)
+
+# Control verbs. `<id>` accepts the literal `latest`/`last` and
+# unique chain-id prefixes the same way `<run-id>` does today.
+deadreckon chain run <id>
+    [--detach] [--quiet] [--plain]
+deadreckon chain attach <id>
+    [--quiet] [--plain]
+deadreckon chain pause <id>
     [--reason <text>]
-deadreckon chain resume <chain-id>
+deadreckon chain resume <id>
     [--from-step <N>]             # default: first non-completed
-    [--max-spend-add <USD>]       # top up chain cap
-deadreckon chain kill <chain-id>
+    [--max-spend-add <USD>]
+    [--reset-breaker]
+    [--apply-mode auto|preview|manual]
+    [--detach] [--quiet] [--plain]
+deadreckon chain kill <id>
     [--force]                     # skip 2 s SIGTERM grace
-deadreckon chain undo <chain-id>
-    [--through step<N>]           # bounded
+deadreckon chain undo <id>
+    [--through step<N>]
     [--no-confirm]
-
-deadreckon chain status [<chain-id>]
-deadreckon chain show <chain-id>
+deadreckon chain extend <id> "<follow-up step>"
+    [--insert-at <N>]             # default = append
+    [--max-spend-add <USD>]
+deadreckon chain redo <id>
+    [--step <N>]                  # default = first failed; else latest applied
+    [--extend "<patched goal>"]   # overrides steps[N].goal for this redo
+    [--reapply]                   # if step was applied, revert before redoing
+deadreckon chain status [<id>]    # all scope chains | one chain detail
+deadreckon chain show <id>
     [--why-failed]
 deadreckon chain list
     [--all]                       # default = current scope
     [--full]                      # exact IDs/paths
 deadreckon chain hooks list
 ```
+
+**`run` parity**: the existing single-run `attach <run-id>` adds a
+chain context banner (one line above the existing header) when the
+run carries `working/.deadreckon/chain-step.json`:
+`chain <id-prefix> · step <N>/<M> · branch=<policy>`. Pressing `c`
+in the single-run TUI opens `chain attach <id>` for the owning chain;
+`Esc` returns. Plain mode prints the same line on attach and after
+every status snapshot.
 
 Refusal cases (parameterized over P10 depth tests):
 
@@ -383,6 +425,11 @@ Refusal cases (parameterized over P10 depth tests):
 | Hook exit 2 | `step '<n>' refused by hook <name>` | (hook-defined stderr message) |
 | Pre-step circuit breaker open | `circuit breaker open after <N> failures` | `chain resume <id> --reset-breaker` |
 | `--max-spend` reached mid-chain | `chain aggregate spend cap hit` | `chain resume <id> --max-spend-add 5` |
+| `chain extend` on completed without `--insert-at` | `cannot extend completed chain at end` | `chain extend <id> "..." --insert-at <N>` or `chain "..." "<new>"` (new chain) |
+| `chain redo` of applied step without `--reapply` | `step '<n>' already applied; redo needs --reapply` | `chain redo <id> --step <n> --reapply` |
+| `chain run` bare with no chain in scope | `no chains in scope '<scope>'` | `deadreckon chain "..." "..."` |
+| `chain` bare with non-empty positional that looks like an id | `did you mean `chain run <id>`?` | `chain run <id>` or `chain "<goal>" "<goal>"` (quote each step) |
+| `--from-stdin` with TTY stdin | `--from-stdin needs a pipe` | `echo "g1\ng2" \| deadreckon chain --from-stdin` |
 
 ## Phases (eleven)
 
@@ -414,54 +461,104 @@ Depth tests (in `crates/deadreckon-core/src/chain.rs` inline tests and
 - `run_promoted_event_includes_library_dir`
 - `chain_lock_task_key_prefix_chain_double_dash`
 
-### P2 — `chain` creation (explicit and `--from-file`)
+### P2 — `chain` create + preview + confirm + run + auto-attach
 
-- New CLI verb `chain "g1" "g2" "g3"` (positional, repeating). Implemented
-  in `crates/deadreckon/src/main.rs:chain_create_command`.
+- New CLI verb `chain "g1" "g2" "g3"` (positional, repeating).
+  Implemented in `crates/deadreckon/src/main.rs:chain_command`.
 - `--from-file <path>` reads a UTF-8 file, splits on newlines, trims,
   drops blanks and lines starting with `#`.
+- `--from-stdin` reads from stdin with the same parsing rules; refuses
+  if stdin is a TTY (avoid surprising the user).
 - Writes `chain.json` with `status = pending`.
 - Resolves `base_branch`/`base_sha` from current git HEAD; refuses if
-  cwd is not a git repo (when `branch_policy != base+--cwd <repo>`).
-- `--preview` prints rider §"Preview format" without writing.
-- `--yes` writes without an interactive confirm.
-- Post-action hint after write:
+  cwd is not a git repo.
+- **Preview + confirm.** Renders the preview block (rider §"Preview
+  format"). In a TTY without `--yes`, prompts `start the chain? [Y/n]`
+  (default `Y`). Off-TTY without `--yes` refuses with
+  `try: chain ... --yes`. With `--draft` the verb stops here.
+- **Run.** Marks `status = running`, then enters the conductor (rider
+  §"Conductor lifecycle"). Foreground by default. With `--detach`,
+  the conductor forks via `daemon(2)`-equivalent (Rust:
+  `nix::unistd::fork` + `setsid` per the existing TUI's detach
+  primitive), writes `conductor.json`, prints
+  `chain <id> detached (pid <p>)`, and exits 0.
+- **Auto-attach.** When stdout is a TTY and neither `--detach` nor
+  `--quiet`/`--plain` is set, the verb drops into the multi-step TUI
+  (P9) once the conductor is alive. `--no-hints` suppresses the
+  post-action hint; `--quiet` suppresses all post-action stdout but
+  still runs.
+- Post-action hint after `--draft`:
   ```
-  chain: <chain-id> with <N> steps
-  edit:  vim ~/.deadreckon/chains/<chain-id>/chain.json
-  run:   deadreckon chain run <chain-id>
+  drafted: <chain-id> with <N> steps
+  edit:    vim ~/.deadreckon/chains/<chain-id>/chain.json
+  run:     deadreckon chain run <chain-id>
   ```
+- Post-action hint after a successful clean exit (run completed all
+  steps + applied):
+  ```
+  chained: <chain-id> done <N>/<N>
+  show:    deadreckon chain show <chain-id>
+  list:    deadreckon chain list
+  ```
+- Bare-verb `chain` (no positional, no flags) dispatches to
+  `chain_status_command(None)` over the current scope.
 
 Depth tests (`crates/deadreckon/tests/chain.rs`):
 - `chain_explicit_writes_chain_json_with_n_steps`
 - `chain_from_file_parses_newline_separated_goals`
+- `chain_from_stdin_parses_when_stdin_is_pipe`
+- `chain_from_stdin_refuses_when_stdin_is_tty`
 - `chain_refuses_one_step_with_try_run_hint`
 - `chain_refuses_more_than_12_steps`
 - `chain_refuses_non_git_cwd_with_try_hint`
 - `chain_preview_lists_per_step_provider_mode_branch_base_caps`
-- `chain_create_writes_post_action_hint`
+- `chain_draft_writes_chain_json_and_does_not_start_conductor`
+- `chain_yes_skips_preview_confirm_and_starts_conductor`
+- `chain_off_tty_without_yes_refuses_with_try_yes`
+- `chain_detach_starts_background_conductor_and_returns_zero`
+- `chain_default_auto_attaches_when_stdout_tty`
+- `chain_quiet_suppresses_stdout_but_runs`
+- `chain_no_args_dispatches_to_chain_status`
 
-### P3 — `chain plan` (provider-decomposed)
+### P3 — `chain plan` / `chain expand` (provider-decomposed)
 
-- New sub-verb `chain plan <goal>` that prompts the configured provider
-  for an ordered JSON array of `<= --n` sub-goals. Prompt template:
+- New sub-verb `chain plan <goal>` plus alias `chain expand <goal>`
+  (both routes register the same clap subcommand). The verb prompts
+  the configured provider for an ordered JSON array of `<= --n`
+  sub-goals. Prompt template (in `crates/deadreckon-core/src/chain.rs`,
+  user-overridable via a `chain-planner` skill resolved by the
+  doc-depth rider's three-tier mechanism if present, otherwise the
+  inline constant):
+
   ```
   You are decomposing a coding goal into an ordered serial chain.
   Output a JSON array of <= N strings, each <= 160 chars, each a
   concrete next step. Each step builds on the previous step's result.
   No prose, no commentary. Goal: "<G>".
   ```
-- Validate: ≥ 2 sub-goals; no duplicates after `lowercase+whitespace-collapse`;
-  each non-empty after trim; each ≤ 160 chars.
+
+- Validate: ≥ 2 sub-goals; no duplicates after
+  `lowercase+whitespace-collapse`; each non-empty after trim; each
+  ≤ 160 chars.
 - Writes `chain.json` with `status = pending`.
-- Falls back: on provider error, exits non-zero with `try: chain --steps ...`.
+- **Same one-command flow as P2** — preview + confirm + run +
+  auto-attach unless `--draft`. The decomposition step itself runs
+  through `ProviderRouter::complete` and counts toward the chain's
+  budget (recorded as a `chain.planner` spend entry in the chain's
+  `spend.jsonl`, separate from per-step inner-run spend).
+- Falls back: on provider error, exits non-zero with
+  `try: chain --steps "..." "..."` and a one-line summary of the
+  provider's failure.
 
 Depth tests:
 - `chain_plan_writes_chain_json_with_n_steps`
+- `chain_expand_is_alias_for_chain_plan`
 - `chain_plan_refuses_single_step_response`
 - `chain_plan_refuses_duplicate_steps`
 - `chain_plan_clamps_n_to_2_through_12`
-- `chain_plan_falls_back_with_try_hint_on_provider_error`
+- `chain_plan_default_starts_conductor_unless_draft`
+- `chain_plan_decomposition_spend_recorded_separately`
+- `chain_plan_falls_back_with_try_explicit_hint_on_provider_error`
 
 ### P4 — Foreground conductor (`chain run`) — sequential, no auto-apply yet
 
@@ -568,36 +665,98 @@ Depth tests:
 - `chain_resume_max_spend_add_recomputes_per_step`
 - `chain_wall_clock_cap_pauses_chain`
 
-### P9 — `chain attach` multi-step TUI
+### P9 — TUI: multi-step `chain attach` + chain context in single-run `attach`
 
-- `deadreckon chain attach <chain-id>` opens a vertical step-timeline
-  TUI in ratatui. Layout:
-  ```
-  ┌─ chain <id-prefix>  status: running  steps: 2/5  spend: $1.20/$10.00
-  ├─ step 0  applied   "scaffold cargo workspace"      $0.45
-  ├─ step 1  applied   "add hello binary"              $0.55
-  ├─ step 2  running   "wire CI"           turn 3      $0.20   ◀ focus
-  │     │ tool: cargo test          0.8 s
-  │     │ tool: edit .github/workflows/ci.yml
-  │     │ ...
-  ├─ step 3  pending   "publish to crates.io"
-  └─ step 4  pending   "tag release"
-  ```
-- Subscribes to each step's `RunEventBus` while focused; for completed
-  steps reads `events.jsonl` for replay.
+Two TUI surfaces; this phase delivers both because each is meaningless
+without the other (the multi-step view drills *into* the single-run
+view; the single-run view should be reachable directly from a chain
+context).
+
+**P9.A — `deadreckon chain attach <chain-id>`** opens a vertical
+step-timeline TUI in ratatui. Layout:
+
+```
+┌─ chain <id-prefix>  status: running  steps: 2/5  spend: $1.20/$10.00
+│  policy: stack | apply=auto | on-fail=stop | base=main@<sha>
+├─ step 0  applied   "scaffold cargo workspace"           $0.45
+├─ step 1  applied   "add hello binary"                   $0.55
+├─ step 2  running   "wire CI"           turn 3           $0.20   ◀ focus
+│     │ tool: cargo test          0.8 s
+│     │ tool: edit .github/workflows/ci.yml
+│     │ ...
+├─ step 3  pending   "publish to crates.io"
+└─ step 4  pending   "tag release"
+[Tab] page  [Enter] drill into step  [r] redo  [e] extend  [p] pause
+[k] kill  [Ctrl-D] detach  [q] quit (no kill)
+```
+
+- The header carries `policy: <branch_policy> | apply=<mode> |
+  on-fail=<policy> | base=<branch>@<sha>` so the user never wonders
+  what mode they're in.
+- For each step the timeline shows: status dot (pending grey / running
+  yellow / completed cyan / applied green / failed red / skipped dim),
+  step index, truncated goal, latency or current turn, per-step spend.
+- The focused step's live stream is rendered below its row (provider
+  activity, recent traces, latest tool call) by subscribing to that
+  step's `RunEventBus` (when same-process) or by tailing the run's
+  `events.jsonl` (cross-process).
+- A persistent right-side narrow panel shows the chain's aggregate
+  budget bar (green/yellow/red over 60/80%), elapsed wall, hook log
+  counters (e.g. `hooks: pre 3, post 3, on-promote 2`).
 - Keys: `Tab`/`Shift+Tab` page focus; `Enter` drills into focused
-  step's single-run TUI (existing `attach <run-id>`); `Esc` returns;
-  `Ctrl-D` detaches without killing; `q` quits TUI (no kill).
-- Off-TTY: prints a plain text snapshot every 2 s (`--plain`).
-- Footer when paused includes the four `try:` lines (P10).
+  step's single-run TUI (existing `attach <run-id>` — see P9.B);
+  `Esc` returns from drill; `r` invokes `chain redo <id> --step
+  <focused>` interactively (confirms first); `e` invokes `chain
+  extend <id> "<prompt>"` interactively; `p` pauses chain; `k` kills
+  chain (confirm); `Ctrl-D` detaches without killing; `q` quits TUI
+  (no kill).
+- Off-TTY (`--plain` or non-TTY): prints a plain text snapshot every
+  2 s with the same fields, no ANSI.
+- Footer when chain is paused includes the four `try:` lines (P10
+  paused-chain footer).
 
-Depth tests:
-- `chain_attach_renders_step_timeline_with_dots`
+**P9.B — Chain context in single-run `attach <run-id>`**. When the
+focused run's working dir contains `working/.deadreckon/chain-step.json`,
+the existing single-run TUI (`main.rs:874+`) renders an extra one-line
+**chain banner** above the existing header:
+
+```
+chain <id-prefix> · step <N>/<M> · policy: stack | apply=auto · prev: applied <sha-prefix>
+```
+
+- The banner is rendered for both running and completed runs.
+- Press `c` (chain) to switch to `chain attach <chain-id>` for the
+  owning chain; `Esc` returns to the single-run view. `c` is added to
+  the keybinding footer.
+- In `--plain` mode, the banner line is printed on attach and after
+  every status snapshot.
+- The non-TTY plain summary that single-run attach prints today
+  (existing behavior) also gains the chain banner line above its
+  current first line.
+- The single-run TUI's completion action footer (existing `[a] Apply`
+  / `[b] Abandon` / `[s] Show`) gains a `[c] Chain` entry when chain
+  context is present.
+
+Depth tests (`crates/deadreckon/tests/chain_tui.rs`):
+- `chain_attach_renders_step_timeline_with_status_dots`
+- `chain_attach_header_shows_policy_apply_mode_on_fail`
+- `chain_attach_focused_step_streams_provider_activity`
 - `chain_attach_tab_pages_focus_between_steps`
 - `chain_attach_enter_drills_to_single_run_tui_esc_returns`
+- `chain_attach_r_invokes_redo_with_confirm`
+- `chain_attach_e_invokes_extend_with_prompt`
+- `chain_attach_p_pauses_chain`
+- `chain_attach_k_kills_chain_with_confirm`
 - `chain_attach_ctrl_d_detaches_does_not_kill_conductor`
 - `chain_attach_shows_aggregate_spend_in_header`
-- `chain_attach_plain_emits_periodic_snapshot`
+- `chain_attach_budget_bar_thresholds_60_80_percent`
+- `chain_attach_plain_emits_periodic_snapshot_no_ansi`
+- `chain_attach_paused_footer_lists_four_try_lines`
+- `single_run_attach_renders_chain_banner_when_step_json_present`
+- `single_run_attach_no_chain_banner_when_step_json_absent`
+- `single_run_attach_c_key_opens_chain_attach`
+- `single_run_attach_completion_footer_gains_chain_entry`
+- `single_run_attach_plain_includes_chain_banner_line`
 
 ### P10 — Friendliness pass (10 contracts + hooks + footers)
 
@@ -640,6 +799,42 @@ Depth tests:
   reverse, runs `git revert --no-edit <sha>` on each `applied_sha`,
   and records `chain.undone_step` events.
 
+- **`chain extend <id> "<step>"`**. Appends (default) or inserts (at
+  `--insert-at <N>`) a new step into `chain.json`. Refuses when
+  `chain.status == completed` unless `--insert-at` is provided **and**
+  the chain is paused. Increments `--max-spend` by `--max-spend-add`
+  if given. Writes a `chain.step_extended` event. Post-action hint:
+  `next: deadreckon chain resume <id>` (or `chain run <id>` if the
+  chain was completed and the extension reopens it).
+
+- **`chain redo <id>`** re-runs one step:
+  - `--step <N>` selects the step (default: first failed step; if
+    none, the latest applied step).
+  - `--extend "<text>"` overwrites `steps[N].goal` for this redo and
+    persists the new goal in `chain.json` (so the audit trail shows
+    what was re-run with what).
+  - `--reapply` is required when the targeted step was already
+    `applied`: before redoing, the conductor `git revert`s
+    `applied_sha` and marks the step as `pending`. Without
+    `--reapply`, redo of an applied step is refused with a
+    `try: chain redo <id> --step N --reapply`.
+  - Re-entry uses the conductor exactly as a normal step run.
+  - Writes a `chain.step_redone` event with the prior + new goal +
+    prior + new run_ids.
+
+- **`latest`/`last` aliases**. The chain-id positional argument
+  accepts the literal `latest` or `last`, which resolves to the most
+  recent chain in current scope by `created_at` (parity with the
+  existing single-run `latest` / `last` resolution).
+
+- **Bare-verb defaults**. `deadreckon chain` with no positional and
+  no flags dispatches to `chain status` over the current scope.
+  `deadreckon chain run` with no positional dispatches to
+  `chain resume latest`. Both behaviors print a `using:` info line
+  on stderr so users learn the shortcut:
+  `using: chain status (scope: <scope>)` /
+  `using: chain resume <chain-id>`.
+
 Depth tests (`crates/deadreckon/tests/chain_friendliness.rs`):
 - `chain_post_action_hints_print_next_verbs`
 - `chain_error_messages_end_with_try_footer` (parameterized over the
@@ -659,6 +854,22 @@ Depth tests (`crates/deadreckon/tests/chain_friendliness.rs`):
 - `chain_pause_then_resume_preserves_step_progress`
 - `chain_pause_refuses_when_status_not_running_with_try`
 - `chain_resume_inherits_remaining_budget`
+- `chain_extend_appends_step_and_writes_event`
+- `chain_extend_insert_at_inserts_at_index`
+- `chain_extend_refuses_completed_chain_without_insert_at`
+- `chain_extend_reopens_completed_chain_when_insert_at_supplied`
+- `chain_redo_default_picks_first_failed_step`
+- `chain_redo_default_falls_back_to_latest_applied`
+- `chain_redo_extend_persists_new_goal_in_chain_json`
+- `chain_redo_applied_step_requires_reapply_flag`
+- `chain_redo_reapply_reverts_applied_sha_before_redoing`
+- `chain_redo_writes_step_redone_event_with_prior_and_new_run_ids`
+- `chain_latest_alias_resolves_to_most_recent_in_scope`
+- `chain_last_alias_resolves_to_most_recent_in_scope`
+- `chain_bare_verb_dispatches_to_chain_status`
+- `chain_run_bare_verb_dispatches_to_chain_resume_latest`
+- `chain_bare_verb_prints_using_info_line_on_stderr`
+- `chain_run_bare_verb_refuses_when_no_chain_in_scope_with_try`
 
 ### P11 — AS-BUILT update + CHANGELOG (doc only; no depth test)
 
@@ -673,14 +884,19 @@ Depth tests (`crates/deadreckon/tests/chain_friendliness.rs`):
 
   28.1 Mental model (one chain → N steps → conductor advances)
   28.2 chain.json schema (verbatim quote from chain.rs)
-  28.3 Branch policy (stack / base / merge)
-  28.4 Apply-mode green policy
-  28.5 Conductor lifecycle + chain lock
-  28.6 Hook contract (pre-step, post-step, on-promote, on-chain-end)
-  28.7 chain-events.jsonl + RunPromoted event
-  28.8 Pause / resume / undo / kill semantics
-  28.9 Aggregate spend cap + per-step budget allocation
-  28.10 What's not yet built (mid-chain provider replanning,
+  28.3 One-command create + run shape; `--draft` two-step;
+       `latest`/`last` aliases; bare-verb defaults (`chain` →
+       status; `chain run` → resume latest)
+  28.4 Branch policy (stack / base / merge)
+  28.5 Apply-mode green policy
+  28.6 Conductor lifecycle + chain lock
+  28.7 Hook contract (pre-step, post-step, on-promote, on-chain-end)
+  28.8 chain-events.jsonl + RunPromoted event
+  28.9 Pause / resume / undo / kill / extend / redo semantics
+  28.10 TUI surfaces: `chain attach` multi-step timeline + single-
+        run `attach` chain banner (press `c` to drill out)
+  28.11 Aggregate spend cap + per-step budget allocation
+  28.12 What's not yet built (mid-chain provider replanning,
         parallel-step DAG within a chain, cross-machine handoff —
         all V1 candidates).
   ```
@@ -690,10 +906,13 @@ Depth tests (`crates/deadreckon/tests/chain_friendliness.rs`):
 - Update §17 CLI Surface: add the new `chain` family verbs to the
   table.
 - Update §22 (Built vs Scaffolding-Thin):
-  - **Add to "Built and reliable":** chain plan/run/attach/show/
-    status/list/pause/resume/kill/undo verbs; chain-level hooks;
-    aggregate spend cap; auto-apply with green policy; RunPromoted
-    event.
+  - **Add to "Built and reliable":** chain plan/expand/run/attach/
+    show/status/list/pause/resume/kill/undo/extend/redo verbs;
+    one-command create+run with auto-attach; bare-verb defaults
+    + `latest`/`last` aliases; chain-level hooks; aggregate spend
+    cap; auto-apply with green policy; RunPromoted event; multi-
+    step `chain attach` TUI + chain-context banner in single-run
+    `attach`.
   - **Partially close in thin list:** #9 multi-run coordination —
     note the sequential half is now built; parallel half remains in
     the orchestrate-rider's scope.
@@ -712,9 +931,22 @@ Depth tests (`crates/deadreckon/tests/chain_friendliness.rs`):
   ```
   ## Autonomous chaining (alpha) — 2026-05-11
 
-  - chain plan/chain "..."/chain run/chain attach/chain status/chain
-    show/chain list/chain pause/chain resume/chain kill/chain undo
-    landed (P2–P10).
+  - chain plan/expand/chain "..."/chain run/chain attach/chain
+    status/chain show/chain list/chain pause/chain resume/chain kill/
+    chain undo/chain extend/chain redo landed (P2–P10).
+  - `chain "..."` is a one-command create + preview + confirm + run +
+    auto-attach (mirrors `deadreckon run`); `--draft` opts into the
+    two-step shape.
+  - `latest`/`last` aliases accepted everywhere; bare-verb defaults
+    `chain` → status, `chain run` → resume latest paused.
+  - `chain extend <id> "<step>"` appends or inserts a step;
+    `chain redo <id> --step N [--extend "..." --reapply]` re-runs
+    one step with optional goal patch and revert.
+  - Multi-step `chain attach` TUI: vertical step timeline with
+    policy header, focus-driven live stream, aggregate budget bar,
+    inline `r`/`e`/`p`/`k`/`Ctrl-D` controls. Single-run `attach`
+    surfaces a chain context banner when the run's working dir has
+    `chain-step.json`; press `c` to drill out to `chain attach`.
   - Conductor is a foreground CLI verb that advances a chain through
     sequential `deadreckon run` invocations and `apply --no-confirm`
     with a green policy (gate-pass + clean rebase + allowlist match).
@@ -744,11 +976,11 @@ Depth tests (`crates/deadreckon/tests/chain_friendliness.rs`):
 | `crates/deadreckon/src/main.rs:apply_command (1993)` | Reused as-is via subprocess; no internal API change |
 | `crates/deadreckon/src/main.rs:status_command (3875)` | Surface chain context when latest run has `chain-step.json` |
 | `crates/deadreckon/src/main.rs:list_command (3137)` | New `chain:<id-prefix>` column for chained runs |
+| `crates/deadreckon/src/main.rs:attach_command (874)` | New chain banner line + `[c]` keybinding + chain footer entry when `chain-step.json` present in the focused run's working dir |
 | `~/.deadreckon/chains/<id>/` | New runtime location |
 | `~/.deadreckon/locks/chain--<id>.lock` | New lock namespace (existing format) |
 | `~/.deadreckon/hooks/chain/` | New runtime location |
 | Frontmatter / `Doc-writer:` line (self-doc rider) | Chain step inner runs continue to write their own docs; chain-level docs are V1 |
-| TUI `attach <run-id>` | Unchanged; chain attach is a separate verb |
 
 ## Error-footer canonical pairs
 
