@@ -643,6 +643,38 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
     assert_success(&attach);
     assert!(!stdout(&attach).contains("export:"));
     assert!(!stdout(&attach).contains("extend:"));
+
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+    let output = deadreckon(&paths)
+        .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
+        .arg("env quiet hinted run")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .env("DEADRECKON_HINTS", "0")
+        .output()
+        .expect("run env no hints");
+    assert_success(&output);
+    assert!(!stdout(&output).contains("export:"));
+    assert!(!stdout(&output).contains("extend:"));
+    let run_id = run_id_from_stdout(&output);
+    let attach = deadreckon(&paths)
+        .arg("attach")
+        .arg(&run_id)
+        .env("DEADRECKON_HINTS", "0")
+        .output()
+        .expect("attach env no hints");
+    assert_success(&attach);
+    assert!(!stdout(&attach).contains("export:"));
+    assert!(!stdout(&attach).contains("extend:"));
 }
 
 #[test]
@@ -656,6 +688,60 @@ fn help_lists_lifecycle_verbs() {
     assert!(stdout.contains("status"));
     assert!(stdout.contains("cleanup"));
     assert!(stdout.contains("Run ids accept unique prefixes"));
+}
+
+#[test]
+fn help_groups_verbs_by_lifecycle_stage() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let output = deadreckon(&paths).arg("--help").output().expect("help");
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("Setup"));
+    assert!(stdout.contains("Run Lifecycle"));
+    assert!(stdout.contains("Completed Run Actions"));
+    assert!(stdout.contains("Cleanup And Recovery"));
+    assert!(stdout.contains("Inspect And Import"));
+}
+
+#[test]
+fn status_includes_library_count_and_disk_usage() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "status library disk");
+
+    let status = deadreckon(&paths)
+        .current_dir(&parent.cwd)
+        .args(["status", &parent.run_id])
+        .output()
+        .expect("status");
+
+    assert_success(&status);
+    let stdout = stdout(&status);
+    assert!(stdout.contains("run health"));
+    assert!(stdout.contains("library"));
+    assert!(stdout.contains("scope artifacts: 1"));
+    assert!(stdout.contains("disk"));
+    assert!(stdout.contains("MB free"));
+}
+
+#[test]
+fn status_tip_line_appears_when_disk_over_threshold() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "status disk tip");
+
+    let status = deadreckon(&paths)
+        .current_dir(&parent.cwd)
+        .args(["status", &parent.run_id])
+        .output()
+        .expect("status");
+
+    assert_success(&status);
+    let stdout = stdout(&status);
+    assert!(stdout.contains("tip:"), "{stdout}");
+    assert!(
+        stdout.contains("deadreckon cleanup --completed"),
+        "{stdout}"
+    );
 }
 
 fn completed_parent(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {

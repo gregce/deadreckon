@@ -154,7 +154,7 @@ fn ui_error(text: impl AsRef<str>) -> String {
     version,
     about = "Unattended agentic coding harness",
     long_about = "deadreckon runs long coding tasks in an isolated worktree or sandbox, tracks durable state, and gives you explicit apply/export/cleanup steps.",
-    after_help = "Lifecycle:\n  deadreckon run \"build the thing\"\n  deadreckon attach latest\n  deadreckon status\n  deadreckon apply latest --autostash --cleanup\n  deadreckon cleanup --completed\n\nRun ids accept unique prefixes. `latest` means the newest run for the current project."
+    after_help = "Command groups:\n  Setup: init, config, doctor\n  Run Lifecycle: run, attach, status, list, kill, resume\n  Completed Run Actions: apply, materialize/export, extend, doc, library\n  Cleanup And Recovery: abandon/discard, cleanup/prune, undo\n  Inspect And Import: show, import\n\nLifecycle:\n  deadreckon run \"build the thing\"\n  deadreckon attach latest\n  deadreckon status\n  deadreckon apply latest --autostash --cleanup\n  deadreckon cleanup --completed\n\nRun ids accept unique prefixes. `latest` means the newest run for the current project."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -163,7 +163,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Create ~/.deadreckon/config.toml and check the local setup")]
+    #[command(
+        next_help_heading = "Setup",
+        about = "Create ~/.deadreckon/config.toml and check the local setup"
+    )]
     Init {
         #[arg(
             long,
@@ -181,12 +184,18 @@ enum Commands {
         #[arg(long, help = "Use detected defaults without interactive prompts")]
         no_confirm: bool,
     },
-    #[command(about = "Read or update ~/.deadreckon/config.toml")]
+    #[command(
+        next_help_heading = "Setup",
+        about = "Read or update ~/.deadreckon/config.toml"
+    )]
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    #[command(about = "Start an unattended coding run")]
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Start an unattended coding run"
+    )]
     Run {
         #[arg(help = "Natural-language coding goal")]
         goal: String,
@@ -250,9 +259,15 @@ enum Commands {
         #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
     },
-    #[command(about = "Check providers, sandboxing, disk, and local prerequisites")]
+    #[command(
+        next_help_heading = "Setup",
+        about = "Check providers, sandboxing, disk, and local prerequisites"
+    )]
     Doctor,
-    #[command(about = "Show runs for the current project by default")]
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Show runs for the current project by default"
+    )]
     List {
         #[arg(long, help = "Filter to a specific scope key")]
         scope: Option<String>,
@@ -261,12 +276,16 @@ enum Commands {
         #[arg(long, help = "Print full TSV-style values for scripts")]
         full: bool,
     },
-    #[command(about = "Inspect promoted run artifacts in the deadreckon library")]
+    #[command(
+        next_help_heading = "Completed Run Actions",
+        about = "Inspect promoted run artifacts in the deadreckon library"
+    )]
     Library {
         #[command(subcommand)]
         command: LibraryCommand,
     },
     #[command(
+        next_help_heading = "Completed Run Actions",
         visible_alias = "export",
         about = "Copy a completed fresh/copy run into a chosen directory"
     )]
@@ -280,7 +299,10 @@ enum Commands {
         #[arg(long, help = "Keep manifest.json in the exported output")]
         include_manifest: bool,
     },
-    #[command(about = "Merge a completed worktree run back into the source checkout")]
+    #[command(
+        next_help_heading = "Completed Run Actions",
+        about = "Merge a completed worktree run back into the source checkout"
+    )]
     Apply {
         #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
@@ -308,6 +330,7 @@ enum Commands {
         message: Option<String>,
     },
     #[command(
+        next_help_heading = "Cleanup And Recovery",
         visible_alias = "discard",
         about = "Remove a run's temporary worktree and branch"
     )]
@@ -320,6 +343,7 @@ enum Commands {
         force: bool,
     },
     #[command(
+        next_help_heading = "Cleanup And Recovery",
         visible_alias = "prune",
         about = "Clean stale or temporary deadreckon worktrees"
     )]
@@ -339,7 +363,10 @@ enum Commands {
         #[arg(long, help = "Keep temporary branches")]
         keep_branch: bool,
     },
-    #[command(about = "Continue from a completed run with a follow-up goal")]
+    #[command(
+        next_help_heading = "Completed Run Actions",
+        about = "Continue from a completed run with a follow-up goal"
+    )]
     Extend {
         #[arg(help = "Parent run id, unique prefix, or latest")]
         parent_run_id: String,
@@ -366,7 +393,10 @@ enum Commands {
         #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
     },
-    #[command(about = "Print or regenerate generated run documentation")]
+    #[command(
+        next_help_heading = "Completed Run Actions",
+        about = "Print or regenerate generated run documentation"
+    )]
     Doc {
         #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
@@ -383,21 +413,27 @@ enum Commands {
         #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
     },
-    #[command(about = "Attach the live terminal UI to a run")]
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Attach the live terminal UI to a run"
+    )]
     Attach {
         #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
         #[arg(long, help = "Suppress post-completion action hints")]
         no_hints: bool,
     },
-    #[command(about = "Cancel a running task")]
+    #[command(next_help_heading = "Run Lifecycle", about = "Cancel a running task")]
     Kill {
         #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
         #[arg(long, help = "Escalate subprocess termination")]
         force: bool,
     },
-    #[command(about = "Resume an incomplete run")]
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Resume an incomplete run"
+    )]
     Resume {
         #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
@@ -406,7 +442,10 @@ enum Commands {
         #[arg(long, help = "Override wall-clock cap")]
         max_wall_seconds: Option<f64>,
     },
-    #[command(about = "Restore an in-place run snapshot")]
+    #[command(
+        next_help_heading = "Cleanup And Recovery",
+        about = "Restore an in-place run snapshot"
+    )]
     Undo {
         #[arg(
             long,
@@ -416,7 +455,10 @@ enum Commands {
         #[arg(long, help = "Snapshot turn to restore")]
         turn: Option<u32>,
     },
-    #[command(about = "Show full state, provenance, and trace details for a run")]
+    #[command(
+        next_help_heading = "Inspect And Import",
+        about = "Show full state, provenance, and trace details for a run"
+    )]
     Show {
         #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
@@ -424,6 +466,7 @@ enum Commands {
         turn: Option<u32>,
     },
     #[command(
+        next_help_heading = "Run Lifecycle",
         visible_alias = "next",
         about = "Explain the current project's latest run and next action"
     )]
@@ -436,7 +479,10 @@ enum Commands {
         )]
         all: bool,
     },
-    #[command(about = "Import read-only history from another coding tool")]
+    #[command(
+        next_help_heading = "Inspect And Import",
+        about = "Import read-only history from another coding tool"
+    )]
     Import {
         #[arg(help = "Source: claude-code, codex, or cursor")]
         source: String,
@@ -678,7 +724,7 @@ async fn main_inner() -> Result<()> {
                 sandbox,
                 no_docs,
                 doc_skill,
-                post_actions: true,
+                post_actions: completion_hints_enabled(false),
             })
             .await
         }
@@ -1188,7 +1234,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         RunLoopOutcome::Failed => println!("{} {}", ui_warn("failed run"), state.run_id),
     }
     print_run_locations(&state);
-    if completed && !no_hints {
+    if completed && completion_hints_enabled(no_hints) {
         complete_run_actions(&state, !no_confirm).await?;
     }
     Ok(())
@@ -3770,16 +3816,17 @@ async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = load_cli_run(&paths, &run_id)?;
     let run_id = state.run_id.clone();
+    let show_hints = completion_hints_enabled(no_hints);
     if io::stdout().is_terminal() {
-        attach_tui(&paths, &run_id, !no_hints).await?;
+        attach_tui(&paths, &run_id, show_hints).await?;
         let state = load_run(&paths, &run_id)?;
-        if state.status == RunStatus::Completed && !no_hints {
+        if state.status == RunStatus::Completed && show_hints {
             print_lifecycle_hints(&state);
         }
         return Ok(());
     }
     print_run_summary(&state);
-    if state.status == RunStatus::Completed && !no_hints {
+    if state.status == RunStatus::Completed && show_hints {
         print_lifecycle_hints(&state);
     }
     Ok(())
@@ -4305,23 +4352,36 @@ fn status_command(run_id: Option<String>, all: bool) -> Result<()> {
 }
 
 fn print_status_card(state: &deadreckon_core::PipelineState) {
+    let paths = DeadreckonPaths::discover();
     let short = run_prefix(&state.run_id);
     let phase = state
         .active_phase()
         .map(|phase| format!("{} {}", phase.id.0, phase.name))
         .unwrap_or_else(|| "-".to_string());
+    let next_action = next_action_label(state);
+    let stale = is_stale_executing(state);
+    let supervised = supervised_pids(state);
     println!("deadreckon status");
     println!("  run:      {} ({})", short, state.run_id);
-    println!(
-        "  state:    {} -> {}",
-        state.status,
-        next_action_label(state)
-    );
+    println!("  state:    {} -> {}", state.status, next_action);
     println!("  phase:    {phase}");
     println!("  scope:    {}", state.scope);
     println!("  updated:  {} ago", relative_age(state.updated_at));
     println!("  provider: {}", state.provider.as_deref().unwrap_or("-"));
     println!("  sandbox:  {}", state.sandbox);
+    println!(
+        "  spend:    ${:.6} / {}",
+        state.total_spend_usd,
+        state
+            .max_spend_usd
+            .map(|cap| format!("${cap:.6}"))
+            .unwrap_or_else(|| "uncapped".to_string())
+    );
+    println!(
+        "  wall:     {:.1}s / {}",
+        state.total_wall_seconds,
+        format_wall_cap(state.max_wall_seconds)
+    );
     println!("  goal:     {}", one_line(&state.goal, 110));
     print_run_locations(state);
     if let Ok(record) = read_codebase_record(&state.working_dir) {
@@ -4332,6 +4392,57 @@ fn print_status_card(state: &deadreckon_core::PipelineState) {
         if let Some(worktree) = record.worktree_path.as_ref() {
             println!("  worktree: {}", worktree.display());
         }
+    }
+    println!();
+    println!("{}", ui_heading("run health"));
+    println!("  next:     {next_action}");
+    println!("  stale:    {}", if stale { "yes" } else { "no" });
+    println!("  pids:     {}", supervised.len());
+    if let Some(reason) = state.pause_reason.as_deref() {
+        println!("  paused:   {}", one_line(reason, 100));
+    }
+    if let Some(reason) = state.failure_reason.as_deref() {
+        println!("  failure:  {}", one_line(reason, 100));
+    }
+    println!("  docs:     {}", docs_status_for_state(state));
+
+    println!();
+    println!("{}", ui_heading("library"));
+    let library_dir = paths.library_dir(&state.scope, &state.run_id);
+    let manifest_present = library_dir.join("manifest.json").exists();
+    let artifact_count = library_entries(&paths, Some(state.scope.clone()), false)
+        .map(|entries| entries.len())
+        .unwrap_or(0);
+    println!("  scope artifacts: {artifact_count}");
+    println!(
+        "  current:  {}",
+        if manifest_present {
+            library_dir.display().to_string()
+        } else {
+            "not promoted".to_string()
+        }
+    );
+    println!(
+        "  exported: {}",
+        materialized_count_label(materialized_marker_count(&library_dir))
+    );
+
+    println!();
+    println!("{}", ui_heading("disk"));
+    match free_kb(paths.home()) {
+        Some(kb) => {
+            let mb = kb / 1024;
+            println!("  home:     {} MB free in {}", mb, paths.home().display());
+            if mb > 10_240 {
+                println!(
+                    "  tip:      {}",
+                    ui_command("deadreckon cleanup --completed")
+                );
+            } else {
+                println!("  warning:  low disk; clean old worktrees and artifacts soon");
+            }
+        }
+        None => println!("  home:     unavailable; run deadreckon doctor"),
     }
 }
 
@@ -4442,6 +4553,18 @@ async fn complete_run_actions(
         completion_action_loop(state).await?;
     }
     Ok(())
+}
+
+fn completion_hints_enabled(no_hints: bool) -> bool {
+    if no_hints {
+        return false;
+    }
+    !std::env::var("DEADRECKON_HINTS").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
 }
 
 async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Result<()> {
