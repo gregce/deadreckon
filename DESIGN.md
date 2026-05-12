@@ -24,10 +24,11 @@ The alpha implementation is intentionally local-first. Runtime state defaults to
 
 Source lives under `/Users/gdc/deadreckon/`:
 
-- `crates/deadreckon-core`: run paths, phase machine, JSON state, codebase mode records, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports.
+- `crates/deadreckon-core`: run paths, phase machine, JSON state, codebase mode records, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports, chains, and run docs primitives.
+- `crates/deadreckon-runtime`: provider turn loop, sandboxed tool dispatch, cancellation checks, docs polish orchestration, `dr-gate` invocation, and promotion orchestration.
 - `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, OpenAI-compatible, `cli:claude-code`, `cli:codex`, and explicit `--smoke` scripted adapters, fallback routing, spend estimates.
 - `crates/deadreckon-sandbox`: `sandbox-exec`, `bwrap`, `docker`, and `none` backends using `tokio::process::Command`; default `auto`.
-- `crates/deadreckon`: clap CLI, ratatui attach UI, init/setup, config/settings, run, status/next, list/runs, doc/docs, attach/watch, kill/stop, resume/continue, undo/restore, show/inspect, import, materialize/export, finish/done, apply/keep, abandon/discard, cleanup/prune, extend/follow-up, library/artifacts, chain, and doctor/check.
+- `crates/deadreckon`: clap parser, command handlers, ratatui attach UI, init/setup, config/settings, run, status/next, list/runs, doc/docs, attach/watch, kill/stop, resume/continue, undo/restore, show/inspect, import, materialize/export, finish/done, apply/keep, abandon/discard, cleanup/prune, extend/follow-up, library/artifacts, chain, and doctor/check.
 - `skills/default-coding/SKILL.md`: Markdown skill loaded at runtime.
 - `tests/`: workspace integration tests.
 
@@ -47,12 +48,13 @@ Source lives under `/Users/gdc/deadreckon/`:
 ## Execution Model
 
 The primary path is provider-driven: `deadreckon run <goal>` resolves the
-codebase mode, previews the plan, creates state, calls `ProviderRouter::complete`,
-parses model actions, executes tool calls in the configured sandbox, feeds
-results into history, and repeats until a provider returns `done`, a spend cap
-pauses the run, or the run is killed. HTTP providers use user-supplied keys or
-env vars; CLI providers use local subscription CLIs and run through the
-deadreckon sandbox wrapper.
+codebase mode, previews the plan, creates state, and hands execution to
+`deadreckon-runtime`. The runtime calls `ProviderRouter::complete`, parses model
+actions, executes tool calls in the configured sandbox, feeds results into
+history, writes docs, invokes `dr-gate`, and promotes successful runs. It
+repeats until a provider returns `done`, a spend cap pauses the run, or the run
+is killed. HTTP providers use user-supplied keys or env vars; CLI providers use
+local subscription CLIs and run through the deadreckon sandbox wrapper.
 
 In a git repo, the default codebase mode is `worktree`: deadreckon creates
 `~/.deadreckon/worktrees/<scope>-<run-id>` on a `dr/...` branch, runs the agent
@@ -117,6 +119,10 @@ builds its default commit body from the narrative and decisions docs.
   `working/.deadreckon/codebase.json` rather than extending `PipelineState`.
   This preserves existing runstate readers while allowing worktree, copy,
   in-place, and fresh flows to evolve independently.
+- Crate boundary: `deadreckon-core` is adapter-free and owns durable schemas and
+  primitives. `deadreckon-runtime` owns the dependencies on providers and
+  sandboxes, so core tests and downstream readers can reason about state without
+  pulling in HTTP, subprocess, or platform sandbox orchestration.
 
 ## Verification
 

@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-11
+**Last updated:** 2026-05-12
 **Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -42,7 +42,7 @@ This document captures the system as built today — what's wired, what's load-b
 
 ## 1. System Overview & Mental Model
 
-deadreckon is a Rust 2024 CLI harness whose default flow is **unattended long-running coding tasks**: `deadreckon run <goal>` creates durable run state, picks a BYOK provider route, executes turns inside a platform-native sandbox, writes spend/provenance/trace records after every turn, and exits only when the LLM declares done, a budget caps the run, or the operator kills it. The CLI is the user-facing layer; the `deadreckon-core` library owns the deterministic primitives (state, locks, gates, snapshots, atomic file ops); `deadreckon-providers` and `deadreckon-sandbox` are pluggable layers underneath.
+deadreckon is a Rust 2024 CLI harness whose default flow is **unattended long-running coding tasks**: `deadreckon run <goal>` creates durable run state, picks a BYOK provider route, executes turns inside a platform-native sandbox, writes spend/provenance/trace records after every turn, and exits only when the LLM declares done, a budget caps the run, or the operator kills it. The CLI is the user-facing layer; `deadreckon-runtime` owns orchestration across providers, sandboxes, docs, and promotion; `deadreckon-core` owns deterministic primitives and durable schemas.
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
@@ -52,52 +52,39 @@ deadreckon is a Rust 2024 CLI harness whose default flow is **unattended long-ru
                                  │
 ┌────────────────────────────────▼──────────────────────────────────────────┐
 │ CLI LAYER (crates/deadreckon)                                             │
-│   main.rs:316  run_command()                                              │
-│   main.rs:940  resume_command()  ← refuses Completed at :947              │
-│   main.rs:874  attach_command()  ← ratatui TUI                            │
-│   main.rs:484  doctor_command()                                           │
-│   main.rs:241  init_command()                                             │
-│ ◆ clap parsing  ◆ ratatui rendering  ◆ post-run summary                   │
+│   cli.rs       clap parser definitions                                    │
+│   main.rs      command handlers, ratatui rendering, post-run summary       │
 └────────────────────────────────┬──────────────────────────────────────────┘
-                                 │ create_run → acquire_lock → run_turn_loop
+                                 │ create_run → acquire_lock → runtime loop
                                  ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ CORE LIBRARY (crates/deadreckon-core)                                     │
+│ RUNTIME ORCHESTRATION (crates/deadreckon-runtime)                         │
 │                                                                           │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │ state.rs     │  │ lock.rs      │  │ promotion.rs │  │ turn_loop.rs │ │
-│  │ ─Pipeline    │  │ ─PID-aware   │  │ ─atomic      │  │ ─the loop    │ │
-│  │   State      │  │  locks       │  │  working→    │  │   load-      │ │
-│  │ ─RunStatus   │  │ ─heartbeats  │  │  library swap │  │  bearing    │ │
-│  │ ─PhaseId     │  │ ─stale       │  │ ─manifest.json│  │ ─snapshots  │ │
-│  │              │  │  reclaim     │  │              │  │ ─dispatch   │ │
-│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘ │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │ gate.rs      │  │ artifacts.rs │  │ paths.rs     │  │ events.rs    │ │
-│  │ ─Acceptance  │  │ ─copy_tree   │  │ ─DeadreckonPaths│ ─RunEventBus │ │
-│  │   Marker     │  │ ─snapshot    │  │ ─scope hash  │  │ ─broadcast   │ │
-│  │ ─signature   │  │ ─append_*    │  │ ─task_key    │  │  channel     │ │
-│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘ │
-└──┬──────────────────────────┬─────────────────────────────────┬───────────┘
-   │ ProviderRouter::complete │ run_sandbox(SandboxSpec)        │ tracing
-   ▼                          ▼                                 ▼
-┌─────────────────┐   ┌──────────────────────┐         ┌────────────────┐
-│ PROVIDERS       │   │ SANDBOX              │         │ RUNTIME STATE  │
-│ HTTP:           │   │ sandbox-exec (mac)   │         │ ~/.deadreckon/ │
-│  anthropic      │   │ bwrap (linux)        │         │  runstate/...  │
-│  openai         │   │ docker (opt-in)      │         │  library/...   │
-│  openai-compat  │   │ none (passthrough)   │         │  locks/...     │
-│ CLI:            │   │ auto (resolves)      │         │  config.toml   │
-│  cli:claude-code│   │ ─SIGTERM 2s → SIGKILL│         └────────────────┘
-│  cli:codex      │   │ ─PID persisted       │
-│ TEST:           │   │ ─cancellation token  │
-│  smoke (scripted)│  └──────────────────────┘
-└─────────────────┘
+│  turn_loop.rs  provider turns, sandboxed tool dispatch, cancellation,      │
+│                acceptance gate invocation, promotion orchestration         │
+│  polish.rs     optional end-of-run doc polish via a doc-provider           │
+└──┬──────────────────────────┬──────────────────────────┬────────────────┘
+   │ durable primitives       │ ProviderRouter::complete  │ run_sandbox
+   ▼                          ▼                          ▼
+┌──────────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+│ CORE LIBRARY             │  │ PROVIDERS            │  │ SANDBOX              │
+│ state, paths, locks      │  │ HTTP: anthropic,     │  │ sandbox-exec, bwrap, │
+│ artifacts, docs, events  │  │ openai, compatible   │  │ docker, none, auto   │
+│ gate, promotion, chains  │  │ CLI: claude, codex   │  │ policy, PID/cancel   │
+│ adapter-free schemas     │  │ TEST: smoke          │  │ doctor checks        │
+└────────────┬─────────────┘  └──────────┬───────────┘  └──────────┬───────────┘
+             │                           │                         │
+             └───────────────────────────┴─────────────┬───────────┘
+                                                       ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│ RUNTIME STATE (~/.deadreckon/)                                            │
+│ runstate/<scope>/runs/<run-id>, library/<scope>/<run-id>, locks, config   │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 Why this shape works:
 
-- **The CLI is thin.** It parses args, sets up state, hands off to the turn loop. All durability lives in `deadreckon-core`.
+- **The CLI is thin.** It parses args, sets up state, hands off to `deadreckon-runtime`, and prints summaries. Durable schemas and atomic file operations live in `deadreckon-core`.
 - **State is on disk before every meaningful change.** `state.json` is atomic-written via temp+rename after every phase transition, snapshot, spend record, and tool call.
 - **The agent cannot mark its own gate.** `dr-gate` is a separate binary that signs an acceptance marker against a nonce only it can read; the deadreckon binary refuses to mark a run `Completed` without that signed marker.
 - **Sandboxes are platform-native.** macOS uses Seatbelt; Linux uses Bubblewrap; Docker is opt-in. No daemon, no `bollard`, no Lima.
@@ -112,11 +99,12 @@ Why this shape works:
 `/Users/gdc/deadreckon/Cargo.toml:1-41`:
 
 - Edition `2024`, resolver `3`, workspace version `0.1.0`.
-- Four workspace members:
-  - `crates/deadreckon-core` — library (~3,900 LoC across 12 modules)
-  - `crates/deadreckon-providers` — library (~1,300 LoC)
-  - `crates/deadreckon-sandbox` — library (~640 LoC)
-  - `crates/deadreckon` — binary (`deadreckon`, ~2,050 LoC) + binary (`dr-gate`, ~33 LoC at `src/bin/dr-gate.rs`)
+- Five workspace members:
+  - `crates/deadreckon-core` — library for durable state, artifacts, gates, docs, locks, chains, and codebase-mode primitives.
+  - `crates/deadreckon-runtime` — library for provider/sandbox orchestration, the turn loop, and doc polish.
+  - `crates/deadreckon-providers` — library for provider config, adapters, and fallback routing.
+  - `crates/deadreckon-sandbox` — library for platform-native sandbox backends and per-tool policy.
+  - `crates/deadreckon` — binary (`deadreckon`) + binary (`dr-gate` at `src/bin/dr-gate.rs`).
 
 ### 2.2 Crate-by-crate
 
@@ -129,25 +117,47 @@ Why this shape works:
 | `lock.rs` | `LockState`, file locks via `fs2`, PID liveness via `nix::kill(pid, 0)`, heartbeat |
 | `promotion.rs` | `promote_completed_run`, manifest writing, atomic working→library swap, crash recovery |
 | `gate.rs` | `AcceptanceMarker`, signature validation, anti-self-attestation |
-| `turn_loop.rs` | `RunLoopConfig`, `run_turn_loop` (load-bearing) |
 | `artifacts.rs` | `copy_tree`, `snapshot_working`, `append_{spend,trace,provenance}` |
+| `cancel.rs` | cancellation markers and run-root cancel checks |
+| `chain.rs` | autonomous goal-chain records and conductor state |
+| `codebase.rs` | worktree/copy/fresh/in-place mode records and source materialization |
+| `docs.rs` | deterministic run-doc templates, frontmatter, inventory, and promotion copies |
 | `events.rs` | `RunEvent`, `RunEventBus`, `tokio::sync::broadcast` channel |
 | `error.rs` | `DeadreckonError`, `Result<T>` |
 
-**`deadreckon-providers` (`crates/deadreckon-providers/src/lib.rs`).** The `Provider` trait and seven adapters.
+**`deadreckon-runtime` (`crates/deadreckon-runtime/src/lib.rs`).** The orchestration layer that depends on core, providers, and sandbox.
+
+| Module | Purpose |
+|---|---|
+| `turn_loop.rs` | `RunLoopConfig`, `RunLoopOutcome`, `run_turn_loop`, model action parsing, tool dispatch, cancellation, acceptance, and promotion |
+| `polish.rs` | `polish_run_docs`, `PolishConfig`, skill resolution, polish input hashing, and nonfatal doc-provider polish |
+
+**`deadreckon-providers` (`crates/deadreckon-providers/src/lib.rs`).** A facade that re-exports the `Provider` trait, config types, HTTP adapter, smoke adapter, and router while keeping implementation modules private.
 
 | Module / file | Adapter |
 |---|---|
-| `lib.rs:135-323` | `ProviderAdapter` (HTTP, used by `anthropic` / `openai` / `openai-compatible`) |
-| `lib.rs:325-418` | `ScriptedSmokeProvider` (`smoke`, dev-only, deterministic) |
+| `http.rs` | `ProviderAdapter` (HTTP, used by `anthropic` / `openai` / `openai-compatible`) |
+| `smoke.rs` | `ScriptedSmokeProvider` (`smoke`, dev-only, deterministic) |
+| `router.rs` | `ProviderRouter` — config-driven fallback chain |
+| `config.rs` | TOML config loading and built-in provider defaults |
+| `types.rs` | public provider request/response/config traits and structs |
+| `error.rs` | `ProviderError`, `Result<T>` |
 | `cli_claude_code.rs` | `CliClaudeCodeProvider` — shells `claude --dangerously-skip-permissions -p` |
 | `cli_codex.rs` | `CliCodexProvider` — shells `codex --ask-for-approval never exec --skip-git-repo-check --sandbox <mode>` |
 | `cli_common.rs` | shared subprocess + allowlist machinery |
-| `lib.rs:420-511` | `ProviderRouter` — config-driven fallback chain |
 
-**`deadreckon-sandbox` (`crates/deadreckon-sandbox/src/lib.rs`).** `SandboxBackend` (`Auto | SandboxExec | Bwrap | Docker | None`), `SandboxSpec`, `run(SandboxSpec) -> SandboxRunOutput`. Per-backend command construction at lines 284–388. Cancellation + SIGTERM/SIGKILL escalation at lines 131–151.
+**`deadreckon-sandbox` (`crates/deadreckon-sandbox/src/lib.rs`).** A facade over sandbox backend resolution, command construction, policy, doctor checks, and subprocess supervision.
 
-**`deadreckon` (`crates/deadreckon/src/main.rs` + `crates/deadreckon/src/bin/dr-gate.rs`).** Clap CLI with 12 verbs, ratatui TUI for `attach`, `dr-gate` as a standalone acceptance-marker writer.
+| Module | Purpose |
+|---|---|
+| `backend.rs` | `SandboxBackend`, `SandboxError`, backend resolution |
+| `spec.rs` | `SandboxSpec` |
+| `commands.rs` | per-backend command/profile construction |
+| `policy.rs` | `ToolSandboxPolicy` |
+| `doctor.rs` | backend availability checks |
+| `process.rs` | `run(SandboxSpec) -> SandboxRunOutput`, PID files, cancellation, SIGTERM/SIGKILL escalation |
+
+**`deadreckon` (`crates/deadreckon/src/cli.rs`, `crates/deadreckon/src/main.rs`, and `crates/deadreckon/src/bin/dr-gate.rs`).** Clap parser definitions, command handlers, ratatui TUI for `attach`, and `dr-gate` as a standalone acceptance-marker writer.
 
 ### 2.3 Top-level documentation
 
@@ -170,9 +180,9 @@ Why this shape works:
 
 | Tool | Caller | Purpose |
 |---|---|---|
-| `sandbox-exec` | `deadreckon-sandbox/src/lib.rs:284` | macOS Seatbelt profile execution |
-| `bwrap` | `deadreckon-sandbox/src/lib.rs:303` | Linux Bubblewrap container |
-| `docker` | `deadreckon-sandbox/src/lib.rs:359` | Opt-in fallback |
+| `sandbox-exec` | `deadreckon-sandbox/src/commands.rs` | macOS Seatbelt profile execution |
+| `bwrap` | `deadreckon-sandbox/src/commands.rs` | Linux Bubblewrap container |
+| `docker` | `deadreckon-sandbox/src/commands.rs` | Opt-in fallback |
 | `claude` | `deadreckon-providers/src/cli_claude_code.rs:25` | CLI sub-agent provider |
 | `codex` | `deadreckon-providers/src/cli_codex.rs:26` | CLI sub-agent provider |
 | `cargo` | `deadreckon-core/src/gate.rs:182,219,260` | Acceptance check for Rust targets |
@@ -191,7 +201,7 @@ deadreckon mirrors the Printing Press split (AS-BUILT §3):
 | **Skill** | Agent-facing prose, judgment, prompt frame | `skills/default-coding/SKILL.md` | Markdown |
 | **Binary** | State, locks, sandboxes, providers, gates | `crates/deadreckon*` | Rust |
 
-The skill is invoked indirectly: it sits at the path recorded in `state.skill_path` and is read into the prompt frame at `crates/deadreckon-core/src/turn_loop.rs:405-417` (`build_prompt`). The binary never reaches into skill internals. New skills can be added under `skills/<name>/SKILL.md` and selected with `deadreckon run --skill <name>`.
+The skill is invoked indirectly: it sits at the path recorded in `state.skill_path` and is read into the prompt frame by `build_prompt` in `crates/deadreckon-runtime/src/turn_loop.rs`. The binary never reaches into skill internals. New skills can be added under `skills/<name>/SKILL.md` and selected with `deadreckon run --skill <name>`.
 
 This split lets each side do what it's good at:
 
@@ -340,10 +350,11 @@ JSONL files (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) 
 ├── Cargo.lock
 ├── README.md / DESIGN.md / CHANGELOG.md / DEPENDENCIES.md / HOWTO.md
 ├── crates/
-│   ├── deadreckon-core/          # state, locks, gates, turn loop
+│   ├── deadreckon-core/          # durable state, locks, gates, docs, artifacts
+│   ├── deadreckon-runtime/       # provider loop, sandbox dispatch, doc polish
 │   ├── deadreckon-providers/     # provider trait + adapters
 │   ├── deadreckon-sandbox/       # platform-native sandboxes
-│   └── deadreckon/               # binary + dr-gate binary + tests
+│   └── deadreckon/               # CLI binary + dr-gate binary + tests
 ├── skills/
 │   └── default-coding/SKILL.md
 ├── tests/                        # (currently empty; per-crate tests live in each crate)
@@ -427,7 +438,7 @@ Task key (`paths.rs:88-99`) is `"<slug-of-goal>-<fnv1a32-hex-of-goal>"` (slug ca
 Sequence for a typical `deadreckon run` invocation:
 
 ```
-main.rs:316 run_command()
+main.rs run_command()
   ↓
   paths = DeadreckonPaths::discover()
   ↓
@@ -448,7 +459,7 @@ main.rs:316 run_command()
   set_phase_status(20, Completed); save_state()   # provider built
   set_phase_status(30, Completed); save_state()   # sandbox resolved
   ↓
-  outcome = run_turn_loop(state, router, RunLoopConfig{...})  # turn_loop.rs:62
+  outcome = run_turn_loop(state, router, RunLoopConfig{...})
   ↓
   state.child_pids.clear(); save_state()
   lock.release()
@@ -555,7 +566,7 @@ pub struct PromotionManifest {
 
 ### 8.3 Where promotion happens
 
-In `turn_loop.rs` at lines 248 (CLI sub-agent path) and 386 (regular path), **before** `set_phase_status(PhaseId(60), Completed)`. If promotion fails, the run never reaches `Completed`. The `working/` directory is the source of truth until promotion; after promotion, the library copy is canonical and `working/` is gone.
+In `crates/deadreckon-runtime/src/turn_loop.rs`, **before** `set_phase_status(PhaseId(60), Completed)`. If promotion fails, the run never reaches `Completed`. The `working/` directory is the source of truth until promotion; after promotion, the library copy is canonical and `working/` is gone.
 
 ### 8.4 Crash recovery between rename steps
 
@@ -571,11 +582,11 @@ This makes promotion crash-safe across a `kill -9` between the two renames.
 
 ## 9. The Turn Loop
 
-The load-bearing function. Lives at `/Users/gdc/deadreckon/crates/deadreckon-core/src/turn_loop.rs:62`.
+The load-bearing function lives in `/Users/gdc/deadreckon/crates/deadreckon-runtime/src/turn_loop.rs`.
 
 ### 9.1 `RunLoopConfig`
 
-`turn_loop.rs:25-35`:
+`crates/deadreckon-runtime/src/turn_loop.rs` defines:
 
 ```rust
 pub struct RunLoopConfig {
@@ -592,7 +603,7 @@ pub struct RunLoopConfig {
 
 ### 9.2 Top-level signature
 
-`turn_loop.rs:62-66`:
+The top-level signature is:
 
 ```rust
 pub async fn run_turn_loop(
@@ -602,7 +613,7 @@ pub async fn run_turn_loop(
 ) -> Result<RunLoopOutcome>
 ```
 
-### 9.3 Loop body (paraphrased; see `turn_loop.rs:62-403`)
+### 9.3 Loop body (paraphrased; see `crates/deadreckon-runtime/src/turn_loop.rs`)
 
 ```text
 load_or_reconstruct_history()      # lines 69, 550-631
@@ -671,7 +682,7 @@ return Failed
 
 ### 9.4 Action enum
 
-Inline at `turn_loop.rs:254` (paraphrased):
+Inline in `crates/deadreckon-runtime/src/turn_loop.rs` (paraphrased):
 
 ```rust
 #[derive(Debug, Deserialize)]
@@ -683,11 +694,11 @@ enum Action {
 }
 ```
 
-Providers return JSON; the loop parses one action per turn. The CLI sub-agent path is detected by `response.trace["kind"] == "cli_subagent"` (`turn_loop.rs:446`) **before** action parsing — those providers do their own tool calls inside the subprocess and return a narrative, not an action JSON.
+Providers return JSON; the loop parses one action per turn. The CLI sub-agent path is detected by `response.trace["kind"] == "cli_subagent"` before action parsing — those providers do their own tool calls inside the subprocess and return a narrative, not an action JSON.
 
 ### 9.5 No smoke fallback in the default path
 
-`grep -r "coding_turn_script\|hardcoded_smoke" /Users/gdc/deadreckon/crates/` returns empty. The deterministic-script path lives entirely inside `ScriptedSmokeProvider` (`crates/deadreckon-providers/src/lib.rs:325-418`), reachable only via `deadreckon run --smoke` (which selects the `smoke` provider, not via a bypass of the run loop).
+`grep -r "coding_turn_script\|hardcoded_smoke" /Users/gdc/deadreckon/crates/` returns empty. The deterministic-script path lives entirely inside `ScriptedSmokeProvider` (`crates/deadreckon-providers/src/smoke.rs`), reachable only via `deadreckon run --smoke` (which selects the `smoke` provider, not via a bypass of the run loop).
 
 ### 9.6 Error handling
 
@@ -705,7 +716,7 @@ The bound is `max_turns` (currently 12), not an error budget.
 
 ### 10.1 The `Provider` trait
 
-`crates/deadreckon-providers/src/lib.rs:126-133`:
+`crates/deadreckon-providers/src/types.rs`:
 
 ```rust
 pub trait Provider: Send + Sync {
@@ -791,7 +802,7 @@ The wall-clock is what `--max-wall-seconds` caps (§9.3).
 
 ### 10.5 Scripted smoke provider
 
-`crates/deadreckon-providers/src/lib.rs:325-418`. In-memory `VecDeque<String>` initialized with three responses:
+`crates/deadreckon-providers/src/smoke.rs`. In-memory `VecDeque<String>` initialized with three responses:
 
 1. `{"action": "bash", "tool_call_id": "smoke-bash-1", "command": "..."}`
 2. `{"action": "write_file", "tool_call_id": "smoke-write-2", "path": "README.md", "content": "..."}`
@@ -801,7 +812,7 @@ Zero cost, no subscription. Reachable only via `--smoke` flag. The trace records
 
 ### 10.6 `ProviderRouter` and fallback chain
 
-`lib.rs:420-511`. Reads config (TOML), resolves a route list (`fallback` array > `default_provider` > built-in chain `cli:claude-code` → `cli:codex` → `anthropic` → `openai` → `openai-compatible`), constructs a `Box<dyn Provider>` per route. On `complete()`:
+`crates/deadreckon-providers/src/router.rs`. Reads config (TOML), resolves a route list (`fallback` array > `default_provider` > built-in chain `cli:claude-code` → `cli:codex` → `anthropic` → `openai` → `openai-compatible`), constructs a `Box<dyn Provider>` per route. On `complete()`:
 
 ```rust
 for route in &self.routes {
@@ -820,11 +831,11 @@ First credentialed route to succeed wins. All errors aggregate into the failure 
 
 ## 11. Sandbox Model
 
-`crates/deadreckon-sandbox/src/lib.rs` is a single ~640-line module that abstracts four backends behind one entry point.
+`crates/deadreckon-sandbox/src/lib.rs` is a public facade over focused modules that abstract four backends behind one entry point.
 
 ### 11.1 `SandboxBackend`
 
-Lines 29–37:
+`crates/deadreckon-sandbox/src/backend.rs`:
 
 ```rust
 #[serde(rename_all = "kebab-case")]
@@ -1016,7 +1027,7 @@ A forged marker by the agent fails the signature check at line 114.
 
 ### 13.5 Where the gate is invoked
 
-`turn_loop.rs:246-248` (CLI sub-agent path) and `turn_loop.rs:384-386` (regular Done path) both call:
+The CLI sub-agent path and regular Done path in `crates/deadreckon-runtime/src/turn_loop.rs` both call:
 
 ```rust
 run_acceptance_gate(state)?;
@@ -1024,7 +1035,7 @@ validate_acceptance_marker(state)?;
 promote_if_ready(state)?;
 ```
 
-The first call invokes `dr-gate` as a subprocess (`turn_loop.rs:662-697`). The second validates what `dr-gate` wrote. The third atomically swaps the working tree into the library.
+The first call invokes `dr-gate` as a subprocess. The second validates what `dr-gate` wrote. The third atomically swaps the working tree into the library.
 
 Failure at any step prevents the run from reaching `Completed`.
 
@@ -1124,7 +1135,7 @@ For non-Completed runs (`Failed`, `Killed`, `Paused`):
 5. Set `child_pids = vec![cli_pid]`.
 6. `save_state()`.
 7. Call `run_turn_loop` with `RunLoopConfig.from_turn = <CLI flag>`.
-8. The loop calls `load_or_reconstruct_history(state, from_turn)` (`turn_loop.rs:550-631`) which loads `history.json` if present, else reconstructs from `traces.jsonl`. With `from_turn = N`, history is truncated to N entries and `state.turn = N`.
+8. The loop calls `load_or_reconstruct_history(state, from_turn)` in `crates/deadreckon-runtime/src/turn_loop.rs`, which loads `history.json` if present, else reconstructs from `traces.jsonl`. With `from_turn = N`, history is truncated to N entries and `state.turn = N`.
 
 History reconstruction tolerates a `traces.jsonl` that ends mid-tool-call by ignoring incomplete entries — the next turn re-runs that turn.
 
@@ -1220,7 +1231,7 @@ Today the TUI **polls** files on disk every 500 ms: `spend.jsonl`, `traces.jsonl
 
 ### 19.1 `config.toml`
 
-Lives at `/Users/gdc/.deadreckon/config.toml` (overridable via `DEADRECKON_HOME`). Schema (`crates/deadreckon-providers/src/lib.rs:104-124`):
+Lives at `/Users/gdc/.deadreckon/config.toml` (overridable via `DEADRECKON_HOME`). Schema (`crates/deadreckon-providers/src/types.rs`):
 
 ```rust
 pub struct ProviderConfigFile {
@@ -1293,7 +1304,7 @@ Three credential paths:
 
 - `crates/deadreckon-providers/tests/cli_providers.rs` (297 lines) — CLI provider routing, fake `claude`/`codex` binaries, output capture, spend.
 - `crates/deadreckon-providers/tests/mock_server.rs` (220 lines) — axum-based OpenAI-compatible mock for HTTP provider tests.
-- `crates/deadreckon-providers/src/lib.rs:721-826` (inline) — config parsing, spend math, credential check, smoke determinism.
+- `crates/deadreckon-providers/src/lib.rs` (inline) and focused module tests — config parsing, spend math, credential check, smoke determinism.
 - `crates/deadreckon/tests/agentic_loop.rs` (841 lines) — end-to-end: run, kill, resume, list, attach, import, doctor, stress.
 
 ### 20.2 Notable integration tests
@@ -1522,7 +1533,7 @@ The docs use stoa-style bold frontmatter: Date, Last updated, Status, Run ID, Go
 
 ### 25.3 Per-Turn Templating
 
-After every successful tool/provider turn, `turn_loop.rs` calls `append_turn_doc`. The deterministic record lands in `_incremental.jsonl` and rewrites the Markdown drafts with turn sections containing tool kind, latency, files, outcome, trace citation, snapshot reference, and worktree commit SHA when available.
+After every successful tool/provider turn, `crates/deadreckon-runtime/src/turn_loop.rs` calls `append_turn_doc`. The deterministic record lands in `_incremental.jsonl` and rewrites the Markdown drafts with turn sections containing tool kind, latency, files, outcome, trace citation, snapshot reference, and worktree commit SHA when available.
 
 ### 25.4 End-of-Run Polish Pass
 

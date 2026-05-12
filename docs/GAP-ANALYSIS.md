@@ -6,9 +6,9 @@ Audit date: 2026-05-11. Scope: `/Users/gdc/deadreckon/`.
 
 | finding | status | evidence |
 |---|---|---|
-| Default run was a fixed local script instead of a provider-driven loop. | Resolved. | `crates/deadreckon-core/src/turn_loop.rs` calls `ProviderRouter::complete`; Tier B grep confirms no `coding_turn_script`, `hardcoded_smoke`, or `fn smoke_turn` remains under `crates/`. |
+| Default run was a fixed local script instead of a provider-driven loop. | Resolved. | `crates/deadreckon-runtime/src/turn_loop.rs` calls `ProviderRouter::complete`; Tier B grep confirms no `coding_turn_script`, `hardcoded_smoke`, or `fn smoke_turn` remains under `crates/`. |
 | Provider router existed but was unused by `run`. | Resolved. | `crates/deadreckon/src/main.rs` builds a router for normal runs, and `run_turn_loop` records `llm.complete` traces per turn. |
-| No model-to-tool protocol existed. | Resolved. | `turn_loop.rs` accepts JSON `bash`, `write_file`, and `done` actions and feeds tool results into `history.json`. |
+| No model-to-tool protocol existed. | Resolved. | `crates/deadreckon-runtime/src/turn_loop.rs` accepts JSON `bash`, `write_file`, and `done` actions and feeds tool results into `history.json`. |
 | CLI sub-agent providers were missing. | Resolved. | `crates/deadreckon-providers/src/cli_claude_code.rs`, `cli_codex.rs`, and `cli_common.rs` implement `cli:claude-code` and `cli:codex`; tests use fake binaries and verify sandbox wrapping. |
 | `kill` could not interrupt live work. | Resolved for the harness process and sandbox child pids. | `state.json` persists `child_pids`; sandbox/provider pid files live under `child-pids/`; `deadreckon kill` signals both sources and marks status `killed`. |
 | `resume` did not continue execution. | Resolved. | `deadreckon resume` reloads state/history and re-enters `run_turn_loop`; integration tests verify history survives. |
