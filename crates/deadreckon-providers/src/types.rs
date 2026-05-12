@@ -1,0 +1,104 @@
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+
+use deadreckon_sandbox::SandboxBackend;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+use crate::error::Result;
+
+pub type ProviderFuture<'a> = Pin<Box<dyn Future<Output = Result<ProviderResponse>> + Send + 'a>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    Anthropic,
+    OpenAi,
+    OpenAiCompatible,
+    CliClaudeCode,
+    CliCodex,
+    ScriptedSmoke,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpendEstimate {
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub subscription: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_time_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderRequest {
+    pub prompt: String,
+    pub max_output_tokens: u32,
+    pub cwd: Option<PathBuf>,
+    pub output_path: Option<PathBuf>,
+    pub sandbox_backend: Option<SandboxBackend>,
+    pub pid_file: Option<PathBuf>,
+    pub cancellation_token: Option<CancellationToken>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderResponse {
+    pub provider: String,
+    pub model: String,
+    pub content: String,
+    pub usage: ProviderUsage,
+    pub spend: SpendEstimate,
+    #[serde(default)]
+    pub trace: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderConfigFile {
+    pub default_provider: Option<String>,
+    pub fallback: Option<Vec<String>>,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderEntry {
+    pub kind: Option<ProviderKind>,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub input_cost_per_million: Option<f64>,
+    pub output_cost_per_million: Option<f64>,
+    pub binary: Option<String>,
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+pub trait Provider: Send + Sync {
+    fn name(&self) -> &str;
+    fn kind(&self) -> ProviderKind;
+    fn model(&self) -> &str;
+    fn has_credential(&self) -> bool;
+    fn estimate_spend(&self, usage: ProviderUsage) -> SpendEstimate;
+    fn complete<'a>(&'a self, request: &'a ProviderRequest) -> ProviderFuture<'a>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRouteInfo {
+    pub name: String,
+    pub kind: ProviderKind,
+    pub model: String,
+    pub has_credential: bool,
+}
