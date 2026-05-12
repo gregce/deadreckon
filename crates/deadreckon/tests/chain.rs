@@ -1,14 +1,23 @@
 use std::fs;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::post;
+use axum::{Json, Router};
 use deadreckon_core::{
     ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainNewOptions, ChainStatus, ChainStepStatus,
     DeadreckonPaths, OnFail, RunEvent, RunEventKind, RunOptions, chain_task_key, create_run,
     load_chain, promote_completed_run,
 };
+use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::net::TcpListener;
 
 fn sample_chain(temp: &TempDir) -> Chain {
     Chain::new(ChainNewOptions {
@@ -368,6 +377,107 @@ fn chain_yes_runs_smoke_steps_and_auto_applies() {
     assert!(log.contains("add goodbye"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_plan_writes_chain_json_with_n_steps() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let server = MockServer::start(r#"["scaffold board","add rules","polish ui"]"#).await;
+    write_config(temp.path(), &server.base_url());
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "plan",
+            "build chess",
+            "--n",
+            "3",
+            "--draft",
+            "--provider",
+            "mock",
+        ])
+        .output()
+        .expect("chain plan");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(
+        chain
+            .steps
+            .iter()
+            .map(|step| step.goal.as_str())
+            .collect::<Vec<_>>(),
+        vec!["scaffold board", "add rules", "polish ui"]
+    );
+    assert!(
+        paths
+            .chain_dir(&chain.chain_id)
+            .join("spend.jsonl")
+            .exists()
+    );
+    assert!(
+        server.journal()[0]["messages"][0]["content"]
+            .as_str()
+            .expect("prompt")
+            .contains("ordered serial chain")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_plan_refuses_single_step_response() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let server = MockServer::start(r#"["only one"]"#).await;
+    write_config(temp.path(), &server.base_url());
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "plan",
+            "build chess",
+            "--draft",
+            "--provider",
+            "mock",
+        ])
+        .output()
+        .expect("chain plan");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("decomposition produced 1 goals; need >= 2"));
+    assert!(stderr.contains("try:"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_plan_refuses_duplicate_steps() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let server = MockServer::start(r#"["add tests","add   tests"]"#).await;
+    write_config(temp.path(), &server.base_url());
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "plan",
+            "build chess",
+            "--draft",
+            "--provider",
+            "mock",
+        ])
+        .output()
+        .expect("chain plan");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("duplicate steps"));
+    assert!(stderr.contains("try:"));
+}
+
 fn read_run_events(state: &deadreckon_core::PipelineState) -> Vec<RunEvent> {
     fs::read_to_string(state.run_root.join("events.jsonl"))
         .expect("events")
@@ -471,4 +581,95 @@ fn git_stdout(cwd: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn write_config(temp: &std::path::Path, base_url: &str) {
+    let home = temp.join("home");
+    fs::create_dir_all(&home).expect("home");
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+fallback = ["mock"]
+
+[providers.mock]
+kind = "open-ai-compatible"
+base_url = "{base_url}"
+model = "mock-agent"
+api_key = "test"
+input_cost_per_million = 1.0
+output_cost_per_million = 1.0
+"#
+        ),
+    )
+    .expect("config");
+}
+
+#[derive(Clone)]
+struct MockState {
+    content: Arc<Mutex<Option<String>>>,
+    journal: Arc<Mutex<Vec<Value>>>,
+}
+
+struct MockServer {
+    addr: SocketAddr,
+    state: MockState,
+}
+
+impl MockServer {
+    async fn start(content: &str) -> Self {
+        let state = MockState {
+            content: Arc::new(Mutex::new(Some(content.to_string()))),
+            journal: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(mock_chat_completions))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        Self { addr, state }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn journal(&self) -> Vec<Value> {
+        self.state.journal.lock().expect("journal").clone()
+    }
+}
+
+async fn mock_chat_completions(
+    State(state): State<MockState>,
+    Json(request): Json<Value>,
+) -> impl IntoResponse {
+    state.journal.lock().expect("journal").push(request);
+    let content = state.content.lock().expect("content").take();
+    let Some(content) = content else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": {"message": "no fixture response left"}})),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": "mock",
+            "object": "chat.completion",
+            "model": "mock-agent",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 25,
+                "total_tokens": 125
+            }
+        })),
+    )
 }

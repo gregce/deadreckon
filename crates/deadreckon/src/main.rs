@@ -1311,7 +1311,8 @@ async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 quiet,
                 plain,
             })
-            .await;
+            .await
+            .map(|_| ());
         }
         eprintln!("using: chain status (scope: {})", current_scope()?);
         return chain_status_command(None, all, full, plain);
@@ -1491,6 +1492,7 @@ async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 plain,
             })
             .await
+            .map(|_| ())
         }
     }
 }
@@ -1534,13 +1536,37 @@ struct ChainRunOptions {
 
 async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
     let n = options.n.clamp(2, 12);
-    let goals = (1..=n)
-        .map(|index| format!("{} (step {index})", options.root_goal))
-        .collect::<Vec<_>>();
-    chain_create_command(ChainCreateOptions { goals, ..options }).await
+    let paths = options.paths.clone();
+    let router = ProviderRouter::from_config_path_with_model(
+        &paths.config_path(),
+        options.provider.as_deref(),
+        options.model.as_deref(),
+    )?;
+    let prompt = chain_planner_prompt(&options.root_goal, n);
+    let response = router
+        .complete(&ProviderRequest {
+            prompt,
+            max_output_tokens: u32::from(n) * 96,
+            cwd: Some(std::env::current_dir()?),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .map_err(|err| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!("chain planner provider failed: {err}"),
+                "deadreckon chain \"step one\" \"step two\"",
+            ))
+        })?;
+    let goals = parse_planner_goals(&response.content, n)?;
+    let chain_id = chain_create_command(ChainCreateOptions { goals, ..options }).await?;
+    append_chain_planner_spend(&paths, &chain_id, &response)?;
+    Ok(())
 }
 
-async fn chain_create_command(options: ChainCreateOptions) -> Result<()> {
+async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
     let ChainCreateOptions {
         paths,
         root_goal,
@@ -1631,7 +1657,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<()> {
                 chain_prefix(&chain.chain_id)
             );
         }
-        return Ok(());
+        return Ok(chain.chain_id);
     }
     if !yes {
         if !io::stdin().is_terminal() {
@@ -1643,12 +1669,13 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<()> {
         let answer = prompt("start the chain? [Y/n]: ")?;
         if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
             println!("cancelled");
-            return Ok(());
+            return Ok(chain.chain_id);
         }
     }
+    let chain_id = chain.chain_id.clone();
     chain_run_command(
         &paths,
-        &chain.chain_id,
+        &chain_id,
         ChainRunOptions {
             detach,
             quiet,
@@ -1659,7 +1686,8 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<()> {
             apply_mode: None,
         },
     )
-    .await
+    .await?;
+    Ok(chain_id)
 }
 
 async fn chain_run_command(
@@ -2505,6 +2533,103 @@ fn parse_goal_lines(raw: &str) -> Vec<String> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(ToString::to_string)
         .collect()
+}
+
+fn chain_planner_prompt(goal: &str, n: u8) -> String {
+    format!(
+        "You are decomposing a coding goal into an ordered serial chain.\n\
+Output a JSON array of <= {n} strings, each <= 160 chars, each a concrete next step. \
+Each step builds on the previous step's result. No prose, no commentary. Goal: {goal:?}."
+    )
+}
+
+fn parse_planner_goals(raw: &str, n: u8) -> Result<Vec<String>> {
+    let raw = raw.trim();
+    let json_text = if raw.starts_with("```") {
+        raw.lines()
+            .filter(|line| !line.trim_start().starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        raw.to_string()
+    };
+    let value = serde_json::from_str::<Value>(json_text.trim()).map_err(|err| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("chain plan returned invalid JSON: {err}"),
+            "deadreckon chain \"step one\" \"step two\"",
+        ))
+    })?;
+    let array = value.as_array().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            "chain plan must return a JSON array of strings",
+            "deadreckon chain \"step one\" \"step two\"",
+        ))
+    })?;
+    let mut seen = BTreeSet::new();
+    let mut goals = Vec::new();
+    for item in array.iter().take(usize::from(n)) {
+        let Some(goal) = item.as_str().map(str::trim).filter(|goal| !goal.is_empty()) else {
+            continue;
+        };
+        if goal.chars().count() > 160 {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "chain plan produced a step longer than 160 chars",
+                "ask for fewer steps or use explicit `deadreckon chain \"...\" \"...\"`",
+            )));
+        }
+        let key = goal
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if !seen.insert(key) {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "chain plan produced duplicate steps",
+                "rerun with --n 3 or provide explicit steps",
+            )));
+        }
+        goals.push(goal.to_string());
+    }
+    deadreckon_core::validate_goal_count(goals.len()).map_err(|_| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("decomposition produced {} goals; need >= 2", goals.len()),
+            "deadreckon chain plan \"goal\" --n 3",
+        ))
+    })?;
+    Ok(goals)
+}
+
+fn append_chain_planner_spend(
+    paths: &DeadreckonPaths,
+    chain_id: &str,
+    response: &deadreckon_providers::ProviderResponse,
+) -> Result<()> {
+    let path = paths.chain_dir(chain_id).join("spend.jsonl");
+    let parent = path.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "path has no parent: {}",
+            path.display()
+        )))
+    })?;
+    fs::create_dir_all(parent)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    serde_json::to_writer(
+        &mut file,
+        &json!({
+            "timestamp": Utc::now(),
+            "kind": "chain.planner",
+            "provider": response.provider,
+            "model": response.model,
+            "input_tokens": response.spend.input_tokens,
+            "output_tokens": response.spend.output_tokens,
+            "cost_usd": response.spend.cost_usd,
+        }),
+    )?;
+    file.write_all(b"\n")?;
+    Ok(())
 }
 
 fn chain_preview(chain: &Chain) -> String {
