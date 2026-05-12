@@ -12,3 +12,4 @@ Tier 1 crates are logged in commit messages. Tier 2 crates are listed here.
 | tokio-util | 0.7.18 | 1 | Hierarchical `CancellationToken` for run, provider, and sandbox cancellation. | Homegrown cancellation would be less reliable than Tokio's standard utility. | cec49f3 |
 | regex | 1.12.3 | 1 | Detect decision markers and deterministic auto-title phrases for self-documenting run drafts. | Hand-rolled matching would be weaker than the rider's regex contract. | self-documenting-runs |
 | sha2 | 0.10.9 | 1 | Compute SHA-256 polish input hashes for idempotent doc-provider calls. | `DefaultHasher` is not stable or cryptographic and would violate the rider hash requirement. | self-documenting-runs |
+| pulldown-cmark | 0.13.3 | 1 | Parse run Markdown docs for styled in-TUI rendering. | Raw Markdown dumping is hard to read; hand-rolled parsing would miss common Markdown constructs and regress formatting. | tui-markdown-docs |

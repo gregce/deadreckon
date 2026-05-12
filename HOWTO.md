@@ -214,6 +214,7 @@ compact spend/context telemetry
 wide center-left tool-call/provider activity stream
 narrow center-right live files being generated
 bottom supervised process/status panel
+completed-run Markdown docs view
 provider activity from live Codex session logs
 ```
 
@@ -233,11 +234,16 @@ After a run completes, the TUI footer adds lifecycle actions:
 ```text
 a        apply a completed worktree run
 b        abandon/discard a completed worktree run
-d        print the run narrative docs
+d        toggle formatted RUN-NARRATIVE.md docs in the main panel
 m        materialize/export a completed copy/fresh artifact
 e        extend a completed copy/fresh run with a follow-up goal
 s        show run details
 ```
+
+The docs view uses a Markdown parser and ratatui styles for headings, bullets,
+inline code, fenced code blocks, links, horizontal rules, and task lists. Press
+`d` again to return to provider activity. Scroll it with the same `j/k`,
+arrow-key, page-key, and mouse-wheel bindings.
 
 The TUI does not start, kill, resume, or undo runs. Use CLI commands for those controls.
 

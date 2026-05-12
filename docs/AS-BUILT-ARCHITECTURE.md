@@ -1203,9 +1203,10 @@ let vertical = Layout::default()
 - **Spend meter** only for metered API providers; CLI subscription providers omit cost and emphasize context/wall time.
 - **Context meter**: compact token/window summary with green/yellow/red thresholds.
 - **Center, left**: wide streaming list of tool calls + provider activity + recent events, with priority ordering — turn summary → live working-tree diff → recent provider activity → recent `RunEvent`s → recent traces.
+- **Completed docs view**: pressing `d` toggles the center-left panel from provider activity to `RUN-NARRATIVE.md` rendered through `pulldown-cmark` into ratatui `Line`/`Span`s. Headings, bullets, inline code, fenced code blocks, links, task markers, math, and horizontal rules receive terminal styles and remain scrollable.
 - **Center, right**: narrower live files list with count/bytes in the panel title.
 - **Bottom**: supervised PIDs + their `ps` lines (alive/dead annotation).
-- **Footer**: action-first completed footer (`[a] Apply`, `[b] Abandon`, `[d] Docs`, `[s] Show`) or scroll/detach help while running.
+- **Footer**: action-first completed footer (`[d] Docs` / `[d] Activity`, `[a] Apply`, `[b] Abandon`, `[s] Show`) or scroll/detach help while running.
 
 ### 18.3 Data source
 
@@ -1360,7 +1361,7 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 - `deadreckon doc`, `list` DOCS status, doc-aware `apply` commit bodies, extend-parent narrative updates, diff coverage retry, and the repo/user/project `run-narrator` skill mechanism.
 - Acceptance gate with signed marker; anti-self-attestation actually enforced.
 - `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import`, `cleanup`/`prune` verbs.
-- `ratatui` attach TUI with spend/context telemetry, provider activity, live files, process panel, scrollable panels, and completion action footer.
+- `ratatui` attach TUI with spend/context telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer.
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.
 - Mock HTTP server for tests; CLI provider tests with fake binaries; 13 integration tests including stress and import round-trips.
 

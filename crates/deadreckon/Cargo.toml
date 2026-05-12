@@ -12,6 +12,7 @@ crossterm.workspace = true
 deadreckon-core = { path = "../deadreckon-core" }
 deadreckon-providers = { path = "../deadreckon-providers" }
 deadreckon-sandbox = { path = "../deadreckon-sandbox" }
+pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true

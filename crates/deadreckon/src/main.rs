@@ -28,11 +28,16 @@ use deadreckon_core::{
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_sandbox::SandboxBackend;
+use pulldown_cmark::{
+    CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions,
+    Parser as MarkdownParser, Tag, TagEnd,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
@@ -3935,7 +3940,7 @@ async fn attach_tui(
         let terminal_area =
             ratatui::layout::Rect::new(0, 0, terminal_size.width, terminal_size.height);
         let panel_layout = attach_panel_layout(terminal_area);
-        let panel_counts = attach_panel_counts(&state, &spend, &traces, &events, &live);
+        let panel_counts = attach_panel_counts(&state, &spend, &traces, &events, &live, &tui_state);
         tui_state.clamp(panel_counts, panel_layout.rows);
         terminal.draw(|frame| {
             render_attach(frame, &state, &spend, &traces, &events, &live, &tui_state)
@@ -3948,7 +3953,9 @@ async fn attach_tui(
                     if tui_state.show_completion_actions
                         && state.status == RunStatus::Completed =>
                 {
-                    if !handle_tui_completion_key(&mut terminal, paths, &state, key).await? {
+                    if key.code == KeyCode::Char('d') && key.modifiers.is_empty() {
+                        tui_state.toggle_docs();
+                    } else if !handle_tui_completion_key(&mut terminal, paths, &state, key).await? {
                         tui_state.handle_key(key, panel_counts, panel_layout.rows);
                     }
                 }
@@ -4093,6 +4100,8 @@ impl AttachPanel {
 struct AttachTuiState {
     focused_panel: AttachPanel,
     activity_scroll: usize,
+    docs_scroll: usize,
+    docs_open: bool,
     files_scroll: usize,
     processes_scroll: usize,
     show_completion_actions: bool,
@@ -4103,6 +4112,8 @@ impl Default for AttachTuiState {
         Self {
             focused_panel: AttachPanel::Activity,
             activity_scroll: 0,
+            docs_scroll: 0,
+            docs_open: false,
             files_scroll: 0,
             processes_scroll: 0,
             show_completion_actions: true,
@@ -4132,6 +4143,11 @@ impl AttachTuiState {
         self.clamp(counts, rows);
     }
 
+    fn toggle_docs(&mut self) {
+        self.docs_open = !self.docs_open;
+        self.focused_panel = AttachPanel::Activity;
+    }
+
     fn scroll_focused(&mut self, delta: isize, counts: AttachPanelCounts, rows: AttachPanelRows) {
         let current = self.focused_scroll();
         let max = max_panel_scroll(self.focused_panel, counts, rows);
@@ -4147,6 +4163,9 @@ impl AttachTuiState {
         self.activity_scroll =
             self.activity_scroll
                 .min(max_panel_scroll(AttachPanel::Activity, counts, rows));
+        self.docs_scroll =
+            self.docs_scroll
+                .min(max_panel_scroll(AttachPanel::Activity, counts, rows));
         self.files_scroll =
             self.files_scroll
                 .min(max_panel_scroll(AttachPanel::Files, counts, rows));
@@ -4157,6 +4176,7 @@ impl AttachTuiState {
 
     fn focused_scroll(&self) -> usize {
         match self.focused_panel {
+            AttachPanel::Activity if self.docs_open => self.docs_scroll,
             AttachPanel::Activity => self.activity_scroll,
             AttachPanel::Files => self.files_scroll,
             AttachPanel::Processes => self.processes_scroll,
@@ -4165,6 +4185,7 @@ impl AttachTuiState {
 
     fn set_focused_scroll(&mut self, offset: usize) {
         match self.focused_panel {
+            AttachPanel::Activity if self.docs_open => self.docs_scroll = offset,
             AttachPanel::Activity => self.activity_scroll = offset,
             AttachPanel::Files => self.files_scroll = offset,
             AttachPanel::Processes => self.processes_scroll = offset,
@@ -4244,9 +4265,14 @@ fn attach_panel_counts(
     traces: &[TraceRecord],
     events: &[RunEvent],
     live: &AttachLive,
+    tui_state: &AttachTuiState,
 ) -> AttachPanelCounts {
     AttachPanelCounts {
-        activity: attach_activity_lines(state, spend, traces, events, live).len(),
+        activity: if tui_state.docs_open && state.status == RunStatus::Completed {
+            render_markdown_doc_lines(state).len()
+        } else {
+            attach_activity_lines(state, spend, traces, events, live).len()
+        },
         files: live_file_lines(live).len(),
         processes: process_lines(live).len(),
     }
@@ -4655,27 +4681,31 @@ fn render_attach(
         render_context(frame, top[1], spend, live);
     }
 
-    let trace_lines = attach_activity_lines(state, spend, traces, events, live);
-    let stream_rows = layout.activity.height.saturating_sub(2) as usize;
-    let trace_items = visible_items(&trace_lines, tui_state.activity_scroll, stream_rows);
-    frame.render_widget(
-        List::new(trace_items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(panel_border_style(
-                    tui_state.focused_panel,
-                    AttachPanel::Activity,
-                ))
-                .title(panel_title(
-                    "tool calls / provider activity",
-                    tui_state.focused_panel == AttachPanel::Activity,
-                    tui_state.activity_scroll,
-                    stream_rows,
-                    trace_lines.len(),
-                )),
-        ),
-        layout.activity,
-    );
+    if tui_state.docs_open && state.status == RunStatus::Completed {
+        render_run_docs(frame, layout.activity, state, tui_state);
+    } else {
+        let trace_lines = attach_activity_lines(state, spend, traces, events, live);
+        let stream_rows = layout.activity.height.saturating_sub(2) as usize;
+        let trace_items = visible_items(&trace_lines, tui_state.activity_scroll, stream_rows);
+        frame.render_widget(
+            List::new(trace_items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(panel_border_style(
+                        tui_state.focused_panel,
+                        AttachPanel::Activity,
+                    ))
+                    .title(panel_title(
+                        "tool calls / provider activity",
+                        tui_state.focused_panel == AttachPanel::Activity,
+                        tui_state.activity_scroll,
+                        stream_rows,
+                        trace_lines.len(),
+                    )),
+            ),
+            layout.activity,
+        );
+    }
     render_live_files(frame, layout.files, live, tui_state);
     render_processes(frame, layout.processes, live, tui_state);
     frame.render_widget(
@@ -4694,11 +4724,19 @@ fn provider_is_metered(state: &deadreckon_core::PipelineState) -> bool {
 fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTuiState) -> String {
     if tui_state.show_completion_actions && state.status == RunStatus::Completed {
         if is_worktree_run(state) {
-            "[a] Apply  [b] Abandon  [d] Docs  [s] Show  |  Tab focus  j/k scroll  q detach"
-                .to_string()
+            if tui_state.docs_open {
+                "[d] Activity  [a] Apply  [b] Abandon  [s] Show  |  Tab focus  j/k scroll  q detach"
+            } else {
+                "[d] Docs  [a] Apply  [b] Abandon  [s] Show  |  Tab focus  j/k scroll  q detach"
+            }
+            .to_string()
         } else {
-            "[m] Materialize  [e] Extend  [d] Docs  [s] Show  |  Tab focus  j/k scroll  q detach"
-                .to_string()
+            if tui_state.docs_open {
+                "[d] Activity  [m] Materialize  [e] Extend  [s] Show  |  Tab focus  j/k scroll  q detach"
+            } else {
+                "[d] Docs  [m] Materialize  [e] Extend  [s] Show  |  Tab focus  j/k scroll  q detach"
+            }
+            .to_string()
         }
     } else {
         "Detach: q Esc Ctrl-D  |  Focus: Tab  |  Scroll: j/k Up/Down PgUp/PgDn mouse".to_string()
@@ -4839,6 +4877,236 @@ fn attach_activity_lines(
         )
     }));
     lines
+}
+
+fn render_run_docs(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    state: &deadreckon_core::PipelineState,
+    tui_state: &AttachTuiState,
+) {
+    let lines = render_markdown_doc_lines(state);
+    let rows = area.height.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(lines.clone())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(panel_border_style(
+                        tui_state.focused_panel,
+                        AttachPanel::Activity,
+                    ))
+                    .title(panel_title(
+                        "run docs / narrative",
+                        tui_state.focused_panel == AttachPanel::Activity,
+                        tui_state.docs_scroll,
+                        rows,
+                        lines.len(),
+                    )),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((tui_state.docs_scroll as u16, 0)),
+        area,
+    );
+}
+
+fn render_markdown_doc_lines(state: &deadreckon_core::PipelineState) -> Vec<Line<'static>> {
+    let Some(path) = doc_path_for_kind(&state.working_dir, DocKind::Narrative) else {
+        return vec![Line::styled(
+            "No narrative docs found for this run.",
+            Style::default().fg(Color::Yellow),
+        )];
+    };
+    match fs::read_to_string(&path) {
+        Ok(raw) => markdown_to_tui_lines(&raw),
+        Err(err) => vec![Line::styled(
+            format!("Unable to read {}: {err}", path.display()),
+            Style::default().fg(Color::Red),
+        )],
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkdownBlock {
+    Paragraph,
+    Heading(HeadingLevel),
+    Item,
+}
+
+fn markdown_to_tui_lines(markdown: &str) -> Vec<Line<'static>> {
+    let options = MarkdownOptions::ENABLE_TABLES
+        | MarkdownOptions::ENABLE_STRIKETHROUGH
+        | MarkdownOptions::ENABLE_TASKLISTS;
+    let parser = MarkdownParser::new_ext(markdown, options);
+    let mut lines = Vec::new();
+    let mut current = Vec::new();
+    let mut block: Option<MarkdownBlock> = None;
+    let mut inline_style = Style::default();
+    let mut code_block = false;
+
+    for event in parser {
+        match event {
+            MarkdownEvent::Start(Tag::Heading { level, .. }) => {
+                flush_markdown_line(&mut lines, &mut current, block.take());
+                block = Some(MarkdownBlock::Heading(level));
+            }
+            MarkdownEvent::End(TagEnd::Heading(_)) => {
+                flush_markdown_line(&mut lines, &mut current, block.take());
+                lines.push(Line::raw(""));
+            }
+            MarkdownEvent::Start(Tag::Paragraph) => {
+                flush_markdown_line(&mut lines, &mut current, block.take());
+                block = Some(MarkdownBlock::Paragraph);
+            }
+            MarkdownEvent::End(TagEnd::Paragraph) => {
+                flush_markdown_line(&mut lines, &mut current, block.take());
+                lines.push(Line::raw(""));
+            }
+            MarkdownEvent::Start(Tag::Item) => {
+                flush_markdown_line(&mut lines, &mut current, block.take());
+                current.push(Span::styled("  - ", Style::default().fg(Color::Cyan)));
+                block = Some(MarkdownBlock::Item);
+            }
+            MarkdownEvent::End(TagEnd::Item) => {
+                flush_markdown_line(&mut lines, &mut current, block.take());
+            }
+            MarkdownEvent::Start(Tag::CodeBlock(kind)) => {
+                flush_markdown_line(&mut lines, &mut current, block.take());
+                let language = match kind {
+                    CodeBlockKind::Fenced(language) if !language.is_empty() => {
+                        format!(" {}", language)
+                    }
+                    _ => String::new(),
+                };
+                lines.push(Line::styled(
+                    format!("```{language}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                code_block = true;
+            }
+            MarkdownEvent::End(TagEnd::CodeBlock) => {
+                code_block = false;
+                lines.push(Line::styled("```", Style::default().fg(Color::DarkGray)));
+                lines.push(Line::raw(""));
+            }
+            MarkdownEvent::Start(Tag::Strong) => {
+                inline_style = inline_style.add_modifier(Modifier::BOLD);
+            }
+            MarkdownEvent::End(TagEnd::Strong) => {
+                inline_style = inline_style.remove_modifier(Modifier::BOLD);
+            }
+            MarkdownEvent::Start(Tag::Emphasis) => {
+                inline_style = inline_style.add_modifier(Modifier::ITALIC);
+            }
+            MarkdownEvent::End(TagEnd::Emphasis) => {
+                inline_style = inline_style.remove_modifier(Modifier::ITALIC);
+            }
+            MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
+                inline_style = inline_style
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::UNDERLINED);
+                if !dest_url.is_empty() {
+                    current.push(Span::styled(
+                        "",
+                        Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ));
+                }
+            }
+            MarkdownEvent::End(TagEnd::Link) => {
+                inline_style = Style::default();
+            }
+            MarkdownEvent::Text(text) => {
+                if code_block {
+                    for line in text.lines() {
+                        lines.push(Line::styled(
+                            format!("  {line}"),
+                            Style::default().fg(Color::LightGreen),
+                        ));
+                    }
+                } else {
+                    current.push(Span::styled(text.into_string(), inline_style));
+                }
+            }
+            MarkdownEvent::Code(code) => current.push(Span::styled(
+                code.into_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            MarkdownEvent::SoftBreak => current.push(Span::raw(" ")),
+            MarkdownEvent::HardBreak => {
+                flush_markdown_line(&mut lines, &mut current, block);
+                block = Some(MarkdownBlock::Paragraph);
+            }
+            MarkdownEvent::Rule => {
+                flush_markdown_line(&mut lines, &mut current, block.take());
+                lines.push(Line::styled(
+                    "────────────────────────────────────────",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            MarkdownEvent::Html(html) | MarkdownEvent::InlineHtml(html) => current.push(
+                Span::styled(html.into_string(), Style::default().fg(Color::DarkGray)),
+            ),
+            MarkdownEvent::InlineMath(math) => current.push(Span::styled(
+                math.into_string(),
+                Style::default().fg(Color::Magenta),
+            )),
+            MarkdownEvent::DisplayMath(math) => {
+                flush_markdown_line(&mut lines, &mut current, block.take());
+                lines.push(Line::styled(
+                    math.into_string(),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            MarkdownEvent::Start(_)
+            | MarkdownEvent::End(_)
+            | MarkdownEvent::FootnoteReference(_) => {}
+            MarkdownEvent::TaskListMarker(checked) => current.push(Span::styled(
+                if checked { "[x] " } else { "[ ] " },
+                Style::default().fg(Color::Cyan),
+            )),
+        }
+    }
+    flush_markdown_line(&mut lines, &mut current, block.take());
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            "Narrative docs are empty.",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines
+}
+
+fn flush_markdown_line(
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
+    block: Option<MarkdownBlock>,
+) {
+    if current.is_empty() {
+        return;
+    }
+    let style = match block.unwrap_or(MarkdownBlock::Paragraph) {
+        MarkdownBlock::Heading(HeadingLevel::H1) => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        MarkdownBlock::Heading(HeadingLevel::H2) => Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+        MarkdownBlock::Heading(_) => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        MarkdownBlock::Item => Style::default().fg(Color::White),
+        MarkdownBlock::Paragraph => Style::default(),
+    };
+    let mut spans = Vec::new();
+    if matches!(block, Some(MarkdownBlock::Heading(level)) if level != HeadingLevel::H1) {
+        spans.push(Span::styled("▸ ", Style::default().fg(Color::Cyan)));
+    }
+    spans.extend(current.drain(..).map(|span| span.patch_style(style)));
+    lines.push(Line::from(spans));
 }
 
 fn render_live_files(
@@ -5136,9 +5404,10 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
 mod tui_tests {
     use super::{
         AttachPanel, AttachPanelCounts, AttachPanelRows, AttachTuiState, CompletionAction,
-        completion_action_from_input, max_panel_scroll,
+        completion_action_from_input, markdown_to_tui_lines, max_panel_scroll,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::style::{Color, Modifier};
 
     fn counts() -> AttachPanelCounts {
         AttachPanelCounts {
@@ -5225,5 +5494,45 @@ mod tui_tests {
             Some(CompletionAction::Quit)
         );
         assert_eq!(completion_action_from_input("wat"), None);
+    }
+
+    #[test]
+    fn markdown_renderer_styles_headings_lists_and_code() {
+        let lines = markdown_to_tui_lines(
+            "# Summary\n\nImplemented `apply`.\n\n- safer checkout\n\n```rust\nfn main() {}\n```\n",
+        );
+        let joined = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Summary"), "{joined}");
+        assert!(joined.contains("Implemented apply."), "{joined}");
+        assert!(joined.contains("- safer checkout"), "{joined}");
+        assert!(joined.contains("fn main() {}"), "{joined}");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.content.as_ref() == "apply"
+                    && span.style.fg == Some(Color::Yellow)
+                    && span.style.add_modifier.contains(Modifier::BOLD)),
+            "inline code should keep its styling"
+        );
+    }
+
+    #[test]
+    fn docs_toggle_uses_activity_panel_scroll_slot() {
+        let mut state = AttachTuiState::default();
+        state.toggle_docs();
+        state.scroll_focused(4, counts(), rows());
+        assert!(state.docs_open);
+        assert_eq!(state.docs_scroll, 4);
+        assert_eq!(state.activity_scroll, 0);
     }
 }

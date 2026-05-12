@@ -131,7 +131,8 @@ deadreckon attach latest
 
 The TUI shows compact run status, phase, goal, working directory, per-turn timer,
 spend or context telemetry, provider/tool activity, generated files, process
-status, and completion actions.
+status, and completion actions. Completed runs can toggle a styled Markdown
+rendering of `RUN-NARRATIVE.md` directly in the main panel.
 
 Detach without killing the run:
 
