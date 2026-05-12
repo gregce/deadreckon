@@ -36,6 +36,7 @@ This document captures the system as built today — what's wired, what's load-b
 23. [Glossary](#23-glossary)
 24. [Codebase Modes](#24-codebase-modes)
 25. [Self-Documenting Runs](#25-self-documenting-runs)
+28. [Chains & Autonomous Goal Chaining](#28-chains--autonomous-goal-chaining)
 
 ---
 
@@ -1167,6 +1168,7 @@ The `Commands` enum in `crates/deadreckon/src/main.rs` defines the CLI surface. 
 | `undo` | `main.rs:1002` | Restore snapshot to a target turn |
 | `show` | `main.rs:1025` | Pretty-print full state + provenance + traces |
 | `import` | `main.rs:1056` | Read-only import from claude/codex/cursor |
+| `chain` | `main.rs:1246` | Create, plan, run, attach, pause/resume/kill, undo, extend, and redo serial autonomous chains |
 
 The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defaults to `$10` (with a confirmation gate above `$50`), `--provider` defaults to the highest-credentialed entry per the fallback chain, `--skill` defaults to `default-coding`.
 
@@ -1381,6 +1383,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Promoted library query surface: `deadreckon library list|search|show` reads library manifests and reverse materialization markers, filters by goal/date, and searches promoted run docs.
 - Import parity hardening: Claude Code/Codex JSONL and Cursor SQLite imports preserve source metadata, deterministic run IDs, stable row ordering, and provenance paths; committed goldens cover normalized `show` output.
 - CLI usability polish: root help includes command groups, `status` includes run health/library/disk blocks, and `DEADRECKON_HINTS=0` suppresses post-completion prompts.
+- Autonomous sequential chains: `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`, and `chain redo`; chains use `latest`/`last` aliases, `chain.json`, `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps, green-policy auto-apply, and a multi-step ratatui timeline with single-run chain context.
 - Mock HTTP server for tests; CLI provider tests with fake binaries; integration coverage for stress, import round-trips, lifecycle, codebase modes, docs, sandbox policy, and gate proof.
 
 ### Hardening v2 closures
@@ -1395,7 +1398,7 @@ The previously named thin areas now have code paths and depth tests:
 6. **Doctor.** Local setup checks are actionable and exhaustive for alpha; provider network pings are opt-in.
 7. **Import normalization.** JSONL/SQLite imports now carry source path/line/row metadata and deterministic imported run IDs, with golden-file `show` round trips.
 8. **Acceptance gate.** `acceptance.yaml` supports structured checks and signed per-check results.
-9. **Multi-run coordination.** Scope-qualified locks, stale reclaim, and same-scope refusal tests are in place; a scheduler remains out of scope.
+9. **Multi-run coordination.** Scope-qualified locks, stale reclaim, same-scope refusal tests, and sequential chain coordination are in place; parallel/DAG scheduling remains out of scope.
 10. **Promotion / library workflow.** Promotion is atomic and `library list|search|show` makes artifacts discoverable by scope, goal, date, and promoted-doc content.
 
 ### Not yet built (V1+ candidates per `docs/goals/2026-05-11-1400-deadreckon-usability-rider.md` and the V1 list in the robust rider)
@@ -1548,6 +1551,78 @@ When `deadreckon apply` builds the default squash or merge message, it reads `RU
 ### 25.10 Cost And Idempotency
 
 `polish.json` stores a SHA-256 inputs hash over goal, traces, provenance, spend, incremental records, changed files, and source AS-BUILT content. A matching polished hash skips duplicate provider calls unless forced. CLI subscription providers report wall time rather than USD cost.
+
+---
+
+## 28. Chains & Autonomous Goal Chaining
+
+### 28.1 Mental Model
+
+A chain is an ordered list of step goals plus branch, apply, budget, and stop policy. The conductor is a CLI process entered by `deadreckon chain ...` or `deadreckon chain run <id>`. It acquires a chain lock, spawns each step as a normal `deadreckon run --worktree`, waits for that run to complete and pass acceptance, applies it to the source branch when policy allows, then bases the next step on the updated head.
+
+Chain state is separate from `PipelineState`: no run schema fields were added. Files live under `~/.deadreckon/chains/<chain-id>/`.
+
+### 28.2 `chain.json`
+
+`crates/deadreckon-core/src/chain.rs` defines `Chain`, `ChainStep`, and `ConductorState`. The top-level chain records `chain_id`, `root_goal`, ordered `steps`, `branch_policy`, `apply_mode`, `apply_strategy`, `apply_allowlist`, `on_fail`, circuit-breaker counters, aggregate spend/wall caps, scope, base branch/SHA, cwd, provider/model/sandbox, status, pause/failure reason, conductor pid, timestamps, and deadreckon version.
+
+Each `ChainStep` records index, goal, status, run id, applied timestamp/SHA, failure reason, step cap, and actual spend. `ConductorState` is the live-process pointer in `conductor.json`: conductor pid, live step, live run id, and live child pid.
+
+### 28.3 Create And Run Shape
+
+The common path mirrors `run`:
+
+```bash
+deadreckon chain "step one" "step two" "step three" --yes
+deadreckon chain plan "build a chess app" --n 6 --yes
+```
+
+`chain expand` is an alias for `chain plan`. `--from-file` and `--from-stdin` accept newline-separated steps. `--draft` writes `chain.json` without starting the conductor. Bare `deadreckon chain` prints scoped status; `deadreckon chain run` resumes `latest`; `latest` and `last` are accepted anywhere a chain id is expected.
+
+### 28.4 Branch Policy
+
+`stack` bases step N+1 on the SHA applied by step N. `base` bases every step on the original chain base SHA. `merge` follows stack semantics but forces `apply --strategy merge`, producing merge commits instead of squash commits.
+
+### 28.5 Apply-Mode Green Policy
+
+`apply_mode=auto` advances only after the inner run completes, the acceptance marker validates, the target tree is clean, file changes match the allowlist when configured, and `on-promote` hooks accept the change. Failure pauses the chain and writes an actionable pause reason. `preview` and `manual` pause after the inner run so the user can inspect/apply explicitly.
+
+### 28.6 Conductor Lifecycle And Locks
+
+The conductor holds a `chain--<id>` lock while active. Inner runs keep their normal task locks. The conductor writes `conductor.json` before work starts and updates it while a child run is live. `chain kill` reads that file, kills the inner run through the normal cancel-marker path when a live run id exists, signals the child process, signals the conductor, waits briefly, then escalates.
+
+### 28.7 Hook Contract
+
+Hooks resolve in project, user, then repo order:
+
+```text
+.deadreckon/hooks/chain/<hook>
+~/.deadreckon/hooks/chain/<hook>
+/Users/gdc/deadreckon/hooks/chain/<hook>
+```
+
+Supported hooks are `pre-step`, `post-step`, `on-promote`, and `on-chain-end`. Payloads are JSON on stdin plus `DEADRECKON_CHAIN_ID`, `DEADRECKON_HOME`, and `DEADRECKON_STEP_INDEX`. Exit `0` proceeds. Exit `1` pauses or skips where defined. Exit `2` refuses/fails the transition. Every invocation appends `chain_hook_invoked`.
+
+### 28.8 Events And Promotion
+
+`chain-events.jsonl` is the chain audit log: created, step started, run completed, apply started, applied/refused, step failed, paused/resumed/killed/completed, undo, hooks, extend, and redo. `promotion.rs` also emits `RunPromoted { library_dir }`, so a chain can attach provenance to the promoted inner run artifact.
+
+### 28.9 Lifecycle Verbs
+
+`chain pause`, `resume`, `kill`, `undo`, `extend`, and `redo` compose with the existing run lifecycle. Undo reverts applied SHAs in reverse order. Extend inserts or appends a step and can reopen a completed chain when inserting. Redo chooses a specified step, the first failed step, or the latest applied step; applied-step redo requires `--reapply`, which reverts before requeueing.
+
+### 28.10 TUI Surfaces
+
+`chain attach <id>` opens a ratatui step timeline on TTYs and falls back to a plain snapshot off-TTY. The timeline shows policy, spend, step dots/statuses/run prefixes, recent chain activity, and controls for drill/show, redo, extend, pause, kill, detach, and scrolling. Single-run `attach` reads `.deadreckon/chain-step.json`, renders a chain context banner, and exposes `[c] Chain` to drill out to `chain attach`.
+
+### 28.11 Spend And Budgeting
+
+`--max-spend` is aggregate. Each pending step receives `(remaining cap)/(remaining pending steps)` as its inner run cap. The conductor reads the completed run's state and adds actual spend/wall time back into `chain.json`. `resume --max-spend-add` increases the aggregate ceiling; `--reset-breaker` clears the consecutive failure counter.
+
+### 28.12 Not Yet Built
+
+Out of scope for this alpha pass: mid-chain provider replanning, parallel/DAG steps inside one chain, cross-machine handoff, cloud sync, and a richer conflict-resolution UI. Those remain V1 candidates.
+
 - **Trace** — every LLM call and every tool dispatch, with latency + structured detail.
 - **CLI sub-agent** — a `cli:*` provider whose `complete()` invocation is one whole turn (the sub-agent does its own tool calls inside). Detected by `response.trace["kind"] == "cli_subagent"`.
 - **dr-gate** — the standalone binary at `crates/deadreckon/src/bin/dr-gate.rs` that owns acceptance verification. The agent cannot impersonate it.
