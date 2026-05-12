@@ -24,13 +24,13 @@ use deadreckon_core::{
     RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions,
     acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
     append_parent_narrative_update, append_provenance, append_trace, apply_commit_body,
-    clear_cancel_marker, copy_source_to_working, copy_tree, create_run, create_worktree,
-    doc_path_for_kind, docs_status_for_state, emit_event, evaluate_acceptance_checks,
-    inventory_files, list_runs, load_chain, load_run, marker_path_for_run_root, pid_is_alive,
-    prepare_worktree_record, preview_git_state, read_chain_step_marker, read_codebase_record,
-    record_for_resolved_mode, release_lock_file, resolve_mode, restore_snapshot, save_chain,
-    save_state, terminate_pid, validate_acceptance_marker, write_cancel_marker,
-    write_chain_step_marker,
+    cancel_marker_present, clear_cancel_marker, copy_source_to_working, copy_tree, create_run,
+    create_worktree, doc_path_for_kind, docs_status_for_state, emit_event,
+    evaluate_acceptance_checks, inventory_files, list_runs, load_chain, load_run,
+    marker_path_for_run_root, pid_is_alive, prepare_worktree_record, preview_git_state,
+    read_chain_step_marker, read_codebase_record, record_for_resolved_mode, release_lock_file,
+    resolve_mode, restore_snapshot, save_chain, save_state, terminate_pid,
+    validate_acceptance_marker, write_cancel_marker, write_chain_step_marker,
 };
 use deadreckon_providers::{
     ProviderRequest, ProviderRouteInfo, ProviderRouter, ProviderUsage, SpendEstimate,
@@ -3775,11 +3775,29 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     state.child_pids = vec![std::process::id()];
     save_state(&state)?;
 
+    if run_cancelled_before_turn_loop(&paths, &mut state)? {
+        lock.release()?;
+        println!("{} {}", ui_warn("killed run"), state.run_id);
+        print_run_locations(&state);
+        return Ok(());
+    }
     state.set_phase_status(PhaseId(20), PhaseStatus::Executing)?;
     save_state(&state)?;
+    if run_cancelled_before_turn_loop(&paths, &mut state)? {
+        lock.release()?;
+        println!("{} {}", ui_warn("killed run"), state.run_id);
+        print_run_locations(&state);
+        return Ok(());
+    }
     lock.heartbeat("provider")?;
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
+    if run_cancelled_before_turn_loop(&paths, &mut state)? {
+        lock.release()?;
+        println!("{} {}", ui_warn("killed run"), state.run_id);
+        print_run_locations(&state);
+        return Ok(());
+    }
     lock.heartbeat("turn-loop")?;
     print_run_started(
         &state,
@@ -3831,6 +3849,34 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         complete_run_actions(&state, !no_confirm).await?;
     }
     Ok(())
+}
+
+fn run_cancelled_before_turn_loop(
+    paths: &DeadreckonPaths,
+    state: &mut deadreckon_core::PipelineState,
+) -> Result<bool> {
+    if !cancel_marker_present(state) {
+        return Ok(false);
+    }
+    if let Ok(latest) = load_run(paths, &state.run_id)
+        && latest.status == RunStatus::Killed
+    {
+        *state = latest;
+        return Ok(true);
+    }
+    state.status = RunStatus::Killed;
+    state.failure_reason = Some("run cancelled before provider turn".to_string());
+    state.killed_at = Some(Utc::now());
+    state.updated_at = Utc::now();
+    save_state(state)?;
+    emit_event(
+        state,
+        None,
+        deadreckon_core::RunEventKind::RunCompleted {
+            status: "killed".to_string(),
+        },
+    )?;
+    Ok(true)
 }
 
 const PROJECT_ACCEPTANCE_DIR: &str = ".deadreckon";
@@ -9261,6 +9307,38 @@ enum CompletionAction {
     Quit,
 }
 
+impl CompletionAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Materialize => "materialize",
+            Self::Extend => "extend",
+            Self::Apply => "apply",
+            Self::Abandon => "abandon",
+            Self::Docs => "docs",
+            Self::Show => "show",
+            Self::Quit => "quit",
+        }
+    }
+
+    fn success_detail(self) -> &'static str {
+        match self {
+            Self::Materialize => {
+                "the completed artifact was exported; destination was printed above"
+            }
+            Self::Extend => {
+                "the follow-up run was created or completed; check list/status for its run id"
+            }
+            Self::Apply => {
+                "changes were applied to the source branch; cleanup may have removed the worktree"
+            }
+            Self::Abandon => "temporary worktree and branch cleanup finished",
+            Self::Docs => "documentation was printed in the terminal",
+            Self::Show => "run details were printed in the terminal",
+            Self::Quit => "no action was taken",
+        }
+    }
+}
+
 fn completion_action_from_input(input: &str) -> Option<CompletionAction> {
     match input.trim().to_ascii_lowercase().as_str() {
         "m" | "materialize" => Some(CompletionAction::Materialize),
@@ -9391,7 +9469,11 @@ async fn attach_tui(
                 {
                     if key.code == KeyCode::Char('d') && key.modifiers.is_empty() {
                         tui_state.toggle_docs();
-                    } else if !handle_tui_completion_key(&mut terminal, paths, &state, key).await? {
+                    } else if let Some(notice) =
+                        handle_tui_completion_key(&mut terminal, paths, &state, key).await?
+                    {
+                        tui_state.record_post_action(notice);
+                    } else {
                         tui_state.handle_key(key, panel_counts, panel_layout.rows);
                     }
                 }
@@ -9430,7 +9512,7 @@ async fn handle_tui_completion_key(
     paths: &DeadreckonPaths,
     state: &deadreckon_core::PipelineState,
     key: KeyEvent,
-) -> Result<bool> {
+) -> Result<Option<AttachActionNotice>> {
     let action = match key.code {
         KeyCode::Char('m') => CompletionAction::Materialize,
         KeyCode::Char('e') => CompletionAction::Extend,
@@ -9438,7 +9520,7 @@ async fn handle_tui_completion_key(
         KeyCode::Char('b') => CompletionAction::Abandon,
         KeyCode::Char('d') => CompletionAction::Docs,
         KeyCode::Char('s') => CompletionAction::Show,
-        _ => return Ok(false),
+        _ => return Ok(None),
     };
 
     suspend_tui(terminal)?;
@@ -9480,7 +9562,10 @@ async fn handle_tui_completion_key(
     }
     let _ = prompt("press Enter to return to attach...");
     resume_tui(terminal)?;
-    Ok(true)
+    Ok(Some(AttachActionNotice {
+        action,
+        success: action_result.is_ok(),
+    }))
 }
 
 fn suspend_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -9543,6 +9628,7 @@ struct AttachTuiState {
     files_scroll: usize,
     processes_scroll: usize,
     show_completion_actions: bool,
+    post_action_notice: Option<AttachActionNotice>,
 }
 
 impl Default for AttachTuiState {
@@ -9555,6 +9641,7 @@ impl Default for AttachTuiState {
             files_scroll: 0,
             processes_scroll: 0,
             show_completion_actions: true,
+            post_action_notice: None,
         }
     }
 }
@@ -9584,6 +9671,17 @@ impl AttachTuiState {
     fn toggle_docs(&mut self) {
         self.docs_open = !self.docs_open;
         self.focused_panel = AttachPanel::Activity;
+        self.post_action_notice = None;
+    }
+
+    fn record_post_action(&mut self, notice: AttachActionNotice) {
+        self.docs_open = false;
+        self.focused_panel = AttachPanel::Activity;
+        self.activity_scroll = 0;
+        self.docs_scroll = 0;
+        self.files_scroll = 0;
+        self.processes_scroll = 0;
+        self.post_action_notice = Some(notice);
     }
 
     fn scroll_focused(&mut self, delta: isize, counts: AttachPanelCounts, rows: AttachPanelRows) {
@@ -9628,6 +9726,27 @@ impl AttachTuiState {
             AttachPanel::Files => self.files_scroll = offset,
             AttachPanel::Processes => self.processes_scroll = offset,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AttachActionNotice {
+    action: CompletionAction,
+    success: bool,
+}
+
+impl AttachActionNotice {
+    fn lines(&self) -> Vec<String> {
+        let status = if self.success { "finished" } else { "failed" };
+        let mut lines = vec![format!("{} action {status}", self.action.label())];
+        if self.success {
+            lines.push(self.action.success_detail().to_string());
+            lines.push("next: q detach | deadreckon status | deadreckon list".to_string());
+        } else {
+            lines.push("see the terminal output above for the error and suggested fix".to_string());
+            lines.push("next: retry the action or q detach".to_string());
+        }
+        lines
     }
 }
 
@@ -9709,7 +9828,7 @@ fn attach_panel_counts(
         activity: if tui_state.docs_open && state.status == RunStatus::Completed {
             render_markdown_doc_lines(state).len()
         } else {
-            attach_activity_lines(state, spend, traces, events, live).len()
+            attach_activity_lines_for_tui(state, spend, traces, events, live, tui_state).len()
         },
         files: live_file_lines(live).len(),
         processes: process_lines(live).len(),
@@ -9761,6 +9880,7 @@ struct AttachLive {
     provider_activity: Vec<String>,
     provider_context_tokens: Option<u64>,
     provider_context_window: Option<u64>,
+    working_dir_exists: bool,
 }
 
 #[derive(Debug)]
@@ -9802,6 +9922,7 @@ fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
         provider_context_tokens: provider_activity.context_tokens,
         provider_context_window: provider_activity.context_window,
         provider_activity: provider_activity.lines,
+        working_dir_exists: state.working_dir.exists(),
     }
 }
 
@@ -10128,7 +10249,8 @@ fn render_attach(
     if tui_state.docs_open && state.status == RunStatus::Completed {
         render_run_docs(frame, layout.activity, state, tui_state);
     } else {
-        let trace_lines = attach_activity_lines(state, spend, traces, events, live);
+        let trace_lines =
+            attach_activity_lines_for_tui(state, spend, traces, events, live, tui_state);
         let stream_rows = layout.activity.height.saturating_sub(2) as usize;
         let trace_items = visible_items(&trace_lines, tui_state.activity_scroll, stream_rows);
         frame.render_widget(
@@ -10175,6 +10297,11 @@ fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTu
     } else {
         ""
     };
+    if state.run_root.join("abandoned.json").exists() {
+        return format!(
+            "worktree cleaned or abandoned  |  q detach  |  deadreckon status/list{chain_suffix}"
+        );
+    }
     let base = if tui_state.show_completion_actions && state.status == RunStatus::Completed {
         if is_worktree_run(state) {
             if tui_state.docs_open {
@@ -10300,6 +10427,23 @@ fn render_turn_summary(spend: &[SpendRecord], show_cost: bool) -> Vec<String> {
             })
             .collect()
     }
+}
+
+fn attach_activity_lines_for_tui(
+    state: &deadreckon_core::PipelineState,
+    spend: &[SpendRecord],
+    traces: &[TraceRecord],
+    events: &[RunEvent],
+    live: &AttachLive,
+    tui_state: &AttachTuiState,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(notice) = tui_state.post_action_notice.as_ref() {
+        lines.extend(notice.lines());
+        lines.push(String::new());
+    }
+    lines.extend(attach_activity_lines(state, spend, traces, events, live));
+    lines
 }
 
 fn attach_activity_lines(
@@ -10597,6 +10741,9 @@ fn render_live_files(
 }
 
 fn live_file_lines(live: &AttachLive) -> Vec<String> {
+    if !live.working_dir_exists {
+        return vec!["working tree was removed after cleanup".to_string()];
+    }
     if live.files.is_empty() {
         return vec!["no files yet".to_string()];
     }
@@ -10876,11 +11023,12 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
 #[cfg(test)]
 mod tui_tests {
     use super::{
-        AttachPanel, AttachPanelCounts, AttachPanelRows, AttachTuiState, ChainAttachTuiState,
-        CompletionAction, chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-        chain_should_auto_attach, chain_timeline_lines, chain_wall_cap_hit,
-        completion_action_from_input, completion_hints_enabled, doc_polish_preview_text,
-        markdown_to_tui_lines, max_panel_scroll, per_step_wall_cap, threshold_color,
+        AttachActionNotice, AttachLive, AttachPanel, AttachPanelCounts, AttachPanelRows,
+        AttachTuiState, ChainAttachTuiState, CompletionAction, chain_activity_lines,
+        chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
+        chain_timeline_lines, chain_wall_cap_hit, completion_action_from_input,
+        completion_hints_enabled, doc_polish_preview_text, live_file_lines, markdown_to_tui_lines,
+        max_panel_scroll, per_step_wall_cap, threshold_color,
     };
     use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -11310,5 +11458,50 @@ mod tui_tests {
         assert!(state.docs_open);
         assert_eq!(state.docs_scroll, 4);
         assert_eq!(state.activity_scroll, 0);
+    }
+
+    #[test]
+    fn post_completion_action_resets_docs_view_and_explains_next_step() {
+        let mut state = AttachTuiState {
+            docs_open: true,
+            docs_scroll: 42,
+            activity_scroll: 10,
+            files_scroll: 3,
+            processes_scroll: 2,
+            ..AttachTuiState::default()
+        };
+
+        state.record_post_action(AttachActionNotice {
+            action: CompletionAction::Apply,
+            success: true,
+        });
+
+        assert!(!state.docs_open);
+        assert_eq!(state.focused_panel, AttachPanel::Activity);
+        assert_eq!(state.activity_scroll, 0);
+        assert_eq!(state.docs_scroll, 0);
+        assert_eq!(state.files_scroll, 0);
+        assert_eq!(state.processes_scroll, 0);
+        let notice = state
+            .post_action_notice
+            .as_ref()
+            .expect("post-action notice")
+            .lines()
+            .join("\n");
+        assert!(notice.contains("apply action finished"), "{notice}");
+        assert!(notice.contains("q detach"), "{notice}");
+    }
+
+    #[test]
+    fn live_files_explain_cleaned_worktree() {
+        let live = AttachLive {
+            working_dir_exists: false,
+            ..AttachLive::default()
+        };
+
+        assert_eq!(
+            live_file_lines(&live),
+            vec!["working tree was removed after cleanup".to_string()]
+        );
     }
 }

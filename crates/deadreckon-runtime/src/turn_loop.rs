@@ -106,10 +106,17 @@ pub async fn run_turn_loop(
     // and writes state after every turn boundary.
     let mut history = load_or_reconstruct_history(state, config.from_turn)?;
     ensure_sandbox_toml(state)?;
-    state.set_phase_status(PhaseId(40), PhaseStatus::Executing)?;
-    save_state(state)?;
     let run_token = config.cancellation_token.clone().unwrap_or_default();
     let _cancel_marker_guard = CancelMarkerGuard::spawn(state.run_root.clone(), run_token.clone());
+    if should_cancel_run(state, &run_token) {
+        state.status = deadreckon_core::state::RunStatus::Killed;
+        state.failure_reason = Some("run cancelled before turn loop".to_string());
+        save_state(state)?;
+        emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
+        return Ok(RunLoopOutcome::Killed);
+    }
+    state.set_phase_status(PhaseId(40), PhaseStatus::Executing)?;
+    save_state(state)?;
     if let Some(from_turn) = config.from_turn {
         state.turn = from_turn;
         save_state(state)?;
