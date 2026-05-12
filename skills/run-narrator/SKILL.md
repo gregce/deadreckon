@@ -54,7 +54,7 @@ Return exactly one JSON object with these string fields:
 - Lead with what was built, how to run or inspect it, which user-authored files matter, how it was checked, and what remains risky or unfinished.
 - Every documentable changed file must be named in `narrative`.
 - Documentable files are source, config, manifest, test, asset, and project docs that a maintainer would intentionally edit.
-- Do not list generated, vendor, cache, dependency, build-output, trace, snapshot, source-map, or run-artifact paths such as `.next/`, `node_modules/`, `dist/`, `build/`, `target/`, `.turbo/`, `.cache/`, `.deadreckon/`, `*.map`, or `docs/RUN-*.md`; summarize them once only when they affected verification.
+- Do not list generated, vendor, cache, dependency, build-output, trace, snapshot, source-map, local-secret, or run-artifact paths such as `.next/`, `.astro/`, `.output/`, `node_modules/`, `.venv/`, `.gradle/`, `CMakeFiles/`, `.dart_tool/`, `.terraform/`, `dist/`, `build/`, `target/`, `.turbo/`, `.cache/`, `.deadreckon/`, `*.map`, `*.tsbuildinfo`, `.env*`, or `docs/RUN-*.md`; summarize them once only when they affected verification.
 - Every claim about a turn must cite `turn N` and link to `../traces.jsonl`.
 - Do not invent tests, commits, files, services, or decisions that are not in the inputs.
 - If no real multi-alternative decisions are present, `decisions` must include the line `No multi-alternative decisions detected in this run.`

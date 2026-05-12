@@ -1138,61 +1138,330 @@ pub fn is_documentable_path(file: &str) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(&path);
+    let file_name_lower = file_name.to_ascii_lowercase();
+    let path_lower = path.to_ascii_lowercase();
     if matches!(
-        file_name,
-        RUN_NARRATIVE
-            | RUN_AS_BUILT
-            | RUN_DECISIONS
-            | AS_BUILT_DELTA
-            | POLISH_JSON
+        file_name_lower.as_str(),
+        "run-narrative.md"
+            | "run-as-built.md"
+            | "run-decisions.md"
+            | "as-built-delta.md"
+            | "polish.json"
             | "traces.jsonl"
             | "provenance.jsonl"
             | "spend.jsonl"
-            | ".DS_Store"
+            | ".ds_store"
+            | "thumbs.db"
+            | "ehthumbs.db"
+            | "ehthumbs_vista.db"
+            | "desktop.ini"
+            | "cmakelists.txt.user"
+            | "cmakecache.txt"
+            | "cmake_install.cmake"
+            | "install_manifest.txt"
+            | "ctesttestfile.cmake"
+            | "compile_commands.json"
+            | "cmakeuserpresets.json"
+            | "go.work.sum"
+            | "package.resolved"
+            | "package.pins"
+            | "pubspec.lock"
+            | "erl_crash.dump"
+            | "pip-log.txt"
+            | "pip-delete-this-directory.txt"
+            | ".coverage"
+            | "coverage.xml"
+            | "nosetests.xml"
+            | ".dmypy.json"
+            | "dmypy.json"
+            | ".pdm-python"
+            | ".pypirc"
+            | ".installed.cfg"
+            | "manifest"
+            | ".rhistory"
+            | ".rdata"
+            | ".ruserdata"
+            | ".renviron"
+            | ".httr-oauth"
+            | "hs_err_pid"
+            | "release.properties"
+            | "dependency-reduced-pom.xml"
+            | "buildnumber.properties"
+            | "gradle-app.setting"
+            | ".gradletasknamecache"
+            | "pom.xml.tag"
+            | "pom.xml.releasebackup"
+            | "pom.xml.versionsbackup"
+            | "pom.xml.next"
+            | "scaffoldingreadme.txt"
+            | "testresult.xml"
+            | "composer.phar"
+            | "composer.lock"
+            | "gemfile.lock"
+            | ".rvmrc"
+            | "modules.order"
+            | "module.symvers"
+            | "mkfile.old"
+            | "dkms.conf"
+            | ".flutter-plugins"
+            | ".flutter-plugins-dependencies"
+            | ".last_build_id"
+            | "servicedefinitions.json"
+            | ".jekyll-metadata"
+            | ".terraform.tfstate.lock.info"
+            | ".terraformrc"
+            | "terraform.rc"
+            | ".env"
+            | ".envrc"
+            | ".vault_pass"
+            | "vault_password_file"
     ) {
         return false;
     }
-    if matches!(
-        Path::new(&path)
-            .extension()
-            .and_then(|extension| extension.to_str()),
-        Some("map" | "tsbuildinfo" | "pyc" | "pyo" | "log" | "tmp")
-    ) {
+    let generated_suffixes = [
+        ".map",
+        ".css.map",
+        ".sass.map",
+        ".scss.map",
+        ".tsbuildinfo",
+        ".pyc",
+        ".pyo",
+        ".pyd",
+        ".log",
+        ".tmp",
+        ".temp",
+        ".cache",
+        ".swp",
+        ".swo",
+        ".swn",
+        ".bak",
+        ".pid",
+        ".pid.lock",
+        ".lcov",
+        ".node",
+        ".class",
+        ".jar",
+        ".war",
+        ".nar",
+        ".ear",
+        ".ctxt",
+        ".tasty",
+        ".o",
+        ".obj",
+        ".ko",
+        ".lo",
+        ".slo",
+        ".gch",
+        ".pch",
+        ".ilk",
+        ".pdb",
+        ".so",
+        ".dylib",
+        ".dll",
+        ".lai",
+        ".la",
+        ".a",
+        ".lib",
+        ".dwo",
+        ".exe",
+        ".out",
+        ".app",
+        ".elf",
+        ".exp",
+        ".hex",
+        ".su",
+        ".idb",
+        ".smod",
+        ".nupkg",
+        ".snupkg",
+        ".binlog",
+        ".trx",
+        ".beam",
+        ".ez",
+        ".tfstate",
+        ".tfvars",
+        ".tfvars.json",
+        ".pkrvars.hcl",
+        ".box",
+    ];
+    if generated_suffixes
+        .iter()
+        .any(|suffix| path_lower.ends_with(suffix))
+        || file_name_lower.ends_with('~')
+        || file_name_lower.starts_with("npm-debug.log")
+        || file_name_lower.starts_with("yarn-debug.log")
+        || file_name_lower.starts_with("yarn-error.log")
+        || file_name_lower.starts_with("lerna-debug.log")
+        || file_name_lower.starts_with("report.") && file_name_lower.ends_with(".json")
+        || file_name_lower.starts_with("hs_err_pid")
+        || file_name_lower.starts_with("replay_pid")
+        || file_name_lower.starts_with("rustc-ice-") && file_name_lower.ends_with(".txt")
+        || file_name_lower.starts_with("vite.config.") && file_name_lower.contains(".timestamp-")
+        || file_name_lower.starts_with(".pnp.")
+        || file_name_lower.starts_with("app.") && file_name_lower.ends_with(".symbols")
+        || file_name_lower.starts_with("flutter_") && file_name_lower.ends_with(".png")
+        || file_name_lower.starts_with("crash.") && file_name_lower.ends_with(".log")
+        || file_name_lower.starts_with(".env.")
+        || file_name_lower.ends_with(".tmp")
+        || file_name_lower.ends_with(".tar.gz")
+        || file_name_lower.ends_with(".dsym.zip")
+    {
         return false;
     }
     let generated_segments = [
         ".deadreckon",
+        ".stoa",
         ".git",
         ".hg",
         ".svn",
+        ".bzr",
+        "cvs",
+        ".specstory",
+        ".claude",
         ".next",
         ".nuxt",
         ".svelte-kit",
+        ".astro",
+        ".output",
+        ".docusaurus",
+        ".vuepress",
+        ".remix",
         ".turbo",
         ".vite",
+        ".vitepress",
         ".cache",
         ".parcel-cache",
+        ".sass-cache",
+        ".jekyll-cache",
         "node_modules",
+        "jspm_packages",
+        "web_modules",
         "bower_components",
+        ".npm",
+        ".pnpm-store",
+        ".pnp",
+        ".yarn",
+        ".nyc_output",
+        ".grunt",
+        ".serverless",
+        ".fusebox",
+        ".dynamodb",
+        ".firebase",
         "vendor",
+        "pods",
+        "carthage",
         "dist",
         "build",
+        "codecoverage",
+        "testresults",
+        "benchmarkdotnet.artifacts",
         "out",
         "coverage",
+        "cover",
+        "htmlcov",
         "target",
+        "downloads",
+        "eggs",
+        ".eggs",
+        "sdist",
+        "wheels",
+        "develop-eggs",
+        "__pypackages__",
         "__pycache__",
         ".pytest_cache",
         ".mypy_cache",
         ".ruff_cache",
+        ".nox",
         ".tox",
+        ".hypothesis",
+        ".pybuilder",
+        ".pdm-build",
+        ".pixi",
+        ".pyre",
+        ".pytype",
+        ".webassets-cache",
+        ".scrapy",
+        "cython_debug",
         ".venv",
         "venv",
+        "env",
+        "env.bak",
+        "venv.bak",
+        ".ipynb_checkpoints",
+        ".virtual_documents",
+        ".gradle",
+        ".kotlin",
+        ".bsp",
+        ".bloop",
+        ".metals",
+        ".mtj.tmp",
+        "cmakefiles",
+        "cmakescripts",
+        "_deps",
+        "vcpkg_installed",
+        ".tmp_versions",
+        ".phpunit.result.cache",
+        ".phpactor.json",
+        ".vs",
+        ".yardoc",
+        "_yardoc",
+        ".bundle",
+        ".build",
+        ".swiftpm",
+        "deriveddata",
+        "xcuserdata",
+        ".dart_tool",
+        ".pub",
+        ".pub-cache",
+        ".buildlog",
+        ".history",
+        "ephemeral",
+        "flutter_assets",
+        ".eunit",
+        ".concrete",
+        ".rebar",
+        ".rebar3",
+        "_build",
+        "_checkouts",
+        "deps",
+        ".elixir_ls",
+        "_site",
+        ".terraform",
+        ".ansible",
+        ".pulumi",
+        "packer_cache",
+        ".vagrant",
+        "cdk.out",
+        ".cdk.staging",
         "tmp",
         "temp",
     ];
-    !path
-        .split('/')
-        .any(|segment| generated_segments.contains(&segment))
+    if path.split('/').any(|segment| {
+        let lower = segment.to_ascii_lowercase();
+        generated_segments.contains(&lower.as_str())
+            || lower.starts_with("cmake-build-")
+            || lower.starts_with("build-")
+            || lower.ends_with(".egg-info")
+            || lower.ends_with(".rs.bk")
+            || lower.starts_with("mutants.out")
+            || lower.ends_with(".dsym")
+            || lower.ends_with(".framework")
+    }) {
+        return false;
+    }
+    if path_lower.contains("/.vitepress/dist/")
+        || path_lower.contains("/.vitepress/cache/")
+        || path_lower.contains("/docs/_build/")
+        || path_lower.contains("/vendor/bundle/")
+        || path_lower.contains("/test/tmp/")
+        || path_lower.starts_with("fastlane/test_output/")
+        || path_lower.contains("/fastlane/test_output/")
+        || path_lower.contains("/generated_plugin_registrant.")
+        || path_lower.contains("/generated_plugins.cmake")
+    {
+        return false;
+    }
+    true
 }
 
 fn diff_sample_for_file(relative: &str, previous: &Path, current: &Path) -> Result<FileChange> {

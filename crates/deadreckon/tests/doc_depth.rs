@@ -154,6 +154,91 @@ fn generated_artifacts_are_omitted_from_doc_inputs() {
 }
 
 #[test]
+fn stoa_cli_artifact_patterns_are_omitted_from_doc_paths() {
+    for path in [
+        ".github/workflows/ci.yml",
+        ".storybook/main.ts",
+        "lib/app.js",
+        "src/main.ts",
+        "src/components/App.tsx",
+        "package-lock.json",
+        "Cargo.lock",
+        "go.mod",
+        ".ruby-version",
+        "README.md",
+    ] {
+        assert!(
+            is_documentable_path(path),
+            "{path} should remain documentable"
+        );
+    }
+
+    for path in [
+        ".stoa/state.json",
+        ".specstory/history/session.md",
+        ".claude/settings.json",
+        "app/.astro/types.d.ts",
+        ".output/server/index.mjs",
+        ".docusaurus/routes.js",
+        ".vuepress/dist/index.html",
+        ".remix/build/index.js",
+        "docs/_build/html/index.html",
+        "site/.vitepress/cache/deps.js",
+        ".gradle/caches/modules-2/files.bin",
+        "android/.kotlin/sessions/state",
+        "target/debug/app",
+        ".venv/lib/python/site-packages/pkg.py",
+        "__pypackages__/3.12/lib/pkg.py",
+        ".tox/py312/log.txt",
+        ".nox/tests/tmp",
+        ".hypothesis/examples/db",
+        ".pybuilder/target/classes",
+        ".pixi/envs/default/python",
+        ".pyre/types.json",
+        ".ipynb_checkpoints/notebook-checkpoint.ipynb",
+        "coverage/lcov.info",
+        "htmlcov/index.html",
+        "node_modules/pkg/index.js",
+        "jspm_packages/pkg/index.js",
+        ".pnpm-store/v3/files/index",
+        ".yarn/cache/pkg.zip",
+        ".nyc_output/out.json",
+        ".serverless/app.zip",
+        ".firebase/hosting.cache",
+        "src/main.css.map",
+        "foo/bar.tsbuildinfo",
+        ".env.local",
+        "Thumbs.db",
+        "CMakeFiles/progress.marks",
+        "cmake-build-debug/compile_commands.json",
+        "_deps/zlib-src/CMakeLists.txt",
+        "vendor/bundle/ruby/gems/rake.rb",
+        "ios/Flutter/ephemeral/file",
+        "ios/Flutter/App.framework/App",
+        ".dart_tool/package_config.json",
+        ".pub-cache/hosted/pub.dev/pkg",
+        "_build/dev/lib/app/ebin/app.beam",
+        "deps/phoenix/mix.exs",
+        ".elixir_ls/build/ref",
+        "_site/index.html",
+        ".terraform/providers/registry.terraform.io/hashicorp/aws",
+        "terraform.tfstate",
+        ".ansible/tmp/playbook",
+        ".pulumi/history/checkpoint.json",
+        "packer_cache/template.iso",
+        ".vagrant/machines/default",
+        "cdk.out/tree.json",
+        ".cdk.staging/asset.hash",
+        "fastlane/test_output/report.xml",
+        "src/generated_plugin_registrant.dart",
+        "build-android/output.apk",
+        "app.dSYM/Contents/Info.plist",
+    ] {
+        assert!(!is_documentable_path(path), "{path} should be omitted");
+    }
+}
+
+#[test]
 fn incremental_jsonl_carries_bash_stdout_and_stderr() {
     let (_temp, state) = fresh_state("stdio capture");
     append_turn_doc(

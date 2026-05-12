@@ -57,6 +57,6 @@ Return exactly one JSON object:
 - Quote a 1-3 line excerpt from the largest diff hunk inline.
 - Include each documentable changed file in `file_changes` with `+adds/-dels`.
 - Documentable files are user-authored source, config, manifests, tests, assets, and project docs that someone would intentionally maintain.
-- Omit generated, vendor, cache, dependency, build-output, trace, snapshot, source-map, and run-artifact paths. Examples: `.next/`, `node_modules/`, `dist/`, `build/`, `target/`, `.turbo/`, `.cache/`, `.deadreckon/`, `*.map`, and `docs/RUN-*.md`.
+- Omit generated, vendor, cache, dependency, build-output, trace, snapshot, source-map, local-secret, and run-artifact paths. Examples: `.next/`, `.astro/`, `.output/`, `node_modules/`, `.venv/`, `.gradle/`, `CMakeFiles/`, `.dart_tool/`, `.terraform/`, `dist/`, `build/`, `target/`, `.turbo/`, `.cache/`, `.deadreckon/`, `*.map`, `*.tsbuildinfo`, `.env*`, and `docs/RUN-*.md`.
 - Do not omit documentable changed files; if a file is unclear, say what evidence exists instead of inventing a role.
 - Keep phases compact. Large generated inventories are a documentation failure, not useful completeness.

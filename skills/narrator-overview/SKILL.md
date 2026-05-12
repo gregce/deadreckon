@@ -65,5 +65,5 @@ Return exactly one JSON object:
 - Put user-visible behavior and maintainer-relevant files ahead of deadreckon mechanics.
 - `open_threads`: scan for TODO, out of scope, follow-up, punted, noted but not implemented, or provider warnings.
 - `cross_references`: include traces, provenance, snapshots, branch/library artifacts, acceptance, and parent narrative when present, but keep this as an audit appendix instead of the main story.
-- Do not mention generated/vendor/cache/build artifacts except as one concise verification note when relevant. Examples to omit: `.next/`, `node_modules/`, `dist/`, `build/`, `target/`, `.turbo/`, `.cache/`, source maps, traces, snapshots, and run artifacts.
+- Do not mention generated/vendor/cache/build artifacts except as one concise verification note when relevant. Examples to omit: `.next/`, `.astro/`, `.output/`, `node_modules/`, `.venv/`, `.gradle/`, `CMakeFiles/`, `.dart_tool/`, `.terraform/`, `dist/`, `build/`, `target/`, `.turbo/`, `.cache/`, source maps, local `.env*` files, traces, snapshots, and run artifacts.
 - Every non-frontmatter claim about work done must cite `[turn N]`.
