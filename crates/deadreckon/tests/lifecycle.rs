@@ -745,6 +745,7 @@ fn help_lists_lifecycle_verbs() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("Lifecycle:"));
+    assert!(stdout.contains("finish latest"));
     assert!(stdout.contains("status"));
     assert!(stdout.contains("cleanup"));
     assert!(stdout.contains("Run ids accept unique prefixes"));
@@ -762,6 +763,94 @@ fn help_groups_verbs_by_lifecycle_stage() {
     assert!(stdout.contains("Completed Run Actions"));
     assert!(stdout.contains("Cleanup And Recovery"));
     assert!(stdout.contains("Inspect And Import"));
+}
+
+#[test]
+fn every_top_level_help_shows_lifecycle_usage() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    for command in [
+        "init",
+        "config",
+        "run",
+        "chain",
+        "doctor",
+        "list",
+        "library",
+        "finish",
+        "materialize",
+        "apply",
+        "abandon",
+        "cleanup",
+        "extend",
+        "doc",
+        "attach",
+        "kill",
+        "resume",
+        "undo",
+        "show",
+        "status",
+        "import",
+    ] {
+        let output = deadreckon(&paths)
+            .arg(command)
+            .arg("--help")
+            .output()
+            .expect("command help");
+        assert_success(&output);
+        let stdout = stdout(&output);
+        assert!(
+            stdout.contains("Lifecycle:"),
+            "{command} help did not include lifecycle guidance:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn chain_help_lists_real_subcommands() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let output = deadreckon(&paths)
+        .args(["chain", "help"])
+        .output()
+        .expect("chain help");
+
+    assert_success(&output);
+    let chain_stdout = stdout(&output);
+    assert!(chain_stdout.contains("deadreckon chain plan"));
+    assert!(chain_stdout.contains("deadreckon chain redo latest --step 2"));
+    assert!(chain_stdout.contains("deadreckon chain hooks list"));
+
+    let redo = deadreckon(&paths)
+        .args(["chain", "help", "redo"])
+        .output()
+        .expect("chain help redo");
+    assert_success(&redo);
+    assert!(stdout(&redo).contains("deadreckon chain undo/redo"));
+}
+
+#[test]
+fn finish_exports_completed_fresh_run() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "finish export parent");
+    let dest = temp.path().join("finished-export");
+
+    let output = deadreckon(&paths)
+        .arg("finish")
+        .arg(&parent.run_id)
+        .arg("--dest")
+        .arg(&dest)
+        .output()
+        .expect("finish");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("finish:"));
+    assert!(stdout.contains("exported run"));
+    assert_eq!(
+        fs::read_to_string(dest.join("app.txt")).expect("app"),
+        "parent app"
+    );
 }
 
 #[test]

@@ -152,13 +152,245 @@ fn ui_error(text: impl AsRef<str>) -> String {
     ui_style(text, "1;31", UiStream::Stderr)
 }
 
+const TOP_LEVEL_HELP: &str = "\
+Lifecycle:
+  1. Setup once:
+       deadreckon init
+       deadreckon doctor
+       deadreckon config provider
+  2. Start and watch work:
+       deadreckon run \"build the thing\"
+       deadreckon attach latest
+       deadreckon next
+  3. Finish completed work:
+       deadreckon finish latest
+       deadreckon apply latest --autostash --cleanup
+       deadreckon export latest --dest ./finished-project
+  4. Continue or recover:
+       deadreckon extend latest \"add tests\"
+       deadreckon resume latest
+       deadreckon cleanup --completed
+
+Command groups:
+  Setup: init/setup, config/settings, doctor/check
+  Run Lifecycle: run, attach/watch, status/next, list/runs, kill/stop, resume/continue
+  Completed Run Actions: finish, apply/keep, materialize/export, extend/follow-up, doc/docs, library/artifacts
+  Cleanup And Recovery: abandon/discard, cleanup/prune, undo/restore
+  Inspect And Import: show/inspect, import
+
+Run ids accept unique prefixes. `latest` means the newest run for the current project.";
+
+const INIT_HELP: &str = "\
+Lifecycle:
+  deadreckon init
+  deadreckon doctor
+  deadreckon run \"build the thing\"
+
+Use `deadreckon config provider` and `deadreckon config model` later to see or change defaults.";
+
+const CONFIG_HELP: &str = "\
+Subcommands:
+  deadreckon config get defaults.provider
+  deadreckon config set defaults.max_spend 15
+  deadreckon config provider
+  deadreckon config provider cli:codex
+  deadreckon config model
+  deadreckon config model gpt-5.1-codex --provider cli:codex
+
+Lifecycle:
+  Configure once, then `deadreckon run \"goal\"`. Per-run flags override these defaults.";
+
+const RUN_HELP: &str = "\
+Lifecycle:
+  deadreckon run \"build the thing\"
+  deadreckon attach latest
+  deadreckon next
+  deadreckon finish latest
+
+Common provider/model changes:
+  deadreckon run \"goal\" --provider cli:codex
+  deadreckon run \"goal\" --provider cli:codex --model gpt-5.1-codex
+  deadreckon config provider cli:codex
+  deadreckon config model gpt-5.1-codex --provider cli:codex
+
+Modes:
+  In a git repo, the default is an isolated worktree.
+  Use `--fresh`, `--from <dir>`, `--worktree`, or `--in-place --i-know-its-a-lot` to force a mode.";
+
+const CHAIN_HELP: &str = "\
+Chain subcommands:
+  deadreckon chain plan \"large goal\" --n 4
+  deadreckon chain \"step one\" \"step two\" --yes
+  deadreckon chain run latest
+  deadreckon chain attach latest
+  deadreckon chain status latest
+  deadreckon chain show latest --why-failed
+  deadreckon chain pause latest --reason \"waiting on review\"
+  deadreckon chain resume latest
+  deadreckon chain kill latest
+  deadreckon chain undo latest --step 2
+  deadreckon chain extend latest \"new step goal\"
+  deadreckon chain redo latest --step 2
+  deadreckon chain hooks list
+
+Lifecycle:
+  plan/expand drafts provider-generated steps.
+  run/resume executes the conductor.
+  attach watches the chain TUI.
+  pause/kill/undo/redo recover specific steps.
+  extend adds a new step to an existing chain.";
+
+const DOCTOR_HELP: &str = "\
+Lifecycle:
+  deadreckon doctor
+  deadreckon init
+  deadreckon run \"goal\"
+
+Doctor checks providers, CLI binaries, sandboxes, disk space, write permissions, and OS details.";
+
+const LIST_HELP: &str = "\
+Lifecycle:
+  deadreckon list
+  deadreckon list --all
+  deadreckon list --full
+  deadreckon attach <short-id>
+  deadreckon finish <short-id>
+
+The default view is compact and scoped to the current project. Use `--full` for scripts.";
+
+const LIBRARY_HELP: &str = "\
+Subcommands:
+  deadreckon library list
+  deadreckon library search gallery
+  deadreckon library show latest
+
+Lifecycle:
+  Accepted runs are promoted into the library. Use this to inspect artifacts after completion.";
+
+const FINISH_HELP: &str = "\
+Lifecycle:
+  deadreckon finish latest
+  deadreckon finish latest --autostash --cleanup
+  deadreckon finish latest --dest ./finished-project
+
+Finish chooses the right completed-run action:
+  worktree run -> apply
+  fresh/copy run -> export
+  in-place run -> show review guidance
+
+It still respects confirmations unless you pass `--no-confirm`.";
+
+const MATERIALIZE_HELP: &str = "\
+Lifecycle:
+  deadreckon export latest --dest ./finished-project
+  deadreckon show latest
+  deadreckon extend latest \"follow-up goal\"
+
+Use export/materialize for completed fresh or copy runs. Worktree runs use `deadreckon apply` instead.";
+
+const APPLY_HELP: &str = "\
+Lifecycle:
+  deadreckon show latest
+  deadreckon apply latest --autostash --cleanup
+  deadreckon discard latest
+
+Use apply for completed worktree runs. It merges the temporary `dr/...` branch back into your checkout.";
+
+const ABANDON_HELP: &str = "\
+Lifecycle:
+  deadreckon discard latest
+  deadreckon cleanup --completed
+
+Discard removes a run's temporary worktree and branch after you decide not to keep it.";
+
+const CLEANUP_HELP: &str = "\
+Lifecycle:
+  deadreckon cleanup --completed
+  deadreckon cleanup --stale --force
+  deadreckon cleanup <run-id>
+
+Cleanup handles abandoned, stale, or completed temporary worktrees. It does not delete promoted library artifacts.";
+
+const EXTEND_HELP: &str = "\
+Lifecycle:
+  deadreckon extend latest \"add tests\"
+  deadreckon attach latest
+  deadreckon finish latest
+
+Extend creates a new run from a completed parent artifact and includes parent context by default.";
+
+const DOC_HELP: &str = "\
+Lifecycle:
+  deadreckon doc latest
+  deadreckon doc latest --kind as-built
+  deadreckon doc latest --kind decisions
+  deadreckon doc latest --export ./RUN-NARRATIVE.md
+
+Docs are generated as part of accepted runs and are also shown in the TUI after completion.";
+
+const ATTACH_HELP: &str = "\
+Lifecycle:
+  deadreckon attach latest
+  deadreckon next
+  deadreckon finish latest
+
+Attach opens the live TUI. `q`, Esc, and Ctrl-D detach without killing the run.";
+
+const KILL_HELP: &str = "\
+Lifecycle:
+  deadreckon kill latest
+  deadreckon resume latest
+  deadreckon cleanup --stale
+
+Kill cancels the run, writes durable state, and terminates supervised child processes.";
+
+const RESUME_HELP: &str = "\
+Lifecycle:
+  deadreckon resume latest
+  deadreckon resume latest --from-turn 2
+  deadreckon attach latest
+
+Resume reconstructs history from traces, skips partial trailing records, and continues the run.";
+
+const UNDO_HELP: &str = "\
+Lifecycle:
+  deadreckon undo --run latest
+  deadreckon show latest
+
+Undo restores a run snapshot. It is mainly for in-place runs or recovery inside a run working directory.";
+
+const SHOW_HELP: &str = "\
+Lifecycle:
+  deadreckon show latest
+  deadreckon doc latest
+  deadreckon finish latest
+
+Show prints state, mode, lineage, traces, provenance, docs, and suggested next actions.";
+
+const STATUS_HELP: &str = "\
+Lifecycle:
+  deadreckon next
+  deadreckon attach latest
+  deadreckon finish latest
+
+Status explains the latest run and what to do next. `next` is the same command.";
+
+const IMPORT_HELP: &str = "\
+Lifecycle:
+  deadreckon import codex
+  deadreckon import claude-code
+  deadreckon import cursor
+  deadreckon show <imported-run-id>
+
+Import is read-only and normalizes other tool histories into deadreckon trace/provenance shape.";
+
 #[derive(Parser)]
 #[command(
     name = "deadreckon",
     version,
     about = "Unattended agentic coding harness",
     long_about = "deadreckon runs long coding tasks in an isolated worktree or sandbox, tracks durable state, and gives you explicit apply/export/cleanup steps.",
-    after_help = "Command groups:\n  Setup: init, config, doctor\n  Run Lifecycle: run, attach, status, list, kill, resume\n  Completed Run Actions: apply, materialize/export, extend, doc, library\n  Cleanup And Recovery: abandon/discard, cleanup/prune, undo\n  Inspect And Import: show, import\n\nLifecycle:\n  deadreckon run \"build the thing\"\n  deadreckon attach latest\n  deadreckon status\n  deadreckon apply latest --autostash --cleanup\n  deadreckon cleanup --completed\n\nRun ids accept unique prefixes. `latest` means the newest run for the current project."
+    after_help = TOP_LEVEL_HELP
 )]
 struct Cli {
     #[command(subcommand)]
@@ -169,7 +401,9 @@ struct Cli {
 enum Commands {
     #[command(
         next_help_heading = "Setup",
-        about = "Create ~/.deadreckon/config.toml and check the local setup"
+        visible_alias = "setup",
+        about = "Create ~/.deadreckon/config.toml and check the local setup",
+        after_help = INIT_HELP
     )]
     Init {
         #[arg(
@@ -190,7 +424,9 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Setup",
-        about = "Read or update ~/.deadreckon/config.toml"
+        visible_alias = "settings",
+        about = "Read or update ~/.deadreckon/config.toml",
+        after_help = CONFIG_HELP
     )]
     Config {
         #[command(subcommand)]
@@ -198,7 +434,8 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Run Lifecycle",
-        about = "Start an unattended coding run"
+        about = "Start an unattended coding run",
+        after_help = RUN_HELP
     )]
     Run {
         #[arg(help = "Natural-language coding goal")]
@@ -265,7 +502,8 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Run Lifecycle",
-        about = "Run a serial chain of coding goals"
+        about = "Run a serial chain of coding goals",
+        after_help = CHAIN_HELP
     )]
     Chain {
         #[arg(value_name = "ARG", num_args = 0.., help = "Step goals or chain subcommand")]
@@ -365,12 +603,16 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Setup",
-        about = "Check providers, sandboxing, disk, and local prerequisites"
+        visible_alias = "check",
+        about = "Check providers, sandboxing, disk, and local prerequisites",
+        after_help = DOCTOR_HELP
     )]
     Doctor,
     #[command(
         next_help_heading = "Run Lifecycle",
-        about = "Show runs for the current project by default"
+        visible_alias = "runs",
+        about = "Show runs for the current project by default",
+        after_help = LIST_HELP
     )]
     List {
         #[arg(long, help = "Filter to a specific scope key")]
@@ -382,7 +624,9 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
-        about = "Inspect promoted run artifacts in the deadreckon library"
+        visible_alias = "artifacts",
+        about = "Inspect promoted run artifacts in the deadreckon library",
+        after_help = LIBRARY_HELP
     )]
     Library {
         #[command(subcommand)]
@@ -390,8 +634,47 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
-        visible_alias = "export",
-        about = "Copy a completed fresh/copy run into a chosen directory"
+        visible_alias = "done",
+        about = "Route a completed run to the right finish action",
+        after_help = FINISH_HELP
+    )]
+    Finish {
+        #[arg(help = "Run id, unique prefix, or latest")]
+        run_id: Option<String>,
+        #[arg(long, help = "Destination directory for fresh/copy exports")]
+        dest: Option<PathBuf>,
+        #[arg(long, help = "Overwrite a non-empty export destination")]
+        force: bool,
+        #[arg(long, help = "Keep manifest.json in exported output")]
+        include_manifest: bool,
+        #[arg(
+            long,
+            default_value = "squash",
+            help = "Worktree apply strategy: squash, merge, or cherry-pick"
+        )]
+        strategy: String,
+        #[arg(long, help = "Apply target branch; defaults to the current branch")]
+        branch: Option<String>,
+        #[arg(
+            long,
+            help = "Temporarily stash local changes and restore them after worktree apply"
+        )]
+        autostash: bool,
+        #[arg(
+            long,
+            help = "Remove the temporary worktree/branch after a successful worktree apply"
+        )]
+        cleanup: bool,
+        #[arg(long, help = "Skip interactive confirmations")]
+        no_confirm: bool,
+        #[arg(long, help = "Commit message override for worktree apply")]
+        message: Option<String>,
+    },
+    #[command(
+        next_help_heading = "Completed Run Actions",
+        visible_aliases = ["export", "copy-out"],
+        about = "Copy a completed fresh/copy run into a chosen directory",
+        after_help = MATERIALIZE_HELP
     )]
     Materialize {
         #[arg(help = "Run id, unique prefix, or latest")]
@@ -405,7 +688,9 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
-        about = "Merge a completed worktree run back into the source checkout"
+        visible_alias = "keep",
+        about = "Merge a completed worktree run back into the source checkout",
+        after_help = APPLY_HELP
     )]
     Apply {
         #[arg(help = "Run id, unique prefix, or latest")]
@@ -436,7 +721,8 @@ enum Commands {
     #[command(
         next_help_heading = "Cleanup And Recovery",
         visible_alias = "discard",
-        about = "Remove a run's temporary worktree and branch"
+        about = "Remove a run's temporary worktree and branch",
+        after_help = ABANDON_HELP
     )]
     Abandon {
         #[arg(help = "Run id, unique prefix, or latest")]
@@ -448,8 +734,9 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Cleanup And Recovery",
-        visible_alias = "prune",
-        about = "Clean stale or temporary deadreckon worktrees"
+        visible_aliases = ["prune", "clean"],
+        about = "Clean stale or temporary deadreckon worktrees",
+        after_help = CLEANUP_HELP
     )]
     Cleanup {
         #[arg(help = "Optional run id, unique prefix, or latest")]
@@ -469,7 +756,9 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
-        about = "Continue from a completed run with a follow-up goal"
+        visible_alias = "follow-up",
+        about = "Continue from a completed run with a follow-up goal",
+        after_help = EXTEND_HELP
     )]
     Extend {
         #[arg(help = "Parent run id, unique prefix, or latest")]
@@ -499,7 +788,9 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
-        about = "Print or regenerate generated run documentation"
+        visible_alias = "docs",
+        about = "Print or regenerate generated run documentation",
+        after_help = DOC_HELP
     )]
     Doc {
         #[arg(help = "Run id, unique prefix, or latest")]
@@ -519,7 +810,9 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Run Lifecycle",
-        about = "Attach the live terminal UI to a run"
+        visible_alias = "watch",
+        about = "Attach the live terminal UI to a run",
+        after_help = ATTACH_HELP
     )]
     Attach {
         #[arg(help = "Run id, unique prefix, or latest")]
@@ -527,7 +820,12 @@ enum Commands {
         #[arg(long, help = "Suppress post-completion action hints")]
         no_hints: bool,
     },
-    #[command(next_help_heading = "Run Lifecycle", about = "Cancel a running task")]
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        visible_alias = "stop",
+        about = "Cancel a running task",
+        after_help = KILL_HELP
+    )]
     Kill {
         #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
@@ -536,7 +834,9 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Run Lifecycle",
-        about = "Resume an incomplete run"
+        visible_alias = "continue",
+        about = "Resume an incomplete run",
+        after_help = RESUME_HELP
     )]
     Resume {
         #[arg(help = "Run id, unique prefix, or latest")]
@@ -548,7 +848,9 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Cleanup And Recovery",
-        about = "Restore an in-place run snapshot"
+        visible_alias = "restore",
+        about = "Restore an in-place run snapshot",
+        after_help = UNDO_HELP
     )]
     Undo {
         #[arg(
@@ -561,7 +863,9 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Inspect And Import",
-        about = "Show full state, provenance, and trace details for a run"
+        visible_alias = "inspect",
+        about = "Show full state, provenance, and trace details for a run",
+        after_help = SHOW_HELP
     )]
     Show {
         #[arg(help = "Run id, unique prefix, or latest")]
@@ -572,7 +876,8 @@ enum Commands {
     #[command(
         next_help_heading = "Run Lifecycle",
         visible_alias = "next",
-        about = "Explain the current project's latest run and next action"
+        about = "Explain the current project's latest run and next action",
+        after_help = STATUS_HELP
     )]
     Status {
         #[arg(help = "Optional run id, unique prefix, or latest")]
@@ -585,7 +890,8 @@ enum Commands {
     },
     #[command(
         next_help_heading = "Inspect And Import",
-        about = "Import read-only history from another coding tool"
+        about = "Import read-only history from another coding tool",
+        after_help = IMPORT_HELP
     )]
     Import {
         #[arg(help = "Source: claude-code, codex, or cursor")]
@@ -860,6 +1166,29 @@ async fn main_inner() -> Result<()> {
         Commands::Doctor => doctor_command().await,
         Commands::List { scope, all, full } => list_command(scope, all, full),
         Commands::Library { command } => library_command(command),
+        Commands::Finish {
+            run_id,
+            dest,
+            force,
+            include_manifest,
+            strategy,
+            branch,
+            autostash,
+            cleanup,
+            no_confirm,
+            message,
+        } => finish_command(
+            run_id,
+            dest,
+            force,
+            include_manifest,
+            strategy,
+            branch,
+            autostash,
+            cleanup,
+            no_confirm,
+            message,
+        ),
         Commands::Materialize {
             run_id,
             dest,
@@ -1243,6 +1572,113 @@ struct ExtendCommandArgs {
     post_actions: bool,
 }
 
+fn print_chain_help(topic: Option<&str>) {
+    let topic = topic.unwrap_or("overview");
+    match topic {
+        "plan" | "expand" => {
+            println!("{}", ui_heading("deadreckon chain plan"));
+            println!(
+                "usage: {}",
+                ui_command("deadreckon chain plan \"large goal\" --n 4")
+            );
+            println!(
+                "purpose: ask the configured provider to split a large goal into ordered steps"
+            );
+            println!("next:    {}", ui_command("deadreckon chain run latest"));
+        }
+        "run" | "resume" => {
+            println!("{}", ui_heading("deadreckon chain run"));
+            println!("usage: {}", ui_command("deadreckon chain run latest"));
+            println!(
+                "usage: {}",
+                ui_command("deadreckon chain resume latest --from-step 2")
+            );
+            println!("purpose: execute or continue the conductor for a chain");
+            println!("next:    {}", ui_command("deadreckon chain attach latest"));
+        }
+        "attach" | "watch" => {
+            println!("{}", ui_heading("deadreckon chain attach"));
+            println!("usage: {}", ui_command("deadreckon chain attach latest"));
+            println!(
+                "purpose: open the chain TUI, including step timeline and live inner run status"
+            );
+            println!("next:    {}", ui_command("deadreckon chain status latest"));
+        }
+        "status" | "list" => {
+            println!("{}", ui_heading("deadreckon chain status/list"));
+            println!("usage: {}", ui_command("deadreckon chain status latest"));
+            println!("usage: {}", ui_command("deadreckon chain list --all"));
+            println!("purpose: find chains, summarize progress, and see the next action");
+            println!("next:    {}", ui_command("deadreckon chain show latest"));
+        }
+        "show" => {
+            println!("{}", ui_heading("deadreckon chain show"));
+            println!(
+                "usage: {}",
+                ui_command("deadreckon chain show latest --why-failed")
+            );
+            println!("purpose: inspect steps, policies, failures, applied SHAs, and run ids");
+            println!("next:    {}", ui_command("deadreckon chain resume latest"));
+        }
+        "pause" | "kill" => {
+            println!("{}", ui_heading("deadreckon chain pause/kill"));
+            println!(
+                "usage: {}",
+                ui_command("deadreckon chain pause latest --reason \"waiting on review\"")
+            );
+            println!(
+                "usage: {}",
+                ui_command("deadreckon chain kill latest --force")
+            );
+            println!(
+                "purpose: stop the conductor intentionally; kill also cascades to the live inner run"
+            );
+            println!("next:    {}", ui_command("deadreckon chain resume latest"));
+        }
+        "undo" | "redo" => {
+            println!("{}", ui_heading("deadreckon chain undo/redo"));
+            println!(
+                "usage: {}",
+                ui_command("deadreckon chain undo latest --step 2")
+            );
+            println!(
+                "usage: {}",
+                ui_command("deadreckon chain redo latest --step 2")
+            );
+            println!("purpose: back out or rerun an applied step with bounded chain state changes");
+            println!("next:    {}", ui_command("deadreckon chain show latest"));
+        }
+        "extend" => {
+            println!("{}", ui_heading("deadreckon chain extend"));
+            println!(
+                "usage: {}",
+                ui_command("deadreckon chain extend latest \"new step goal\"")
+            );
+            println!(
+                "usage: {}",
+                ui_command("deadreckon chain extend latest \"new step goal\" --insert-at 2")
+            );
+            println!("purpose: add a new step to an existing chain");
+            println!("next:    {}", ui_command("deadreckon chain run latest"));
+        }
+        "hooks" => {
+            println!("{}", ui_heading("deadreckon chain hooks"));
+            println!("usage: {}", ui_command("deadreckon chain hooks list"));
+            println!("purpose: list lifecycle hook names supported by the conductor");
+        }
+        _ => {
+            println!("{}", ui_heading("deadreckon chain"));
+            println!("{CHAIN_HELP}");
+            println!();
+            println!("More help:");
+            println!("  {}", ui_command("deadreckon chain help plan"));
+            println!("  {}", ui_command("deadreckon chain help run"));
+            println!("  {}", ui_command("deadreckon chain help pause"));
+            println!("  {}", ui_command("deadreckon chain help undo"));
+        }
+    }
+}
+
 async fn chain_command(args: ChainCommandArgs) -> Result<()> {
     let ChainCommandArgs {
         args,
@@ -1282,6 +1718,10 @@ async fn chain_command(args: ChainCommandArgs) -> Result<()> {
         why_failed,
     } = args;
     let paths = DeadreckonPaths::discover();
+    if args.first().is_some_and(|arg| arg == "help") {
+        print_chain_help(args.get(1).map(String::as_str));
+        return Ok(());
+    }
     let Some(first) = args.first().map(String::as_str) else {
         if from_file.is_some() || from_stdin {
             let goals = collect_chain_goals(&[], from_file, from_stdin)?;
@@ -4916,6 +5356,94 @@ fn materialize_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn finish_command(
+    run_id: Option<String>,
+    dest: Option<PathBuf>,
+    force: bool,
+    include_manifest: bool,
+    strategy: String,
+    branch: Option<String>,
+    autostash: bool,
+    cleanup: bool,
+    no_confirm: bool,
+    message: Option<String>,
+) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let requested = run_id.unwrap_or_else(|| "latest".to_string());
+    let state = load_cli_run(&paths, &requested)?;
+    match state.status {
+        RunStatus::Completed => {}
+        RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("run {} is still {}", state.run_id, state.status),
+                &format!("deadreckon attach {}", run_prefix(&state.run_id)),
+            )));
+        }
+        RunStatus::Failed | RunStatus::Killed => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("run {} is {}", state.run_id, state.status),
+                &format!("deadreckon resume {}", run_prefix(&state.run_id)),
+            )));
+        }
+    }
+
+    let mode = read_codebase_record(&state.working_dir)
+        .map(|record| record.mode)
+        .unwrap_or(CodebaseMode::Fresh);
+    match mode {
+        CodebaseMode::Worktree => {
+            println!(
+                "{} {}",
+                ui_heading("finish:"),
+                ui_command(format!("deadreckon apply {}", run_prefix(&state.run_id)))
+            );
+            apply_command(
+                state.run_id,
+                strategy,
+                branch,
+                no_confirm,
+                autostash,
+                cleanup,
+                message,
+            )
+        }
+        CodebaseMode::Copy | CodebaseMode::Fresh => {
+            println!(
+                "{} {}",
+                ui_heading("finish:"),
+                ui_command(format!("deadreckon export {}", run_prefix(&state.run_id)))
+            );
+            materialize_completed_run(&paths, &state, dest, force, include_manifest)
+                .map(|materialized| print_materialized(&materialized))
+        }
+        CodebaseMode::InPlace => {
+            println!(
+                "{} {}",
+                ui_ok("finished in-place run"),
+                ui_id(&state.run_id)
+            );
+            println!("  working: {}", state.working_dir.display());
+            println!(
+                "  review:  {}",
+                ui_command(format!("deadreckon show {}", run_prefix(&state.run_id)))
+            );
+            println!(
+                "  docs:    {}",
+                ui_command(format!("deadreckon doc {}", run_prefix(&state.run_id)))
+            );
+            println!(
+                "  undo:    {}",
+                ui_command(format!(
+                    "deadreckon undo --run {}",
+                    run_prefix(&state.run_id)
+                ))
+            );
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug)]
 struct MaterializedRun {
     run_id: String,
@@ -6637,9 +7165,9 @@ fn next_action_label(state: &deadreckon_core::PipelineState) -> String {
             .map(|record| record.mode)
             .unwrap_or(CodebaseMode::Fresh)
         {
-            CodebaseMode::Worktree => "apply".to_string(),
-            CodebaseMode::Copy | CodebaseMode::Fresh => "export".to_string(),
-            CodebaseMode::InPlace => "review".to_string(),
+            CodebaseMode::Worktree => "finish (apply)".to_string(),
+            CodebaseMode::Copy | CodebaseMode::Fresh => "finish (export)".to_string(),
+            CodebaseMode::InPlace => "finish (review)".to_string(),
         },
     }
 }
@@ -7529,6 +8057,13 @@ fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
         && record.mode == CodebaseMode::Worktree
     {
         println!("{}", ui_heading("next actions:"));
+        println!(
+            "  finish:  {}",
+            ui_command(format!(
+                "deadreckon finish {} --autostash --cleanup",
+                run_prefix(&state.run_id)
+            ))
+        );
         if let Some(worktree) = record.worktree_path.as_ref() {
             println!("  inspect: cd {} && git status", worktree.display());
         }
@@ -7555,6 +8090,14 @@ fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
     }
     let task_prefix = state.task_key.chars().take(24).collect::<String>();
     println!("{}", ui_heading("next actions:"));
+    println!(
+        "  finish: {}",
+        ui_command(format!(
+            "deadreckon finish {} --dest ./{}",
+            run_prefix(&state.run_id),
+            task_prefix
+        ))
+    );
     println!(
         "  export: {}",
         ui_command(format!(

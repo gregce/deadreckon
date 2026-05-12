@@ -27,7 +27,7 @@ Source lives under `/Users/gdc/deadreckon/`:
 - `crates/deadreckon-core`: run paths, phase machine, JSON state, codebase mode records, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports.
 - `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, OpenAI-compatible, `cli:claude-code`, `cli:codex`, and explicit `--smoke` scripted adapters, fallback routing, spend estimates.
 - `crates/deadreckon-sandbox`: `sandbox-exec`, `bwrap`, `docker`, and `none` backends using `tokio::process::Command`; default `auto`.
-- `crates/deadreckon`: clap CLI, ratatui attach UI, init/config/run/status/list/doc/attach/kill/resume/undo/show/import/materialize/export/apply/abandon/discard/cleanup/extend/doctor.
+- `crates/deadreckon`: clap CLI, ratatui attach UI, init/setup, config/settings, run, status/next, list/runs, doc/docs, attach/watch, kill/stop, resume/continue, undo/restore, show/inspect, import, materialize/export, finish/done, apply/keep, abandon/discard, cleanup/prune, extend/follow-up, library/artifacts, chain, and doctor/check.
 - `skills/default-coding/SKILL.md`: Markdown skill loaded at runtime.
 - `tests/`: workspace integration tests.
 
@@ -69,15 +69,18 @@ The default skill is Markdown and external to the binary. The binary loads it an
 
 Completed artifacts are promoted into `/Users/gdc/.deadreckon/library/<scope>/<run-id>/`.
 Worktree runs keep their `dr/...` branch available for review and finish with
-`deadreckon apply <run-id>` or `deadreckon abandon <run-id>`. `discard` is a
-friendlier alias for `abandon`. `apply` supports squash, merge, and cherry-pick
-strategies; `abandon` removes the worktree and, unless `--keep-branch` is used,
-the temporary branch.
+`deadreckon finish <run-id>`, `deadreckon apply <run-id>`, or
+`deadreckon abandon <run-id>`. `done` aliases `finish`, `keep` aliases `apply`,
+and `discard` aliases `abandon`. `apply` supports squash, merge, and
+cherry-pick strategies; `abandon` removes the worktree and, unless
+`--keep-branch` is used, the temporary branch.
 
 Copy and fresh runs use `deadreckon materialize <run-id> --dest <path>` or the
 `deadreckon export <run-id> --dest <path>` alias to copy the library artifact to
-a user-owned path, write `.deadreckon/parent.json`, and record the reverse
-`.materialized-to` marker in the library. `deadreckon extend
+a user-owned path. `deadreckon finish <run-id> --dest <path>` routes to the same
+export behavior for copy/fresh runs. These commands write
+`.deadreckon/parent.json` and record the reverse `.materialized-to` marker in
+the library. `deadreckon extend
 <run-id> "follow-up goal"` preserves the parent's mode semantics: worktree
 parents create a child `dr/...` branch off the parent branch, copy/fresh parents
 seed a new working tree from the parent library, and in-place parents refuse with

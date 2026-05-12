@@ -15,6 +15,7 @@ deadreckon run "replace the legacy billing flow with Stripe Checkout"
 deadreckon attach latest
 deadreckon status
 deadreckon doc latest
+deadreckon finish latest
 deadreckon apply latest --autostash --cleanup
 ```
 
@@ -226,6 +227,7 @@ deadreckon kill latest
 deadreckon resume latest
 deadreckon resume latest --from-turn 2
 deadreckon extend latest "add tests and polish the UI"
+deadreckon finish latest
 deadreckon export latest --dest ./finished-project
 deadreckon cleanup --completed
 ```
@@ -437,7 +439,9 @@ status/next   show the current project's latest run and next action
 list          show current-project runs by default; --all shows every scope
 show          inspect state, lineage, spend, files
 doc           print or export run documentation
+finish/done   choose apply or export from the completed run mode
 apply         apply a completed worktree run to your branch
+keep          alias for apply
 abandon       remove a worktree run and temporary branch
 discard       alias for abandon
 materialize   copy a completed artifact to a normal directory
@@ -445,8 +449,11 @@ export        alias for materialize
 cleanup       clean abandoned, stale, or completed worktrees
 prune         alias for cleanup
 extend        continue from a completed run
+follow-up     alias for extend
 resume        continue an interrupted run
+continue      alias for resume
 kill          stop a live run and child processes
+stop          alias for kill
 undo          restore a previous turn snapshot
 import        normalize histories from other coding tools
 doctor        check config, providers, sandboxes, disk, runtime

@@ -146,6 +146,7 @@ After `init`, the normal path in a git repo is:
 deadreckon run "make a full task productivity tracker in nodejs that allows me to manage my day"
 deadreckon attach latest
 deadreckon status
+deadreckon finish latest
 deadreckon apply latest --autostash --cleanup
 ```
 
@@ -277,9 +278,17 @@ completed artifact, `d` to read `RUN-NARRATIVE.md`, or `s` to inspect state and 
 The CLI aliases use friendlier lifecycle names:
 
 ```bash
+deadreckon finish latest                            # choose apply or export from run mode
+deadreckon done latest                              # alias for finish
 deadreckon export latest --dest ./finished-project   # alias for materialize
+deadreckon keep latest --autostash --cleanup         # alias for apply
 deadreckon discard latest                            # alias for abandon
 deadreckon next                                      # alias for status
+deadreckon watch latest                              # alias for attach
+deadreckon stop latest                               # alias for kill
+deadreckon continue latest                           # alias for resume
+deadreckon inspect latest                            # alias for show
+deadreckon docs latest                               # alias for doc
 deadreckon prune --completed                         # alias for cleanup
 ```
 
@@ -300,11 +309,16 @@ deadreckon status
 deadreckon next
 deadreckon show <run-id>
 deadreckon show latest
+deadreckon inspect latest
+deadreckon finish latest
+deadreckon finish latest --dest ./finished-project
+deadreckon finish latest --autostash --cleanup
 deadreckon apply <run-id>
 deadreckon apply <run-id> --autostash
 deadreckon apply <run-id> --cleanup --no-confirm
 deadreckon apply <run-id> --strategy merge
 deadreckon apply <run-id> --strategy cherry-pick --no-confirm
+deadreckon keep <run-id> --autostash --cleanup
 deadreckon abandon <run-id>
 deadreckon discard <run-id>
 deadreckon abandon <run-id> --keep-branch
@@ -313,11 +327,17 @@ deadreckon cleanup --stale --force
 deadreckon cleanup --all --completed --no-confirm
 deadreckon prune --completed
 deadreckon kill <run-id>
+deadreckon stop <run-id>
 deadreckon kill <run-id> --force
 deadreckon resume <run-id>
+deadreckon continue <run-id>
 deadreckon resume <run-id> --from-turn 2
 deadreckon resume <run-id> --max-wall-seconds 3600
 ```
+
+`finish` is the easiest completion command. For a worktree run it routes to
+`apply`; for a fresh/copy run it routes to `export`; for an in-place run it
+prints review, docs, and undo guidance.
 
 Re-running `deadreckon apply <run-id>` after the changes are already on the
 target branch is safe: deadreckon reports `already applied` instead of creating
