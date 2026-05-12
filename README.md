@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/deadreckon-wordmark.png" alt="deadreckon logo" width="640">
+</p>
+
 # deadreckon
 
 **The control plane for unattended agentic coding CLIs.**
