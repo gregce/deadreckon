@@ -14,6 +14,8 @@ pub const DEFAULT_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockState {
+    /// Scoped owner key. Normal runs use a task key; chain conductors use the
+    /// reserved `chain--<chain-id>` prefix while keeping the same lock format.
     pub task_key: String,
     pub run_id: String,
     pub scope: String,

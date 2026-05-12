@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod cancel;
+pub mod chain;
 pub mod codebase;
 pub mod docs;
 pub mod error;
@@ -21,6 +22,13 @@ pub use artifacts::{
 pub use cancel::{
     CANCEL_MARKER, CancelMarker, cancel_marker_path, cancel_marker_path_for_run_root,
     cancel_marker_present, clear_cancel_marker, write_cancel_marker,
+};
+pub use chain::{
+    ApplyMode, ApplyStrategy, BranchPolicy, CHAIN_EVENTS_JSONL, CHAIN_JSON, CHAIN_LOCK_PREFIX,
+    CHAIN_STEP_JSON, Chain, ChainEvent, ChainEventKind, ChainNewOptions, ChainStatus, ChainStep,
+    ChainStepMarker, ChainStepStatus, ConductorState, OnFail, append_chain_event, chain_json_path,
+    chain_task_key, load_chain, read_chain_step_marker, save_chain, validate_goal_count,
+    write_chain_step_marker,
 };
 pub use codebase::{
     CODEBASE_RECORD_PATH, CodebaseMode, CodebaseRecord, ModeFlags, PreviewGitState, ResolvedMode,

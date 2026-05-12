@@ -59,6 +59,26 @@ impl DeadreckonPaths {
         self.home.join("locks")
     }
 
+    pub fn chains_dir(&self) -> PathBuf {
+        self.home.join("chains")
+    }
+
+    pub fn chain_dir(&self, chain_id: &str) -> PathBuf {
+        self.chains_dir().join(chain_id)
+    }
+
+    pub fn chain_json(&self, chain_id: &str) -> PathBuf {
+        self.chain_dir(chain_id).join("chain.json")
+    }
+
+    pub fn chain_events(&self, chain_id: &str) -> PathBuf {
+        self.chain_dir(chain_id).join("chain-events.jsonl")
+    }
+
+    pub fn conductor_json(&self, chain_id: &str) -> PathBuf {
+        self.chain_dir(chain_id).join("conductor.json")
+    }
+
     pub fn library_dir(&self, scope: &str, run_id: &str) -> PathBuf {
         self.home.join("library").join(scope).join(run_id)
     }

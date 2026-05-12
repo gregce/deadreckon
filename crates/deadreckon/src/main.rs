@@ -6168,6 +6168,9 @@ fn event_line(event: &RunEvent, show_cost: bool) -> String {
         deadreckon_core::RunEventKind::RunCompleted { status } => {
             format!("run {status}")
         }
+        deadreckon_core::RunEventKind::RunPromoted { library_dir } => {
+            format!("promoted {}", library_dir.display())
+        }
         deadreckon_core::RunEventKind::Error { turn, message } => {
             format!("turn {} error {message}", turn.unwrap_or_default())
         }

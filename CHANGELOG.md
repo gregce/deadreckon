@@ -1,5 +1,9 @@
 # Changelog
 
+## Autonomous chaining (alpha) — 2026-05-11
+
+- Added the chain data model foundation: `chain.json`, `chain-events.jsonl`, chain path helpers, chain lock task-key convention, and `RunPromoted` events after promotion.
+
 ## Hardening v2 (alpha) — 2026-05-11
 
 - Added `docs/AUDIT-2026-05-11.md` mapping the original 25 unmet needs to current evidence and the P2-P10 closure plan.

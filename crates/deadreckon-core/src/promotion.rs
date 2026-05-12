@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifacts::copy_tree;
 use crate::error::{DeadreckonError, IoContext, Result};
+use crate::events::{RunEventKind, emit_event};
 use crate::gate::validate_acceptance_marker;
 use crate::paths::DeadreckonPaths;
 use crate::state::{PipelineState, save_state};
@@ -63,6 +64,13 @@ pub fn promote_completed_run(
     fs::rename(&staging, &library_dir).with_path(&staging)?;
     state.working_dir = library_dir.clone();
     state.promoted_library_dir = Some(library_dir.clone());
+    emit_event(
+        state,
+        None,
+        RunEventKind::RunPromoted {
+            library_dir: library_dir.clone(),
+        },
+    )?;
     save_state(state)?;
     Ok(library_dir)
 }
