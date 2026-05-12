@@ -4,32 +4,24 @@ use clap::{Parser, Subcommand, ValueEnum};
 use deadreckon_core::DocKind;
 
 const TOP_LEVEL_HELP: &str = "\
-Lifecycle:
-  1. Setup once:
-       deadreckon init
-       deadreckon doctor
-       deadreckon config provider
-       deadreckon acceptance setup
-  2. Start and watch work:
-       deadreckon run \"build the thing\"
-       deadreckon attach latest
-       deadreckon next
-  3. Finish completed work:
-       deadreckon finish latest
-       deadreckon apply latest --autostash --cleanup
-       deadreckon export latest --dest ./finished-project
-  4. Continue or recover:
-       deadreckon extend latest \"add tests\"
-       deadreckon resume latest
-       deadreckon cleanup --completed
+Core lifecycle:
+  deadreckon init
+  deadreckon doctor
+  deadreckon done \"builds, tests pass, and opens in a browser\"
+  deadreckon run \"build the thing\"
+  deadreckon attach latest
+  deadreckon status
+  deadreckon finish latest
 
-Command groups:
-  Setup: init/setup, config/settings, doctor/check
-  Acceptance: acceptance
-  Run Lifecycle: run, attach/watch, status/next, list/runs, kill/stop, resume/continue
-  Completed Run Actions: finish, apply/keep, materialize/export, extend/follow-up, doc/docs, library/artifacts
-  Cleanup And Recovery: abandon/discard, cleanup/prune, undo/restore
-  Inspect And Import: show/inspect, import
+Continue or recover:
+  deadreckon extend latest \"add tests\"
+  deadreckon resume latest
+  deadreckon kill latest
+  deadreckon cleanup --completed
+
+More help:
+  deadreckon help-all
+  deadreckon <command> --help
 
 Run ids accept unique prefixes. `latest` means the newest run for the current project.";
 
@@ -67,18 +59,35 @@ Common provider/model changes:
   deadreckon config provider cli:codex
   deadreckon config model gpt-5.1-codex --provider cli:codex
 
-Acceptance:
-  deadreckon acceptance setup \"build, test, and open in a browser\"
-  deadreckon acceptance add browser
-  deadreckon acceptance init --preset node
-  deadreckon acceptance draft \"what should count as done\"
-  deadreckon run \"goal\" --acceptance .deadreckon/acceptance.yaml
+Done criteria:
+  deadreckon done \"build, test, and open in a browser\"
+  deadreckon done add \"users can save drawings\"
+  deadreckon done check
+  deadreckon done show
 
 Modes:
   In a git repo, the default is an isolated worktree.
   Use `--fresh`, `--from <dir>`, `--worktree`, or `--in-place --i-know-its-a-lot` to force a mode.";
 
+const DONE_HELP: &str = "\
+Lifecycle:
+  deadreckon done \"builds, opens in a browser, and has no console errors\"
+  deadreckon run \"finish the app\"
+
+Common actions:
+  deadreckon done \"plain-English definition of done\"
+  deadreckon done add \"one more thing that must be true\"
+  deadreckon done add browser
+  deadreckon done check
+  deadreckon done show
+
+What it means:
+  Write done criteria in English. deadreckon compiles them into checks for dr-gate.
+  `deadreckon run` and `deadreckon chain run` prompt for this when criteria are missing.";
+
 const ACCEPTANCE_HELP: &str = "\
+Advanced compatibility command. Most users should use `deadreckon done`.
+
 Subcommands:
   deadreckon acceptance setup
   deadreckon acceptance setup \"build, load in a browser, and show no console errors\"
@@ -318,13 +327,52 @@ pub(crate) enum Commands {
         command: ConfigCommand,
     },
     #[command(
+        next_help_heading = "Setup",
+        visible_alias = "commands",
+        about = "Show every command, including advanced commands",
+        after_help = "Lifecycle:\n  deadreckon help-all\n  deadreckon <command> --help"
+    )]
+    HelpAll,
+    #[command(
         next_help_heading = "Acceptance",
+        hide = true,
         about = "Create, refine, explain, and check project acceptance criteria",
         after_help = ACCEPTANCE_HELP
     )]
     Acceptance {
         #[command(subcommand)]
         command: AcceptanceCommand,
+    },
+    #[command(
+        next_help_heading = "Done Criteria",
+        about = "Write, add, show, and check done criteria in English",
+        after_help = DONE_HELP
+    )]
+    Done {
+        #[arg(
+            value_name = "TEXT_OR_COMMAND",
+            num_args = 0..,
+            help = "Plain-English criteria, or add/check/show"
+        )]
+        args: Vec<String>,
+        #[arg(long, help = "Provider route override for drafting")]
+        provider: Option<String>,
+        #[arg(long, help = "Model override for drafting")]
+        model: Option<String>,
+        #[arg(long, help = "Overwrite generated criteria/helper files")]
+        force: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Compiled criteria file to show/check"
+        )]
+        spec: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Working directory to check; defaults to current directory"
+        )]
+        against: Option<PathBuf>,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -526,6 +574,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
+        hide = true,
         visible_alias = "artifacts",
         about = "Inspect promoted run artifacts in the deadreckon library",
         after_help = LIBRARY_HELP
@@ -536,7 +585,6 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
-        visible_alias = "done",
         about = "Route a completed run to the right finish action",
         after_help = FINISH_HELP
     )]
@@ -574,6 +622,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
+        hide = true,
         visible_aliases = ["export", "copy-out"],
         about = "Copy a completed fresh/copy run into a chosen directory",
         after_help = MATERIALIZE_HELP
@@ -590,6 +639,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
+        hide = true,
         visible_alias = "keep",
         about = "Merge a completed worktree run back into the source checkout",
         after_help = APPLY_HELP
@@ -622,6 +672,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Cleanup And Recovery",
+        hide = true,
         visible_alias = "discard",
         about = "Remove a run's temporary worktree and branch",
         after_help = ABANDON_HELP
@@ -690,6 +741,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
+        hide = true,
         visible_alias = "docs",
         about = "Print or regenerate generated run documentation",
         after_help = DOC_HELP
@@ -754,6 +806,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Cleanup And Recovery",
+        hide = true,
         visible_alias = "restore",
         about = "Restore an in-place run snapshot",
         after_help = UNDO_HELP
@@ -769,6 +822,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Inspect And Import",
+        hide = true,
         visible_alias = "inspect",
         about = "Show full state, provenance, and trace details for a run",
         after_help = SHOW_HELP
@@ -796,6 +850,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Inspect And Import",
+        hide = true,
         about = "Import read-only history from another coding tool",
         after_help = IMPORT_HELP
     )]

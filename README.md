@@ -163,7 +163,7 @@ deadreckon undo --run <run-id> --turn 3
 
 This is not just `git reset`. It works against the run's own snapshot trail and records the undo in the run trace.
 
-### Signed Acceptance Gates
+### Signed Done Criteria
 
 The agent cannot declare its own work accepted.
 
@@ -172,9 +172,9 @@ Completion requires a marker written by the separate `dr-gate` binary and bound 
 Default acceptance checks that the working directory exists and runs `cargo test` when `Cargo.toml` is present. For real work, write the definition of done in English and let deadreckon compile it into the `dr-gate` format:
 
 ```bash
-deadreckon acceptance setup "build, load in a browser, and show no console errors"
-deadreckon acceptance add browser
-deadreckon acceptance check
+deadreckon done "build, load in a browser, and show no console errors"
+deadreckon done add "users can save drawings"
+deadreckon done check
 deadreckon run "finish the app"
 ```
 
@@ -426,7 +426,7 @@ deadreckon is not a replacement for agentic CLIs like Amp, Rovo Dev, Cursor CLI,
 | Undo | Usually git-level or manual | Snapshots every turn and restores a specific turn with `deadreckon undo` |
 | Provenance | Conversation history may not map cleanly to file changes | Records model/tool/file linkage in `provenance.jsonl` |
 | Observability | Tool logs are tool-specific | Writes normalized `events.jsonl`, `traces.jsonl`, spend, docs, and run state |
-| Acceptance | The agent may declare itself done | Requires a signed `dr-gate` marker before promotion |
+| Done criteria | The agent may declare itself done | Requires a signed `dr-gate` marker before promotion |
 | Applying work | Patch review/apply flow is tool-specific | `apply`, `discard`, `export`, `extend`, and `cleanup` are first-class lifecycle actions |
 | Multi-run coordination | Usually left to the operator | Scope/task locks prevent conflicting same-task runs |
 
@@ -443,7 +443,7 @@ status/next   show the current project's latest run and next action
 list          show current-project runs by default; --all shows every scope
 show          inspect state, lineage, spend, files
 doc           print or export run documentation
-finish/done   choose apply or export from the completed run mode
+finish        choose apply or export from the completed run mode
 apply         apply a completed worktree run to your branch
 keep          alias for apply
 abandon       remove a worktree run and temporary branch

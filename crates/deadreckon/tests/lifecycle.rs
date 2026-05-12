@@ -744,10 +744,13 @@ fn help_lists_lifecycle_verbs() {
     let output = deadreckon(&paths).arg("--help").output().expect("help");
     assert_success(&output);
     let stdout = stdout(&output);
-    assert!(stdout.contains("Lifecycle:"));
+    assert!(stdout.contains("Core lifecycle:"));
+    assert!(stdout.contains("done \""));
     assert!(stdout.contains("finish latest"));
     assert!(stdout.contains("status"));
     assert!(stdout.contains("cleanup"));
+    assert!(stdout.contains("help-all"));
+    assert!(!stdout.contains("acceptance"));
     assert!(stdout.contains("Run ids accept unique prefixes"));
 }
 
@@ -758,11 +761,10 @@ fn help_groups_verbs_by_lifecycle_stage() {
     let output = deadreckon(&paths).arg("--help").output().expect("help");
     assert_success(&output);
     let stdout = stdout(&output);
-    assert!(stdout.contains("Setup"));
-    assert!(stdout.contains("Run Lifecycle"));
-    assert!(stdout.contains("Completed Run Actions"));
-    assert!(stdout.contains("Cleanup And Recovery"));
-    assert!(stdout.contains("Inspect And Import"));
+    assert!(stdout.contains("Core lifecycle:"));
+    assert!(stdout.contains("Continue or recover:"));
+    assert!(stdout.contains("More help:"));
+    assert!(!stdout.contains("Inspect And Import"));
 }
 
 #[test]
@@ -772,6 +774,8 @@ fn every_top_level_help_shows_lifecycle_usage() {
     for command in [
         "init",
         "config",
+        "help-all",
+        "done",
         "acceptance",
         "run",
         "chain",
@@ -805,6 +809,66 @@ fn every_top_level_help_shows_lifecycle_usage() {
             "{command} help did not include lifecycle guidance:\n{stdout}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_plain_english_uses_configured_provider() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("done-app");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(workspace.join("README.md"), "done app").expect("readme");
+    let response = json!({
+        "acceptance_yaml": "name: done\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        "acceptance_md": "# Done Criteria\n\nREADME must exist."
+    })
+    .to_string();
+    let server = MockServer::start(vec![FixtureResponse {
+        content: response,
+        prompt_tokens: 20,
+        completion_tokens: 20,
+    }])
+    .await;
+    write_config(paths.home(), &server.base_url());
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args(["done", "README exists", "--provider", "mock"])
+        .output()
+        .expect("done");
+
+    assert_success(&output);
+    assert!(stdout(&output).contains("done criteria configured"));
+    assert!(workspace.join(".deadreckon/acceptance.yaml").exists());
+}
+
+#[test]
+fn done_check_and_show_are_user_facing() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("done-check-app");
+    fs::create_dir_all(workspace.join(".deadreckon")).expect("workspace");
+    fs::write(
+        workspace.join(".deadreckon/acceptance.yaml"),
+        "name: check\nchecks:\n  - kind: shell\n    command: \"test -d .\"\n    cwd: \"{working_dir}\"\n",
+    )
+    .expect("yaml");
+
+    let check = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args(["done", "check"])
+        .output()
+        .expect("done check");
+    assert_success(&check);
+    assert!(stdout(&check).contains("done criteria passed"));
+
+    let show = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args(["done", "show"])
+        .output()
+        .expect("done show");
+    assert_success(&show);
+    assert!(stdout(&show).contains("done criteria"));
 }
 
 #[test]
@@ -911,7 +975,7 @@ fn acceptance_check_dry_runs_project_spec() {
         .expect("acceptance check");
 
     assert_success(&output);
-    assert!(stdout(&output).contains("acceptance check passed"));
+    assert!(stdout(&output).contains("done criteria passed"));
 }
 
 #[test]
@@ -1005,7 +1069,7 @@ fn acceptance_check_reports_shell_failure_output() {
         .expect("acceptance check");
 
     assert!(!output.status.success());
-    assert!(stdout(&output).contains("acceptance check failed"));
+    assert!(stdout(&output).contains("done criteria failed"));
     assert!(stdout(&output).contains("helpful failure"));
 }
 
