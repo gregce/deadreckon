@@ -792,6 +792,59 @@ fn chain_pause_refuses_when_status_not_running_with_try() {
 }
 
 #[test]
+fn chain_kill_cascade_terminates_inner_run_and_conductor_under_5s() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let fake_codex = temp.path().join("fake-codex-sleep");
+    write_sleeping_cli(&fake_codex);
+    write_cli_codex_config(&paths, &fake_codex);
+
+    let launch = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--detach",
+            "--provider",
+            "slow-codex",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "2",
+            "slow one",
+            "slow two",
+        ])
+        .output()
+        .expect("launch");
+    assert_success(&launch);
+    let chain_id = newest_chain(&paths).chain_id;
+    let (run_id, conductor_pid, child_pid) = wait_for_live_conductor(&paths, &chain_id);
+
+    let started = std::time::Instant::now();
+    let kill = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "kill", "latest"])
+        .output()
+        .expect("kill");
+
+    assert_success(&kill);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "chain kill took {:?}",
+        started.elapsed()
+    );
+    let chain = load_chain(&paths, &chain_id).expect("chain");
+    assert_eq!(chain.status, ChainStatus::Killed);
+    let run = deadreckon_core::load_run(&paths, &run_id).expect("run");
+    assert_eq!(run.status, deadreckon_core::RunStatus::Killed);
+    wait_until_pid_dead(conductor_pid);
+    wait_until_pid_dead(child_pid);
+    assert!(!deadreckon_core::pid_is_alive(conductor_pid));
+    assert!(!deadreckon_core::pid_is_alive(child_pid));
+}
+
+#[test]
 fn chain_hooks_list_emits_resolution_tiers() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -948,6 +1001,85 @@ fn write_hook(repo: &std::path::Path, name: &str, body: &str) {
     }
     git(repo, &["add", ".deadreckon/hooks/chain"]).expect("add hook");
     git(repo, &["commit", "-m", &format!("add {name} hook")]).expect("commit hook");
+}
+
+fn write_sleeping_cli(path: &std::path::Path) {
+    fs::write(
+        path,
+        r#"#!/bin/sh
+trap 'kill "$child" 2>/dev/null; exit 143' TERM INT
+sleep 60 &
+child=$!
+wait "$child"
+"#,
+    )
+    .expect("fake cli");
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("permissions");
+    }
+}
+
+fn write_cli_codex_config(paths: &DeadreckonPaths, binary: &std::path::Path) {
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(
+        paths.config_path(),
+        format!(
+            r#"
+fallback = ["slow-codex"]
+
+[providers.slow-codex]
+kind = "cli-codex"
+binary = "{}"
+model = "cli:codex"
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
+"#,
+            binary.display()
+        ),
+    )
+    .expect("config");
+}
+
+fn wait_for_live_conductor(paths: &DeadreckonPaths, chain_id: &str) -> (String, u32, u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(raw) = fs::read_to_string(paths.conductor_json(chain_id))
+            && let Ok(value) = serde_json::from_str::<Value>(&raw)
+        {
+            let run_id = value
+                .get("live_run_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let conductor_pid = value
+                .get("conductor_pid")
+                .and_then(Value::as_u64)
+                .map(|pid| pid as u32);
+            let child_pid = value
+                .get("live_child_pid")
+                .and_then(Value::as_u64)
+                .map(|pid| pid as u32);
+            if let (Some(run_id), Some(conductor_pid), Some(child_pid)) =
+                (run_id, conductor_pid, child_pid)
+            {
+                return (run_id, conductor_pid, child_pid);
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for live conductor"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn wait_until_pid_dead(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while deadreckon_core::pid_is_alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn newest_chain(paths: &DeadreckonPaths) -> Chain {

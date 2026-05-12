@@ -257,8 +257,12 @@ pub struct ConductorState {
     pub chain_id: String,
     pub conductor_pid: u32,
     pub started_at: DateTime<Utc>,
+    #[serde(default)]
     pub live_step: Option<u32>,
+    #[serde(default)]
     pub live_run_id: Option<String>,
+    #[serde(default)]
+    pub live_child_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

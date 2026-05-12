@@ -1758,6 +1758,7 @@ async fn run_chain_conductor(
         started_at: Utc::now(),
         live_step: None,
         live_run_id: None,
+        live_child_pid: None,
     };
     fs::create_dir_all(paths.chain_dir(&chain.chain_id))?;
     fs::write(
@@ -1825,7 +1826,9 @@ async fn run_chain_conductor(
             json!({ "goal": chain.steps[index].goal, "base": base_ref, "max_spend": step_cap }),
         )?;
         save_chain(paths, &chain)?;
-        let run_id = match run_chain_step(&chain, index, &base_ref, step_cap, options.quiet).await {
+        let run_id = match run_chain_step(paths, &chain, index, &base_ref, step_cap, options.quiet)
+            .await
+        {
             Ok(run_id) => run_id,
             Err(err) => {
                 completed = handle_chain_step_failure(paths, &mut chain, index, err.to_string())?;
@@ -1976,6 +1979,7 @@ async fn run_chain_conductor(
 }
 
 async fn run_chain_step(
+    paths: &DeadreckonPaths,
     chain: &Chain,
     index: usize,
     base_ref: &str,
@@ -2009,24 +2013,133 @@ async fn run_chain_step(
     if let Some(step_cap) = step_cap {
         command.arg("--max-spend").arg(format!("{step_cap:.6}"));
     }
-    let output = command.output()?;
-    if !quiet {
-        io::stdout().write_all(&output.stdout)?;
-        io::stderr().write_all(&output.stderr)?;
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    let child_pid = child.id();
+    update_conductor_live(paths, chain, Some(index as u32), None, Some(child_pid))?;
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "failed to capture chain step stdout".to_string(),
+        ))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "failed to capture chain step stderr".to_string(),
+        ))
+    })?;
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let stdout_thread = spawn_chain_step_reader(stdout, true, tx.clone());
+    let stderr_thread = spawn_chain_step_reader(stderr, false, tx);
+    let mut stdout_text = String::new();
+    let mut stderr_text = String::new();
+    let mut live_run_id: Option<String> = None;
+    let status = loop {
+        while let Ok((is_stdout, line)) = rx.try_recv() {
+            if let Some(run_id) = capture_chain_step_output(
+                is_stdout,
+                &line,
+                &mut stdout_text,
+                &mut stderr_text,
+                quiet,
+            )? && live_run_id.as_deref() != Some(run_id.as_str())
+            {
+                update_conductor_live(
+                    paths,
+                    chain,
+                    Some(index as u32),
+                    Some(run_id.clone()),
+                    Some(child_pid),
+                )?;
+                live_run_id = Some(run_id);
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    while let Ok((is_stdout, line)) = rx.try_recv() {
+        if let Some(run_id) =
+            capture_chain_step_output(is_stdout, &line, &mut stdout_text, &mut stderr_text, quiet)?
+            && live_run_id.as_deref() != Some(run_id.as_str())
+        {
+            update_conductor_live(
+                paths,
+                chain,
+                Some(index as u32),
+                Some(run_id.clone()),
+                Some(child_pid),
+            )?;
+            live_run_id = Some(run_id);
+        }
     }
-    if !output.status.success() {
+    update_conductor_live(paths, chain, None, None, None)?;
+    if !status.success() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
             "step {} run failed: {}{}",
             index + 1,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            stdout_text,
+            stderr_text
         ))));
     }
-    parse_started_run_id(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
-        CliError::Core(DeadreckonError::InvalidInput(
-            "could not find inner run id in run output\ntry: deadreckon list".to_string(),
-        ))
+    live_run_id
+        .or_else(|| parse_started_run_id(&stdout_text))
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "could not find inner run id in run output\ntry: deadreckon list".to_string(),
+            ))
+        })
+}
+
+fn spawn_chain_step_reader<R: Read + Send + 'static>(
+    reader: R,
+    is_stdout: bool,
+    tx: std::sync::mpsc::Sender<(bool, String)>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = io::BufReader::new(reader);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send((is_stdout, line)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
     })
+}
+
+fn capture_chain_step_output(
+    is_stdout: bool,
+    line: &str,
+    stdout_text: &mut String,
+    stderr_text: &mut String,
+    quiet: bool,
+) -> Result<Option<String>> {
+    if is_stdout {
+        stdout_text.push_str(line);
+        if !quiet {
+            print!("{line}");
+            io::stdout().flush()?;
+        }
+        Ok(parse_started_run_id(stdout_text))
+    } else {
+        stderr_text.push_str(line);
+        if !quiet {
+            eprint!("{line}");
+            io::stderr().flush()?;
+        }
+        Ok(None)
+    }
 }
 
 fn auto_apply_chain_step(
@@ -2254,6 +2367,47 @@ fn detach_chain_conductor(
     Ok(())
 }
 
+fn read_conductor_state(paths: &DeadreckonPaths, chain_id: &str) -> Result<Option<ConductorState>> {
+    let path = paths.conductor_json(chain_id);
+    match fs::read(&path) {
+        Ok(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Io(source)),
+    }
+}
+
+fn write_conductor_state(paths: &DeadreckonPaths, state: &ConductorState) -> Result<()> {
+    let path = paths.conductor_json(&state.chain_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(state)?)?;
+    Ok(())
+}
+
+fn update_conductor_live(
+    paths: &DeadreckonPaths,
+    chain: &Chain,
+    live_step: Option<u32>,
+    live_run_id: Option<String>,
+    live_child_pid: Option<u32>,
+) -> Result<()> {
+    let mut conductor =
+        read_conductor_state(paths, &chain.chain_id)?.unwrap_or_else(|| ConductorState {
+            schema_version: 1,
+            chain_id: chain.chain_id.clone(),
+            conductor_pid: chain.conductor_pid.unwrap_or_else(std::process::id),
+            started_at: chain.started_at.unwrap_or_else(Utc::now),
+            live_step: None,
+            live_run_id: None,
+            live_child_pid: None,
+        });
+    conductor.live_step = live_step;
+    conductor.live_run_id = live_run_id;
+    conductor.live_child_pid = live_child_pid;
+    write_conductor_state(paths, &conductor)
+}
+
 fn invoke_chain_hook(
     paths: &DeadreckonPaths,
     chain: &Chain,
@@ -2450,12 +2604,61 @@ fn chain_pause_command(paths: &DeadreckonPaths, id: &str, reason: Option<String>
 fn chain_kill_command(paths: &DeadreckonPaths, id: &str, force: bool) -> Result<()> {
     let id = resolve_chain_id(paths, id, false)?;
     let mut chain = load_chain(paths, &id)?;
-    if let Some(pid) = chain.conductor_pid {
+    let conductor = read_conductor_state(paths, &id)?;
+    let mut signaled_pids = BTreeSet::new();
+    if let Some(run_id) = conductor
+        .as_ref()
+        .and_then(|state| state.live_run_id.as_deref())
+        .map(ToString::to_string)
+        .or_else(|| {
+            chain
+                .steps
+                .iter()
+                .find(|step| step.status == ChainStepStatus::Running)
+                .and_then(|step| step.run_id.clone())
+        })
+        && let Ok(mut state) = load_run(paths, &run_id)
+    {
+        kill_loaded_run(paths, &mut state, force)?;
+        signaled_pids.extend(supervised_pids(&state));
+    }
+    if let Some(pid) = conductor.as_ref().and_then(|state| state.live_child_pid) {
         terminate_pid(pid, force)?;
+        signaled_pids.insert(pid);
+    }
+    if let Some(pid) = conductor
+        .as_ref()
+        .map(|state| state.conductor_pid)
+        .or(chain.conductor_pid)
+        && pid != std::process::id()
+    {
+        terminate_pid(pid, force)?;
+        signaled_pids.insert(pid);
+    }
+    if !force {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while signaled_pids
+            .iter()
+            .any(|pid| *pid != std::process::id() && pid_is_alive(*pid))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        for pid in &signaled_pids {
+            if *pid != std::process::id() && pid_is_alive(*pid) {
+                terminate_pid(*pid, true)?;
+            }
+        }
     }
     chain.status = ChainStatus::Killed;
     chain.failure_reason = Some("killed by user".to_string());
     chain.conductor_pid = None;
+    for step in &mut chain.steps {
+        if step.status == ChainStepStatus::Running {
+            step.status = ChainStepStatus::Failed;
+            step.fail_reason = Some("killed by user".to_string());
+        }
+    }
     save_chain(paths, &chain)?;
     append_chain_event(
         paths,
@@ -2464,6 +2667,7 @@ fn chain_kill_command(paths: &DeadreckonPaths, id: &str, force: bool) -> Result<
         None,
         json!({ "force": force }),
     )?;
+    let _ = fs::remove_file(paths.conductor_json(&chain.chain_id));
     println!("killed {}", chain_prefix(&chain.chain_id));
     Ok(())
 }
@@ -3357,7 +3561,6 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         copy_source_to_working(source_path, &state.working_dir)?;
         deadreckon_core::write_codebase_record(&state.working_dir, &codebase)?;
     }
-    print_run_started(&state, selected_route.as_ref());
     let mut lock = acquire_lock(
         &paths,
         &state.task_key,
@@ -3375,6 +3578,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
+    print_run_started(&state, selected_route.as_ref());
     let outcome = run_turn_loop(
         &mut state,
         &router,
@@ -6798,6 +7002,7 @@ fn print_run_started(state: &deadreckon_core::PipelineState, route: Option<&Prov
         ui_command(format!("deadreckon attach {}", run_prefix(&state.run_id)))
     );
     println!("state {}", state.state_path().display());
+    let _ = io::stdout().flush();
 }
 
 fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
