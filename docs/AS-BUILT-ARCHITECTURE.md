@@ -1349,7 +1349,7 @@ cargo fmt --check
 
 ## 22. What's Built vs Scaffolding-Thin
 
-The codebase is more complete than a typical V0 but several layers remain scaffolding rather than finished systems. Honest accounting per the most recent retrospective (`docs/CHANGELOG.md` + `docs/GAP-ANALYSIS.md`):
+The codebase is more complete than a typical first pass, and the 2026-05-11 hardening pass replaced the earlier thin seams with depth-tested implementations where those seams were in alpha scope. Honest accounting per `docs/CHANGELOG.md`, `docs/GAP-ANALYSIS.md`, and `docs/AUDIT-2026-05-11.md`:
 
 ### Built and reliable
 
@@ -1372,20 +1372,31 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 - `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import`, `cleanup`/`prune` verbs.
 - `ratatui` attach TUI with spend/context telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer.
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.
-- Mock HTTP server for tests; CLI provider tests with fake binaries; 13 integration tests including stress and import round-trips.
+- Event-backed TUI attach: same-process attaches use `RunEventBus`; cross-process attaches replay `events.jsonl` incrementally.
+- Cross-process cancellation: `kill` writes a durable cancel marker before signaling; the run loop observes it while provider calls are in flight and reports killed status through events.
+- Partial-trace resume: resume reconstructs only completed tool boundaries and `resume --from-turn` truncates traces, spend records, and future snapshots together.
+- Per-tool sandbox policy: bash/provider/write-file paths get specific filesystem and network permissions; refused writes are recorded in traces and provenance.
+- YAML acceptance specs: `dr-gate` evaluates required/optional tests, file existence, content matches, shell commands, and build checks, then signs check-level proof results.
+- Exhaustive local doctor: OS, sandbox binaries, provider binaries, config, runstate permissions, disk, and opt-in provider pings all produce actionable `try:` hints.
+- Promoted library query surface: `deadreckon library list|search|show` reads library manifests and reverse materialization markers.
+- Import parity hardening: Claude Code/Codex JSONL and Cursor SQLite imports preserve source metadata, deterministic run IDs, stable row ordering, and provenance paths.
+- CLI usability polish: root help includes command groups, `status` includes run health/library/disk blocks, and `DEADRECKON_HINTS=0` suppresses post-completion prompts.
+- Mock HTTP server for tests; CLI provider tests with fake binaries; integration coverage for stress, import round-trips, lifecycle, codebase modes, docs, sandbox policy, and gate proof.
 
-### Scaffolding-thin (named in `docs/goals/2026-05-11-1400-deadreckon-robust-rider.md`)
+### Hardening v2 closures
 
-1. **TUI streaming.** Poll-driven from disk; should be event-driven via the `RunEventBus` broadcast channel.
-2. **Resume from partial trace.** Works at run/state level; doesn't yet handle truly mid-tool-call truncation with grace.
-3. **Cancellation model.** Single-process tokens work; cross-process kill is signal-based and can't cancel an in-flight `reqwest` task in a separate deadreckon process.
-4. **Wall-clock spend for CLI providers.** Tracked, capped — but the budget-to-wall-time mapping isn't yet rich.
-5. **Sandbox profiles.** Functional, not yet a hardened policy comparable to Claude Code's per-tool permission layer.
-6. **Doctor.** Useful, not yet exhaustive (no provider-ping, OS-version sanity is shallow).
-7. **Import normalization.** Inventory-level; not full round-trip parity.
-8. **Acceptance gate.** Basic — runs `cargo test` when applicable. A full YAML-driven spec language is planned.
-9. **Multi-run coordination.** Locks and scopes work; there's no scheduler or queue.
-10. **Promotion / library workflow.** Atomic swap works; the library doesn't yet have a richer query/listing surface.
+The previously named thin areas now have code paths and depth tests:
+
+1. **TUI streaming.** `tui_events.rs` covers broadcast attach, JSONL replay, partial-line handling, and kill visibility.
+2. **Resume from partial trace.** `turn_loop` tests cover mid-tool-call truncation and `--from-turn` cleanup.
+3. **Cancellation model.** `kill` writes a cancel marker before signals; tests cover cross-process marker semantics, HTTP aborts, and kill storms.
+4. **Wall-clock spend for CLI providers.** CLI providers accumulate wall time and caps; richer subscription-to-budget policy remains a future routing concern.
+5. **Sandbox profiles.** Per-tool policy blocks disallowed filesystem/network access and records refusals.
+6. **Doctor.** Local setup checks are actionable and exhaustive for alpha; provider network pings are opt-in.
+7. **Import normalization.** JSONL/SQLite imports now carry source path/line/row metadata and deterministic imported run IDs.
+8. **Acceptance gate.** `acceptance.yaml` supports structured checks and signed per-check results.
+9. **Multi-run coordination.** Scope-qualified locks, stale reclaim, and same-scope refusal tests are in place; a scheduler remains out of scope.
+10. **Promotion / library workflow.** Promotion is atomic and `library list|search|show` makes artifacts discoverable.
 
 ### Not yet built (V1+ candidates per `docs/goals/2026-05-11-1400-deadreckon-usability-rider.md` and the V1 list in the robust rider)
 
