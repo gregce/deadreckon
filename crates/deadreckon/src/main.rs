@@ -32,7 +32,9 @@ use deadreckon_core::{
     save_state, terminate_pid, validate_acceptance_marker, write_cancel_marker,
     write_chain_step_marker,
 };
-use deadreckon_providers::{ProviderRequest, ProviderRouteInfo, ProviderRouter};
+use deadreckon_providers::{
+    ProviderRequest, ProviderRouteInfo, ProviderRouter, ProviderUsage, SpendEstimate,
+};
 use deadreckon_runtime::{
     PolishConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, polish_run_docs, run_turn_loop,
 };
@@ -7340,6 +7342,23 @@ async fn doc_command(args: DocCommandArgs) -> Result<()> {
             .doc_polish_token_budget
             .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET);
         let budget_cap = budget_cap.or(defaults.doc_polish_budget_cap_usd);
+        let router = ProviderRouter::from_config_path(&paths.config_path(), Some(&provider))?;
+        let estimated_spend =
+            estimate_doc_polish_spend(&router, &provider, token_budget, subskills.len())?;
+        if let Some(cap) = budget_cap
+            && estimated_spend.cost_usd > cap
+        {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "doc polish would cost about ${:.6}, above cap ${cap:.6}",
+                    estimated_spend.cost_usd
+                ),
+                &format!(
+                    "deadreckon doc {} --polish --budget-cap {:.2} --no-confirm",
+                    state.run_id, estimated_spend.cost_usd
+                ),
+            )));
+        }
         if !no_confirm && completion_hints_enabled(false) && io::stdin().is_terminal() {
             print_doc_polish_preview(
                 &state,
@@ -7348,6 +7367,7 @@ async fn doc_command(args: DocCommandArgs) -> Result<()> {
                 &subskills,
                 token_budget,
                 budget_cap,
+                &estimated_spend,
             )?;
             let answer = prompt("polish docs now? [Y/n]: ")?;
             if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
@@ -7360,7 +7380,6 @@ async fn doc_command(args: DocCommandArgs) -> Result<()> {
                 &format!("deadreckon doc {} --polish --no-confirm", state.run_id),
             )));
         }
-        let router = ProviderRouter::from_config_path(&paths.config_path(), Some(&provider))?;
         polish_run_docs(
             &mut state,
             &router,
@@ -7424,20 +7443,85 @@ fn print_doc_polish_preview(
     subskills: &[String],
     token_budget: u32,
     budget_cap: Option<f64>,
+    estimated_spend: &SpendEstimate,
 ) -> Result<()> {
+    print!(
+        "{}",
+        doc_polish_preview_text(
+            state,
+            provider,
+            provider_source,
+            subskills,
+            token_budget,
+            budget_cap,
+            estimated_spend,
+        )?
+    );
+    Ok(())
+}
+
+fn doc_polish_preview_text(
+    state: &deadreckon_core::PipelineState,
+    provider: &str,
+    provider_source: &str,
+    subskills: &[String],
+    token_budget: u32,
+    budget_cap: Option<f64>,
+    estimated_spend: &SpendEstimate,
+) -> Result<String> {
     let hash = deadreckon_runtime::inputs_hash(state)?;
-    println!("{}", ui_heading("polish preview:"));
-    println!("  provider:  {} ({provider_source})", ui_id(provider));
-    println!("  subskills: {}", subskills.join(", "));
-    println!("  budget:    {} tokens per subcall", token_budget);
-    println!(
-        "  cost cap:  {}",
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", ui_heading("polish preview:")));
+    out.push_str(&format!(
+        "  provider:  {} ({provider_source})\n",
+        ui_id(provider)
+    ));
+    out.push_str(&format!("  subskills: {}\n", subskills.join(", ")));
+    out.push_str(&format!(
+        "  budget:    {} tokens per subcall\n",
+        token_budget
+    ));
+    out.push_str(&format!(
+        "  estimate:  {}\n",
+        doc_polish_cost_label(estimated_spend)
+    ));
+    out.push_str(&format!(
+        "  cost cap:  {}\n",
         budget_cap
             .map(|cap| format!("${cap:.2}"))
             .unwrap_or_else(|| "provider/account default".to_string())
-    );
-    println!("  inputs:    {}", &hash[..hash.len().min(12)]);
-    Ok(())
+    ));
+    out.push_str(&format!("  inputs:    {}\n", &hash[..hash.len().min(12)]));
+    Ok(out)
+}
+
+fn estimate_doc_polish_spend(
+    router: &ProviderRouter,
+    provider: &str,
+    token_budget: u32,
+    subskill_count: usize,
+) -> Result<SpendEstimate> {
+    let calls = subskill_count.max(1) as u64;
+    router
+        .estimate_for_route(
+            Some(provider),
+            ProviderUsage {
+                input_tokens: 0,
+                output_tokens: u64::from(token_budget) * calls,
+            },
+        )
+        .map_err(CliError::from)
+}
+
+fn doc_polish_cost_label(estimate: &SpendEstimate) -> String {
+    if estimate.subscription {
+        "$0.00 (subscription)".to_string()
+    } else {
+        format!(
+            "${:.6} for up to {} output tokens",
+            estimate.cost_usd, estimate.output_tokens
+        )
+    }
 }
 
 fn print_doc_polish_summary(record: &deadreckon_runtime::PolishRecord) {
@@ -9976,15 +10060,16 @@ mod tui_tests {
         AttachPanel, AttachPanelCounts, AttachPanelRows, AttachTuiState, ChainAttachTuiState,
         CompletionAction, chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
         chain_should_auto_attach, chain_timeline_lines, chain_wall_cap_hit,
-        completion_action_from_input, markdown_to_tui_lines, max_panel_scroll, per_step_wall_cap,
-        threshold_color,
+        completion_action_from_input, completion_hints_enabled, doc_polish_preview_text,
+        markdown_to_tui_lines, max_panel_scroll, per_step_wall_cap, threshold_color,
     };
     use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use deadreckon_core::{
         ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainEvent, ChainEventKind, ChainNewOptions,
-        ChainStatus, ChainStepStatus, OnFail,
+        ChainStatus, ChainStepStatus, DeadreckonPaths, OnFail, RunOptions, create_run,
     };
+    use deadreckon_providers::SpendEstimate;
     use ratatui::style::{Color, Modifier};
     use ratatui::text::Line;
 
@@ -10022,6 +10107,66 @@ mod tui_tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn doc_preview_state() -> (tempfile::TempDir, deadreckon_core::PipelineState) {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "preview docs".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("cli:codex".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("state");
+        (temp, state)
+    }
+
+    #[test]
+    fn polish_preview_block_lists_provider_and_subskills() {
+        let (_temp, state) = doc_preview_state();
+        let estimate = SpendEstimate {
+            provider: "cli:codex".to_string(),
+            model: "provider default".to_string(),
+            input_tokens: 0,
+            output_tokens: 65_536,
+            cost_usd: 0.0,
+            subscription: true,
+            wall_time_seconds: None,
+        };
+        let text = doc_polish_preview_text(
+            &state,
+            "cli:codex",
+            "auto_subscription",
+            &[
+                "narrator-overview".to_string(),
+                "narrator-phases".to_string(),
+                "narrator-as-built".to_string(),
+                "narrator-decisions".to_string(),
+            ],
+            16_384,
+            Some(0.0),
+            &estimate,
+        )
+        .expect("preview");
+        assert!(text.contains("provider:"));
+        assert!(text.contains("cli:codex"));
+        assert!(text.contains("narrator-overview, narrator-phases"));
+        assert!(text.contains("$0.00 (subscription)"));
+    }
+
+    #[test]
+    fn polish_preview_suppressed_by_hints_env() {
+        assert!(!completion_hints_enabled(true));
     }
 
     fn counts() -> AttachPanelCounts {

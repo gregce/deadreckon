@@ -1567,6 +1567,26 @@ When `deadreckon apply` builds the default squash or merge message, it reads `RU
 
 `polish.json` stores a SHA-256 inputs hash over goal, traces, provenance, spend, incremental records, changed files, and source AS-BUILT content. Schema v2 records `doc_provider_source`, `subcalls[]` with skill/status/provider/tokens/cost/duration/retries, `merged_at`, and `diff_coverage`. A matching polished hash skips duplicate provider calls unless forced. CLI subscription providers report wall time rather than USD cost, but the doc-provider resolver still records whether the route came from a flag, config, auto-detected subscription CLI, run provider fallback, or no provider.
 
+### 25.11 Skill Split Into Four Subskills
+
+The default polish path resolves `narrator-overview`, `narrator-phases`, `narrator-as-built`, and `narrator-decisions` separately so each prompt owns one documentation surface. The legacy `run-narrator` skill remains as the single-call compatibility path.
+
+### 25.12 Per-Turn Capture Richness
+
+Turn docs preserve the provider response up to 50 KB, stdout/stderr up to 10 KB each, per-file add/delete counts, binary markers, and the largest textual hunk excerpt. These fields are stored in `_incremental.jsonl` rather than `PipelineState`.
+
+### 25.13 Doc-Provider Auto-Resolution
+
+Doc polish chooses `--doc-provider`, then `[defaults].doc_provider`, then in-PATH subscription CLIs (`cli:codex`, `cli:claude-code`), then the run provider. If none resolve, the command fails with an actionable `try:` hint instead of silently leaving `Doc-writer: templated only`.
+
+### 25.14 Component Inference And Topology
+
+The deterministic as-built seed maps changed paths into concrete layers such as Rust crates, frontend components/routes, tests, documentation, manifests, migrations, and CI. Unmapped files are omitted instead of grouped under `Project files`; topology ASCII is emitted only when at least three top-level directories changed.
+
+### 25.15 Polish Preview And Budget Cap
+
+`deadreckon doc <id> --polish` estimates the maximum output-token cost before calling the provider. Paid API routes are refused when the estimate exceeds `--budget-cap` or `[defaults].doc_polish_budget_cap_usd`; subscription CLI routes estimate as `$0.00 (subscription)`.
+
 ---
 
 ## 28. Chains & Autonomous Goal Chaining

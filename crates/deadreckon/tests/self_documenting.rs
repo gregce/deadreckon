@@ -1,5 +1,7 @@
 use std::fs;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -12,9 +14,10 @@ use axum::{Json, Router};
 use deadreckon_core::{
     CodebaseMode, CodebaseRecord, DeadreckonPaths, FileChange, FrontmatterFields, RunOptions,
     RunStatus, TurnDocInput, TurnRecord, append_parent_narrative_update, append_turn_doc,
-    apply_commit_body, as_built_path, auto_title, coalesce_into_phases, decisions_path, docs_dir,
-    frontmatter, is_decision_candidate, missing_files_in_narrative, narrative_path,
-    publish_docs_for_promotion, rewrite_templated_docs, save_state, should_emit_delta,
+    apply_commit_body, as_built_path, auto_title, coalesce_into_phases, decisions_path,
+    diff_samples_markdown, docs_dir, frontmatter, is_decision_candidate,
+    missing_files_in_narrative, narrative_path, publish_docs_for_promotion, rewrite_templated_docs,
+    save_state, should_emit_delta, source_layout, tool_stdio_markdown,
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_runtime::{
@@ -358,7 +361,7 @@ async fn polish_uses_doc_provider_override_when_configured() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn split_polish_runs_four_subskills_with_16k_budget() {
+async fn polish_runs_four_subcalls_sequentially() {
     let (_temp, paths, mut state) = fresh_state("split polish");
     append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
     let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
@@ -400,7 +403,7 @@ async fn split_polish_runs_four_subskills_with_16k_budget() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn split_polish_cost_sums_subcalls() {
+async fn polish_total_cost_summed_across_subcalls() {
     let (_temp, paths, mut state) = fresh_state("split cost");
     append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
     let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
@@ -424,7 +427,131 @@ async fn split_polish_cost_sums_subcalls() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn split_polish_retries_only_phases_for_missing_file_coverage() {
+async fn polish_per_subcall_token_budget_is_16k() {
+    let (_temp, paths, mut state) = fresh_state("split budget");
+    append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    polish_run_docs(
+        &mut state,
+        &router,
+        &split_polish_config(paths.home(), false),
+    )
+    .await
+    .expect("polish");
+    for request in server.journal() {
+        assert_eq!(request["max_tokens"].as_u64(), Some(16_384));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn polish_records_per_subcall_status_in_polish_json() {
+    let (_temp, paths, mut state) = fresh_state("split records");
+    append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    polish_run_docs(
+        &mut state,
+        &router,
+        &split_polish_config(paths.home(), false),
+    )
+    .await
+    .expect("polish");
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert_eq!(record.subcalls.len(), 4);
+    assert!(record.subcalls.iter().all(|subcall| subcall.status == "ok"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn polish_merges_overview_into_narrative_intro() {
+    let (_temp, paths, mut state) = fresh_state("split overview");
+    append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    polish_run_docs(
+        &mut state,
+        &router,
+        &split_polish_config(paths.home(), false),
+    )
+    .await
+    .expect("polish");
+    let narrative = fs::read_to_string(narrative_path(&state.working_dir)).expect("narrative");
+    assert!(narrative.contains("## Reading order"));
+    assert!(narrative.contains("Read the narrative first"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn polish_merges_phases_into_narrative_body() {
+    let (_temp, paths, mut state) = fresh_state("split phases");
+    append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    polish_run_docs(
+        &mut state,
+        &router,
+        &split_polish_config(paths.home(), false),
+    )
+    .await
+    .expect("polish");
+    let narrative = fs::read_to_string(narrative_path(&state.working_dir)).expect("narrative");
+    assert!(narrative.contains("### Phase 1"));
+    assert!(narrative.contains("The provider completed the turn"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn polish_subcall_failure_does_not_abort_other_subcalls() {
+    let (_temp, paths, mut state) = fresh_state("split failure");
+    append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
+    let server = MockServer::start(vec![
+        FixtureResponse::json(overview_json_for_tests()),
+        FixtureResponse::text("not-json"),
+        FixtureResponse::json(as_built_json(&["a.txt"])),
+        FixtureResponse::json(decisions_json()),
+    ])
+    .await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    polish_run_docs(
+        &mut state,
+        &router,
+        &split_polish_config(paths.home(), false),
+    )
+    .await
+    .expect("polish");
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert!(record.status.starts_with("failed_subcall"));
+    assert!(record.subcalls.iter().any(|subcall| subcall.status == "ok"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn polish_idempotent_when_inputs_unchanged_across_subcalls() {
+    let (_temp, paths, mut state) = fresh_state("split idempotent");
+    append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    let config = split_polish_config(paths.home(), false);
+    polish_run_docs(&mut state, &router, &config)
+        .await
+        .expect("first");
+    polish_run_docs(&mut state, &router, &config)
+        .await
+        .expect("second");
+    assert_eq!(server.journal().len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_retry_targets_only_narrator_phases() {
     let (_temp, paths, mut state) = fresh_state("split coverage");
     append_sample_turn(&state, 1, "write_file", &["a.txt", "b.txt"], "ok");
     let server = MockServer::start(vec![
@@ -462,6 +589,66 @@ async fn split_polish_retries_only_phases_for_missing_file_coverage() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_retry_capped_at_two_per_subcall() {
+    let (_temp, paths, mut state) = fresh_state("split coverage cap");
+    append_sample_turn(&state, 1, "write_file", &["a.txt", "b.txt"], "ok");
+    let server = MockServer::start(vec![
+        FixtureResponse::json(overview_json_for_tests()),
+        FixtureResponse::json(phases_json(&["a.txt"])),
+        FixtureResponse::json(as_built_json(&["a.txt", "b.txt"])),
+        FixtureResponse::json(decisions_json()),
+        FixtureResponse::json(phases_json(&["a.txt"])),
+        FixtureResponse::json(phases_json(&["a.txt"])),
+    ])
+    .await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    polish_run_docs(
+        &mut state,
+        &router,
+        &split_polish_config(paths.home(), false),
+    )
+    .await
+    .expect("polish");
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert_eq!(server.journal().len(), 6);
+    assert_eq!(record.retries, 2);
+    assert_eq!(record.diff_coverage.as_ref().expect("coverage").retries, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_phases_subcalls_not_coverage_gated() {
+    let (_temp, paths, mut state) = fresh_state("split coverage non phases");
+    append_sample_turn(&state, 1, "write_file", &["a.txt", "b.txt"], "ok");
+    let server = MockServer::start(vec![
+        FixtureResponse::json(overview_json_for_tests()),
+        FixtureResponse::json(phases_json(&["a.txt"])),
+        FixtureResponse::json(as_built_json(&["a.txt", "b.txt"])),
+        FixtureResponse::json(decisions_json()),
+        FixtureResponse::json(phases_json(&["a.txt", "b.txt"])),
+    ])
+    .await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    polish_run_docs(
+        &mut state,
+        &router,
+        &split_polish_config(paths.home(), false),
+    )
+    .await
+    .expect("polish");
+    let skills = server
+        .journal()
+        .iter()
+        .filter_map(|request| request["messages"][0]["content"].as_str())
+        .filter(|prompt| prompt.contains("narrator-as-built"))
+        .count();
+    assert_eq!(skills, 1);
+}
+
 #[test]
 fn polish_resolves_project_skill_before_user_before_repo() {
     let (temp, paths, state) = copy_state_with_source("skill precedence");
@@ -497,9 +684,69 @@ async fn polish_records_no_skill_status_when_unresolvable() {
 }
 
 #[test]
-fn placeholder_substitution_replaces_known_handles_unknown_passthrough() {
+fn unknown_placeholder_passes_through_unchanged() {
     let out = substitute_placeholders("{{ goal }} {{unknown}}", &[("goal", "ship".to_string())]);
     assert_eq!(out, "ship {{unknown}}");
+}
+
+#[test]
+fn diff_samples_placeholder_renders_per_file_blocks() {
+    let mut record = turn_record(1, "write_file", &["src/app.rs"]);
+    record.files[0].adds = 2;
+    record.files[0].dels = 1;
+    record.files[0].largest_hunk_excerpt = "@@ -1,1 +1,2 @@\n+new".to_string();
+    let prompt = substitute_placeholders(
+        "diffs:\n{{ diff_samples }}",
+        &[("diff_samples", diff_samples_markdown(&[record]))],
+    );
+    assert!(prompt.contains("### Turn 1"));
+    assert!(prompt.contains("`src/app.rs`: +2/-1"));
+    assert!(prompt.contains("+new"));
+}
+
+#[test]
+fn tool_stdout_placeholder_omits_non_bash_turns() {
+    let mut bash = turn_record(1, "bash", &[]);
+    bash.tool_stdout = Some("cargo test ok".to_string());
+    let non_bash = turn_record(2, "write_file", &[]);
+    let prompt = substitute_placeholders(
+        "{{ tool_stdout }}",
+        &[("tool_stdout", tool_stdio_markdown(&[bash, non_bash]))],
+    );
+    assert!(prompt.contains("cargo test ok"));
+    assert!(!prompt.contains("Turn 2"));
+}
+
+#[test]
+fn source_layout_placeholder_uses_path_inference() {
+    let record = turn_record(1, "write_file", &["crates/app/src/lib.rs"]);
+    let (_temp, _paths, state) = fresh_state("source layout");
+    let prompt = substitute_placeholders(
+        "{{ source_layout }}",
+        &[(
+            "source_layout",
+            source_layout(&[record], &state.working_dir),
+        )],
+    );
+    assert!(prompt.contains("Crate app (Rust)"));
+}
+
+#[test]
+fn parent_narrative_placeholder_empty_for_solo_runs() {
+    let out = substitute_placeholders(
+        "parent={{ parent_narrative }}",
+        &[("parent_narrative", String::new())],
+    );
+    assert_eq!(out, "parent=");
+}
+
+#[test]
+fn parent_narrative_placeholder_loaded_for_extend_runs() {
+    let out = substitute_placeholders(
+        "{{ parent_narrative }}",
+        &[("parent_narrative", "# Parent narrative".to_string())],
+    );
+    assert_eq!(out, "# Parent narrative");
 }
 
 #[test]
@@ -587,7 +834,7 @@ async fn missing_file_triggers_polish_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn still_missing_after_two_retries_logs_warning_but_promotes() {
+async fn coverage_warning_logged_when_still_missing_after_two_retries() {
     let (_temp, paths, mut state) = fresh_state("coverage warning");
     append_sample_turn(&state, 1, "write_file", &["a.txt", "b.txt"], "ok");
     let server = MockServer::start(vec![
@@ -734,6 +981,335 @@ async fn doc_polish_triggers_fresh_call_with_confirm() {
     assert!(stdout(&output).contains("doc polish:"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn polish_preview_skipped_with_no_confirm() {
+    let (_temp, paths, state) = completed_state_with_docs("no preview");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let output = deadreckon(paths.home())
+        .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+        .output()
+        .expect("doc");
+    assert_success(&output);
+    assert!(!stdout(&output).contains("polish preview"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_polish_summary_lists_each_subcall_status() {
+    let (_temp, paths, state) = completed_state_with_docs("summary subcalls");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let output = deadreckon(paths.home())
+        .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+        .output()
+        .expect("doc");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("subcalls:"));
+    assert!(out.contains("narrator-overview"));
+    assert!(out.contains("narrator-phases"));
+    assert!(out.contains("narrator-as-built"));
+    assert!(out.contains("narrator-decisions"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doc_polish_budget_cap_refuses_above_threshold() {
+    let (_temp, paths, state) = completed_state_with_docs("budget cap");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config_with_costs(paths.home(), &server.base_url(), "docmock", 10_000.0);
+    let output = deadreckon(paths.home())
+        .args([
+            "doc",
+            &state.run_id,
+            "--polish",
+            "--no-confirm",
+            "--force",
+            "--budget-cap",
+            "0.01",
+        ])
+        .output()
+        .expect("doc");
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("doc polish would cost"));
+    assert!(stderr(&output).contains("try: deadreckon doc"));
+    assert_eq!(server.journal().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doc_polish_budget_cap_zero_for_subscription_providers() {
+    let (temp, paths, state) = completed_state_with_docs("subscription budget");
+    let fake_dir = temp.path().join("fake-codex-budget");
+    write_fake_subscription_cli(&fake_dir, "codex", split_docs_fixtures(&["a.txt"]));
+    write_config_without_doc_provider(paths.home());
+    let output = deadreckon(paths.home())
+        .env("PATH", fake_dir.join("bin"))
+        .env("DEADRECKON_FAKE_CLI_DIR", &fake_dir)
+        .args([
+            "doc",
+            &state.run_id,
+            "--polish",
+            "--no-confirm",
+            "--force",
+            "--budget-cap",
+            "0",
+        ])
+        .output()
+        .expect("doc");
+    assert_success(&output);
+    assert_eq!(read_polish_record(&state).unwrap().unwrap().cost_usd, 0.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doc_polish_force_ignores_inputs_hash() {
+    let (_temp, paths, state) = completed_state_with_docs("force polish");
+    let server = MockServer::start(
+        split_docs_fixtures(&["a.txt"])
+            .into_iter()
+            .chain(split_docs_fixtures(&["a.txt"]))
+            .collect(),
+    )
+    .await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    for _ in 0..2 {
+        let output = deadreckon(paths.home())
+            .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+            .output()
+            .expect("doc");
+        assert_success(&output);
+    }
+    assert_eq!(server.journal().len(), 8);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doc_polish_force_re_runs_all_subcalls_not_just_changed() {
+    let (_temp, paths, state) = completed_state_with_docs("force all subcalls");
+    let server = MockServer::start(
+        split_docs_fixtures(&["a.txt"])
+            .into_iter()
+            .chain(split_docs_fixtures(&["a.txt"]))
+            .collect(),
+    )
+    .await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    for _ in 0..2 {
+        let output = deadreckon(paths.home())
+            .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+            .output()
+            .expect("doc");
+        assert_success(&output);
+    }
+    let prompts = server.journal();
+    assert_eq!(prompts.len(), 8);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doc_provider_resolves_to_cli_codex_when_in_path() {
+    let (temp, paths, state) = completed_state_with_docs("auto cli docs");
+    let fake_dir = temp.path().join("fake-codex");
+    write_fake_subscription_cli(&fake_dir, "codex", split_docs_fixtures(&["a.txt"]));
+    write_config_without_doc_provider(paths.home());
+
+    let output = deadreckon(paths.home())
+        .env("PATH", fake_dir.join("bin"))
+        .env("DEADRECKON_FAKE_CLI_DIR", &fake_dir)
+        .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+        .output()
+        .expect("doc");
+    assert_success(&output);
+    assert!(stdout(&output).contains("provider: cli:codex"));
+    assert!(stdout(&output).contains("cost:     $0.000000"));
+
+    let narrative =
+        fs::read_to_string(state.working_dir.join("docs/RUN-NARRATIVE.md")).expect("narrative");
+    assert!(narrative.contains("**Doc-writer:** cli:codex via"));
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert_eq!(record.provider.as_deref(), Some("cli:codex"));
+    assert_eq!(
+        record.doc_provider_source.as_deref(),
+        Some("auto_subscription")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doc_provider_resolves_to_cli_claude_code_when_codex_absent() {
+    let (temp, paths, state) = completed_state_with_docs("auto claude docs");
+    let fake_dir = temp.path().join("fake-claude");
+    write_fake_subscription_cli(&fake_dir, "claude", split_docs_fixtures(&["a.txt"]));
+    write_config_without_doc_provider(paths.home());
+
+    let output = deadreckon(paths.home())
+        .env("PATH", fake_dir.join("bin"))
+        .env("DEADRECKON_FAKE_CLI_DIR", &fake_dir)
+        .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+        .output()
+        .expect("doc");
+    assert_success(&output);
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert_eq!(record.provider.as_deref(), Some("cli:claude-code"));
+    assert_eq!(
+        record.doc_provider_source.as_deref(),
+        Some("auto_subscription")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doc_provider_resolves_from_config_second() {
+    let (_temp, paths, state) = completed_state_with_docs("config doc provider");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let output = deadreckon(paths.home())
+        .env("PATH", "")
+        .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+        .output()
+        .expect("doc");
+    assert_success(&output);
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert_eq!(record.provider.as_deref(), Some("docmock"));
+    assert_eq!(record.doc_provider_source.as_deref(), Some("config"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doc_provider_resolves_from_flag_first() {
+    let (_temp, paths, state) = completed_state_with_docs("flag doc provider");
+    let config_server = MockServer::start(Vec::new()).await;
+    let flag_server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_two_provider_config(
+        paths.home(),
+        &config_server.base_url(),
+        "docmock",
+        &flag_server.base_url(),
+        "flagmock",
+        "docmock",
+    );
+    let output = deadreckon(paths.home())
+        .env("PATH", "")
+        .args([
+            "doc",
+            &state.run_id,
+            "--polish",
+            "--doc-provider",
+            "flagmock",
+            "--no-confirm",
+            "--force",
+        ])
+        .output()
+        .expect("doc");
+    assert_success(&output);
+    assert_eq!(config_server.journal().len(), 0);
+    assert_eq!(flag_server.journal().len(), 4);
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert_eq!(record.provider.as_deref(), Some("flagmock"));
+    assert_eq!(record.doc_provider_source.as_deref(), Some("flag"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doc_provider_falls_back_to_run_provider_last() {
+    let (temp, paths, mut state) = completed_state_with_docs("run provider docs");
+    state.provider = Some("docmock".to_string());
+    save_state(&state).expect("save");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config_run_provider_only(paths.home(), &server.base_url(), "docmock");
+    let empty_path = temp.path().join("empty-path");
+    fs::create_dir_all(&empty_path).expect("empty path");
+    let output = deadreckon(paths.home())
+        .env("PATH", &empty_path)
+        .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+        .output()
+        .expect("doc");
+    assert_success(&output);
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert_eq!(record.provider.as_deref(), Some("docmock"));
+    assert_eq!(record.doc_provider_source.as_deref(), Some("run_provider"));
+}
+
+#[test]
+fn no_doc_provider_emits_install_try_hint() {
+    let (temp, paths, mut state) = completed_state_with_docs("no provider docs");
+    state.provider = None;
+    save_state(&state).expect("save");
+    write_config_without_doc_provider(paths.home());
+    let empty_path = temp.path().join("empty-path");
+    fs::create_dir_all(&empty_path).expect("empty path");
+    let output = deadreckon(paths.home())
+        .env("PATH", &empty_path)
+        .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+        .output()
+        .expect("doc");
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("no doc provider available"));
+    assert!(stderr(&output).contains("try: install codex or claude"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doc_provider_records_source_in_polish_json() {
+    let (_temp, paths, state) = completed_state_with_docs("provider source");
+    let server = MockServer::start(split_docs_fixtures(&["a.txt"])).await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let output = deadreckon(paths.home())
+        .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+        .output()
+        .expect("doc");
+    assert_success(&output);
+    assert_eq!(
+        read_polish_record(&state)
+            .unwrap()
+            .unwrap()
+            .doc_provider_source
+            .as_deref(),
+        Some("config")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repolish_smoke_one_turn_fixture_yields_250_line_stoa_shape() {
+    let (_temp, paths, state) = completed_state_with_docs(
+        "make it possible to create and add a gallery of artwork and browse it without shallow docs",
+    );
+    let long_tail = "This sentence appears beyond the old two hundred character cutoff and proves the narrative keeps meaningful provider output instead of clipping mid-thought.";
+    append_turn_doc(
+        &state,
+        TurnDocInput {
+            turn: 2,
+            tool_kind: "write_file".to_string(),
+            latency_ms: Some(20),
+            files: vec![state.working_dir.join("src/gallery.rs")],
+            outcome: format!("expanded gallery docs. {long_tail}"),
+            response_text: format!("implemented gallery workflow. {long_tail}"),
+            tool_stdout: Some("cargo test passed\nrendered gallery preview".to_string()),
+            tool_stderr: None,
+        },
+    )
+    .expect("turn 2");
+    let server = MockServer::start(vec![
+        FixtureResponse::json(long_overview_json()),
+        FixtureResponse::json(long_phases_json(&["a.txt", "src/gallery.rs"], long_tail)),
+        FixtureResponse::json(as_built_json(&["a.txt", "src/gallery.rs"])),
+        FixtureResponse::json(decisions_json()),
+    ])
+    .await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let output = deadreckon(paths.home())
+        .args(["doc", &state.run_id, "--polish", "--no-confirm", "--force"])
+        .output()
+        .expect("doc");
+    assert_success(&output);
+
+    let narrative =
+        fs::read_to_string(state.working_dir.join("docs/RUN-NARRATIVE.md")).expect("narrative");
+    assert!(
+        narrative.lines().count() >= 250,
+        "{} lines",
+        narrative.lines().count()
+    );
+    assert!(narrative.contains("### Phase 1"));
+    assert!(narrative.contains(long_tail));
+    assert!(narrative.contains("`src/gallery.rs`"));
+    let as_built =
+        fs::read_to_string(state.working_dir.join("docs/RUN-AS-BUILT.md")).expect("as built");
+    assert!(as_built.contains("| Layer | Responsibilities | Key entrypoints |"));
+    assert!(as_built.contains("`src/gallery.rs:1`"));
+}
+
 #[test]
 fn extend_narrative_links_to_parent() {
     let (_temp, _paths, state) = fresh_state("extend child");
@@ -771,6 +1347,19 @@ fn plan_narrative_aggregates_child_summaries() {
         !stdout(&help).contains(" plan "),
         "orchestrate not landed; plan narrative gated"
     );
+}
+
+#[test]
+fn doc_help_describes_force_and_budget_cap_flags() {
+    let help = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .args(["doc", "--help"])
+        .output()
+        .expect("help");
+    assert_success(&help);
+    let out = stdout(&help);
+    assert!(out.contains("--force"));
+    assert!(out.contains("--budget-cap"));
+    assert!(out.contains("--doc-provider"));
 }
 
 #[test]
@@ -1017,6 +1606,44 @@ fn phases_json(files: &[&str]) -> String {
     }).to_string()
 }
 
+fn long_overview_json() -> String {
+    json!({
+        "reading_order": "Start with the narrative to understand the run chronology, then read the as-built architecture for file-level ownership, then finish with decisions for what was intentionally left alone.",
+        "why_now": "The run crossed the completion boundary, so the docs need to preserve not just that files changed but why the implementation hangs together and how a maintainer should re-enter it.",
+        "high_level_approach": "deadreckon merged the provider trace, diff samples, stdout, and per-file provenance into a reader-friendly account instead of a generic turn stub.",
+        "open_threads": ["Verify the gallery sorting behavior with a browser smoke before promoting to a public release."],
+        "cross_references": ["Trace: `traces.jsonl`", "Narrative: `docs/RUN-NARRATIVE.md`", "Architecture: `docs/AS-BUILT-ARCHITECTURE.md`"]
+    }).to_string()
+}
+
+fn long_phases_json(files: &[&str], sentinel: &str) -> String {
+    let mut paragraph = String::new();
+    paragraph.push_str("The provider completed a one-turn implementation and left enough evidence to reconstruct the work. ");
+    paragraph.push_str(sentinel);
+    paragraph.push('\n');
+    for idx in 1..=260 {
+        paragraph.push_str(&format!(
+            "Evidence line {idx}: the run ties `{}` back to the trace, diff hunk, and generated narrative so the reader can audit the shipped behavior.\n",
+            files[idx as usize % files.len()]
+        ));
+    }
+    json!({
+        "phases": [{
+            "title": "Build Gallery Flow",
+            "paragraph": paragraph,
+            "commit": "-",
+            "file_changes": files.iter().map(|file| json!({
+                "path": file,
+                "adds": 12,
+                "dels": 2,
+                "largest_hunk_excerpt": format!("@@ -1,1 +1,12 @@\n+{}", file)
+            })).collect::<Vec<_>>(),
+            "citations": ["[turn 1](../traces.jsonl#turn-1)", "[turn 2](../traces.jsonl#turn-2)"]
+        }]
+    })
+    .to_string()
+}
+
 fn as_built_json(files: &[&str]) -> String {
     json!({
         "system_overview": format!("The run produced trace-backed files: {}.", files.join(", ")),
@@ -1077,6 +1704,147 @@ output_cost_per_million = 0.0
         ),
     )
     .expect("config");
+}
+
+fn write_config_with_costs(home: &Path, base_url: &str, provider: &str, output_cost: f64) {
+    fs::create_dir_all(home).expect("home");
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+fallback = ["{provider}"]
+
+[defaults]
+provider = "{provider}"
+doc_provider = "{provider}"
+doc_skill = "run-narrator"
+doc_subskills = ["narrator-overview", "narrator-phases", "narrator-as-built", "narrator-decisions"]
+doc_polish_token_budget = 16384
+
+[providers.{provider}]
+kind = "open-ai-compatible"
+base_url = "{base_url}"
+model = "mock-agent"
+api_key = "test"
+input_cost_per_million = 0.0
+output_cost_per_million = {output_cost}
+"#
+        ),
+    )
+    .expect("config");
+}
+
+fn write_two_provider_config(
+    home: &Path,
+    first_base_url: &str,
+    first_provider: &str,
+    second_base_url: &str,
+    second_provider: &str,
+    doc_provider: &str,
+) {
+    fs::create_dir_all(home).expect("home");
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+fallback = ["{first_provider}"]
+
+[defaults]
+provider = "{first_provider}"
+doc_provider = "{doc_provider}"
+doc_skill = "run-narrator"
+doc_subskills = ["narrator-overview", "narrator-phases", "narrator-as-built", "narrator-decisions"]
+
+[providers.{first_provider}]
+kind = "open-ai-compatible"
+base_url = "{first_base_url}"
+model = "mock-agent"
+api_key = "test"
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
+
+[providers.{second_provider}]
+kind = "open-ai-compatible"
+base_url = "{second_base_url}"
+model = "mock-agent"
+api_key = "test"
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
+"#
+        ),
+    )
+    .expect("config");
+}
+
+fn write_config_run_provider_only(home: &Path, base_url: &str, provider: &str) {
+    fs::create_dir_all(home).expect("home");
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+fallback = ["{provider}"]
+
+[defaults]
+provider = "{provider}"
+doc_skill = "run-narrator"
+doc_subskills = ["narrator-overview", "narrator-phases", "narrator-as-built", "narrator-decisions"]
+
+[providers.{provider}]
+kind = "open-ai-compatible"
+base_url = "{base_url}"
+model = "mock-agent"
+api_key = "test"
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
+"#
+        ),
+    )
+    .expect("config");
+}
+
+fn write_config_without_doc_provider(home: &Path) {
+    fs::create_dir_all(home).expect("home");
+    fs::write(
+        home.join("config.toml"),
+        r#"
+[defaults]
+doc_skill = "run-narrator"
+doc_subskills = ["narrator-overview", "narrator-phases", "narrator-as-built", "narrator-decisions"]
+doc_polish_token_budget = 16384
+"#,
+    )
+    .expect("config");
+}
+
+fn write_fake_subscription_cli(root: &Path, binary: &str, fixtures: Vec<FixtureResponse>) {
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("fake bin");
+    for (idx, fixture) in fixtures.iter().enumerate() {
+        fs::write(root.join(format!("{}.json", idx + 1)), &fixture.content).expect("fixture");
+    }
+    fs::write(
+        bin_dir.join(binary),
+        r#"#!/bin/sh
+set -eu
+count_file="$DEADRECKON_FAKE_CLI_DIR/count"
+if [ -f "$count_file" ]; then
+  n="$(/bin/cat "$count_file")"
+else
+  n=0
+fi
+n=$((n + 1))
+printf '%s' "$n" > "$count_file"
+/bin/cat "$DEADRECKON_FAKE_CLI_DIR/$n.json"
+"#,
+    )
+    .expect("fake cli");
+    #[cfg(unix)]
+    {
+        let path = bin_dir.join(binary);
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod");
+    }
 }
 
 fn deadreckon(home: &Path) -> Command {
