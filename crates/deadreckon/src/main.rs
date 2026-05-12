@@ -26,8 +26,8 @@ use deadreckon_core::{
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
     docs_status_for_state, emit_event, inventory_files, list_runs, load_chain, load_run,
     pid_is_alive, polish_run_docs, prepare_worktree_record, preview_git_state,
-    read_codebase_record, record_for_resolved_mode, release_lock_file, resolve_mode,
-    restore_snapshot, run_turn_loop, save_chain, save_state, terminate_pid,
+    read_chain_step_marker, read_codebase_record, record_for_resolved_mode, release_lock_file,
+    resolve_mode, restore_snapshot, run_turn_loop, save_chain, save_state, terminate_pid,
     validate_acceptance_marker, write_cancel_marker, write_chain_step_marker,
 };
 use deadreckon_providers::{ProviderRequest, ProviderRouteInfo, ProviderRouter};
@@ -6314,6 +6314,9 @@ fn undo_restore_state(
 fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = load_cli_run(&paths, &run_id)?;
+    if let Some(line) = chain_context_line_for_working(&state.working_dir)? {
+        println!("{line}");
+    }
     if let Some(marker) = read_parent_marker(&state.working_dir)?
         && marker.kind == "extended"
     {
@@ -6719,6 +6722,12 @@ fn print_status_card(state: &deadreckon_core::PipelineState) {
 }
 
 fn print_run_summary(state: &deadreckon_core::PipelineState) {
+    if let Some(line) = chain_context_line_for_working(&state.working_dir)
+        .ok()
+        .flatten()
+    {
+        println!("{line}");
+    }
     println!("{} {}", ui_heading("run"), ui_id(&state.run_id));
     println!("status {}", state.status);
     println!("goal {}", state.goal);
@@ -6738,6 +6747,37 @@ fn print_run_locations(state: &deadreckon_core::PipelineState) {
     } else {
         println!("working {}", state.working_dir.display());
     }
+}
+
+fn chain_context_line_for_working(working_dir: &Path) -> Result<Option<String>> {
+    let Some(marker) = read_chain_step_marker(working_dir)? else {
+        return Ok(None);
+    };
+    let paths = DeadreckonPaths::discover();
+    let chain = load_chain(&paths, &marker.chain_id).ok();
+    let total_steps = chain.as_ref().map(|chain| chain.steps.len()).unwrap_or(0);
+    let policy = chain
+        .as_ref()
+        .map(|chain| branch_policy_label(chain.branch_policy))
+        .unwrap_or("unknown");
+    let apply = chain
+        .as_ref()
+        .map(|chain| apply_mode_label(chain.apply_mode))
+        .unwrap_or("unknown");
+    let prior = marker
+        .prior_applied_sha
+        .as_deref()
+        .map(short_sha)
+        .unwrap_or_else(|| "none".to_string());
+    Ok(Some(format!(
+        "chain {} · step {}/{} · policy: {} | apply={} · prev: {}",
+        chain_prefix(&marker.chain_id),
+        marker.step_index + 1,
+        total_steps,
+        policy,
+        apply,
+        prior
+    )))
 }
 
 fn print_run_started(state: &deadreckon_core::PipelineState, route: Option<&ProviderRouteInfo>) {

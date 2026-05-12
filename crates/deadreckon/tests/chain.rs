@@ -563,6 +563,45 @@ fn chain_per_step_cap_is_remaining_over_remaining_steps() {
 }
 
 #[test]
+fn single_run_show_renders_chain_banner_when_step_json_present() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "2",
+            "banner one",
+            "banner two",
+        ])
+        .output()
+        .expect("chain run");
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    let run_id = chain.steps[0].run_id.as_deref().expect("run");
+
+    let show = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["show", run_id])
+        .output()
+        .expect("show");
+
+    assert_success(&show);
+    let stdout = stdout(&show);
+    assert!(stdout.contains(&format!("chain {}", &chain.chain_id[..8])));
+    assert!(stdout.contains("step 1/2"));
+    assert!(stdout.contains("policy: stack | apply=auto"));
+}
+
+#[test]
 fn chain_hooks_list_emits_resolution_tiers() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
