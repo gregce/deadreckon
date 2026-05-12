@@ -1,5 +1,14 @@
 # Changelog
 
+## UX consolidation — 2026-05-11
+
+- Made `deadreckon list` project-scoped by default, with `--all` for global history and `--full` for script-friendly full values.
+- Added `latest` / `last` run-id aliases for user-facing run commands, resolved to the latest run in the current project.
+- Added `deadreckon status` with `next` as an alias; running `deadreckon` with no subcommand now shows the current project's latest run and next action.
+- Added `deadreckon cleanup` with `prune` as an alias for cleaned, stale, or completed worktree cleanup.
+- Added friendlier command aliases: `export` for `materialize` and `discard` for `abandon`.
+- Improved root and subcommand help text, terminal output formatting, TUI layout, completion action footer, and scoped workflow hints.
+
 ## Apply/list usability — 2026-05-11
 
 - Made run-id arguments accept unique prefixes so compact `deadreckon list` IDs can be reused directly.

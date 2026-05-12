@@ -1275,7 +1275,7 @@ fn post_apply_hint_includes_git_log_one_stat() {
     assert!(stdout.contains(&format!("applied {run_id} onto")));
     assert!(stdout.contains("commit "));
     assert!(stdout.contains("Cargo.toml"));
-    assert!(stdout.contains(&format!("next: deadreckon abandon {run_id}")));
+    assert!(stdout.contains(&format!("next: deadreckon discard {}", &run_id[..8])));
 }
 
 #[test]
@@ -1437,7 +1437,11 @@ fn abandon_writes_abandoned_json_for_list_visibility() {
     let state = load_run(&paths, &run_id).expect("state");
     assert!(state.run_root.join("abandoned.json").exists());
 
-    let list = deadreckon(&paths).arg("list").output().expect("list");
+    let list = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("list")
+        .output()
+        .expect("list");
     assert_success(&list);
     assert!(stdout(&list).contains("abandoned"));
 }
@@ -1537,7 +1541,11 @@ fn list_shows_mode_column() {
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     run_worktree_smoke(&paths, &repo);
 
-    let output = deadreckon(&paths).arg("list").output().expect("list");
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("list")
+        .output()
+        .expect("list");
 
     assert_success(&output);
     let stdout = stdout(&output);
@@ -1566,7 +1574,11 @@ fn list_default_is_compact_and_full_keeps_full_values() {
     )
     .expect("run");
 
-    let compact = deadreckon(&paths).arg("list").output().expect("list");
+    let compact = deadreckon(&paths)
+        .current_dir(temp.path())
+        .arg("list")
+        .output()
+        .expect("list");
     assert_success(&compact);
     let compact_stdout = stdout(&compact);
     assert!(compact_stdout.contains("AGE"));
@@ -1581,6 +1593,7 @@ fn list_default_is_compact_and_full_keeps_full_values() {
     );
 
     let full = deadreckon(&paths)
+        .current_dir(temp.path())
         .args(["list", "--full"])
         .output()
         .expect("list full");
@@ -1588,6 +1601,96 @@ fn list_default_is_compact_and_full_keeps_full_values() {
     let full_stdout = stdout(&full);
     assert!(full_stdout.contains(&state.run_id));
     assert!(full_stdout.contains(goal));
+}
+
+#[test]
+fn list_defaults_to_current_scope_and_all_shows_other_scopes() {
+    let temp = repo_tempdir();
+    let repo_a = clean_git_repo_in(&temp, "repo-a");
+    let repo_b = clean_git_repo_in(&temp, "repo-b");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_a = run_worktree_smoke(&paths, &repo_a);
+    let run_b = run_worktree_smoke(&paths, &repo_b);
+
+    let scoped = deadreckon(&paths)
+        .current_dir(&repo_a)
+        .arg("list")
+        .output()
+        .expect("list");
+    assert_success(&scoped);
+    let scoped_stdout = stdout(&scoped);
+    assert!(scoped_stdout.contains(&run_a[..8]), "{scoped_stdout}");
+    assert!(!scoped_stdout.contains(&run_b[..8]), "{scoped_stdout}");
+
+    let all = deadreckon(&paths)
+        .current_dir(&repo_a)
+        .args(["list", "--all"])
+        .output()
+        .expect("list all");
+    assert_success(&all);
+    let all_stdout = stdout(&all);
+    assert!(all_stdout.contains(&run_a[..8]), "{all_stdout}");
+    assert!(all_stdout.contains(&run_b[..8]), "{all_stdout}");
+}
+
+#[test]
+fn latest_alias_resolves_to_current_scope_for_show_and_status() {
+    let temp = repo_tempdir();
+    let repo_a = clean_git_repo_in(&temp, "repo-a");
+    let repo_b = clean_git_repo_in(&temp, "repo-b");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_a = run_worktree_smoke(&paths, &repo_a);
+    let run_b = run_worktree_smoke(&paths, &repo_b);
+
+    let show = deadreckon(&paths)
+        .current_dir(&repo_a)
+        .args(["show", "latest"])
+        .output()
+        .expect("show latest");
+    assert_success(&show);
+    let show_stdout = stdout(&show);
+    assert!(show_stdout.contains(&run_a), "{show_stdout}");
+    assert!(!show_stdout.contains(&run_b), "{show_stdout}");
+
+    let status = deadreckon(&paths)
+        .current_dir(&repo_a)
+        .arg("status")
+        .output()
+        .expect("status");
+    assert_success(&status);
+    let status_stdout = stdout(&status);
+    assert!(status_stdout.contains("deadreckon status"));
+    assert!(status_stdout.contains(&run_a[..8]), "{status_stdout}");
+    assert!(status_stdout.contains("next actions:"));
+}
+
+#[test]
+fn cleanup_completed_defaults_to_current_scope() {
+    let temp = repo_tempdir();
+    let repo_a = clean_git_repo_in(&temp, "repo-a");
+    let repo_b = clean_git_repo_in(&temp, "repo-b");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_a = run_worktree_smoke(&paths, &repo_a);
+    let run_b = run_worktree_smoke(&paths, &repo_b);
+    let state_a = load_run(&paths, &run_a).expect("state a");
+    let state_b = load_run(&paths, &run_b).expect("state b");
+    let worktree_a = read_codebase_record(&state_a.working_dir)
+        .expect("codebase a")
+        .worktree_path
+        .expect("worktree a");
+    let worktree_b = read_codebase_record(&state_b.working_dir)
+        .expect("codebase b")
+        .worktree_path
+        .expect("worktree b");
+
+    let cleanup = deadreckon(&paths)
+        .current_dir(&repo_a)
+        .args(["cleanup", "--completed", "--no-confirm"])
+        .output()
+        .expect("cleanup");
+    assert_success(&cleanup);
+    assert!(!worktree_a.exists());
+    assert!(worktree_b.exists());
 }
 
 #[test]
@@ -1635,10 +1738,14 @@ fn post_run_hint_lists_apply_and_abandon_lines() {
         .into_iter()
         .next()
         .expect("run");
+    let short = &run.run_id[..8];
     let stdout = stdout(&output);
     assert!(stdout.contains("next actions:"));
-    assert!(stdout.contains(&format!("apply:   deadreckon apply {}", run.run_id)));
-    assert!(stdout.contains(&format!("abandon: deadreckon abandon {}", run.run_id)));
+    assert!(stdout.contains(&format!("apply:   deadreckon apply {short}")));
+    assert!(stdout.contains(&format!(
+        "cleanup: deadreckon apply {short} --autostash --cleanup"
+    )));
+    assert!(stdout.contains(&format!("discard: deadreckon discard {short}")));
 }
 
 fn repo_tempdir() -> TempDir {
@@ -1670,7 +1777,11 @@ fn run_worktree_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> String
 }
 
 fn clean_git_repo(temp: &TempDir) -> PathBuf {
-    let repo = temp.path().join("repo");
+    clean_git_repo_in(temp, "repo")
+}
+
+fn clean_git_repo_in(temp: &TempDir, name: &str) -> PathBuf {
+    let repo = temp.path().join(name);
     fs::create_dir_all(&repo).expect("repo");
     git(&repo, &["init"]).expect("git init");
     fs::write(repo.join("README.md"), "hello").expect("readme");

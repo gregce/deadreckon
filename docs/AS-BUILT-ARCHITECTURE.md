@@ -1155,9 +1155,12 @@ The `Commands` enum in `crates/deadreckon/src/main.rs` defines the CLI surface. 
 | `config get/set` | `main.rs:279` | Non-interactive TOML edits |
 | `run` | `main.rs:316` | Create + enter turn loop |
 | `doctor` | `main.rs:484` | 8-point actionable preflight |
-| `list` | `main.rs:856` | Run inventory (run_id / status / scope / updated_at / goal) |
+| `status` / `next` | `main.rs` | Current project's latest run, locations, and next action |
+| `list` | `main.rs` | Project-scoped run inventory by default; `--all` for global history, `--full` for exact values |
 | `apply` | `main.rs` | Apply a completed worktree run to the user's current branch |
-| `abandon` | `main.rs` | Remove a run's worktree branch/path or mark no-op modes abandoned |
+| `abandon` / `discard` | `main.rs` | Remove a run's worktree branch/path or mark no-op modes abandoned |
+| `materialize` / `export` | `main.rs` | Copy a completed fresh/copy artifact to a normal directory |
+| `cleanup` / `prune` | `main.rs` | Clean abandoned, stale, or selected completed worktree runs |
 | `attach` | `main.rs:874` | TUI on a live or completed run |
 | `kill` | `main.rs:885` | Lock release + child PID termination |
 | `resume` | `main.rs:940` | Re-enter the loop on a non-Completed run |
@@ -1167,7 +1170,7 @@ The `Commands` enum in `crates/deadreckon/src/main.rs` defines the CLI surface. 
 
 The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defaults to `$10` (with a confirmation gate above `$50`), `--provider` defaults to the highest-credentialed entry per the fallback chain, `--skill` defaults to `default-coding`.
 
-`run` now starts codebase-aware by default. In a git repo it previews and then creates a `git worktree` on a `dr/...` branch; `--fresh` preserves the old empty-working-dir behavior, `--from <path>` uses copy mode, and `--in-place --i-know-its-a-lot` edits the source tree directly. Completed worktree runs hint `apply` / `abandon`; copy and fresh runs hint `materialize` / `extend`.
+`run` now starts codebase-aware by default. In a git repo it previews and then creates a `git worktree` on a `dr/...` branch; `--fresh` preserves the old empty-working-dir behavior, `--from <path>` uses copy mode, and `--in-place --i-know-its-a-lot` edits the source tree directly. Completed worktree runs hint `apply` / `discard`; copy and fresh runs hint `export` / `extend`. Run-id arguments accept unique prefixes and `latest` / `last` resolves to the latest run in the current project scope.
 
 ---
 
@@ -1188,21 +1191,21 @@ The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defau
 let vertical = Layout::default()
     .direction(Direction::Vertical)
     .constraints([
-        Constraint::Length(6),    // header + spend/context meters
+        Constraint::Length(5),    // header + compact spend/context metrics
         Constraint::Min(10),      // tool calls + provider activity
-        Constraint::Length(5),    // processes
+        Constraint::Length(4),    // processes/status
         Constraint::Length(1),    // keybindings footer
     ])
     .split(area);
 ```
 
-- **Header** (run id, status, phase, provider, sandbox, turn timer, working dir, goal).
-- **Spend meter** (when metered): gauge with `$spent / $cap`.
-- **Context meter** (always): tokens / context window with green/yellow/red thresholds.
-- **Center, left (62%)**: streaming list of tool calls + provider activity + recent events, with priority ordering — turn summary → live working-tree diff → recent provider activity → recent `RunEvent`s → recent traces.
-- **Center, right (38%)**: live files list (count + 12 most recent with age and size).
+- **Header** (short run id, status, phase, provider, sandbox, turn timer, truncated goal, working/artifact path).
+- **Spend meter** only for metered API providers; CLI subscription providers omit cost and emphasize context/wall time.
+- **Context meter**: compact token/window summary with green/yellow/red thresholds.
+- **Center, left**: wide streaming list of tool calls + provider activity + recent events, with priority ordering — turn summary → live working-tree diff → recent provider activity → recent `RunEvent`s → recent traces.
+- **Center, right**: narrower live files list with count/bytes in the panel title.
 - **Bottom**: supervised PIDs + their `ps` lines (alive/dead annotation).
-- **Footer**: keybindings (`q`/`Esc`/`Ctrl-D` to exit).
+- **Footer**: action-first completed footer (`[a] Apply`, `[b] Abandon`, `[d] Docs`, `[s] Show`) or scroll/detach help while running.
 
 ### 18.3 Data source
 
@@ -1352,11 +1355,12 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 - Codebase-default running: worktree mode, copy mode, in-place mode, fresh-mode preservation, preflight + preview UX, and `codebase.json` files-not-fields metadata.
 - `apply` and `abandon` for worktree rollback/apply lifecycle.
 - `materialize`, `extend`, `undo`, `list`, and `show` integration with codebase mode metadata, including worktree extension branches chained from parent `dr/...` branches.
+- UX consolidation: project-scoped `list`, `latest` run aliases, `status`/`next`, `cleanup`/`prune`, `export`/`discard` aliases, and TTY-aware formatted output.
 - Self-documenting run artifacts in stoa shape: `RUN-NARRATIVE.md`, `RUN-AS-BUILT.md`, `RUN-DECISIONS.md`, optional `AS-BUILT-DELTA.md`, per-turn `_incremental.jsonl`, and `polish.json`.
 - `deadreckon doc`, `list` DOCS status, doc-aware `apply` commit bodies, extend-parent narrative updates, diff coverage retry, and the repo/user/project `run-narrator` skill mechanism.
 - Acceptance gate with signed marker; anti-self-attestation actually enforced.
-- `init`, `config get/set`, `run`, `doctor`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import` verbs.
-- `ratatui` attach TUI with spend meter, context meter, recent activity.
+- `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import`, `cleanup`/`prune` verbs.
+- `ratatui` attach TUI with spend/context telemetry, provider activity, live files, process panel, scrollable panels, and completion action footer.
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.
 - Mock HTTP server for tests; CLI provider tests with fake binaries; 13 integration tests including stress and import round-trips.
 
@@ -1444,7 +1448,20 @@ Before file changes, `run` prints a single preview block with goal, source/git s
 
 ### 24.10 `apply` / `abandon`
 
-`apply` supports `squash` (default), `merge`, and `cherry-pick`. It refuses non-worktree runs and dirty user checkouts, then prints `git log -1 --stat`. `abandon` removes the worktree and branch when safe, supports `--keep-branch`, and writes `abandoned.json`.
+`apply` supports `squash` (default), `merge`, and `cherry-pick`. It refuses non-worktree runs and dirty user checkouts unless `--autostash` is set, then prints `git log -1 --stat`. `--cleanup` removes the temporary worktree/branch after successful apply. `abandon` / `discard` removes the worktree and branch when safe, supports `--keep-branch`, and writes `abandoned.json`.
+
+### 24.10.1 `status`, `list`, and `cleanup`
+
+`list` defaults to the current project scope so old runs from unrelated repos do
+not dominate the common path. `list --all` scans every scope; `list --full`
+prints exact TSV-style values for scripts. `status` (alias `next`) prints the
+latest current-project run, its artifact/worktree locations, and the next
+recommended action. Running `deadreckon` with no subcommand dispatches to
+`status`.
+
+`cleanup` (alias `prune`) removes worktrees and temporary branches for already
+abandoned runs by default, with opt-in `--completed`, `--stale`, `--all`, and
+`--force` selectors. It leaves promoted library artifacts intact.
 
 ### 24.11 Integration With Existing Verbs
 

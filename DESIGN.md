@@ -27,7 +27,7 @@ Source lives under `/Users/gdc/deadreckon/`:
 - `crates/deadreckon-core`: run paths, phase machine, JSON state, codebase mode records, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports.
 - `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, OpenAI-compatible, `cli:claude-code`, `cli:codex`, and explicit `--smoke` scripted adapters, fallback routing, spend estimates.
 - `crates/deadreckon-sandbox`: `sandbox-exec`, `bwrap`, `docker`, and `none` backends using `tokio::process::Command`; default `auto`.
-- `crates/deadreckon`: clap CLI, ratatui attach UI, init/config/run/list/doc/attach/kill/resume/undo/show/import/materialize/extend/doctor.
+- `crates/deadreckon`: clap CLI, ratatui attach UI, init/config/run/status/list/doc/attach/kill/resume/undo/show/import/materialize/export/apply/abandon/discard/cleanup/extend/doctor.
 - `skills/default-coding/SKILL.md`: Markdown skill loaded at runtime.
 - `tests/`: workspace integration tests.
 
@@ -42,7 +42,7 @@ Source lives under `/Users/gdc/deadreckon/`:
 7. Disposable Sandboxes: platform-native sandbox backends, Docker opt-in, `none` warning.
 8. Billing Guardrails: `--max-spend <USD>` pauses runs when durable spend reaches cap.
 9. Provider Routing / BYOK: adapters, CLI sub-agents, `deadreckon init`, `deadreckon config get/set`, and fallback chain configured from TOML.
-10. Workspace Inventory & Run Queue: `list`, `attach`, `kill`, `resume`, and state scan commands.
+10. Workspace Inventory & Run Queue: project-scoped `list`, `status`/`next`, `latest` run aliases, `attach`, `kill`, `resume`, `cleanup`, and state scan commands.
 
 ## Execution Model
 
@@ -69,19 +69,29 @@ The default skill is Markdown and external to the binary. The binary loads it an
 
 Completed artifacts are promoted into `/Users/gdc/.deadreckon/library/<scope>/<run-id>/`.
 Worktree runs keep their `dr/...` branch available for review and finish with
-`deadreckon apply <run-id>` or `deadreckon abandon <run-id>`. `apply` supports
-squash, merge, and cherry-pick strategies; `abandon` removes the worktree and,
-unless `--keep-branch` is used, the temporary branch.
+`deadreckon apply <run-id>` or `deadreckon abandon <run-id>`. `discard` is a
+friendlier alias for `abandon`. `apply` supports squash, merge, and cherry-pick
+strategies; `abandon` removes the worktree and, unless `--keep-branch` is used,
+the temporary branch.
 
-Copy and fresh runs use `deadreckon materialize <run-id> --dest <path>` to copy
-the library artifact to a user-owned path, write `.deadreckon/parent.json`, and
-record the reverse `.materialized-to` marker in the library. `deadreckon extend
+Copy and fresh runs use `deadreckon materialize <run-id> --dest <path>` or the
+`deadreckon export <run-id> --dest <path>` alias to copy the library artifact to
+a user-owned path, write `.deadreckon/parent.json`, and record the reverse
+`.materialized-to` marker in the library. `deadreckon extend
 <run-id> "follow-up goal"` preserves the parent's mode semantics: worktree
 parents create a child `dr/...` branch off the parent branch, copy/fresh parents
 seed a new working tree from the parent library, and in-place parents refuse with
 a direct `run --in-place` hint. Extended runs store parent lineage in
 `working/.deadreckon/parent.json` and start the normal turn loop with reset
 resource caps.
+
+For normal operation, run ids accept unique prefixes and `latest` / `last`
+resolve to the most recent run in the current project scope. `deadreckon list`
+defaults to that current scope, `deadreckon list --all` shows global history, and
+running `deadreckon` without a subcommand is equivalent to `deadreckon status`.
+`deadreckon cleanup` / `deadreckon prune` remove abandoned, stale, or explicitly
+selected completed worktree runs while leaving promoted library artifacts in
+place.
 
 Lineage and codebase mode metadata intentionally stay outside `PipelineState`;
 show/list/hints derive them from marker files and `working/.deadreckon/codebase.json`

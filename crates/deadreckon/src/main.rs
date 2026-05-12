@@ -14,6 +14,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
     CodebaseMode, CodebaseRecord, DeadreckonError, DeadreckonPaths, DocKind, ModeFlags, PhaseId,
     PhaseStatus, PolishConfig, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent,
@@ -84,189 +85,344 @@ fn error_hint(err: &CliError) -> Option<&'static str> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum UiStream {
+    Stdout,
+    Stderr,
+}
+
+fn ui_enabled(stream: UiStream) -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var("TERM").is_ok_and(|term| term == "dumb") {
+        return false;
+    }
+    match stream {
+        UiStream::Stdout => io::stdout().is_terminal(),
+        UiStream::Stderr => io::stderr().is_terminal(),
+    }
+}
+
+fn ui_style(text: impl AsRef<str>, code: &str, stream: UiStream) -> String {
+    let text = text.as_ref();
+    if ui_enabled(stream) {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn ui_heading(text: impl AsRef<str>) -> String {
+    ui_style(text, "1;36", UiStream::Stdout)
+}
+
+fn ui_muted(text: impl AsRef<str>) -> String {
+    ui_style(text, "2", UiStream::Stdout)
+}
+
+fn ui_id(text: impl AsRef<str>) -> String {
+    ui_style(text, "1;35", UiStream::Stdout)
+}
+
+fn ui_command(text: impl AsRef<str>) -> String {
+    ui_style(text, "1;34", UiStream::Stdout)
+}
+
+fn ui_ok(text: impl AsRef<str>) -> String {
+    ui_style(text, "1;32", UiStream::Stdout)
+}
+
+fn ui_warn(text: impl AsRef<str>) -> String {
+    ui_style(text, "1;33", UiStream::Stdout)
+}
+
+fn ui_error(text: impl AsRef<str>) -> String {
+    ui_style(text, "1;31", UiStream::Stderr)
+}
+
 #[derive(Parser)]
 #[command(
     name = "deadreckon",
     version,
     about = "Unattended agentic coding harness",
-    after_help = "Lifecycle:\n  run <goal>\n  attach <run-id>\n  doc <run-id>\n  resume <run-id>\n  undo [--run <run-id>]\n  materialize <run-id> [--dest <path>]\n  extend <run-id> <new-goal>"
+    long_about = "deadreckon runs long coding tasks in an isolated worktree or sandbox, tracks durable state, and gives you explicit apply/export/cleanup steps.",
+    after_help = "Lifecycle:\n  deadreckon run \"build the thing\"\n  deadreckon attach latest\n  deadreckon status\n  deadreckon apply latest --autostash --cleanup\n  deadreckon cleanup --completed\n\nRun ids accept unique prefixes. `latest` means the newest run for the current project."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(about = "Create ~/.deadreckon/config.toml and check the local setup")]
     Init {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Default provider route, for example cli:codex or cli:claude-code"
+        )]
         provider: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Provider API key for API-backed providers")]
         api_key: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Base URL for OpenAI-compatible providers")]
         base_url: Option<String>,
-        #[arg(long, default_value_t = 10.0)]
+        #[arg(long, default_value_t = 10.0, help = "Default spend cap in USD")]
         max_spend: f64,
-        #[arg(long, default_value = "auto")]
+        #[arg(long, default_value = "auto", help = "Default sandbox backend")]
         sandbox: String,
-        #[arg(long)]
+        #[arg(long, help = "Use detected defaults without interactive prompts")]
         no_confirm: bool,
     },
+    #[command(about = "Read or update ~/.deadreckon/config.toml")]
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    #[command(about = "Start an unattended coding run")]
     Run {
+        #[arg(help = "Natural-language coding goal")]
         goal: String,
-        #[arg(long)]
+        #[arg(long, help = "Start from an empty workspace")]
         fresh: bool,
-        #[arg(long)]
+        #[arg(long, help = "Force a git worktree run")]
         worktree: bool,
-        #[arg(long = "from")]
+        #[arg(
+            long = "from",
+            help = "Copy this source directory into runstate before running"
+        )]
         from: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Edit the current directory directly; requires explicit acknowledgement"
+        )]
         in_place: bool,
-        #[arg(long)]
+        #[arg(long, help = "Base git ref for worktree runs")]
         base: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Branch name for worktree runs")]
         branch: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Seed current dirty/untracked files into the worktree")]
         allow_dirty: bool,
-        #[arg(long)]
+        #[arg(long, help = "Initialize git in a plain directory before running")]
         init_git: bool,
-        #[arg(long)]
+        #[arg(long, help = "Skip the run preview confirmation")]
         yes: bool,
-        #[arg(long)]
+        #[arg(long, help = "Show the planned run without creating state")]
         preview: bool,
-        #[arg(long)]
+        #[arg(long, help = "Print a single-line preview")]
         brief: bool,
-        #[arg(long)]
+        #[arg(long, help = "Spend cap in USD")]
         max_spend: Option<f64>,
-        #[arg(long)]
+        #[arg(long, help = "Wall-clock cap for CLI-backed turns")]
         max_wall_seconds: Option<f64>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
+        )]
         sandbox: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Provider route override")]
         provider: Option<String>,
-        #[arg(long, default_value = "default-coding")]
+        #[arg(
+            long,
+            default_value = "default-coding",
+            help = "Skill name under skills/"
+        )]
         skill: String,
-        #[arg(long)]
+        #[arg(long, help = "Use the deterministic smoke provider")]
         smoke: bool,
-        #[arg(long)]
+        #[arg(long, help = "Allow high spend or in-place edits")]
         i_know_its_a_lot: bool,
-        #[arg(long)]
+        #[arg(long, help = "Skip safety prompts in scripts")]
         no_confirm: bool,
-        #[arg(long)]
+        #[arg(long, help = "Suppress post-completion action prompts")]
         no_hints: bool,
-        #[arg(long)]
+        #[arg(long, help = "Skip generated run documentation")]
         no_docs: bool,
-        #[arg(long)]
+        #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
     },
+    #[command(about = "Check providers, sandboxing, disk, and local prerequisites")]
     Doctor,
+    #[command(about = "Show runs for the current project by default")]
     List {
-        #[arg(long)]
+        #[arg(long, help = "Filter to a specific scope key")]
         scope: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Show runs from all projects")]
+        all: bool,
+        #[arg(long, help = "Print full TSV-style values for scripts")]
         full: bool,
     },
+    #[command(
+        visible_alias = "export",
+        about = "Copy a completed fresh/copy run into a chosen directory"
+    )]
     Materialize {
+        #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
-        #[arg(long)]
+        #[arg(long, help = "Destination directory")]
         dest: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, help = "Overwrite a non-empty destination")]
         force: bool,
-        #[arg(long)]
+        #[arg(long, help = "Keep manifest.json in the exported output")]
         include_manifest: bool,
     },
+    #[command(about = "Merge a completed worktree run back into the source checkout")]
     Apply {
+        #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
-        #[arg(long, default_value = "squash")]
+        #[arg(
+            long,
+            default_value = "squash",
+            help = "Apply strategy: squash, merge, or cherry-pick"
+        )]
         strategy: String,
-        #[arg(long)]
+        #[arg(long, help = "Target branch; defaults to the current branch")]
         branch: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Skip interactive confirmation")]
         no_confirm: bool,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Temporarily stash local changes and restore them after apply"
+        )]
         autostash: bool,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Remove the temporary worktree/branch after a successful apply"
+        )]
         cleanup: bool,
-        #[arg(long)]
+        #[arg(long, help = "Commit message override")]
         message: Option<String>,
     },
+    #[command(
+        visible_alias = "discard",
+        about = "Remove a run's temporary worktree and branch"
+    )]
     Abandon {
+        #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
-        #[arg(long)]
+        #[arg(long, help = "Keep the temporary branch")]
         keep_branch: bool,
-        #[arg(long)]
+        #[arg(long, help = "Clean even if the run is still marked executing")]
         force: bool,
     },
-    Extend {
-        parent_run_id: String,
-        new_goal: String,
-        #[arg(long)]
-        dest: Option<PathBuf>,
-        #[arg(long)]
-        max_context_turns: Option<u32>,
-        #[arg(long)]
-        no_context: bool,
-        #[arg(long)]
-        max_spend: Option<f64>,
-        #[arg(long)]
-        max_wall_seconds: Option<f64>,
-        #[arg(long)]
-        provider: Option<String>,
-        #[arg(long)]
-        sandbox: Option<String>,
-        #[arg(long)]
-        no_docs: bool,
-        #[arg(long)]
-        doc_skill: Option<String>,
-    },
-    Doc {
-        run_id: String,
-        #[arg(long, value_enum, default_value_t = CliDocKind::Narrative)]
-        kind: CliDocKind,
-        #[arg(long)]
-        export: Option<PathBuf>,
-        #[arg(long)]
-        polish: bool,
-        #[arg(long)]
+    #[command(
+        visible_alias = "prune",
+        about = "Clean stale or temporary deadreckon worktrees"
+    )]
+    Cleanup {
+        #[arg(help = "Optional run id, unique prefix, or latest")]
+        run_id: Option<String>,
+        #[arg(long, help = "Search all project scopes")]
+        all: bool,
+        #[arg(long, help = "Include completed worktree runs not already abandoned")]
+        completed: bool,
+        #[arg(long, help = "Include stale executing runs")]
+        stale: bool,
+        #[arg(long, help = "Skip interactive confirmation")]
         no_confirm: bool,
-        #[arg(long)]
+        #[arg(long, help = "Pass --force to git worktree remove and kill stale runs")]
         force: bool,
-        #[arg(long)]
+        #[arg(long, help = "Keep temporary branches")]
+        keep_branch: bool,
+    },
+    #[command(about = "Continue from a completed run with a follow-up goal")]
+    Extend {
+        #[arg(help = "Parent run id, unique prefix, or latest")]
+        parent_run_id: String,
+        #[arg(help = "Follow-up coding goal")]
+        new_goal: String,
+        #[arg(long, help = "Destination working directory for copy/fresh extensions")]
+        dest: Option<PathBuf>,
+        #[arg(long, help = "Maximum parent turns to include in context")]
+        max_context_turns: Option<u32>,
+        #[arg(long, help = "Do not include parent context")]
+        no_context: bool,
+        #[arg(long, help = "Spend cap in USD")]
+        max_spend: Option<f64>,
+        #[arg(long, help = "Wall-clock cap for CLI-backed turns")]
+        max_wall_seconds: Option<f64>,
+        #[arg(long, help = "Provider route override")]
+        provider: Option<String>,
+        #[arg(long, help = "Sandbox backend override")]
+        sandbox: Option<String>,
+        #[arg(long, help = "Skip generated run documentation")]
+        no_docs: bool,
+        #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
     },
-    Attach {
+    #[command(about = "Print or regenerate generated run documentation")]
+    Doc {
+        #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
-        #[arg(long)]
+        #[arg(long, value_enum, default_value_t = CliDocKind::Narrative, help = "Document kind")]
+        kind: CliDocKind,
+        #[arg(long, help = "Write the document to this path instead of stdout")]
+        export: Option<PathBuf>,
+        #[arg(long, help = "Use the doc provider to polish generated docs")]
+        polish: bool,
+        #[arg(long, help = "Skip polish confirmation")]
+        no_confirm: bool,
+        #[arg(long, help = "Overwrite existing export or polish output")]
+        force: bool,
+        #[arg(long, help = "Documentation skill name")]
+        doc_skill: Option<String>,
+    },
+    #[command(about = "Attach the live terminal UI to a run")]
+    Attach {
+        #[arg(help = "Run id, unique prefix, or latest")]
+        run_id: String,
+        #[arg(long, help = "Suppress post-completion action hints")]
         no_hints: bool,
     },
+    #[command(about = "Cancel a running task")]
     Kill {
+        #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
-        #[arg(long)]
+        #[arg(long, help = "Escalate subprocess termination")]
         force: bool,
     },
+    #[command(about = "Resume an incomplete run")]
     Resume {
+        #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
-        #[arg(long)]
+        #[arg(long, help = "Resume from this turn number")]
         from_turn: Option<u32>,
-        #[arg(long)]
+        #[arg(long, help = "Override wall-clock cap")]
         max_wall_seconds: Option<f64>,
     },
+    #[command(about = "Restore an in-place run snapshot")]
     Undo {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Run id, unique prefix, or latest; defaults to current project's latest"
+        )]
         run: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Snapshot turn to restore")]
         turn: Option<u32>,
     },
+    #[command(about = "Show full state, provenance, and trace details for a run")]
     Show {
+        #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
-        #[arg(long)]
+        #[arg(long, help = "Only show trace/provenance records for this turn")]
         turn: Option<u32>,
     },
+    #[command(
+        visible_alias = "next",
+        about = "Explain the current project's latest run and next action"
+    )]
+    Status {
+        #[arg(help = "Optional run id, unique prefix, or latest")]
+        run_id: Option<String>,
+        #[arg(
+            long,
+            help = "Use the global latest run instead of the current project"
+        )]
+        all: bool,
+    },
+    #[command(about = "Import read-only history from another coding tool")]
     Import {
+        #[arg(help = "Source: claude-code, codex, or cursor")]
         source: String,
     },
 }
@@ -292,16 +448,26 @@ impl From<CliDocKind> for DocKind {
 
 #[derive(Subcommand)]
 enum ConfigCommand {
-    Get { key: String },
-    Set { key: String, value: String },
+    #[command(about = "Print one config value")]
+    Get {
+        #[arg(help = "Dotted key, for example defaults.provider")]
+        key: String,
+    },
+    #[command(about = "Set one config value")]
+    Set {
+        #[arg(help = "Dotted key, for example defaults.provider")]
+        key: String,
+        #[arg(help = "TOML value or plain string")]
+        value: String,
+    },
 }
 
 #[tokio::main]
 async fn main() {
     if let Err(err) = main_inner().await {
-        eprintln!("error: {err}");
+        eprintln!("{} {err}", ui_error("error:"));
         if let Some(hint) = error_hint(&err) {
-            eprintln!("  hint: {hint}");
+            eprintln!("  {} {hint}", ui_style("hint:", "1;34", UiStream::Stderr));
         }
         std::process::exit(1);
     }
@@ -315,7 +481,11 @@ async fn main_inner() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    match cli.command {
+    let command = cli.command.unwrap_or(Commands::Status {
+        run_id: None,
+        all: false,
+    });
+    match command {
         Commands::Init {
             provider,
             api_key,
@@ -381,7 +551,7 @@ async fn main_inner() -> Result<()> {
             doctor_command();
             Ok(())
         }
-        Commands::List { scope, full } => list_command(scope, full),
+        Commands::List { scope, all, full } => list_command(scope, all, full),
         Commands::Materialize {
             run_id,
             dest,
@@ -404,6 +574,23 @@ async fn main_inner() -> Result<()> {
             keep_branch,
             force,
         } => abandon_command(run_id, keep_branch, force),
+        Commands::Cleanup {
+            run_id,
+            all,
+            completed,
+            stale,
+            no_confirm,
+            force,
+            keep_branch,
+        } => cleanup_command(
+            run_id,
+            all,
+            completed,
+            stale,
+            no_confirm,
+            force,
+            keep_branch,
+        ),
         Commands::Extend {
             parent_run_id,
             new_goal,
@@ -462,6 +649,7 @@ async fn main_inner() -> Result<()> {
         } => resume_command(run_id, from_turn, max_wall_seconds).await,
         Commands::Undo { run, turn } => undo_command(run, turn),
         Commands::Show { run_id, turn } => show_command(run_id, turn),
+        Commands::Status { run_id, all } => status_command(run_id, all),
         Commands::Import { source } => import_command(source),
     }
 }
@@ -498,9 +686,13 @@ fn init_command(
         &sandbox,
     );
     fs::write(paths.config_path(), config)?;
-    println!("wrote {}", paths.config_path().display());
+    println!("{} {}", ui_ok("wrote"), paths.config_path().display());
     doctor_command();
-    println!("next: deadreckon run \"describe the coding task\"");
+    println!(
+        "{} {}",
+        ui_command("next:"),
+        ui_command("deadreckon run \"describe the coding task\"")
+    );
     Ok(())
 }
 
@@ -523,7 +715,7 @@ fn config_command(command: ConfigCommand) -> Result<()> {
             let mut root = load_config_value(&paths)?;
             set_toml_path(&mut root, &key, parse_config_value(&value));
             fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
-            println!("set {key}");
+            println!("{} {key}", ui_ok("set"));
         }
     }
     Ok(())
@@ -779,10 +971,10 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
 
     let completed = outcome == RunLoopOutcome::Done;
     match outcome {
-        RunLoopOutcome::Done => println!("completed run {}", state.run_id),
-        RunLoopOutcome::PausedAtCap => println!("paused run {}", state.run_id),
-        RunLoopOutcome::Killed => println!("killed run {}", state.run_id),
-        RunLoopOutcome::Failed => println!("failed run {}", state.run_id),
+        RunLoopOutcome::Done => println!("{} {}", ui_ok("completed run"), state.run_id),
+        RunLoopOutcome::PausedAtCap => println!("{} {}", ui_warn("paused run"), state.run_id),
+        RunLoopOutcome::Killed => println!("{} {}", ui_warn("killed run"), state.run_id),
+        RunLoopOutcome::Failed => println!("{} {}", ui_warn("failed run"), state.run_id),
     }
     print_run_locations(&state);
     if completed && !no_hints {
@@ -866,8 +1058,9 @@ fn confirm_spend_cap(
 
 fn doctor_command() {
     let paths = DeadreckonPaths::discover();
-    println!("✓ source /Users/gdc/deadreckon");
-    println!("✓ home {}", paths.home().display());
+    println!("{}", ui_heading("deadreckon doctor"));
+    println!("{} source /Users/gdc/deadreckon", ui_ok("✓"));
+    println!("{} home {}", ui_ok("✓"), paths.home().display());
     for backend in deadreckon_sandbox::doctor() {
         if backend.available {
             let path = backend
@@ -881,36 +1074,54 @@ fn doctor_command() {
                 .and_then(|path| command_version(path))
                 .map(|version| format!(" ({version})"))
                 .unwrap_or_default();
-            println!("✓ sandbox {} found{}{}", backend.backend, path, version);
+            println!(
+                "{} sandbox {} found{}{}",
+                ui_ok("✓"),
+                backend.backend,
+                path,
+                version
+            );
         } else {
-            println!("✗ sandbox {} missing", backend.backend);
-            println!("    fix: {}", backend.note);
+            println!("{} sandbox {} missing", ui_warn("✗"), backend.backend);
+            println!("    {} {}", ui_command("fix:"), backend.note);
         }
     }
     if paths.config_path().exists() {
         match load_config_value(&paths) {
             Ok(root) => {
-                println!("✓ {} present and parseable", paths.config_path().display());
+                println!(
+                    "{} {} present and parseable",
+                    ui_ok("✓"),
+                    paths.config_path().display()
+                );
                 doctor_providers(&root);
             }
             Err(err) => {
-                println!("✗ {} is not parseable", paths.config_path().display());
-                println!("    fix: check TOML syntax or rerun `deadreckon init` ({err})");
+                println!(
+                    "{} {} is not parseable",
+                    ui_warn("✗"),
+                    paths.config_path().display()
+                );
+                println!(
+                    "    {} check TOML syntax or rerun `deadreckon init` ({err})",
+                    ui_command("fix:")
+                );
             }
         }
     } else {
-        println!("✗ {} missing", paths.config_path().display());
-        println!("    fix: deadreckon init");
+        println!("{} {} missing", ui_warn("✗"), paths.config_path().display());
+        println!("    {} deadreckon init", ui_command("fix:"));
     }
     let defaults = config_defaults(&paths).unwrap_or_default();
     if defaults.provider.is_some() || paths.config_path().exists() {
-        println!("✓ provider defaults configured");
+        println!("{} provider defaults configured", ui_ok("✓"));
     } else if command_exists("claude") || command_exists("codex") {
-        println!("✓ cli subscription provider available");
+        println!("{} cli subscription provider available", ui_ok("✓"));
     } else {
-        println!("✗ no provider configured");
+        println!("{} no provider configured", ui_warn("✗"));
         println!(
-            "    fix: deadreckon init or deadreckon config set providers.anthropic.api_key <KEY>"
+            "    {} deadreckon init or deadreckon config set providers.anthropic.api_key <KEY>",
+            ui_command("fix:")
         );
     }
     doctor_disk_and_permissions(&paths);
@@ -921,8 +1132,8 @@ fn doctor_command() {
 
 fn doctor_providers(root: &toml::Value) {
     let Some(providers) = root.get("providers").and_then(toml::Value::as_table) else {
-        println!("✗ providers table missing");
-        println!("    fix: deadreckon init");
+        println!("{} providers table missing", ui_warn("✗"));
+        println!("    {} deadreckon init", ui_command("fix:"));
         return;
     };
     for (name, entry) in providers {
@@ -942,20 +1153,32 @@ fn doctor_providers(root: &toml::Value) {
                     }
                 });
             if command_exists(binary) || PathBuf::from(binary).exists() {
-                println!("✓ provider {name} CLI binary {binary} found");
+                println!("{} provider {name} CLI binary {binary} found", ui_ok("✓"));
             } else {
-                println!("✗ provider {name} CLI binary {binary} missing");
-                println!("    fix: install {binary} or set providers.\"{name}\".binary");
+                println!(
+                    "{} provider {name} CLI binary {binary} missing",
+                    ui_warn("✗")
+                );
+                println!(
+                    "    {} install {binary} or set providers.\"{name}\".binary",
+                    ui_command("fix:")
+                );
             }
         } else if provider_has_key(entry) {
             if std::env::var_os("DEADRECKON_DOCTOR_PING").is_some() {
-                println!("✓ provider {name} credential present; ping requested");
+                println!(
+                    "{} provider {name} credential present; ping requested",
+                    ui_ok("✓")
+                );
             } else {
-                println!("✓ provider {name} credential present");
+                println!("{} provider {name} credential present", ui_ok("✓"));
             }
         } else {
-            println!("✗ provider {name} credential missing");
-            println!("    fix: deadreckon config set providers.{name}.api_key <KEY>");
+            println!("{} provider {name} credential missing", ui_warn("✗"));
+            println!(
+                "    {} deadreckon config set providers.{name}.api_key <KEY>",
+                ui_command("fix:")
+            );
         }
     }
 }
@@ -975,11 +1198,13 @@ fn provider_has_key(entry: &toml::Value) -> bool {
 fn doctor_disk_and_permissions(paths: &DeadreckonPaths) {
     if let Err(err) = fs::create_dir_all(paths.runstate_dir()) {
         println!(
-            "✗ runstate dir {} not writable",
+            "{} runstate dir {} not writable",
+            ui_warn("✗"),
             paths.runstate_dir().display()
         );
         println!(
-            "    fix: mkdir -p {} && chmod u+w {}",
+            "    {} mkdir -p {} && chmod u+w {}",
+            ui_command("fix:"),
             paths.runstate_dir().display(),
             paths.runstate_dir().display()
         );
@@ -988,36 +1213,55 @@ fn doctor_disk_and_permissions(paths: &DeadreckonPaths) {
     }
     let probe = paths.runstate_dir().join(".doctor-write-test");
     match fs::write(&probe, b"ok").and_then(|_| fs::remove_file(&probe)) {
-        Ok(()) => println!("✓ runstate dir {} writable", paths.runstate_dir().display()),
+        Ok(()) => println!(
+            "{} runstate dir {} writable",
+            ui_ok("✓"),
+            paths.runstate_dir().display()
+        ),
         Err(err) => {
             println!(
-                "✗ runstate dir {} not writable",
+                "{} runstate dir {} not writable",
+                ui_warn("✗"),
                 paths.runstate_dir().display()
             );
-            println!("    fix: chmod u+w {}", paths.runstate_dir().display());
+            println!(
+                "    {} chmod u+w {}",
+                ui_command("fix:"),
+                paths.runstate_dir().display()
+            );
             println!("    detail: {err}");
         }
     }
     match free_kb(paths.home()) {
         Some(kb) if kb < 1_048_576 => {
             println!(
-                "✗ disk space low: {} MB free in {}",
+                "{} disk space low: {} MB free in {}",
+                ui_warn("✗"),
                 kb / 1024,
                 paths.home().display()
             );
-            println!("    fix: free at least 1 GB or set DEADRECKON_HOME to a larger disk");
+            println!(
+                "    {} free at least 1 GB or set DEADRECKON_HOME to a larger disk",
+                ui_command("fix:")
+            );
         }
         Some(kb) => println!(
-            "✓ disk space {} MB free in {}",
+            "{} disk space {} MB free in {}",
+            ui_ok("✓"),
             kb / 1024,
             paths.home().display()
         ),
         None => {
             println!(
-                "✗ disk space check unavailable for {}",
+                "{} disk space check unavailable for {}",
+                ui_warn("✗"),
                 paths.home().display()
             );
-            println!("    fix: run `df -Pk {}` manually", paths.home().display());
+            println!(
+                "    {} run `df -Pk {}` manually",
+                ui_command("fix:"),
+                paths.home().display()
+            );
         }
     }
 }
@@ -1031,7 +1275,7 @@ fn doctor_os() {
             .ok()
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        println!("✓ os macOS {version}");
+        println!("{} os macOS {version}", ui_ok("✓"));
     }
     #[cfg(target_os = "linux")]
     {
@@ -1041,21 +1285,23 @@ fn doctor_os() {
             .ok()
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        println!("✓ os Linux kernel {version}");
+        println!("{} os Linux kernel {version}", ui_ok("✓"));
     }
 }
 
 fn doctor_subscription_binary(binary: &str) {
     if command_exists(binary) {
         println!(
-            "✓ subscription binary {binary} {}",
+            "{} subscription binary {binary} {}",
+            ui_ok("✓"),
             command_version(std::path::Path::new(binary))
                 .unwrap_or_else(|| "version unknown".to_string())
         );
     } else {
-        println!("✗ subscription binary {binary} missing");
+        println!("{} subscription binary {binary} missing", ui_warn("✗"));
         println!(
-            "    fix: install {binary} or choose another provider with `deadreckon config set defaults.provider <name>`"
+            "    {} install {binary} or choose another provider with `deadreckon config set defaults.provider <name>`",
+            ui_command("fix:")
         );
     }
 }
@@ -1478,7 +1724,7 @@ fn materialize_command(
     include_manifest: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = load_run(&paths, &run_id)?;
+    let state = load_cli_run(&paths, &run_id)?;
     let materialized = materialize_completed_run(&paths, &state, dest, force, include_manifest)?;
     print_materialized(&materialized);
     Ok(())
@@ -1552,9 +1798,9 @@ fn materialize_completed_run(
 }
 
 fn print_materialized(materialized: &MaterializedRun) {
-    println!("materialized run {}", materialized.run_id);
-    println!("source {}", materialized.source.display());
-    println!("dest {}", materialized.dest.display());
+    println!("{} {}", ui_ok("exported run"), ui_id(&materialized.run_id));
+    println!("  source: {}", materialized.source.display());
+    println!("  dest:   {}", materialized.dest.display());
 }
 
 fn apply_command(
@@ -1567,7 +1813,7 @@ fn apply_command(
     message: Option<String>,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = load_run(&paths, &run_id)?;
+    let state = load_cli_run(&paths, &run_id)?;
     if state.status != RunStatus::Completed {
         return Err(CliError::Core(deadreckon_core::user_error(
             &format!("run {} is {}", state.run_id, state.status),
@@ -1657,13 +1903,22 @@ fn apply_command(
     if let Some(stash) = autostash.as_ref() {
         restore_apply_autostash(git_root, &state.run_id, stash)?;
     }
-    println!("applied {} onto {}:", state.run_id, target);
+    println!(
+        "{} {} onto {}",
+        ui_ok("applied"),
+        ui_id(&state.run_id),
+        target
+    );
     println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
     let cleanup_now = cleanup || should_prompt_cleanup(no_confirm)?;
     if cleanup_now {
         cleanup_worktree_run(&state, &record, false, false)?;
     } else {
-        println!("next: deadreckon abandon {}", state.run_id);
+        println!(
+            "{} {}",
+            ui_command("next:"),
+            ui_command(format!("deadreckon discard {}", run_prefix(&state.run_id)))
+        );
     }
     Ok(())
 }
@@ -1783,7 +2038,7 @@ fn should_prompt_cleanup(no_confirm: bool) -> Result<bool> {
 
 fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let mut state = load_run(&paths, &run_id)?;
+    let mut state = load_cli_run(&paths, &run_id)?;
     let record = match read_codebase_record(&state.working_dir) {
         Ok(record) => record,
         Err(_) => {
@@ -1807,6 +2062,125 @@ fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()>
         let _ = kill_loaded_run(&paths, &mut state, true);
     }
     cleanup_worktree_run(&state, &record, keep_branch, force)
+}
+
+fn cleanup_command(
+    run_id: Option<String>,
+    all: bool,
+    completed: bool,
+    stale: bool,
+    no_confirm: bool,
+    force: bool,
+    keep_branch: bool,
+) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    if let Some(run_id) = run_id {
+        let mut state = load_cli_run(&paths, &run_id)?;
+        if state.status == RunStatus::Executing {
+            if !force {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    &format!("run {} is executing", state.run_id),
+                    &format!("deadreckon cleanup {} --force", state.run_id),
+                )));
+            }
+            let _ = kill_loaded_run(&paths, &mut state, true);
+        }
+        let record = read_codebase_record(&state.working_dir)?;
+        cleanup_worktree_run(&state, &record, keep_branch, force)?;
+        return Ok(());
+    }
+
+    let candidates = cleanup_candidates(&paths, all, completed, stale)?;
+    if candidates.is_empty() {
+        println!("no cleanup candidates");
+        if !completed {
+            println!(
+                "hint: use `deadreckon cleanup --completed` to discard completed worktree runs"
+            );
+        }
+        if !all {
+            println!("hint: use `deadreckon cleanup --all` to search every project");
+        }
+        return Ok(());
+    }
+
+    println!("cleanup candidates:");
+    for candidate in &candidates {
+        println!(
+            "  {:<8} {:<10} {:<16} {}",
+            run_prefix(&candidate.state.run_id),
+            candidate.state.status,
+            candidate.reason,
+            one_line(&candidate.state.goal, 72)
+        );
+    }
+    if !no_confirm {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "non-interactive cleanup requires --no-confirm",
+                "deadreckon cleanup --no-confirm",
+            )));
+        }
+        let answer = prompt("clean these runs? [y/N]: ")?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("cancelled");
+            return Ok(());
+        }
+    }
+
+    for mut candidate in candidates {
+        if candidate.state.status == RunStatus::Executing {
+            let _ = kill_loaded_run(&paths, &mut candidate.state, true);
+        }
+        cleanup_worktree_run(&candidate.state, &candidate.record, keep_branch, force)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CleanupCandidate {
+    state: deadreckon_core::PipelineState,
+    record: CodebaseRecord,
+    reason: String,
+}
+
+fn cleanup_candidates(
+    paths: &DeadreckonPaths,
+    all: bool,
+    include_completed: bool,
+    include_stale: bool,
+) -> Result<Vec<CleanupCandidate>> {
+    let scope = if all { None } else { Some(current_scope()?) };
+    let mut candidates = Vec::new();
+    for run in list_runs(paths, scope.as_deref())? {
+        let Ok(state) = load_run(paths, &run.run_id) else {
+            continue;
+        };
+        let Ok(record) = read_codebase_record(&state.working_dir) else {
+            continue;
+        };
+        if record.mode != CodebaseMode::Worktree {
+            continue;
+        }
+        let abandoned = state.run_root.join("abandoned.json").exists();
+        let stale = include_stale && is_stale_executing(&state);
+        let completed = include_completed && state.status == RunStatus::Completed && !abandoned;
+        if abandoned || stale || completed {
+            let reason = if abandoned {
+                "cleaned".to_string()
+            } else if stale {
+                "stale".to_string()
+            } else {
+                "completed".to_string()
+            };
+            candidates.push(CleanupCandidate {
+                state,
+                record,
+                reason,
+            });
+        }
+    }
+    Ok(candidates)
 }
 
 fn cleanup_worktree_run(
@@ -1840,7 +2214,7 @@ fn cleanup_worktree_run(
         }
     }
     write_abandoned_marker(state)?;
-    println!("abandoned {}", state.run_id);
+    println!("{} {}", ui_ok("abandoned"), ui_id(&state.run_id));
     for item in removed {
         println!("  removed: {item}");
     }
@@ -1884,7 +2258,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     }
 
     let paths = DeadreckonPaths::discover();
-    let parent = load_run(&paths, &parent_run_id)?;
+    let parent = load_cli_run(&paths, &parent_run_id)?;
     if parent.status != RunStatus::Completed {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
             "parent {} is {}; use 'deadreckon resume' for incomplete runs",
@@ -2053,10 +2427,12 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
 
     let completed = outcome == RunLoopOutcome::Done;
     match outcome {
-        RunLoopOutcome::Done => println!("completed extended run {}", state.run_id),
-        RunLoopOutcome::PausedAtCap => println!("paused extended run {}", state.run_id),
-        RunLoopOutcome::Killed => println!("killed extended run {}", state.run_id),
-        RunLoopOutcome::Failed => println!("failed extended run {}", state.run_id),
+        RunLoopOutcome::Done => println!("{} {}", ui_ok("completed extended run"), state.run_id),
+        RunLoopOutcome::PausedAtCap => {
+            println!("{} {}", ui_warn("paused extended run"), state.run_id)
+        }
+        RunLoopOutcome::Killed => println!("{} {}", ui_warn("killed extended run"), state.run_id),
+        RunLoopOutcome::Failed => println!("{} {}", ui_warn("failed extended run"), state.run_id),
     }
     print_run_locations(&state);
     if completed {
@@ -2528,20 +2904,34 @@ fn escape_toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn list_command(scope: Option<String>, full: bool) -> Result<()> {
+fn list_command(scope: Option<String>, all: bool, full: bool) -> Result<()> {
     // REPORT.md: Workspace Inventory & Run Queue is a local scan over durable
     // runstate, not a live daemon query.
     let paths = DeadreckonPaths::discover();
-    let runs = list_runs(&paths, scope.as_deref())?;
+    let effective_scope = if all {
+        None
+    } else {
+        Some(scope.unwrap_or(current_scope()?))
+    };
+    let runs = list_runs(&paths, effective_scope.as_deref())?;
     if runs.is_empty() {
-        println!("no runs");
+        match effective_scope.as_deref() {
+            Some(scope) => {
+                println!("no runs for current project ({scope})");
+                println!("hint: use `deadreckon list --all` to see every project");
+            }
+            None => println!("no runs"),
+        }
         return Ok(());
     }
     if full {
-        println!("RUN\tSTATUS\tSCOPE\tUPDATED\tMODE\tDOCS\tMATERIALIZED\tGOAL");
+        println!(
+            "{}",
+            ui_heading("RUN\tSTATUS\tSCOPE\tUPDATED\tMODE\tDOCS\tMATERIALIZED\tNEXT\tGOAL")
+        );
         for run in runs {
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 run.run_id,
                 run.status,
                 run.scope,
@@ -2549,33 +2939,89 @@ fn list_command(scope: Option<String>, full: bool) -> Result<()> {
                 codebase_mode_status(&paths, &run),
                 docs_status(&paths, &run),
                 materialized_status(&paths, &run),
+                next_action_label_for_entry(&paths, &run),
                 run.goal
             );
         }
         return Ok(());
     }
 
-    println!(
-        "{:<8}  {:<9}  {:<7}  {:<26}  {:<9}  {:<8}  {:<12}  GOAL",
-        "RUN", "STATUS", "AGE", "SCOPE", "MODE", "DOCS", "MATERIALIZED"
+    let header = format!(
+        "{:<8}  {:<10}  {:<7}  {:<26}  {:<10}  {:<16}  GOAL",
+        "RUN", "STATUS", "AGE", "SCOPE", "MODE", "NEXT"
     );
+    println!("{}", ui_heading(header));
     for run in runs {
         println!(
-            "{:<8}  {:<9}  {:<7}  {:<26}  {:<9}  {:<8}  {:<12}  {}",
-            run_prefix(&run.run_id),
-            truncate_text(&run.status.to_string(), 9),
+            "{:<8}  {:<10}  {:<7}  {:<26}  {:<10}  {:<16}  {}",
+            ui_id(run_prefix(&run.run_id)),
+            truncate_text(&run.status.to_string(), 10),
             relative_age(run.updated_at),
             truncate_text(&run.scope, 26),
-            truncate_text(&codebase_mode_status(&paths, &run), 9),
-            truncate_text(&docs_status(&paths, &run), 8),
-            truncate_text(&materialized_status(&paths, &run), 12),
+            truncate_text(&codebase_mode_status(&paths, &run), 10),
+            truncate_text(&next_action_label_for_entry(&paths, &run), 16),
             truncate_text(&one_line(&run.goal, 80), 80)
         );
     }
     println!(
-        "hint: use `deadreckon show <run-id>` for paths, or `deadreckon list --full` for full values"
+        "{} run ids accept prefixes; use `{}`, `{}`, or `{}`",
+        ui_muted("hint:"),
+        ui_command("deadreckon status latest"),
+        ui_command("deadreckon list --all"),
+        ui_command("deadreckon list --full")
     );
     Ok(())
+}
+
+fn current_scope() -> Result<String> {
+    let cwd = std::env::current_dir()?;
+    workspace_scope(&cwd).map_err(CliError::from)
+}
+
+fn load_cli_run(paths: &DeadreckonPaths, run_id: &str) -> Result<deadreckon_core::PipelineState> {
+    load_cli_run_with_scope(paths, run_id, false)
+}
+
+fn load_cli_run_with_scope(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+    all: bool,
+) -> Result<deadreckon_core::PipelineState> {
+    if matches!(run_id, "latest" | "last") {
+        latest_run(paths, all)
+    } else {
+        load_run(paths, run_id).map_err(CliError::from)
+    }
+}
+
+fn next_action_label_for_entry(
+    paths: &DeadreckonPaths,
+    run: &deadreckon_core::RunListEntry,
+) -> String {
+    load_run(paths, &run.run_id)
+        .map(|state| next_action_label(&state))
+        .unwrap_or_else(|_| "-".to_string())
+}
+
+fn next_action_label(state: &deadreckon_core::PipelineState) -> String {
+    if state.run_root.join("abandoned.json").exists() {
+        return "cleaned".to_string();
+    }
+    if is_stale_executing(state) {
+        return "cleanup --stale".to_string();
+    }
+    match state.status {
+        RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => "attach".to_string(),
+        RunStatus::Failed | RunStatus::Killed => "resume".to_string(),
+        RunStatus::Completed => match read_codebase_record(&state.working_dir)
+            .map(|record| record.mode)
+            .unwrap_or(CodebaseMode::Fresh)
+        {
+            CodebaseMode::Worktree => "apply".to_string(),
+            CodebaseMode::Copy | CodebaseMode::Fresh => "export".to_string(),
+            CodebaseMode::InPlace => "review".to_string(),
+        },
+    }
 }
 
 fn relative_age(updated_at: DateTime<Utc>) -> String {
@@ -2650,7 +3096,7 @@ async fn doc_command(
     doc_skill: Option<String>,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let mut state = load_run(&paths, &run_id)?;
+    let mut state = load_cli_run(&paths, &run_id)?;
     if polish {
         if state.status != RunStatus::Completed {
             return Err(CliError::Core(deadreckon_core::user_error(
@@ -2734,6 +3180,8 @@ async fn doc_command(
 
 async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
+    let state = load_cli_run(&paths, &run_id)?;
+    let run_id = state.run_id.clone();
     if io::stdout().is_terminal() {
         attach_tui(&paths, &run_id, !no_hints).await?;
         let state = load_run(&paths, &run_id)?;
@@ -2742,7 +3190,6 @@ async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let state = load_run(&paths, &run_id)?;
     print_run_summary(&state);
     if state.status == RunStatus::Completed && !no_hints {
         print_lifecycle_hints(&state);
@@ -2752,7 +3199,7 @@ async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
 
 fn kill_command(run_id: String, force: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let mut state = load_run(&paths, &run_id)?;
+    let mut state = load_cli_run(&paths, &run_id)?;
     kill_loaded_run(&paths, &mut state, force)?;
     if force {
         println!("killed run {} forcefully", state.run_id);
@@ -2817,13 +3264,29 @@ fn supervised_pids(state: &deadreckon_core::PipelineState) -> Vec<u32> {
     pids.into_iter().collect()
 }
 
+fn is_stale_executing(state: &deadreckon_core::PipelineState) -> bool {
+    if state.status != RunStatus::Executing {
+        return false;
+    }
+    let pids = supervised_pids(state);
+    if pids.is_empty() {
+        return Utc::now()
+            .signed_duration_since(state.updated_at)
+            .num_minutes()
+            >= 5;
+    }
+    !pids
+        .into_iter()
+        .any(|pid| pid != std::process::id() && deadreckon_core::pid_is_alive(pid))
+}
+
 async fn resume_command(
     run_id: String,
     from_turn: Option<u32>,
     max_wall_seconds: Option<f64>,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let mut state = load_run(&paths, &run_id)?;
+    let mut state = load_cli_run(&paths, &run_id)?;
     if state.status == RunStatus::Completed {
         println!("run {} is already completed", state.run_id);
         return Ok(());
@@ -2892,8 +3355,8 @@ async fn resume_command(
 fn undo_command(run: Option<String>, turn: Option<u32>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = match run {
-        Some(run_id) => load_run(&paths, &run_id)?,
-        None => latest_run(&paths)?,
+        Some(run_id) => load_cli_run(&paths, &run_id)?,
+        None => latest_run(&paths, false)?,
     };
     let target_turn = turn.unwrap_or_else(|| state.turn.saturating_sub(1));
     let restore_state = undo_restore_state(&state)?;
@@ -2934,7 +3397,7 @@ fn undo_restore_state(
 
 fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = load_run(&paths, &run_id)?;
+    let state = load_cli_run(&paths, &run_id)?;
     if let Some(marker) = read_parent_marker(&state.working_dir)?
         && marker.kind == "extended"
     {
@@ -3165,16 +3628,64 @@ fn stable_hash(value: &str) -> u64 {
     hasher.finish()
 }
 
-fn latest_run(paths: &DeadreckonPaths) -> Result<deadreckon_core::PipelineState> {
-    let latest = list_runs(paths, None)?
+fn latest_run(paths: &DeadreckonPaths, all: bool) -> Result<deadreckon_core::PipelineState> {
+    let scope = if all { None } else { Some(current_scope()?) };
+    let latest = list_runs(paths, scope.as_deref())?
         .into_iter()
         .next()
-        .ok_or_else(|| DeadreckonError::NotFound("latest run".to_string()))?;
+        .ok_or_else(|| {
+            DeadreckonError::NotFound(match scope {
+                Some(scope) => format!("latest run for current project ({scope})"),
+                None => "latest run".to_string(),
+            })
+        })?;
     load_run(paths, &latest.run_id).map_err(CliError::from)
 }
 
+fn status_command(run_id: Option<String>, all: bool) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let state = match run_id {
+        Some(run_id) => load_cli_run_with_scope(&paths, &run_id, all)?,
+        None => latest_run(&paths, all)?,
+    };
+    print_status_card(&state);
+    print_lifecycle_hints(&state);
+    Ok(())
+}
+
+fn print_status_card(state: &deadreckon_core::PipelineState) {
+    let short = run_prefix(&state.run_id);
+    let phase = state
+        .active_phase()
+        .map(|phase| format!("{} {}", phase.id.0, phase.name))
+        .unwrap_or_else(|| "-".to_string());
+    println!("deadreckon status");
+    println!("  run:      {} ({})", short, state.run_id);
+    println!(
+        "  state:    {} -> {}",
+        state.status,
+        next_action_label(state)
+    );
+    println!("  phase:    {phase}");
+    println!("  scope:    {}", state.scope);
+    println!("  updated:  {} ago", relative_age(state.updated_at));
+    println!("  provider: {}", state.provider.as_deref().unwrap_or("-"));
+    println!("  sandbox:  {}", state.sandbox);
+    println!("  goal:     {}", one_line(&state.goal, 110));
+    print_run_locations(state);
+    if let Ok(record) = read_codebase_record(&state.working_dir) {
+        println!("  mode:     {}", record.mode);
+        if let Some(branch) = record.branch_name.as_deref() {
+            println!("  branch:   {branch}");
+        }
+        if let Some(worktree) = record.worktree_path.as_ref() {
+            println!("  worktree: {}", worktree.display());
+        }
+    }
+}
+
 fn print_run_summary(state: &deadreckon_core::PipelineState) {
-    println!("run {}", state.run_id);
+    println!("{} {}", ui_heading("run"), ui_id(&state.run_id));
     println!("status {}", state.status);
     println!("goal {}", state.goal);
     print_run_locations(state);
@@ -3196,8 +3707,16 @@ fn print_run_locations(state: &deadreckon_core::PipelineState) {
 }
 
 fn print_run_started(state: &deadreckon_core::PipelineState) {
-    println!("started run {}", state.run_id);
-    println!("attach: deadreckon attach {}", state.run_id);
+    println!(
+        "{} {}",
+        ui_ok("started run"),
+        ui_id(format!("{} ({})", run_prefix(&state.run_id), state.run_id))
+    );
+    println!(
+        "{} {}",
+        ui_command("attach:"),
+        ui_command(format!("deadreckon attach {}", run_prefix(&state.run_id)))
+    );
     println!("state {}", state.state_path().display());
 }
 
@@ -3205,27 +3724,56 @@ fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
     if let Ok(record) = read_codebase_record(&state.working_dir)
         && record.mode == CodebaseMode::Worktree
     {
-        println!("next actions:");
+        println!("{}", ui_heading("next actions:"));
         if let Some(worktree) = record.worktree_path.as_ref() {
             println!("  inspect: cd {} && git status", worktree.display());
         }
-        println!("  apply:   deadreckon apply {}", state.run_id);
-        println!("  abandon: deadreckon abandon {}", state.run_id);
-        println!("  docs:    deadreckon doc {}", state.run_id);
+        println!(
+            "  apply:   {}",
+            ui_command(format!("deadreckon apply {}", run_prefix(&state.run_id)))
+        );
+        println!(
+            "  cleanup: {}",
+            ui_command(format!(
+                "deadreckon apply {} --autostash --cleanup",
+                run_prefix(&state.run_id)
+            ))
+        );
+        println!(
+            "  discard: {}",
+            ui_command(format!("deadreckon discard {}", run_prefix(&state.run_id)))
+        );
+        println!(
+            "  docs:    {}",
+            ui_command(format!("deadreckon doc {}", run_prefix(&state.run_id)))
+        );
         return;
     }
     let task_prefix = state.task_key.chars().take(24).collect::<String>();
-    println!("next actions:");
+    println!("{}", ui_heading("next actions:"));
     println!(
-        "  materialize: deadreckon materialize {} --dest ./{}",
-        state.run_id, task_prefix
+        "  export: {}",
+        ui_command(format!(
+            "deadreckon export {} --dest ./{}",
+            run_prefix(&state.run_id),
+            task_prefix
+        ))
     );
     println!(
-        "  extend:      deadreckon extend {} '<your follow-up goal>'",
-        state.run_id
+        "  extend: {}",
+        ui_command(format!(
+            "deadreckon extend {} '<your follow-up goal>'",
+            run_prefix(&state.run_id)
+        ))
     );
-    println!("  show:        deadreckon show {}", state.run_id);
-    println!("  docs:        deadreckon doc {}", state.run_id);
+    println!(
+        "  show:   {}",
+        ui_command(format!("deadreckon show {}", run_prefix(&state.run_id)))
+    );
+    println!(
+        "  docs:   {}",
+        ui_command(format!("deadreckon doc {}", run_prefix(&state.run_id)))
+    );
 }
 
 async fn complete_run_actions(
@@ -3640,9 +4188,11 @@ struct AttachPanelRows {
 
 #[derive(Debug, Clone, Copy)]
 struct AttachPanelLayout {
+    header: ratatui::layout::Rect,
     activity: ratatui::layout::Rect,
     files: ratatui::layout::Rect,
     processes: ratatui::layout::Rect,
+    footer: ratatui::layout::Rect,
     rows: AttachPanelRows,
 }
 
@@ -3664,20 +4214,22 @@ fn attach_panel_layout(area: ratatui::layout::Rect) -> AttachPanelLayout {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
-            Constraint::Min(10),
             Constraint::Length(5),
+            Constraint::Min(10),
+            Constraint::Length(4),
             Constraint::Length(1),
         ])
         .split(area);
     let center = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .constraints([Constraint::Min(60), Constraint::Length(44)])
         .split(vertical[1]);
     AttachPanelLayout {
+        header: vertical[0],
         activity: center[0],
         files: center[1],
         processes: vertical[2],
+        footer: vertical[3],
         rows: AttachPanelRows {
             activity: panel_inner_rows(center[0]),
             files: panel_inner_rows(center[1]),
@@ -4054,30 +4606,22 @@ fn render_attach(
     tui_state: &AttachTuiState,
 ) {
     let area = frame.area();
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6),
-            Constraint::Min(10),
-            Constraint::Length(5),
-            Constraint::Length(1),
-        ])
-        .split(area);
+    let layout = attach_panel_layout(area);
 
     let metered_provider = provider_is_metered(state);
     let top_constraints = if metered_provider {
         vec![
-            Constraint::Percentage(58),
-            Constraint::Percentage(21),
-            Constraint::Percentage(21),
+            Constraint::Percentage(60),
+            Constraint::Percentage(18),
+            Constraint::Percentage(22),
         ]
     } else {
-        vec![Constraint::Percentage(72), Constraint::Percentage(28)]
+        vec![Constraint::Percentage(74), Constraint::Percentage(26)]
     };
     let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(top_constraints)
-        .split(vertical[0]);
+        .split(layout.header);
     let phase = state
         .active_phase()
         .map(|phase| format!("{} {}", phase.id.0, phase.name))
@@ -4088,16 +4632,19 @@ fn render_attach(
         "working"
     };
     let header = Paragraph::new(format!(
-        "run {}\nstatus {}  phase {}  provider {}  sandbox {}\nturn {}\n{} {}\ngoal {}",
-        state.run_id,
+        "run {}  status {}  phase {}  turn {}  provider {}  sandbox {}\ngoal {}\n{} {}",
+        run_prefix(&state.run_id),
         state.status,
         phase,
+        turn_timer(events, spend, traces, state),
         state.provider.as_deref().unwrap_or("-"),
         state.sandbox,
-        turn_timer(events, spend, traces, state),
+        one_line(&state.goal, top[0].width.saturating_sub(8) as usize),
         path_label,
-        state.working_dir.display(),
-        state.goal
+        one_line(
+            &state.working_dir.display().to_string(),
+            top[0].width.saturating_sub(12) as usize
+        )
     ))
     .block(Block::default().borders(Borders::ALL).title("deadreckon"));
     frame.render_widget(header, top[0]);
@@ -4108,13 +4655,8 @@ fn render_attach(
         render_context(frame, top[1], spend, live);
     }
 
-    let center = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(vertical[1]);
-
-    let stream_rows = center[0].height.saturating_sub(2) as usize;
     let trace_lines = attach_activity_lines(state, spend, traces, events, live);
+    let stream_rows = layout.activity.height.saturating_sub(2) as usize;
     let trace_items = visible_items(&trace_lines, tui_state.activity_scroll, stream_rows);
     frame.render_widget(
         List::new(trace_items).block(
@@ -4132,21 +4674,14 @@ fn render_attach(
                     trace_lines.len(),
                 )),
         ),
-        center[0],
+        layout.activity,
     );
-    render_live_files(frame, center[1], live, tui_state);
-    render_processes(frame, vertical[2], live, tui_state);
-    let footer = if tui_state.show_completion_actions
-        && state.status == RunStatus::Completed
-        && is_worktree_run(state)
-    {
-        "completed: a apply  b abandon  d docs  s show  Tab focus  j/k scroll  q/Esc quit"
-    } else if tui_state.show_completion_actions && state.status == RunStatus::Completed {
-        "completed: m materialize  e extend  d docs  s show  Tab focus  j/k scroll  q/Esc quit"
-    } else {
-        "Tab focus  ↑/↓ j/k scroll  PgUp/PgDn  Home/End  mouse wheel  Ctrl-D detach  q/Esc quit"
-    };
-    frame.render_widget(Paragraph::new(footer), vertical[3]);
+    render_live_files(frame, layout.files, live, tui_state);
+    render_processes(frame, layout.processes, live, tui_state);
+    frame.render_widget(
+        Paragraph::new(footer_for_state(state, tui_state)),
+        layout.footer,
+    );
 }
 
 fn provider_is_metered(state: &deadreckon_core::PipelineState) -> bool {
@@ -4154,6 +4689,20 @@ fn provider_is_metered(state: &deadreckon_core::PipelineState) -> bool {
         .provider
         .as_deref()
         .is_some_and(|provider| provider.starts_with("cli:") || provider.starts_with("import:"))
+}
+
+fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTuiState) -> String {
+    if tui_state.show_completion_actions && state.status == RunStatus::Completed {
+        if is_worktree_run(state) {
+            "[a] Apply  [b] Abandon  [d] Docs  [s] Show  |  Tab focus  j/k scroll  q detach"
+                .to_string()
+        } else {
+            "[m] Materialize  [e] Extend  [d] Docs  [s] Show  |  Tab focus  j/k scroll  q detach"
+                .to_string()
+        }
+    } else {
+        "Detach: q Esc Ctrl-D  |  Focus: Tab  |  Scroll: j/k Up/Down PgUp/PgDn mouse".to_string()
+    }
 }
 
 fn render_spend(
@@ -4310,7 +4859,11 @@ fn render_live_files(
                     AttachPanel::Files,
                 ))
                 .title(panel_title(
-                    "live files",
+                    &format!(
+                        "live files  {} files  {}",
+                        live.file_count,
+                        format_bytes(live.total_bytes)
+                    ),
                     tui_state.focused_panel == AttachPanel::Files,
                     tui_state.files_scroll,
                     rows,
@@ -4322,11 +4875,10 @@ fn render_live_files(
 }
 
 fn live_file_lines(live: &AttachLive) -> Vec<String> {
-    let mut lines = vec![format!(
-        "{} files  {}",
-        live.file_count,
-        format_bytes(live.total_bytes)
-    )];
+    if live.files.is_empty() {
+        return vec!["no files yet".to_string()];
+    }
+    let mut lines = Vec::new();
     lines.extend(live.files.iter().map(|file| {
         format!(
             "{:>7} {:>8}  {}",

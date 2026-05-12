@@ -478,7 +478,11 @@ fn list_shows_materialized_status() {
     assert_success(&materialize);
     assert_eq!(list_runs(&paths, None).expect("runs").len(), 1);
 
-    let output = deadreckon(&paths).arg("list").output().expect("list");
+    let output = deadreckon(&paths)
+        .current_dir(&parent.cwd)
+        .args(["list", "--full"])
+        .output()
+        .expect("list");
 
     assert_success(&output);
     let stdout = stdout(&output);
@@ -531,17 +535,17 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
     let run_stdout = stdout(&output);
     assert!(run_stdout.contains("started run "));
     assert!(run_stdout.contains("attach: deadreckon attach "));
-    assert!(run_stdout.contains("materialize:"));
+    assert!(run_stdout.contains("export:"));
     assert!(run_stdout.contains("extend:"));
     let run_id = run_id_from_stdout(&output);
-    assert!(run_stdout.contains(&format!("attach: deadreckon attach {run_id}")));
+    assert!(run_stdout.contains(&format!("attach: deadreckon attach {}", &run_id[..8])));
     let attach = deadreckon(&paths)
         .arg("attach")
         .arg(&run_id)
         .output()
         .expect("attach");
     assert_success(&attach);
-    assert!(stdout(&attach).contains("materialize:"));
+    assert!(stdout(&attach).contains("export:"));
     assert!(stdout(&attach).contains("extend:"));
 
     let temp = repo_tempdir();
@@ -563,7 +567,7 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .output()
         .expect("run no hints");
     assert_success(&output);
-    assert!(!stdout(&output).contains("materialize:"));
+    assert!(!stdout(&output).contains("export:"));
     assert!(!stdout(&output).contains("extend:"));
     let run_id = run_id_from_stdout(&output);
     let attach = deadreckon(&paths)
@@ -573,7 +577,7 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .output()
         .expect("attach no hints");
     assert_success(&attach);
-    assert!(!stdout(&attach).contains("materialize:"));
+    assert!(!stdout(&attach).contains("export:"));
     assert!(!stdout(&attach).contains("extend:"));
 }
 
@@ -585,8 +589,9 @@ fn help_lists_lifecycle_verbs() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("Lifecycle:"));
-    assert!(stdout.contains("materialize <run-id>"));
-    assert!(stdout.contains("extend <run-id>"));
+    assert!(stdout.contains("status"));
+    assert!(stdout.contains("cleanup"));
+    assert!(stdout.contains("Run ids accept unique prefixes"));
 }
 
 fn completed_parent(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {

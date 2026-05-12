@@ -671,8 +671,12 @@ fn plan_narrative_aggregates_child_summaries() {
 
 #[test]
 fn list_shows_docs_status_column() {
-    let (_temp, paths, _state) = completed_state_with_docs("list docs");
-    let output = deadreckon(paths.home()).arg("list").output().expect("list");
+    let (_temp, paths, state) = completed_state_with_docs("list docs");
+    let output = deadreckon(paths.home())
+        .current_dir(&state.cwd)
+        .args(["list", "--full"])
+        .output()
+        .expect("list");
     assert_success(&output);
     assert!(stdout(&output).contains("DOCS"));
 }

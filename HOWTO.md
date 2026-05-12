@@ -112,11 +112,14 @@ rm -rf "$DEADRECKON_HOME"
 
 deadreckon run "tiny hello rust" --smoke --sandbox none --max-spend 1
 deadreckon list
+deadreckon status
 ```
 
-The default list is compact and shows eight-character run IDs. Commands accept
-unique prefixes, so `deadreckon show 861c51bf` works when that prefix is unique.
-Use `--full` for scripts or exact-copy output.
+The default list is compact, project-scoped, and shows eight-character run IDs.
+Commands accept unique prefixes, so `deadreckon show 861c51bf` works when that
+prefix is unique. Most run-id arguments also accept `latest` or `last`, resolved
+to the latest run for the current project. Use `--all` for global history and
+`--full` for scripts or exact-copy output.
 
 Capture the latest full run id:
 
@@ -128,7 +131,7 @@ Then inspect it:
 
 ```bash
 deadreckon show "$RUN_ID"
-deadreckon attach "$RUN_ID"
+deadreckon attach latest
 ```
 
 ## Normal Coding Run
@@ -137,16 +140,16 @@ After `init`, the normal path in a git repo is:
 
 ```bash
 deadreckon run "make a full task productivity tracker in nodejs that allows me to manage my day"
-deadreckon attach <run-id>
-deadreckon apply <run-id>
-deadreckon abandon <run-id>
+deadreckon attach latest
+deadreckon status
+deadreckon apply latest --autostash --cleanup
 ```
 
 `run` prints the run id and attach command as soon as state is created:
 
 ```text
-started run <run-id>
-attach: deadreckon attach <run-id>
+started run <short-id> (<full-id>)
+attach: deadreckon attach <short-id>
 ```
 
 Before it creates state or files, `run` prints a preview. In a clean git repo,
@@ -207,10 +210,10 @@ The TUI shows:
 run id, status, phase, goal
 working directory
 per-turn timer
-compact spend and context meters
-center-left tool-call/provider activity stream
-center-right live files being generated
-supervised process status
+compact spend/context telemetry
+wide center-left tool-call/provider activity stream
+narrow center-right live files being generated
+bottom supervised process/status panel
 provider activity from live Codex session logs
 ```
 
@@ -229,9 +232,9 @@ After a run completes, the TUI footer adds lifecycle actions:
 
 ```text
 a        apply a completed worktree run
-b        abandon a completed worktree run
+b        abandon/discard a completed worktree run
 d        print the run narrative docs
-m        materialize a completed copy/fresh artifact
+m        materialize/export a completed copy/fresh artifact
 e        extend a completed copy/fresh run with a follow-up goal
 s        show run details
 ```
@@ -253,6 +256,15 @@ library artifact into a normal directory, `e` to start a child run from the
 completed artifact, `d` to read `RUN-NARRATIVE.md`, or `s` to inspect state and lineage. Pass `--no-hints` to
 `run` or `attach` when scripting.
 
+The CLI aliases use friendlier lifecycle names:
+
+```bash
+deadreckon export latest --dest ./finished-project   # alias for materialize
+deadreckon discard latest                            # alias for abandon
+deadreckon next                                      # alias for status
+deadreckon prune --completed                         # alias for cleanup
+```
+
 `extend` is still available for completed worktree runs from the CLI. It creates
 a new `dr/...` branch from the parent run's branch, so the follow-up keeps the
 parent changes without applying them to your checkout first:
@@ -265,14 +277,23 @@ deadreckon extend <worktree-run-id> "continue with the next change"
 
 ```bash
 deadreckon list
+deadreckon list --all
+deadreckon status
+deadreckon next
 deadreckon show <run-id>
+deadreckon show latest
 deadreckon apply <run-id>
 deadreckon apply <run-id> --autostash
 deadreckon apply <run-id> --cleanup --no-confirm
 deadreckon apply <run-id> --strategy merge
 deadreckon apply <run-id> --strategy cherry-pick --no-confirm
 deadreckon abandon <run-id>
+deadreckon discard <run-id>
 deadreckon abandon <run-id> --keep-branch
+deadreckon cleanup --completed
+deadreckon cleanup --stale --force
+deadreckon cleanup --all --completed --no-confirm
+deadreckon prune --completed
 deadreckon kill <run-id>
 deadreckon kill <run-id> --force
 deadreckon resume <run-id>
