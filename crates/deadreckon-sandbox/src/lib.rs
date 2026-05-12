@@ -81,6 +81,44 @@ pub struct SandboxSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSandboxPolicy {
+    pub allow_network: bool,
+    pub read_allowlist: Vec<PathBuf>,
+    pub write_allowlist: Vec<PathBuf>,
+    pub network_allowlist: Vec<String>,
+}
+
+impl ToolSandboxPolicy {
+    pub fn bash(working_dir: impl Into<PathBuf>) -> Self {
+        let working_dir = working_dir.into();
+        Self {
+            allow_network: false,
+            read_allowlist: vec![working_dir.clone()],
+            write_allowlist: vec![working_dir],
+            network_allowlist: Vec::new(),
+        }
+    }
+
+    pub fn cli_provider(
+        working_dir: impl Into<PathBuf>,
+        mut read_allowlist: Vec<PathBuf>,
+        mut write_allowlist: Vec<PathBuf>,
+    ) -> Self {
+        let working_dir = working_dir.into();
+        read_allowlist.push(working_dir.clone());
+        write_allowlist.push(working_dir);
+        dedup_policy_paths(&mut read_allowlist);
+        dedup_policy_paths(&mut write_allowlist);
+        Self {
+            allow_network: true,
+            read_allowlist,
+            write_allowlist,
+            network_allowlist: vec!["*".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCommand {
     pub backend: SandboxBackend,
     pub program: OsString,
@@ -88,6 +126,11 @@ pub struct SandboxCommand {
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
     pub warning: Option<String>,
+}
+
+fn dedup_policy_paths(paths: &mut Vec<PathBuf>) {
+    paths.sort();
+    paths.dedup();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,7 +549,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{SandboxBackend, SandboxError, SandboxSpec, build_command, run};
+    use super::{SandboxBackend, SandboxError, SandboxSpec, ToolSandboxPolicy, build_command, run};
 
     fn shell_spec() -> SandboxSpec {
         SandboxSpec {
@@ -588,6 +631,34 @@ mod tests {
             assert!(profile.contains(".ssh"));
             assert!(profile.contains("(deny file-read*"));
         }
+    }
+
+    #[test]
+    fn sandbox_escape_prompt_cannot_read_home_ssh() {
+        let spec = shell_spec();
+        let profile = super::sandbox_exec_profile(&spec).expect("profile");
+        assert!(profile.contains(".ssh"));
+        assert!(profile.contains("(deny file-read*"));
+        assert!(profile.contains("(deny file-write*"));
+    }
+
+    #[test]
+    fn network_allowlist_blocks_unknown_host() {
+        let mut spec = shell_spec();
+        spec.allow_network = true;
+        spec.network_allowlist = vec!["api.openai.com".to_string()];
+        let profile = super::sandbox_exec_profile(&spec).expect("profile");
+        assert!(profile.contains("(deny network*)"));
+    }
+
+    #[test]
+    fn per_tool_policy_scopes_bash_to_working_dir_without_network() {
+        let work = PathBuf::from("/tmp/deadreckon-policy-work");
+        let policy = ToolSandboxPolicy::bash(&work);
+        assert!(!policy.allow_network);
+        assert_eq!(policy.read_allowlist, vec![work.clone()]);
+        assert_eq!(policy.write_allowlist, vec![work]);
+        assert!(policy.network_allowlist.is_empty());
     }
 
     #[cfg(target_os = "macos")]

@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use deadreckon_sandbox::{SandboxBackend, SandboxSpec, run as run_sandbox};
+use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as run_sandbox};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -40,19 +40,25 @@ pub(crate) async fn run_cli(
         if let Some(home) = std::env::var_os("HOME") {
             env.insert("HOME".to_string(), home.to_string_lossy().to_string());
         }
+        let program = resolved.program.clone().into_os_string();
+        let policy = ToolSandboxPolicy::cli_provider(
+            cwd.clone(),
+            resolved.read_allowlist,
+            cli_provider_write_allowlist(provider),
+        );
         let output = run_sandbox(SandboxSpec {
             backend,
             cwd,
-            program: resolved.program.clone().into_os_string(),
+            program,
             args: args.iter().map(OsString::from).collect(),
             env,
-            allow_network: true,
+            allow_network: policy.allow_network,
             pid_file,
             cancellation_token,
             profile_dir: None,
-            read_allowlist: resolved.read_allowlist,
-            write_allowlist: cli_provider_write_allowlist(provider),
-            network_allowlist: vec!["*".to_string()],
+            read_allowlist: policy.read_allowlist,
+            write_allowlist: policy.write_allowlist,
+            network_allowlist: policy.network_allowlist,
         })
         .await
         .map_err(|source| ProviderError::Cli {

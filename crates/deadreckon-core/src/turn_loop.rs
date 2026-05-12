@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 use deadreckon_providers::{ProviderRequest, ProviderResponse, ProviderRouter};
-use deadreckon_sandbox::{SandboxBackend, SandboxSpec, run as run_sandbox};
+use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as run_sandbox};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -25,7 +25,7 @@ use crate::gate::validate_acceptance_marker;
 use crate::paths::DeadreckonPaths;
 use crate::polish::{PolishConfig, polish_run_docs};
 use crate::promotion::promote_completed_run;
-use crate::state::{PhaseId, PhaseStatus, PipelineState, RunStatus, save_state};
+use crate::state::{PhaseId, PhaseStatus, PipelineState, RunStatus, append_json_line, save_state};
 
 #[derive(Debug, Clone)]
 pub struct RunLoopConfig {
@@ -338,13 +338,14 @@ pub async fn run_turn_loop(
                     },
                 )?;
                 let started = Instant::now();
+                let policy = ToolSandboxPolicy::bash(state.working_dir.clone());
                 let output = match run_sandbox(SandboxSpec {
                     backend: config.sandbox_backend,
                     cwd: state.working_dir.clone(),
                     program: OsString::from("sh"),
                     args: vec![OsString::from("-lc"), OsString::from(command.clone())],
                     env: BTreeMap::new(),
-                    allow_network: false,
+                    allow_network: policy.allow_network,
                     pid_file: Some(
                         state
                             .run_root
@@ -353,9 +354,9 @@ pub async fn run_turn_loop(
                     ),
                     cancellation_token: Some(tool_token),
                     profile_dir: Some(state.run_root.join("sandbox")),
-                    read_allowlist: vec![state.working_dir.clone()],
-                    write_allowlist: Vec::new(),
-                    network_allowlist: Vec::new(),
+                    read_allowlist: policy.read_allowlist,
+                    write_allowlist: policy.write_allowlist,
+                    network_allowlist: policy.network_allowlist,
                 })
                 .await
                 {
@@ -444,7 +445,26 @@ pub async fn run_turn_loop(
                         args: tool_args_json(path.display().to_string()),
                     },
                 )?;
-                let target = safe_working_path(&state.working_dir, &path)?;
+                let target = match safe_working_path(&state.working_dir, &path) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        let reason = err.to_string();
+                        append_tool_refusal(
+                            state,
+                            turn,
+                            &tool_call_id,
+                            "write_file",
+                            &response.model,
+                            &reason,
+                            config.event_sender.as_ref(),
+                        )?;
+                        history.push(format!("tool {tool_call_id} refused: {reason}"));
+                        state.turn = turn;
+                        save_history(state, &history)?;
+                        save_state(state)?;
+                        continue;
+                    }
+                };
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent).with_path(parent)?;
                 }
@@ -707,6 +727,56 @@ fn append_provenance_for_files(
             tool_call_id: tool_call_id.to_string(),
             session_id: state.run_id.clone(),
             files,
+        },
+    )
+}
+
+fn append_tool_refusal(
+    state: &PipelineState,
+    turn: u32,
+    tool_call_id: &str,
+    tool_name: &str,
+    model: &str,
+    reason: &str,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+) -> Result<()> {
+    append_trace(
+        state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn,
+            event: "tool.refused".to_string(),
+            latency_ms: None,
+            detail: json!({
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "reason": reason,
+            }),
+        },
+    )?;
+    append_json_line(
+        &state.run_root.join("provenance.jsonl"),
+        &json!({
+            "timestamp": Utc::now(),
+            "prompt_id": format!("turn-{turn}"),
+            "model": model,
+            "tool_call_id": tool_call_id,
+            "session_id": state.run_id.clone(),
+            "files": [],
+            "event": "tool.refused",
+            "tool_name": tool_name,
+            "reason": reason,
+        }),
+    )?;
+    emit_event(
+        state,
+        sender,
+        RunEventKind::ToolCallResult {
+            turn,
+            tool_call_id: tool_call_id.to_string(),
+            status: "refused".to_string(),
+            preview: event_preview(reason),
         },
     )
 }
@@ -1037,6 +1107,7 @@ fn gate_binary_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use deadreckon_providers::ProviderRouter;
@@ -1047,7 +1118,10 @@ mod tests {
     use crate::paths::DeadreckonPaths;
     use crate::state::{RunOptions, RunStatus, create_run};
 
-    use super::{RunLoopConfig, RunLoopDocsConfig, load_or_reconstruct_history, run_turn_loop};
+    use super::{
+        RunLoopConfig, RunLoopDocsConfig, append_tool_refusal, load_or_reconstruct_history,
+        run_turn_loop, safe_working_path,
+    };
 
     #[tokio::test]
     async fn tui_streams_tool_call_within_250ms() {
@@ -1313,5 +1387,56 @@ mod tests {
         assert!(!trace.contains("tool-3"));
         assert!(!future_snapshot.exists());
         assert_eq!(state.turn, 1);
+    }
+
+    #[test]
+    fn per_tool_policy_refuses_write_outside_working_dir() {
+        let root = PathBuf::from("/tmp/deadreckon-safe-root");
+        let absolute = safe_working_path(&root, Path::new("/Users/gdc/.ssh/id_rsa"))
+            .expect_err("absolute path refused");
+        let parent =
+            safe_working_path(&root, Path::new("../outside.txt")).expect_err("parent path refused");
+
+        assert!(absolute.to_string().contains("unsafe write path"));
+        assert!(parent.to_string().contains("unsafe write path"));
+    }
+
+    #[test]
+    fn tool_refusal_records_provenance_event() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "refusal".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+
+        append_tool_refusal(
+            &state,
+            1,
+            "tool-refused",
+            "write_file",
+            "mock-agent",
+            "unsafe write path ../secret",
+            None,
+        )
+        .expect("refusal");
+
+        let provenance =
+            std::fs::read_to_string(state.run_root.join("provenance.jsonl")).expect("provenance");
+        let traces = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
+        assert!(provenance.contains(r#""event":"tool.refused""#));
+        assert!(provenance.contains("unsafe write path"));
+        assert!(traces.contains(r#""event":"tool.refused""#));
     }
 }
