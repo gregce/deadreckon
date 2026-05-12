@@ -16,8 +16,8 @@ use crossterm::terminal::{
 };
 use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
-    ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainEventKind, ChainNewOptions, ChainStatus,
-    ChainStepMarker, ChainStepStatus, CodebaseMode, CodebaseRecord, ConductorState,
+    ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainEvent, ChainEventKind, ChainNewOptions,
+    ChainStatus, ChainStepMarker, ChainStepStatus, CodebaseMode, CodebaseRecord, ConductorState,
     DeadreckonError, DeadreckonPaths, DocKind, ModeFlags, OnFail, PhaseId, PhaseStatus,
     PolishConfig, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent,
     RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunOptions, RunStatus, SpendRecord,
@@ -2534,13 +2534,21 @@ fn chain_show_command(paths: &DeadreckonPaths, id: &str, why_failed: bool) -> Re
     Ok(())
 }
 
-fn chain_attach_command(paths: &DeadreckonPaths, id: &str, _plain: bool) -> Result<()> {
+fn chain_attach_command(paths: &DeadreckonPaths, id: &str, plain: bool) -> Result<()> {
     let id = resolve_chain_id(paths, id, false)?;
     let chain = load_chain(paths, &id)?;
+    if io::stdout().is_terminal() && !plain {
+        return chain_attach_tui(paths, &id);
+    }
+    print_chain_attach_snapshot(&chain);
+    Ok(())
+}
+
+fn print_chain_attach_snapshot(chain: &Chain) {
     println!(
         "chain {} status: {} steps: {}/{} spend: ${:.2}/{}",
         chain_prefix(&chain.chain_id),
-        chain_status_label(&chain),
+        chain_status_label(chain),
         chain
             .steps
             .iter()
@@ -2571,7 +2579,335 @@ fn chain_attach_command(paths: &DeadreckonPaths, id: &str, _plain: bool) -> Resu
         );
     }
     println!("[r] redo  [e] extend  [p] pause  [k] kill  [Ctrl-D] detach  [q] quit");
-    Ok(())
+}
+
+fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let mut tui_state = ChainAttachTuiState::default();
+
+    let result = loop {
+        let chain = load_chain(paths, chain_id)?;
+        let events = read_jsonl::<ChainEvent>(&paths.chain_events(chain_id))?;
+        tui_state.clamp(&chain);
+        terminal.draw(|frame| render_chain_attach(frame, &chain, &events, &tui_state))?;
+
+        if event::poll(std::time::Duration::from_millis(250))? {
+            match event::read()? {
+                Event::Key(key) if attach_should_quit(key) => break Ok(()),
+                Event::Key(key) => match key.code {
+                    KeyCode::Enter => {
+                        suspend_tui(&mut terminal)?;
+                        if let Some(run_id) = chain
+                            .steps
+                            .get(tui_state.selected_step)
+                            .and_then(|step| step.run_id.clone())
+                        {
+                            let _ = show_command(run_id, None);
+                        } else {
+                            eprintln!("selected step has no run yet");
+                        }
+                        let _ = prompt("press Enter to return to chain attach...");
+                        resume_tui(&mut terminal)?;
+                    }
+                    KeyCode::Char('r') => {
+                        suspend_tui(&mut terminal)?;
+                        let action = chain_redo_command(
+                            paths,
+                            chain_id,
+                            Some(tui_state.selected_step as u32 + 1),
+                            None,
+                            false,
+                        );
+                        if let Err(err) = &action {
+                            eprintln!("error: {err}");
+                        }
+                        let _ = prompt("press Enter to return to chain attach...");
+                        resume_tui(&mut terminal)?;
+                    }
+                    KeyCode::Char('e') => {
+                        suspend_tui(&mut terminal)?;
+                        let goal = prompt("new chain step goal: ")?;
+                        if !goal.trim().is_empty() {
+                            let action = chain_extend_command(paths, chain_id, goal, None, None);
+                            if let Err(err) = &action {
+                                eprintln!("error: {err}");
+                            }
+                        }
+                        let _ = prompt("press Enter to return to chain attach...");
+                        resume_tui(&mut terminal)?;
+                    }
+                    KeyCode::Char('p') => {
+                        suspend_tui(&mut terminal)?;
+                        let action =
+                            chain_pause_command(paths, chain_id, Some("user_paused".to_string()));
+                        if let Err(err) = &action {
+                            eprintln!("error: {err}");
+                        }
+                        let _ = prompt("press Enter to return to chain attach...");
+                        resume_tui(&mut terminal)?;
+                    }
+                    KeyCode::Char('k') => {
+                        suspend_tui(&mut terminal)?;
+                        let answer = prompt("kill chain? [y/N]: ")?;
+                        if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+                            && let Err(err) = chain_kill_command(paths, chain_id, false)
+                        {
+                            eprintln!("error: {err}");
+                        }
+                        let _ = prompt("press Enter to return to chain attach...");
+                        resume_tui(&mut terminal)?;
+                    }
+                    _ => tui_state.handle_key(key, &chain),
+                },
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollDown => tui_state.scroll(1, &chain),
+                    MouseEventKind::ScrollUp => tui_state.scroll(-1, &chain),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    };
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+    result
+}
+
+#[derive(Debug, Default)]
+struct ChainAttachTuiState {
+    selected_step: usize,
+    events_scroll: u16,
+}
+
+impl ChainAttachTuiState {
+    fn clamp(&mut self, chain: &Chain) {
+        if chain.steps.is_empty() {
+            self.selected_step = 0;
+            self.events_scroll = 0;
+            return;
+        }
+        self.selected_step = self.selected_step.min(chain.steps.len() - 1);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, chain: &Chain) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.scroll(-1, chain),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.scroll(1, chain),
+            KeyCode::PageUp => {
+                self.events_scroll = self.events_scroll.saturating_sub(8);
+            }
+            KeyCode::PageDown => {
+                self.events_scroll = self.events_scroll.saturating_add(8);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.selected_step = 0;
+                self.events_scroll = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.selected_step = chain.steps.len().saturating_sub(1);
+            }
+            _ => {}
+        }
+        self.clamp(chain);
+    }
+
+    fn scroll(&mut self, delta: isize, chain: &Chain) {
+        if chain.steps.is_empty() {
+            return;
+        }
+        let next = (self.selected_step as isize + delta)
+            .clamp(0, chain.steps.len().saturating_sub(1) as isize);
+        self.selected_step = next as usize;
+    }
+}
+
+fn render_chain_attach(
+    frame: &mut ratatui::Frame<'_>,
+    chain: &Chain,
+    events: &[ChainEvent],
+    tui_state: &ChainAttachTuiState,
+) {
+    let area = frame.area();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[1]);
+
+    frame.render_widget(
+        Paragraph::new(chain_attach_header_text(chain)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("deadreckon chain"),
+        ),
+        rows[0],
+    );
+    let timeline = chain_timeline_lines(chain, tui_state)
+        .into_iter()
+        .map(ListItem::new)
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(timeline).block(Block::default().borders(Borders::ALL).title("steps")),
+        body[0],
+    );
+    let event_lines = chain_activity_lines(events, tui_state)
+        .into_iter()
+        .map(ListItem::new)
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(event_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("chain activity"),
+        ),
+        body[1],
+    );
+    frame.render_widget(Paragraph::new(chain_attach_footer_text(chain)), rows[2]);
+}
+
+fn chain_attach_header_text(chain: &Chain) -> String {
+    let applied = chain
+        .steps
+        .iter()
+        .filter(|step| step.status == ChainStepStatus::Applied)
+        .count();
+    format!(
+        "{}  status {}  steps {}/{}  spend ${:.6}/{}\npolicy branch={} apply={} strategy={} on-fail={}\nbase {}@{}  cwd {}",
+        chain_prefix(&chain.chain_id),
+        chain_status_label(chain),
+        applied,
+        chain.steps.len(),
+        chain.total_spend_usd,
+        chain
+            .max_spend_usd
+            .map(|value| format!("${value:.6}"))
+            .unwrap_or_else(|| "uncapped".to_string()),
+        branch_policy_label(chain.branch_policy),
+        apply_mode_label(chain.apply_mode),
+        apply_strategy_label(chain_apply_strategy(chain)),
+        on_fail_label(chain.on_fail),
+        chain.base_branch,
+        short_sha(&chain.base_sha),
+        one_line(&chain.cwd.display().to_string(), 96)
+    )
+}
+
+fn chain_timeline_lines(chain: &Chain, tui_state: &ChainAttachTuiState) -> Vec<Line<'static>> {
+    chain
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let marker = if index == tui_state.selected_step {
+                ">"
+            } else {
+                " "
+            };
+            let run = step
+                .run_id
+                .as_deref()
+                .map(|run_id| format!(" run {}", run_prefix(run_id)))
+                .unwrap_or_default();
+            let mut spans = vec![
+                Span::styled(marker.to_string(), Style::default().fg(Color::Cyan)),
+                Span::raw(format!(
+                    " {} step {:>2} {:<8} {}{}",
+                    chain_step_dot(step.status),
+                    step.index + 1,
+                    chain_step_status_label(step.status),
+                    one_line(&step.goal, 54),
+                    run
+                )),
+            ];
+            if let Some(reason) = step.fail_reason.as_deref() {
+                spans.push(Span::styled(
+                    format!("  {}", one_line(reason, 32)),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn chain_activity_lines(
+    events: &[ChainEvent],
+    tui_state: &ChainAttachTuiState,
+) -> Vec<Line<'static>> {
+    let start = usize::from(tui_state.events_scroll).min(events.len());
+    events
+        .iter()
+        .rev()
+        .skip(start)
+        .take(240)
+        .map(|event| {
+            let step = event
+                .step_index
+                .map(|index| format!(" step {}", index + 1))
+                .unwrap_or_default();
+            let detail = if event.detail.is_null() {
+                String::new()
+            } else {
+                format!(" {}", one_line(&event.detail.to_string(), 120))
+            };
+            Line::from(format!(
+                "{} {}{}{}",
+                event.timestamp.format("%H:%M:%S"),
+                chain_event_label(&event.event),
+                step,
+                detail
+            ))
+        })
+        .collect()
+}
+
+fn chain_attach_footer_text(chain: &Chain) -> String {
+    if chain.status == ChainStatus::Paused {
+        format!(
+            "paused: {} | try: show --why-failed | resume | resume --apply-mode preview | undo | q detach",
+            chain.paused_reason.as_deref().unwrap_or("paused")
+        )
+    } else {
+        "[Enter] drill  [r] redo  [e] extend  [p] pause  [k] kill  [Ctrl-D/q/Esc] detach  j/k move  PgUp/PgDn activity".to_string()
+    }
+}
+
+fn chain_event_label(event: &ChainEventKind) -> &'static str {
+    match event {
+        ChainEventKind::ChainCreated => "created",
+        ChainEventKind::ChainStepStarted => "step started",
+        ChainEventKind::ChainRunCompleted => "run completed",
+        ChainEventKind::ChainApplyStarted => "apply started",
+        ChainEventKind::ChainApplied => "applied",
+        ChainEventKind::ChainApplyRefused => "apply refused",
+        ChainEventKind::ChainStepFailed => "step failed",
+        ChainEventKind::ChainPaused => "paused",
+        ChainEventKind::ChainResumed => "resumed",
+        ChainEventKind::ChainKilled => "killed",
+        ChainEventKind::ChainCompleted => "completed",
+        ChainEventKind::ChainUndoStarted => "undo started",
+        ChainEventKind::ChainUndoneStep => "undone step",
+        ChainEventKind::ChainHookInvoked => "hook",
+        ChainEventKind::ChainStepExtended => "extended",
+        ChainEventKind::ChainStepRedone => "redone",
+    }
 }
 
 fn chain_pause_command(paths: &DeadreckonPaths, id: &str, reason: Option<String>) -> Result<()> {
@@ -7247,6 +7583,20 @@ async fn attach_tui(
             match event::read()? {
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key)
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.is_empty()
+                        && read_chain_step_marker(&state.working_dir)?.is_some() =>
+                {
+                    if let Some(marker) = read_chain_step_marker(&state.working_dir)? {
+                        suspend_tui(&mut terminal)?;
+                        let action = chain_attach_command(paths, &marker.chain_id, false);
+                        if let Err(err) = &action {
+                            eprintln!("error: {err}");
+                        }
+                        resume_tui(&mut terminal)?;
+                    }
+                }
+                Event::Key(key)
                     if tui_state.show_completion_actions
                         && state.status == RunStatus::Completed =>
                 {
@@ -7954,8 +8304,14 @@ fn render_attach(
     } else {
         "working"
     };
+    let chain_line = chain_context_line_for_working(&state.working_dir)
+        .ok()
+        .flatten()
+        .map(|line| format!("{line}\n"))
+        .unwrap_or_default();
     let header = Paragraph::new(format!(
-        "run {}  status {}  phase {}  turn {}  provider {}  sandbox {}\ngoal {}\n{} {}",
+        "{}run {}  status {}  phase {}  turn {}  provider {}  sandbox {}\ngoal {}\n{} {}",
+        chain_line,
         run_prefix(&state.run_id),
         state.status,
         phase,
@@ -8019,7 +8375,16 @@ fn provider_is_metered(state: &deadreckon_core::PipelineState) -> bool {
 }
 
 fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTuiState) -> String {
-    if tui_state.show_completion_actions && state.status == RunStatus::Completed {
+    let chain_suffix = if read_chain_step_marker(&state.working_dir)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        "  [c] Chain"
+    } else {
+        ""
+    };
+    let base = if tui_state.show_completion_actions && state.status == RunStatus::Completed {
         if is_worktree_run(state) {
             if tui_state.docs_open {
                 "[d] Activity  [a] Apply  [b] Abandon  [s] Show  |  Tab focus  j/k scroll  q detach"
@@ -8037,7 +8402,8 @@ fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTu
         }
     } else {
         "Detach: q Esc Ctrl-D  |  Focus: Tab  |  Scroll: j/k Up/Down PgUp/PgDn mouse".to_string()
-    }
+    };
+    format!("{base}{chain_suffix}")
 }
 
 fn render_spend(
@@ -8716,11 +9082,55 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
 #[cfg(test)]
 mod tui_tests {
     use super::{
-        AttachPanel, AttachPanelCounts, AttachPanelRows, AttachTuiState, CompletionAction,
-        completion_action_from_input, markdown_to_tui_lines, max_panel_scroll,
+        AttachPanel, AttachPanelCounts, AttachPanelRows, AttachTuiState, ChainAttachTuiState,
+        CompletionAction, chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
+        chain_timeline_lines, completion_action_from_input, markdown_to_tui_lines,
+        max_panel_scroll,
     };
+    use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use deadreckon_core::{
+        ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainEvent, ChainEventKind, ChainNewOptions,
+        ChainStatus, ChainStepStatus, OnFail,
+    };
     use ratatui::style::{Color, Modifier};
+    use ratatui::text::Line;
+
+    fn chain_fixture() -> Chain {
+        let mut chain = Chain::new(ChainNewOptions {
+            root_goal: "build app".to_string(),
+            goals: vec!["first step".to_string(), "second step".to_string()],
+            scope: "scope".to_string(),
+            base_branch: "main".to_string(),
+            base_sha: "abcdef123456".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/project"),
+            provider: Some("smoke".to_string()),
+            model: None,
+            sandbox: "none".to_string(),
+            branch_policy: BranchPolicy::Stack,
+            apply_mode: ApplyMode::Auto,
+            apply_strategy: ApplyStrategy::Squash,
+            apply_allowlist: Vec::new(),
+            on_fail: OnFail::Stop,
+            circuit_breaker_threshold: 2,
+            max_spend_usd: Some(5.0),
+            max_wall_seconds: Some(600.0),
+            deadreckon_version: "0.1.0".to_string(),
+        })
+        .expect("chain");
+        chain.steps[0].status = ChainStepStatus::Applied;
+        chain.steps[0].run_id = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        chain.steps[1].status = ChainStepStatus::Running;
+        chain
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
 
     fn counts() -> AttachPanelCounts {
         AttachPanelCounts {
@@ -8736,6 +9146,74 @@ mod tui_tests {
             files: 4,
             processes: 4,
         }
+    }
+
+    #[test]
+    fn chain_attach_renders_step_timeline_with_status_dots() {
+        let chain = chain_fixture();
+        let tui_state = ChainAttachTuiState::default();
+
+        let lines = chain_timeline_lines(&chain, &tui_state)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(lines[0].contains("● step  1 applied"));
+        assert!(lines[0].contains("run aaaaaaaa"));
+        assert!(lines[1].contains("● step  2 running"));
+    }
+
+    #[test]
+    fn chain_attach_header_shows_policy_apply_mode_on_fail() {
+        let chain = chain_fixture();
+        let header = chain_attach_header_text(&chain);
+
+        assert!(header.contains("status pending"));
+        assert!(header.contains("policy branch=stack apply=auto strategy=squash on-fail=stop"));
+        assert!(header.contains("spend $0.000000/$5.000000"));
+    }
+
+    #[test]
+    fn chain_attach_activity_lists_newest_events_first() {
+        let chain = chain_fixture();
+        let events = vec![
+            ChainEvent {
+                timestamp: Utc::now(),
+                chain_id: chain.chain_id.clone(),
+                event: ChainEventKind::ChainCreated,
+                step_index: None,
+                detail: serde_json::json!({ "goal": "build app" }),
+            },
+            ChainEvent {
+                timestamp: Utc::now(),
+                chain_id: chain.chain_id.clone(),
+                event: ChainEventKind::ChainStepStarted,
+                step_index: Some(1),
+                detail: serde_json::json!({ "goal": "second step" }),
+            },
+        ];
+
+        let lines = chain_activity_lines(&events, &ChainAttachTuiState::default())
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(lines[0].contains("step started step 2"));
+        assert!(lines[1].contains("created"));
+    }
+
+    #[test]
+    fn chain_attach_paused_footer_lists_try_lines() {
+        let mut chain = chain_fixture();
+        chain.status = ChainStatus::Paused;
+        chain.paused_reason = Some("apply_refused_conflict".to_string());
+
+        let footer = chain_attach_footer_text(&chain);
+
+        assert!(footer.contains("paused: apply_refused_conflict"));
+        assert!(footer.contains("show --why-failed"));
+        assert!(footer.contains("resume --apply-mode preview"));
+        assert!(footer.contains("undo"));
     }
 
     #[test]
