@@ -3,25 +3,41 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use deadreckon_core::DocKind;
 
+const TOP_LEVEL_TEMPLATE: &str = "\
+{name} {version}
+{about-with-newline}
+{usage-heading}
+  {usage}{after-help}
+
+Options:
+{options}";
+
 const TOP_LEVEL_HELP: &str = "\
-Core lifecycle:
-  deadreckon init
-  deadreckon doctor
+Typical flow:
   deadreckon done \"builds, tests pass, and opens in a browser\"
   deadreckon run \"build the thing\"
   deadreckon attach latest
-  deadreckon status
   deadreckon finish latest
 
+Core lifecycle:
+  init        configure deadreckon
+  doctor      check provider, sandbox, and local setup
+  done        write/check done criteria in English
+  run         start unattended coding work
+  attach      watch a run in the TUI
+  status      see the latest run and next action
+  finish      apply or export completed work
+
 Continue or recover:
-  deadreckon extend latest \"add tests\"
-  deadreckon resume latest
-  deadreckon kill latest
-  deadreckon cleanup --completed
+  extend      continue from a completed run
+  resume      resume an incomplete run
+  kill        cancel a running task
+  cleanup     remove stale or completed worktrees
 
 More help:
-  deadreckon help-all
-  deadreckon <command> --help
+  help-all    show every command, including advanced commands
+  commands    alias for help-all
+  <command> --help
 
 Run ids accept unique prefixes. `latest` means the newest run for the current project.";
 
@@ -284,6 +300,7 @@ Import is read-only and normalizes other tool histories into deadreckon trace/pr
     version,
     about = "Unattended agentic coding harness",
     long_about = "deadreckon runs long coding tasks in an isolated worktree or sandbox, tracks durable state, and gives you explicit apply/export/cleanup steps.",
+    help_template = TOP_LEVEL_TEMPLATE,
     after_help = TOP_LEVEL_HELP
 )]
 pub(crate) struct Cli {

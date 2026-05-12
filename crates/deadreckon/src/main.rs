@@ -192,6 +192,11 @@ async fn main_inner() -> Result<()> {
         .compact()
         .init();
 
+    if wants_top_level_help() {
+        print_top_help();
+        return Ok(());
+    }
+
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Commands::Status {
         run_id: None,
@@ -485,6 +490,90 @@ async fn main_inner() -> Result<()> {
         Commands::Show { run_id, turn } => show_command(run_id, turn),
         Commands::Status { run_id, all } => status_command(run_id, all),
         Commands::Import { source } => import_command(source),
+    }
+}
+
+fn wants_top_level_help() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    let Some(arg) = args.next() else {
+        return false;
+    };
+    if args.next().is_some() {
+        return false;
+    }
+    matches!(arg.to_string_lossy().as_ref(), "-h" | "--help" | "help")
+}
+
+fn print_top_help() {
+    println!(
+        "{} {}",
+        ui_heading("deadreckon"),
+        ui_muted(env!("CARGO_PKG_VERSION"))
+    );
+    println!(
+        "deadreckon runs long coding tasks in an isolated worktree or sandbox, tracks durable state, and gives you explicit apply/export/cleanup steps."
+    );
+    println!();
+    println!("{}", ui_heading("Usage:"));
+    println!("  {}", ui_command("deadreckon [command]"));
+    println!();
+    println!("{}", ui_heading("Typical flow:"));
+    for command in [
+        "deadreckon done \"builds, tests pass, and opens in a browser\"",
+        "deadreckon run \"build the thing\"",
+        "deadreckon attach latest",
+        "deadreckon finish latest",
+    ] {
+        println!("  {}", ui_command(command));
+    }
+    println!();
+    println!("{}", ui_heading("Core lifecycle:"));
+    for (name, purpose) in [
+        ("init", "configure deadreckon"),
+        ("doctor", "check provider, sandbox, and local setup"),
+        ("done", "write/check done criteria in English"),
+        ("run", "start unattended coding work"),
+        ("attach", "watch a run in the TUI"),
+        ("status", "see the latest run and next action"),
+        ("finish", "apply or export completed work"),
+    ] {
+        println!("  {:<12} {}", ui_command(name), purpose);
+    }
+    println!();
+    println!("{}", ui_heading("Continue or recover:"));
+    for (name, purpose) in [
+        ("extend", "continue from a completed run"),
+        ("resume", "resume an incomplete run"),
+        ("kill", "cancel a running task"),
+        ("cleanup", "remove stale or completed worktrees"),
+    ] {
+        println!("  {:<12} {}", ui_command(name), purpose);
+    }
+    println!();
+    println!("{}", ui_heading("More help:"));
+    for (name, purpose) in [
+        (
+            "help-all",
+            "show every command, including advanced commands",
+        ),
+        ("commands", "alias for help-all"),
+        ("<command> --help", "detailed help for one command"),
+    ] {
+        println!("  {:<18} {}", ui_command(name), purpose);
+    }
+    println!();
+    println!(
+        "{} Run ids accept unique prefixes. {} means the newest run for the current project.",
+        ui_heading("Note:"),
+        ui_command("latest")
+    );
+    println!();
+    println!("{}", ui_heading("Options:"));
+    for (flag, purpose) in [
+        ("-h, --help", "print help"),
+        ("-V, --version", "print version"),
+    ] {
+        println!("  {:<18} {}", ui_command(flag), purpose);
     }
 }
 
