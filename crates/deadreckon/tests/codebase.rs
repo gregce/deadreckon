@@ -1017,6 +1017,40 @@ fn apply_squash_creates_commit_on_user_branch() {
 }
 
 #[test]
+fn apply_squash_is_idempotent_after_changes_already_landed() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+
+    let first_apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("first apply");
+    assert_success(&first_apply);
+    let commits_after_first = git_stdout(&repo, &["rev-list", "--count", "HEAD"]);
+
+    let second_apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("second apply");
+
+    assert_success(&second_apply);
+    let stdout = stdout(&second_apply);
+    assert!(stdout.contains("already applied"), "{stdout}");
+    assert_eq!(
+        git_stdout(&repo, &["rev-list", "--count", "HEAD"]),
+        commits_after_first
+    );
+}
+
+#[test]
 fn apply_refuses_on_dirty_user_tree() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -1087,6 +1121,43 @@ fn apply_cleanup_removes_worktree_and_branch_after_success() {
         .expect("apply");
 
     assert_success(&apply);
+    assert!(!worktree.exists());
+    assert!(!git_ref_exists(&repo, &branch));
+    assert!(state.run_root.join("abandoned.json").exists());
+}
+
+#[test]
+fn apply_cleanup_after_already_applied_removes_worktree_and_branch() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+    let state = load_run(&paths, &run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    let worktree = record.worktree_path.clone().expect("worktree");
+    let branch = record.branch_name.clone().expect("branch");
+
+    let first_apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("first apply");
+    assert_success(&first_apply);
+
+    let cleanup_apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .arg("--cleanup")
+        .output()
+        .expect("cleanup apply");
+
+    assert_success(&cleanup_apply);
+    let stdout = stdout(&cleanup_apply);
+    assert!(stdout.contains("already applied"), "{stdout}");
     assert!(!worktree.exists());
     assert!(!git_ref_exists(&repo, &branch));
     assert!(state.run_root.join("abandoned.json").exists());

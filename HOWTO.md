@@ -307,6 +307,11 @@ deadreckon resume <run-id> --from-turn 2
 deadreckon resume <run-id> --max-wall-seconds 3600
 ```
 
+Re-running `deadreckon apply <run-id>` after the changes are already on the
+target branch is safe: deadreckon reports `already applied` instead of creating
+or failing an empty commit. Add `--cleanup` to remove the temporary worktree and
+branch in that already-applied state.
+
 `resume --from-turn N` truncates reconstructed history to turn `N` and continues with turn `N + 1`.
 
 ## Undo

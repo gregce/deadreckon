@@ -3,6 +3,7 @@
 ## UX consolidation — 2026-05-11
 
 - Added an in-TUI Markdown docs view for completed runs. Press `d` in `attach` to toggle a styled `RUN-NARRATIVE.md` rendering instead of dropping to plain terminal output.
+- Made `deadreckon apply` idempotent when a run branch has already landed on the target branch; it now reports `already applied` and can still perform `--cleanup` instead of failing on an empty commit.
 - Made `deadreckon list` project-scoped by default, with `--all` for global history and `--full` for script-friendly full values.
 - Added `latest` / `last` run-id aliases for user-facing run commands, resolved to the latest run in the current project.
 - Added `deadreckon status` with `next` as an alias; running `deadreckon` with no subcommand now shows the current project's latest run and next action.

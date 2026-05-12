@@ -1846,9 +1846,13 @@ fn apply_command(
         &["diff", "--stat", &format!("{target}..{branch}")],
     )
     .unwrap_or_default();
-    if !diff_stat.trim().is_empty() {
-        eprintln!("{diff_stat}");
+    if diff_stat.trim().is_empty() {
+        print_already_applied(&state, branch, &target);
+        finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
+        return Ok(());
     }
+    eprintln!("{diff_stat}");
+
     if !no_confirm && io::stdin().is_terminal() {
         let answer = prompt("apply these changes? [Y/n]: ")?;
         if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
@@ -1888,6 +1892,15 @@ fn apply_command(
         "squash" => {
             git_status(git_root, &["merge", "--squash", branch])
                 .map_err(|err| apply_merge_error(&state.run_id, &autostash, err))?;
+            let staged_stat = git_stdout(git_root, &["diff", "--cached", "--stat"])?;
+            if staged_stat.trim().is_empty() {
+                if let Some(stash) = autostash.as_ref() {
+                    restore_apply_autostash(git_root, &state.run_id, stash)?;
+                }
+                print_already_applied(&state, branch, &target);
+                finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
+                return Ok(());
+            }
             if let Some(body) = commit_body.as_deref() {
                 git_status(git_root, &["commit", "-m", &commit_subject, "-m", body])?;
             } else {
@@ -1915,9 +1928,29 @@ fn apply_command(
         target
     );
     println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
+    finish_apply_cleanup(&state, &record, cleanup, no_confirm)
+}
+
+fn print_already_applied(state: &deadreckon_core::PipelineState, branch: &str, target: &str) {
+    println!(
+        "{} {} onto {}",
+        ui_ok("already applied"),
+        ui_id(&state.run_id),
+        target
+    );
+    println!("  branch: {branch}");
+    println!("  reason: no file changes remain between the branch and target");
+}
+
+fn finish_apply_cleanup(
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
+    cleanup: bool,
+    no_confirm: bool,
+) -> Result<()> {
     let cleanup_now = cleanup || should_prompt_cleanup(no_confirm)?;
     if cleanup_now {
-        cleanup_worktree_run(&state, &record, false, false)?;
+        cleanup_worktree_run(state, record, false, false)?;
     } else {
         println!(
             "{} {}",
