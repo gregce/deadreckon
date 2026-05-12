@@ -6,7 +6,7 @@ Ship a Rust agentic CLI named **deadreckon** whose **primary** flow is unattende
 
 **References — read first.**
 
-- `/Users/gdc/deadreckon/docs/goals/2026-05-10-deadreckon-build-rider.md` — architecture, must-have needs, decisions, layout, verification.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-10-1400-deadreckon-build-rider.md` — architecture, must-have needs, decisions, layout, verification.
 - `/Users/gdc/stoa/docs/research/2026-05-10-unmet-needs/REPORT.md` — 25 needs; top 10 are V0 scope.
 - `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` — Printing Press pattern. Port structure, not Go code.
 - `/Users/gdc/cli-printing-press/internal/pipeline/{state,lock,phase5_gate}.go` + `/Users/gdc/cli-printing-press/skills/printing-press/SKILL.md` — reference shapes.

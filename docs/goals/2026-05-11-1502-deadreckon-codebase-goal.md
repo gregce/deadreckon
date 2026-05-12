@@ -3,7 +3,7 @@ GOAL: Make codebase-aware running the **default** mode of deadreckon at `/Users/
 **Read first.**
 
 - `/Users/gdc/deadreckon/docs/AS-BUILT-ARCHITECTURE.md` — substrate; only working-dir-seeding changes. `PipelineState` unchanged (mode metadata in `working/.deadreckon/codebase.json` per files-not-fields).
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-codebase-rider.md` — mode resolution, schemas, signatures, preview, depth tests.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-1502-deadreckon-codebase-rider.md` — mode resolution, schemas, signatures, preview, depth tests.
 - `/Users/gdc/stoa/docs/research/2026-05-10-unmet-needs/REPORT.md` — primary needs #3, #2.
 - Prior riders in `/Users/gdc/deadreckon/docs/goals/` — invariants hold.
 

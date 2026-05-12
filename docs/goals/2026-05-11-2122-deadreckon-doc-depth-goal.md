@@ -3,8 +3,8 @@ GOAL: Make every deadreckon run produce documentation as substantive as the stoa
 **Read first.**
 
 - `/Users/gdc/deadreckon/docs/AS-BUILT-ARCHITECTURE.md` (especially §25).
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-self-documenting-rider.md` — predecessor; invariants hold.
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-doc-depth-rider.md` — schemas, prompts, depth tests.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-1525-deadreckon-self-documenting-rider.md` — predecessor; invariants hold.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-2122-deadreckon-doc-depth-rider.md` — schemas, prompts, depth tests.
 - Stoa target shape: `/Users/gdc/stoa/docs/implementation/2026-05-07-MEETING-AUTO-CAPTURE-AND-TRANSCRIPTION.md`, `/Users/gdc/stoa/stoa-cli/pkg/scribe/AS-BUILT-ARCHITECTURE.md`.
 - Current shallow output: `/Users/gdc/test-deadreckon/build-a-full-ms-paint-ty/docs/`.
 - `/Users/gdc/deadreckon/skills/run-narrator/SKILL.md` — current shallow skill.

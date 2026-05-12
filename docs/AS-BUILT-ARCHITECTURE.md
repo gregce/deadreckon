@@ -1141,7 +1141,7 @@ See `/Users/gdc/deadreckon/docs/RESUME-SEMANTICS.md` for the contract.
 | `codex` | `~/.codex/sessions/` (`DEADRECKON_IMPORT_CODEX_ROOT`) | JSONL |
 | `cursor` | `~/.cursor/chats/` (`DEADRECKON_IMPORT_CURSOR_ROOT`) | SQLite |
 
-The handler creates an `imported-<hash>` run, parses the source, appends entries to `traces.jsonl` + `provenance.jsonl`, marks the run `Completed` (skipping the gate), and never writes back to the source. Current coverage is **inventory-level**: it produces a listing/summary but doesn't deeply normalize all fields. Round-trip parity (import → `show <id>` → render comparable to source) is a hardening target — see `docs/goals/2026-05-11-deadreckon-robust-rider.md` §7.
+The handler creates an `imported-<hash>` run, parses the source, appends entries to `traces.jsonl` + `provenance.jsonl`, marks the run `Completed` (skipping the gate), and never writes back to the source. Current coverage is **inventory-level**: it produces a listing/summary but doesn't deeply normalize all fields. Round-trip parity (import → `show <id>` → render comparable to source) is a hardening target — see `docs/goals/2026-05-11-1400-deadreckon-robust-rider.md` §7.
 
 ---
 
@@ -1210,7 +1210,7 @@ let vertical = Layout::default()
 
 ### 18.3 Data source
 
-Today the TUI **polls** files on disk every 500 ms: `spend.jsonl`, `traces.jsonl`, `events.jsonl`, plus `~/.codex/sessions/` for codex-specific provider activity. The `RunEventBus` broadcast channel exists in `deadreckon-core::events` but the TUI does not yet subscribe to it — switching from poll-driven to stream-driven is a robustness-rider hardening target (§1 of `docs/goals/2026-05-11-deadreckon-robust-rider.md`).
+Today the TUI **polls** files on disk every 500 ms: `spend.jsonl`, `traces.jsonl`, `events.jsonl`, plus `~/.codex/sessions/` for codex-specific provider activity. The `RunEventBus` broadcast channel exists in `deadreckon-core::events` but the TUI does not yet subscribe to it — switching from poll-driven to stream-driven is a robustness-rider hardening target (§1 of `docs/goals/2026-05-11-1400-deadreckon-robust-rider.md`).
 
 ---
 
@@ -1374,7 +1374,7 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.
 - Mock HTTP server for tests; CLI provider tests with fake binaries; 13 integration tests including stress and import round-trips.
 
-### Scaffolding-thin (named in `docs/goals/2026-05-11-deadreckon-robust-rider.md`)
+### Scaffolding-thin (named in `docs/goals/2026-05-11-1400-deadreckon-robust-rider.md`)
 
 1. **TUI streaming.** Poll-driven from disk; should be event-driven via the `RunEventBus` broadcast channel.
 2. **Resume from partial trace.** Works at run/state level; doesn't yet handle truly mid-tool-call truncation with grace.
@@ -1387,7 +1387,7 @@ The codebase is more complete than a typical V0 but several layers remain scaffo
 9. **Multi-run coordination.** Locks and scopes work; there's no scheduler or queue.
 10. **Promotion / library workflow.** Atomic swap works; the library doesn't yet have a richer query/listing surface.
 
-### Not yet built (V1+ candidates per `docs/goals/2026-05-11-deadreckon-usability-rider.md` and the V1 list in the robust rider)
+### Not yet built (V1+ candidates per `docs/goals/2026-05-11-1400-deadreckon-usability-rider.md` and the V1 list in the robust rider)
 
 - Sub-agent forking as a user-facing CLI verb.
 - Hook system (pre/post tool call).

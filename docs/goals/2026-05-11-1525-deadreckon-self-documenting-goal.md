@@ -3,7 +3,7 @@ GOAL: Make every deadreckon run at `/Users/gdc/deadreckon/` produce a human-read
 **Read first.**
 
 - `/Users/gdc/deadreckon/docs/AS-BUILT-ARCHITECTURE.md` — substrate.
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-self-documenting-rider.md` — schemas, frontmatter, skill mechanism, depth tests.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-1525-deadreckon-self-documenting-rider.md` — schemas, frontmatter, skill mechanism, depth tests.
 - Stoa exemplars: `/Users/gdc/stoa/docs/implementation/2026-05-07-MEETING-AUTO-CAPTURE-AND-TRANSCRIPTION.md` + `/Users/gdc/stoa/stoa-cli/pkg/scribe/AS-BUILT-ARCHITECTURE.md`.
 - Prior riders in `/Users/gdc/deadreckon/docs/goals/` — invariants hold.
 

@@ -1,10 +1,10 @@
 # deadreckon — Robustness Rider (alpha hardening)
 
 This rider holds the prescriptive constraints for the goal at
-`/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-robust-goal.md`. It
+`/Users/gdc/deadreckon/docs/goals/2026-05-11-1400-deadreckon-robust-goal.md`. It
 supersedes nothing in the earlier riders
-(`2026-05-10-deadreckon-build-rider.md`,
-`2026-05-11-deadreckon-primary-flow-rider.md`) — their invariants,
+(`2026-05-10-1400-deadreckon-build-rider.md`,
+`2026-05-11-1400-deadreckon-primary-flow-rider.md`) — their invariants,
 dependency policy, UX commitments, sandbox defaults, and CLI surface still
 apply. This rider adds depth contracts and a no-new-features fence around
 the hardening work.

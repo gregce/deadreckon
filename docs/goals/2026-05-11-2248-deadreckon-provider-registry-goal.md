@@ -3,8 +3,8 @@ GOAL: Make deadreckon's provider layer pluggable, mining `/Users/gdc/specstory-c
 **Read first.**
 
 - `/Users/gdc/deadreckon/docs/AS-BUILT-ARCHITECTURE.md` — substrate; especially §10 / §19.
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-provider-registry-rider.md` — descriptor schema, registry, depth tests.
-- `/Users/gdc/deadreckon/docs/goals/2026-05-10-deadreckon-build-rider.md` — predecessor; provider invariants hold.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-2248-deadreckon-provider-registry-rider.md` — descriptor schema, registry, depth tests.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-10-1400-deadreckon-build-rider.md` — predecessor; provider invariants hold.
 - specstory-cli exemplars: `/Users/gdc/specstory-cli/pkg/spi/{provider.go,cmdline.go,factory/registry.go}` and `/Users/gdc/specstory-cli/pkg/providers/{claudecode,codexcli,cursorcli,gemini}/provider.go`.
 - Current Rust seams: `/Users/gdc/deadreckon/crates/deadreckon-providers/src/{lib.rs,cli_claude_code.rs,cli_codex.rs,cli_common.rs}`.
 - Prior riders in `/Users/gdc/deadreckon/docs/goals/` — invariants hold.

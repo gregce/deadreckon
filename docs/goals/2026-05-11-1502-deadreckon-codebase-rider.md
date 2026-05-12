@@ -1,13 +1,13 @@
 # deadreckon — Codebase-Mode Rider (codebase as default; worktree as primary)
 
 This rider holds the prescriptive constraints for the goal at
-`/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-codebase-goal.md`.
+`/Users/gdc/deadreckon/docs/goals/2026-05-11-1502-deadreckon-codebase-goal.md`.
 It supersedes nothing in prior riders
-(`2026-05-10-deadreckon-build-rider.md`,
-`2026-05-11-deadreckon-primary-flow-rider.md`,
-`2026-05-11-deadreckon-robust-rider.md`,
-`2026-05-11-deadreckon-usability-rider.md`,
-`2026-05-11-deadreckon-orchestrate-rider.md`) — their invariants,
+(`2026-05-10-1400-deadreckon-build-rider.md`,
+`2026-05-11-1400-deadreckon-primary-flow-rider.md`,
+`2026-05-11-1400-deadreckon-robust-rider.md`,
+`2026-05-11-1400-deadreckon-usability-rider.md`,
+`2026-05-11-1444-deadreckon-orchestrate-rider.md`) — their invariants,
 dependency policy, sandbox defaults, lifecycle hint convention,
 files-not-fields lineage pattern, and existing verbs still apply. This
 rider changes the **default** semantics of `deadreckon run`, adds two

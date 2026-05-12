@@ -1,15 +1,15 @@
 # deadreckon — Audit + Hardening v2 Rider (close §22 thin items)
 
 This rider holds the prescriptive constraints for the goal at
-`/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-audit-harden-goal.md`.
+`/Users/gdc/deadreckon/docs/goals/2026-05-11-2110-deadreckon-audit-harden-goal.md`.
 It supersedes nothing in prior riders
-(`2026-05-10-deadreckon-build-rider.md`,
-`2026-05-11-deadreckon-primary-flow-rider.md`,
-`2026-05-11-deadreckon-robust-rider.md`,
-`2026-05-11-deadreckon-usability-rider.md`,
-`2026-05-11-deadreckon-orchestrate-rider.md`,
-`2026-05-11-deadreckon-codebase-rider.md`,
-`2026-05-11-deadreckon-self-documenting-rider.md`) — their invariants,
+(`2026-05-10-1400-deadreckon-build-rider.md`,
+`2026-05-11-1400-deadreckon-primary-flow-rider.md`,
+`2026-05-11-1400-deadreckon-robust-rider.md`,
+`2026-05-11-1400-deadreckon-usability-rider.md`,
+`2026-05-11-1444-deadreckon-orchestrate-rider.md`,
+`2026-05-11-1502-deadreckon-codebase-rider.md`,
+`2026-05-11-1525-deadreckon-self-documenting-rider.md`) — their invariants,
 dependency policy, sandbox defaults, files-not-fields lineage pattern,
 error-footer convention, and existing verbs still apply. This rider
 adds an audit document, nine concrete closures of §22 thin items, and

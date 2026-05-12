@@ -3,7 +3,7 @@ GOAL: Extend deadreckon at `/Users/gdc/deadreckon/` from a single-agent harness 
 **Read first.**
 
 - `/Users/gdc/deadreckon/docs/AS-BUILT-ARCHITECTURE.md` — substrate to extend (turn loop §9, gate §13, promotion §8, locks §7, scopes §23); §22 names what's thin.
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-orchestrate-rider.md` — schemas, signatures, phases, named depth tests.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-1444-deadreckon-orchestrate-rider.md` — schemas, signatures, phases, named depth tests.
 - `/Users/gdc/stoa/docs/research/2026-05-10-unmet-needs/REPORT.md` — primary needs #2, #6; incidental #1 #5 #7 #8.
 - Prior riders in `/Users/gdc/deadreckon/docs/goals/` — invariants still hold.
 

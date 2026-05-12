@@ -6,8 +6,8 @@ V0 scaffolding at `/Users/gdc/deadreckon/` shipped, but `deadreckon run` is a ha
 
 **References — read first.**
 
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-primary-flow-rider.md` — mock spec, CLI invocations, test matrix, anti-self-attestation gate, verification helpers.
-- `/Users/gdc/deadreckon/docs/goals/2026-05-10-deadreckon-build-rider.md` — original V0 rider; invariants still hold.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-1400-deadreckon-primary-flow-rider.md` — mock spec, CLI invocations, test matrix, anti-self-attestation gate, verification helpers.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-10-1400-deadreckon-build-rider.md` — original V0 rider; invariants still hold.
 - `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` §8 / §9 / §10 / §17.
 - `/Users/gdc/claude-code-source-code/src/{assistant,tools,coordinator,upstreamproxy}/`.
 - `/Users/gdc/deadreckon/{CHANGELOG.md,DESIGN.md,crates/}`.

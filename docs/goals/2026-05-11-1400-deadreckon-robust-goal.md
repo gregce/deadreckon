@@ -6,8 +6,8 @@ The earlier build shipped a credible harness at `/Users/gdc/deadreckon/` (primar
 
 **References — read first.**
 
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-robust-rider.md` — area contracts, test names, V0-cleanup grep list.
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-primary-flow-rider.md` + `2026-05-10-deadreckon-build-rider.md` — prior invariants hold.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-1400-deadreckon-robust-rider.md` — area contracts, test names, V0-cleanup grep list.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-1400-deadreckon-primary-flow-rider.md` + `2026-05-10-1400-deadreckon-build-rider.md` — prior invariants hold.
 - `/Users/gdc/deadreckon/{CHANGELOG.md,DESIGN.md,docs/GAP-ANALYSIS.md}`.
 - `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` §6 / §7 / §8 / §11 / §15 / §17.
 - `/Users/gdc/claude-code-source-code/src/{tools,coordinator,upstreamproxy}/`.

@@ -1,7 +1,7 @@
 # deadreckon — Build Rider (V0)
 
 This rider holds the prescriptive constraints for the goal at
-`/Users/gdc/deadreckon/docs/goals/2026-05-10-deadreckon-build-goal.md`.
+`/Users/gdc/deadreckon/docs/goals/2026-05-10-1400-deadreckon-build-goal.md`.
 Read it before writing code. Sections marked "do not violate" are hard constraints.
 
 **All paths in this document are absolute. Generated code, config, docs, and

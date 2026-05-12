@@ -3,7 +3,7 @@ GOAL: Audit deadreckon at `/Users/gdc/deadreckon/` against the 25 original unmet
 **Read first.**
 
 - `/Users/gdc/deadreckon/docs/AS-BUILT-ARCHITECTURE.md` — substrate; especially §22.
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-audit-harden-rider.md` — audit shape, schemas, depth tests, eleven-phase plan.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-2110-deadreckon-audit-harden-rider.md` — audit shape, schemas, depth tests, eleven-phase plan.
 - `/Users/gdc/stoa/docs/research/2026-05-10-unmet-needs/REPORT.md` — the original 25 needs.
 - `/Users/gdc/deadreckon/CHANGELOG.md`, `docs/GAP-ANALYSIS.md`, `docs/V1-CANDIDATES.md`.
 - Prior riders in `/Users/gdc/deadreckon/docs/goals/` — invariants hold.

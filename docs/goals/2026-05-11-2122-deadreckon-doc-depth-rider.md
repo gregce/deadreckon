@@ -1,9 +1,9 @@
 # deadreckon — Doc Depth Rider (close the gap to stoa shape)
 
 This rider holds the prescriptive constraints for the goal at
-`/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-doc-depth-goal.md`.
+`/Users/gdc/deadreckon/docs/goals/2026-05-11-2122-deadreckon-doc-depth-goal.md`.
 It supersedes nothing in prior riders — and most directly extends
-`/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-self-documenting-rider.md`
+`/Users/gdc/deadreckon/docs/goals/2026-05-11-1525-deadreckon-self-documenting-rider.md`
 (predecessor). Their invariants, file layouts, three-tier skill
 resolution, polish-failure-non-fatal posture, frontmatter format,
 diff-coverage retry, error-footer convention, and existing verbs

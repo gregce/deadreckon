@@ -1,12 +1,12 @@
 # deadreckon — Orchestration Rider (multi-agent on a goal-driven harness)
 
 This rider holds the prescriptive constraints for the goal at
-`/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-orchestrate-goal.md`.
+`/Users/gdc/deadreckon/docs/goals/2026-05-11-1444-deadreckon-orchestrate-goal.md`.
 It supersedes nothing in prior riders
-(`2026-05-10-deadreckon-build-rider.md`,
-`2026-05-11-deadreckon-primary-flow-rider.md`,
-`2026-05-11-deadreckon-robust-rider.md`,
-`2026-05-11-deadreckon-usability-rider.md`) — their invariants, dependency
+(`2026-05-10-1400-deadreckon-build-rider.md`,
+`2026-05-11-1400-deadreckon-primary-flow-rider.md`,
+`2026-05-11-1400-deadreckon-robust-rider.md`,
+`2026-05-11-1400-deadreckon-usability-rider.md`) — their invariants, dependency
 policy, sandbox defaults, CLI surface, lifecycle hints, and existing
 verbs still apply. This rider adds **plans**, **children**, a
 **coordinator**, four new top-level verbs, multi-pane TUI, and the

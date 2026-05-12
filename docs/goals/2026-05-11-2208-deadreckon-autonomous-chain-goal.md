@@ -3,7 +3,7 @@ GOAL: Extend deadreckon at `/Users/gdc/deadreckon/` from a single-shot harness i
 **Read first.**
 
 - `/Users/gdc/deadreckon/docs/AS-BUILT-ARCHITECTURE.md` (§22 thin).
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-autonomous-chain-rider.md` — schemas, verbs, depth tests, hooks, TUI.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-2208-deadreckon-autonomous-chain-rider.md` — schemas, verbs, depth tests, hooks, TUI.
 - `/Users/gdc/Downloads/{AS-BUILT-ARCHITECTURE,printing-press-agentic-techniques}.md`.
 - Prior riders in `/Users/gdc/deadreckon/docs/goals/` — invariants hold.
 

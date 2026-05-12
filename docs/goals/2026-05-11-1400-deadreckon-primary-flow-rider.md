@@ -1,9 +1,9 @@
 # deadreckon — Primary-Flow Rider (V0 completion)
 
 This rider holds the prescriptive constraints for the goal at
-`/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-primary-flow-goal.md`.
+`/Users/gdc/deadreckon/docs/goals/2026-05-11-1400-deadreckon-primary-flow-goal.md`.
 It supersedes nothing in the original V0 rider
-(`/Users/gdc/deadreckon/docs/goals/2026-05-10-deadreckon-build-rider.md`) — that
+(`/Users/gdc/deadreckon/docs/goals/2026-05-10-1400-deadreckon-build-rider.md`) — that
 rider's invariants, dependency policy, UX commitments, file-system layout,
 and engineering style **still apply**. This rider adds the contracts needed
 to make the primary agentic flow real.

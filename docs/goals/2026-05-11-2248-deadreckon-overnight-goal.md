@@ -3,7 +3,7 @@ GOAL: Polish deadreckon at `/Users/gdc/deadreckon/` for true overnight operation
 **Read first.**
 
 - `/Users/gdc/deadreckon/docs/AS-BUILT-ARCHITECTURE.md` — substrate; especially §17 CLI, §18 TUI, §22 thin.
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-overnight-rider.md` — card primitives, schemas, depth tests, sleep-handshake shape, phase plan.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-2248-deadreckon-overnight-rider.md` — card primitives, schemas, depth tests, sleep-handshake shape, phase plan.
 - gnhf exemplars: `https://github.com/kunchenguid/gnhf` (`src/core/{exit-summary,sleep,git}.ts`) — aesthetic + systemd-inhibit handshake to mine.
 - Prior riders in `/Users/gdc/deadreckon/docs/goals/` — invariants hold; doctor + status polish lightly overlap audit-harden P7/P10 (rider says how to land non-conflicting).
 

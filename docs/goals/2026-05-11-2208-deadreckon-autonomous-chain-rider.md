@@ -1,18 +1,18 @@
 # deadreckon — Autonomous Chain Rider (serial goal chaining + auto-apply)
 
 This rider holds the prescriptive constraints for the goal at
-`/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-autonomous-chain-goal.md`.
+`/Users/gdc/deadreckon/docs/goals/2026-05-11-2208-deadreckon-autonomous-chain-goal.md`.
 It supersedes nothing in prior riders
-(`2026-05-10-deadreckon-build-rider.md`,
-`2026-05-11-deadreckon-primary-flow-rider.md`,
-`2026-05-11-deadreckon-robust-rider.md`,
-`2026-05-11-deadreckon-usability-rider.md`,
-`2026-05-11-deadreckon-orchestrate-rider.md`,
-`2026-05-11-deadreckon-codebase-rider.md`,
-`2026-05-11-deadreckon-self-documenting-rider.md`,
-`2026-05-11-deadreckon-audit-harden-rider.md`,
-`2026-05-11-deadreckon-doc-depth-rider.md`,
-`2026-05-11-deadreckon-provider-registry-rider.md`) — their
+(`2026-05-10-1400-deadreckon-build-rider.md`,
+`2026-05-11-1400-deadreckon-primary-flow-rider.md`,
+`2026-05-11-1400-deadreckon-robust-rider.md`,
+`2026-05-11-1400-deadreckon-usability-rider.md`,
+`2026-05-11-1444-deadreckon-orchestrate-rider.md`,
+`2026-05-11-1502-deadreckon-codebase-rider.md`,
+`2026-05-11-1525-deadreckon-self-documenting-rider.md`,
+`2026-05-11-2110-deadreckon-audit-harden-rider.md`,
+`2026-05-11-2122-deadreckon-doc-depth-rider.md`,
+`2026-05-11-2248-deadreckon-provider-registry-rider.md`) — their
 invariants, sandbox defaults, files-not-fields posture, error-footer
 convention, existing verbs, codebase-mode resolution, doc polish,
 provider registry, and acceptance gate still apply. This rider adds:

@@ -1,7 +1,7 @@
 # deadreckon — Overnight Rider (caffeinate + cards)
 
 This rider holds the prescriptive constraints for the goal at
-`/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-overnight-goal.md`.
+`/Users/gdc/deadreckon/docs/goals/2026-05-11-2248-deadreckon-overnight-goal.md`.
 It supersedes nothing in prior riders (2026-05-10-build,
 2026-05-11-{audit-harden, autonomous-chain, codebase, doc-depth,
 orchestrate, primary-flow, provider-registry, robust, self-documenting,

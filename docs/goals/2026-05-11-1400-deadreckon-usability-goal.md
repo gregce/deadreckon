@@ -11,8 +11,8 @@ Two ergonomic holes: (1) completed artifacts stay trapped in `/Users/gdc/.deadre
 
 **References — read first.**
 
-- `/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-usability-rider.md` — signatures, schemas, summary format, test names, README diff.
-- Prior riders hold: `2026-05-10-deadreckon-build-rider.md`, `2026-05-11-deadreckon-primary-flow-rider.md`, `2026-05-11-deadreckon-robust-rider.md`.
+- `/Users/gdc/deadreckon/docs/goals/2026-05-11-1400-deadreckon-usability-rider.md` — signatures, schemas, summary format, test names, README diff.
+- Prior riders hold: `2026-05-10-1400-deadreckon-build-rider.md`, `2026-05-11-1400-deadreckon-primary-flow-rider.md`, `2026-05-11-1400-deadreckon-robust-rider.md`.
 - `/Users/gdc/deadreckon/crates/deadreckon-core/src/{state.rs,promotion.rs,artifacts.rs}` — `PipelineState`, promotion, `copy_tree`.
 - `/Users/gdc/deadreckon/crates/deadreckon/src/main.rs` — CLI verbs, resume guard at line 947.
 - `/Users/gdc/deadreckon/crates/deadreckon/tests/agentic_loop.rs` — integration test pattern.

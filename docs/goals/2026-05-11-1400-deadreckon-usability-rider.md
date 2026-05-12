@@ -1,10 +1,10 @@
 # deadreckon — Usability Rider (materialize + extend)
 
 This rider holds the prescriptive constraints for the goal at
-`/Users/gdc/deadreckon/docs/goals/2026-05-11-deadreckon-usability-goal.md`. Prior
-riders (`2026-05-10-deadreckon-build-rider.md`,
-`2026-05-11-deadreckon-primary-flow-rider.md`,
-`2026-05-11-deadreckon-robust-rider.md`) still apply — their invariants,
+`/Users/gdc/deadreckon/docs/goals/2026-05-11-1400-deadreckon-usability-goal.md`. Prior
+riders (`2026-05-10-1400-deadreckon-build-rider.md`,
+`2026-05-11-1400-deadreckon-primary-flow-rider.md`,
+`2026-05-11-1400-deadreckon-robust-rider.md`) still apply — their invariants,
 dependency policy, UX commitments, sandbox defaults, and CLI surface hold.
 This rider adds two CLI verbs (`materialize`, `extend`), supporting types,
 lifecycle hints, and named tests.
