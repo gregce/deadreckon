@@ -169,7 +169,18 @@ The agent cannot declare its own work accepted.
 
 Completion requires a marker written by the separate `dr-gate` binary and bound to the run id with a run-local nonce. deadreckon refuses forged or self-written markers.
 
-Default acceptance checks that the working directory exists and runs `cargo test` when `Cargo.toml` is present. You can add an explicit `acceptance.yaml`:
+Default acceptance checks that the working directory exists and runs `cargo test` when `Cargo.toml` is present. For real work, write the definition of done in English and let deadreckon compile it into the `dr-gate` format:
+
+```bash
+deadreckon acceptance setup "build, load in a browser, and show no console errors"
+deadreckon acceptance add browser
+deadreckon acceptance check
+deadreckon run "finish the app"
+```
+
+`deadreckon run` and `deadreckon chain run` prompt interactively when a project has no acceptance file yet. The generated files live under `.deadreckon/acceptance.yaml`, `.deadreckon/acceptance.md`, and optional helper scripts in `.deadreckon/acceptance/`.
+
+You can still edit the compiled YAML directly:
 
 ```yaml
 name: notes check
@@ -183,14 +194,7 @@ checks:
     cwd: "{working_dir}"
 ```
 
-Supported check kinds:
-
-```text
-cargo_test
-file_exists
-content_match
-build_success
-```
+Supported executable check kinds are `cargo_test`, `file_exists`, `content_match`, `build_success`, and `shell`. `content_match` treats `pattern` as a regex when valid, with substring fallback for simple text.
 
 ### Provenance, Traces, And Run Docs
 

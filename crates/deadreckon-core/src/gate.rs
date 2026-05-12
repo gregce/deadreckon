@@ -1,7 +1,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,16 @@ pub struct AcceptanceCheckResult {
     pub passed: bool,
     pub must_pass: bool,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
 }
 
 pub fn marker_path(state: &PipelineState) -> PathBuf {
@@ -139,6 +150,11 @@ pub fn write_acceptance_marker(
             passed: true,
             must_pass: true,
             detail: format!("legacy check {}", idx + 1),
+            command: None,
+            cwd: None,
+            duration_ms: None,
+            stdout: None,
+            stderr: None,
         })
         .collect::<Vec<_>>();
     write_acceptance_marker_with_results(run_root, run_id, working_dir, checks)
@@ -179,6 +195,23 @@ pub fn evaluate_acceptance(
     run_root: &Path,
     working_dir: &Path,
 ) -> Result<Vec<AcceptanceCheckResult>> {
+    let results = evaluate_acceptance_checks(run_root, working_dir)?;
+    if let Some(failed) = results
+        .iter()
+        .find(|result| result.must_pass && !result.passed)
+    {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "acceptance check failed: {}",
+            failed.detail
+        )));
+    }
+    Ok(results)
+}
+
+pub fn evaluate_acceptance_checks(
+    run_root: &Path,
+    working_dir: &Path,
+) -> Result<Vec<AcceptanceCheckResult>> {
     let spec_path = acceptance_spec_path_for_run_root(run_root);
     if !spec_path.exists() {
         return evaluate_default_acceptance(working_dir);
@@ -188,16 +221,6 @@ pub fn evaluate_acceptance(
     let mut results = Vec::new();
     for check in checks {
         let result = evaluate_check(working_dir, check)?;
-        if result.must_pass && !result.passed {
-            results.push(result);
-            return Err(DeadreckonError::InvalidInput(format!(
-                "acceptance check failed: {}",
-                results
-                    .last()
-                    .map(|result| result.detail.as_str())
-                    .unwrap_or("unknown")
-            )));
-        }
         results.push(result);
     }
     Ok(results)
@@ -205,66 +228,95 @@ pub fn evaluate_acceptance(
 
 fn evaluate_default_acceptance(working_dir: &Path) -> Result<Vec<AcceptanceCheckResult>> {
     if working_dir.join("Cargo.toml").exists() {
-        let status = Command::new("cargo")
+        let started = Instant::now();
+        let output = Command::new("cargo")
             .arg("test")
             .current_dir(working_dir)
-            .status()
+            .output()
             .map_err(|source| DeadreckonError::Io {
                 path: working_dir.join("Cargo.toml"),
                 source,
             })?;
-        if !status.success() {
-            return Err(DeadreckonError::InvalidInput(
-                "cargo test failed in working directory".to_string(),
-            ));
-        }
         return Ok(vec![AcceptanceCheckResult {
             kind: "cargo_test".to_string(),
-            passed: true,
+            passed: output.status.success(),
             must_pass: true,
-            detail: "cargo test passed".to_string(),
+            detail: format!("cargo test exited with {}", output.status),
+            command: Some("cargo test".to_string()),
+            cwd: Some(working_dir.to_path_buf()),
+            duration_ms: Some(duration_ms(started)),
+            stdout: clipped_stdout(&output),
+            stderr: clipped_stderr(&output),
         }]);
     }
     if !working_dir.is_dir() {
-        return Err(DeadreckonError::InvalidInput(format!(
-            "working directory does not exist: {}",
-            working_dir.display()
-        )));
+        return Ok(vec![AcceptanceCheckResult {
+            kind: "working_dir".to_string(),
+            passed: false,
+            must_pass: true,
+            detail: format!("working directory missing: {}", working_dir.display()),
+            command: None,
+            cwd: Some(working_dir.to_path_buf()),
+            duration_ms: None,
+            stdout: None,
+            stderr: None,
+        }]);
     }
     Ok(vec![AcceptanceCheckResult {
         kind: "working_dir".to_string(),
         passed: true,
         must_pass: true,
         detail: "working directory exists".to_string(),
+        command: None,
+        cwd: Some(working_dir.to_path_buf()),
+        duration_ms: None,
+        stdout: None,
+        stderr: None,
     }])
 }
 
 fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<AcceptanceCheckResult> {
     match check {
         AcceptanceCheck::CargoTest { args, must_pass } => {
-            let status = Command::new("cargo")
+            let started = Instant::now();
+            let output = Command::new("cargo")
                 .arg("test")
-                .args(args)
+                .args(&args)
                 .current_dir(working_dir)
-                .status()
+                .output()
                 .map_err(|source| DeadreckonError::Io {
                     path: working_dir.join("Cargo.toml"),
                     source,
                 })?;
             Ok(AcceptanceCheckResult {
                 kind: "cargo_test".to_string(),
-                passed: status.success(),
+                passed: output.status.success(),
                 must_pass,
-                detail: format!("cargo test exited with {status}"),
+                detail: format!("cargo test exited with {}", output.status),
+                command: Some(format_command("cargo test", &args)),
+                cwd: Some(working_dir.to_path_buf()),
+                duration_ms: Some(duration_ms(started)),
+                stdout: clipped_stdout(&output),
+                stderr: clipped_stderr(&output),
             })
         }
         AcceptanceCheck::FileExists { path, must_pass } => {
             let path = render_template(working_dir, &path);
+            let exists = path.exists();
             Ok(AcceptanceCheckResult {
                 kind: "file_exists".to_string(),
-                passed: path.exists(),
+                passed: exists,
                 must_pass,
-                detail: format!("{} exists", path.display()),
+                detail: if exists {
+                    format!("{} exists", path.display())
+                } else {
+                    format!("{} is missing", path.display())
+                },
+                command: None,
+                cwd: None,
+                duration_ms: None,
+                stdout: None,
+                stderr: None,
             })
         }
         AcceptanceCheck::ContentMatch {
@@ -274,28 +326,50 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
         } => {
             let path = render_template(working_dir, &path);
             let body = std::fs::read_to_string(&path).unwrap_or_default();
+            let matched = regex::Regex::new(&pattern)
+                .map(|regex| regex.is_match(&body))
+                .unwrap_or_else(|_| body.contains(&pattern));
             Ok(AcceptanceCheckResult {
                 kind: "content_match".to_string(),
-                passed: body.contains(&pattern),
+                passed: matched,
                 must_pass,
-                detail: format!("{} contains {:?}", path.display(), pattern),
+                detail: if matched {
+                    format!("{} matches {:?}", path.display(), pattern)
+                } else {
+                    format!("{} does not match {:?}", path.display(), pattern)
+                },
+                command: None,
+                cwd: None,
+                duration_ms: None,
+                stdout: None,
+                stderr: None,
             })
         }
         AcceptanceCheck::BuildSuccess { cwd, must_pass } => {
             let cwd = render_template(working_dir, &cwd);
-            let status = Command::new("cargo")
+            let started = Instant::now();
+            let output = Command::new("cargo")
                 .arg("build")
                 .current_dir(&cwd)
-                .status()
+                .output()
                 .map_err(|source| DeadreckonError::Io {
                     path: cwd.join("Cargo.toml"),
                     source,
                 })?;
             Ok(AcceptanceCheckResult {
                 kind: "build_success".to_string(),
-                passed: status.success(),
+                passed: output.status.success(),
                 must_pass,
-                detail: format!("cargo build in {} exited with {status}", cwd.display()),
+                detail: format!(
+                    "cargo build in {} exited with {}",
+                    cwd.display(),
+                    output.status
+                ),
+                command: Some("cargo build".to_string()),
+                cwd: Some(cwd),
+                duration_ms: Some(duration_ms(started)),
+                stdout: clipped_stdout(&output),
+                stderr: clipped_stderr(&output),
             })
         }
         AcceptanceCheck::Shell {
@@ -306,26 +380,75 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
             let cwd = cwd
                 .map(|cwd| render_template(working_dir, &cwd))
                 .unwrap_or_else(|| working_dir.to_path_buf());
-            let status = Command::new("sh")
+            let started = Instant::now();
+            let output = Command::new("sh")
                 .arg("-lc")
                 .arg(&command)
                 .current_dir(&cwd)
-                .status()
+                .output()
                 .map_err(|source| DeadreckonError::Io {
                     path: cwd.clone(),
                     source,
                 })?;
             Ok(AcceptanceCheckResult {
                 kind: "shell".to_string(),
-                passed: status.success(),
+                passed: output.status.success(),
                 must_pass,
                 detail: format!(
-                    "shell {:?} in {} exited with {status}",
+                    "shell {:?} in {} exited with {}",
                     command,
-                    cwd.display()
+                    cwd.display(),
+                    output.status
                 ),
+                command: Some(command),
+                cwd: Some(cwd),
+                duration_ms: Some(duration_ms(started)),
+                stdout: clipped_stdout(&output),
+                stderr: clipped_stderr(&output),
             })
         }
+    }
+}
+
+fn duration_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn clipped_stdout(output: &Output) -> Option<String> {
+    clipped_output(&output.stdout)
+}
+
+fn clipped_stderr(output: &Output) -> Option<String> {
+    clipped_output(&output.stderr)
+}
+
+fn clipped_output(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(clip_text(&text, 4096))
+    }
+}
+
+fn clip_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut clipped = text
+        .char_indices()
+        .take_while(|(idx, _)| *idx < limit)
+        .map(|(_, ch)| ch)
+        .collect::<String>();
+    clipped.push_str("\n... output truncated ...");
+    clipped
+}
+
+fn format_command(base: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} {}", args.join(" "))
     }
 }
 
@@ -683,6 +806,94 @@ optional:
     }
 
     #[test]
+    fn acceptance_checks_collect_failure_evidence_without_short_circuiting() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "spec-fail-evidence".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            r#"
+checks:
+  - kind: shell
+    command: "echo first-failed >&2; exit 4"
+  - kind: shell
+    command: "echo second-ran"
+"#,
+        )
+        .expect("spec");
+
+        let results =
+            super::evaluate_acceptance_checks(&state.run_root, &state.working_dir).expect("checks");
+
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].passed);
+        assert!(
+            results[0]
+                .stderr
+                .as_deref()
+                .is_some_and(|stderr| stderr.contains("first-failed"))
+        );
+        assert!(results[1].passed);
+        assert!(
+            results[1]
+                .stdout
+                .as_deref()
+                .is_some_and(|stdout| stdout.contains("second-ran"))
+        );
+    }
+
+    #[test]
+    fn content_match_accepts_regex_patterns() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "regex".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(state.working_dir.join("app.txt"), "version 12").expect("app");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            r#"
+checks:
+  - kind: content_match
+    path: "{working_dir}/app.txt"
+    pattern: 'version \d+'
+"#,
+        )
+        .expect("spec");
+
+        let results =
+            super::evaluate_acceptance(&state.run_root, &state.working_dir).expect("acceptance");
+
+        assert!(results[0].passed);
+    }
+
+    #[test]
     fn marker_signature_includes_check_results() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -710,6 +921,11 @@ optional:
                 passed: true,
                 must_pass: true,
                 detail: "original".to_string(),
+                command: None,
+                cwd: None,
+                duration_ms: None,
+                stdout: None,
+                stderr: None,
             }],
         )
         .expect("marker");

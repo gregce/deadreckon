@@ -915,16 +915,116 @@ fn acceptance_check_dry_runs_project_spec() {
 }
 
 #[test]
+fn acceptance_add_browser_pack_writes_helper_and_yaml() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("browser-app");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(workspace.join("index.html"), "<html><body>ok</body></html>").expect("html");
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args(["acceptance", "add", "browser"])
+        .output()
+        .expect("acceptance add");
+
+    assert_success(&output);
+    let yaml = fs::read_to_string(workspace.join(".deadreckon/acceptance.yaml")).expect("yaml");
+    assert!(yaml.contains("browser-smoke.mjs"));
+    assert!(
+        workspace
+            .join(".deadreckon/acceptance/browser-smoke.mjs")
+            .exists()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acceptance_add_plain_english_uses_provider_files() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("english-app");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(workspace.join("README.md"), "gallery").expect("readme");
+    let response = json!({
+        "acceptance_yaml": "name: english\nchecks:\n  - kind: shell\n    command: \"node .deadreckon/acceptance/gallery-check.mjs\"\n    cwd: \"{working_dir}\"\n",
+        "acceptance_md": "# Acceptance\n\nUsers can add and browse artwork.",
+        "files": {
+            ".deadreckon/acceptance/gallery-check.mjs": "console.log('gallery ok')"
+        }
+    })
+    .to_string();
+    let server = MockServer::start(vec![FixtureResponse {
+        content: response,
+        prompt_tokens: 20,
+        completion_tokens: 20,
+    }])
+    .await;
+    write_config(paths.home(), &server.base_url());
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args([
+            "acceptance",
+            "add",
+            "users can add artwork and browse the gallery",
+            "--provider",
+            "mock",
+        ])
+        .output()
+        .expect("acceptance add english");
+
+    assert_success(&output);
+    assert!(
+        fs::read_to_string(workspace.join(".deadreckon/acceptance.md"))
+            .expect("md")
+            .contains("Users can add")
+    );
+    assert!(
+        workspace
+            .join(".deadreckon/acceptance/gallery-check.mjs")
+            .exists()
+    );
+}
+
+#[test]
+fn acceptance_check_reports_shell_failure_output() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("failed-acceptance");
+    fs::create_dir_all(workspace.join(".deadreckon")).expect("workspace");
+    fs::write(
+        workspace.join(".deadreckon/acceptance.yaml"),
+        "name: failing\nchecks:\n  - kind: shell\n    command: \"echo helpful failure >&2; exit 9\"\n    cwd: \"{working_dir}\"\n",
+    )
+    .expect("yaml");
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args(["acceptance", "check"])
+        .output()
+        .expect("acceptance check");
+
+    assert!(!output.status.success());
+    assert!(stdout(&output).contains("acceptance check failed"));
+    assert!(stdout(&output).contains("helpful failure"));
+}
+
+#[test]
 fn run_copies_project_acceptance_spec_into_run_root() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let workspace = temp.path().join("run-acceptance");
-    fs::create_dir_all(workspace.join(".deadreckon")).expect("workspace");
+    fs::create_dir_all(workspace.join(".deadreckon/acceptance")).expect("workspace");
     fs::write(
         workspace.join(".deadreckon/acceptance.yaml"),
-        "name: run acceptance\nchecks:\n  - kind: shell\n    command: \"test -d .\"\n    cwd: \"{working_dir}\"\n",
+        "name: run acceptance\nchecks:\n  - kind: shell\n    command: \"sh .deadreckon/acceptance/check.sh\"\n    cwd: \"{working_dir}\"\n",
     )
     .expect("yaml");
+    fs::write(
+        workspace.join(".deadreckon/acceptance/check.sh"),
+        "test -d .\n",
+    )
+    .expect("helper");
 
     let output = deadreckon(&paths)
         .current_dir(&workspace)
@@ -948,6 +1048,12 @@ fn run_copies_project_acceptance_spec_into_run_root() {
     let run_id = run_id_from_stdout(&output);
     let state = load_run(&paths, &run_id).expect("state");
     assert!(state.run_root.join("acceptance.yaml").exists());
+    assert!(
+        state
+            .working_dir
+            .join(".deadreckon/acceptance/check.sh")
+            .exists()
+    );
     let marker =
         fs::read_to_string(state.run_root.join("proofs/turn-acceptance.json")).expect("marker");
     assert!(marker.contains("\"kind\": \"shell\""));

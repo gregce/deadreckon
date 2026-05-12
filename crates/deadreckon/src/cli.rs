@@ -9,6 +9,7 @@ Lifecycle:
        deadreckon init
        deadreckon doctor
        deadreckon config provider
+       deadreckon acceptance setup
   2. Start and watch work:
        deadreckon run \"build the thing\"
        deadreckon attach latest
@@ -67,6 +68,8 @@ Common provider/model changes:
   deadreckon config model gpt-5.1-codex --provider cli:codex
 
 Acceptance:
+  deadreckon acceptance setup \"build, test, and open in a browser\"
+  deadreckon acceptance add browser
   deadreckon acceptance init --preset node
   deadreckon acceptance draft \"what should count as done\"
   deadreckon run \"goal\" --acceptance .deadreckon/acceptance.yaml
@@ -77,6 +80,10 @@ Modes:
 
 const ACCEPTANCE_HELP: &str = "\
 Subcommands:
+  deadreckon acceptance setup
+  deadreckon acceptance setup \"build, load in a browser, and show no console errors\"
+  deadreckon acceptance add browser
+  deadreckon acceptance add \"users can add artwork and browse the gallery\"
   deadreckon acceptance init --preset auto
   deadreckon acceptance draft \"generate acceptance for this app\"
   deadreckon acceptance refine \"also require websocket reconnect tests\"
@@ -84,9 +91,12 @@ Subcommands:
   deadreckon acceptance check
 
 Lifecycle:
-  Create `.deadreckon/acceptance.yaml` before a run.
+  Write criteria in English; deadreckon compiles them to `.deadreckon/acceptance.yaml`.
   `deadreckon run` automatically uses it, or pass `--acceptance <path>`.
-  `dr-gate` remains the pass/fail authority at completion.";
+  `dr-gate` remains the pass/fail authority at completion.
+
+Packs:
+  auto, basic, build, test, rust, node, static-site, browser, playwright, vite, nextjs, python";
 
 pub(crate) const CHAIN_HELP: &str = "\
 Chain subcommands:
@@ -816,6 +826,38 @@ impl From<CliDocKind> for DocKind {
 
 #[derive(Subcommand)]
 pub(crate) enum AcceptanceCommand {
+    #[command(
+        about = "Create acceptance criteria from plain English",
+        after_help = ACCEPTANCE_HELP
+    )]
+    Setup {
+        #[arg(value_name = "REQUEST", num_args = 0.., help = "Plain-English definition of done")]
+        request: Vec<String>,
+        #[arg(long, help = "Provider route override for drafting")]
+        provider: Option<String>,
+        #[arg(long, help = "Model override for drafting")]
+        model: Option<String>,
+        #[arg(long, help = "Overwrite existing .deadreckon/acceptance files")]
+        force: bool,
+    },
+    #[command(
+        about = "Add an acceptance pack or plain-English criterion",
+        after_help = ACCEPTANCE_HELP
+    )]
+    Add {
+        #[arg(
+            value_name = "PACK_OR_REQUEST",
+            num_args = 1..,
+            help = "Pack name like browser/node/playwright, or an English criterion"
+        )]
+        request: Vec<String>,
+        #[arg(long, help = "Provider route override for English criteria")]
+        provider: Option<String>,
+        #[arg(long, help = "Model override for English criteria")]
+        model: Option<String>,
+        #[arg(long, help = "Overwrite generated helper files")]
+        force: bool,
+    },
     #[command(about = "Write a local acceptance template", after_help = ACCEPTANCE_HELP)]
     Init {
         #[arg(

@@ -54,9 +54,9 @@ pub use events::{
 };
 pub use gate::{
     AcceptanceCheck, AcceptanceCheckResult, AcceptanceMarker, AcceptanceSpec,
-    acceptance_spec_path_for_run_root, evaluate_acceptance, gate_nonce_path_for_run_root,
-    marker_path_for_run_root, validate_acceptance_marker, write_acceptance_marker,
-    write_acceptance_marker_with_results,
+    acceptance_spec_path_for_run_root, evaluate_acceptance, evaluate_acceptance_checks,
+    gate_nonce_path_for_run_root, marker_path_for_run_root, validate_acceptance_marker,
+    write_acceptance_marker, write_acceptance_marker_with_results,
 };
 pub use lock::{
     LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,
