@@ -20,11 +20,11 @@ use deadreckon_core::{
     PhaseStatus, PolishConfig, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent,
     RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunOptions, RunStatus, SpendRecord,
     TraceRecord, WorktreeOptions, acquire_lock, append_parent_narrative_update, append_provenance,
-    append_trace, apply_commit_body, copy_source_to_working, copy_tree, create_run,
-    create_worktree, doc_path_for_kind, docs_status_for_state, inventory_files, list_runs,
-    load_run, polish_run_docs, prepare_worktree_record, preview_git_state, read_codebase_record,
-    record_for_resolved_mode, release_lock_file, resolve_mode, restore_snapshot, run_turn_loop,
-    save_state, terminate_pid,
+    append_trace, apply_commit_body, clear_cancel_marker, copy_source_to_working, copy_tree,
+    create_run, create_worktree, doc_path_for_kind, docs_status_for_state, emit_event,
+    inventory_files, list_runs, load_run, polish_run_docs, prepare_worktree_record,
+    preview_git_state, read_codebase_record, record_for_resolved_mode, release_lock_file,
+    resolve_mode, restore_snapshot, run_turn_loop, save_state, terminate_pid, write_cancel_marker,
 };
 use deadreckon_providers::{ProviderRouteInfo, ProviderRouter};
 use deadreckon_sandbox::SandboxBackend;
@@ -3445,12 +3445,20 @@ fn kill_loaded_run(
     force: bool,
 ) -> Result<()> {
     let pids = supervised_pids(state);
+    write_cancel_marker(state, "killed by user")?;
     release_lock_file(paths, &state.scope, &state.task_key)?;
     state.status = RunStatus::Killed;
     state.failure_reason = Some("killed by user".to_string());
     state.killed_at = Some(Utc::now());
     state.updated_at = Utc::now();
     save_state(state)?;
+    emit_event(
+        state,
+        None,
+        deadreckon_core::RunEventKind::RunCompleted {
+            status: "killed".to_string(),
+        },
+    )?;
     for pid in &pids {
         if *pid != std::process::id() {
             let _ = terminate_pid(*pid, force);
@@ -3533,6 +3541,7 @@ async fn resume_command(
     state.pause_reason = None;
     state.killed_at = None;
     state.status = RunStatus::Planned;
+    clear_cancel_marker(&state)?;
     if let Some(max_wall_seconds) = max_wall_seconds {
         state.max_wall_seconds = Some(max_wall_seconds);
     }

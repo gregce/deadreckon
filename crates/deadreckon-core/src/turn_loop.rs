@@ -16,6 +16,7 @@ use crate::artifacts::{
     ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
     inventory_files, snapshot_working,
 };
+use crate::cancel::{cancel_marker_path_for_run_root, cancel_marker_present};
 use crate::codebase::{CodebaseMode, read_codebase_record};
 use crate::docs::{TurnDocInput, append_turn_doc};
 use crate::error::{DeadreckonError, IoContext, Result};
@@ -84,13 +85,14 @@ pub async fn run_turn_loop(
     state.set_phase_status(PhaseId(40), PhaseStatus::Executing)?;
     save_state(state)?;
     let run_token = config.cancellation_token.clone().unwrap_or_default();
+    let _cancel_marker_guard = CancelMarkerGuard::spawn(state.run_root.clone(), run_token.clone());
     if let Some(from_turn) = config.from_turn {
         state.turn = from_turn;
         save_state(state)?;
     }
 
     for _ in 0..config.max_turns {
-        if state.status == crate::state::RunStatus::Killed || run_token.is_cancelled() {
+        if should_cancel_run(state, &run_token) {
             state.status = crate::state::RunStatus::Killed;
             state.failure_reason = Some("run cancelled".to_string());
             save_state(state)?;
@@ -132,7 +134,24 @@ pub async fn run_turn_loop(
         };
 
         let started = Instant::now();
-        let response = router.complete(&request).await?;
+        let response = match router.complete(&request).await {
+            Ok(response) => response,
+            Err(err) if should_cancel_run(state, &run_token) => {
+                state.status = crate::state::RunStatus::Killed;
+                state.failure_reason = Some(format!("run cancelled during provider call: {err}"));
+                save_state(state)?;
+                emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
+                return Ok(RunLoopOutcome::Killed);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if should_cancel_run(state, &run_token) {
+            state.status = crate::state::RunStatus::Killed;
+            state.failure_reason = Some("run cancelled after provider call".to_string());
+            save_state(state)?;
+            emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
+            return Ok(RunLoopOutcome::Killed);
+        }
         let provider_trace_id = format!("llm-turn-{turn}");
         append_trace(
             state,
@@ -319,7 +338,7 @@ pub async fn run_turn_loop(
                     },
                 )?;
                 let started = Instant::now();
-                let output = run_sandbox(SandboxSpec {
+                let output = match run_sandbox(SandboxSpec {
                     backend: config.sandbox_backend,
                     cwd: state.working_dir.clone(),
                     program: OsString::from("sh"),
@@ -338,7 +357,24 @@ pub async fn run_turn_loop(
                     write_allowlist: Vec::new(),
                     network_allowlist: Vec::new(),
                 })
-                .await?;
+                .await
+                {
+                    Ok(output) => output,
+                    Err(deadreckon_sandbox::SandboxError::Cancelled)
+                        if should_cancel_run(state, &run_token) =>
+                    {
+                        state.status = crate::state::RunStatus::Killed;
+                        state.failure_reason = Some("run cancelled during tool call".to_string());
+                        save_state(state)?;
+                        emit_run_completed(
+                            state,
+                            config.event_sender.as_ref(),
+                            RunLoopOutcome::Killed,
+                        )?;
+                        return Ok(RunLoopOutcome::Killed);
+                    }
+                    Err(err) => return Err(err.into()),
+                };
                 append_trace(
                     state,
                     &TraceRecord {
@@ -495,6 +531,44 @@ pub async fn run_turn_loop(
     save_state(state)?;
     emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
     Ok(RunLoopOutcome::Failed)
+}
+
+fn should_cancel_run(state: &PipelineState, token: &CancellationToken) -> bool {
+    state.status == RunStatus::Killed || token.is_cancelled() || cancel_marker_present(state)
+}
+
+struct CancelMarkerGuard {
+    shutdown: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl CancelMarkerGuard {
+    fn spawn(run_root: PathBuf, run_token: CancellationToken) -> Self {
+        let shutdown = CancellationToken::new();
+        let shutdown_for_task = shutdown.clone();
+        let marker = cancel_marker_path_for_run_root(&run_root);
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_for_task.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        if marker.exists() {
+                            run_token.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self { shutdown, handle }
+    }
+}
+
+impl Drop for CancelMarkerGuard {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.handle.abort();
+    }
 }
 
 fn emit_run_completed(

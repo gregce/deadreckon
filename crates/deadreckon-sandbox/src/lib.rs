@@ -501,10 +501,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
-    use super::{SandboxBackend, SandboxSpec, build_command, run};
+    use super::{SandboxBackend, SandboxError, SandboxSpec, build_command, run};
 
     fn shell_spec() -> SandboxSpec {
         SandboxSpec {
@@ -530,6 +532,29 @@ mod tests {
         assert_eq!(output.stdout, "ok");
         assert!(output.pid.is_some());
         assert!(output.warning.expect("warning").contains("unsafe"));
+    }
+
+    #[tokio::test]
+    async fn subprocess_cancel_escalates_sigterm_to_sigkill() {
+        let token = CancellationToken::new();
+        let mut spec = shell_spec();
+        spec.args = vec![
+            OsString::from("-c"),
+            OsString::from("trap '' TERM; while true; do sleep 1; done"),
+        ];
+        spec.cancellation_token = Some(token.clone());
+        let started = Instant::now();
+        let handle = tokio::spawn(async move { run(spec).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        token.cancel();
+        let err = handle.await.expect("join").expect_err("cancelled");
+
+        assert!(matches!(err, SandboxError::Cancelled));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "cancel did not escalate promptly"
+        );
     }
 
     #[test]

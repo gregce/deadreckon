@@ -1,6 +1,7 @@
 //! Core state, locking, and run artifacts for the deadreckon harness.
 
 pub mod artifacts;
+pub mod cancel;
 pub mod codebase;
 pub mod docs;
 pub mod error;
@@ -16,6 +17,10 @@ pub mod turn_loop;
 pub use artifacts::{
     ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
     copy_tree, inventory_files, restore_snapshot, snapshot_working,
+};
+pub use cancel::{
+    CANCEL_MARKER, CancelMarker, cancel_marker_path, cancel_marker_path_for_run_root,
+    cancel_marker_present, clear_cancel_marker, write_cancel_marker,
 };
 pub use codebase::{
     CODEBASE_RECORD_PATH, CodebaseMode, CodebaseRecord, ModeFlags, PreviewGitState, ResolvedMode,

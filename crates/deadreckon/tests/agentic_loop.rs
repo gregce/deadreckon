@@ -9,7 +9,10 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
-use deadreckon_core::{DeadreckonPaths, RunStatus, list_runs, load_run};
+use deadreckon_core::{
+    DeadreckonPaths, RUN_EVENTS_JSONL, RunStatus, cancel_marker_path, list_runs, load_run,
+    write_cancel_marker,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -64,7 +67,7 @@ async fn mock_provider_records_three_turns_and_artifacts_match() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_mid_turn_sets_killed_and_stops_process() {
+async fn cross_process_kill_writes_cancel_marker_before_signal() {
     let _gate = env!("CARGO_BIN_EXE_dr-gate");
     let temp = repo_tempdir();
     let server = MockServer::start(kill_script()).await;
@@ -101,6 +104,50 @@ async fn kill_mid_turn_sets_killed_and_stops_process() {
     let _ = child.wait();
     let state = load_run(&paths, &run_id).expect("state");
     assert_eq!(state.status, RunStatus::Killed);
+    assert!(cancel_marker_path(&state).exists());
+    let events = fs::read_to_string(state.run_root.join(RUN_EVENTS_JSONL)).expect("events");
+    assert!(events.contains(r#""kind":"run_completed""#));
+    assert!(events.contains(r#""status":"killed""#));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_http_call_aborts_when_cancel_marker_appears() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let server = MockServer::start(kill_script()).await;
+    write_config(temp.path(), &server.base_url());
+    let home = temp.path().join("home");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
+        .arg("mock marker cancel")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .env("DEADRECKON_HOME", &home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run");
+
+    let paths = DeadreckonPaths::from_home(&home);
+    let run_id = wait_for_run_id(&paths);
+    let state = load_run(&paths, &run_id).expect("state");
+    write_cancel_marker(&state, "test marker cancel").expect("cancel marker");
+    assert!(
+        wait_for_child_exit(&mut child, Duration::from_secs(2)),
+        "run did not abort after cancel marker"
+    );
+
+    let state = load_run(&paths, &run_id).expect("state");
+    assert_eq!(state.status, RunStatus::Killed);
+    let events = fs::read_to_string(state.run_root.join(RUN_EVENTS_JSONL)).expect("events");
+    assert!(events.contains(r#""kind":"run_completed""#));
+    assert!(events.contains(r#""status":"killed""#));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -708,6 +755,21 @@ fn wait_for_run_id(paths: &DeadreckonPaths) -> String {
             }
         }
         assert!(Instant::now() < deadline, "run state did not appear");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("try wait").is_some() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
