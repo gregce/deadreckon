@@ -633,7 +633,11 @@ async fn main_inner() -> Result<()> {
             max_wall_seconds,
         } => resume_command(run_id, from_turn, max_wall_seconds).await,
         Commands::Undo { run, turn } => undo_command(run, turn),
-        Commands::Show { run_id, turn } => show_command(run_id, turn),
+        Commands::Show {
+            run_id,
+            turn,
+            why_failed,
+        } => show_command(run_id, turn, why_failed),
         Commands::Status { run_id, all } => status_command(run_id, all),
         Commands::Import { source } => import_command(source),
     }
@@ -2938,7 +2942,7 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
                             .get(tui_state.selected_step)
                             .and_then(|step| step.run_id.clone())
                         {
-                            let _ = show_command(run_id, None);
+                            let _ = show_command(run_id, None, false);
                         } else {
                             eprintln!("selected step has no run yet");
                         }
@@ -10968,13 +10972,97 @@ fn undo_restore_state(
 
 // SAFETY: Show arguments are owned clap values at the command boundary.
 #[allow(clippy::needless_pass_by_value)]
-fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
+fn show_plan_why_failed(paths: &DeadreckonPaths, plan: &Plan) -> Result<()> {
+    if plan.status == PlanStatus::Merged
+        && plan
+            .tasks
+            .iter()
+            .all(|task| task.status == PlanTaskStatus::Completed)
+    {
+        println!("no failures detected");
+        return Ok(());
+    }
+    println!("plan {} failure summary", run_prefix(&plan.plan_id));
+    println!("status {:?}", plan.status);
+    for task in &plan.tasks {
+        if task.status == PlanTaskStatus::Completed {
+            continue;
+        }
+        println!(
+            "child {} {} status {} run {}",
+            task.index,
+            task.task_id,
+            task_status_label(task.status),
+            task.child_run_id
+                .as_deref()
+                .map(run_prefix)
+                .unwrap_or_else(|| "-".to_string())
+        );
+        if let Some(run_id) = task.child_run_id.as_deref() {
+            println!("  try: deadreckon show {} --why-failed", run_prefix(run_id));
+        }
+        if let Some(summary) = task.summary_path.as_ref() {
+            println!(
+                "  summary {}",
+                paths.plan_dir(&plan.plan_id).join(summary).display()
+            );
+        }
+    }
+    let blockers = read_plan_messages(paths, &plan.plan_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|message| message.kind == PlanMessageKind::Blocker)
+        .collect::<Vec<_>>();
+    for message in blockers.iter().rev().take(3) {
+        println!(
+            "blocker {} -> {}: {}",
+            message.from, message.to, message.summary
+        );
+    }
+    Ok(())
+}
+
+fn show_run_why_failed(state: &deadreckon_core::PipelineState) -> Result<()> {
+    if state.status == RunStatus::Completed {
+        println!("no failures detected");
+        return Ok(());
+    }
+    println!("run {} status {}", run_prefix(&state.run_id), state.status);
+    if let Some(reason) = state.failure_reason.as_deref() {
+        println!("reason {}", reason);
+    }
+    let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
+    for trace in traces
+        .iter()
+        .rev()
+        .filter(|trace| {
+            trace.event.contains("error")
+                || trace.event.contains("failed")
+                || trace.detail.get("exit_code").is_some()
+                || trace.detail.get("stderr").is_some()
+        })
+        .take(3)
+    {
+        println!(
+            "turn {} {} {}",
+            trace.turn,
+            trace.event,
+            one_line(&trace.detail.to_string(), 200)
+        );
+    }
+    Ok(())
+}
+
+fn show_command(run_id: String, turn: Option<u32>, why_failed: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = match load_cli_run(&paths, &run_id) {
         Ok(state) => state,
         Err(run_error) => {
             if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
                 let plan = load_plan(&paths, &plan_id)?;
+                if why_failed {
+                    return show_plan_why_failed(&paths, &plan);
+                }
                 print_plan_summary(&paths, &plan, true)?;
                 println!("{}", serde_json::to_string_pretty(&plan)?);
                 return Ok(());
@@ -10982,6 +11070,9 @@ fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
             return Err(run_error);
         }
     };
+    if why_failed {
+        return show_run_why_failed(&state);
+    }
     if let Some(line) = chain_context_line_for_working(&state.working_dir)? {
         println!("{line}");
     }
@@ -11651,7 +11742,7 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
                 }))
                 .await?
             }
-            Some(CompletionAction::Show) => show_command(state.run_id.clone(), None)?,
+            Some(CompletionAction::Show) => show_command(state.run_id.clone(), None, false)?,
             Some(CompletionAction::Quit) | None => break,
         }
     }
@@ -12193,7 +12284,7 @@ async fn handle_tui_completion_key(
             }))
             .await
         }
-        CompletionAction::Show => show_command(state.run_id.clone(), None),
+        CompletionAction::Show => show_command(state.run_id.clone(), None, false),
         CompletionAction::Quit => Ok(()),
     };
     if let Err(err) = &action_result {

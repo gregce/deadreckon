@@ -1092,6 +1092,8 @@ pub(crate) enum Commands {
         run_id: String,
         #[arg(long, help = "Only show trace/provenance records for this turn")]
         turn: Option<u32>,
+        #[arg(long, help = "Explain the most likely failure cause")]
+        why_failed: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",

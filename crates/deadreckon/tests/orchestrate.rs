@@ -6,7 +6,7 @@ use std::process::Command;
 
 use deadreckon_core::{
     DeadreckonPaths, Plan, PlanMode, PlanRole, PlanStatus, PlanTaskStatus, load_plan,
-    read_plan_messages,
+    read_plan_messages, save_plan,
 };
 use tempfile::TempDir;
 
@@ -358,6 +358,49 @@ fn attach_and_show_accept_plan_ids() {
     let out = stdout(&output);
     assert!(out.contains(&plan.plan_id), "{out}");
     assert!(out.contains("\"root_goal\""), "{out}");
+}
+
+#[test]
+fn show_why_failed_plan_names_blocking_child() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.status = PlanStatus::Forked;
+    plan.tasks[0].status = PlanTaskStatus::Failed;
+    plan.tasks[0].child_run_id = Some("abc1234567890def".to_string());
+    save_plan(&paths, &plan).expect("save plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["show", &plan.plan_id[..8], "--why-failed"])
+        .output()
+        .expect("show why failed");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("failure summary"), "{out}");
+    assert!(out.contains("child 0 task-0 status failed"), "{out}");
+    assert!(
+        out.contains("deadreckon show abc12345 --why-failed"),
+        "{out}"
+    );
 }
 
 fn plan_and_fork_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> Plan {
