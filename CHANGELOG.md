@@ -9,6 +9,7 @@
 - P5: Tuned release/dev profiles and captured a release binary size baseline with slack guard.
 - P6: Routed internal crates through `[workspace.dependencies]` and guarded the internal cargo metadata DAG.
 - P7: Added library-crate print refusal while keeping the binary crate exempt.
+- P8: Added registry-shape guard tests for `deadreckon-core`'s library root; no public surface changed.
 
 ## Doc depth (alpha) — 2026-05-12
 

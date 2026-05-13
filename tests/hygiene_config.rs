@@ -247,6 +247,31 @@ fn binary_crate_does_not_inherit_print_deny() {
     assert!(!root.join("crates/deadreckon/src/lib.rs").exists());
 }
 
+#[test]
+fn core_lib_rs_module_declarations_grouped() {
+    assert_lib_rs_module_declarations_grouped("crates/deadreckon-core/src/lib.rs");
+}
+
+#[test]
+fn core_lib_rs_pub_use_paths_sorted() {
+    assert_lib_rs_pub_use_paths_sorted("crates/deadreckon-core/src/lib.rs");
+}
+
+#[test]
+fn core_lib_rs_contains_no_impl_block() {
+    let text = lib_rs_text("crates/deadreckon-core/src/lib.rs");
+    assert!(!text.contains("\nimpl "), "core lib.rs must not contain impl blocks");
+}
+
+#[test]
+fn core_lib_rs_contains_no_fn_definition() {
+    let text = lib_rs_text("crates/deadreckon-core/src/lib.rs");
+    assert!(
+        !text.contains("\nfn "),
+        "core lib.rs must not contain function definitions"
+    );
+}
+
 fn assert_lint_level(lint: &str, level: &str) {
     let text = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read Cargo.toml");
     let needle = format!("{lint} = \"{level}\"");
@@ -255,6 +280,95 @@ fn assert_lint_level(lint: &str, level: &str) {
 
 fn lib_rs_text(rel: &str) -> String {
     fs::read_to_string(workspace_root().join(rel)).expect("read library lib.rs")
+}
+
+fn assert_lib_rs_module_declarations_grouped(rel: &str) {
+    let text = lib_rs_text(rel);
+    let kinds = registry_kinds(&text);
+    let mut seen_pub_mod = false;
+    let mut seen_pub_use = false;
+    for kind in kinds {
+        match kind {
+            RegistryKind::PrivateMod => {
+                assert!(!seen_pub_mod, "{rel} has private mod after pub mod");
+                assert!(!seen_pub_use, "{rel} has private mod after pub use");
+            }
+            RegistryKind::PubMod => {
+                seen_pub_mod = true;
+                assert!(!seen_pub_use, "{rel} has pub mod after pub use");
+            }
+            RegistryKind::PubUse => seen_pub_use = true,
+        }
+    }
+    assert_sorted_group(rel, "mod", registry_lines(&text, RegistryKind::PrivateMod));
+    assert_sorted_group(rel, "pub mod", registry_lines(&text, RegistryKind::PubMod));
+    assert_sorted_group(rel, "pub use", registry_lines(&text, RegistryKind::PubUse));
+}
+
+fn assert_lib_rs_pub_use_paths_sorted(rel: &str) {
+    let text = lib_rs_text(rel);
+    let paths = collect_pub_use_statements(&text);
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(sorted, paths, "{rel} pub use statements are not sorted");
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RegistryKind {
+    PrivateMod,
+    PubMod,
+    PubUse,
+}
+
+fn registry_kinds(text: &str) -> Vec<RegistryKind> {
+    text.lines().filter_map(registry_kind).collect()
+}
+
+fn registry_lines(text: &str, wanted: RegistryKind) -> Vec<String> {
+    text.lines()
+        .filter(|line| registry_kind(line) == Some(wanted))
+        .map(|line| line.trim().to_string())
+        .collect()
+}
+
+fn registry_kind(line: &str) -> Option<RegistryKind> {
+    let line = line.trim();
+    if line.starts_with("pub use ") {
+        Some(RegistryKind::PubUse)
+    } else if line.starts_with("pub mod ") {
+        Some(RegistryKind::PubMod)
+    } else if line.starts_with("mod ") {
+        Some(RegistryKind::PrivateMod)
+    } else {
+        None
+    }
+}
+
+fn assert_sorted_group(rel: &str, name: &str, lines: Vec<String>) {
+    let mut sorted = lines.clone();
+    sorted.sort();
+    assert_eq!(sorted, lines, "{rel} {name} declarations are not sorted");
+}
+
+fn collect_pub_use_statements(text: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = Vec::new();
+    let mut in_statement = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !in_statement && trimmed.starts_with("pub use ") {
+            current.push(trimmed.to_string());
+            in_statement = true;
+        } else if in_statement {
+            current.push(trimmed.to_string());
+        }
+        if in_statement && trimmed.ends_with(';') {
+            statements.push(current.join(" "));
+            current.clear();
+            in_statement = false;
+        }
+    }
+    statements
 }
 
 fn assert_cargo_toml_contains(needle: &str) {
