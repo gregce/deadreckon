@@ -85,6 +85,8 @@ fn normalize_narrative(content: &str) -> String {
                 "**Last updated:** <normalized>".to_string()
             } else if line.starts_with("**Run ID:** ") {
                 "**Run ID:** `<normalized>`".to_string()
+            } else if line.starts_with("**Owner:** ") {
+                "**Owner:** <normalized>".to_string()
             } else if line.starts_with("- Tool: bash (") && line.ends_with("ms)") {
                 "- Tool: bash (<duration>)".to_string()
             } else {
