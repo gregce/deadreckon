@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-12 (post acceptance-progress / shell-completions / interactive-feedback pass)
+**Last updated:** 2026-05-12 (post workspace hygiene pass)
 **Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -37,6 +37,7 @@ This document captures the system as built today — what's wired, what's load-b
 24. [Codebase Modes](#24-codebase-modes)
 25. [Self-Documenting Runs](#25-self-documenting-runs)
 28. [Chains & Autonomous Goal Chaining](#28-chains--autonomous-goal-chaining)
+29. [Workspace Hygiene](#29-workspace-hygiene)
 
 ---
 
@@ -1398,6 +1399,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 ### Built and reliable
 
 - Workspace, crates, build, lint, fmt, test discipline.
+- Workspace lint discipline (deny-tier clippy + rustc), tuned release profile, registry-shaped library `lib.rs`, library print refusal, and error retryable/fatal taxonomy as vocabulary for future watchdog work.
 - `PipelineState` shape, phase machine, atomic state writes, schema version.
 - PID-aware locks + heartbeats + stale reclaim.
 - Atomic working→library promotion with crash recovery.
@@ -1430,6 +1432,8 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - CLI usability polish: root help includes command groups, `status` includes run health/library/disk blocks, and `DEADRECKON_HINTS=0` suppresses post-completion prompts.
 - Autonomous sequential chains: `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`, and `chain redo`; chains use `latest`/`last` aliases, `chain.json`, `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps, green-policy auto-apply, and a multi-step ratatui timeline with single-run chain context.
 - Mock HTTP server for tests; CLI provider tests with fake binaries; integration coverage for stress, import round-trips, lifecycle, codebase modes, docs, sandbox policy, and gate proof.
+
+The hygiene rider is purely structural; it does not close prior thin items, but it raises the floor for every future rider.
 
 ### Hardening v2 closures
 
@@ -1700,6 +1704,42 @@ Out of scope for this alpha pass: mid-chain provider replanning, parallel/DAG st
 - **CLI sub-agent** — a `cli:*` provider whose `complete()` invocation is one whole turn (the sub-agent does its own tool calls inside). Detected by `response.trace["kind"] == "cli_subagent"`.
 - **dr-gate** — the standalone binary at `crates/deadreckon/src/bin/dr-gate.rs` that owns acceptance verification. The agent cannot impersonate it.
 - **BYOK** — Bring Your Own Key. In deadreckon this extends to subscriptions: a Claude Max or ChatGPT Pro user can drive deadreckon via `cli:*` providers without an API key.
+
+---
+
+## 29. Workspace Hygiene
+
+### 29.1 Centralized Lints
+
+The root `Cargo.toml` owns `[workspace.lints]` for Rust and clippy policy. Every crate inherits it with `[lints] workspace = true`, so deny-tier rules such as `unsafe_code`, `unused_must_use`, `unwrap_used`, `expect_used`, `await_holding_lock`, `redundant_clone`, `needless_borrow`, and the `manual_*` family are enforced from one place. `clippy.toml` keeps test ergonomics explicit with test-only unwrap/expect/dbg exemptions and a `large-error-threshold = 256`.
+
+### 29.2 Formatted Imports
+
+`rustfmt.toml` pins edition `2024`, import reordering, `imports_granularity = "Item"`, and `group_imports = "StdExternalCrate"`. Stable rustfmt currently warns that the last two knobs are nightly-only, but `cargo fmt --check` still exits cleanly and the guard tests ensure the config remains intentional.
+
+### 29.3 Tuned Profiles
+
+`[profile.release]` uses fat LTO, one codegen unit, symbol stripping, and `split-debuginfo = "off"` while keeping the pre-existing panic behavior explicit with `panic = "unwind"`. `[profile.dev] debug = "limited"` keeps local compiles lighter without changing runtime behavior.
+
+### 29.4 Internal Crate Routing
+
+The four internal libraries (`deadreckon-core`, `deadreckon-runtime`, `deadreckon-providers`, `deadreckon-sandbox`) are declared in root `[workspace.dependencies]`. Member crates depend on them through `{ workspace = true }`, which keeps the internal dependency graph centralized and lets metadata tests detect accidental raw `../` path dependencies.
+
+### 29.5 Registry-Shaped Library Roots
+
+Every library `lib.rs` is a registry: crate docs, sorted `mod` declarations, sorted `pub mod` declarations, and sorted `pub use` re-exports. Business logic, `impl` blocks, and helper functions live in real modules. Public re-export set tests guard the pre-rider surface.
+
+### 29.6 Library Print Refusal
+
+Library crate roots deny `clippy::print_stdout` and `clippy::print_stderr`. User-facing output remains the responsibility of the `deadreckon` binary crate, where formatted CLI/TUI output belongs.
+
+### 29.7 Error Taxonomy
+
+`DeadreckonError`, `ProviderError`, and `SandboxError` expose exhaustive `is_retryable()` and `is_fatal()` methods. I/O interruptions, timeouts, reset/aborted connections, broken pipes, and held locks are retryable; schema, config, credential, routing, invalid-input, not-found, CLI, sandbox, cancellation, and status-less HTTP errors are fatal. These methods are vocabulary only in this pass; watchdog wiring remains a future behavior change.
+
+### 29.8 Behavior Invariants
+
+`tests/smoke_invariant.rs` protects the smoke-run narrative hash, and `tests/public_surface.rs` protects the public library re-export set. `tests/hygiene_config.rs` adds targeted guards for lints, formatting config, profile settings, internal dependency routing, registry shape, print refusal, binary size, cargo metadata stability, and error taxonomy.
 
 ---
 

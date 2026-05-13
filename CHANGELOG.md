@@ -12,6 +12,7 @@
 - P8: Added registry-shape guard tests for `deadreckon-core`'s library root; no public surface changed.
 - P9: Regrouped provider/runtime/sandbox library roots into registry shape and preserved the public re-export set.
 - P10: Added exhaustive retryable/fatal taxonomy methods to core, provider, and sandbox errors while keeping runtime errors on the core taxonomy.
+- P11: Updated `docs/AS-BUILT-ARCHITECTURE.md` with §29 Workspace Hygiene and amended §22 to mark the hygiene rider as structural, not a prior thin-item closure.
 
 ## Doc depth (alpha) — 2026-05-12
 
