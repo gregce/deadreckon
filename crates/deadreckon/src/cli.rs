@@ -89,6 +89,16 @@ Detect probes registered providers from descriptor data. CLI providers check PAT
 and version output; API providers check credentials by default and only touch
 endpoints when `--ping` is supplied.";
 
+const PROVIDERS_HELP: &str = "\
+Lifecycle:
+  deadreckon providers list
+  deadreckon providers list --all
+  deadreckon providers list --models
+  deadreckon run \"goal\" --provider cli:codex --model gpt-5.1-codex
+
+`providers list` is registry-backed. By default it shows the configured
+provider route; `--all` shows every built-in and override descriptor.";
+
 const RUN_HELP: &str = "\
 Lifecycle:
   deadreckon run \"build the thing\"
@@ -629,6 +639,15 @@ pub(crate) enum Commands {
         ping: bool,
     },
     #[command(
+        next_help_heading = "Setup",
+        about = "List registered provider descriptors",
+        after_help = PROVIDERS_HELP
+    )]
+    Providers {
+        #[command(subcommand)]
+        command: ProvidersCommand,
+    },
+    #[command(
         next_help_heading = "Run Lifecycle",
         visible_alias = "runs",
         about = "Show runs for the current project by default",
@@ -1078,6 +1097,22 @@ pub(crate) enum ConfigCommand {
             help = "Provider route to update; defaults to the active provider"
         )]
         provider: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ProvidersCommand {
+    #[command(about = "List providers registered in the descriptor registry")]
+    List {
+        #[arg(long, help = "Also list model catalog entries")]
+        models: bool,
+        #[arg(
+            long,
+            help = "Show every registered provider, not only configured routes"
+        )]
+        all: bool,
+        #[arg(long, help = "Print exact IDs and paths for scripts")]
+        full: bool,
     },
 }
 

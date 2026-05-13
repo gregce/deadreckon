@@ -36,10 +36,11 @@ use deadreckon_core::{
     validate_acceptance_marker, write_cancel_marker, write_chain_step_marker,
 };
 use deadreckon_providers::registry::{
-    ProbeStatus, ProviderProbe, ProviderProbeOptions, ProviderProbeResult, ProviderRegistry,
+    DescriptorKind, ProbeStatus, ProviderProbe, ProviderProbeOptions, ProviderProbeResult,
+    ProviderRegistry,
 };
 use deadreckon_providers::{
-    ProviderRequest, ProviderRouteInfo, ProviderRouter, ProviderUsage, SpendEstimate,
+    ProviderRequest, ProviderRouteInfo, ProviderRouter, ProviderUsage, SpendEstimate, read_config,
 };
 use deadreckon_runtime::{
     PolishConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, polish_run_docs, run_turn_loop,
@@ -65,7 +66,8 @@ mod tui_events;
 
 use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, Commands,
-    CompletionCommand, ConfigCommand, ExtendCommandArgs, LibraryCommand, RunCommandArgs,
+    CompletionCommand, ConfigCommand, ExtendCommandArgs, LibraryCommand, ProvidersCommand,
+    RunCommandArgs,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -384,6 +386,7 @@ async fn main_inner() -> Result<()> {
         }
         Commands::Doctor => doctor_command().await,
         Commands::Detect { id, json, ping } => detect_command(id, json, ping).await,
+        Commands::Providers { command } => providers_command(command).await,
         Commands::List { scope, all } => list_command(scope, all),
         Commands::Library { command } => library_command(command),
         Commands::Finish {
@@ -1030,6 +1033,160 @@ async fn detect_command(id: Option<String>, json_output: bool, ping: bool) -> Re
         print_detect_results(&results);
     }
     Ok(())
+}
+
+async fn providers_command(command: ProvidersCommand) -> Result<()> {
+    match command {
+        ProvidersCommand::List { models, all, full } => {
+            providers_list_command(models, all, full).await
+        }
+    }
+}
+
+async fn providers_list_command(models: bool, all: bool, full: bool) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let ids = if all {
+        registry.ids()
+    } else {
+        configured_provider_ids(&paths)?
+    };
+    println!("{}", ui_heading("provider registry"));
+    if ids.is_empty() {
+        println!("{} no configured providers", ui_muted("-"));
+        println!(
+            "{} {}",
+            ui_command("try:"),
+            ui_command("deadreckon providers list --all")
+        );
+        return Ok(());
+    }
+    for id in ids {
+        let Some(descriptor) = registry.get(&id) else {
+            println!(
+                "{} {} not registered | {}",
+                ui_warn("✗"),
+                ui_id(&id),
+                ui_command("deadreckon detect")
+            );
+            continue;
+        };
+        let result = descriptor.probe(ProviderProbeOptions { ping: false }).await;
+        print_provider_list_row(&result, descriptor, full);
+        if models {
+            print_provider_models(descriptor);
+        }
+    }
+    if !all {
+        println!(
+            "{} {}",
+            ui_muted("hint:"),
+            ui_command("deadreckon providers list --all")
+        );
+    }
+    Ok(())
+}
+
+fn configured_provider_ids(paths: &DeadreckonPaths) -> Result<Vec<String>> {
+    let config = read_config(&paths.config_path())?;
+    let mut ids = Vec::new();
+    if let Some(default_provider) = config.default_provider {
+        push_unique(&mut ids, default_provider);
+    }
+    if let Some(fallback) = config.fallback {
+        for provider in fallback {
+            push_unique(&mut ids, provider);
+        }
+    }
+    for provider in config.providers.into_keys() {
+        push_unique(&mut ids, provider);
+    }
+    Ok(ids)
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn print_provider_list_row(
+    result: &ProviderProbeResult,
+    descriptor: &deadreckon_providers::registry::ProviderDescriptor,
+    full: bool,
+) {
+    let symbol = match result.status {
+        ProbeStatus::Ok => ui_ok("✓"),
+        ProbeStatus::Failed => ui_warn("✗"),
+        ProbeStatus::Skipped => ui_muted("-"),
+    };
+    let location = result.location.as_deref().unwrap_or("-");
+    let version = result.version.as_deref().unwrap_or("-");
+    let model = descriptor.default_model.as_deref().unwrap_or("-");
+    if full {
+        println!(
+            "{} {} kind={} credential={} model={} metering={} location={} version={}",
+            symbol,
+            ui_id(&result.id),
+            descriptor_kind_label(&descriptor.kind),
+            result.credential,
+            model,
+            result.metering,
+            location,
+            version
+        );
+    } else {
+        println!(
+            "{:<20} {}  {:<10} credential={:<8} model={} metering={} location={} version={}",
+            ui_id(&result.id),
+            symbol,
+            descriptor_kind_label(&descriptor.kind),
+            result.credential,
+            model,
+            result.metering,
+            location,
+            version
+        );
+    }
+}
+
+fn print_provider_models(descriptor: &deadreckon_providers::registry::ProviderDescriptor) {
+    if descriptor.model_catalog.is_empty() {
+        println!("    {}", ui_muted("models: none"));
+        return;
+    }
+    println!("    {}", ui_muted("models:"));
+    for model in &descriptor.model_catalog {
+        let aliases = if model.aliases.is_empty() {
+            "-".to_string()
+        } else {
+            model.aliases.join(",")
+        };
+        let context = model
+            .context_window
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let price = match (model.input_per_million, model.output_per_million) {
+            (Some(input), Some(output)) => format!("${input:.3}/${output:.3} per 1M"),
+            _ => "-".to_string(),
+        };
+        println!(
+            "      {} aliases={} context={} price={}",
+            ui_id(&model.id),
+            aliases,
+            context,
+            price
+        );
+    }
+}
+
+fn descriptor_kind_label(kind: &DescriptorKind) -> &'static str {
+    match kind {
+        DescriptorKind::Http => "http",
+        DescriptorKind::Cli => "cli",
+        DescriptorKind::LocalHttp => "local-http",
+        DescriptorKind::Scripted => "scripted",
+    }
 }
 
 fn print_detect_results(results: &[ProviderProbeResult]) {
