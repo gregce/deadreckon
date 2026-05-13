@@ -379,6 +379,63 @@ async fn extend_in_worktree_chains_branches() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extend_worktree_after_apply_cleanup_recovers_from_library_record() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let parent_run = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("worktree parent cleanup")
+        .arg("--smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--yes")
+        .arg("--no-hints")
+        .output()
+        .expect("parent run");
+    assert_success(&parent_run);
+    let parent = load_run(&paths, &run_id_from_stdout(&parent_run)).expect("parent");
+    let parent_record = read_codebase_record(&parent.working_dir).expect("parent codebase");
+    let parent_branch = parent_record.branch_name.clone().expect("parent branch");
+    let original_base = parent_record.base_ref.clone().expect("parent base");
+
+    let apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&parent.run_id)
+        .arg("--no-confirm")
+        .arg("--cleanup")
+        .output()
+        .expect("apply cleanup");
+    assert_success(&apply);
+    assert!(!git_ref_exists(&repo, &parent_branch));
+
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+    let output = extend_command(&paths, &parent, "worktree child after cleanup")
+        .current_dir(&repo)
+        .output()
+        .expect("extend");
+
+    assert_success(&output);
+    let child = load_run(&paths, &extended_run_id(&output)).expect("child");
+    let child_record = read_codebase_record(&child.working_dir).expect("child codebase");
+    assert_eq!(child_record.mode, CodebaseMode::Worktree);
+    assert_eq!(
+        child_record.base_ref.as_deref(),
+        Some(original_base.as_str())
+    );
+    assert_eq!(
+        child_record.parent_branch.as_deref(),
+        Some(parent_branch.as_str())
+    );
+    assert!(child.working_dir.join("child.txt").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extend_in_copy_unchanged_from_today() {
     let temp = repo_tempdir();
     let source = temp.path().join("source");
@@ -464,7 +521,7 @@ async fn extend_in_in_place_refuses_with_run_hint() {
 }
 
 #[test]
-fn list_shows_materialized_status() {
+fn library_list_shows_materialized_status() {
     let temp = repo_tempdir();
     let (paths, parent) = completed_parent(&temp, "list materialized parent");
     let dest = temp.path().join("listed-materialized");
@@ -480,14 +537,14 @@ fn list_shows_materialized_status() {
 
     let output = deadreckon(&paths)
         .current_dir(&parent.cwd)
-        .args(["list", "--full"])
+        .args(["library", "list"])
         .output()
-        .expect("list");
+        .expect("library list");
 
     assert_success(&output);
     let stdout = stdout(&output);
-    assert!(stdout.contains("MATERIALIZED"));
-    assert!(stdout.contains("yes (1 time)"));
+    assert!(stdout.contains("EXPORTED"));
+    assert!(stdout.contains("yes (1)"));
 }
 
 #[test]
@@ -1300,6 +1357,15 @@ fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
+}
+
+fn git_ref_exists(cwd: &std::path::Path, reference: &str) -> bool {
+    Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn deadreckon(paths: &DeadreckonPaths) -> Command {

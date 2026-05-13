@@ -123,18 +123,17 @@ The default list is compact, project-scoped, and shows eight-character run IDs.
 Commands accept unique prefixes, so `deadreckon show 861c51bf` works when that
 prefix is unique. Most run-id arguments also accept `latest` or `last`, resolved
 to the latest run for the current project. Use `--all` for global history and
-`--full` for scripts or exact-copy output.
+`show` when you need full paths, IDs, traces, docs, and next actions.
 
-Capture the latest full run id:
+Inspect the latest run:
 
 ```bash
-RUN_ID=$(deadreckon list --full | awk 'NR==2 {print $1}')
+deadreckon show latest
 ```
 
-Then inspect it:
+Then attach to or finish it:
 
 ```bash
-deadreckon show "$RUN_ID"
 deadreckon attach latest
 ```
 

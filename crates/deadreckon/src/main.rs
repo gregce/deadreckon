@@ -360,7 +360,7 @@ async fn main_inner() -> Result<()> {
             .await
         }
         Commands::Doctor => doctor_command().await,
-        Commands::List { scope, all, full } => list_command(scope, all, full),
+        Commands::List { scope, all } => list_command(scope, all),
         Commands::Library { command } => library_command(command),
         Commands::Finish {
             run_id,
@@ -5878,6 +5878,16 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+fn git_ref_exists(cwd: &Path, reference: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn git_status(cwd: &Path, args: &[&str]) -> Result<()> {
     git_stdout(cwd, args).map(|_| ())
 }
@@ -6605,7 +6615,7 @@ fn finish_apply_cleanup(
 ) -> Result<()> {
     let cleanup_now = cleanup || should_prompt_cleanup(no_confirm)?;
     if cleanup_now {
-        cleanup_worktree_run(state, record, false, false)?;
+        cleanup_worktree_run(state, record, false, false, CleanupReason::Applied)?;
     } else if !quiet {
         println!(
             "{} {}",
@@ -6754,7 +6764,13 @@ fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()>
         }
         let _ = kill_loaded_run(&paths, &mut state, true);
     }
-    cleanup_worktree_run(&state, &record, keep_branch, force)
+    cleanup_worktree_run(
+        &state,
+        &record,
+        keep_branch,
+        force,
+        CleanupReason::Abandoned,
+    )
 }
 
 fn cleanup_command(
@@ -6779,7 +6795,7 @@ fn cleanup_command(
             let _ = kill_loaded_run(&paths, &mut state, true);
         }
         let record = read_codebase_record(&state.working_dir)?;
-        cleanup_worktree_run(&state, &record, keep_branch, force)?;
+        cleanup_worktree_run(&state, &record, keep_branch, force, CleanupReason::Cleaned)?;
         return Ok(());
     }
 
@@ -6825,7 +6841,13 @@ fn cleanup_command(
         if candidate.state.status == RunStatus::Executing {
             let _ = kill_loaded_run(&paths, &mut candidate.state, true);
         }
-        cleanup_worktree_run(&candidate.state, &candidate.record, keep_branch, force)?;
+        cleanup_worktree_run(
+            &candidate.state,
+            &candidate.record,
+            keep_branch,
+            force,
+            CleanupReason::Cleaned,
+        )?;
     }
     Ok(())
 }
@@ -6876,11 +6898,36 @@ fn cleanup_candidates(
     Ok(candidates)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CleanupReason {
+    Abandoned,
+    Applied,
+    Cleaned,
+}
+
+impl CleanupReason {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Abandoned => "abandoned",
+            Self::Applied => "applied",
+            Self::Cleaned => "cleaned",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Abandoned => "abandoned",
+            Self::Applied | Self::Cleaned => "cleaned",
+        }
+    }
+}
+
 fn cleanup_worktree_run(
     state: &deadreckon_core::PipelineState,
     record: &CodebaseRecord,
     keep_branch: bool,
     force: bool,
+    reason: CleanupReason,
 ) -> Result<()> {
     let mut removed = Vec::new();
     if record.mode == CodebaseMode::Worktree
@@ -6906,8 +6953,8 @@ fn cleanup_worktree_run(
             removed.push(format!("branch {branch}"));
         }
     }
-    write_abandoned_marker(state)?;
-    println!("{} {}", ui_ok("abandoned"), ui_id(&state.run_id));
+    write_abandoned_marker(state, reason)?;
+    println!("{} {}", ui_ok(reason.label()), ui_id(&state.run_id));
     for item in removed {
         println!("  removed: {item}");
     }
@@ -6959,7 +7006,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             parent.run_id, parent.status
         ))));
     }
-    let parent_codebase = read_codebase_record(&parent.working_dir).ok();
+    let parent_codebase = read_run_codebase_record(&paths, &parent).ok();
     if parent_codebase
         .as_ref()
         .is_some_and(|record| record.mode == CodebaseMode::InPlace)
@@ -7204,16 +7251,16 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         post_actions,
         context_turns,
     } = args;
-    let parent_branch = parent_record.branch_name.clone().ok_or_else(|| {
-        CliError::Core(DeadreckonError::InvalidInput(
-            "parent worktree record missing branch_name".to_string(),
-        ))
-    })?;
+    let parent_branch = parent_record.branch_name.clone();
     let source_git_root = parent_record.source_git_root.clone().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(
             "parent worktree record missing source_git_root".to_string(),
         ))
     })?;
+    let base_ref = parent_branch
+        .as_deref()
+        .filter(|branch| git_ref_exists(&source_git_root, &format!("refs/heads/{branch}")))
+        .map(str::to_string);
     let run_id = Uuid::new_v4().simple().to_string();
     let mut codebase = prepare_worktree_record(
         &paths,
@@ -7221,12 +7268,12 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
             run_id: run_id.clone(),
             task_key: deadreckon_core::paths::task_key(&new_goal),
             source_path: source_git_root.clone(),
-            base_ref: Some(parent_branch.clone()),
+            base_ref,
             branch_name: None,
             allow_dirty: false,
         },
     )?;
-    codebase.parent_branch = Some(parent_branch);
+    codebase.parent_branch = parent_branch.or_else(|| codebase.base_ref.clone());
     create_worktree(&codebase)?;
     let mut state = create_run(
         &paths,
@@ -7239,7 +7286,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
             max_spend_usd: effective_max_spend,
             max_wall_seconds: effective_max_wall_seconds,
             run_id: Some(run_id),
-            codebase: Some(codebase),
+            codebase: Some(codebase.clone()),
         },
     )?;
 
@@ -7271,6 +7318,8 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
                 "parent_completed_at": parent.updated_at,
                 "context_turns_included": context_turns,
                 "mode": "worktree",
+                "base_ref": codebase.base_ref.clone(),
+                "parent_branch": codebase.parent_branch.clone(),
             }),
         },
     )?;
@@ -7526,7 +7575,10 @@ fn append_materialized_marker(library_dir: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_abandoned_marker(state: &deadreckon_core::PipelineState) -> Result<()> {
+fn write_abandoned_marker(
+    state: &deadreckon_core::PipelineState,
+    reason: CleanupReason,
+) -> Result<()> {
     let path = state.run_root.join("abandoned.json");
     fs::write(
         &path,
@@ -7534,6 +7586,7 @@ fn write_abandoned_marker(state: &deadreckon_core::PipelineState) -> Result<()> 
             "schema_version": 1,
             "run_id": state.run_id,
             "abandoned_at": Utc::now(),
+            "reason": reason.marker(),
         }))?,
     )?;
     Ok(())
@@ -7634,7 +7687,7 @@ fn escape_toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn list_command(scope: Option<String>, all: bool, full: bool) -> Result<()> {
+fn list_command(scope: Option<String>, all: bool) -> Result<()> {
     // REPORT.md: Workspace Inventory & Run Queue is a local scan over durable
     // runstate, not a live daemon query.
     let paths = DeadreckonPaths::discover();
@@ -7654,31 +7707,9 @@ fn list_command(scope: Option<String>, all: bool, full: bool) -> Result<()> {
         }
         return Ok(());
     }
-    if full {
-        println!(
-            "{}",
-            ui_heading("RUN\tSTATUS\tSCOPE\tUPDATED\tMODE\tDOCS\tMATERIALIZED\tNEXT\tGOAL")
-        );
-        for run in runs {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                run.run_id,
-                run.status,
-                run.scope,
-                run.updated_at,
-                codebase_mode_status(&paths, &run),
-                docs_status(&paths, &run),
-                materialized_status(&paths, &run),
-                next_action_label_for_entry(&paths, &run),
-                run.goal
-            );
-        }
-        return Ok(());
-    }
-
     let header = format!(
         "{:<8}  {:<10}  {:<7}  {:<26}  {:<10}  {:<16}  GOAL",
-        "RUN", "STATUS", "AGE", "SCOPE", "MODE", "NEXT"
+        "RUN", "STATUS", "AGE", "SCOPE", "MODE", "ACTION"
     );
     println!("{}", ui_heading(header));
     for run in runs {
@@ -7698,7 +7729,7 @@ fn list_command(scope: Option<String>, all: bool, full: bool) -> Result<()> {
         ui_muted("hint:"),
         ui_command("deadreckon status latest"),
         ui_command("deadreckon list --all"),
-        ui_command("deadreckon list --full")
+        ui_command("deadreckon show <run>")
     );
     Ok(())
 }
@@ -8067,13 +8098,13 @@ fn next_action_label_for_entry(
     run: &deadreckon_core::RunListEntry,
 ) -> String {
     load_run(paths, &run.run_id)
-        .map(|state| next_action_label(&state))
+        .map(|state| next_action_label(paths, &state))
         .unwrap_or_else(|_| "-".to_string())
 }
 
-fn next_action_label(state: &deadreckon_core::PipelineState) -> String {
+fn next_action_label(paths: &DeadreckonPaths, state: &deadreckon_core::PipelineState) -> String {
     if state.run_root.join("abandoned.json").exists() {
-        return "cleaned".to_string();
+        return cleanup_action_label(state);
     }
     if is_stale_executing(state) {
         return "cleanup --stale".to_string();
@@ -8081,7 +8112,7 @@ fn next_action_label(state: &deadreckon_core::PipelineState) -> String {
     match state.status {
         RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => "attach".to_string(),
         RunStatus::Failed | RunStatus::Killed => "resume".to_string(),
-        RunStatus::Completed => match read_codebase_record(&state.working_dir)
+        RunStatus::Completed => match read_run_codebase_record(paths, state)
             .map(|record| record.mode)
             .unwrap_or(CodebaseMode::Fresh)
         {
@@ -8090,6 +8121,25 @@ fn next_action_label(state: &deadreckon_core::PipelineState) -> String {
             CodebaseMode::InPlace => "finish (review)".to_string(),
         },
     }
+}
+
+fn cleanup_action_label(state: &deadreckon_core::PipelineState) -> String {
+    match cleanup_marker_reason(state).as_deref() {
+        Some("abandoned") => "abandoned".to_string(),
+        Some("applied" | "cleaned" | "cleanup") => "done".to_string(),
+        _ if state.status == RunStatus::Completed => "done".to_string(),
+        _ => "cleaned".to_string(),
+    }
+}
+
+fn cleanup_marker_reason(state: &deadreckon_core::PipelineState) -> Option<String> {
+    let raw = fs::read_to_string(state.run_root.join("abandoned.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("reason")
+        .or_else(|| value.get("action"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn relative_age(updated_at: DateTime<Utc>) -> String {
@@ -8117,41 +8167,39 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     format!("{}...", value.chars().take(prefix).collect::<String>())
 }
 
-fn docs_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEntry) -> String {
-    load_run(paths, &run.run_id)
-        .map(|state| docs_status_for_state(&state).to_string())
-        .unwrap_or_else(|_| "n/a".to_string())
-}
-
 fn codebase_mode_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEntry) -> String {
     let state = match load_run(paths, &run.run_id) {
         Ok(state) => state,
         Err(_) => return "-".to_string(),
     };
-    if state.run_root.join("abandoned.json").exists() {
-        return "abandoned".to_string();
-    }
-    read_codebase_record(&state.working_dir)
+    read_run_codebase_record(paths, &state)
         .map(|record| record.mode.to_string())
         .unwrap_or_else(|_| "-".to_string())
 }
 
-fn materialized_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEntry) -> String {
-    if run.status != RunStatus::Completed {
-        return "n/a".to_string();
+fn read_run_codebase_record(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+) -> Result<CodebaseRecord> {
+    let mut bases = vec![state.working_dir.clone()];
+    if let Some(library_dir) = state.promoted_library_dir.as_ref() {
+        bases.push(library_dir.clone());
     }
-    let marker = paths
-        .library_dir(&run.scope, &run.run_id)
-        .join(".materialized-to");
-    let count = fs::read_to_string(marker)
-        .ok()
-        .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
-        .unwrap_or(0);
-    match count {
-        0 => "no".to_string(),
-        1 => "yes (1 time)".to_string(),
-        count => format!("yes ({count} times)"),
+    bases.push(paths.library_dir(&state.scope, &state.run_id));
+    for turn in (0..=state.turn).rev() {
+        bases.push(
+            state
+                .run_root
+                .join("snapshots")
+                .join(format!("turn-{turn}")),
+        );
     }
+    for base in bases {
+        if let Ok(record) = read_codebase_record(&base) {
+            return Ok(record);
+        }
+    }
+    read_codebase_record(&state.working_dir).map_err(CliError::from)
 }
 
 struct DocCommandArgs {
@@ -8972,7 +9020,7 @@ fn print_status_card(state: &deadreckon_core::PipelineState) {
         .active_phase()
         .map(|phase| format!("{} {}", phase.id.0, phase.name))
         .unwrap_or_else(|| "-".to_string());
-    let next_action = next_action_label(state);
+    let next_action = next_action_label(&paths, state);
     let stale = is_stale_executing(state);
     let supervised = supervised_pids(state);
     println!("deadreckon status");

@@ -1488,11 +1488,11 @@ Before file changes, `run` prints a single preview block with goal, source/git s
 ### 24.10.1 `status`, `list`, and `cleanup`
 
 `list` defaults to the current project scope so old runs from unrelated repos do
-not dominate the common path. `list --all` scans every scope; `list --full`
-prints exact TSV-style values for scripts. `status` (alias `next`) prints the
-latest current-project run, its artifact/worktree locations, and the next
-recommended action. Running `deadreckon` with no subcommand dispatches to
-`status`.
+not dominate the common path. `list --all` scans every scope; `show <run-id>`
+prints exact IDs, locations, docs, traces, and the next recommended action.
+`status` (alias `next`) prints the latest current-project run, its
+artifact/worktree locations, and the next recommended action. Running
+`deadreckon` with no subcommand dispatches to `status`.
 
 `cleanup` (alias `prune`) removes worktrees and temporary branches for already
 abandoned runs by default, with opt-in `--completed`, `--stale`, `--all`, and

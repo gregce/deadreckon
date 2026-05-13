@@ -158,11 +158,11 @@ const LIST_HELP: &str = "\
 Lifecycle:
   deadreckon list
   deadreckon list --all
-  deadreckon list --full
+  deadreckon show <short-id>
   deadreckon attach <short-id>
   deadreckon finish <short-id>
 
-The default view is compact and scoped to the current project. Use `--full` for scripts.";
+The default view is compact and scoped to the current project. Use `show` for full run details.";
 
 const LIBRARY_HELP: &str = "\
 Subcommands:
@@ -586,8 +586,6 @@ pub(crate) enum Commands {
         scope: Option<String>,
         #[arg(long, help = "Show runs from all projects")]
         all: bool,
-        #[arg(long, help = "Print full TSV-style values for scripts")]
-        full: bool,
     },
     #[command(
         next_help_heading = "Completed Run Actions",

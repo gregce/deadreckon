@@ -1363,15 +1363,15 @@ fn doc_help_describes_force_and_budget_cap_flags() {
 }
 
 #[test]
-fn list_shows_docs_status_column() {
+fn status_shows_docs_status() {
     let (_temp, paths, state) = completed_state_with_docs("list docs");
     let output = deadreckon(paths.home())
         .current_dir(&state.cwd)
-        .args(["list", "--full"])
+        .args(["status", &state.run_id])
         .output()
-        .expect("list");
+        .expect("status");
     assert_success(&output);
-    assert!(stdout(&output).contains("DOCS"));
+    assert!(stdout(&output).contains("docs:"));
 }
 
 fn fresh_state(goal: &str) -> (TempDir, DeadreckonPaths, deadreckon_core::PipelineState) {

@@ -1205,6 +1205,19 @@ fn apply_cleanup_removes_worktree_and_branch_after_success() {
     assert!(!worktree.exists());
     assert!(!git_ref_exists(&repo, &branch));
     assert!(state.run_root.join("abandoned.json").exists());
+
+    let list = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("list")
+        .output()
+        .expect("list");
+    assert_success(&list);
+    let stdout = stdout(&list);
+    assert!(stdout.contains("ACTION"), "{stdout}");
+    assert!(stdout.contains("worktree"), "{stdout}");
+    assert!(stdout.contains("done"), "{stdout}");
+    assert!(!stdout.contains("abandoned"), "{stdout}");
+    assert!(!stdout.contains("cleaned"), "{stdout}");
 }
 
 #[test]
@@ -1702,11 +1715,12 @@ fn list_shows_mode_column() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("MODE"));
+    assert!(stdout.contains("ACTION"));
     assert!(stdout.contains("worktree"));
 }
 
 #[test]
-fn list_default_is_compact_and_full_keeps_full_values() {
+fn list_default_is_compact_and_points_to_show_for_details() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let goal = "make this exceptionally long paint application goal readable in list output without wrapping every row across the terminal";
@@ -1744,15 +1758,17 @@ fn list_default_is_compact_and_full_keeps_full_values() {
         "{compact_stdout}"
     );
 
-    let full = deadreckon(&paths)
+    let help = deadreckon(&paths)
         .current_dir(temp.path())
-        .args(["list", "--full"])
+        .args(["list", "--help"])
         .output()
-        .expect("list full");
-    assert_success(&full);
-    let full_stdout = stdout(&full);
-    assert!(full_stdout.contains(&state.run_id));
-    assert!(full_stdout.contains(goal));
+        .expect("list help");
+    assert_success(&help);
+    let help_stdout = stdout(&help);
+    assert!(help_stdout.contains("deadreckon show <short-id>"));
+    assert!(!help_stdout.contains("--full"));
+    assert!(compact_stdout.contains("deadreckon show <run>"));
+    assert!(!compact_stdout.contains("deadreckon list --full"));
 }
 
 #[test]

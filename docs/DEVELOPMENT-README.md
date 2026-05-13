@@ -64,8 +64,8 @@ deadreckon attach <run-id>
 <run-id>` immediately, so you can attach from another terminal without going
 through `list`.
 Most commands accept a unique run-id prefix, so the compact eight-character IDs
-shown by `deadreckon list` are usually enough. Use `deadreckon list --full`
-when you need exact full IDs for scripts.
+shown by `deadreckon list` are usually enough. Use `deadreckon show <run-id>`
+when you need exact IDs, paths, docs, traces, or the next recommended action.
 
 Apply a completed worktree run back to your current branch:
 
