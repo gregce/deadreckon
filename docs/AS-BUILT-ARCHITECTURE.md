@@ -747,6 +747,7 @@ pub enum ProviderKind {
     CliClaudeCode,
     CliCodex,
     ScriptedSmoke,
+    Generic(String),
 }
 ```
 
@@ -786,9 +787,11 @@ codex --ask-for-approval never exec --skip-git-repo-check --sandbox <mode> -- "<
 
 The trailing `--` delimiter is non-negotiable: doc-polish prompts often begin with YAML frontmatter (`---`), which `clap`-based Codex CLIs otherwise interpret as an option-like argument. Adding `--` forces the prompt to be parsed as the positional value.
 
+**Descriptor-backed CLI providers.** The provider registry now owns compiled-in TOML descriptors plus `providers.d` overrides. Generic CLI descriptors (`ProviderKind::Generic(id)` where the descriptor kind is `cli`) are launched by `GenericCliProvider`, which renders `exec_template.args_template` with `{prompt}`, `{sandbox}`, and `{cwd}` placeholders and applies the descriptor `model_arg` before the prompt. `cli:gemini` and `cli:opencode` are the first built-in generic CLI pilots; `cli:claude-code` and `cli:codex` remain concrete adapters for compatibility with their established launch quirks.
+
 **Shared subprocess machinery (`cli_common.rs:22-120`).** Builds a `SandboxSpec` with explicit allowlists (`cli_common.rs:154-166`):
 
-- Write allowlist: `~/.codex` for codex, `~/.claude` for claude.
+- Write allowlist: descriptor `sandbox_writes` for registered CLIs, with concrete compatibility fallbacks for codex and claude.
 - Read allowlist: binary location + `~/.bun`, `~/.local`, `~/.npm-global`, `~/.opencode`.
 - `allow_network: true` (CLI agents need outbound for their own API calls).
 
@@ -816,7 +819,7 @@ Zero cost, no subscription. Reachable only via `--smoke` flag. The trace records
 
 ### 10.6 `ProviderRouter` and fallback chain
 
-`crates/deadreckon-providers/src/router.rs`. Reads config (TOML), resolves a route list (`fallback` array > `default_provider` > built-in chain `cli:claude-code` → `cli:codex` → `anthropic` → `openai` → `openai-compatible`), constructs a `Box<dyn Provider>` per route. On `complete()`:
+`crates/deadreckon-providers/src/router.rs`. Reads config (TOML), loads the provider registry with `providers.d` overrides, resolves a route list (`fallback` array > `default_provider` > built-in chain `cli:claude-code` → `cli:codex` → `anthropic` → `openai` → `openai-compatible`), and constructs a `Box<dyn Provider>` per route. Concrete providers handle Anthropic/OpenAI/OpenAI-compatible/smoke/Codex/Claude; descriptor-backed generic CLI providers handle any registered CLI descriptor that does not need a concrete adapter. On `complete()`:
 
 ```rust
 for route in &self.routes {
@@ -1251,7 +1254,7 @@ The top band is split horizontally into three panels for subscription providers 
 
 ### 18.3 Data source
 
-Today the TUI **polls** files on disk every 500 ms: `spend.jsonl`, `traces.jsonl`, `events.jsonl`, `proofs/acceptance-progress.jsonl`, `proofs/turn-acceptance.json`, plus provider-native JSONL logs when the active provider writes them. `collect_provider_activity` now routes through a generic JSONL collector: each provider supplies a small `ProviderJsonlLogSpec` with candidate roots, a cwd-matching strategy, and a row decoder. `cli:codex` reads `~/.codex/sessions/**.jsonl` and matches `session_meta.payload.cwd`; `cli:claude-code` reads `~/.claude/projects/<cwd-slug>/*.jsonl` using Claude Code's path-to-project mapping and matches top-level `cwd`. The shared collector handles candidate discovery, recency filtering, run matching, stream capping, and context telemetry. Schema-specific adapters only decode rows into common activity lines (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`).
+Today the TUI **polls** files on disk every 500 ms: `spend.jsonl`, `traces.jsonl`, `events.jsonl`, `proofs/acceptance-progress.jsonl`, `proofs/turn-acceptance.json`, plus provider-native logs when the active provider writes them. `collect_provider_activity` now resolves provider ingest through descriptor `[ingest]` metadata: candidate roots, env overrides, cwd matching, storage kind, file glob, freshness window, and schema key. `cli:codex` reads `~/.codex/sessions/**.jsonl` and matches `session_meta.payload.cwd`; `cli:claude-code` reads `~/.claude/projects/<cwd-slug>/*.jsonl` using Claude Code's path-to-project mapping and matches top-level `cwd`; `cli:gemini` reads Gemini JSON/JSONL file logs; `cli:opencode` reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON. The shared collector handles candidate discovery, recency filtering, run matching, stream capping, and context telemetry. Schema-specific adapters only decode rows into common activity lines (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`) and normalize tool labels through `deadreckon_providers::taxonomy`.
 
 Same-process attaches use the `RunEventBus` broadcast channel directly; cross-process attaches still poll. The mixed model is acknowledged in the robustness rider as a future consolidation target.
 
@@ -1406,6 +1409,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Sandbox dispatch for sandbox-exec / bwrap / docker / none + auto resolution.
 - HTTP providers (Anthropic / OpenAI / OpenAI-compatible) with token-based spend.
 - CLI providers (`cli:claude-code`, `cli:codex`) with wall-clock subscription spend.
+- Descriptor-backed CLI providers with generic `exec_template` launch, registry-driven detection/init/listing, descriptor sandbox writes, and pilot `cli:gemini` / `cli:opencode` providers.
 - Smoke provider (deterministic) for keyless tests.
 - Turn loop with action parsing (Bash / WriteFile / Done) and CLI sub-agent path.
 - Codebase-default running: worktree mode, copy mode, in-place mode, fresh-mode preservation, preflight + preview UX, and `codebase.json` files-not-fields metadata.
@@ -1418,6 +1422,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import`, `cleanup`/`prune`, `completion` verbs.
 - Shell tab-completion via `completion install` / `completion {bash,zsh,fish,elvish,powershell}` driven from the live clap command tree; `init` opt-out installs completions and (for zsh) appends a managed `.zshrc` block.
 - `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer. Long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
+- Descriptor-driven provider activity ingest for Codex, Claude Code, Gemini JSON/JSONL, and OpenCode file-mode logs, normalized into `agent` / `thinking` / `tool` / `result` / `todo` / `tokens` rows without rewriting provider-owned logs.
 - Streaming acceptance progress: `proofs/acceptance-progress.jsonl` reports per-check `started`/`running`/`passed`/`failed` transitions while `dr-gate` is mid-evaluation; the attach TUI tails it alongside the signed marker.
 - Extended runs carry the parent's `acceptance.yaml` into the child run and emit the same `print_run_started` startup details (provider route, doc-provider source) as fresh runs; resume does the same.
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.

@@ -148,7 +148,7 @@ pub async fn run_turn_loop(
             .provider
             .as_deref()
             .map(provider_output_name)
-            .unwrap_or("provider.out");
+            .unwrap_or_else(|| "provider.out".to_string());
         let request = ProviderRequest {
             prompt,
             max_output_tokens: 2048,
@@ -1224,11 +1224,29 @@ fn paths_for_state(state: &PipelineState) -> Result<DeadreckonPaths> {
     Ok(DeadreckonPaths::from_home(home))
 }
 
-fn provider_output_name(provider: &str) -> &'static str {
-    match provider {
-        "cli:claude-code" => "claude.out",
-        "cli:codex" => "codex.out",
-        _ => "provider.out",
+fn provider_output_name(provider: &str) -> String {
+    if provider == "cli:claude-code" {
+        return "claude.out".to_string();
+    }
+    let Some(cli_id) = provider.strip_prefix("cli:") else {
+        return "provider.out".to_string();
+    };
+    let slug = cli_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if slug.is_empty() {
+        "provider.out".to_string()
+    } else {
+        format!("{slug}.out")
     }
 }
 
@@ -1344,9 +1362,19 @@ mod tests {
     use super::{
         RunLoopConfig, RunLoopDocsConfig, append_tool_refusal, bash_policy_refusal,
         build_cli_subagent_prompt, ensure_sandbox_toml, load_or_reconstruct_history,
-        load_tool_policy_from_sandbox_toml, run_turn_loop, safe_working_path,
+        load_tool_policy_from_sandbox_toml, provider_output_name, run_turn_loop, safe_working_path,
         safe_working_path_with_policy,
     };
+
+    #[test]
+    fn provider_output_name_slugifies_cli_descriptor_id() {
+        assert_eq!(provider_output_name("cli:codex"), "codex.out");
+        assert_eq!(provider_output_name("cli:claude-code"), "claude.out");
+        assert_eq!(provider_output_name("cli:gemini"), "gemini.out");
+        assert_eq!(provider_output_name("cli:opencode"), "opencode.out");
+        assert_eq!(provider_output_name("cli:local/test"), "local-test.out");
+        assert_eq!(provider_output_name("anthropic"), "provider.out");
+    }
 
     #[tokio::test]
     async fn tui_streams_tool_call_within_250ms() {

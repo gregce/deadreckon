@@ -1,0 +1,43 @@
+id = "cli:opencode"
+display_name = "OpenCode CLI"
+kind = "cli"
+default_binary = "opencode"
+allow_network_default = true
+default_model = "provider default"
+sandbox_writes = ["~/.local/share/opencode"]
+sandbox_reads = ["~/.local/share/opencode"]
+fs_detection_paths = ["~/.local/share/opencode"]
+docs_url = "https://opencode.ai/docs/cli/"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[version_probe]
+args = ["--version"]
+
+[exec_template]
+args_template = ["run", "--dangerously-skip-permissions", "{prompt}"]
+model_arg = "--model"
+timeout_seconds = 1800
+
+[install_hint]
+url = "https://opencode.ai/docs/"
+try_lines = ["curl -fsSL https://opencode.ai/install | bash"]
+
+[ingest]
+id_prefix = "opencode:"
+env_var = "OPENCODE_DIR"
+default_dirs = ["~/.local/share/opencode"]
+watch_subdirs = ["storage/session", "storage/message", "storage/part"]
+schema = "opencode"
+cwd_match = "directory-field"
+file_glob = "*.json"
+freshness_minutes = 2
+storage = "opencode-storage"
+
+[[model_catalog]]
+id = "provider default"
+aliases = ["opencode-default"]
+input_per_million = 0.0
+output_per_million = 0.0

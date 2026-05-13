@@ -1,13 +1,16 @@
 use std::fs;
 
 use deadreckon_providers::ProviderKind;
+use deadreckon_providers::registry::IngestCwdMatch;
+use deadreckon_providers::registry::IngestStorage;
 use deadreckon_providers::registry::ProviderDescriptor;
 use deadreckon_providers::registry::ProviderRegistry;
 use deadreckon_providers::registry::parse_custom_command;
+use deadreckon_providers::registry::parse_descriptor;
 use tempfile::TempDir;
 
 #[test]
-fn registry_builtin_lists_six_existing_providers() {
+fn registry_builtin_lists_cli_ingest_providers() {
     let registry = ProviderRegistry::builtin().expect("builtin registry");
     for id in [
         "anthropic",
@@ -16,6 +19,8 @@ fn registry_builtin_lists_six_existing_providers() {
         "smoke",
         "cli:claude-code",
         "cli:codex",
+        "cli:gemini",
+        "cli:opencode",
     ] {
         assert!(registry.get(id).is_some(), "{id} missing from registry");
     }
@@ -28,6 +33,57 @@ fn descriptor_toml_round_trips_serde() {
     let encoded = toml::to_string(descriptor).expect("serialize descriptor");
     let decoded: ProviderDescriptor = toml::from_str(&encoded).expect("deserialize descriptor");
     assert_eq!(descriptor, &decoded);
+}
+
+#[test]
+fn descriptor_ingest_round_trips_for_codex_and_claude() {
+    let registry = ProviderRegistry::builtin().expect("builtin registry");
+    let codex = registry.get("cli:codex").expect("codex descriptor");
+    let codex_ingest = codex.ingest.as_ref().expect("codex ingest");
+    assert_eq!(codex_ingest.id_prefix.as_deref(), Some("codex:"));
+    assert_eq!(codex_ingest.env_var.as_deref(), Some("CODEX_SESSIONS_DIR"));
+    assert_eq!(codex_ingest.schema, "codex-cli");
+    assert_eq!(codex_ingest.cwd_match, IngestCwdMatch::SessionMeta);
+    assert_eq!(codex_ingest.storage, Some(IngestStorage::Jsonl));
+
+    let claude = registry
+        .get("cli:claude-code")
+        .expect("claude-code descriptor");
+    let claude_ingest = claude.ingest.as_ref().expect("claude ingest");
+    assert_eq!(
+        claude_ingest.env_var.as_deref(),
+        Some("CLAUDE_PROJECTS_DIR")
+    );
+    assert_eq!(claude_ingest.schema, "claude-code");
+    assert_eq!(claude_ingest.cwd_match, IngestCwdMatch::ClaudeProjectDir);
+    assert_eq!(claude_ingest.storage, Some(IngestStorage::Jsonl));
+
+    let encoded = toml::to_string(codex).expect("serialize codex descriptor");
+    let decoded: ProviderDescriptor = toml::from_str(&encoded).expect("decode codex descriptor");
+    assert_eq!(decoded.ingest, codex.ingest);
+}
+
+#[test]
+fn descriptor_without_ingest_still_loads() {
+    let descriptor = parse_descriptor(
+        r#"
+id = "cli:minimal"
+display_name = "Minimal CLI"
+kind = "cli"
+default_binary = "minimal"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["run", "{prompt}"]
+"#,
+        "test:minimal",
+    )
+    .expect("parse descriptor without ingest");
+
+    assert!(descriptor.ingest.is_none());
 }
 
 #[test]
@@ -79,6 +135,38 @@ default_binary = "/opt/deadreckon/codex"
     assert_eq!(
         descriptor.default_binary.as_deref(),
         Some("/opt/deadreckon/codex")
+    );
+    assert_eq!(
+        descriptor.exec_template.model_arg.as_deref(),
+        Some("--model")
+    );
+}
+
+#[test]
+fn provider_override_can_replace_ingest_roots_without_losing_exec_template() {
+    let temp = TempDir::new().expect("tempdir");
+    let dir = temp.path().join("providers.d");
+    fs::create_dir_all(&dir).expect("providers.d");
+    fs::write(
+        dir.join("codex.toml"),
+        r#"
+id = "cli:codex"
+
+[ingest]
+default_dirs = ["~/custom-codex/sessions"]
+schema = "codex-cli"
+cwd_match = "session-meta"
+storage = "jsonl"
+"#,
+    )
+    .expect("write override");
+
+    let registry = ProviderRegistry::with_overrides(temp.path()).expect("registry");
+    let descriptor = registry.get("cli:codex").expect("codex descriptor");
+    let ingest = descriptor.ingest.as_ref().expect("codex ingest");
+    assert_eq!(
+        ingest.default_dirs,
+        [std::path::PathBuf::from("~/custom-codex/sessions")]
     );
     assert_eq!(
         descriptor.exec_template.model_arg.as_deref(),

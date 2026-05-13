@@ -1,3 +1,9 @@
+#![allow(
+    clippy::expect_used,
+    clippy::needless_pass_by_value,
+    clippy::redundant_clone
+)]
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

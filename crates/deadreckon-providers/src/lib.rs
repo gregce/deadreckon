@@ -4,6 +4,7 @@
 //! Provider routing and adapters for deadreckon.
 
 mod cli_common;
+mod cli_generic;
 mod config;
 mod error;
 mod http;
@@ -14,6 +15,7 @@ mod types;
 pub mod cli_claude_code;
 pub mod cli_codex;
 pub mod registry;
+pub mod taxonomy;
 
 pub use config::{DEFAULT_CONFIG_PATH, read_config};
 pub use error::{ProviderError, Result};

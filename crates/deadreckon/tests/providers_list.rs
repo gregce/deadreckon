@@ -1,3 +1,9 @@
+#![allow(
+    clippy::expect_used,
+    clippy::needless_pass_by_value,
+    clippy::redundant_clone
+)]
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -56,6 +62,8 @@ kind = "cli-codex"
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cli:codex"));
+    assert!(stdout.contains("cli:gemini"));
+    assert!(stdout.contains("cli:opencode"));
     assert!(stdout.contains("openai-compatible"));
     assert!(stdout.contains("smoke"));
 }

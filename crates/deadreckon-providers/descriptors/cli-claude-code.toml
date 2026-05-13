@@ -26,6 +26,15 @@ timeout_seconds = 1800
 url = "https://docs.claude.com/en/docs/claude-code/quickstart"
 try_lines = ["npm i -g @anthropic-ai/claude-code"]
 
+[ingest]
+env_var = "CLAUDE_PROJECTS_DIR"
+default_dirs = ["~/.claude/projects"]
+schema = "claude-code"
+cwd_match = "claude-project-dir"
+file_glob = "*.jsonl"
+freshness_minutes = 2
+storage = "jsonl"
+
 [[model_catalog]]
 id = "provider default"
 context_window = 200000

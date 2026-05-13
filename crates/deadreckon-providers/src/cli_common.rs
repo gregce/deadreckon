@@ -29,8 +29,37 @@ pub(crate) async fn run_cli(
     pid_file: Option<PathBuf>,
     cancellation_token: Option<CancellationToken>,
 ) -> Result<CliOutput> {
-    if let Some(backend) = sandbox_backend {
-        let cwd = cwd.unwrap_or_else(|| {
+    run_cli_with_options(
+        provider,
+        binary,
+        args,
+        CliRunOptions {
+            cwd,
+            sandbox_backend,
+            pid_file,
+            cancellation_token,
+            extra_write_allowlist: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub(crate) struct CliRunOptions {
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) sandbox_backend: Option<SandboxBackend>,
+    pub(crate) pid_file: Option<PathBuf>,
+    pub(crate) cancellation_token: Option<CancellationToken>,
+    pub(crate) extra_write_allowlist: Vec<PathBuf>,
+}
+
+pub(crate) async fn run_cli_with_options(
+    provider: &str,
+    binary: &str,
+    args: &[String],
+    options: CliRunOptions,
+) -> Result<CliOutput> {
+    if let Some(backend) = options.sandbox_backend {
+        let cwd = options.cwd.unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/Users/gdc/deadreckon"))
         });
         let resolved = resolve_cli_binary(binary);
@@ -42,11 +71,11 @@ pub(crate) async fn run_cli(
             env.insert("HOME".to_string(), home.to_string_lossy().to_string());
         }
         let program = resolved.program.clone().into_os_string();
-        let policy = ToolSandboxPolicy::cli_provider(
-            cwd.clone(),
-            resolved.read_allowlist,
-            cli_provider_write_allowlist(provider),
-        );
+        let mut write_allowlist = cli_provider_write_allowlist(provider);
+        write_allowlist.extend(options.extra_write_allowlist);
+        dedup_paths(&mut write_allowlist);
+        let policy =
+            ToolSandboxPolicy::cli_provider(cwd.clone(), resolved.read_allowlist, write_allowlist);
         let output = run_sandbox(SandboxSpec {
             backend,
             cwd,
@@ -54,8 +83,8 @@ pub(crate) async fn run_cli(
             args: args.iter().map(OsString::from).collect(),
             env,
             allow_network: policy.allow_network,
-            pid_file,
-            cancellation_token,
+            pid_file: options.pid_file,
+            cancellation_token: options.cancellation_token,
             profile_dir: None,
             read_allowlist: policy.read_allowlist,
             write_allowlist: policy.write_allowlist,
@@ -78,7 +107,7 @@ pub(crate) async fn run_cli(
 
     let mut command = Command::new(binary);
     command.args(args);
-    if let Some(cwd) = cwd {
+    if let Some(cwd) = options.cwd {
         command.current_dir(cwd);
     }
     let child = command
@@ -90,7 +119,7 @@ pub(crate) async fn run_cli(
             detail: source.to_string(),
         })?;
     let pid = child.id();
-    if let (Some(pid), Some(pid_file)) = (pid, pid_file.as_ref()) {
+    if let (Some(pid), Some(pid_file)) = (pid, options.pid_file.as_ref()) {
         if let Some(parent) = pid_file.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -113,7 +142,7 @@ pub(crate) async fn run_cli(
             provider: provider.to_string(),
             detail: source.to_string(),
         })?;
-    if let Some(pid_file) = pid_file.as_ref() {
+    if let Some(pid_file) = options.pid_file.as_ref() {
         let _ = tokio::fs::remove_file(pid_file).await;
     }
     Ok(CliOutput {

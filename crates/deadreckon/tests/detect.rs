@@ -1,3 +1,9 @@
+#![allow(
+    clippy::expect_used,
+    clippy::needless_pass_by_value,
+    clippy::redundant_clone
+)]
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -26,12 +32,96 @@ fn detect_lists_every_registered_provider() {
         "smoke",
         "cli:claude-code",
         "cli:codex",
+        "cli:gemini",
+        "cli:opencode",
     ] {
         assert!(
             stdout.contains(id),
             "{id} missing from detect output:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn detect_lists_new_cli_descriptors_with_install_hints() {
+    let temp = repo_tempdir();
+    let output = deadreckon(temp.path())
+        .arg("detect")
+        .env("PATH", temp.path().join("empty-bin"))
+        .output()
+        .expect("detect");
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cli:gemini"), "{stdout}");
+    assert!(
+        stdout.contains("npm install -g @google/gemini-cli"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("cli:opencode"), "{stdout}");
+    assert!(
+        stdout.contains("curl -fsSL https://opencode.ai/install | bash"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn init_yes_prefers_registry_cli_binary_order() {
+    let temp = repo_tempdir();
+    let bin = temp.path().join("bin");
+    write_fake_binary(&bin, "a-first", "a-first 1.0.0");
+    write_fake_binary(&bin, "z-second", "z-second 1.0.0");
+    write_provider_override(
+        temp.path(),
+        "a-first.toml",
+        r#"
+id = "cli:a-first"
+display_name = "A First CLI"
+kind = "cli"
+default_binary = "a-first"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["run", "{prompt}"]
+"#,
+    );
+    write_provider_override(
+        temp.path(),
+        "z-second.toml",
+        r#"
+id = "cli:z-second"
+display_name = "Z Second CLI"
+kind = "cli"
+default_binary = "z-second"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["run", "{prompt}"]
+"#,
+    );
+
+    let output = deadreckon(temp.path())
+        .args(["init", "--no-confirm", "--no-completion"])
+        .env("PATH", &bin)
+        .output()
+        .expect("init");
+
+    assert_success(&output);
+    let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+    assert!(
+        config.contains("default_provider = \"cli:a-first\""),
+        "{config}"
+    );
+    assert!(
+        config.contains("doc_provider = \"cli:a-first\""),
+        "{config}"
+    );
 }
 
 #[test]

@@ -270,6 +270,254 @@ async fn cli_claude_model_config_passes_model_flag() {
 }
 
 #[tokio::test]
+async fn generic_cli_provider_runs_descriptor_template() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let providers_dir = home.join("providers.d");
+    fs::create_dir_all(&providers_dir).expect("providers dir");
+    let binary = temp.path().join("fake-local-test");
+    write_fake_binary(&binary, "local-test-output");
+    fs::write(
+        providers_dir.join("local-test.toml"),
+        format!(
+            r#"
+id = "cli:local-test"
+display_name = "Local Test CLI"
+kind = "cli"
+default_binary = "{}"
+subscription = true
+sandbox_writes = ["~/.local-test"]
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["run", "--sandbox", "{{sandbox}}", "{{prompt}}"]
+model_arg = "--model"
+
+[install_hint]
+url = "https://example.invalid/local-test"
+try_lines = ["install local-test"]
+"#,
+            binary.display()
+        ),
+    )
+    .expect("write provider descriptor");
+    let config_path = home.join("config.toml");
+    fs::write(&config_path, "default_provider = \"cli:local-test\"\n").expect("write config");
+
+    let router =
+        ProviderRouter::from_config_path_with_model(&config_path, None, Some("local-model"))
+            .expect("router");
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "make notes".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(response.content.contains("local-test-output"));
+    assert!(
+        response
+            .content
+            .contains("args:run --sandbox workspace-write --model local-model make notes"),
+        "{}",
+        response.content
+    );
+    assert_eq!(response.model, "local-model");
+    assert_eq!(response.trace["kind"], "cli_subagent");
+    assert!(
+        response.trace["sandbox_write_allowlist"]
+            .as_array()
+            .expect("sandbox writes")
+            .iter()
+            .any(|path| path
+                .as_str()
+                .is_some_and(|path| path.ends_with(".local-test"))),
+        "{}",
+        response.trace
+    );
+    assert!(response.spend.subscription);
+}
+
+#[tokio::test]
+async fn generic_cli_provider_preserves_codex_prompt_delimiter() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let providers_dir = home.join("providers.d");
+    fs::create_dir_all(&providers_dir).expect("providers dir");
+    let binary = temp.path().join("fake-generic-codex");
+    write_fake_binary(&binary, "generic-codex-output");
+    fs::write(
+        providers_dir.join("generic-codex.toml"),
+        format!(
+            r#"
+id = "cli:generic-codex"
+display_name = "Generic Codex"
+kind = "cli"
+default_binary = "{}"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["exec", "--", "{{prompt}}"]
+"#,
+            binary.display()
+        ),
+    )
+    .expect("write provider descriptor");
+    let config_path = home.join("config.toml");
+    fs::write(&config_path, "default_provider = \"cli:generic-codex\"\n").expect("write config");
+
+    let router = ProviderRouter::from_config_path(&config_path, None).expect("router");
+    let prompt = "---\nname: narrator-overview\n---\nwrite docs";
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: prompt.to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(
+        response
+            .content
+            .contains("args:exec -- ---\nname: narrator-overview"),
+        "{}",
+        response.content
+    );
+    let args = response.trace["args"].as_array().expect("args");
+    assert_eq!(args[1], "--");
+    assert_eq!(args.last().and_then(|arg| arg.as_str()), Some(prompt));
+}
+
+#[tokio::test]
+async fn generic_cli_provider_passes_model_arg_from_descriptor() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join("providers.d")).expect("providers dir");
+    let binary = temp.path().join("fake-model-cli");
+    write_fake_binary(&binary, "model-cli-output");
+    fs::write(
+        home.join("providers.d/model-cli.toml"),
+        format!(
+            r#"
+id = "cli:model-cli"
+display_name = "Model CLI"
+kind = "cli"
+default_binary = "{}"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["run", "{{prompt}}"]
+model_arg = "--model"
+"#,
+            binary.display()
+        ),
+    )
+    .expect("write provider descriptor");
+    let config_path = home.join("config.toml");
+    fs::write(&config_path, "default_provider = \"cli:model-cli\"\n").expect("write config");
+
+    let router =
+        ProviderRouter::from_config_path_with_model(&config_path, None, Some("fast-model"))
+            .expect("router");
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "ship it".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(
+        response
+            .content
+            .contains("args:run --model fast-model ship it")
+    );
+    assert_eq!(response.model, "fast-model");
+}
+
+#[tokio::test]
+async fn generic_cli_provider_uses_descriptor_sandbox_writes() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join("providers.d")).expect("providers dir");
+    let binary = temp.path().join("fake-sandbox-cli");
+    write_fake_binary(&binary, "sandbox-cli-output");
+    fs::write(
+        home.join("providers.d/sandbox-cli.toml"),
+        format!(
+            r#"
+id = "cli:sandbox-cli"
+display_name = "Sandbox CLI"
+kind = "cli"
+default_binary = "{}"
+subscription = true
+sandbox_writes = ["~/.sandbox-cli"]
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["run", "{{prompt}}"]
+"#,
+            binary.display()
+        ),
+    )
+    .expect("write provider descriptor");
+    let config_path = home.join("config.toml");
+    fs::write(&config_path, "default_provider = \"cli:sandbox-cli\"\n").expect("write config");
+
+    let router = ProviderRouter::from_config_path(&config_path, None).expect("router");
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "ship it".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(
+        response.trace["sandbox_write_allowlist"]
+            .as_array()
+            .expect("sandbox writes")
+            .iter()
+            .any(|path| path
+                .as_str()
+                .is_some_and(|path| path.ends_with(".sandbox-cli"))),
+        "{}",
+        response.trace
+    );
+}
+
+#[tokio::test]
 async fn cli_provider_runs_inside_requested_sandbox_backend() {
     let temp = TempDir::new().expect("tempdir");
     let binary = temp.path().join("fake-claude");
@@ -458,6 +706,7 @@ async fn cli_provider_errors_on_nonzero_exit_after_capturing_output() {
     assert!(captured.contains("failure stderr"));
 }
 
+#[allow(clippy::expect_used)]
 fn write_fake_binary(path: &std::path::Path, label: &str) {
     fs::write(
         path,
@@ -467,6 +716,7 @@ fn write_fake_binary(path: &std::path::Path, label: &str) {
     chmod_exec(path);
 }
 
+#[allow(clippy::expect_used)]
 fn chmod_exec(path: &std::path::Path) {
     #[cfg(unix)]
     {

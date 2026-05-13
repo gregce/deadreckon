@@ -33,6 +33,14 @@ const BUILTIN_DESCRIPTOR_SOURCES: &[(&str, &str)] = &[
         "cli:codex",
         include_str!("../../descriptors/cli-codex.toml"),
     ),
+    (
+        "cli:gemini",
+        include_str!("../../descriptors/cli-gemini.toml"),
+    ),
+    (
+        "cli:opencode",
+        include_str!("../../descriptors/cli-opencode.toml"),
+    ),
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +125,45 @@ pub struct InstallHint {
     pub try_lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IngestCwdMatch {
+    #[default]
+    None,
+    SessionMeta,
+    TopLevel,
+    JsonPointer,
+    ClaudeProjectDir,
+    DirectoryField,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IngestStorage {
+    Jsonl,
+    Json,
+    JsonOrJsonl,
+    #[serde(rename = "opencode-storage")]
+    OpenCodeStorage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct IngestDescriptor {
+    pub id_prefix: Option<String>,
+    pub env_var: Option<String>,
+    pub default_dirs: Vec<PathBuf>,
+    pub watch_subdirs: Vec<PathBuf>,
+    pub shallow_watch: bool,
+    pub schema: String,
+    pub cwd_match: IngestCwdMatch,
+    pub cwd_match_path: Option<String>,
+    pub session_id_from: Option<String>,
+    pub file_glob: Option<String>,
+    pub freshness_minutes: Option<i64>,
+    pub storage: Option<IngestStorage>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ProviderDescriptor {
@@ -137,6 +184,7 @@ pub struct ProviderDescriptor {
     pub install_hint: InstallHint,
     pub docs_url: Option<String>,
     pub subscription: bool,
+    pub ingest: Option<IngestDescriptor>,
 }
 
 #[derive(Debug, Clone, Default)]

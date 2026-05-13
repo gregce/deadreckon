@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

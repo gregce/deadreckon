@@ -1,0 +1,43 @@
+id = "cli:gemini"
+display_name = "Gemini CLI"
+kind = "cli"
+default_binary = "gemini"
+allow_network_default = true
+default_model = "provider default"
+sandbox_writes = ["~/.gemini"]
+sandbox_reads = ["~/.gemini"]
+fs_detection_paths = ["~/.gemini"]
+docs_url = "https://google-gemini.github.io/gemini-cli/docs/cli/"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[version_probe]
+args = ["--version"]
+
+[exec_template]
+args_template = ["-p", "{prompt}"]
+model_arg = "--model"
+timeout_seconds = 1800
+
+[install_hint]
+url = "https://google-gemini.github.io/gemini-cli/docs/get-started/"
+try_lines = ["npm install -g @google/gemini-cli"]
+
+[ingest]
+id_prefix = "gemini:"
+env_var = "GEMINI_DIR"
+default_dirs = ["~/.gemini"]
+watch_subdirs = ["tmp"]
+schema = "gemini"
+cwd_match = "none"
+freshness_minutes = 2
+storage = "json-or-jsonl"
+
+[[model_catalog]]
+id = "provider default"
+context_window = 1000000
+aliases = ["gemini-default"]
+input_per_million = 0.0
+output_per_million = 0.0

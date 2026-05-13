@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::needless_pass_by_value,
+        clippy::redundant_clone
+    )
+)]
+
 use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
 use std::fs;
 use std::future::Future;
@@ -36,9 +45,10 @@ use deadreckon_core::{
     validate_acceptance_marker, write_cancel_marker, write_chain_step_marker,
 };
 use deadreckon_providers::registry::{
-    DescriptorKind, ProbeStatus, ProviderProbe, ProviderProbeOptions, ProviderProbeResult,
-    ProviderRegistry,
+    DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
+    ProviderProbeOptions, ProviderProbeResult, ProviderRegistry,
 };
+use deadreckon_providers::taxonomy::normalize_tool_category;
 use deadreckon_providers::{
     ProviderRequest, ProviderRouteInfo, ProviderRouter, ProviderUsage, SpendEstimate, read_config,
 };
@@ -821,11 +831,12 @@ async fn init_command(
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     fs::create_dir_all(paths.home())?;
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
     let provider = match provider {
         Some(provider) => provider,
-        None if no_confirm && command_exists("claude") => "cli:claude-code".to_string(),
-        None if no_confirm && command_exists("codex") => "cli:codex".to_string(),
-        None if no_confirm => "anthropic".to_string(),
+        None if no_confirm => {
+            auto_subscription_cli_provider(&registry).unwrap_or_else(|| "anthropic".to_string())
+        }
         None => prompt_provider()?,
     };
     let api_key = api_key.or_else(|| {
@@ -854,6 +865,21 @@ async fn init_command(
         ui_command("deadreckon run \"describe the coding task\"")
     );
     Ok(())
+}
+
+fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String> {
+    registry
+        .iter()
+        .filter(|descriptor| {
+            descriptor.kind == DescriptorKind::Cli
+                && descriptor.subscription
+                && descriptor
+                    .default_binary
+                    .as_deref()
+                    .is_some_and(provider_binary_available)
+        })
+        .map(|descriptor| descriptor.id.clone())
+        .next()
 }
 
 fn config_command(command: ConfigCommand) -> Result<()> {
@@ -6765,6 +6791,10 @@ fn command_exists(name: &str) -> bool {
         })
 }
 
+fn provider_binary_available(binary: &str) -> bool {
+    command_exists(binary) || PathBuf::from(binary).exists()
+}
+
 // SAFETY: Materialize arguments are owned clap values at the command boundary.
 #[allow(clippy::needless_pass_by_value)]
 fn materialize_command(
@@ -10838,17 +10868,15 @@ struct ProviderActivity {
     context_window: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum ProviderJsonlSchema {
-    CodexCli,
-    ClaudeCode,
-}
-
 #[derive(Debug)]
 struct ProviderJsonlLogSpec {
-    schema: ProviderJsonlSchema,
+    schema: String,
     roots: Vec<PathBuf>,
     since: DateTime<Utc>,
+    cwd_match: IngestCwdMatch,
+    cwd_match_path: Option<String>,
+    storage: IngestStorage,
+    file_glob: Option<String>,
 }
 
 fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> ProviderActivity {
@@ -10860,28 +10888,34 @@ fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> Provider
 
 fn provider_jsonl_log_spec(state: &deadreckon_core::PipelineState) -> Option<ProviderJsonlLogSpec> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let since = state.started_at - ChronoDuration::minutes(2);
-    match state.provider.as_deref()? {
-        "cli:codex" => Some(ProviderJsonlLogSpec {
-            schema: ProviderJsonlSchema::CodexCli,
-            roots: vec![home.join(".codex/sessions")],
-            since,
-        }),
-        "cli:claude-code" => {
-            let mut seen_roots = BTreeSet::new();
-            let roots = run_working_dirs(state)
-                .iter()
-                .map(|working_dir| claude_project_dir_for_workdir(&home, working_dir))
-                .filter(|root| seen_roots.insert(root.clone()))
-                .collect::<Vec<_>>();
-            Some(ProviderJsonlLogSpec {
-                schema: ProviderJsonlSchema::ClaudeCode,
-                roots,
-                since,
-            })
-        }
-        _ => None,
+    let paths = DeadreckonPaths::discover();
+    let registry = ProviderRegistry::with_overrides(paths.home()).ok()?;
+    provider_jsonl_log_spec_from_registry(state, &registry, &home)
+}
+
+fn provider_jsonl_log_spec_from_registry(
+    state: &deadreckon_core::PipelineState,
+    registry: &ProviderRegistry,
+    home: &Path,
+) -> Option<ProviderJsonlLogSpec> {
+    let provider = state.provider.as_deref()?;
+    let ingest = registry.get(provider)?.ingest.as_ref()?;
+    let schema = ingest.schema.trim();
+    if schema.is_empty() {
+        return None;
     }
+    let freshness_minutes = ingest.freshness_minutes.unwrap_or(2).max(0);
+    let since = state.started_at - ChronoDuration::minutes(freshness_minutes);
+    let storage = ingest.storage.clone().unwrap_or(IngestStorage::Jsonl);
+    Some(ProviderJsonlLogSpec {
+        schema: schema.to_string(),
+        roots: provider_ingest_roots(ingest, state, home),
+        since,
+        cwd_match: ingest.cwd_match.clone(),
+        cwd_match_path: ingest.cwd_match_path.clone(),
+        storage,
+        file_glob: ingest.file_glob.clone(),
+    })
 }
 
 fn collect_jsonl_provider_activity(
@@ -10891,20 +10925,22 @@ fn collect_jsonl_provider_activity(
     let working_dirs = run_working_dirs(state);
     let mut candidates = Vec::new();
     for root in &spec.roots {
-        collect_recent_jsonl_files(root, spec.since, &mut candidates, 0);
+        collect_recent_provider_files(root, spec, &mut candidates, 0);
     }
     candidates.sort_by(|left, right| right.1.cmp(&left.1));
     for (path, _) in candidates {
-        if !provider_jsonl_session_matches_run(spec.schema, &path, &working_dirs) {
+        if !provider_jsonl_session_matches_run(spec, &path, &working_dirs) {
             continue;
         }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
         let mut activity = ProviderActivity::default();
-        for line in raw.lines() {
-            let mut parsed = provider_jsonl_activity_lines(spec.schema, line, &mut activity);
-            activity.lines.append(&mut parsed);
+        if !provider_jsonl_activity_file(&spec.schema, &path, &mut activity) {
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in raw.lines() {
+                let mut parsed = provider_jsonl_activity_lines(&spec.schema, line, &mut activity);
+                activity.lines.append(&mut parsed);
+            }
         }
         if activity.lines.is_empty() {
             continue;
@@ -10923,26 +10959,56 @@ fn run_working_dirs(state: &deadreckon_core::PipelineState) -> Vec<String> {
 }
 
 fn provider_jsonl_session_matches_run(
-    schema: ProviderJsonlSchema,
+    spec: &ProviderJsonlLogSpec,
     path: &Path,
     working_dirs: &[String],
 ) -> bool {
-    match schema {
-        ProviderJsonlSchema::CodexCli => jsonl_session_meta_cwd_matches(path, working_dirs),
-        ProviderJsonlSchema::ClaudeCode => jsonl_top_level_cwd_matches(path, working_dirs, 80),
+    match spec.cwd_match {
+        IngestCwdMatch::None => true,
+        IngestCwdMatch::SessionMeta => jsonl_session_meta_cwd_matches(path, working_dirs),
+        IngestCwdMatch::TopLevel | IngestCwdMatch::ClaudeProjectDir => {
+            jsonl_top_level_cwd_matches(path, working_dirs, 80)
+                || matches!(spec.cwd_match, IngestCwdMatch::ClaudeProjectDir)
+        }
+        IngestCwdMatch::JsonPointer => spec
+            .cwd_match_path
+            .as_deref()
+            .is_some_and(|pointer| jsonl_pointer_cwd_matches(path, pointer, working_dirs, 80)),
+        IngestCwdMatch::DirectoryField => {
+            json_file_field_cwd_matches(path, "directory", working_dirs)
+        }
     }
 }
 
 fn provider_jsonl_activity_lines(
-    schema: ProviderJsonlSchema,
+    schema: &str,
     line: &str,
     activity: &mut ProviderActivity,
 ) -> Vec<String> {
     match schema {
-        ProviderJsonlSchema::CodexCli => codex_activity_line(line, activity)
+        "codex-cli" => codex_activity_line(line, activity)
             .into_iter()
             .collect::<Vec<_>>(),
-        ProviderJsonlSchema::ClaudeCode => claude_activity_lines(line, activity),
+        "claude-code" => claude_activity_lines(line, activity),
+        _ => Vec::new(),
+    }
+}
+
+fn provider_jsonl_activity_file(
+    schema: &str,
+    path: &Path,
+    activity: &mut ProviderActivity,
+) -> bool {
+    match schema {
+        "gemini" => {
+            parse_gemini_activity_file(path, activity);
+            true
+        }
+        "opencode" => {
+            parse_opencode_activity_file(path, activity);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -11018,7 +11084,56 @@ fn jsonl_top_level_cwd_matches(path: &Path, working_dirs: &[String], scan_lines:
     false
 }
 
-fn claude_project_dir_for_workdir(home: &Path, working_dir: &str) -> PathBuf {
+fn jsonl_pointer_cwd_matches(
+    path: &Path,
+    pointer: &str,
+    working_dirs: &[String],
+    scan_lines: usize,
+) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let reader = io::BufReader::new(file);
+    for line in reader
+        .lines()
+        .map_while(std::result::Result::ok)
+        .take(scan_lines)
+    {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value
+            .pointer(&json_pointer_path(pointer))
+            .and_then(Value::as_str)
+            .is_some_and(|cwd| working_dirs.iter().any(|working_dir| working_dir == cwd))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn json_file_field_cwd_matches(path: &Path, field: &str, working_dirs: &[String]) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|cwd| working_dirs.iter().any(|working_dir| working_dir == cwd))
+}
+
+fn json_pointer_path(path: &str) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    format!("/{}", path.replace('.', "/"))
+}
+
+fn claude_project_name_for_workdir(working_dir: &str) -> String {
     let resolved = fs::canonicalize(working_dir).unwrap_or_else(|_| PathBuf::from(working_dir));
     let raw = resolved.to_string_lossy();
     let mut name = String::new();
@@ -11032,15 +11147,75 @@ fn claude_project_dir_for_workdir(home: &Path, working_dir: &str) -> PathBuf {
     if !name.starts_with('-') {
         name.insert(0, '-');
     }
-    home.join(".claude/projects").join(name)
+    name
 }
 
-fn collect_recent_jsonl_files(
+fn provider_ingest_roots(
+    ingest: &IngestDescriptor,
+    state: &deadreckon_core::PipelineState,
+    home: &Path,
+) -> Vec<PathBuf> {
+    let env_value = ingest.env_var.as_deref().and_then(std::env::var_os);
+    let base_roots = provider_ingest_base_roots(ingest, home, env_value.as_deref());
+    let mut roots = Vec::new();
+    match ingest.cwd_match {
+        IngestCwdMatch::ClaudeProjectDir => {
+            for base in &base_roots {
+                for working_dir in run_working_dirs(state) {
+                    roots.push(base.join(claude_project_name_for_workdir(&working_dir)));
+                }
+            }
+        }
+        _ => roots.extend(base_roots),
+    }
+    dedup_pathbufs(&mut roots);
+    roots
+}
+
+fn provider_ingest_base_roots(
+    ingest: &IngestDescriptor,
+    home: &Path,
+    env_value: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let mut roots = env_value
+        .filter(|value| !value.is_empty())
+        .map(|value| std::env::split_paths(value).collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            ingest
+                .default_dirs
+                .iter()
+                .map(|path| expand_home_path_for(path, home))
+                .collect()
+        });
+    dedup_pathbufs(&mut roots);
+    roots
+}
+
+fn expand_home_path_for(path: &Path, home: &Path) -> PathBuf {
+    if path == Path::new("~") {
+        return home.to_path_buf();
+    }
+    if let Ok(rest) = path.strip_prefix("~") {
+        return home.join(rest);
+    }
+    path.to_path_buf()
+}
+
+fn dedup_pathbufs(paths: &mut Vec<PathBuf>) {
+    paths.sort();
+    paths.dedup();
+}
+
+fn collect_recent_provider_files(
     root: &Path,
-    since: DateTime<Utc>,
+    spec: &ProviderJsonlLogSpec,
     files: &mut Vec<(PathBuf, DateTime<Utc>)>,
     depth: usize,
 ) {
+    if depth == 0 && spec.storage == IngestStorage::OpenCodeStorage {
+        collect_recent_opencode_session_files(root, spec.since, files);
+        return;
+    }
     if depth > 8 {
         return;
     }
@@ -11053,17 +11228,76 @@ fn collect_recent_jsonl_files(
             continue;
         };
         if metadata.is_dir() {
-            collect_recent_jsonl_files(&path, since, files, depth + 1);
+            collect_recent_provider_files(&path, spec, files, depth + 1);
             continue;
         }
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        if !provider_file_matches_spec(&path, spec) {
             continue;
         }
         let Some(modified_at) = metadata.modified().ok().map(DateTime::<Utc>::from) else {
             continue;
         };
-        if modified_at >= since {
+        if modified_at >= spec.since {
             files.push((path, modified_at));
+        }
+    }
+}
+
+fn collect_recent_opencode_session_files(
+    root: &Path,
+    since: DateTime<Utc>,
+    files: &mut Vec<(PathBuf, DateTime<Utc>)>,
+) {
+    let session_root = root.join("storage/session");
+    let Ok(projects) = fs::read_dir(session_root) else {
+        return;
+    };
+    for project in projects.flatten() {
+        let project_path = project.path();
+        let Ok(metadata) = project.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(project_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(modified_at) = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(DateTime::<Utc>::from)
+            else {
+                continue;
+            };
+            if modified_at >= since {
+                files.push((path, modified_at));
+            }
+        }
+    }
+}
+
+fn provider_file_matches_spec(path: &Path, spec: &ProviderJsonlLogSpec) -> bool {
+    if let Some(glob) = spec.file_glob.as_deref()
+        && let Some(extension) = glob.strip_prefix("*.")
+    {
+        return path.extension().and_then(|value| value.to_str()) == Some(extension);
+    }
+    match spec.storage {
+        IngestStorage::Jsonl => path.extension().and_then(|value| value.to_str()) == Some("jsonl"),
+        IngestStorage::Json => path.extension().and_then(|value| value.to_str()) == Some("json"),
+        IngestStorage::JsonOrJsonl => matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("json") | Some("jsonl")
+        ),
+        IngestStorage::OpenCodeStorage => {
+            path.extension().and_then(|value| value.to_str()) == Some("json")
         }
     }
 }
@@ -11111,7 +11345,8 @@ fn codex_activity_line(line: &str, activity: &mut ProviderActivity) -> Option<St
                 .and_then(Value::as_str)
                 .unwrap_or("");
             Some(format!(
-                "{timestamp} tool {name} {}",
+                "{timestamp} tool {} {}",
+                provider_tool_label(name),
                 one_line(&tool_call_summary(name, args), 140)
             ))
         }
@@ -11177,7 +11412,8 @@ fn claude_assistant_activity_lines(
                 let name = part.get("name").and_then(Value::as_str).unwrap_or("tool");
                 let input = part.get("input").unwrap_or(&Value::Null);
                 lines.push(format!(
-                    "{timestamp} tool {name} {}",
+                    "{timestamp} tool {} {}",
+                    provider_tool_label(name),
                     one_line(&claude_tool_summary(name, input), 140)
                 ));
             }
@@ -11254,6 +11490,284 @@ fn claude_content_text(value: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn provider_tool_label(name: &str) -> &str {
+    let category = normalize_tool_category(name);
+    if category == "Other" { name } else { category }
+}
+
+fn parse_gemini_activity_file(path: &Path, activity: &mut ProviderActivity) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(&raw)
+        && (value.get("messages").is_some() || value.get("sessionId").is_some())
+    {
+        if let Some(messages) = value.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                let lines = gemini_activity_lines_from_value(message, activity);
+                activity.lines.extend(lines);
+            }
+        } else {
+            let lines = gemini_activity_lines_from_value(&value, activity);
+            activity.lines.extend(lines);
+        }
+        return;
+    }
+    let mut records = BTreeMap::new();
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let row_type = value.get("type").and_then(Value::as_str);
+        if !matches!(row_type, Some("user") | Some("gemini")) {
+            continue;
+        }
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            records.insert(id.to_string(), value);
+        } else {
+            let key = format!("__row_{}", records.len());
+            records.insert(key, value);
+        }
+    }
+    for value in records.values() {
+        let lines = gemini_activity_lines_from_value(value, activity);
+        activity.lines.extend(lines);
+    }
+}
+
+fn gemini_activity_lines_from_value(value: &Value, activity: &mut ProviderActivity) -> Vec<String> {
+    if value.get("type").and_then(Value::as_str) != Some("gemini") {
+        return Vec::new();
+    }
+    apply_gemini_tokens(value, activity);
+    let timestamp = short_timestamp(value.get("timestamp").and_then(Value::as_str));
+    let mut lines = Vec::new();
+    if let Some(thoughts) = value.get("thoughts").and_then(Value::as_array) {
+        for thought in thoughts {
+            let subject = thought.get("subject").and_then(Value::as_str).unwrap_or("");
+            let description = thought
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let text = [subject, description]
+                .into_iter()
+                .filter(|part| !part.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                lines.push(format!("{timestamp} thinking {}", one_line(&text, 140)));
+            }
+        }
+    }
+    for text in gemini_content_texts(value.get("content").unwrap_or(&Value::Null)) {
+        if !text.trim().is_empty() {
+            lines.push(format!("{timestamp} agent {}", one_line(&text, 140)));
+        }
+    }
+    if let Some(tool_calls) = value.get("toolCalls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            let name = tool_call
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let args = tool_call.get("args").unwrap_or(&Value::Null);
+            lines.push(format!(
+                "{timestamp} tool {} {}",
+                provider_tool_label(name),
+                one_line(&json_tool_summary(name, args), 140)
+            ));
+            if let Some(results) = tool_call.get("result").and_then(Value::as_array) {
+                for result in results {
+                    if let Some(output) = result.pointer("/functionResponse/response/output") {
+                        lines.push(format!(
+                            "{timestamp} result {}",
+                            one_line(&json_value_text(output), 140)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn gemini_content_texts(value: &Value) -> Vec<String> {
+    if let Some(text) = value.as_str() {
+        return vec![text.to_string()];
+    }
+    value
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn apply_gemini_tokens(value: &Value, activity: &mut ProviderActivity) {
+    let Some(tokens) = value.get("tokens") else {
+        return;
+    };
+    let input = tokens.get("input").and_then(Value::as_u64).unwrap_or(0);
+    let cached = tokens.get("cached").and_then(Value::as_u64).unwrap_or(0);
+    let total = input + cached;
+    if total > 0 {
+        activity.context_tokens = Some(total);
+        activity.context_window = Some(1_000_000);
+    }
+}
+
+fn parse_opencode_activity_file(path: &Path, activity: &mut ProviderActivity) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(session) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+    let Some(session_id) = session.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(root) = path.ancestors().nth(4) else {
+        return;
+    };
+    let messages = read_json_values_sorted(&root.join("storage/message").join(session_id));
+    for message in messages {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        apply_opencode_tokens(&message, activity);
+        let Some(message_id) = message.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let timestamp = timestamp_from_millis(opencode_time_value(&message));
+        let parts = read_json_values_sorted(&root.join("storage/part").join(message_id));
+        for part in parts {
+            apply_opencode_tokens(&part, activity);
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") if role == "assistant" => {
+                    let text = part
+                        .get("content")
+                        .or_else(|| part.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !text.trim().is_empty() {
+                        activity
+                            .lines
+                            .push(format!("{timestamp} agent {}", one_line(text, 140)));
+                    }
+                }
+                Some("reasoning") if role == "assistant" => {
+                    let text = part
+                        .get("content")
+                        .or_else(|| part.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !text.trim().is_empty() {
+                        activity
+                            .lines
+                            .push(format!("{timestamp} thinking {}", one_line(text, 140)));
+                    }
+                }
+                Some("tool") if role == "assistant" => {
+                    let name = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                    let input = part
+                        .pointer("/state/input")
+                        .or_else(|| part.get("input"))
+                        .unwrap_or(&Value::Null);
+                    activity.lines.push(format!(
+                        "{timestamp} tool {} {}",
+                        provider_tool_label(name),
+                        one_line(&json_tool_summary(name, input), 140)
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn read_json_values_sorted(dir: &Path) -> Vec<Value> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut values = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                return None;
+            }
+            let raw = fs::read_to_string(path).ok()?;
+            serde_json::from_str::<Value>(&raw).ok()
+        })
+        .collect::<Vec<_>>();
+    values.sort_by_key(opencode_time_value);
+    values
+}
+
+fn opencode_time_value(value: &Value) -> i64 {
+    let time = value.get("time").unwrap_or(&Value::Null);
+    for key in ["created", "start", "end", "updated"] {
+        if let Some(value) = time.get(key).and_then(Value::as_i64)
+            && value > 0
+        {
+            return value;
+        }
+    }
+    0
+}
+
+fn apply_opencode_tokens(value: &Value, activity: &mut ProviderActivity) {
+    let Some(tokens) = value.get("tokens") else {
+        return;
+    };
+    let input = tokens.get("input").and_then(Value::as_u64).unwrap_or(0);
+    let cache_read = tokens
+        .pointer("/cache/read")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_write = tokens
+        .pointer("/cache/write")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = input + cache_read + cache_write;
+    if total > 0 {
+        activity.context_tokens = Some(total);
+    }
+}
+
+fn timestamp_from_millis(value: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(value)
+        .map(|timestamp| timestamp.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "--:--:--".to_string())
+}
+
+fn json_tool_summary(name: &str, input: &Value) -> String {
+    match name {
+        "read_file" | "read" | "write_file" | "write" | "edit_file" | "edit" => input
+            .get("path")
+            .or_else(|| input.get("file_path"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| input.to_string()),
+        "run_command" | "execute_command" | "run_shell_command" | "bash" => input
+            .get("command")
+            .or_else(|| input.get("cmd"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| input.to_string()),
+        _ => input.to_string(),
+    }
+}
+
+fn json_value_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn claude_usage_tokens(usage: &Value) -> Option<u64> {
@@ -12358,12 +12872,14 @@ mod tui_tests {
     use super::{
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachTuiState, ChainAttachTuiState, CompletionAction,
-        ProviderActivity, ProviderJsonlSchema, acceptance_activity_lines, attach_header_text,
+        ProviderActivity, ProviderJsonlLogSpec, acceptance_activity_lines, attach_header_text,
         chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-        chain_should_auto_attach, chain_timeline_lines, chain_wall_cap_hit, cli_wait_status_line,
+        chain_should_auto_attach, chain_timeline_lines, chain_wall_cap_hit,
+        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
         completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
         deadreckoning_status_text, doc_polish_preview_text, live_file_lines, markdown_to_tui_lines,
-        max_panel_scroll, per_step_wall_cap, provider_jsonl_activity_lines,
+        max_panel_scroll, per_step_wall_cap, provider_ingest_base_roots,
+        provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
         provider_jsonl_session_matches_run, threshold_color,
     };
     use chrono::Utc;
@@ -12373,6 +12889,9 @@ mod tui_tests {
         ChainStatus, ChainStepStatus, DeadreckonPaths, OnFail, RunOptions, create_run,
     };
     use deadreckon_providers::SpendEstimate;
+    use deadreckon_providers::registry::{
+        IngestCwdMatch, IngestDescriptor, IngestStorage, ProviderRegistry,
+    };
     use ratatui::style::{Color, Modifier};
     use ratatui::text::Line;
 
@@ -12638,6 +13157,75 @@ mod tui_tests {
         assert!(lines.contains("npm test"), "{lines}");
     }
 
+    fn test_log_spec(cwd_match: IngestCwdMatch) -> ProviderJsonlLogSpec {
+        ProviderJsonlLogSpec {
+            schema: "test".to_string(),
+            roots: Vec::new(),
+            since: Utc::now(),
+            cwd_match,
+            cwd_match_path: None,
+            storage: IngestStorage::Jsonl,
+            file_glob: Some("*.jsonl".to_string()),
+        }
+    }
+
+    #[test]
+    fn provider_log_spec_uses_descriptor_roots_for_codex() {
+        let (_temp, state) = doc_preview_state();
+        let registry = ProviderRegistry::builtin().expect("registry");
+        let home = std::path::PathBuf::from("/tmp/deadreckon-home");
+
+        let spec = provider_jsonl_log_spec_from_registry(&state, &registry, &home)
+            .expect("codex log spec");
+
+        assert_eq!(spec.schema, "codex-cli");
+        assert_eq!(spec.cwd_match, IngestCwdMatch::SessionMeta);
+        assert!(spec.roots.contains(&home.join(".codex/sessions")));
+        assert!(spec.roots.contains(&home.join(".codex/archived_sessions")));
+    }
+
+    #[test]
+    fn provider_log_spec_honors_ingest_env_override() {
+        let home = std::path::PathBuf::from("/tmp/deadreckon-home");
+        let first = std::path::PathBuf::from("/tmp/codex-one");
+        let second = std::path::PathBuf::from("/tmp/codex-two");
+        let env_value =
+            std::env::join_paths([first.as_path(), second.as_path()]).expect("join env paths");
+        let ingest = IngestDescriptor {
+            env_var: Some("CODEX_SESSIONS_DIR".to_string()),
+            default_dirs: vec![std::path::PathBuf::from("~/.codex/sessions")],
+            ..IngestDescriptor::default()
+        };
+
+        let roots = provider_ingest_base_roots(&ingest, &home, Some(env_value.as_os_str()));
+
+        assert_eq!(roots, [first, second]);
+    }
+
+    #[test]
+    fn claude_ingest_roots_remain_workdir_scoped_and_deduped() {
+        let (_temp, mut state) = doc_preview_state();
+        state.provider = Some("cli:claude-code".to_string());
+        let registry = ProviderRegistry::builtin().expect("registry");
+        let home = std::path::PathBuf::from("/tmp/deadreckon-home");
+
+        let spec = provider_jsonl_log_spec_from_registry(&state, &registry, &home)
+            .expect("claude log spec");
+        let expected = home
+            .join(".claude/projects")
+            .join(claude_project_name_for_workdir(
+                &state.working_dir.to_string_lossy(),
+            ));
+
+        assert_eq!(spec.schema, "claude-code");
+        assert_eq!(spec.cwd_match, IngestCwdMatch::ClaudeProjectDir);
+        assert!(spec.roots.contains(&expected), "{:?}", spec.roots);
+        let mut deduped = spec.roots.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(spec.roots, deduped);
+    }
+
     #[test]
     fn provider_jsonl_matchers_cover_session_meta_and_top_level_cwd() {
         std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
@@ -12654,8 +13242,9 @@ mod tui_tests {
             ),
         )
         .expect("codex jsonl");
+        let codex_spec = test_log_spec(IngestCwdMatch::SessionMeta);
         assert!(provider_jsonl_session_matches_run(
-            ProviderJsonlSchema::CodexCli,
+            &codex_spec,
             &codex,
             &working_dirs
         ));
@@ -12669,9 +13258,33 @@ mod tui_tests {
             ),
         )
         .expect("claude jsonl");
+        let claude_spec = test_log_spec(IngestCwdMatch::TopLevel);
         assert!(provider_jsonl_session_matches_run(
-            ProviderJsonlSchema::ClaudeCode,
+            &claude_spec,
             &claude,
+            &working_dirs
+        ));
+    }
+
+    #[test]
+    fn cwd_match_directory_field_matches_opencode_json() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let working_dir = temp.path().join("work");
+        let working_dirs = vec![working_dir.to_string_lossy().to_string()];
+        let path = temp.path().join("opencode.json");
+        std::fs::write(
+            &path,
+            format!(r#"{{"id":"s1","directory":"{}"}}"#, working_dir.display()),
+        )
+        .expect("opencode json");
+
+        let mut spec = test_log_spec(IngestCwdMatch::DirectoryField);
+        spec.storage = IngestStorage::Json;
+
+        assert!(provider_jsonl_session_matches_run(
+            &spec,
+            &path,
             &working_dirs
         ));
     }
@@ -12680,16 +13293,23 @@ mod tui_tests {
     fn provider_jsonl_activity_dispatches_codex_and_claude_rows() {
         let mut codex = ProviderActivity::default();
         let codex_lines = provider_jsonl_activity_lines(
-            ProviderJsonlSchema::CodexCli,
+            "codex-cli",
             r#"{"type":"event_msg","timestamp":"2026-05-13T02:34:17Z","payload":{"type":"agent_message","message":"Working on it"}}"#,
             &mut codex,
         );
         assert_eq!(codex_lines.len(), 1);
         assert!(codex_lines[0].contains("agent Working on it"));
+        let codex_tool_lines = provider_jsonl_activity_lines(
+            "codex-cli",
+            r#"{"type":"response_item","timestamp":"2026-05-13T02:34:18Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+            &mut codex,
+        );
+        assert_eq!(codex_tool_lines.len(), 1);
+        assert!(codex_tool_lines[0].contains("tool Bash cargo test"));
 
         let mut claude = ProviderActivity::default();
         let claude_lines = provider_jsonl_activity_lines(
-            ProviderJsonlSchema::ClaudeCode,
+            "claude-code",
             r#"{"type":"assistant","timestamp":"2026-05-13T02:34:17.615Z","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4},"content":[{"type":"text","text":"Adding tests"},{"type":"tool_use","name":"Bash","input":{"command":"npm test"}}]}}"#,
             &mut claude,
         );
@@ -12698,6 +13318,162 @@ mod tui_tests {
         assert_eq!(claude_lines.len(), 2);
         assert!(claude_lines[0].contains("agent Adding tests"));
         assert!(claude_lines[1].contains("tool Bash npm test"));
+    }
+
+    #[test]
+    fn schema_dispatch_unknown_schema_is_quiet() {
+        let mut activity = ProviderActivity::default();
+        let lines = provider_jsonl_activity_lines(
+            "unknown-schema",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"hidden"}}"#,
+            &mut activity,
+        );
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn gemini_json_object_fixture_emits_agent_tool_result_and_tokens() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let (_state_temp, state) = doc_preview_state();
+        let root = temp.path().join("gemini");
+        std::fs::create_dir_all(&root).expect("gemini root");
+        std::fs::write(
+            root.join("session-test.json"),
+            r#"{
+  "sessionId": "s1",
+  "messages": [{
+    "type": "gemini",
+    "timestamp": "2026-05-13T02:34:17Z",
+    "thoughts": [{"subject": "Plan", "description": "Read the file"}],
+    "content": "I will inspect the file",
+    "tokens": {"input": 10, "cached": 2, "output": 3},
+    "toolCalls": [{
+      "name": "read_file",
+      "args": {"path": "src/main.rs"},
+      "result": [{"functionResponse": {"id": "r1", "response": {"output": "file contents"}}}]
+    }]
+  }]
+}"#,
+        )
+        .expect("gemini fixture");
+        let spec = ProviderJsonlLogSpec {
+            schema: "gemini".to_string(),
+            roots: vec![root],
+            since: Utc::now() - chrono::Duration::minutes(1),
+            cwd_match: IngestCwdMatch::None,
+            cwd_match_path: None,
+            storage: IngestStorage::JsonOrJsonl,
+            file_glob: None,
+        };
+
+        let activity = collect_jsonl_provider_activity(&state, &spec);
+        let lines = activity.lines.join("\n");
+
+        assert!(lines.contains("thinking Plan Read the file"), "{lines}");
+        assert!(lines.contains("agent I will inspect the file"), "{lines}");
+        assert!(lines.contains("tool Read src/main.rs"), "{lines}");
+        assert!(lines.contains("result file contents"), "{lines}");
+        assert_eq!(activity.context_tokens, Some(12));
+        assert_eq!(activity.context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn gemini_jsonl_fixture_emits_activity_and_tokens() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let (_state_temp, state) = doc_preview_state();
+        let root = temp.path().join("gemini");
+        std::fs::create_dir_all(&root).expect("gemini root");
+        std::fs::write(
+            root.join("session-test.jsonl"),
+            r#"{"type":"user","id":"u1","timestamp":"2026-05-13T02:34:16Z","content":"hello"}
+{"type":"gemini","id":"g1","timestamp":"2026-05-13T02:34:17Z","content":[{"text":"Done"}],"tokens":{"input":4,"cached":1},"toolCalls":[{"name":"run_command","args":{"command":"cargo test"}}]}
+"#,
+        )
+        .expect("gemini jsonl fixture");
+        let spec = ProviderJsonlLogSpec {
+            schema: "gemini".to_string(),
+            roots: vec![root],
+            since: Utc::now() - chrono::Duration::minutes(1),
+            cwd_match: IngestCwdMatch::None,
+            cwd_match_path: None,
+            storage: IngestStorage::JsonOrJsonl,
+            file_glob: None,
+        };
+
+        let activity = collect_jsonl_provider_activity(&state, &spec);
+        let lines = activity.lines.join("\n");
+
+        assert!(lines.contains("agent Done"), "{lines}");
+        assert!(lines.contains("tool Bash cargo test"), "{lines}");
+        assert_eq!(activity.context_tokens, Some(5));
+        assert_eq!(activity.context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn opencode_storage_fixture_emits_agent_thinking_tool_and_tokens() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let (_state_temp, state) = doc_preview_state();
+        let root = temp.path().join("opencode");
+        let session_dir = root.join("storage/session/project");
+        let message_dir = root.join("storage/message/s1");
+        let part_dir = root.join("storage/part/m1");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        std::fs::create_dir_all(&message_dir).expect("message dir");
+        std::fs::create_dir_all(&part_dir).expect("part dir");
+        std::fs::write(
+            session_dir.join("s1.json"),
+            format!(
+                r#"{{"id":"s1","directory":"{}","time":{{"created":1770000000000}}}}"#,
+                state.working_dir.display()
+            ),
+        )
+        .expect("session");
+        std::fs::write(
+            message_dir.join("m1.json"),
+            r#"{"id":"m1","sessionID":"s1","role":"assistant","time":{"created":1770000000000}}"#,
+        )
+        .expect("message");
+        std::fs::write(
+            part_dir.join("01.json"),
+            r#"{"id":"p1","messageID":"m1","type":"reasoning","content":"Need to edit","time":{"created":1770000000001}}"#,
+        )
+        .expect("reasoning");
+        std::fs::write(
+            part_dir.join("02.json"),
+            r#"{"id":"p2","messageID":"m1","type":"text","content":"Editing now","time":{"created":1770000000002}}"#,
+        )
+        .expect("text");
+        std::fs::write(
+            part_dir.join("03.json"),
+            r#"{"id":"p3","messageID":"m1","type":"tool","tool":"bash","state":{"input":{"command":"cargo test"}},"time":{"created":1770000000003}}"#,
+        )
+        .expect("tool");
+        std::fs::write(
+            part_dir.join("04.json"),
+            r#"{"id":"p4","messageID":"m1","type":"step-finish","tokens":{"input":7,"cache":{"read":2,"write":1}},"time":{"created":1770000000004}}"#,
+        )
+        .expect("tokens");
+        let spec = ProviderJsonlLogSpec {
+            schema: "opencode".to_string(),
+            roots: vec![root],
+            since: Utc::now() - chrono::Duration::minutes(1),
+            cwd_match: IngestCwdMatch::DirectoryField,
+            cwd_match_path: None,
+            storage: IngestStorage::OpenCodeStorage,
+            file_glob: Some("*.json".to_string()),
+        };
+
+        let activity = collect_jsonl_provider_activity(&state, &spec);
+        let lines = activity.lines.join("\n");
+
+        assert!(lines.contains("thinking Need to edit"), "{lines}");
+        assert!(lines.contains("agent Editing now"), "{lines}");
+        assert!(lines.contains("tool Bash cargo test"), "{lines}");
+        assert_eq!(activity.context_tokens, Some(10));
     }
 
     #[test]

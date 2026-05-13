@@ -42,9 +42,15 @@ fn defaults_provider(raw: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[cfg(test)]
 pub(crate) fn builtin_entries() -> Result<BTreeMap<String, ProviderEntry>> {
-    let registry = ProviderRegistry::builtin()?;
-    Ok(registry
+    Ok(provider_entries_from_registry(&ProviderRegistry::builtin()?))
+}
+
+pub(crate) fn provider_entries_from_registry(
+    registry: &ProviderRegistry,
+) -> BTreeMap<String, ProviderEntry> {
+    registry
         .iter()
         .map(|descriptor| {
             (
@@ -52,10 +58,10 @@ pub(crate) fn builtin_entries() -> Result<BTreeMap<String, ProviderEntry>> {
                 provider_entry_from_descriptor(descriptor),
             )
         })
-        .collect())
+        .collect()
 }
 
-fn provider_entry_from_descriptor(descriptor: &ProviderDescriptor) -> ProviderEntry {
+pub(crate) fn provider_entry_from_descriptor(descriptor: &ProviderDescriptor) -> ProviderEntry {
     let default_model = if descriptor.kind == DescriptorKind::Cli {
         None
     } else if descriptor.id == "openai-compatible" {

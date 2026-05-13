@@ -33,6 +33,17 @@ timeout_seconds = 1800
 url = "https://developers.openai.com/codex/quickstart"
 try_lines = ["npm i -g @openai/codex"]
 
+[ingest]
+id_prefix = "codex:"
+env_var = "CODEX_SESSIONS_DIR"
+default_dirs = ["~/.codex/sessions", "~/.codex/archived_sessions"]
+schema = "codex-cli"
+cwd_match = "session-meta"
+cwd_match_path = "payload.cwd"
+file_glob = "*.jsonl"
+freshness_minutes = 2
+storage = "jsonl"
+
 [[model_catalog]]
 id = "provider default"
 context_window = 258400

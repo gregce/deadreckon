@@ -2,8 +2,12 @@ use std::path::Path;
 
 use crate::cli_claude_code::CliClaudeCodeProvider;
 use crate::cli_codex::CliCodexProvider;
-use crate::config::{builtin_entries, kind_from_name, merge_provider_entry, read_config};
+use crate::cli_generic::GenericCliProvider;
+use crate::config::{
+    kind_from_name, merge_provider_entry, provider_entries_from_registry, read_config,
+};
 use crate::http::ProviderAdapter;
+use crate::registry::{DescriptorKind, ProviderRegistry};
 use crate::smoke::ScriptedSmokeProvider;
 use crate::{
     Provider, ProviderConfigFile, ProviderEntry, ProviderError, ProviderKind, ProviderRequest,
@@ -33,7 +37,17 @@ impl ProviderRouter {
         // REPORT.md: Provider Routing / BYOK keeps credentials in the user's
         // local config/env and tries the configured fallback chain.
         let config = read_config(path)?;
-        Self::from_config_with_model(config, override_provider, override_model)
+        let registry = path
+            .parent()
+            .map(ProviderRegistry::with_overrides)
+            .transpose()?
+            .unwrap_or(ProviderRegistry::builtin()?);
+        Self::from_config_with_model_and_registry(
+            config,
+            override_provider,
+            override_model,
+            &registry,
+        )
     }
 
     pub fn from_config(
@@ -48,7 +62,22 @@ impl ProviderRouter {
         override_provider: Option<&str>,
         override_model: Option<&str>,
     ) -> Result<Self> {
-        let mut providers = builtin_entries()?;
+        let registry = ProviderRegistry::builtin()?;
+        Self::from_config_with_model_and_registry(
+            config,
+            override_provider,
+            override_model,
+            &registry,
+        )
+    }
+
+    fn from_config_with_model_and_registry(
+        config: ProviderConfigFile,
+        override_provider: Option<&str>,
+        override_model: Option<&str>,
+        registry: &ProviderRegistry,
+    ) -> Result<Self> {
+        let mut providers = provider_entries_from_registry(registry);
         for (name, entry) in config.providers {
             if let Some(base) = providers.get_mut(&name) {
                 merge_provider_entry(base, entry);
@@ -75,7 +104,7 @@ impl ProviderRouter {
             }
             let kind = entry.kind.unwrap_or_else(|| kind_from_name(&name));
             entry.kind = Some(kind.clone());
-            routes.push(build_provider(name, kind, entry)?);
+            routes.push(build_provider(name, kind, entry, registry)?);
         }
 
         Ok(Self { routes })
@@ -165,6 +194,7 @@ fn build_provider(
     name: String,
     kind: ProviderKind,
     entry: ProviderEntry,
+    registry: &ProviderRegistry,
 ) -> Result<Box<dyn Provider>> {
     match kind {
         ProviderKind::CliClaudeCode => Ok(Box::new(CliClaudeCodeProvider::new(name, entry))),
@@ -173,8 +203,23 @@ fn build_provider(
         ProviderKind::Anthropic | ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => {
             Ok(Box::new(ProviderAdapter::new(name, kind, entry)))
         }
-        ProviderKind::Generic(id) => Err(ProviderError::InvalidConfig(format!(
-            "generic provider {id} is registered but not wired for dispatch yet"
-        ))),
+        ProviderKind::Generic(id) => {
+            let descriptor = registry
+                .get(&id)
+                .or_else(|| registry.get(&name))
+                .ok_or_else(|| {
+                    ProviderError::InvalidConfig(format!("generic provider {id} has no descriptor"))
+                })?;
+            if descriptor.kind != DescriptorKind::Cli {
+                return Err(ProviderError::InvalidConfig(format!(
+                    "generic provider {id} is not a cli descriptor"
+                )));
+            }
+            Ok(Box::new(GenericCliProvider::new(
+                name,
+                entry,
+                descriptor.clone(),
+            )?))
+        }
     }
 }
