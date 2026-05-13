@@ -10,9 +10,10 @@ GOAL: Extend deadreckon at `/Users/gdc/deadreckon/` from single-run harness into
 
 **Core idea.**
 
-- **Split mode:** `plan` decomposes a goal into N sub-goals. `fork` runs each child through the existing turn loop in its own scope/worktree/provider. `merge` composes accepted child artifacts, runs the gate again, and promotes the merged artifact.
-- **Review mode:** `orchestrate "goal" --mode review --coder-provider cli:claude-code --reviewer-provider cli:codex` runs one normal coding run, then launches the reviewer via `extend` to inspect, write `.deadreckon/REVIEW.md`, apply review fixes, and gate the reviewed artifact.
-- A child is still just a normal deadreckon run plus `parent_plan_id`, `child_index`, `plan_role`, and provider metadata in `.deadreckon/parent.json`.
+- **Split mode:** `plan` decomposes a goal into a task graph with providers, dependencies, worker specs, capability requests, and done criteria. `fork` runs ready child tasks through the existing turn loop in isolated scopes/worktrees. `merge` composes accepted artifacts, gates again, and promotes the merged artifact.
+- **Review mode:** `orchestrate "goal" --mode review --coder-provider cli:claude-code --reviewer-provider cli:codex` runs one normal coding task, then launches a fresh reviewer lane via `extend` to inspect, write `.deadreckon/REVIEW.md`, apply review fixes when allowed, and gate the reviewed artifact.
+- A child is still just a normal deadreckon run plus `parent_plan_id`, `task_id`, `child_index`, `plan_role`, provider metadata, and a self-contained `worker-spec.md`.
+- Coordinator messages are typed files (`progress`, `blocker`, `review_request`, `review_response`, `capability_request`, `shutdown_*`); no arbitrary child-to-child chat.
 
 **New verbs.**
 
@@ -26,9 +27,9 @@ GOAL: Extend deadreckon at `/Users/gdc/deadreckon/` from single-run harness into
 
 **Ergonomics.**
 
-- Preview prints resolved providers before work starts.
+- Preview prints resolved providers, task graph, planned working dirs, and requested capabilities before work starts.
 - Review mode is the common path for "Claude codes, Codex reviews" without requiring decomposition.
-- TUI shows each child role, provider, status, spend/context, latest activity, and final gate state.
+- TUI shows each child task, role, provider, dependency state, status, spend/context, latest activity, summaries, and final gate state.
 - Every refusal has a `try:` line; `--quiet`/`--plain` work for headless use.
 
 **Phases.** Eleven (P1-P11) in the rider. Each: depth test first -> implementation -> targeted verification or full verification when practical -> conventional local commit -> CHANGELOG. P11 updates AS-BUILT and §22.

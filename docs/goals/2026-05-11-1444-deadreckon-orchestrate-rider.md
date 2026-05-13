@@ -8,10 +8,11 @@ It supersedes nothing in prior riders
 `2026-05-11-1400-deadreckon-robust-rider.md`,
 `2026-05-11-1400-deadreckon-usability-rider.md`) — their invariants, dependency
 policy, sandbox defaults, CLI surface, lifecycle hints, and existing
-verbs still apply. This rider adds **plans**, **children**, a
-**coordinator**, explicit provider assignment, a coder/reviewer
-orchestration lane, multi-pane TUI, and the ergonomic conventions the
-multi-agent view requires.
+verbs still apply. This rider adds **plans**, **task graph children**, a
+**coordinator**, self-contained worker specs, coordinator-only typed
+messages, compact child summaries, explicit provider assignment, a
+coder/reviewer orchestration lane, multi-pane TUI, and the ergonomic
+conventions the multi-agent view requires.
 
 **All paths absolute.** Source `/Users/gdc/deadreckon/`, runtime
 `/Users/gdc/.deadreckon/`.
@@ -52,10 +53,30 @@ Path: `/Users/gdc/.deadreckon/plans/<plan-id>/plan.json`.
     "reviewer": null,
     "children": { "0": "cli:claude-code", "1": "cli:codex" }
   },
-  "sub_goals": [
-    { "index": 0, "goal": "<sub-goal text>",
-      "provider": "cli:claude-code", "role": "child",
-      "child_run_id": null, "child_scope": null, "status": "pending" }
+  "capability_preview": {
+    "network": "deny|allowlist|full",
+    "deploy": false,
+    "global_install": false,
+    "filesystem": ["<relative or absolute allowed path>"],
+    "notes": ["<human-readable reason>"]
+  },
+  "tasks": [
+    {
+      "index": 0,
+      "task_id": "task-0",
+      "subject": "<imperative 5-10 word task label>",
+      "goal": "<self-contained task goal text>",
+      "active_form": "<present-progress text for the TUI>",
+      "provider": "cli:claude-code",
+      "role": "child|coder|reviewer",
+      "depends_on": [],
+      "worker_spec": "worker-specs/task-0.md",
+      "summary_path": null,
+      "review_status": null,
+      "child_run_id": null,
+      "child_scope": null,
+      "status": "pending"
+    }
   ],
   "parent_scope": "<canonical parent-scope or null>",
   "status": "pending|forked|merged|failed",
@@ -67,15 +88,20 @@ Path: `/Users/gdc/.deadreckon/plans/<plan-id>/plan.json`.
 }
 ```
 
-`mode = "split"` uses provider-decomposed sub-goals. `mode = "review"` uses two
-logical sub-goals without provider planning: a coder run followed by a reviewer
-extend/review run. `sub_goals[i].status` transitions:
+`mode = "split"` uses a provider-decomposed task graph. `mode = "review"` uses
+two logical tasks without provider planning: a coder run followed by a reviewer
+extend/review run. `tasks[i].status` transitions:
 `pending → running → completed | failed | killed`.
 `plan.status` transitions: `pending → forked → merged | failed`.
 
 Provider entries are resolved at plan creation and copied into the plan file so
 that a later `fork` is reproducible. CLI flags may override them at fork time,
 but the override is recorded back into `plan.json` before any child starts.
+
+The `tasks` array intentionally follows Claude Code's task-list shape more than
+a bare list of task slices: each task has an owner/provider, a short subject, an
+`active_form` string for progress displays, dependencies, and a pointer to the
+durable worker spec. Dependencies are allowed but must form a DAG.
 
 ### Child `.deadreckon/parent.json` (extends usability-rider schema)
 
@@ -88,8 +114,10 @@ A child's working dir contains:
   "parent_plan_id": "<plan-uuid>",
   "parent_scope": "<parent scope>",
   "parent_goal": "<root goal>",
+  "task_id": "task-0",
   "child_index": 0,
-  "sub_goal": "<this child's sub-goal>",
+  "task_goal": "<this child's task goal>",
+  "worker_spec": "/Users/gdc/.deadreckon/plans/<plan-id>/worker-specs/task-0.md",
   "provider": "cli:claude-code",
   "role": "child|coder|reviewer",
   "created_at": "<RFC3339>",
@@ -132,6 +160,11 @@ absent at fork time, the coordinator's cwd is used.
 ```
 plan.json
 coordinator.json        (present only while a fork is supervised)
+worker-specs/
+  task-0.md             (self-contained prompt/spec for one child)
+summaries/
+  task-0.md             (compact child result summary for merge/review)
+messages.jsonl          (typed coordinator mailbox; append-only)
 merge-working/          (created by `merge`; promoted to library/ on gate pass)
 merge-proofs/           (gate output for the merge run)
 ```
@@ -139,6 +172,59 @@ merge-proofs/           (gate output for the merge run)
 Children themselves live under the normal
 `~/.deadreckon/runstate/<sub-scope>/runs/<child-run-id>/`. The plan
 directory contains pointers, never copies of child state.
+
+### `messages.jsonl` (coordinator-only mailbox)
+
+Path: `/Users/gdc/.deadreckon/plans/<plan-id>/messages.jsonl`.
+
+```json
+{
+  "schema_version": 1,
+  "ts": "<RFC3339>",
+  "request_id": "<uuid-or-null>",
+  "from": "coordinator|task-0|task-1",
+  "to": "coordinator|task-0|task-1",
+  "type": "progress|blocker|review_request|review_response|capability_request|shutdown_request|shutdown_response",
+  "summary": "<5-12 word display summary>",
+  "body": {}
+}
+```
+
+This borrows Claude Code's typed message idea without adopting arbitrary live
+child-to-child chat. Children never broadcast to each other directly. The
+coordinator writes prompts/follow-ups and reads child reports; the TUI can show
+these messages as a plan activity stream. `request_id` is required for
+`review_request`, `review_response`, `shutdown_request`, and
+`shutdown_response`.
+
+### Worker specs
+
+Path: `/Users/gdc/.deadreckon/plans/<plan-id>/worker-specs/<task-id>.md`.
+
+Each child receives this file path and an inline copy of the spec in its prompt.
+The spec must be self-contained:
+
+- root goal and this task's exact scope;
+- provider and role;
+- files/directories owned by the task, if known;
+- dependencies already satisfied;
+- acceptance checks relevant to the task;
+- capability constraints (network, deploy, filesystem, install);
+- done criteria;
+- required report shape: scope, result, key files, files changed, issues.
+
+Worker specs must include the child hygiene rules: do not spawn subagents, stay
+within scope, do not editorialize between tool calls, verify before reporting,
+and record changed files/commit hash when the provider supports commits.
+
+### Child summaries
+
+Path: `/Users/gdc/.deadreckon/plans/<plan-id>/summaries/<task-id>.md`.
+
+At child completion the coordinator writes a compact summary from
+`state.json`, traces, provenance, changed files, acceptance output, and the
+child's final provider message. Merge/review phases consume summaries rather
+than full transcripts unless `--verbose` is requested.
 
 ## Provider assignment model
 
@@ -187,6 +273,47 @@ apply only review-fix changes needed to satisfy acceptance. The final reviewed
 run is the promoted output. If the reviewer only writes findings and no code
 changes, the coordinator still gates the coder artifact and records the review.
 
+## Planning and worker prompt contracts
+
+These contracts are mined from Claude Code's coordinator, plan-agent, fork, and
+review prompt surfaces, adapted to deadreckon's file-backed model.
+
+### Read-only planner
+
+The split-mode planner is a read-only agent. Its prompt forbids file writes,
+temporary files, installs, commits, and destructive shell commands. It may only
+inspect the repository and return JSON. The planner output is a task DAG, not a
+free-form essay. Required planner fields per task: `subject`, `goal`,
+`active_form`, `depends_on`, `role`, optional `owned_paths`, optional
+`acceptance_notes`, and optional capability requests. The binary validates the
+DAG and writes the canonical `plan.json`; the planner never writes it.
+
+### Coordinator synthesis
+
+The coordinator never tells a child "based on the previous worker's findings".
+Before a child starts or is continued, the coordinator writes a synthesized
+worker spec with concrete context: file paths, error snippets, acceptance
+result, scope boundaries, and done criteria. This is what keeps provider CLIs
+with different memory models deterministic.
+
+### Continue versus spawn
+
+- Continue the same child when correcting its own failed acceptance check or
+  extending the exact files it just edited.
+- Spawn a fresh reviewer for verification so it starts without the coder's
+  implementation assumptions.
+- Spawn fresh for unrelated retries after a wrong approach; stale context is a
+  liability.
+
+### Reviewer prompt
+
+Review mode uses a skeptical reviewer prompt derived from Claude Code's review
+surface: correctness, regressions, tests, security/permissions, acceptance
+mismatch, and user-goal fit. The reviewer must write
+`.deadreckon/REVIEW.md` with findings first, then may apply only fixes that are
+directly tied to those findings and acceptance. No multi-round debate loop in
+this milestone.
+
 ## Phases
 
 Each phase: (1) write the named depth test(s) **first** and watch them
@@ -220,40 +347,64 @@ Depth tests (in `crates/deadreckon/tests/orchestrate.rs`):
 
 - New module `crates/deadreckon-core/src/plan.rs` with the `Plan`
   struct + JSON round-trip. No CLI yet.
+- Model a task DAG, not a flat task-slice list: task ids, subjects,
+  `active_form`, providers, roles, `depends_on`, worker-spec path, summary
+  path, review status, child run pointer, and status.
+- Add `PlanMessage` and append-only `messages.jsonl` helpers.
+- Add deterministic worker-spec and child-summary path helpers.
 - Extend `DeadreckonPaths` to expose `plan_dir(plan_id)`,
   `plan_json(plan_id)`, `coordinator_json(plan_id)`,
-  `merge_working(plan_id)`.
+  `plan_messages(plan_id)`, `worker_spec(plan_id, task_id)`,
+  `child_summary(plan_id, task_id)`, `merge_working(plan_id)`.
 - Extend the child-side `parent.json` writer to support `kind:
   "plan_child"` per the schema above, including provider and role.
 
 Depth tests:
 - `plan_json_serializes_roundtrip` — write/read a fully-populated
   `Plan`; equality on round-trip.
+- `plan_task_dag_rejects_cycles` — fixture with `task-0 -> task-1 -> task-0`
+  is refused with a `try:` line.
 - `child_parent_json_plan_kind` — write/read with `kind: "plan_child"`;
   required fields present.
 - `plan_json_preserves_provider_role_assignments` — round-trip split and review
   plans with planner/default-child/per-child/coder/reviewer providers intact.
+- `plan_messages_jsonl_roundtrips_typed_requests` — append/read progress,
+  review request/response, and shutdown request/response with `request_id`
+  validation.
+- `worker_spec_paths_are_plan_local` — path helpers never escape
+  `~/.deadreckon/plans/<plan-id>/`.
 
 ### P3 — `plan` verb (provider-driven decomposition + role preview)
 
 - New verb. Provider prompt template (in
-  `crates/deadreckon-core/src/plan.rs`): asks for a JSON array of N
-  short sub-goals, each ≤ 120 chars, distinct, parallelizable.
+  `crates/deadreckon-core/src/plan.rs`) is read-only and asks for JSON tasks,
+  not prose: each task has `subject`, `goal`, `active_form`, dependencies,
+  role, optional owned paths, optional acceptance notes, and optional capability
+  requests.
 - `--planner-provider` selects the provider used to decompose the goal.
 - `--provider` is an alias for `--default-child-provider` in split mode.
 - `--child-provider <idx=id>` records per-child provider overrides after the
-  provider returns sub-goals and before writing `plan.json`.
+  provider returns tasks and before writing `plan.json`.
 - `--mode review` skips provider decomposition and writes a two-role plan:
-  coder then reviewer.
-- Validate provider output: ≥ 2 sub-goals, each non-empty after trim,
-  no duplicates after lowercase/whitespace-normalize.
+  coder then reviewer, with reviewer depending on coder.
+- Validate provider output: ≥ 2 tasks, each non-empty after trim, no duplicate
+  subjects after lowercase/whitespace-normalize, dependencies reference known
+  tasks, dependency graph is acyclic.
+- Write `worker-specs/<task-id>.md` for every task before `plan.json`.
+- Write `capability_preview` and render it in the preview; do not grant new
+  capabilities here.
 - Write `plan.json` with status `pending`.
 - Print post-action hints (see "Hints" below).
 
 Depth tests:
-- `plan_writes_plan_json_with_n_subgoals` — mock provider returns 3
-  sub-goals; assert file present, schema valid.
-- `plan_refuses_one_subgoal_response` — mock returns 1 sub-goal;
+- `plan_writes_plan_json_with_n_tasks` — mock provider returns 3
+  tasks; assert file present, schema valid.
+- `plan_writes_worker_specs_for_each_task` — every task has a durable spec
+  containing root goal, task scope, provider, role, done criteria, and
+  capability constraints.
+- `planner_prompt_is_read_only` — captured mock provider prompt contains the
+  no-write/no-install/no-commit constraints.
+- `plan_refuses_one_task_response` — mock returns 1 task;
   assert exit non-zero, error text + `try:` line, no plan.json
   written.
 - `plan_n_flag_clamped_to_2_through_6` — `--n 1` and `--n 7` rejected.
@@ -263,25 +414,34 @@ Depth tests:
 - `plan_review_mode_writes_coder_reviewer_plan_without_decomposition` —
   `--mode review` does not call the planner provider and records coder/reviewer
   roles.
+- `plan_preview_prints_capabilities_and_provider_table` — preview includes
+  providers, tasks, dependencies, working dirs, and requested capabilities.
 
 ### P4 — `fork` verb (spawn split children + review lane)
 
 - New verb. Loads `plan.json`, refuses if status != `pending`.
-- For each sub-goal, spawns a child `deadreckon run` subprocess with:
-  - `--goal "<sub-goal>"`
+- Runs tasks whose dependencies are satisfied. Independent split tasks may run
+  concurrently; dependent tasks wait for predecessor completion and summaries.
+- For each ready task, spawns a child `deadreckon run` subprocess with:
+  - `--goal "<task goal>"`
   - `--scope <parent-scope>-c<index>`
   - the inherited resource flags (`--max-spend`, `--max-wall-seconds`,
     `--sandbox`, resolved `--provider`)
   - `--parent-plan-id <plan-uuid>` (new internal flag; rider §"Verb
     signatures" lists)
+- The child prompt includes the inline worker spec and the absolute
+  `worker-spec.md` path. The coordinator appends `progress` messages when
+  tasks start/finish and `blocker` messages when a task cannot start.
 - In split mode, children with no explicit provider use
-  `providers.default_child`; children with `sub_goals[i].provider` use that
+  `providers.default_child`; children with `tasks[i].provider` use that
   provider.
 - In review mode, child 0 runs with `providers.coder`; child 1 is launched only
   after child 0 completes and passes acceptance. Child 1 is an `extend` of the
   coder artifact using `providers.reviewer`; its prompt is review-focused and
   includes the coder run id, artifact path, acceptance summary, and request to
   write `.deadreckon/REVIEW.md`.
+- On child completion, write `summaries/<task-id>.md` from state, traces,
+  provenance, changed files, acceptance output, and final provider message.
 - Acquires each child's task lock per existing `lock.rs` semantics.
 - Writes `coordinator.json` with all child PIDs.
 - Foregrounds as the coordinator until all children terminate.
@@ -296,6 +456,12 @@ Depth tests:
   fork; assert N child runstate dirs exist, distinct scopes.
 - `fork_launches_each_child_with_resolved_provider` — fixture plan with child
   provider overrides; fake binaries assert each child used the expected route.
+- `fork_respects_task_dependencies` — task 1 depends on task 0; assert task 1
+  does not start until task 0 completed and summary exists.
+- `fork_passes_worker_spec_to_child_prompt` — fake provider captures prompt and
+  sees the exact worker spec, not only a bare task sentence.
+- `fork_writes_progress_messages_jsonl` — start/completion/blocker messages are
+  appended with typed schema and display summaries.
 - `fork_refuses_when_plan_already_forked` — re-fork yields the
   expected error + `try:` line.
 - `fork_writes_coordinator_json_with_child_pids` — assert each PID
@@ -310,10 +476,11 @@ Depth tests:
 
 - `deadreckon attach <plan-id>` opens a plan TUI: grid of N panes
   (auto-layout up to 6 children; ≥4 children → 2-row grid).
-- Each pane shows: child index, sub-goal (truncated), status, current
-  turn, provider, role, spend, progress bar (turns / estimated total ≈ unknown so use
-  spend / cap; if `--max-spend` absent, render activity dots), latest
-  trace line.
+- Each pane shows: task subject, dependency state, child index, goal
+  (truncated), status, current turn, provider, role, spend/context, `active_form`
+  progress text, latest trace line, and latest coordinator message summary.
+- A side or footer strip shows plan-level capability preview, review/gate state,
+  and counts: ready/running/completed/failed/blocked.
 - Keys: `Enter` drills into the focused child (existing single-run
   TUI); `Esc` returns to plan view; `Ctrl-D` detaches without killing;
   `q` quits the TUI (does not kill); arrow keys move focus.
@@ -328,6 +495,10 @@ Depth tests:
   test backend; assert N panes rendered.
 - `attach_plan_shows_provider_and_role_per_pane` — split and review fixtures
   render child/coder/reviewer labels and provider ids.
+- `attach_plan_shows_task_dependency_and_message_summary` — fixture with one
+  blocked task renders dependency state and the last `messages.jsonl` summary.
+- `attach_plan_shows_capability_preview` — fixture plan with network/deploy
+  requests renders the capability strip.
 - `attach_plan_enter_drills_then_esc_returns` — synthesize input
   events; assert view changes.
 - `attach_plan_ctrl_d_detaches_does_not_kill` — children survive
@@ -352,6 +523,9 @@ Depth tests:
   `library/<merged-scope>/<merged-run-id>/`, write
   `manifest.json` with the plan_id + child run_ids + provider roles, mark
   `plan.status = merged`, write `plan.merged_run_id`.
+- Merge manifest also records task ids, dependency edges, worker spec paths,
+  child summary paths, coordinator message counts, and capability preview so the
+  merged artifact can be audited without replaying provider transcripts.
 - Print materialize hint.
 
 Depth tests:
@@ -366,6 +540,8 @@ Depth tests:
   `library/<scope>/<merged-id>/` exists with manifest.json.
 - `merge_manifest_records_child_provider_roles` — manifest includes the provider
   used by each child and, for review mode, identifies the reviewed run.
+- `merge_manifest_records_task_graph_and_summaries` — manifest includes task
+  ids, dependency edges, worker specs, summaries, and message counts.
 - `merge_refuses_running_child` — child still running → error with
   `try: kill or wait`.
 
@@ -432,6 +608,8 @@ Depth tests:
     one-line RCA + `try: deadreckon show <child-run-id> --why-failed`.
     If merge failed: report the gate failure or conflict that blocked
     promotion.
+    Include the latest relevant `messages.jsonl` blocker/review summary and the
+    child summary path when present.
 
 Depth tests:
 - `show_why_failed_completed_says_no_failures` — completed fixture
@@ -441,6 +619,8 @@ Depth tests:
 - `show_why_failed_plan_names_blocking_child` — 3-child plan where
   child 1 failed → output names child 1 + its child-run-id +
   try-line.
+- `show_why_failed_plan_includes_blocker_message` — fixture messages.jsonl with
+  a `blocker` entry appears in the plan RCA.
 
 ### P10 — Friendliness pass
 
@@ -492,8 +672,10 @@ Depth tests:
 
   After `plan`:
   ```
-  plan: <plan-id> with <N> sub-goals
+  plan: <plan-id> with <N> tasks
   providers: planner=<id> default-child=<id>
+  capabilities: network=<mode> deploy=<yes/no> install=<yes/no>
+  tasks: <ready>/<blocked> ready now
   edit: vim /Users/gdc/.deadreckon/plans/<plan-id>/plan.json
   fork: deadreckon fork <plan-id>
   ```
@@ -502,6 +684,7 @@ Depth tests:
   ```
   plan: <plan-id> review mode
   providers: coder=<id> reviewer=<id>
+  flow: coder -> fresh reviewer -> final gate
   fork: deadreckon fork <plan-id>
   ```
 
@@ -545,6 +728,8 @@ Depth tests:
   matching line in output.
 - `review_mode_post_action_hints_name_coder_and_reviewer` — hints show both
   providers and the next attach/merge command.
+- `plan_hints_name_capabilities_and_ready_tasks` — split-mode hints include
+  capability preview and ready/blocked task count.
 
 ### P11 — AS-BUILT update + CHANGELOG (doc only; no depth test)
 
@@ -555,18 +740,20 @@ Depth tests:
   ```
   ## 18. Plans & Multi-Agent Orchestration
 
-  18.1 Mental model (one plan → N children → one merge)
+  18.1 Mental model (one plan → task DAG → children → one merge)
   18.2 plan.json schema (verbatim quote from plan.rs)
   18.3 Provider roles and assignment precedence
-  18.4 Child lineage (parent.json with kind: plan_child)
-  18.5 Coordinator process (coordinator.json, supervision lifecycle)
-  18.6 Review mode (coder provider → reviewer provider → final gate)
-  18.7 Sub-scope naming
-  18.8 Multi-pane TUI (layout sketch)
-  18.9 Merge strategy & conflict resolution
-  18.10 Cancellation cascade
-  18.11 Plan-aware history grep
-  18.12 What's not yet built (e.g., team-context WriteToTeam action,
+  18.4 Task graph, dependencies, worker specs, and child summaries
+  18.5 Coordinator mailbox (typed messages, no arbitrary child chat)
+  18.6 Child lineage (parent.json with kind: plan_child)
+  18.7 Coordinator process (coordinator.json, supervision lifecycle)
+  18.8 Review mode (coder provider → fresh reviewer provider → final gate)
+  18.9 Sub-scope naming
+  18.10 Multi-pane TUI (layout sketch)
+  18.11 Merge strategy & conflict resolution
+  18.12 Cancellation cascade
+  18.13 Plan-aware history grep
+  18.14 What's not yet built (e.g., team-context WriteToTeam action,
         auto-decompose-during-run)
   ```
 
@@ -592,6 +779,7 @@ Depth tests:
 
   - plan/fork/merge/kill/attach<plan-id> verbs landed (P3–P7)
   - explicit planner/default-child/per-child/coder/reviewer provider roles
+  - task DAG, worker specs, typed coordinator messages, and child summaries
   - review mode runs one provider as coder and a second as reviewer/fixer
   - history grep + show --why-failed landed (P8–P9)
   - TUI event streaming via RunEventBus (P1)
@@ -690,8 +878,10 @@ Internal-only flag added to `deadreckon run` for use by `fork`:
 ```
 deadreckon run <goal>
     --parent-plan-id <plan-uuid>      # hidden from --help; sets parent.json kind
+    --plan-task-id <task-id>          # hidden from --help; same
     --child-index <N>                 # hidden from --help; same
     --plan-role <child|coder|reviewer> # hidden from --help; same
+    --worker-spec <path>              # hidden from --help; included in prompt
     [...existing flags...]
 ```
 
@@ -701,7 +891,7 @@ deadreckon run <goal>
 |---|---|---|---|
 | `plan` | empty goal | `--goal must be non-empty` | `deadreckon plan "your goal"` |
 | `plan` | N out of range | `--n must be 2..=6` | `deadreckon plan ... --n 3` |
-| `plan` | < 2 valid sub-goals | `provider returned <K> sub-goals; need >=2` | `deadreckon plan ... --provider <other>` |
+| `plan` | < 2 valid tasks | `provider returned <K> tasks; need >=2` | `deadreckon plan ... --provider <other>` |
 | `plan`/`fork` | provider role missing | `provider role <role> is not configured` | `deadreckon orchestrate "goal" --mode review --coder-provider cli:claude-code --reviewer-provider cli:codex` |
 | `plan`/`fork` | child provider index out of range | `child provider index <idx> outside 0..<N>` | `--child-provider 1=cli:codex` |
 | `fork` | plan not found | `no plan <id>` | `deadreckon plan list` (or `ls ~/.deadreckon/plans/`) |
@@ -722,18 +912,21 @@ deadreckon run <goal>
   `merge` for the selected mode. It uses the same files and coordinator model;
   there is no separate orchestration state.
 - `deadreckon fork` is a foreground process that becomes the
-  coordinator. It writes `coordinator.json`, spawns N child
-  subprocesses, and waits.
+  coordinator. It writes `coordinator.json`, appends typed activity to
+  `messages.jsonl`, spawns ready child subprocesses, and waits.
 - Each child is launched with `Command::new(<self>)` arguments
   reconstructed from the parent invocation, with the parent flag
-  set, including resolved provider and role. The child writes its `state.json` and runs the normal turn
-  loop.
+  set, including task id, worker spec, resolved provider, and role. The child
+  writes its `state.json` and runs the normal turn loop.
+- Task dependencies are scheduled conservatively: only tasks whose
+  `depends_on` tasks completed and have summaries are eligible to start.
 - In review mode, the coordinator runs the coder child first, waits for gate
   success, then launches the reviewer through the existing extend path with the
   reviewer provider. The reviewed run becomes the merge/promote candidate.
 - Supervision: every 500 ms the coordinator polls each child's
   `state.json` status field and `kill(pid, 0)` liveness; updates
-  `coordinator.json.children[i].status`.
+  `coordinator.json.children[i].status`. On child completion it writes the
+  compact child summary before scheduling dependents.
 - Plan TUI subscribes to a coordinator broadcast channel that
   multiplexes child events (the TUI process is separate from the
   coordinator — it tails the children's `events.jsonl` files when not
@@ -747,14 +940,14 @@ deadreckon run <goal>
 ```
 ┌── Plan: <plan-id-prefix> "<root-goal-trimmed>" (<status>) ──────────────┐
 │                                                                          │
-│ ┌── Child 0: "<sub-goal-trimmed>" ─┐ ┌── Child 1: "<sub-goal>" ────────┐ │
-│ │ status: running                  │ │ status: completed               │ │
-│ │ turn: 4   spend: $0.12           │ │ turn: 6   spend: $0.18          │ │
-│ │ ▓▓▓░░░░░ 35% of $0.50            │ │ ▓▓▓▓▓▓▓▓ 100%                   │ │
-│ │ > turn 4 tool=Bash exit=0        │ │ > acceptance: pass              │ │
+│ ┌── task-0 code ui (cli:claude) ───┐ ┌── task-1 review (cli:codex) ───┐ │
+│ │ running · Coding game board      │ │ blocked: waits for task-0       │ │
+│ │ turn: 4   context: 42%           │ │ reviewer · fresh context        │ │
+│ │ cap: network=deny deploy=no      │ │ message: waiting on summary     │ │
+│ │ > turn 4 tool=Bash exit=0        │ │ > acceptance: pending           │ │
 │ └──────────────────────────────────┘ └─────────────────────────────────┘ │
 │                                                                          │
-│ ┌── Child 2: "<sub-goal>" ────────────────────────────────────────────┐  │
+│ ┌── task-2 docs (cli:claude) ─────────────────────────────────────────┐  │
 │ │ status: pending                                                      │  │
 │ └──────────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
@@ -786,10 +979,10 @@ Items in §22 of AS-BUILT that this milestone does **not** close:
 - #8 acceptance YAML spec
 
 Also out of scope:
-- A `WriteToTeam` action / shared team-context file for live
-  cross-child communication. Children get the root goal and their
-  sub-goal at fork time and run independently. Cross-child memory is
-  a V1-CANDIDATE.
+- A general-purpose `WriteToTeam` action or arbitrary live child-to-child chat.
+  This milestone only includes typed coordinator-mediated messages in
+  `messages.jsonl` and child summaries. Rich shared team memory is a
+  V1-CANDIDATE.
 - Auto-decompose inside a running turn loop (`Fork` as a tool action).
   V1-CANDIDATE.
 - N > 6 children. The current TUI layout caps useful display at 6;
@@ -809,7 +1002,12 @@ Also out of scope:
   tests all started green never failed; that's a smell.
 - **Child runs are deadreckon runs.** Do not introduce a "child mode"
   in the turn loop. The only difference is the `parent.json` content
-  and the scope naming.
+  the worker spec included in the prompt, and the scope naming.
+- **Children do not spawn children.** Worker specs explicitly forbid recursive
+  orchestration; the coordinator is the only process that creates child runs.
+- **Coordinator messages are typed.** Do not add free-form cross-child chat in
+  this milestone. Add a new message type only with a depth test and a display
+  rule.
 - **Locks remain task-scoped.** Each child takes its own task lock.
   The plan does not take a lock.
 - **The coordinator is not a state machine.** If you find yourself
