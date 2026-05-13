@@ -122,6 +122,16 @@ args_template = ["run", "{prompt}"]
         config.contains("doc_provider = \"cli:a-first\""),
         "{config}"
     );
+    assert!(
+        config.contains(
+            "fallback = [\"cli:a-first\", \"cli:claude-code\", \"cli:codex\", \"anthropic\", \"openai\"]"
+        ),
+        "{config}"
+    );
+    assert!(
+        config.contains("[providers.\"cli:a-first\"]\nkind = \"cli:a-first\"\nextra_args = []"),
+        "{config}"
+    );
 }
 
 #[test]

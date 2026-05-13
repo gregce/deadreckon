@@ -6659,11 +6659,19 @@ fn init_config_text(
     sandbox: &str,
 ) -> String {
     let fallback = match provider {
-        "cli:claude-code" => "[\"cli:claude-code\", \"cli:codex\", \"anthropic\", \"openai\"]",
-        "cli:codex" => "[\"cli:codex\", \"cli:claude-code\", \"anthropic\", \"openai\"]",
-        "openai" => "[\"openai\", \"anthropic\", \"cli:codex\", \"cli:claude-code\"]",
-        "openai-compatible" => "[\"openai-compatible\", \"openai\", \"anthropic\"]",
-        _ => "[\"anthropic\", \"openai\", \"cli:claude-code\", \"cli:codex\"]",
+        "cli:claude-code" => {
+            "[\"cli:claude-code\", \"cli:codex\", \"anthropic\", \"openai\"]".to_string()
+        }
+        "cli:codex" => {
+            "[\"cli:codex\", \"cli:claude-code\", \"anthropic\", \"openai\"]".to_string()
+        }
+        provider if provider.starts_with("cli:") => format!(
+            "[\"{}\", \"cli:claude-code\", \"cli:codex\", \"anthropic\", \"openai\"]",
+            escape_toml_string(provider)
+        ),
+        "openai" => "[\"openai\", \"anthropic\", \"cli:codex\", \"cli:claude-code\"]".to_string(),
+        "openai-compatible" => "[\"openai-compatible\", \"openai\", \"anthropic\"]".to_string(),
+        _ => "[\"anthropic\", \"openai\", \"cli:claude-code\", \"cli:codex\"]".to_string(),
     };
     let mut out = format!(
         "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\ndoc_provider = \"{provider}\"\ndoc_skill = \"run-narrator\"\ndoc_subskills = [\"narrator-overview\", \"narrator-phases\", \"narrator-as-built\", \"narrator-decisions\"]\ndoc_polish_token_budget = 16384\nmax_spend = {max_spend}\ncli_max_wall_seconds = 3600\nsandbox = \"{sandbox}\"\n\n"
@@ -6674,6 +6682,12 @@ fn init_config_text(
         }
         "cli:codex" => {
             out.push_str("[providers.\"cli:codex\"]\nkind = \"cli-codex\"\nbinary = \"codex\"\nextra_args = []\n");
+        }
+        provider if provider.starts_with("cli:") => {
+            let provider = escape_toml_string(provider);
+            out.push_str(&format!(
+                "[providers.\"{provider}\"]\nkind = \"{provider}\"\nextra_args = []\n"
+            ));
         }
         "openai" => {
             out.push_str("[providers.openai]\nkind = \"open-ai\"\n");
