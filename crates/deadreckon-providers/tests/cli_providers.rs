@@ -322,9 +322,59 @@ async fn cli_provider_runs_inside_requested_sandbox_backend() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn cli_provider_resolves_user_path_binary_inside_sandbox_exec() {
+    const HELPER_ENV: &str = "DEADRECKON_TEST_PATH_HELPER";
+    const TEMP_ENV: &str = "DEADRECKON_TEST_PATH_TEMP";
+
     if which::which("sandbox-exec").is_err() {
         return;
     }
+    if std::env::var_os(HELPER_ENV).is_some() {
+        let temp_path =
+            std::path::PathBuf::from(std::env::var_os(TEMP_ENV).expect("helper temp path"));
+        let router = ProviderRouter::from_config(
+            ProviderConfigFile {
+                default_provider: None,
+                fallback: Some(vec!["cli:codex".to_string()]),
+                providers: [(
+                    "cli:codex".to_string(),
+                    ProviderEntry {
+                        kind: Some(ProviderKind::CliCodex),
+                        api_key: None,
+                        api_key_env: None,
+                        base_url: None,
+                        model: Some("cli:codex".to_string()),
+                        input_cost_per_million: Some(0.0),
+                        output_cost_per_million: Some(0.0),
+                        binary: Some("fake-codex".to_string()),
+                        extra_args: Vec::new(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+            None,
+        )
+        .expect("router");
+
+        let response = router
+            .complete(&ProviderRequest {
+                prompt: "make notes".to_string(),
+                max_output_tokens: 128,
+                cwd: Some(temp_path),
+                output_path: None,
+                sandbox_backend: Some(SandboxBackend::SandboxExec),
+                pid_file: None,
+                cancellation_token: None,
+            })
+            .await
+            .expect("sandboxed completion");
+
+        assert!(response.content.contains("path-resolved-codex-output"));
+        assert!(response.content.contains("--sandbox danger-full-access"));
+        assert_eq!(response.trace["sandbox_backend"], "sandbox-exec");
+        return;
+    }
+
     let temp = TempDir::new().expect("tempdir");
     let bin_dir = temp.path().join("user-bin");
     fs::create_dir_all(&bin_dir).expect("bin dir");
@@ -332,53 +382,25 @@ async fn cli_provider_resolves_user_path_binary_inside_sandbox_exec() {
     write_fake_binary(&binary, "path-resolved-codex-output");
     let old_path = std::env::var_os("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", bin_dir.display(), old_path.to_string_lossy());
-    unsafe {
-        std::env::set_var("PATH", &new_path);
-    }
-    let router = ProviderRouter::from_config(
-        ProviderConfigFile {
-            default_provider: None,
-            fallback: Some(vec!["cli:codex".to_string()]),
-            providers: [(
-                "cli:codex".to_string(),
-                ProviderEntry {
-                    kind: Some(ProviderKind::CliCodex),
-                    api_key: None,
-                    api_key_env: None,
-                    base_url: None,
-                    model: Some("cli:codex".to_string()),
-                    input_cost_per_million: Some(0.0),
-                    output_cost_per_million: Some(0.0),
-                    binary: Some("fake-codex".to_string()),
-                    extra_args: Vec::new(),
-                },
-            )]
-            .into_iter()
-            .collect(),
-        },
-        None,
-    )
-    .expect("router");
 
-    let response = router
-        .complete(&ProviderRequest {
-            prompt: "make notes".to_string(),
-            max_output_tokens: 128,
-            cwd: Some(temp.path().to_path_buf()),
-            output_path: None,
-            sandbox_backend: Some(SandboxBackend::SandboxExec),
-            pid_file: None,
-            cancellation_token: None,
-        })
-        .await
-        .expect("sandboxed completion");
-    unsafe {
-        std::env::set_var("PATH", old_path);
-    }
+    let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "--exact",
+            "cli_provider_resolves_user_path_binary_inside_sandbox_exec",
+            "--nocapture",
+        ])
+        .env(HELPER_ENV, "1")
+        .env(TEMP_ENV, temp.path())
+        .env("PATH", new_path)
+        .output()
+        .expect("spawn path helper");
 
-    assert!(response.content.contains("path-resolved-codex-output"));
-    assert!(response.content.contains("--sandbox danger-full-access"));
-    assert_eq!(response.trace["sandbox_backend"], "sandbox-exec");
+    assert!(
+        output.status.success(),
+        "helper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]

@@ -559,44 +559,44 @@ fn parse_acceptance_checks(raw: &str) -> Result<Vec<AcceptanceCheck>> {
     })?;
     let mut checks = Vec::new();
     for item in yaml_seq(yaml_get(&root, "checks")) {
-        checks.push(parse_check_value(item.clone(), None)?);
+        checks.push(parse_check_value(item, None)?);
     }
     for item in yaml_seq(yaml_get(&root, "required")) {
-        checks.push(parse_check_value(item.clone(), Some(true))?);
+        checks.push(parse_check_value(item, Some(true))?);
     }
     for item in yaml_seq(yaml_get(&root, "optional")) {
-        checks.push(parse_check_value(item.clone(), Some(false))?);
+        checks.push(parse_check_value(item, Some(false))?);
     }
     for item in yaml_seq(yaml_get(&root, "tests")) {
-        checks.push(parse_shell_check(item.clone(), true)?);
+        checks.push(parse_shell_check(item, true)?);
     }
     for item in yaml_seq(yaml_get(&root, "file-exists")) {
-        checks.push(parse_file_exists_check(item.clone(), true)?);
+        checks.push(parse_file_exists_check(item, true)?);
     }
     for item in yaml_seq(yaml_get(&root, "content-match")) {
-        checks.push(parse_content_match_check(item.clone(), true)?);
+        checks.push(parse_content_match_check(item, true)?);
     }
     for item in yaml_seq(yaml_get(&root, "build-success")) {
-        checks.push(parse_build_success_check(item.clone(), true)?);
+        checks.push(parse_build_success_check(item, true));
     }
     Ok(checks)
 }
 
-fn parse_check_value(value: YamlValue, force_must_pass: Option<bool>) -> Result<AcceptanceCheck> {
+fn parse_check_value(value: &YamlValue, force_must_pass: Option<bool>) -> Result<AcceptanceCheck> {
     if let Ok(mut check) = serde_yaml::from_value::<AcceptanceCheck>(value.clone()) {
         if let Some(must_pass) = force_must_pass {
             check.set_must_pass(must_pass);
         }
         return Ok(check);
     }
-    if let Some(command) = yaml_string(&value) {
+    if let Some(command) = yaml_string(value) {
         return Ok(AcceptanceCheck::Shell {
             command,
             cwd: None,
             must_pass: force_must_pass.unwrap_or(true),
         });
     }
-    let Some((kind, body)) = single_key_mapping(&value) else {
+    let Some((kind, body)) = single_key_mapping(value) else {
         return Err(DeadreckonError::InvalidInput(format!(
             "invalid acceptance check: {:?}",
             value
@@ -604,10 +604,10 @@ fn parse_check_value(value: YamlValue, force_must_pass: Option<bool>) -> Result<
     };
     let must_pass = force_must_pass.unwrap_or(true);
     match kind.as_str() {
-        "file-exists" | "file_exists" => parse_file_exists_check(body.clone(), must_pass),
-        "content-match" | "content_match" => parse_content_match_check(body.clone(), must_pass),
-        "build-success" | "build_success" => parse_build_success_check(body.clone(), must_pass),
-        "shell" | "test" => parse_shell_check(body.clone(), must_pass),
+        "file-exists" | "file_exists" => parse_file_exists_check(body, must_pass),
+        "content-match" | "content_match" => parse_content_match_check(body, must_pass),
+        "build-success" | "build_success" => Ok(parse_build_success_check(body, must_pass)),
+        "shell" | "test" => parse_shell_check(body, must_pass),
         "cargo-test" | "cargo_test" => Ok(AcceptanceCheck::CargoTest {
             args: yaml_string(body).map(|arg| vec![arg]).unwrap_or_default(),
             must_pass,
@@ -618,18 +618,18 @@ fn parse_check_value(value: YamlValue, force_must_pass: Option<bool>) -> Result<
     }
 }
 
-fn parse_file_exists_check(value: YamlValue, must_pass: bool) -> Result<AcceptanceCheck> {
-    let path = yaml_string(&value)
-        .or_else(|| yaml_get(&value, "path").and_then(yaml_string))
+fn parse_file_exists_check(value: &YamlValue, must_pass: bool) -> Result<AcceptanceCheck> {
+    let path = yaml_string(value)
+        .or_else(|| yaml_get(value, "path").and_then(yaml_string))
         .ok_or_else(|| DeadreckonError::InvalidInput("file-exists requires path".to_string()))?;
     Ok(AcceptanceCheck::FileExists { path, must_pass })
 }
 
-fn parse_content_match_check(value: YamlValue, must_pass: bool) -> Result<AcceptanceCheck> {
-    let path = yaml_get(&value, "path")
+fn parse_content_match_check(value: &YamlValue, must_pass: bool) -> Result<AcceptanceCheck> {
+    let path = yaml_get(value, "path")
         .and_then(yaml_string)
         .ok_or_else(|| DeadreckonError::InvalidInput("content-match requires path".to_string()))?;
-    let pattern = yaml_get(&value, "pattern")
+    let pattern = yaml_get(value, "pattern")
         .and_then(yaml_string)
         .ok_or_else(|| {
             DeadreckonError::InvalidInput("content-match requires pattern".to_string())
@@ -641,18 +641,18 @@ fn parse_content_match_check(value: YamlValue, must_pass: bool) -> Result<Accept
     })
 }
 
-fn parse_build_success_check(value: YamlValue, must_pass: bool) -> Result<AcceptanceCheck> {
-    let cwd = yaml_string(&value)
-        .or_else(|| yaml_get(&value, "cwd").and_then(yaml_string))
+fn parse_build_success_check(value: &YamlValue, must_pass: bool) -> AcceptanceCheck {
+    let cwd = yaml_string(value)
+        .or_else(|| yaml_get(value, "cwd").and_then(yaml_string))
         .unwrap_or_else(|| "{working_dir}".to_string());
-    Ok(AcceptanceCheck::BuildSuccess { cwd, must_pass })
+    AcceptanceCheck::BuildSuccess { cwd, must_pass }
 }
 
-fn parse_shell_check(value: YamlValue, must_pass: bool) -> Result<AcceptanceCheck> {
-    let command = yaml_string(&value)
-        .or_else(|| yaml_get(&value, "command").and_then(yaml_string))
+fn parse_shell_check(value: &YamlValue, must_pass: bool) -> Result<AcceptanceCheck> {
+    let command = yaml_string(value)
+        .or_else(|| yaml_get(value, "command").and_then(yaml_string))
         .ok_or_else(|| DeadreckonError::InvalidInput("shell check requires command".to_string()))?;
-    let cwd = yaml_get(&value, "cwd").and_then(yaml_string);
+    let cwd = yaml_get(value, "cwd").and_then(yaml_string);
     Ok(AcceptanceCheck::Shell {
         command,
         cwd,

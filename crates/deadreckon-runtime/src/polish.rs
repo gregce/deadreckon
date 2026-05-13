@@ -663,7 +663,7 @@ fn merge_split_docs(
             outputs.get("narrator-overview"),
             outputs.get("narrator-phases"),
             &fallback.narrative,
-        )?,
+        ),
         as_built: render_split_as_built(
             state,
             outputs.get("narrator-as-built"),
@@ -679,9 +679,9 @@ fn render_split_narrative(
     overview: Option<&Value>,
     phases: Option<&Value>,
     fallback: &str,
-) -> Result<String> {
+) -> String {
     if let Some(narrative) = overview.and_then(|value| string_field(value, "narrative")) {
-        return Ok(narrative);
+        return narrative;
     }
     let mut out = frontmatter_prefix(fallback);
     if let Some(reading_order) = overview.and_then(|value| string_field(value, "reading_order"))
@@ -737,7 +737,7 @@ fn render_split_narrative(
             out.push_str(&format!("- {item}\n"));
         }
     }
-    Ok(out.trim_end().to_string() + "\n")
+    out.trim_end().to_string() + "\n"
 }
 
 fn render_phases_value(value: &Value) -> Option<String> {
@@ -1173,6 +1173,8 @@ fn write_polished_docs(state: &PipelineState, docs: &PolishedDocs) -> Result<()>
     Ok(())
 }
 
+// SAFETY: Call sites construct one-shot records at the boundary where they are persisted.
+#[allow(clippy::needless_pass_by_value)]
 fn write_polish_record(state: &PipelineState, record: PolishRecord) -> Result<()> {
     let path = polish_path(&state.working_dir);
     if let Some(parent) = path.parent() {

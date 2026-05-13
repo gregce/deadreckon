@@ -149,7 +149,7 @@ impl ProviderAdapter {
             ProviderKind::CliClaudeCode | ProviderKind::CliCodex | ProviderKind::ScriptedSmoke => {
                 unreachable!("CLI providers do not parse HTTP responses")
             }
-        }?;
+        };
         let spend = self.estimate_spend(usage.clone());
         Ok(ProviderResponse {
             provider: self.name.clone(),
@@ -224,7 +224,7 @@ fn default_model(kind: ProviderKind) -> String {
     }
 }
 
-fn parse_openai_response(value: &Value) -> Result<(String, ProviderUsage)> {
+fn parse_openai_response(value: &Value) -> (String, ProviderUsage) {
     let content = value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -240,10 +240,10 @@ fn parse_openai_response(value: &Value) -> Result<(String, ProviderUsage)> {
             .and_then(Value::as_u64)
             .unwrap_or(0),
     };
-    Ok((content, usage))
+    (content, usage)
 }
 
-fn parse_anthropic_response(value: &Value) -> Result<(String, ProviderUsage)> {
+fn parse_anthropic_response(value: &Value) -> (String, ProviderUsage) {
     let content = value
         .pointer("/content/0/text")
         .and_then(Value::as_str)
@@ -259,7 +259,7 @@ fn parse_anthropic_response(value: &Value) -> Result<(String, ProviderUsage)> {
             .and_then(Value::as_u64)
             .unwrap_or(0),
     };
-    Ok((content, usage))
+    (content, usage)
 }
 
 fn trim_for_error(body: &str) -> String {

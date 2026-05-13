@@ -22,7 +22,7 @@ pub fn build_command(spec: &SandboxSpec) -> Result<SandboxCommand> {
     match backend {
         SandboxBackend::SandboxExec => sandbox_exec_command(spec, warning),
         SandboxBackend::Bwrap => bwrap_command(spec, warning),
-        SandboxBackend::Docker => docker_command(spec, warning),
+        SandboxBackend::Docker => Ok(docker_command(spec, warning)),
         SandboxBackend::None => Ok(SandboxCommand {
             backend,
             program: spec.program.clone(),
@@ -115,7 +115,7 @@ fn bwrap_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxC
     })
 }
 
-fn docker_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxCommand> {
+fn docker_command(spec: &SandboxSpec, warning: Option<String>) -> SandboxCommand {
     let cwd = spec.cwd.to_string_lossy().to_string();
     let mut args = vec![
         "run".into(),
@@ -136,14 +136,14 @@ fn docker_command(spec: &SandboxSpec, warning: Option<String>) -> Result<Sandbox
     args.push("rust:1".into());
     args.push(spec.program.clone());
     args.extend(spec.args.clone());
-    Ok(SandboxCommand {
+    SandboxCommand {
         backend: SandboxBackend::Docker,
         program: OsString::from("docker"),
         args,
         env: BTreeMap::new(),
         cwd: spec.cwd.clone(),
         warning,
-    })
+    }
 }
 
 pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {

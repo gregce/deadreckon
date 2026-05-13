@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 const CRATE_MANIFESTS: &[&str] = &[
     "crates/deadreckon/Cargo.toml",
@@ -31,14 +32,39 @@ fn clippy_toml_allows_unwrap_in_tests() {
 }
 
 #[test]
-fn clippy_warn_snapshot_present() {
-    let path = workspace_root().join("tests/.clippy-warn-snapshot");
-    let text = fs::read_to_string(&path).expect("read clippy warn snapshot");
+fn lint_table_denies_unwrap_used() {
+    assert_lint_level("unwrap_used", "deny");
+}
+
+#[test]
+fn lint_table_denies_expect_used() {
+    assert_lint_level("expect_used", "deny");
+}
+
+#[test]
+fn lint_table_denies_await_holding_lock() {
+    assert_lint_level("await_holding_lock", "deny");
+}
+
+#[test]
+fn clippy_runs_clean_under_deny_warnings() {
+    let output = Command::new("cargo")
+        .args(["clippy", "--workspace", "--", "-D", "warnings"])
+        .current_dir(workspace_root())
+        .output()
+        .expect("run cargo clippy --workspace -- -D warnings");
     assert!(
-        !text.trim().is_empty(),
-        "{} should record the P2 warn-only clippy output",
-        path.display()
+        output.status.success(),
+        "clippy must be clean under -D warnings\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn assert_lint_level(lint: &str, level: &str) {
+    let text = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read Cargo.toml");
+    let needle = format!("{lint} = \"{level}\"");
+    assert!(text.contains(&needle), "missing `{needle}`");
 }
 
 fn workspace_root() -> PathBuf {

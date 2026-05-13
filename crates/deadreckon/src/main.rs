@@ -661,22 +661,21 @@ fn completion_command(command: Option<CompletionCommand>) -> Result<()> {
         CompletionCommand::Install { shell, path, no_rc } => {
             install_completion(shell, path, !no_rc)?;
         }
-        CompletionCommand::Bash => write_completion_script(Shell::Bash, &mut io::stdout())?,
-        CompletionCommand::Elvish => write_completion_script(Shell::Elvish, &mut io::stdout())?,
-        CompletionCommand::Fish => write_completion_script(Shell::Fish, &mut io::stdout())?,
+        CompletionCommand::Bash => write_completion_script(Shell::Bash, &mut io::stdout()),
+        CompletionCommand::Elvish => write_completion_script(Shell::Elvish, &mut io::stdout()),
+        CompletionCommand::Fish => write_completion_script(Shell::Fish, &mut io::stdout()),
         CompletionCommand::PowerShell => {
-            write_completion_script(Shell::PowerShell, &mut io::stdout())?;
+            write_completion_script(Shell::PowerShell, &mut io::stdout());
         }
-        CompletionCommand::Zsh => write_completion_script(Shell::Zsh, &mut io::stdout())?,
+        CompletionCommand::Zsh => write_completion_script(Shell::Zsh, &mut io::stdout()),
     }
     Ok(())
 }
 
-fn write_completion_script(shell: Shell, output: &mut dyn Write) -> io::Result<()> {
+fn write_completion_script(shell: Shell, output: &mut dyn Write) {
     let mut command = completion_command_tree();
     let bin_name = command.get_name().to_string();
     generate(shell, &mut command, bin_name, output);
-    Ok(())
 }
 
 fn completion_command_tree() -> ClapCommand {
@@ -705,7 +704,7 @@ fn install_completion(
         fs::create_dir_all(parent)?;
     }
     let mut script = Vec::new();
-    write_completion_script(shell, &mut script)?;
+    write_completion_script(shell, &mut script);
     fs::write(&path, script)?;
     println!("{} completion {}", ui_ok("installed"), path.display());
     if shell == Shell::Zsh && update_rc {
@@ -975,24 +974,27 @@ fn set_provider_model(root: &mut toml::Value, provider: &str, model: &str) {
     if !root.is_table() {
         *root = toml::Value::Table(Default::default());
     }
-    let root_table = root.as_table_mut().expect("table after initialization");
+    let Some(root_table) = root.as_table_mut() else {
+        return;
+    };
     let providers = root_table
         .entry("providers".to_string())
         .or_insert_with(|| toml::Value::Table(Default::default()));
     if !providers.is_table() {
         *providers = toml::Value::Table(Default::default());
     }
-    let providers_table = providers.as_table_mut().expect("providers table");
+    let Some(providers_table) = providers.as_table_mut() else {
+        return;
+    };
     let provider_entry = providers_table
         .entry(provider.to_string())
         .or_insert_with(|| toml::Value::Table(Default::default()));
     if !provider_entry.is_table() {
         *provider_entry = toml::Value::Table(Default::default());
     }
-    provider_entry
-        .as_table_mut()
-        .expect("provider table")
-        .insert("model".to_string(), toml::Value::String(model.to_string()));
+    if let Some(provider_table) = provider_entry.as_table_mut() {
+        provider_table.insert("model".to_string(), toml::Value::String(model.to_string()));
+    }
 }
 
 fn format_provider_kind(kind: deadreckon_providers::ProviderKind) -> &'static str {
@@ -2255,6 +2257,8 @@ fn auto_apply_chain_step(
     Ok(())
 }
 
+// SAFETY: Chain failure reasons are owned when they are persisted and emitted as JSON.
+#[allow(clippy::needless_pass_by_value)]
 fn handle_chain_step_failure(
     paths: &DeadreckonPaths,
     chain: &mut Chain,
@@ -2293,6 +2297,8 @@ fn handle_chain_step_failure(
     }
 }
 
+// SAFETY: Pause reasons are command-boundary values that are stored and emitted atomically.
+#[allow(clippy::needless_pass_by_value)]
 fn pause_chain_at_step(
     paths: &DeadreckonPaths,
     chain: &mut Chain,
@@ -2385,6 +2391,8 @@ fn update_conductor_live(
     write_conductor_state(paths, &conductor)
 }
 
+// SAFETY: Hook payloads are owned JSON messages written once to child process stdin.
+#[allow(clippy::needless_pass_by_value)]
 fn invoke_chain_hook(
     paths: &DeadreckonPaths,
     chain: &Chain,
@@ -3403,6 +3411,8 @@ fn print_chain_table(chains: &[Chain], full: bool) {
     }
 }
 
+// SAFETY: Chain list filters are owned clap values at the command boundary.
+#[allow(clippy::needless_pass_by_value)]
 fn list_chain_records(paths: &DeadreckonPaths, scope: Option<String>) -> Result<Vec<Chain>> {
     if !paths.chains_dir().exists() {
         return Ok(Vec::new());
@@ -3892,7 +3902,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     if codebase.mode == CodebaseMode::Fresh {
         codebase.source_path = None;
     }
-    let preview_text = run_preview(RunPreview {
+    let preview_text = run_preview(&RunPreview {
         goal: &goal,
         cwd: &cwd,
         codebase: &codebase,
@@ -4267,7 +4277,7 @@ async fn acceptance_agent_command_in_dir(
             "deadreckon done \"what should count as done\"",
         )));
     }
-    let request = acceptance_request_text(request, mode)?;
+    let request = acceptance_request_text(&request, mode)?;
     if !force && yaml_path.exists() && matches!(mode, AcceptanceAgentMode::Draft) {
         return Err(CliError::Core(deadreckon_core::user_error(
             ".deadreckon/acceptance.yaml already exists",
@@ -4362,7 +4372,7 @@ fn acceptance_add_pack_command(cwd: &Path, pack: AcceptancePack, force: bool) ->
             files: BTreeMap::new(),
         }
     };
-    let pack_draft = acceptance_pack_draft(pack, cwd)?;
+    let pack_draft = acceptance_pack_draft(pack, cwd);
     draft.yaml = append_acceptance_checks(&draft.yaml, &pack_draft.yaml)?;
     if !draft.markdown.ends_with('\n') {
         draft.markdown.push('\n');
@@ -4434,41 +4444,40 @@ impl AcceptancePack {
     }
 }
 
+// SAFETY: Acceptance paths are owned clap values at the command boundary.
+#[allow(clippy::needless_pass_by_value)]
 fn acceptance_explain_command(spec: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let path = resolve_acceptance_path_for_command(&cwd, spec.as_deref())?;
-    match path {
-        Some(path) => {
-            let raw = fs::read_to_string(&path)?;
-            let count = acceptance_check_count(&raw)?;
-            println!("{}", ui_heading("done criteria"));
-            println!("  spec:   {}", path.display());
-            println!("  checks: {count}");
-            if path == project_acceptance_yaml(&cwd)
-                && let Some(markdown) = read_optional_text(&project_acceptance_md(&cwd))?
-            {
-                println!();
-                println!("{}", markdown.trim());
-            }
+    if let Some(path) = path {
+        let raw = fs::read_to_string(&path)?;
+        let count = acceptance_check_count(&raw)?;
+        println!("{}", ui_heading("done criteria"));
+        println!("  spec:   {}", path.display());
+        println!("  checks: {count}");
+        if path == project_acceptance_yaml(&cwd)
+            && let Some(markdown) = read_optional_text(&project_acceptance_md(&cwd))?
+        {
             println!();
-            print_acceptance_yaml_summary(&raw)?;
+            println!("{}", markdown.trim());
         }
-        None => {
-            println!("{}", ui_heading("done criteria"));
-            println!("  spec:   default dr-gate behavior");
-            println!(
-                "  checks: working directory exists, or cargo test when Cargo.toml is present"
-            );
-            println!();
-            println!(
-                "{}",
-                ui_command("deadreckon done \"what should count as done\"")
-            );
-        }
+        println!();
+        print_acceptance_yaml_summary(&raw)?;
+    } else {
+        println!("{}", ui_heading("done criteria"));
+        println!("  spec:   default dr-gate behavior");
+        println!("  checks: working directory exists, or cargo test when Cargo.toml is present");
+        println!();
+        println!(
+            "{}",
+            ui_command("deadreckon done \"what should count as done\"")
+        );
     }
     Ok(())
 }
 
+// SAFETY: Acceptance check paths are owned clap values at the command boundary.
+#[allow(clippy::needless_pass_by_value)]
 fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let working_dir = against.unwrap_or(cwd.clone());
@@ -4558,7 +4567,7 @@ fn ui_error_stdout(text: impl AsRef<str>) -> String {
     ui_style(text, "1;31", UiStream::Stdout)
 }
 
-fn acceptance_request_text(request: Vec<String>, mode: AcceptanceAgentMode) -> Result<String> {
+fn acceptance_request_text(request: &[String], mode: AcceptanceAgentMode) -> Result<String> {
     let joined = request.join(" ").trim().to_string();
     if !joined.is_empty() {
         return Ok(joined);
@@ -5186,7 +5195,7 @@ These checks define what `deadreckon` should verify before promoting a completed
     }
 }
 
-fn acceptance_pack_draft(pack: AcceptancePack, cwd: &Path) -> Result<AcceptanceDraft> {
+fn acceptance_pack_draft(pack: AcceptancePack, cwd: &Path) -> AcceptanceDraft {
     let pack = match pack {
         AcceptancePack::Auto => match detect_acceptance_preset(cwd) {
             AcceptancePreset::Rust => AcceptancePack::Rust,
@@ -5268,7 +5277,7 @@ fn acceptance_pack_draft(pack: AcceptancePack, cwd: &Path) -> Result<AcceptanceD
             playwright_smoke_spec().to_string(),
         );
     }
-    Ok(AcceptanceDraft {
+    AcceptanceDraft {
         markdown: format!(
             "# Acceptance Criteria\n\nAdded the `{}` pack.\n\n{}",
             pack.name(),
@@ -5276,7 +5285,7 @@ fn acceptance_pack_draft(pack: AcceptancePack, cwd: &Path) -> Result<AcceptanceD
         ),
         yaml,
         files,
-    })
+    }
 }
 
 fn append_acceptance_checks(existing_raw: &str, addition_raw: &str) -> Result<String> {
@@ -6144,8 +6153,8 @@ struct RunPreview<'a> {
     run_id: &'a str,
 }
 
-fn run_preview(input: RunPreview<'_>) -> String {
-    let RunPreview {
+fn run_preview(input: &RunPreview<'_>) -> String {
+    let &RunPreview {
         goal,
         cwd,
         codebase,
@@ -6484,7 +6493,9 @@ fn set_toml_path(root: &mut toml::Value, key: &str, value: toml::Value) {
         if !cursor.is_table() {
             *cursor = toml::Value::Table(Default::default());
         }
-        let table = cursor.as_table_mut().expect("table after initialization");
+        let Some(table) = cursor.as_table_mut() else {
+            return;
+        };
         cursor = table
             .entry((*part).to_string())
             .or_insert_with(|| toml::Value::Table(Default::default()));
@@ -6492,8 +6503,9 @@ fn set_toml_path(root: &mut toml::Value, key: &str, value: toml::Value) {
     if !cursor.is_table() {
         *cursor = toml::Value::Table(Default::default());
     }
-    let table = cursor.as_table_mut().expect("table after initialization");
-    if let Some(last) = parts.last() {
+    if let Some(table) = cursor.as_table_mut()
+        && let Some(last) = parts.last()
+    {
         table.insert((*last).to_string(), value);
     }
 }
@@ -6541,6 +6553,8 @@ fn command_exists(name: &str) -> bool {
         })
 }
 
+// SAFETY: Materialize arguments are owned clap values at the command boundary.
+#[allow(clippy::needless_pass_by_value)]
 fn materialize_command(
     run_id: String,
     dest: Option<PathBuf>,
@@ -6697,7 +6711,7 @@ fn materialize_completed_run(
     remove_if_exists(&dest.join(".materialized-to"))?;
     write_parent_marker(
         &dest.join(".deadreckon").join("parent.json"),
-        materialized_parent_marker(state),
+        &materialized_parent_marker(state),
     )?;
     normalize_permissions(&dest)?;
     append_materialized_marker(&library_dir, &dest)?;
@@ -6757,6 +6771,8 @@ fn apply_command_quiet(
     )
 }
 
+// SAFETY: Apply arguments are owned clap values at the command boundary.
+#[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 fn apply_command_inner(
     run_id: String,
@@ -6847,10 +6863,10 @@ fn apply_command_inner(
             git_root,
             &["merge", "--no-ff", branch, "-m", &full_merge_message],
         )
-        .map_err(|err| apply_merge_error(&state.run_id, &autostash, err))?,
+        .map_err(|err| apply_merge_error(&state.run_id, &autostash, &err))?,
         "squash" => {
             git_status(git_root, &["merge", "--squash", branch])
-                .map_err(|err| apply_merge_error(&state.run_id, &autostash, err))?;
+                .map_err(|err| apply_merge_error(&state.run_id, &autostash, &err))?;
             let staged_stat = git_stdout(git_root, &["diff", "--cached", "--stat"])?;
             if staged_stat.trim().is_empty() {
                 if let Some(stash) = autostash.as_ref() {
@@ -6871,7 +6887,7 @@ fn apply_command_inner(
         "cherry-pick" => {
             let base = record.base_sha.as_deref().unwrap_or("HEAD");
             git_status(git_root, &["cherry-pick", &format!("{base}..{branch}")])
-                .map_err(|err| apply_merge_error(&state.run_id, &autostash, err))?;
+                .map_err(|err| apply_merge_error(&state.run_id, &autostash, &err))?;
         }
         other => {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -7016,7 +7032,7 @@ fn restore_apply_autostash(git_root: &Path, run_id: &str, stash: &ApplyAutoStash
     })
 }
 
-fn apply_merge_error(run_id: &str, autostash: &Option<ApplyAutoStash>, err: CliError) -> CliError {
+fn apply_merge_error(run_id: &str, autostash: &Option<ApplyAutoStash>, err: &CliError) -> CliError {
     CliError::Core(deadreckon_core::user_error(
         &format!("merge produced conflicts: {err}"),
         &apply_conflict_hint(run_id, autostash),
@@ -7045,15 +7061,14 @@ fn should_prompt_cleanup(no_confirm: bool) -> Result<bool> {
     ))
 }
 
+// SAFETY: Abandon arguments are owned clap values at the command boundary.
+#[allow(clippy::needless_pass_by_value)]
 fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = load_cli_run(&paths, &run_id)?;
-    let record = match read_codebase_record(&state.working_dir) {
-        Ok(record) => record,
-        Err(_) => {
-            println!("nothing to abandon for run {}", state.run_id);
-            return Ok(());
-        }
+    let Ok(record) = read_codebase_record(&state.working_dir) else {
+        println!("nothing to abandon for run {}", state.run_id);
+        return Ok(());
     };
     if record.mode == CodebaseMode::InPlace {
         return Err(CliError::Core(deadreckon_core::user_error(
@@ -7437,7 +7452,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     seed_working_from_library(&parent_library, &state.working_dir)?;
     write_parent_marker(
         &state.working_dir.join(".deadreckon").join("parent.json"),
-        extended_parent_marker(&parent, &new_goal, context_turns),
+        &extended_parent_marker(&parent, &new_goal, context_turns),
     )?;
     write_parent_history(&state, &parent, context_turns)?;
     copy_existing_acceptance_into_run(&state, &[&state.cwd, &state.working_dir])?;
@@ -7623,7 +7638,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     )?;
     write_parent_marker(
         &state.working_dir.join(".deadreckon").join("parent.json"),
-        extended_parent_marker(&parent, &new_goal, context_turns),
+        &extended_parent_marker(&parent, &new_goal, context_turns),
     )?;
     write_parent_history(&state, &parent, context_turns)?;
     copy_existing_acceptance_into_run(&state, &[&state.cwd, &state.working_dir])?;
@@ -7895,11 +7910,11 @@ fn materialized_parent_marker(state: &deadreckon_core::PipelineState) -> ParentM
     }
 }
 
-fn write_parent_marker(path: &Path, marker: ParentMarker) -> Result<()> {
+fn write_parent_marker(path: &Path, marker: &ParentMarker) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(&marker)?)?;
+    fs::write(path, serde_json::to_vec_pretty(marker)?)?;
     Ok(())
 }
 
@@ -8107,11 +8122,10 @@ fn library_command(command: LibraryCommand) -> Result<()> {
         } => {
             let filter = LibraryFilter::new(None, since, until)?;
             let needle = query.to_lowercase();
-            let entries =
-                filter_library_entries(library_entries(&paths, scope.clone(), all)?, &filter)
-                    .into_iter()
-                    .filter(|entry| library_entry_matches_query(entry, &needle))
-                    .collect::<Vec<_>>();
+            let entries = filter_library_entries(library_entries(&paths, scope, all)?, &filter)
+                .into_iter()
+                .filter(|entry| library_entry_matches_query(entry, &needle))
+                .collect::<Vec<_>>();
             if entries.is_empty() {
                 println!("no library artifacts matched {query:?}");
                 println!(
@@ -8505,9 +8519,8 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 }
 
 fn codebase_mode_status(paths: &DeadreckonPaths, run: &deadreckon_core::RunListEntry) -> String {
-    let state = match load_run(paths, &run.run_id) {
-        Ok(state) => state,
-        Err(_) => return "-".to_string(),
+    let Ok(state) = load_run(paths, &run.run_id) else {
+        return "-".to_string();
     };
     read_run_codebase_record(paths, &state)
         .map(|record| record.mode.to_string())
@@ -8819,6 +8832,8 @@ async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
     Ok(())
 }
 
+// SAFETY: Kill arguments are owned clap values at the command boundary.
+#[allow(clippy::needless_pass_by_value)]
 fn kill_command(run_id: String, force: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = load_cli_run(&paths, &run_id)?;
@@ -9053,6 +9068,8 @@ fn undo_restore_state(
     Ok(restore_state)
 }
 
+// SAFETY: Show arguments are owned clap values at the command boundary.
+#[allow(clippy::needless_pass_by_value)]
 fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = load_cli_run(&paths, &run_id)?;
@@ -9118,6 +9135,8 @@ fn read_parent_marker(root: &Path) -> Result<Option<ParentMarker>> {
     }
 }
 
+// SAFETY: Import source is an owned clap value at the command boundary.
+#[allow(clippy::needless_pass_by_value)]
 fn import_command(source: String) -> Result<()> {
     // REPORT.md: Cross-Tool State Sharing (read-only import) never writes into
     // Claude Code, Codex, or Cursor state directories.
@@ -10375,7 +10394,7 @@ fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
         .filter(|path| {
             !path_has_component(path, "node_modules") && !path_has_component(path, ".git")
         })
-        .filter_map(|path| live_file(&state.working_dir, path))
+        .filter_map(|path| live_file(&state.working_dir, &path))
         .collect::<Vec<_>>();
     files.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
     let file_count = files.len();
@@ -10405,7 +10424,7 @@ fn collect_acceptance_live(state: &deadreckon_core::PipelineState) -> Acceptance
         && let Ok(bytes) = fs::read(&marker_path)
         && let Ok(marker) = serde_json::from_slice::<AcceptanceMarker>(&bytes)
     {
-        return acceptance_live_from_marker(marker);
+        return acceptance_live_from_marker(&marker);
     }
 
     let progress_path = acceptance_progress_path_for_run_root(&state.run_root);
@@ -10413,7 +10432,7 @@ fn collect_acceptance_live(state: &deadreckon_core::PipelineState) -> Acceptance
         && let Ok(entries) = read_jsonl::<AcceptanceProgressEntry>(&progress_path)
         && !entries.is_empty()
     {
-        return acceptance_live_from_progress(entries);
+        return acceptance_live_from_progress(&entries);
     }
 
     let spec_path = acceptance_spec_path_for_run_root(&state.run_root);
@@ -10435,7 +10454,7 @@ fn collect_acceptance_live(state: &deadreckon_core::PipelineState) -> Acceptance
     }
 }
 
-fn acceptance_live_from_marker(marker: AcceptanceMarker) -> AcceptanceLive {
+fn acceptance_live_from_marker(marker: &AcceptanceMarker) -> AcceptanceLive {
     let total = marker.checks.len().max(marker.check_count);
     let passed = if marker.checks.is_empty() {
         marker.check_count
@@ -10471,7 +10490,7 @@ fn acceptance_live_from_marker(marker: AcceptanceMarker) -> AcceptanceLive {
     }
 }
 
-fn acceptance_live_from_progress(entries: Vec<AcceptanceProgressEntry>) -> AcceptanceLive {
+fn acceptance_live_from_progress(entries: &[AcceptanceProgressEntry]) -> AcceptanceLive {
     let total = entries.iter().map(|entry| entry.total).max().unwrap_or(0);
     let mut results = entries
         .iter()
@@ -10558,9 +10577,9 @@ fn acceptance_result_line(result: &deadreckon_core::AcceptanceCheckResult) -> St
     format!("{mark} {} {}", result.kind, one_line(&result.detail, 120))
 }
 
-fn live_file(root: &Path, path: PathBuf) -> Option<LiveFile> {
-    let metadata = fs::metadata(&path).ok()?;
-    let relative = path.strip_prefix(root).unwrap_or(&path);
+fn live_file(root: &Path, path: &Path) -> Option<LiveFile> {
+    let metadata = fs::metadata(path).ok()?;
+    let relative = path.strip_prefix(root).unwrap_or(path);
     Some(LiveFile {
         path: relative.display().to_string(),
         bytes: metadata.len(),

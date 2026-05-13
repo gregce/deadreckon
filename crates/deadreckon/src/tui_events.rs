@@ -62,7 +62,7 @@ impl TuiEventFeed {
                 if events.is_empty() {
                     events.extend(replay.read_new()?);
                 } else {
-                    replay.skip_to_end()?;
+                    replay.skip_to_end();
                 }
             }
             TuiEventSource::FileTail(replay) => {
@@ -143,12 +143,11 @@ impl JsonlTail {
             .collect())
     }
 
-    fn skip_to_end(&mut self) -> std::io::Result<()> {
+    fn skip_to_end(&mut self) {
         self.offset = fs::metadata(&self.path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         self.partial.clear();
-        Ok(())
     }
 
     fn open_at_offset(&mut self) -> std::io::Result<Option<fs::File>> {

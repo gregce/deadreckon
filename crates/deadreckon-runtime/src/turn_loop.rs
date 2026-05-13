@@ -107,7 +107,7 @@ pub async fn run_turn_loop(
     let mut history = load_or_reconstruct_history(state, config.from_turn)?;
     ensure_sandbox_toml(state)?;
     let run_token = config.cancellation_token.clone().unwrap_or_default();
-    let _cancel_marker_guard = CancelMarkerGuard::spawn(state.run_root.clone(), run_token.clone());
+    let _cancel_marker_guard = CancelMarkerGuard::spawn(&state.run_root, run_token.clone());
     if should_cancel_run(state, &run_token) {
         state.status = deadreckon_core::state::RunStatus::Killed;
         state.failure_reason = Some("run cancelled before turn loop".to_string());
@@ -174,7 +174,7 @@ pub async fn run_turn_loop(
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
                 return Ok(RunLoopOutcome::Killed);
             }
-            Err(err) => return Err(provider_error(err)),
+            Err(err) => return Err(provider_error(&err)),
         };
         if should_cancel_run(state, &run_token) {
             state.status = deadreckon_core::state::RunStatus::Killed;
@@ -432,7 +432,7 @@ pub async fn run_turn_loop(
                         )?;
                         return Ok(RunLoopOutcome::Killed);
                     }
-                    Err(err) => return Err(sandbox_error(err)),
+                    Err(err) => return Err(sandbox_error(&err)),
                 };
                 append_trace(
                     state,
@@ -626,11 +626,11 @@ fn should_cancel_run(state: &PipelineState, token: &CancellationToken) -> bool {
     state.status == RunStatus::Killed || token.is_cancelled() || cancel_marker_present(state)
 }
 
-fn provider_error(err: deadreckon_providers::ProviderError) -> DeadreckonError {
+fn provider_error(err: &deadreckon_providers::ProviderError) -> DeadreckonError {
     DeadreckonError::InvalidInput(format!("provider error: {err}"))
 }
 
-fn sandbox_error(err: deadreckon_sandbox::SandboxError) -> DeadreckonError {
+fn sandbox_error(err: &deadreckon_sandbox::SandboxError) -> DeadreckonError {
     DeadreckonError::InvalidInput(format!("sandbox error: {err}"))
 }
 
@@ -640,10 +640,10 @@ struct CancelMarkerGuard {
 }
 
 impl CancelMarkerGuard {
-    fn spawn(run_root: PathBuf, run_token: CancellationToken) -> Self {
+    fn spawn(run_root: &Path, run_token: CancellationToken) -> Self {
         let shutdown = CancellationToken::new();
         let shutdown_for_task = shutdown.clone();
-        let marker = cancel_marker_path_for_run_root(&run_root);
+        let marker = cancel_marker_path_for_run_root(run_root);
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -668,6 +668,8 @@ impl Drop for CancelMarkerGuard {
     }
 }
 
+// SAFETY: `RunLoopOutcome` is the stable event vocabulary used at call sites.
+#[allow(clippy::needless_pass_by_value)]
 fn emit_run_completed(
     state: &PipelineState,
     sender: Option<&broadcast::Sender<RunEvent>>,
@@ -1255,9 +1257,8 @@ fn run_acceptance_gate(state: &PipelineState) -> Result<()> {
 }
 
 fn commit_worktree_turn(state: &PipelineState, turn: u32, label: &str) -> Result<()> {
-    let record = match read_codebase_record(&state.working_dir) {
-        Ok(record) => record,
-        Err(_) => return Ok(()),
+    let Ok(record) = read_codebase_record(&state.working_dir) else {
+        return Ok(());
     };
     if record.mode != CodebaseMode::Worktree {
         return Ok(());

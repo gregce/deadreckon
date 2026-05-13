@@ -266,7 +266,7 @@ pub fn append_turn_doc(state: &PipelineState, input: TurnDocInput) -> Result<Tur
         tool_stderr: input.tool_stderr.as_deref().map(capture_tool_stdio),
         trace_link: format!("../traces.jsonl#turn-{}", input.turn),
         snapshot_link: format!("../../snapshots/turn-{}/", input.turn),
-        commit_sha: current_worktree_sha(state)?,
+        commit_sha: current_worktree_sha(state),
         decision_candidate: is_decision_candidate(&input.response_text),
         response_text: input.response_text,
     };
@@ -760,10 +760,7 @@ fn render_narrative(
     {
         out.push_str(&format!(
             "- Branch: `{branch}` at `{}`\n",
-            current_worktree_sha(state)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "-".to_string())
+            current_worktree_sha(state).unwrap_or_else(|| "-".to_string())
         ));
     }
     out.push_str("- Acceptance: `proofs/turn-acceptance.json`\n");
@@ -1057,10 +1054,7 @@ fn commit_or_working_lines(state: &PipelineState) -> Vec<String> {
                 .as_deref()
                 .map(short_id)
                 .unwrap_or_else(|| "-".to_string());
-            let head = current_worktree_sha(state)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "-".to_string());
+            let head = current_worktree_sha(state).unwrap_or_else(|| "-".to_string());
             let branch = record.branch_name.as_deref().unwrap_or("-");
             let commits = worktree_commit_count(state, record.base_sha.as_deref()).unwrap_or(0);
             let (adds, dels) = diff_numstat(state, record.base_sha.as_deref()).unwrap_or((0, 0));
@@ -1701,7 +1695,7 @@ fn component_rows(records: &[TurnRecord]) -> Vec<ComponentRow> {
             };
             rows.entry(format!("{layer}:{}", file.path))
                 .or_insert_with(|| ComponentRow {
-                    layer: layer.to_string(),
+                    layer: layer.clone(),
                     responsibility: responsibility_for_layer(&layer).to_string(),
                     entrypoint: entrypoint_for_change(file),
                 });
@@ -1837,19 +1831,17 @@ fn directory_mentions(working_dir: &Path, left: &str, right: &str) -> bool {
         .any(|path| fs::read_to_string(path).is_ok_and(|raw| raw.contains(&needle)))
 }
 
-fn current_worktree_sha(state: &PipelineState) -> Result<Option<String>> {
+fn current_worktree_sha(state: &PipelineState) -> Option<String> {
     let Ok(record) = read_codebase_record(&state.working_dir) else {
-        return Ok(None);
+        return None;
     };
     if record.mode != CodebaseMode::Worktree {
-        return Ok(None);
+        return None;
     }
-    Ok(
-        git_output(&state.working_dir, &["rev-parse", "--short", "HEAD"])
-            .ok()
-            .map(|sha| sha.trim().to_string())
-            .filter(|sha| !sha.is_empty()),
-    )
+    git_output(&state.working_dir, &["rev-parse", "--short", "HEAD"])
+        .ok()
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
 }
 
 fn worktree_commit_count(state: &PipelineState, base: Option<&str>) -> Result<usize> {
@@ -2053,8 +2045,10 @@ fn phase_from_group(index: usize, turns: Vec<TurnRecord>) -> Phase {
 fn ill_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"(?i)\bi['’]?ll\s+([a-z][a-z0-9_-]*(?:\s+[a-z0-9_./-]+){0,5})")
-            .expect("valid auto-title regex")
+        match Regex::new(r"(?i)\bi['’]?ll\s+([a-z][a-z0-9_-]*(?:\s+[a-z0-9_./-]+){0,5})") {
+            Ok(regex) => regex,
+            Err(err) => panic!("valid auto-title regex: {err}"),
+        }
     })
 }
 
@@ -2069,7 +2063,10 @@ fn decision_markers() -> &'static [Regex] {
                 r"(?i)\bdecision\b.*\b(chose|pick|go(?:ing)? with)\b",
             ]
             .iter()
-            .map(|pattern| Regex::new(pattern).expect("valid decision marker regex"))
+            .map(|pattern| match Regex::new(pattern) {
+                Ok(regex) => regex,
+                Err(err) => panic!("valid decision marker regex: {err}"),
+            })
             .collect()
         })
         .as_slice()
