@@ -22,7 +22,7 @@ use deadreckon_core::{
     ChainEvent, ChainEventKind, ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus,
     CodebaseMode, CodebaseRecord, ConductorState, DEFAULT_DOC_POLISH_TOKEN_BUDGET,
     DEFAULT_DOC_SUBSKILLS, DeadreckonError, DeadreckonPaths, DocKind, DocProviderSelection,
-    DocProviderSource, ModeFlags, OnFail, PhaseId, PhaseStatus, PromotionManifest,
+    DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId, PhaseStatus, PromotionManifest,
     ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunOptions, RunStatus, SpendRecord,
     TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
     acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
@@ -3810,11 +3810,18 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     let effective_doc_skill = doc_skill
         .or(defaults.doc_skill.clone())
         .unwrap_or_else(|| "run-narrator".to_string());
-    let doc_provider_selection = resolve_doc_provider(
+    let mut doc_provider_selection = resolve_doc_provider(
         doc_provider.as_deref(),
         &defaults,
         effective_provider.as_deref(),
     );
+    let effective_no_docs = no_docs || (smoke && doc_provider.is_none());
+    if effective_no_docs {
+        doc_provider_selection = DocProviderSelection {
+            provider: None,
+            source: DocProviderSource::None,
+        };
+    }
     if max_spend.is_none() {
         let cap = effective_max_spend.unwrap_or(10.0);
         println!(
@@ -4014,7 +4021,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
                         .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
                     budget_cap_usd: defaults.doc_polish_budget_cap_usd,
                     doc_skill: effective_doc_skill,
-                    no_docs,
+                    no_docs: effective_no_docs,
                 },
             },
         ),
@@ -9423,7 +9430,17 @@ fn print_status_card(state: &deadreckon_core::PipelineState) {
         println!("  failure:  {}", one_line(reason, 100));
     }
     println!("  gate:     {}", acceptance_status_line(state));
-    println!("  docs:     {}", docs_status_for_state(state));
+    let docs_status = docs_status_for_state(state);
+    println!("  docs:     {docs_status}");
+    if docs_status == DocsStatus::Failed
+        && let Ok(Some(record)) = deadreckon_runtime::read_polish_record(state)
+    {
+        let detail = record.error.as_deref().unwrap_or(record.status.as_str());
+        println!(
+            "  docs:     polish failed ({}); fallback docs are still available",
+            one_line(detail, 72)
+        );
+    }
 
     println!();
     println!("{}", ui_heading("library"));

@@ -16,8 +16,8 @@ use deadreckon_core::{
     RunStatus, TurnDocInput, TurnRecord, append_parent_narrative_update, append_turn_doc,
     apply_commit_body, as_built_path, auto_title, coalesce_into_phases, decisions_path,
     diff_samples_markdown, docs_dir, frontmatter, is_decision_candidate,
-    missing_files_in_narrative, narrative_path, publish_docs_for_promotion, rewrite_templated_docs,
-    save_state, should_emit_delta, source_layout, tool_stdio_markdown,
+    missing_files_in_narrative, narrative_path, polish_path, publish_docs_for_promotion,
+    rewrite_templated_docs, save_state, should_emit_delta, source_layout, tool_stdio_markdown,
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_runtime::{
@@ -1372,6 +1372,43 @@ fn status_shows_docs_status() {
         .expect("status");
     assert_success(&output);
     assert!(stdout(&output).contains("docs:"));
+}
+
+#[test]
+fn status_explains_failed_polish_when_fallback_docs_exist() {
+    let (_temp, paths, state) = completed_state_with_docs("failed docs");
+    fs::write(
+        polish_path(&state.working_dir),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 2,
+            "status": "failed_subcall:narrator-overview",
+            "inputs_hash": "hash",
+            "provider": "cli:codex",
+            "skill_path": null,
+            "skill_source": null,
+            "completed_at": "2026-05-13T00:00:00Z",
+            "cost_usd": 0.0,
+            "retries": 0,
+            "missing_files": [],
+            "error": "subcall narrator-overview did not complete cleanly"
+        }))
+        .expect("json"),
+    )
+    .expect("polish");
+
+    let output = deadreckon(paths.home())
+        .current_dir(&state.cwd)
+        .args(["status", &state.run_id])
+        .output()
+        .expect("status");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("docs:     failed"), "{out}");
+    assert!(
+        out.contains("polish failed") && out.contains("fallback docs are still available"),
+        "{out}"
+    );
 }
 
 fn fresh_state(goal: &str) -> (TempDir, DeadreckonPaths, deadreckon_core::PipelineState) {

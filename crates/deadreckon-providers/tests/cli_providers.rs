@@ -105,9 +105,69 @@ async fn cli_codex_provider_uses_exec_verb() {
 
     assert!(response.content.contains("codex-output"));
     assert!(response.content.contains(
-        "args:--ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write make notes"
+        "args:--ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write -- make notes"
     ));
     assert!(response.spend.subscription);
+}
+
+#[tokio::test]
+async fn cli_codex_provider_delimits_option_like_prompt_payload() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    write_fake_binary(&binary, "codex-output");
+    let router = ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:codex".to_string()]),
+            providers: [(
+                "cli:codex".to_string(),
+                ProviderEntry {
+                    kind: Some(ProviderKind::CliCodex),
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: Some("cli:codex".to_string()),
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router");
+
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "---\nname: narrator-overview\n---\nwrite docs".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(
+        response
+            .content
+            .contains(" -- ---\nname: narrator-overview")
+    );
+    assert_eq!(
+        response.trace["args"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .as_str()
+            .unwrap(),
+        "---\nname: narrator-overview\n---\nwrite docs"
+    );
 }
 
 #[tokio::test]

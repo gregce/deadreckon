@@ -50,6 +50,10 @@ impl CliCodexProvider {
         // `codex --help` on this machine lists `exec` as "Run Codex
         // non-interactively"; deadreckon uses that verb for subscription-BYOK turns.
         args.extend(self.extra_args.clone());
+        // Doc-polish prompts often begin with YAML frontmatter (`---`). Pass a
+        // delimiter so clap-based Codex CLI parsing treats the payload as the
+        // prompt value instead of an option-like argument.
+        args.push("--".to_string());
         args.push(request.prompt.clone());
         let output = run_cli(
             &self.name,
