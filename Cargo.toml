@@ -43,3 +43,24 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 walkdir = "2.5.0"
 which = "8.0.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+await_holding_lock = "warn"
+expect_used = "warn"
+unwrap_used = "warn"
+needless_borrow = "warn"
+needless_collect = "warn"
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+manual_flatten = "warn"
+manual_map = "warn"
+manual_find = "warn"
+manual_let_else = "warn"
+single_match_else = "warn"
+explicit_iter_loop = "warn"
+implicit_clone = "warn"
+unnecessary_wraps = "warn"
