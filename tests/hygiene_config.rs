@@ -117,10 +117,60 @@ fn format_commit_touches_only_whitespace_and_imports() {
     }
 }
 
+#[test]
+fn release_profile_pins_lto_fat() {
+    assert_cargo_toml_contains("lto = \"fat\"");
+}
+
+#[test]
+fn release_profile_pins_codegen_units_one() {
+    assert_cargo_toml_contains("codegen-units = 1");
+}
+
+#[test]
+fn release_profile_keeps_panic_unwind() {
+    assert_cargo_toml_contains("panic = \"unwind\"");
+}
+
+#[test]
+fn release_binary_size_within_baseline_slack() {
+    let root = workspace_root();
+    let baseline = fs::read_to_string(root.join("tests/.size-baseline"))
+        .expect("read size baseline")
+        .trim()
+        .parse::<u64>()
+        .expect("parse size baseline");
+    let binary = root.join("target/release/deadreckon");
+    if !binary.exists() {
+        let output = Command::new("cargo")
+            .args(["build", "--release"])
+            .current_dir(&root)
+            .output()
+            .expect("build release binary");
+        assert!(
+            output.status.success(),
+            "cargo build --release failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let actual = fs::metadata(&binary).expect("release binary metadata").len();
+    let allowed = baseline + (baseline / 20);
+    assert!(
+        actual <= allowed,
+        "release binary grew too much: actual={actual}, baseline={baseline}, allowed={allowed}"
+    );
+}
+
 fn assert_lint_level(lint: &str, level: &str) {
     let text = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read Cargo.toml");
     let needle = format!("{lint} = \"{level}\"");
     assert!(text.contains(&needle), "missing `{needle}`");
+}
+
+fn assert_cargo_toml_contains(needle: &str) {
+    let text = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read Cargo.toml");
+    assert!(text.contains(needle), "missing `{needle}`");
 }
 
 fn assert_rs_identifier_set_unchanged(root: &PathBuf, commit: &str, file: &str) {

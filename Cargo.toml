@@ -64,3 +64,13 @@ single_match_else = "warn"
 explicit_iter_loop = "warn"
 implicit_clone = "warn"
 unnecessary_wraps = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+split-debuginfo = "off"
+panic = "unwind"
+
+[profile.dev]
+debug = "limited"
