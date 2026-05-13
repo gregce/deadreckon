@@ -568,6 +568,15 @@ pub(crate) enum Commands {
         mode: CliPlanMode,
         #[arg(long, default_value_t = 3, help = "Split-mode task count, 2 through 6")]
         n: u8,
+        #[arg(long, help = "Per-child spend cap in USD")]
+        max_spend: Option<f64>,
+        #[arg(long, help = "Per-child wall-clock cap for CLI-backed turns")]
+        max_wall_seconds: Option<f64>,
+        #[arg(
+            long,
+            help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
+        )]
+        sandbox: Option<String>,
         #[arg(long, help = "Split-mode planner provider")]
         planner_provider: Option<String>,
         #[arg(long, help = "Default split child provider")]
@@ -1400,6 +1409,9 @@ pub(crate) struct PlanCommandArgs {
     pub(crate) goal: String,
     pub(crate) n: u8,
     pub(crate) mode: CliPlanMode,
+    pub(crate) max_spend: Option<f64>,
+    pub(crate) max_wall_seconds: Option<f64>,
+    pub(crate) sandbox: Option<String>,
     pub(crate) planner_provider: Option<String>,
     pub(crate) provider: Option<String>,
     pub(crate) child_provider: Vec<String>,

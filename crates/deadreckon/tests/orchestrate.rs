@@ -284,6 +284,37 @@ fn merge_fails_on_conflict_then_prefer_child_promotes() {
     );
 }
 
+#[test]
+fn orchestrate_review_mode_runs_fork_and_merge() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "orchestrate",
+            "tiny hello rust",
+            "--mode",
+            "review",
+            "--coder-provider",
+            "smoke",
+            "--reviewer-provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--quiet",
+        ])
+        .output()
+        .expect("orchestrate");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.mode, PlanMode::Review);
+    assert_eq!(plan.status, PlanStatus::Merged);
+    assert!(plan.merged_run_id.is_some());
+}
+
 fn plan_and_fork_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> Plan {
     let output = deadreckon(paths)
         .current_dir(repo)

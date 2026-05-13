@@ -325,6 +325,9 @@ async fn main_inner() -> Result<()> {
             goal,
             mode,
             n,
+            max_spend,
+            max_wall_seconds,
+            sandbox,
             planner_provider,
             provider,
             child_provider,
@@ -338,6 +341,9 @@ async fn main_inner() -> Result<()> {
                 goal,
                 n,
                 mode,
+                max_spend,
+                max_wall_seconds,
+                sandbox,
                 planner_provider,
                 provider,
                 child_provider,
@@ -364,6 +370,9 @@ async fn main_inner() -> Result<()> {
                 goal,
                 n,
                 mode,
+                max_spend: None,
+                max_wall_seconds: None,
+                sandbox: None,
                 planner_provider,
                 provider,
                 child_provider,
@@ -6615,15 +6624,19 @@ fn run_preview(input: &RunPreview<'_>) -> String {
 async fn orchestrate_command(args: PlanCommandArgs) -> Result<()> {
     let quiet = args.quiet;
     let no_hints = args.no_hints;
+    let max_spend = args.max_spend;
+    let max_wall_seconds = args.max_wall_seconds;
+    let sandbox = args.sandbox.clone();
     let plan = create_orchestration_plan(args).await?;
+    let plan_id = plan.plan_id.clone();
     if !quiet {
         print_plan_created(&plan, no_hints);
     }
     fork_command(ForkCommandArgs {
-        plan_id: plan.plan_id,
-        max_spend: None,
-        max_wall_seconds: None,
-        sandbox: None,
+        plan_id: plan_id.clone(),
+        max_spend,
+        max_wall_seconds,
+        sandbox,
         provider: None,
         child_provider: Vec::new(),
         coder_provider: None,
@@ -6631,7 +6644,15 @@ async fn orchestrate_command(args: PlanCommandArgs) -> Result<()> {
         no_hints,
         quiet,
     })
-    .await
+    .await?;
+    merge_command(MergeCommandArgs {
+        plan_id,
+        strategy: "fail-on-conflict".to_string(),
+        prefer_child: None,
+        no_gate: false,
+        no_hints,
+        quiet,
+    })
 }
 
 async fn plan_command(args: PlanCommandArgs) -> Result<()> {
@@ -6649,6 +6670,9 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
         goal,
         n,
         mode,
+        max_spend: _,
+        max_wall_seconds: _,
+        sandbox: _,
         planner_provider,
         provider,
         child_provider,
@@ -7851,7 +7875,19 @@ fn child_artifact_root(paths: &DeadreckonPaths, state: &deadreckon_core::Pipelin
 }
 
 fn skip_plan_merge_file(relative: &Path) -> bool {
-    relative == Path::new("manifest.json") || relative.starts_with(".deadreckon")
+    relative == Path::new("manifest.json")
+        || relative.starts_with(".deadreckon")
+        || path_has_component(relative, "target")
+        || path_has_component(relative, "node_modules")
+        || path_has_component(relative, ".next")
+        || path_has_component(relative, "dist")
+        || path_has_component(relative, "build")
+        || relative
+            .strip_prefix("docs")
+            .ok()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("RUN-"))
 }
 
 fn file_hash(path: &Path) -> Result<u64> {
