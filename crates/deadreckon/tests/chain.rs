@@ -15,7 +15,7 @@ use axum::{Json, Router};
 use deadreckon_core::{
     ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainNewOptions, ChainStatus, ChainStepStatus,
     DeadreckonPaths, OnFail, RunEvent, RunEventKind, RunOptions, chain_task_key, create_run,
-    load_chain, promote_completed_run,
+    load_chain, load_run, promote_completed_run,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -406,6 +406,52 @@ fn chain_yes_runs_smoke_steps_and_auto_applies() {
     let log = git_stdout(&repo, &["log", "--oneline"]);
     assert!(log.contains("tiny hello"));
     assert!(log.contains("add goodbye"));
+}
+
+#[test]
+fn chain_child_runs_copy_project_acceptance_into_run_roots() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    fs::create_dir_all(repo.join(".deadreckon")).expect("acceptance dir");
+    fs::write(
+        repo.join(".deadreckon/acceptance.yaml"),
+        "name: chain acceptance\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("acceptance yaml");
+    git(&repo, &["add", "-f", ".deadreckon/acceptance.yaml"]).expect("add acceptance");
+    git(&repo, &["commit", "-m", "add acceptance"]).expect("commit acceptance");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "4",
+            "tiny hello",
+            "add goodbye",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.status, ChainStatus::Completed);
+    for step in chain.steps {
+        let run_id = step.run_id.expect("step run id");
+        let state = load_run(&paths, &run_id).expect("run state");
+        let acceptance =
+            fs::read_to_string(state.run_root.join("acceptance.yaml")).expect("acceptance");
+        assert!(acceptance.contains("chain acceptance"), "{acceptance}");
+        let marker =
+            fs::read_to_string(state.run_root.join("proofs/turn-acceptance.json")).expect("marker");
+        assert!(marker.contains("\"kind\": \"file_exists\""), "{marker}");
+    }
 }
 
 #[test]

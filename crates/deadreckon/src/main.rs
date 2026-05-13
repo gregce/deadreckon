@@ -4774,9 +4774,40 @@ fn copy_acceptance_into_run(
             .working_dir
             .join(PROJECT_ACCEPTANCE_DIR)
             .join(PROJECT_ACCEPTANCE_HELPERS);
-        copy_tree(&helper_source, &helper_dest)?;
+        if !same_path_best_effort(&helper_source, &helper_dest) {
+            copy_tree(&helper_source, &helper_dest)?;
+        }
     }
     Ok(())
+}
+
+fn copy_existing_acceptance_into_run(
+    state: &deadreckon_core::PipelineState,
+    candidate_roots: &[&Path],
+) -> Result<()> {
+    let source = resolve_existing_acceptance_source(candidate_roots)?;
+    copy_acceptance_into_run(state, &source)
+}
+
+fn resolve_existing_acceptance_source(
+    candidate_roots: &[&Path],
+) -> Result<Option<AcceptanceSource>> {
+    for root in candidate_roots {
+        if let Some(source) = resolve_acceptance_source(root, None)? {
+            return Ok(Some(source));
+        }
+    }
+    Ok(None)
+}
+
+fn same_path_best_effort(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn resolve_acceptance_path_for_command(cwd: &Path, spec: Option<&Path>) -> Result<Option<PathBuf>> {
@@ -7230,6 +7261,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         extended_parent_marker(&parent, &new_goal, context_turns),
     )?;
     write_parent_history(&state, &parent, context_turns)?;
+    copy_existing_acceptance_into_run(&state, &[&state.cwd, &state.working_dir])?;
     append_trace(
         &state,
         &TraceRecord {
@@ -7415,6 +7447,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         extended_parent_marker(&parent, &new_goal, context_turns),
     )?;
     write_parent_history(&state, &parent, context_turns)?;
+    copy_existing_acceptance_into_run(&state, &[&state.cwd, &state.working_dir])?;
     append_trace(
         &state,
         &TraceRecord {

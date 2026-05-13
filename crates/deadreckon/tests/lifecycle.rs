@@ -158,6 +158,12 @@ fn materialize_refuses_dest_inside_runstate() {
 async fn extend_creates_new_run_with_parent_artifacts() {
     let temp = repo_tempdir();
     let (paths, parent) = completed_parent(&temp, "extend parent artifacts");
+    fs::create_dir_all(parent.cwd.join(".deadreckon")).expect("acceptance dir");
+    fs::write(
+        parent.cwd.join(".deadreckon/acceptance.yaml"),
+        "name: extend acceptance\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/child.txt\"\n",
+    )
+    .expect("acceptance yaml");
     let server = MockServer::start(extend_script()).await;
     write_config(paths.home(), &server.base_url());
 
@@ -183,6 +189,11 @@ async fn extend_creates_new_run_with_parent_artifacts() {
     assert_eq!(
         fs::read_to_string(child.working_dir.join("child.txt")).expect("child"),
         "extended child"
+    );
+    assert!(
+        fs::read_to_string(child.run_root.join("acceptance.yaml"))
+            .expect("child acceptance")
+            .contains("extend acceptance")
     );
     assert_eq!(
         parent_json(&child.working_dir)["kind"]
@@ -325,6 +336,14 @@ async fn materialize_then_extend_roundtrip() {
 async fn extend_in_worktree_chains_branches() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
+    fs::create_dir_all(repo.join(".deadreckon")).expect("acceptance dir");
+    fs::write(
+        repo.join(".deadreckon/acceptance.yaml"),
+        "name: worktree acceptance\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("acceptance yaml");
+    git(&repo, &["add", "-f", ".deadreckon/acceptance.yaml"]).expect("add acceptance");
+    git(&repo, &["commit", "-m", "add acceptance"]).expect("commit acceptance");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let parent_run = deadreckon(&paths)
         .current_dir(&repo)
@@ -366,6 +385,11 @@ async fn extend_in_worktree_chains_branches() {
     assert_ne!(child_record.branch_name.as_ref(), Some(&parent_branch));
     assert!(child_record.worktree_path.expect("child worktree").exists());
     assert!(child.working_dir.join("child.txt").exists());
+    assert!(
+        fs::read_to_string(child.run_root.join("acceptance.yaml"))
+            .expect("child acceptance")
+            .contains("worktree acceptance")
+    );
     assert_eq!(
         parent_json(&child.working_dir)["kind"]
             .as_str()
