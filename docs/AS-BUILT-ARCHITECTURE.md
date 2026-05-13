@@ -1783,7 +1783,7 @@ Every child run receives an inline copy of its worker spec in the prompt. The sp
 - `fork <plan-id>` runs ready child tasks through `deadreckon run`, using distinct plan-child scopes via `DEADRECKON_SCOPE_ROOT`. It writes typed progress/blocker messages and child summaries.
 - `merge <plan-id>` composes completed child library artifacts into a new promoted run. It fails on conflicting file contents by default; `--strategy prefer-child --prefer-child <idx>` records the conflict and chooses that child.
 - `orchestrate <goal>` is the one-command wrapper. In review mode it performs plan -> fork -> merge end to end.
-- `attach <plan-id>` and `show <plan-id>` currently render a plain plan summary with task status, provider, child run prefixes, summaries, latest message, and next actions.
+- `attach <plan-id>` opens a plan TUI on TTYs and renders a plain summary off-TTY. The TUI shows child panes with provider/role/status, run prefixes, summaries, and coordinator messages; `Enter` drills into the selected child run.
 - `kill <plan-id>` reads `coordinator.json` and child run state to signal the coordinator and live children.
 
 ### 30.4 Merge Artifact
@@ -1794,7 +1794,7 @@ Generated run artifacts are intentionally excluded from merge composition: `.dea
 
 ### 30.5 Current Limits
 
-The first orchestration milestone is usable but not the full rider endpoint. Independent split tasks are supervised sequentially rather than concurrently. `attach <plan-id>` is a plain summary, not the planned multi-pane TUI. Review mode uses a fresh child run from the coder artifact rather than the older `extend` verb path. Plan-aware `history grep` and `show --why-failed` remain future slices.
+The first orchestration milestone is usable but not the full rider endpoint. Independent split tasks are supervised sequentially rather than concurrently. The plan TUI is a basic pane grid rather than the full event-streamed dashboard. Review mode uses a fresh child run from the coder artifact rather than the older `extend` verb path. Plan-aware `history grep` and `show --why-failed` remain future slices.
 
 ---
 

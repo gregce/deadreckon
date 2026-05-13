@@ -6,7 +6,7 @@
 - Added `deadreckon plan`, `fork`, `merge`, and review-mode `orchestrate` so a common coder -> reviewer -> merge flow can complete end to end.
 - Added explicit planner/default-child/per-child/coder/reviewer provider resolution and persisted overrides into `plan.json`.
 - Added merge conflict detection with `--strategy prefer-child --prefer-child <idx>` and promoted merge artifacts with `deadreckon-plan-manifest.json`.
-- Added plan-aware `attach`, `show`, and `kill` fallbacks so plan IDs participate in the normal lifecycle.
+- Added plan-aware `attach`, `show`, and `kill` so plan IDs participate in the normal lifecycle, including a basic multi-pane plan TUI with child drill-in.
 - Verified with focused orchestration tests plus core plan round-trips and `cargo fmt --check`; full multi-pane TUI, concurrent child scheduling, plan-aware history grep, and `show --why-failed` remain future slices.
 
 ## Copilot and Pi providers (alpha) - 2026-05-13

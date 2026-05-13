@@ -10655,7 +10655,12 @@ async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
         Err(run_error) => {
             if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
                 let plan = load_plan(&paths, &plan_id)?;
-                print_plan_summary(&paths, &plan, completion_hints_enabled(no_hints))?;
+                let show_hints = completion_hints_enabled(no_hints);
+                if io::stdout().is_terminal() {
+                    attach_plan_tui(&paths, &plan.plan_id, show_hints).await?;
+                } else {
+                    print_plan_summary(&paths, &plan, show_hints)?;
+                }
                 return Ok(());
             }
             return Err(run_error);
@@ -11766,6 +11771,286 @@ fn is_worktree_run(state: &deadreckon_core::PipelineState) -> bool {
     read_codebase_record(&state.working_dir)
         .map(|record| record.mode == CodebaseMode::Worktree)
         .unwrap_or(false)
+}
+
+async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: bool) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let mut selected = 0_usize;
+
+    let result = loop {
+        let plan = load_plan(paths, plan_id)?;
+        let messages = read_plan_messages(paths, plan_id).unwrap_or_default();
+        if selected >= plan.tasks.len() {
+            selected = plan.tasks.len().saturating_sub(1);
+        }
+        terminal.draw(|frame| {
+            render_plan_attach(frame, paths, &plan, &messages, selected, show_hints)
+        })?;
+        if event::poll(std::time::Duration::from_millis(250))? {
+            match event::read()? {
+                Event::Key(key) if attach_should_quit(key) => break Ok(()),
+                Event::Key(key)
+                    if matches!(
+                        key.code,
+                        KeyCode::Right | KeyCode::Down | KeyCode::Tab | KeyCode::Char('j')
+                    ) =>
+                {
+                    selected = (selected + 1).min(plan.tasks.len().saturating_sub(1));
+                }
+                Event::Key(key)
+                    if matches!(key.code, KeyCode::Left | KeyCode::Up | KeyCode::Char('k')) =>
+                {
+                    selected = selected.saturating_sub(1);
+                }
+                Event::Key(key) if key.code == KeyCode::Enter => {
+                    if let Some(run_id) = plan
+                        .tasks
+                        .get(selected)
+                        .and_then(|task| task.child_run_id.as_deref())
+                    {
+                        suspend_tui(&mut terminal)?;
+                        let child_result = attach_tui(paths, run_id, show_hints).await;
+                        if let Err(err) = &child_result {
+                            eprintln!("error: {err}");
+                            let _ = prompt("press Enter to return to plan attach...");
+                        }
+                        resume_tui(&mut terminal)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+    result
+}
+
+fn render_plan_attach(
+    frame: &mut ratatui::Frame<'_>,
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    messages: &[PlanMessage],
+    selected: usize,
+    show_hints: bool,
+) {
+    let area = frame.area();
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(10),
+            Constraint::Length(7),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    let counts = plan_task_counts(plan);
+    let header = vec![
+        Line::from(vec![
+            Span::styled("plan ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                run_prefix(&plan.plan_id),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "  status {:?}  mode {:?}  tasks {}/{}/{}",
+                plan.status,
+                plan.mode,
+                counts.0,
+                counts.1,
+                plan.tasks.len()
+            )),
+        ]),
+        Line::from(one_line(
+            &plan.root_goal,
+            area.width.saturating_sub(4) as usize,
+        )),
+        Line::from(plan_provider_summary(plan)),
+    ];
+    frame.render_widget(
+        Paragraph::new(header)
+            .block(
+                Block::default()
+                    .title("deadreckon plan")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        vertical[0],
+    );
+
+    let task_area = vertical[1];
+    let panes = plan_task_pane_layout(task_area, plan.tasks.len());
+    for (index, task) in plan.tasks.iter().enumerate() {
+        let Some(rect) = panes.get(index).copied() else {
+            continue;
+        };
+        let is_selected = index == selected;
+        let title = format!(
+            "{} {} {}",
+            if is_selected { "*" } else { " " },
+            task.task_id,
+            task_status_label(task.status)
+        );
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{:?}", task.role).to_ascii_lowercase(),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::raw(format!(
+                    "  provider {}",
+                    task.provider.as_deref().unwrap_or("-")
+                )),
+            ]),
+            Line::from(one_line(
+                &task.subject,
+                rect.width.saturating_sub(4) as usize,
+            )),
+            Line::from(format!(
+                "run {}",
+                task.child_run_id
+                    .as_deref()
+                    .map(run_prefix)
+                    .unwrap_or_else(|| "-".to_string())
+            )),
+            Line::from(format!(
+                "deps {}",
+                if task.depends_on.is_empty() {
+                    "-".to_string()
+                } else {
+                    task.depends_on.join(",")
+                }
+            )),
+        ];
+        if let Some(summary) = task.summary_path.as_ref() {
+            lines.push(Line::from(format!(
+                "summary {}",
+                paths.plan_dir(&plan.plan_id).join(summary).display()
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_style(if is_selected {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default()
+                        }),
+                )
+                .wrap(Wrap { trim: true }),
+            rect,
+        );
+    }
+
+    let activity = plan_activity_lines(messages, vertical[2].height.saturating_sub(2) as usize);
+    frame.render_widget(
+        List::new(activity).block(
+            Block::default()
+                .title("coordinator messages")
+                .borders(Borders::ALL),
+        ),
+        vertical[2],
+    );
+    let footer = if show_hints {
+        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter drill into child  |  merge after fork"
+    } else {
+        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter drill into child"
+    };
+    frame.render_widget(Paragraph::new(footer), vertical[3]);
+}
+
+fn plan_task_counts(plan: &Plan) -> (usize, usize) {
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .count();
+    let running = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Running)
+        .count();
+    (completed, running)
+}
+
+fn plan_provider_summary(plan: &Plan) -> String {
+    match plan.mode {
+        PlanMode::Split => format!(
+            "planner {}  default child {}",
+            plan.providers.planner.as_deref().unwrap_or("-"),
+            plan.providers.default_child.as_deref().unwrap_or("-")
+        ),
+        PlanMode::Review => format!(
+            "coder {}  reviewer {}",
+            plan.providers.coder.as_deref().unwrap_or("-"),
+            plan.providers.reviewer.as_deref().unwrap_or("-")
+        ),
+    }
+}
+
+fn plan_task_pane_layout(
+    area: ratatui::layout::Rect,
+    task_count: usize,
+) -> Vec<ratatui::layout::Rect> {
+    if task_count == 0 {
+        return Vec::new();
+    }
+    let rows = if task_count <= 3 { 1 } else { 2 };
+    let row_constraints =
+        std::iter::repeat_n(Constraint::Ratio(1, rows as u32), rows).collect::<Vec<_>>();
+    let row_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(row_constraints)
+        .split(area);
+    let mut rects = Vec::new();
+    for row in 0..rows {
+        let remaining = task_count.saturating_sub(rects.len());
+        let columns = remaining.min(if rows == 1 { task_count } else { 3 }).max(1);
+        let col_constraints =
+            std::iter::repeat_n(Constraint::Ratio(1, columns as u32), columns).collect::<Vec<_>>();
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(col_constraints)
+            .split(row_chunks[row]);
+        for col in cols.iter().copied().take(remaining) {
+            rects.push(col);
+            if rects.len() == task_count {
+                break;
+            }
+        }
+    }
+    rects
+}
+
+fn plan_activity_lines(messages: &[PlanMessage], max: usize) -> Vec<ListItem<'static>> {
+    let mut lines = messages
+        .iter()
+        .rev()
+        .take(max.max(1))
+        .map(|message| {
+            ListItem::new(Line::from(format!(
+                "{} -> {} {:?}: {}",
+                message.from, message.to, message.kind, message.summary
+            )))
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(ListItem::new(Line::from("no coordinator messages yet")));
+    }
+    lines
 }
 
 async fn attach_tui(
