@@ -143,6 +143,15 @@ Plan writes ~/.deadreckon/plans/<plan-id>/plan.json plus worker specs. Split
 mode asks the planner provider for a task graph. Review mode writes a coder task
 followed by a fresh reviewer task.";
 
+const FORK_HELP: &str = "\
+Lifecycle:
+  deadreckon fork <plan-id>
+  deadreckon attach <plan-id>
+  deadreckon merge <plan-id>
+
+Fork starts the plan coordinator. Each child is still a normal deadreckon run,
+using the provider recorded in plan.json unless you override it here.";
+
 const DONE_HELP: &str = "\
 Lifecycle:
   deadreckon def-done \"builds, opens in a browser, and has no console errors\"
@@ -601,6 +610,42 @@ pub(crate) enum Commands {
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
         quiet: bool,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Start child runs for an orchestration plan",
+        after_help = FORK_HELP
+    )]
+    Fork {
+        #[arg(help = "Plan id or unique prefix")]
+        plan_id: String,
+        #[arg(long, help = "Per-child spend cap in USD")]
+        max_spend: Option<f64>,
+        #[arg(long, help = "Per-child wall-clock cap for CLI-backed turns")]
+        max_wall_seconds: Option<f64>,
+        #[arg(
+            long,
+            help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
+        )]
+        sandbox: Option<String>,
+        #[arg(long, help = "Override the split default child provider")]
+        provider: Option<String>,
+        #[arg(
+            long,
+            value_name = "IDX=PROVIDER",
+            help = "Per-child provider override"
+        )]
+        child_provider: Vec<String>,
+        #[arg(long, help = "Review-mode coding provider override")]
+        coder_provider: Option<String>,
+        #[arg(long, help = "Review-mode reviewer provider override")]
+        reviewer_provider: Option<String>,
+        #[arg(long, help = "Suppress post-action hints")]
+        no_hints: bool,
+        #[arg(long, help = "Suppress success stdout")]
+        quiet: bool,
+        #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+        plain: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -1322,6 +1367,19 @@ pub(crate) struct PlanCommandArgs {
     pub(crate) n: u8,
     pub(crate) mode: CliPlanMode,
     pub(crate) planner_provider: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) child_provider: Vec<String>,
+    pub(crate) coder_provider: Option<String>,
+    pub(crate) reviewer_provider: Option<String>,
+    pub(crate) no_hints: bool,
+    pub(crate) quiet: bool,
+}
+
+pub(crate) struct ForkCommandArgs {
+    pub(crate) plan_id: String,
+    pub(crate) max_spend: Option<f64>,
+    pub(crate) max_wall_seconds: Option<f64>,
+    pub(crate) sandbox: Option<String>,
     pub(crate) provider: Option<String>,
     pub(crate) child_provider: Vec<String>,
     pub(crate) coder_provider: Option<String>,

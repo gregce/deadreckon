@@ -29,21 +29,23 @@ use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
     AcceptanceMarker, AcceptanceProgressEntry, ApplyMode, ApplyStrategy, BranchPolicy, Chain,
     ChainEvent, ChainEventKind, ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus,
-    CodebaseMode, CodebaseRecord, ConductorState, DEFAULT_DOC_POLISH_TOKEN_BUDGET,
-    DEFAULT_DOC_SUBSKILLS, DeadreckonError, DeadreckonPaths, DocKind, DocProviderSelection,
-    DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId, PhaseStatus, Plan, PlanMode,
-    PlanProviders, PlanRole, PlanTask, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL,
-    ResolvedMode, RunEvent, RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions,
-    acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root, acquire_lock,
-    append_chain_event, append_parent_narrative_update, append_provenance, append_trace,
-    apply_commit_body, cancel_marker_present, clear_cancel_marker, copy_source_to_working,
-    copy_tree, create_run, create_worktree, doc_path_for_kind, docs_status_for_state, emit_event,
-    evaluate_acceptance_checks, inventory_files, list_runs, load_chain, load_run,
-    marker_path_for_run_root, pid_is_alive, prepare_worktree_record, preview_git_state,
-    read_chain_step_marker, read_codebase_record, record_for_resolved_mode, release_lock_file,
-    resolve_mode, restore_snapshot, save_chain, save_plan, save_state, terminate_pid,
-    validate_acceptance_marker, validate_task_count, write_cancel_marker, write_chain_step_marker,
-    write_worker_spec,
+    CodebaseMode, CodebaseRecord, ConductorState, CoordinatorChild, CoordinatorState,
+    DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DeadreckonError, DeadreckonPaths,
+    DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId,
+    PhaseStatus, Plan, PlanChildMarker, PlanMessage, PlanMessageKind, PlanMode, PlanProviders,
+    PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest, ProvenanceRecord,
+    RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunOptions, RunStatus, SpendRecord, TraceRecord,
+    WorktreeOptions, acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root,
+    acquire_lock, append_chain_event, append_parent_narrative_update, append_plan_message,
+    append_provenance, append_trace, apply_commit_body, cancel_marker_present, clear_cancel_marker,
+    copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
+    docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files, list_runs,
+    load_chain, load_plan, load_run, marker_path_for_run_root, pid_is_alive,
+    prepare_worktree_record, preview_git_state, read_chain_step_marker, read_codebase_record,
+    record_for_resolved_mode, release_lock_file, resolve_mode, restore_snapshot, save_chain,
+    save_plan, save_state, terminate_pid, validate_acceptance_marker, validate_task_count,
+    write_cancel_marker, write_chain_step_marker, write_child_summary, write_coordinator_state,
+    write_plan_child_marker, write_worker_spec,
 };
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
@@ -77,8 +79,8 @@ mod tui_events;
 
 use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, CliPlanMode, Commands,
-    CompletionCommand, ConfigCommand, ExtendCommandArgs, LibraryCommand, PlanCommandArgs,
-    ProvidersCommand, RunCommandArgs,
+    CompletionCommand, ConfigCommand, ExtendCommandArgs, ForkCommandArgs, LibraryCommand,
+    PlanCommandArgs, ProvidersCommand, RunCommandArgs,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -363,6 +365,33 @@ async fn main_inner() -> Result<()> {
                 n,
                 mode,
                 planner_provider,
+                provider,
+                child_provider,
+                coder_provider,
+                reviewer_provider,
+                no_hints,
+                quiet,
+            })
+            .await
+        }
+        Commands::Fork {
+            plan_id,
+            max_spend,
+            max_wall_seconds,
+            sandbox,
+            provider,
+            child_provider,
+            coder_provider,
+            reviewer_provider,
+            no_hints,
+            quiet,
+            plain: _,
+        } => {
+            fork_command(ForkCommandArgs {
+                plan_id,
+                max_spend,
+                max_wall_seconds,
+                sandbox,
                 provider,
                 child_provider,
                 coder_provider,
@@ -6573,13 +6602,20 @@ async fn orchestrate_command(args: PlanCommandArgs) -> Result<()> {
     let plan = create_orchestration_plan(args).await?;
     if !quiet {
         print_plan_created(&plan, no_hints);
-        println!(
-            "{} full orchestration starts with {}",
-            ui_warn("pending"),
-            ui_command(format!("deadreckon fork {}", run_prefix(&plan.plan_id)))
-        );
     }
-    Ok(())
+    fork_command(ForkCommandArgs {
+        plan_id: plan.plan_id,
+        max_spend: None,
+        max_wall_seconds: None,
+        sandbox: None,
+        provider: None,
+        child_provider: Vec::new(),
+        coder_provider: None,
+        reviewer_provider: None,
+        no_hints,
+        quiet,
+    })
+    .await
 }
 
 async fn plan_command(args: PlanCommandArgs) -> Result<()> {
@@ -7021,6 +7057,613 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
             "{} deadreckon fork {}",
             ui_command("fork:"),
             run_prefix(&plan.plan_id)
+        );
+    }
+}
+
+async fn fork_command(args: ForkCommandArgs) -> Result<()> {
+    let ForkCommandArgs {
+        plan_id,
+        max_spend,
+        max_wall_seconds,
+        sandbox,
+        provider,
+        child_provider,
+        coder_provider,
+        reviewer_provider,
+        no_hints,
+        quiet,
+    } = args;
+    let paths = DeadreckonPaths::discover();
+    let resolved_id = resolve_plan_id(&paths, &plan_id)?;
+    let mut plan = load_plan(&paths, &resolved_id)?;
+    if plan.status != PlanStatus::Pending {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("plan {} is {:?}", run_prefix(&plan.plan_id), plan.status),
+            match plan.status {
+                PlanStatus::Forked => "deadreckon merge <plan-id>",
+                PlanStatus::Merged => "deadreckon show <merged-run-id>",
+                PlanStatus::Failed => "deadreckon show <plan-id> --why-failed",
+                PlanStatus::Pending => "deadreckon fork <plan-id>",
+            },
+        )));
+    }
+    apply_fork_provider_overrides(
+        &mut plan,
+        provider,
+        child_provider,
+        coder_provider,
+        reviewer_provider,
+    )?;
+    let defaults = config_defaults(&paths)?;
+    let sandbox = sandbox
+        .or(defaults.sandbox)
+        .unwrap_or_else(|| "auto".to_string());
+    let parent_cwd = std::env::current_dir()?;
+
+    plan.status = PlanStatus::Forked;
+    plan.forked_at = Some(Utc::now());
+    save_plan(&paths, &plan)?;
+    write_coordinator_snapshot(&paths, &plan, None)?;
+
+    let mut made_progress = true;
+    while made_progress {
+        made_progress = false;
+        let ready = plan.ready_pending_task_indices();
+        for task_index in ready {
+            made_progress = true;
+            let task_id = plan.tasks[task_index].task_id.clone();
+            mark_plan_task_status(&mut plan, task_index, PlanTaskStatus::Running)?;
+            append_plan_message(
+                &paths,
+                &plan.plan_id,
+                &PlanMessage::new(
+                    "coordinator",
+                    &task_id,
+                    PlanMessageKind::Progress,
+                    format!("{task_id} started"),
+                    json!({ "task_index": task_index }),
+                )?,
+            )?;
+            save_plan(&paths, &plan)?;
+            write_coordinator_snapshot(&paths, &plan, None)?;
+
+            let source_dir = plan_child_source_dir(&paths, &plan, task_index, &parent_cwd)?;
+            let outcome = run_plan_child(
+                &paths,
+                &plan,
+                task_index,
+                &source_dir,
+                &sandbox,
+                max_spend,
+                max_wall_seconds,
+                quiet,
+            )
+            .await;
+            match outcome {
+                Ok(run_id) => {
+                    let state = load_run(&paths, &run_id)?;
+                    let status = plan_status_from_run_status(state.status);
+                    let summary =
+                        summarize_child_run(&paths, &plan, &plan.tasks[task_index], &state);
+                    write_child_summary(&paths, &plan.plan_id, &task_id, &summary)?;
+                    let marker = plan_child_marker(&paths, &plan, &plan.tasks[task_index], &state);
+                    write_plan_child_marker(&state.working_dir, &marker)?;
+                    let library_dir = paths.library_dir(&state.scope, &state.run_id);
+                    if library_dir.is_dir() {
+                        write_plan_child_marker(&library_dir, &marker)?;
+                    }
+                    {
+                        let task = &mut plan.tasks[task_index];
+                        task.child_run_id = Some(run_id.clone());
+                        task.child_scope = Some(state.scope.clone());
+                        task.summary_path =
+                            Some(deadreckon_core::child_summary_relative_path(&task.task_id));
+                        task.status = status;
+                    }
+                    append_plan_message(
+                        &paths,
+                        &plan.plan_id,
+                        &PlanMessage::new(
+                            "coordinator",
+                            &task_id,
+                            if status == PlanTaskStatus::Completed {
+                                PlanMessageKind::Progress
+                            } else {
+                                PlanMessageKind::Blocker
+                            },
+                            format!("{task_id} {}", task_status_label(status)),
+                            json!({
+                                "task_index": task_index,
+                                "run_id": run_id,
+                                "run_status": state.status.to_string(),
+                            }),
+                        )?,
+                    )?;
+                    save_plan(&paths, &plan)?;
+                    write_coordinator_snapshot(&paths, &plan, None)?;
+                }
+                Err(error) => {
+                    mark_plan_task_status(&mut plan, task_index, PlanTaskStatus::Failed)?;
+                    append_plan_message(
+                        &paths,
+                        &plan.plan_id,
+                        &PlanMessage::new(
+                            "coordinator",
+                            &task_id,
+                            PlanMessageKind::Blocker,
+                            format!("{task_id} failed"),
+                            json!({ "task_index": task_index, "error": error.to_string() }),
+                        )?,
+                    )?;
+                    save_plan(&paths, &plan)?;
+                    write_coordinator_snapshot(&paths, &plan, None)?;
+                }
+            }
+        }
+    }
+
+    mark_blocked_pending_tasks(&paths, &mut plan)?;
+    save_plan(&paths, &plan)?;
+    let _ = fs::remove_file(paths.coordinator_json(&plan.plan_id));
+    if !quiet {
+        print_fork_finished(&plan, no_hints);
+    }
+    Ok(())
+}
+
+fn resolve_plan_id(paths: &DeadreckonPaths, id: &str) -> Result<String> {
+    let mut plans = fs::read_dir(paths.plans_dir())
+        .map_err(|source| DeadreckonError::Io {
+            path: paths.plans_dir(),
+            source,
+        })?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().join("plan.json").is_file())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    plans.sort();
+    if matches!(id, "latest" | "last") {
+        plans.sort_by_key(|plan_id| {
+            fs::metadata(paths.plan_json(plan_id))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        });
+        return plans.last().cloned().ok_or_else(|| {
+            CliError::Core(deadreckon_core::user_error(
+                "no plans",
+                "deadreckon plan \"your goal\"",
+            ))
+        });
+    }
+    let matches = plans
+        .into_iter()
+        .filter(|plan_id| plan_id.starts_with(id))
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches[0].clone()),
+        0 => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("no plan {id}"),
+            "deadreckon plan \"your goal\"",
+        ))),
+        _ => Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "ambiguous plan id prefix {id}; matches {}",
+                matches.join(", ")
+            ),
+            "use a longer plan id prefix",
+        ))),
+    }
+}
+
+fn apply_fork_provider_overrides(
+    plan: &mut Plan,
+    provider: Option<String>,
+    child_provider: Vec<String>,
+    coder_provider: Option<String>,
+    reviewer_provider: Option<String>,
+) -> Result<()> {
+    match plan.mode {
+        PlanMode::Split => {
+            if let Some(provider) = provider {
+                plan.providers.default_child = Some(provider.clone());
+                for task in &mut plan.tasks {
+                    task.provider = Some(provider.clone());
+                }
+            }
+            let overrides = parse_child_provider_overrides(&child_provider, plan.n as u8)?;
+            for (index, provider) in overrides {
+                plan.providers.children.insert(index, provider.clone());
+                let task = plan.tasks.get_mut(index as usize).ok_or_else(|| {
+                    CliError::Core(deadreckon_core::user_error(
+                        &format!("child provider index {index} outside 0..{}", plan.n),
+                        "--child-provider 1=cli:codex",
+                    ))
+                })?;
+                task.provider = Some(provider);
+            }
+        }
+        PlanMode::Review => {
+            if let Some(provider) = coder_provider {
+                plan.providers.coder = Some(provider.clone());
+                if let Some(task) = plan
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.role == PlanRole::Coder)
+                {
+                    task.provider = Some(provider);
+                }
+            }
+            if let Some(provider) = reviewer_provider {
+                plan.providers.reviewer = Some(provider.clone());
+                if let Some(task) = plan
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.role == PlanRole::Reviewer)
+                {
+                    task.provider = Some(provider);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mark_plan_task_status(plan: &mut Plan, task_index: usize, status: PlanTaskStatus) -> Result<()> {
+    let task = plan.tasks.get_mut(task_index).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("no task index {task_index}"),
+            "deadreckon plan \"your goal\"",
+        ))
+    })?;
+    task.status = status;
+    Ok(())
+}
+
+fn write_coordinator_snapshot(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    live_child: Option<(usize, u32)>,
+) -> Result<()> {
+    let children = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| CoordinatorChild {
+            child_index: task.index,
+            task_id: task.task_id.clone(),
+            run_id: task.child_run_id.clone(),
+            pid: live_child.and_then(|(live_index, pid)| (live_index == index).then_some(pid)),
+            scope: task.child_scope.clone(),
+            provider: task.provider.clone(),
+            role: task.role,
+            status: task.status,
+        })
+        .collect::<Vec<_>>();
+    write_coordinator_state(
+        paths,
+        &plan.plan_id,
+        &CoordinatorState {
+            schema_version: 1,
+            plan_id: plan.plan_id.clone(),
+            coordinator_pid: std::process::id(),
+            started_at: plan.forked_at.unwrap_or_else(Utc::now),
+            children,
+        },
+    )?;
+    Ok(())
+}
+
+fn plan_child_source_dir(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task_index: usize,
+    parent_cwd: &Path,
+) -> Result<PathBuf> {
+    let task = &plan.tasks[task_index];
+    if task.role != PlanRole::Reviewer {
+        return Ok(parent_cwd.to_path_buf());
+    }
+    let Some(dependency) = task.depends_on.first() else {
+        return Ok(parent_cwd.to_path_buf());
+    };
+    let Some(parent_task) = plan.task_by_id(dependency) else {
+        return Ok(parent_cwd.to_path_buf());
+    };
+    let Some(run_id) = parent_task.child_run_id.as_deref() else {
+        return Ok(parent_cwd.to_path_buf());
+    };
+    let state = load_run(paths, run_id)?;
+    let library_dir = paths.library_dir(&state.scope, &state.run_id);
+    if library_dir.is_dir() {
+        Ok(library_dir)
+    } else {
+        Ok(state.working_dir)
+    }
+}
+
+async fn run_plan_child(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task_index: usize,
+    source_dir: &Path,
+    sandbox: &str,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    quiet: bool,
+) -> Result<String> {
+    let task = &plan.tasks[task_index];
+    let worker_spec_path = paths.worker_spec(&plan.plan_id, &task.task_id);
+    let worker_spec = fs::read_to_string(&worker_spec_path)?;
+    let prompt = plan_child_prompt(plan, task, &worker_spec, &worker_spec_path);
+    let launch_dir = paths
+        .plan_dir(&plan.plan_id)
+        .join("launch")
+        .join(&task.task_id);
+    fs::create_dir_all(&launch_dir)?;
+
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .current_dir(source_dir)
+        .env("DEADRECKON_HOME", paths.home())
+        .env("DEADRECKON_SCOPE_ROOT", &launch_dir)
+        .arg("run")
+        .arg(prompt)
+        .arg("--from")
+        .arg(source_dir)
+        .arg("--yes")
+        .arg("--no-confirm")
+        .arg("--no-hints")
+        .arg("--sandbox")
+        .arg(sandbox);
+    if let Some(max_spend) = max_spend {
+        command.arg("--max-spend").arg(format!("{max_spend:.6}"));
+    }
+    if let Some(max_wall_seconds) = max_wall_seconds {
+        command
+            .arg("--max-wall-seconds")
+            .arg(max_wall_seconds.to_string());
+    }
+    if task
+        .provider
+        .as_deref()
+        .is_some_and(|provider| provider == "smoke" || provider.starts_with("smoke:"))
+    {
+        command.arg("--smoke");
+    } else if let Some(provider) = task.provider.as_deref() {
+        command.arg("--provider").arg(provider);
+    }
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    write_coordinator_snapshot(paths, plan, Some((task_index, child.id())))?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "failed to capture child stdout".to_string(),
+        ))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "failed to capture child stderr".to_string(),
+        ))
+    })?;
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let stdout_thread = spawn_chain_step_reader(stdout, true, tx.clone());
+    let stderr_thread = spawn_chain_step_reader(stderr, false, tx);
+    let mut stdout_text = String::new();
+    let mut stderr_text = String::new();
+    let mut live_run_id = None;
+    let status = loop {
+        while let Ok((is_stdout, line)) = rx.try_recv() {
+            if let Some(run_id) = capture_chain_step_output(
+                is_stdout,
+                &line,
+                &mut stdout_text,
+                &mut stderr_text,
+                quiet,
+            )? {
+                live_run_id = Some(run_id);
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    while let Ok((is_stdout, line)) = rx.try_recv() {
+        if let Some(run_id) =
+            capture_chain_step_output(is_stdout, &line, &mut stdout_text, &mut stderr_text, quiet)?
+        {
+            live_run_id = Some(run_id);
+        }
+    }
+    let run_id = live_run_id.or_else(|| parse_started_run_id(&stdout_text));
+    if !status.success() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "child {} failed: {}{}",
+            task.task_id, stdout_text, stderr_text
+        ))));
+    }
+    run_id.ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("could not find run id for {}", task.task_id),
+            "deadreckon list",
+        ))
+    })
+}
+
+fn plan_child_prompt(plan: &Plan, task: &PlanTask, spec: &str, spec_path: &Path) -> String {
+    let role_note = match task.role {
+        PlanRole::Reviewer => {
+            "This is a fresh review/fix lane. Write .deadreckon/REVIEW.md first, then apply only fixes tied to findings and acceptance."
+        }
+        PlanRole::Coder => "This is the coding lane for review-mode orchestration.",
+        PlanRole::Child => "This is one split child task in a larger plan.",
+    };
+    format!(
+        "{role_note}\n\nRoot goal: {}\nPlan: {}\nTask: {}\nWorker spec path: {}\n\n{}\n",
+        plan.root_goal,
+        plan.plan_id,
+        task.task_id,
+        spec_path.display(),
+        spec
+    )
+}
+
+fn plan_status_from_run_status(status: RunStatus) -> PlanTaskStatus {
+    match status {
+        RunStatus::Completed => PlanTaskStatus::Completed,
+        RunStatus::Killed => PlanTaskStatus::Killed,
+        RunStatus::Failed => PlanTaskStatus::Failed,
+        RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => PlanTaskStatus::Failed,
+    }
+}
+
+fn summarize_child_run(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task: &PlanTask,
+    state: &deadreckon_core::PipelineState,
+) -> String {
+    let library_dir = paths.library_dir(&state.scope, &state.run_id);
+    let files = inventory_files(&state.working_dir).unwrap_or_default();
+    let file_lines = files
+        .iter()
+        .take(20)
+        .map(|file| format!("- {}", file.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "# Child Summary: {}\n\nPlan: {}\nTask: {}\nRole: {:?}\nProvider: {}\nRun: {}\nStatus: {}\nWorking: {}\nLibrary: {}\n\n## Goal\n\n{}\n\n## Files\n\n{}\n",
+        task.subject,
+        plan.plan_id,
+        task.task_id,
+        task.role,
+        task.provider.as_deref().unwrap_or("config default"),
+        state.run_id,
+        state.status,
+        state.working_dir.display(),
+        library_dir.display(),
+        task.goal,
+        if file_lines.is_empty() {
+            "- no files recorded".to_string()
+        } else {
+            file_lines
+        }
+    )
+}
+
+fn plan_child_marker(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task: &PlanTask,
+    state: &deadreckon_core::PipelineState,
+) -> PlanChildMarker {
+    PlanChildMarker {
+        schema_version: 1,
+        kind: "plan_child".to_string(),
+        parent_plan_id: plan.plan_id.clone(),
+        parent_scope: plan
+            .parent_scope
+            .clone()
+            .unwrap_or_else(|| state.scope.clone()),
+        parent_goal: plan.root_goal.clone(),
+        task_id: task.task_id.clone(),
+        child_index: task.index,
+        task_goal: task.goal.clone(),
+        worker_spec: paths.worker_spec(&plan.plan_id, &task.task_id),
+        provider: task.provider.clone(),
+        role: task.role,
+        created_at: Utc::now(),
+        deadreckon_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+fn mark_blocked_pending_tasks(paths: &DeadreckonPaths, plan: &mut Plan) -> Result<()> {
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .map(|task| task.task_id.clone())
+        .collect::<BTreeSet<_>>();
+    let blockers = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status != PlanTaskStatus::Completed)
+        .map(|task| task.task_id.clone())
+        .collect::<BTreeSet<_>>();
+    let pending = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.status == PlanTaskStatus::Pending)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    for index in pending {
+        let missing = plan.tasks[index]
+            .depends_on
+            .iter()
+            .filter(|dependency| !completed.contains(*dependency))
+            .cloned()
+            .collect::<Vec<_>>();
+        let blocked_by = missing
+            .iter()
+            .filter(|dependency| blockers.contains(*dependency))
+            .cloned()
+            .collect::<Vec<_>>();
+        let task_id = plan.tasks[index].task_id.clone();
+        plan.tasks[index].status = PlanTaskStatus::Failed;
+        append_plan_message(
+            paths,
+            &plan.plan_id,
+            &PlanMessage::new(
+                "coordinator",
+                &task_id,
+                PlanMessageKind::Blocker,
+                format!("{task_id} blocked"),
+                json!({ "missing_dependencies": missing, "blocked_by": blocked_by }),
+            )?,
+        )?;
+    }
+    Ok(())
+}
+
+fn task_status_label(status: PlanTaskStatus) -> &'static str {
+    match status {
+        PlanTaskStatus::Pending => "pending",
+        PlanTaskStatus::Running => "running",
+        PlanTaskStatus::Completed => "completed",
+        PlanTaskStatus::Failed => "failed",
+        PlanTaskStatus::Killed => "killed",
+    }
+}
+
+fn print_fork_finished(plan: &Plan, no_hints: bool) {
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .count();
+    println!(
+        "{} {} done with {}/{} completed",
+        ui_ok("forked"),
+        ui_id(run_prefix(&plan.plan_id)),
+        completed,
+        plan.tasks.len()
+    );
+    if !no_hints {
+        println!(
+            "{} {}",
+            ui_command("attach:"),
+            ui_command(format!("deadreckon attach {}", run_prefix(&plan.plan_id)))
+        );
+        println!(
+            "{} {}",
+            ui_command("merge:"),
+            ui_command(format!("deadreckon merge {}", run_prefix(&plan.plan_id)))
         );
     }
 }

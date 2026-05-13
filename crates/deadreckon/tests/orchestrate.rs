@@ -4,7 +4,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use deadreckon_core::{DeadreckonPaths, Plan, PlanMode, PlanRole, load_plan};
+use deadreckon_core::{
+    DeadreckonPaths, Plan, PlanMode, PlanRole, PlanStatus, PlanTaskStatus, load_plan,
+    read_plan_messages,
+};
 use tempfile::TempDir;
 
 #[test]
@@ -172,6 +175,61 @@ fn plan_records_explicit_child_provider_overrides() {
     );
     assert_eq!(plan.tasks[0].provider.as_deref(), Some("smoke:default"));
     assert_eq!(plan.tasks[1].provider.as_deref(), Some("smoke:reviewer"));
+}
+
+#[test]
+fn fork_spawns_children_with_distinct_scopes_and_messages() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+
+    assert_success(&output);
+    let plan = load_plan(&paths, &plan.plan_id).expect("plan");
+    assert_eq!(plan.status, PlanStatus::Forked);
+    assert!(!paths.coordinator_json(&plan.plan_id).is_file());
+    assert!(
+        plan.tasks
+            .iter()
+            .all(|task| task.status == PlanTaskStatus::Completed)
+    );
+    let scopes = plan
+        .tasks
+        .iter()
+        .map(|task| task.child_scope.clone().expect("child scope"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(scopes.len(), 2);
+    for task in &plan.tasks {
+        assert!(paths.child_summary(&plan.plan_id, &task.task_id).is_file());
+        let run_id = task.child_run_id.as_ref().expect("run id");
+        let state = deadreckon_core::load_run(&paths, run_id).expect("child run");
+        assert!(state.working_dir.join(".deadreckon/parent.json").is_file());
+    }
+    let messages = read_plan_messages(&paths, &plan.plan_id).expect("messages");
+    assert!(messages.len() >= 4, "{messages:#?}");
 }
 
 fn repo_tempdir() -> TempDir {
