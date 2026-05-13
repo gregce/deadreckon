@@ -41,6 +41,11 @@ const BUILTIN_DESCRIPTOR_SOURCES: &[(&str, &str)] = &[
         "cli:opencode",
         include_str!("../../descriptors/cli-opencode.toml"),
     ),
+    (
+        "cli:copilot",
+        include_str!("../../descriptors/cli-copilot.toml"),
+    ),
+    ("cli:pi", include_str!("../../descriptors/cli-pi.toml")),
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

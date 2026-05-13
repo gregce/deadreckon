@@ -11004,6 +11004,8 @@ fn provider_jsonl_activity_lines(
             .into_iter()
             .collect::<Vec<_>>(),
         "claude-code" => claude_activity_lines(line, activity),
+        "copilot-cli" => copilot_activity_lines(line, activity),
+        "pi" => pi_activity_lines(line, activity),
         _ => Vec::new(),
     }
 }
@@ -11020,6 +11022,10 @@ fn provider_jsonl_activity_file(
         }
         "opencode" => {
             parse_opencode_activity_file(path, activity);
+            true
+        }
+        "pi" => {
+            parse_pi_activity_file(path, activity);
             true
         }
         _ => false,
@@ -11504,6 +11510,265 @@ fn claude_content_text(value: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn copilot_activity_lines(line: &str, activity: &mut ProviderActivity) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    let timestamp = short_timestamp(value.get("timestamp").and_then(Value::as_str));
+    let mut lines = Vec::new();
+    if let Some(usage) = value.get("usage")
+        && let Some(line) = usage_activity_line(&timestamp, usage, activity, Some(258_400))
+    {
+        lines.push(line);
+    }
+    match value.get("type").and_then(Value::as_str) {
+        Some("assistant.message") => {
+            let data = value.get("data").unwrap_or(&Value::Null);
+            if let Some(reasoning) = data.get("reasoningText").and_then(Value::as_str)
+                && !reasoning.trim().is_empty()
+            {
+                lines.push(format!("{timestamp} thinking {}", one_line(reasoning, 140)));
+            }
+            if let Some(content) = data.get("content").and_then(Value::as_str)
+                && !content.trim().is_empty()
+            {
+                lines.push(format!("{timestamp} agent {}", one_line(content, 140)));
+            }
+            if let Some(tool_requests) = data.get("toolRequests").and_then(Value::as_array) {
+                for request in tool_requests {
+                    let name = request
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    let input = provider_arguments_value(request.get("arguments"));
+                    lines.push(format!(
+                        "{timestamp} tool {} {}",
+                        provider_tool_label(name),
+                        one_line(&json_tool_summary(name, &input), 140)
+                    ));
+                }
+            }
+            if let Some(output) = data.get("outputTokens").and_then(Value::as_u64) {
+                lines.push(format!("{timestamp} tokens output {output}"));
+            }
+        }
+        Some("assistant.reasoning") => {
+            let data = value.get("data").unwrap_or(&Value::Null);
+            let text = data
+                .get("text")
+                .or_else(|| data.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("reasoning");
+            lines.push(format!("{timestamp} thinking {}", one_line(text, 140)));
+        }
+        Some("tool.execution_complete") => {
+            let data = value.get("data").unwrap_or(&Value::Null);
+            let result = data.get("result").unwrap_or(&Value::Null);
+            if !result.is_null() {
+                lines.push(format!(
+                    "{timestamp} result {}",
+                    one_line(&json_value_text(result), 140)
+                ));
+            }
+        }
+        _ => {}
+    }
+    lines
+}
+
+fn pi_activity_lines(line: &str, activity: &mut ProviderActivity) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    let timestamp = pi_activity_timestamp(&value);
+    if value.get("type").and_then(Value::as_str) != Some("message") {
+        return Vec::new();
+    }
+    let message = value.get("message").unwrap_or(&Value::Null);
+    let mut lines = Vec::new();
+    if let Some(usage) = message.get("usage")
+        && let Some(line) = usage_activity_line(&timestamp, usage, activity, Some(1_000_000))
+    {
+        lines.push(line);
+    }
+    match message.get("role").and_then(Value::as_str) {
+        Some("assistant") => {
+            lines.extend(pi_assistant_content_lines(&timestamp, message));
+        }
+        Some("toolResult") => {
+            let content = message.get("content").unwrap_or(&Value::Null);
+            if !content.is_null() {
+                lines.push(format!(
+                    "{timestamp} result {}",
+                    one_line(&json_value_text(content), 140)
+                ));
+            }
+        }
+        _ => {}
+    }
+    lines
+}
+
+fn parse_pi_activity_file(path: &Path, activity: &mut ProviderActivity) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let mut saw_session_header = false;
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        saw_session_header = value.get("type").and_then(Value::as_str) == Some("session");
+        break;
+    }
+    if !saw_session_header {
+        return;
+    }
+    for line in raw.lines() {
+        let mut parsed = pi_activity_lines(line, activity);
+        activity.lines.append(&mut parsed);
+    }
+}
+
+fn pi_assistant_content_lines(timestamp: &str, message: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let content = message.get("content").unwrap_or(&Value::Null);
+    if let Some(text) = content.as_str() {
+        if !text.trim().is_empty() {
+            lines.push(format!("{timestamp} agent {}", one_line(text, 140)));
+        }
+        return lines;
+    }
+    let Some(blocks) = content.as_array() else {
+        return lines;
+    };
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    lines.push(format!("{timestamp} agent {}", one_line(text, 140)));
+                }
+            }
+            Some("thinking") => {
+                let text = block
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .unwrap_or("thinking");
+                lines.push(format!("{timestamp} thinking {}", one_line(text, 140)));
+            }
+            Some("toolCall") => {
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                let input =
+                    normalize_pi_tool_arguments(provider_arguments_value(block.get("arguments")));
+                lines.push(format!(
+                    "{timestamp} tool {} {}",
+                    provider_tool_label(name),
+                    one_line(&json_tool_summary(name, &input), 140)
+                ));
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
+fn provider_arguments_value(value: Option<&Value>) -> Value {
+    let Some(value) = value else {
+        return Value::Null;
+    };
+    if let Some(raw) = value.as_str() {
+        return serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+    }
+    value.clone()
+}
+
+fn normalize_pi_tool_arguments(mut value: Value) -> Value {
+    let Some(map) = value.as_object_mut() else {
+        return value;
+    };
+    if map.contains_key("description") {
+        return value;
+    }
+    if let Some(intent) = map.remove("agent__intent").or_else(|| map.remove("_i")) {
+        map.insert("description".to_string(), intent);
+    }
+    value
+}
+
+fn usage_activity_line(
+    timestamp: &str,
+    usage: &Value,
+    activity: &mut ProviderActivity,
+    context_window: Option<u64>,
+) -> Option<String> {
+    let input = number_field_any(usage, &["inputTokens", "input_tokens", "input"]);
+    let output = number_field_any(usage, &["outputTokens", "output_tokens", "output"]);
+    let cache_read = number_field_any(
+        usage,
+        &[
+            "cacheReadTokens",
+            "cache_read_tokens",
+            "cache_read_input_tokens",
+            "cacheRead",
+            "cache.read",
+        ],
+    );
+    let cache_write = number_field_any(
+        usage,
+        &[
+            "cacheCreationTokens",
+            "cacheWriteTokens",
+            "cache_creation_tokens",
+            "cache_creation_input_tokens",
+            "cache_write_tokens",
+            "cacheCreation",
+            "cacheWrite",
+            "cache.write",
+        ],
+    );
+    if input.is_none() && output.is_none() && cache_read.is_none() && cache_write.is_none() {
+        return None;
+    }
+    let context = input.unwrap_or(0) + cache_read.unwrap_or(0) + cache_write.unwrap_or(0);
+    if context > 0 {
+        activity.context_tokens = Some(context);
+        activity.context_window = context_window;
+    }
+    Some(format!(
+        "{timestamp} tokens input {} output {} cache {}",
+        input.unwrap_or(0),
+        output.unwrap_or(0),
+        cache_read.unwrap_or(0) + cache_write.unwrap_or(0)
+    ))
+}
+
+fn number_field_any(value: &Value, names: &[&str]) -> Option<u64> {
+    names.iter().find_map(|name| {
+        value
+            .pointer(&json_pointer_path(name))
+            .or_else(|| value.get(*name))
+            .and_then(Value::as_u64)
+    })
+}
+
+fn pi_activity_timestamp(value: &Value) -> String {
+    if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
+        return short_timestamp(Some(timestamp));
+    }
+    value
+        .pointer("/message/timestamp")
+        .and_then(Value::as_i64)
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map(|timestamp| timestamp.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "--:--:--".to_string())
 }
 
 fn provider_tool_label(name: &str) -> &str {
@@ -13335,6 +13600,109 @@ mod tui_tests {
     }
 
     #[test]
+    fn provider_jsonl_copilot_activity_parses_assistant_message_and_usage() {
+        let mut activity = ProviderActivity::default();
+        let lines = provider_jsonl_activity_lines(
+            "copilot-cli",
+            r#"{"type":"assistant.message","timestamp":"2026-05-13T02:34:17Z","usage":{"inputTokens":10,"output_tokens":4,"cacheReadTokens":2,"cacheWriteTokens":1},"data":{"reasoningText":"Need a plan","content":"I will edit the file","outputTokens":4}}"#,
+            &mut activity,
+        );
+        let joined = lines.join("\n");
+
+        assert!(
+            joined.contains("tokens input 10 output 4 cache 3"),
+            "{joined}"
+        );
+        assert!(joined.contains("thinking Need a plan"), "{joined}");
+        assert!(joined.contains("agent I will edit the file"), "{joined}");
+        assert!(joined.contains("tokens output 4"), "{joined}");
+        assert_eq!(activity.context_tokens, Some(13));
+        assert_eq!(activity.context_window, Some(258_400));
+    }
+
+    #[test]
+    fn provider_jsonl_copilot_activity_parses_tool_request_and_result() {
+        let mut activity = ProviderActivity::default();
+        let tool_lines = provider_jsonl_activity_lines(
+            "copilot-cli",
+            r#"{"type":"assistant.message","timestamp":"2026-05-13T02:34:18Z","data":{"toolRequests":[{"toolCallId":"t1","name":"bash","arguments":{"command":"cargo test"}}]}}"#,
+            &mut activity,
+        );
+        let result_lines = provider_jsonl_activity_lines(
+            "copilot-cli",
+            r#"{"type":"tool.execution_complete","timestamp":"2026-05-13T02:34:19Z","data":{"toolCallId":"t1","result":"tests passed"}}"#,
+            &mut activity,
+        );
+
+        assert!(tool_lines.join("\n").contains("tool Bash cargo test"));
+        assert!(result_lines.join("\n").contains("result tests passed"));
+    }
+
+    #[test]
+    fn provider_jsonl_copilot_activity_ignores_unrelated_event_rows() {
+        let mut activity = ProviderActivity::default();
+        let lines = provider_jsonl_activity_lines(
+            "copilot-cli",
+            r#"{"type":"session.start","timestamp":"2026-05-13T02:34:16Z","data":{"sessionId":"s1"}}"#,
+            &mut activity,
+        );
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn provider_jsonl_pi_activity_parses_text_thinking_tool_and_result_blocks() {
+        let mut activity = ProviderActivity::default();
+        let assistant_lines = provider_jsonl_activity_lines(
+            "pi",
+            r#"{"type":"message","timestamp":"2026-05-13T02:34:17Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Need to inspect"},{"type":"text","text":"I will inspect the file"},{"type":"toolCall","id":"t1","name":"bash","arguments":{"command":"cargo test"}}]}}"#,
+            &mut activity,
+        );
+        let result_lines = provider_jsonl_activity_lines(
+            "pi",
+            r#"{"type":"message","timestamp":"2026-05-13T02:34:18Z","message":{"role":"toolResult","toolCallId":"t1","content":"ok"}}"#,
+            &mut activity,
+        );
+        let joined = assistant_lines.join("\n");
+
+        assert!(joined.contains("thinking Need to inspect"), "{joined}");
+        assert!(joined.contains("agent I will inspect the file"), "{joined}");
+        assert!(joined.contains("tool Bash cargo test"), "{joined}");
+        assert!(result_lines.join("\n").contains("result ok"));
+    }
+
+    #[test]
+    fn provider_jsonl_pi_activity_normalizes_intent_argument_description() {
+        let mut activity = ProviderActivity::default();
+        let lines = provider_jsonl_activity_lines(
+            "pi",
+            r#"{"type":"message","timestamp":"2026-05-13T02:34:17Z","message":{"role":"assistant","content":[{"type":"toolCall","name":"Task","arguments":{"agent__intent":"review docs","prompt":"read files"}}]}}"#,
+            &mut activity,
+        );
+
+        assert!(lines.join("\n").contains(r#""description":"review docs""#));
+    }
+
+    #[test]
+    fn provider_jsonl_pi_activity_extracts_usage_context_tokens() {
+        let mut activity = ProviderActivity::default();
+        let lines = provider_jsonl_activity_lines(
+            "pi",
+            r#"{"type":"message","timestamp":"2026-05-13T02:34:17Z","message":{"role":"assistant","usage":{"input":10,"output":5,"cache":{"read":3,"write":2}},"content":"Done"}}"#,
+            &mut activity,
+        );
+        let joined = lines.join("\n");
+
+        assert!(
+            joined.contains("tokens input 10 output 5 cache 5"),
+            "{joined}"
+        );
+        assert!(joined.contains("agent Done"), "{joined}");
+        assert_eq!(activity.context_tokens, Some(15));
+        assert_eq!(activity.context_window, Some(1_000_000));
+    }
+
+    #[test]
     fn schema_dispatch_unknown_schema_is_quiet() {
         let mut activity = ProviderActivity::default();
         let lines = provider_jsonl_activity_lines(
@@ -13344,6 +13712,169 @@ mod tui_tests {
         );
 
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn provider_jsonl_copilot_ingest_discovers_bare_session_state_jsonl() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let (_state_temp, mut state) = doc_preview_state();
+        state.provider = Some("cli:copilot".to_string());
+        let home = temp.path().join("home");
+        let session_dir = home.join(".copilot/session-state");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        std::fs::write(
+            session_dir.join("abc.jsonl"),
+            format!(
+                r#"{{"type":"session.start","timestamp":"2026-05-13T02:34:16Z","data":{{"context":{{"cwd":"{}"}}}}}}
+{{"type":"assistant.message","timestamp":"2026-05-13T02:34:17Z","data":{{"content":"Copilot edited the file"}}}}
+"#,
+                state.working_dir.display()
+            ),
+        )
+        .expect("copilot session");
+        let registry = ProviderRegistry::builtin().expect("registry");
+        let spec =
+            provider_jsonl_log_spec_from_registry(&state, &registry, &home).expect("copilot spec");
+
+        let activity = collect_jsonl_provider_activity(&state, &spec);
+        let lines = activity.lines.join("\n");
+
+        assert!(lines.contains("agent Copilot edited the file"), "{lines}");
+        assert!(lines.contains("provider log"), "{lines}");
+    }
+
+    #[test]
+    fn provider_jsonl_copilot_ingest_discovers_nested_events_jsonl() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let (_state_temp, mut state) = doc_preview_state();
+        state.provider = Some("cli:copilot".to_string());
+        let home = temp.path().join("home");
+        let session_dir = home.join(".copilot/session-state/sess-1");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        std::fs::write(
+            session_dir.join("events.jsonl"),
+            format!(
+                r#"{{"type":"session.start","timestamp":"2026-05-13T02:34:16Z","data":{{"context":{{"cwd":"{}"}}}}}}
+{{"type":"assistant.message","timestamp":"2026-05-13T02:34:17Z","data":{{"content":"Nested event worked"}}}}
+"#,
+                state.working_dir.display()
+            ),
+        )
+        .expect("events");
+        let registry = ProviderRegistry::builtin().expect("registry");
+        let spec =
+            provider_jsonl_log_spec_from_registry(&state, &registry, &home).expect("copilot spec");
+
+        let activity = collect_jsonl_provider_activity(&state, &spec);
+
+        assert!(activity.lines.join("\n").contains("Nested event worked"));
+    }
+
+    #[test]
+    fn provider_jsonl_copilot_ingest_json_pointer_cwd_matches_session_start() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let working_dir = temp.path().join("work");
+        let path = temp.path().join("copilot.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type":"session.start","data":{{"context":{{"cwd":"{}"}}}}}}"#,
+                working_dir.display()
+            ),
+        )
+        .expect("copilot jsonl");
+        let mut spec = test_log_spec(IngestCwdMatch::JsonPointer);
+        spec.cwd_match_path = Some("data.context.cwd".to_string());
+
+        assert!(provider_jsonl_session_matches_run(
+            &spec,
+            &path,
+            &[working_dir.to_string_lossy().to_string()]
+        ));
+    }
+
+    #[test]
+    fn provider_jsonl_pi_ingest_discovers_session_jsonl_under_encoded_cwd_dir() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let (_state_temp, mut state) = doc_preview_state();
+        state.provider = Some("cli:pi".to_string());
+        let home = temp.path().join("home");
+        let session_dir = home.join(".pi/agent/sessions/--tmp-work--");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        std::fs::write(
+            session_dir.join("pi-session.jsonl"),
+            format!(
+                r#"{{"type":"session","id":"s1","timestamp":"2026-05-13T02:34:16Z","cwd":"{}"}}
+{{"type":"message","timestamp":"2026-05-13T02:34:17Z","message":{{"role":"assistant","content":"Pi edited the file"}}}}
+"#,
+                state.working_dir.display()
+            ),
+        )
+        .expect("pi session");
+        let registry = ProviderRegistry::builtin().expect("registry");
+        let spec =
+            provider_jsonl_log_spec_from_registry(&state, &registry, &home).expect("pi spec");
+
+        let activity = collect_jsonl_provider_activity(&state, &spec);
+        let lines = activity.lines.join("\n");
+
+        assert!(lines.contains("agent Pi edited the file"), "{lines}");
+        assert!(lines.contains("provider log"), "{lines}");
+    }
+
+    #[test]
+    fn provider_jsonl_pi_ingest_rejects_jsonl_without_session_header() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let (_state_temp, mut state) = doc_preview_state();
+        state.provider = Some("cli:pi".to_string());
+        let home = temp.path().join("home");
+        let session_dir = home.join(".pi/agent/sessions/--tmp-work--");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        std::fs::write(
+            session_dir.join("not-pi.jsonl"),
+            format!(
+                r#"{{"type":"note","cwd":"{}"}}
+{{"type":"message","timestamp":"2026-05-13T02:34:17Z","message":{{"role":"assistant","content":"Should not show"}}}}
+"#,
+                state.working_dir.display()
+            ),
+        )
+        .expect("not pi");
+        let registry = ProviderRegistry::builtin().expect("registry");
+        let spec =
+            provider_jsonl_log_spec_from_registry(&state, &registry, &home).expect("pi spec");
+
+        let activity = collect_jsonl_provider_activity(&state, &spec);
+
+        assert!(activity.lines.is_empty(), "{:?}", activity.lines);
+    }
+
+    #[test]
+    fn provider_jsonl_pi_ingest_top_level_cwd_matches_session_header() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let working_dir = temp.path().join("work");
+        let path = temp.path().join("pi.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type":"session","id":"s1","cwd":"{}"}}"#,
+                working_dir.display()
+            ),
+        )
+        .expect("pi jsonl");
+        let spec = test_log_spec(IngestCwdMatch::TopLevel);
+
+        assert!(provider_jsonl_session_matches_run(
+            &spec,
+            &path,
+            &[working_dir.to_string_lossy().to_string()]
+        ));
     }
 
     #[test]

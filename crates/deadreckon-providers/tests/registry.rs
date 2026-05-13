@@ -21,9 +21,19 @@ fn registry_builtin_lists_cli_ingest_providers() {
         "cli:codex",
         "cli:gemini",
         "cli:opencode",
+        "cli:copilot",
+        "cli:pi",
     ] {
         assert!(registry.get(id).is_some(), "{id} missing from registry");
     }
+}
+
+#[test]
+fn registry_builtin_lists_copilot_and_pi() {
+    let registry = ProviderRegistry::builtin().expect("builtin registry");
+
+    assert!(registry.get("cli:copilot").is_some());
+    assert!(registry.get("cli:pi").is_some());
 }
 
 #[test]
@@ -61,6 +71,73 @@ fn descriptor_ingest_round_trips_for_codex_and_claude() {
     let encoded = toml::to_string(codex).expect("serialize codex descriptor");
     let decoded: ProviderDescriptor = toml::from_str(&encoded).expect("decode codex descriptor");
     assert_eq!(decoded.ingest, codex.ingest);
+}
+
+#[test]
+fn descriptor_ingest_round_trips_for_copilot_and_pi() {
+    let registry = ProviderRegistry::builtin().expect("builtin registry");
+    let copilot = registry.get("cli:copilot").expect("copilot descriptor");
+    let copilot_ingest = copilot.ingest.as_ref().expect("copilot ingest");
+    assert_eq!(copilot.default_binary.as_deref(), Some("copilot"));
+    assert_eq!(copilot_ingest.id_prefix.as_deref(), Some("copilot:"));
+    assert_eq!(copilot_ingest.env_var.as_deref(), Some("COPILOT_DIR"));
+    assert_eq!(copilot_ingest.schema, "copilot-cli");
+    assert_eq!(copilot_ingest.cwd_match, IngestCwdMatch::JsonPointer);
+    assert_eq!(
+        copilot_ingest.cwd_match_path.as_deref(),
+        Some("data.context.cwd")
+    );
+    assert_eq!(copilot_ingest.storage, Some(IngestStorage::Jsonl));
+
+    let pi = registry.get("cli:pi").expect("pi descriptor");
+    let pi_ingest = pi.ingest.as_ref().expect("pi ingest");
+    assert_eq!(pi.default_binary.as_deref(), Some("pi"));
+    assert_eq!(pi_ingest.id_prefix.as_deref(), Some("pi:"));
+    assert_eq!(
+        pi_ingest.env_var.as_deref(),
+        Some("PI_CODING_AGENT_SESSION_DIR")
+    );
+    assert_eq!(pi_ingest.schema, "pi");
+    assert_eq!(pi_ingest.cwd_match, IngestCwdMatch::TopLevel);
+    assert_eq!(pi_ingest.storage, Some(IngestStorage::Jsonl));
+
+    let encoded = toml::to_string(copilot).expect("serialize copilot descriptor");
+    let decoded: ProviderDescriptor = toml::from_str(&encoded).expect("decode copilot descriptor");
+    assert_eq!(decoded.ingest, copilot.ingest);
+}
+
+#[test]
+fn descriptor_models_and_install_hints_cover_copilot_and_pi() {
+    let registry = ProviderRegistry::builtin().expect("builtin registry");
+    let copilot = registry.get("cli:copilot").expect("copilot descriptor");
+    assert_eq!(copilot.exec_template.model_arg.as_deref(), Some("--model"));
+    assert!(
+        copilot
+            .install_hint
+            .try_lines
+            .iter()
+            .any(|line| line.contains("@github/copilot"))
+    );
+    assert!(
+        copilot
+            .model_catalog
+            .iter()
+            .any(|entry| entry.aliases.iter().any(|alias| alias == "copilot-default"))
+    );
+
+    let pi = registry.get("cli:pi").expect("pi descriptor");
+    assert_eq!(pi.exec_template.model_arg.as_deref(), Some("--model"));
+    assert!(
+        pi.install_hint
+            .try_lines
+            .iter()
+            .any(|line| line.contains("@earendil-works/pi-coding-agent"))
+    );
+    assert!(
+        pi.model_catalog
+            .iter()
+            .any(|entry| entry.aliases.iter().any(|alias| alias == "pi-default"))
+    );
 }
 
 #[test]

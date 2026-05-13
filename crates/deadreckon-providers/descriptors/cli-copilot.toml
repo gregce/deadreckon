@@ -1,0 +1,46 @@
+id = "cli:copilot"
+display_name = "GitHub Copilot CLI"
+kind = "cli"
+default_binary = "copilot"
+allow_network_default = true
+default_model = "provider default"
+sandbox_writes = ["~/.copilot"]
+sandbox_reads = ["~/.copilot"]
+fs_detection_paths = ["~/.copilot"]
+docs_url = "https://docs.github.com/copilot"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[version_probe]
+args = ["--help"]
+expect_substring = "GitHub Copilot CLI"
+
+[exec_template]
+args_template = ["-p", "{prompt}", "--output-format", "json", "--stream", "off", "--no-color", "--allow-all"]
+model_arg = "--model"
+timeout_seconds = 1800
+
+[install_hint]
+url = "https://docs.github.com/copilot"
+try_lines = ["npm install -g @github/copilot"]
+
+[ingest]
+id_prefix = "copilot:"
+env_var = "COPILOT_DIR"
+default_dirs = ["~/.copilot"]
+watch_subdirs = ["session-state"]
+schema = "copilot-cli"
+cwd_match = "json-pointer"
+cwd_match_path = "data.context.cwd"
+file_glob = "*.jsonl"
+freshness_minutes = 2
+storage = "jsonl"
+
+[[model_catalog]]
+id = "provider default"
+context_window = 258400
+aliases = ["copilot-default"]
+input_per_million = 0.0
+output_per_million = 0.0

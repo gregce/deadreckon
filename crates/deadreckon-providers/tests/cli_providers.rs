@@ -460,6 +460,270 @@ model_arg = "--model"
 }
 
 #[tokio::test]
+async fn generic_cli_provider_places_model_before_prompt_value_flag() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join("providers.d")).expect("providers dir");
+    let binary = temp.path().join("fake-prompt-flag-cli");
+    write_fake_binary(&binary, "prompt-flag-output");
+    fs::write(
+        home.join("providers.d/prompt-flag.toml"),
+        format!(
+            r#"
+id = "cli:prompt-flag"
+display_name = "Prompt Flag CLI"
+kind = "cli"
+default_binary = "{}"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["-p", "{{prompt}}"]
+model_arg = "--model"
+"#,
+            binary.display()
+        ),
+    )
+    .expect("write provider descriptor");
+    let config_path = home.join("config.toml");
+    fs::write(&config_path, "default_provider = \"cli:prompt-flag\"\n").expect("write config");
+
+    let router =
+        ProviderRouter::from_config_path_with_model(&config_path, None, Some("flag-model"))
+            .expect("router");
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "ship it".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(
+        response
+            .content
+            .contains("args:--model flag-model -p ship it")
+    );
+}
+
+#[tokio::test]
+async fn generic_cli_provider_runs_builtin_copilot_descriptor() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-copilot");
+    write_fake_binary(&binary, "copilot-output");
+    let router = ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:copilot".to_string()]),
+            providers: [(
+                "cli:copilot".to_string(),
+                ProviderEntry {
+                    kind: None,
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: None,
+                    input_cost_per_million: None,
+                    output_cost_per_million: None,
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router");
+
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "make notes".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(response.content.contains("copilot-output"));
+    assert!(
+        response.content.contains(
+            "args:-p make notes --output-format json --stream off --no-color --allow-all"
+        )
+    );
+    assert_eq!(response.trace["kind"], "cli_subagent");
+    assert_eq!(response.trace["descriptor"], "cli:copilot");
+    assert!(response.spend.subscription);
+}
+
+#[tokio::test]
+async fn generic_cli_provider_passes_copilot_model_arg() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-copilot");
+    write_fake_binary(&binary, "copilot-model-output");
+    let router = ProviderRouter::from_config_with_model(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:copilot".to_string()]),
+            providers: [(
+                "cli:copilot".to_string(),
+                ProviderEntry {
+                    kind: None,
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: None,
+                    input_cost_per_million: None,
+                    output_cost_per_million: None,
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        Some("cli:copilot"),
+        Some("gpt-5.1"),
+    )
+    .expect("router");
+
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "ship it".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(response.content.contains(
+        "args:--model gpt-5.1 -p ship it --output-format json --stream off --no-color --allow-all"
+    ));
+    assert_eq!(response.model, "gpt-5.1");
+}
+
+#[tokio::test]
+async fn generic_cli_provider_runs_builtin_pi_descriptor() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-pi");
+    write_fake_binary(&binary, "pi-output");
+    let router = ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:pi".to_string()]),
+            providers: [(
+                "cli:pi".to_string(),
+                ProviderEntry {
+                    kind: None,
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: None,
+                    input_cost_per_million: None,
+                    output_cost_per_million: None,
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router");
+
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "make notes".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(response.content.contains("pi-output"));
+    assert!(
+        response
+            .content
+            .contains("args:--mode json --print make notes")
+    );
+    assert_eq!(response.trace["kind"], "cli_subagent");
+    assert_eq!(response.trace["descriptor"], "cli:pi");
+    assert!(response.spend.subscription);
+}
+
+#[tokio::test]
+async fn generic_cli_provider_passes_pi_model_arg() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-pi");
+    write_fake_binary(&binary, "pi-model-output");
+    let router = ProviderRouter::from_config_with_model(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:pi".to_string()]),
+            providers: [(
+                "cli:pi".to_string(),
+                ProviderEntry {
+                    kind: None,
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: None,
+                    input_cost_per_million: None,
+                    output_cost_per_million: None,
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        Some("cli:pi"),
+        Some("google/gemini-2.5-pro"),
+    )
+    .expect("router");
+
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "ship it".to_string(),
+            max_output_tokens: 128,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+        .expect("completion");
+
+    assert!(
+        response
+            .content
+            .contains("args:--mode json --print --model google/gemini-2.5-pro ship it")
+    );
+    assert_eq!(response.model, "google/gemini-2.5-pro");
+}
+
+#[tokio::test]
 async fn generic_cli_provider_uses_descriptor_sandbox_writes() {
     let temp = TempDir::new().expect("tempdir");
     let home = temp.path().join("home");

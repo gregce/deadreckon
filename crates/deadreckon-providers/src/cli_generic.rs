@@ -98,13 +98,24 @@ impl GenericCliProvider {
     }
 
     fn render_args(&self, request: &ProviderRequest) -> Vec<String> {
-        let mut args = Vec::new();
+        let mut args: Vec<String> = Vec::new();
         let mut inserted_model = false;
         let mut inserted_extra = false;
         for part in &self.descriptor.exec_template.args_template {
             if part == "{prompt}" {
-                self.push_model_arg(&mut args, &mut inserted_model);
-                self.push_extra_args(&mut args, &mut inserted_extra);
+                if args
+                    .last()
+                    .is_some_and(|arg| prompt_value_flag_requires_next_arg(arg))
+                {
+                    if let Some(prompt_flag) = args.pop() {
+                        self.push_model_arg(&mut args, &mut inserted_model);
+                        self.push_extra_args(&mut args, &mut inserted_extra);
+                        args.push(prompt_flag);
+                    }
+                } else {
+                    self.push_model_arg(&mut args, &mut inserted_model);
+                    self.push_extra_args(&mut args, &mut inserted_extra);
+                }
                 args.push(request.prompt.clone());
                 continue;
             }
@@ -151,6 +162,10 @@ impl GenericCliProvider {
         paths.dedup();
         paths
     }
+}
+
+fn prompt_value_flag_requires_next_arg(arg: &str) -> bool {
+    matches!(arg, "-p" | "--prompt" | "--interactive")
 }
 
 fn render_template_part(part: &str, request: &ProviderRequest) -> String {

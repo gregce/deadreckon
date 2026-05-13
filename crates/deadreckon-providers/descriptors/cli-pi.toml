@@ -1,0 +1,44 @@
+id = "cli:pi"
+display_name = "Pi CLI"
+kind = "cli"
+default_binary = "pi"
+allow_network_default = true
+default_model = "provider default"
+sandbox_writes = ["~/.pi/agent"]
+sandbox_reads = ["~/.pi/agent"]
+fs_detection_paths = ["~/.pi/agent/sessions"]
+docs_url = "https://pi.dev/"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[version_probe]
+args = ["--help"]
+expect_substring = "AI coding assistant"
+
+[exec_template]
+args_template = ["--mode", "json", "--print", "{prompt}"]
+model_arg = "--model"
+timeout_seconds = 1800
+
+[install_hint]
+url = "https://pi.dev/"
+try_lines = ["npm install -g @earendil-works/pi-coding-agent"]
+
+[ingest]
+id_prefix = "pi:"
+env_var = "PI_CODING_AGENT_SESSION_DIR"
+default_dirs = ["~/.pi/agent/sessions"]
+schema = "pi"
+cwd_match = "top-level"
+file_glob = "*.jsonl"
+freshness_minutes = 2
+storage = "jsonl"
+
+[[model_catalog]]
+id = "provider default"
+context_window = 1000000
+aliases = ["pi-default"]
+input_per_million = 0.0
+output_per_million = 0.0

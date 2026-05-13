@@ -64,8 +64,35 @@ kind = "cli-codex"
     assert!(stdout.contains("cli:codex"));
     assert!(stdout.contains("cli:gemini"));
     assert!(stdout.contains("cli:opencode"));
+    assert!(stdout.contains("cli:copilot"));
+    assert!(stdout.contains("cli:pi"));
     assert!(stdout.contains("openai-compatible"));
     assert!(stdout.contains("smoke"));
+}
+
+#[test]
+fn providers_list_all_includes_copilot_and_pi() {
+    let temp = repo_tempdir();
+    write_config(
+        temp.path(),
+        r#"
+default_provider = "cli:codex"
+
+[providers."cli:codex"]
+kind = "cli-codex"
+"#,
+    );
+
+    let output = deadreckon(temp.path())
+        .args(["providers", "list", "--all"])
+        .env("PATH", temp.path().join("empty-bin"))
+        .output()
+        .expect("providers list all");
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cli:copilot"), "{stdout}");
+    assert!(stdout.contains("cli:pi"), "{stdout}");
 }
 
 #[test]

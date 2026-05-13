@@ -1432,6 +1432,8 @@ mod tests {
         assert_eq!(provider_output_name("cli:claude-code"), "claude.out");
         assert_eq!(provider_output_name("cli:gemini"), "gemini.out");
         assert_eq!(provider_output_name("cli:opencode"), "opencode.out");
+        assert_eq!(provider_output_name("cli:copilot"), "copilot.out");
+        assert_eq!(provider_output_name("cli:pi"), "pi.out");
         assert_eq!(provider_output_name("cli:local/test"), "local-test.out");
         assert_eq!(provider_output_name("anthropic"), "provider.out");
     }
