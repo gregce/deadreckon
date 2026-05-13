@@ -315,6 +315,51 @@ fn orchestrate_review_mode_runs_fork_and_merge() {
     assert!(plan.merged_run_id.is_some());
 }
 
+#[test]
+fn attach_and_show_accept_plan_ids() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["attach", &plan.plan_id[..8], "--no-hints"])
+        .output()
+        .expect("attach");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("plan"), "{out}");
+    assert!(out.contains("task-0"), "{out}");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["show", &plan.plan_id[..8]])
+        .output()
+        .expect("show");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains(&plan.plan_id), "{out}");
+    assert!(out.contains("\"root_goal\""), "{out}");
+}
+
 fn plan_and_fork_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> Plan {
     let output = deadreckon(paths)
         .current_dir(repo)

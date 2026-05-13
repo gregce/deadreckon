@@ -42,10 +42,11 @@ use deadreckon_core::{
     docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files, list_runs,
     load_chain, load_plan, load_run, marker_path_for_run_root, pid_is_alive,
     prepare_worktree_record, preview_git_state, promote_completed_run, read_chain_step_marker,
-    read_codebase_record, record_for_resolved_mode, release_lock_file, resolve_mode,
-    restore_snapshot, save_chain, save_plan, save_state, terminate_pid, validate_acceptance_marker,
-    validate_task_count, write_acceptance_marker, write_cancel_marker, write_chain_step_marker,
-    write_child_summary, write_coordinator_state, write_plan_child_marker, write_worker_spec,
+    read_codebase_record, read_plan_messages, record_for_resolved_mode, release_lock_file,
+    resolve_mode, restore_snapshot, save_chain, save_plan, save_state, terminate_pid,
+    validate_acceptance_marker, validate_task_count, write_acceptance_marker, write_cancel_marker,
+    write_chain_step_marker, write_child_summary, write_coordinator_state, write_plan_child_marker,
+    write_worker_spec,
 };
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
@@ -7998,6 +7999,100 @@ fn print_merge_finished(
     }
 }
 
+fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) -> Result<()> {
+    println!(
+        "{} {} ({})",
+        ui_heading("plan"),
+        ui_id(run_prefix(&plan.plan_id)),
+        plan.plan_id
+    );
+    println!("status {:?}", plan.status);
+    println!("mode {:?}", plan.mode);
+    println!("goal {}", one_line(&plan.root_goal, 120));
+    match plan.mode {
+        PlanMode::Split => {
+            println!(
+                "providers planner={} default-child={}",
+                plan.providers.planner.as_deref().unwrap_or("-"),
+                plan.providers.default_child.as_deref().unwrap_or("-")
+            );
+        }
+        PlanMode::Review => {
+            println!(
+                "providers coder={} reviewer={}",
+                plan.providers.coder.as_deref().unwrap_or("-"),
+                plan.providers.reviewer.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    println!("tasks");
+    for task in &plan.tasks {
+        println!(
+            "  {} {:<9} {:<9} provider={} run={} {}",
+            task.task_id,
+            format!("{:?}", task.role).to_ascii_lowercase(),
+            task_status_label(task.status),
+            task.provider.as_deref().unwrap_or("-"),
+            task.child_run_id
+                .as_deref()
+                .map(run_prefix)
+                .unwrap_or_else(|| "-".to_string()),
+            one_line(&task.subject, 60)
+        );
+        if let Some(summary) = task.summary_path.as_ref() {
+            println!(
+                "    summary {}",
+                paths.plan_dir(&plan.plan_id).join(summary).display()
+            );
+        }
+    }
+    let messages = read_plan_messages(paths, &plan.plan_id).unwrap_or_default();
+    if let Some(message) = messages.last() {
+        println!(
+            "latest {} -> {} {:?}: {}",
+            message.from, message.to, message.kind, message.summary
+        );
+    }
+    if let Some(merged_run_id) = plan.merged_run_id.as_deref() {
+        println!("merged run {}", run_prefix(merged_run_id));
+    }
+    if show_hints {
+        match plan.status {
+            PlanStatus::Pending => {
+                println!(
+                    "{} {}",
+                    ui_command("fork:"),
+                    ui_command(format!("deadreckon fork {}", run_prefix(&plan.plan_id)))
+                );
+            }
+            PlanStatus::Forked => {
+                println!(
+                    "{} {}",
+                    ui_command("merge:"),
+                    ui_command(format!("deadreckon merge {}", run_prefix(&plan.plan_id)))
+                );
+            }
+            PlanStatus::Merged => {
+                if let Some(run_id) = plan.merged_run_id.as_deref() {
+                    println!(
+                        "{} {}",
+                        ui_command("materialize:"),
+                        ui_command(format!("deadreckon materialize {}", run_prefix(run_id)))
+                    );
+                }
+            }
+            PlanStatus::Failed => {
+                println!(
+                    "{} {}",
+                    ui_command("why:"),
+                    ui_command(format!("deadreckon show {}", run_prefix(&plan.plan_id)))
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn format_wall_cap(max_wall_seconds: Option<f64>) -> String {
     let Some(seconds) = max_wall_seconds else {
         return "uncapped".to_string();
@@ -10555,7 +10650,17 @@ fn print_doc_polish_summary(record: &deadreckon_runtime::PolishRecord) {
 
 async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = load_cli_run(&paths, &run_id)?;
+    let state = match load_cli_run(&paths, &run_id) {
+        Ok(state) => state,
+        Err(run_error) => {
+            if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
+                let plan = load_plan(&paths, &plan_id)?;
+                print_plan_summary(&paths, &plan, completion_hints_enabled(no_hints))?;
+                return Ok(());
+            }
+            return Err(run_error);
+        }
+    };
     let run_id = state.run_id.clone();
     let show_hints = completion_hints_enabled(no_hints);
     if io::stdout().is_terminal() {
@@ -10577,13 +10682,60 @@ async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
 #[allow(clippy::needless_pass_by_value)]
 fn kill_command(run_id: String, force: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let mut state = load_cli_run(&paths, &run_id)?;
+    let mut state = match load_cli_run(&paths, &run_id) {
+        Ok(state) => state,
+        Err(run_error) => {
+            if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
+                return kill_plan_command(&paths, &plan_id, force);
+            }
+            return Err(run_error);
+        }
+    };
     kill_loaded_run(&paths, &mut state, force)?;
     if force {
         println!("killed run {} forcefully", state.run_id);
     } else {
         println!("killed run {}", state.run_id);
     }
+    Ok(())
+}
+
+fn kill_plan_command(paths: &DeadreckonPaths, plan_id: &str, force: bool) -> Result<()> {
+    let plan = load_plan(paths, plan_id)?;
+    let mut killed = 0_u32;
+    if let Ok(raw) = fs::read_to_string(paths.coordinator_json(plan_id))
+        && let Ok(coordinator) = serde_json::from_str::<CoordinatorState>(&raw)
+    {
+        for child in coordinator.children {
+            if let Some(pid) = child.pid
+                && pid_is_alive(pid)
+            {
+                terminate_pid(pid, force)?;
+                killed += 1;
+            }
+        }
+        if pid_is_alive(coordinator.coordinator_pid) {
+            terminate_pid(coordinator.coordinator_pid, force)?;
+            killed += 1;
+        }
+    }
+    for task in &plan.tasks {
+        if let Some(run_id) = task.child_run_id.as_deref()
+            && let Ok(mut state) = load_run(paths, run_id)
+            && matches!(
+                state.status,
+                RunStatus::Pending | RunStatus::Planned | RunStatus::Executing
+            )
+        {
+            kill_loaded_run(paths, &mut state, force)?;
+            killed += 1;
+        }
+    }
+    println!(
+        "killed plan {} ({} processes signalled)",
+        run_prefix(plan_id),
+        killed
+    );
     Ok(())
 }
 
@@ -10813,7 +10965,18 @@ fn undo_restore_state(
 #[allow(clippy::needless_pass_by_value)]
 fn show_command(run_id: String, turn: Option<u32>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = load_cli_run(&paths, &run_id)?;
+    let state = match load_cli_run(&paths, &run_id) {
+        Ok(state) => state,
+        Err(run_error) => {
+            if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
+                let plan = load_plan(&paths, &plan_id)?;
+                print_plan_summary(&paths, &plan, true)?;
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+                return Ok(());
+            }
+            return Err(run_error);
+        }
+    };
     if let Some(line) = chain_context_line_for_working(&state.working_dir)? {
         println!("{line}");
     }
