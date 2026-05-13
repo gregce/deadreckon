@@ -1,0 +1,37 @@
+id = "openai"
+display_name = "OpenAI API"
+kind = "http"
+default_endpoint = "https://api.openai.com/v1"
+allow_network_default = true
+default_model = "gpt-5.1-codex"
+docs_url = "https://platform.openai.com/docs"
+subscription = false
+
+[auth]
+kind = "api-key"
+env_var = "OPENAI_API_KEY"
+header = "authorization"
+scheme = "bearer"
+
+[exec_template]
+request_shape = "open-ai-chat"
+path_template = "/chat/completions"
+timeout_seconds = 120
+
+[install_hint]
+url = "https://platform.openai.com/api-keys"
+try_lines = ["export OPENAI_API_KEY=sk-..."]
+
+[[model_catalog]]
+id = "gpt-5.1-codex"
+context_window = 400000
+input_per_million = 1.25
+output_per_million = 10.0
+aliases = ["codex", "gpt-codex"]
+
+[[model_catalog]]
+id = "gpt-4o-mini"
+context_window = 128000
+input_per_million = 0.15
+output_per_million = 0.60
+aliases = ["4o-mini"]

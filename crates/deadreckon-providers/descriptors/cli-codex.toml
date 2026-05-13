@@ -1,0 +1,41 @@
+id = "cli:codex"
+display_name = "Codex CLI"
+kind = "cli"
+default_binary = "codex"
+allow_network_default = true
+default_model = "provider default"
+sandbox_writes = ["~/.codex"]
+sandbox_reads = ["~/.codex"]
+fs_detection_paths = ["~/.codex/sessions"]
+docs_url = "https://developers.openai.com/codex/quickstart"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[version_probe]
+args = ["--version"]
+
+[exec_template]
+args_template = [
+  "--ask-for-approval",
+  "never",
+  "exec",
+  "--skip-git-repo-check",
+  "--sandbox",
+  "{sandbox}",
+  "{prompt}",
+]
+model_arg = "--model"
+timeout_seconds = 1800
+
+[install_hint]
+url = "https://developers.openai.com/codex/quickstart"
+try_lines = ["npm i -g @openai/codex"]
+
+[[model_catalog]]
+id = "provider default"
+context_window = 258400
+aliases = ["codex-default"]
+input_per_million = 0.0
+output_per_million = 0.0

@@ -1,0 +1,30 @@
+id = "anthropic"
+display_name = "Anthropic API"
+kind = "http"
+default_endpoint = "https://api.anthropic.com"
+allow_network_default = true
+default_model = "claude-sonnet-4-5"
+docs_url = "https://docs.anthropic.com/"
+subscription = false
+
+[auth]
+kind = "api-key"
+env_var = "ANTHROPIC_API_KEY"
+header = "x-api-key"
+scheme = "x-api-key"
+
+[exec_template]
+request_shape = "anthropic-messages"
+path_template = "/v1/messages"
+timeout_seconds = 120
+
+[install_hint]
+url = "https://console.anthropic.com/settings/keys"
+try_lines = ["export ANTHROPIC_API_KEY=sk-ant-..."]
+
+[[model_catalog]]
+id = "claude-sonnet-4-5"
+context_window = 200000
+input_per_million = 3.0
+output_per_million = 15.0
+aliases = ["sonnet", "sonnet-4.5"]

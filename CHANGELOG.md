@@ -1,5 +1,9 @@
 # Changelog
 
+## Provider registry (alpha) — 2026-05-13
+
+- P1: Added descriptor TOML, `ProviderDescriptor`, `ProviderRegistry`, override loading from `providers.d`, and shell-like custom command parsing; existing built-in providers now have compiled-in descriptors.
+
 ## Workspace hygiene (alpha) — 2026-05-12
 
 - P1: Captured smoke and public-surface baselines, added invariant tests, and made `make smoke` run fresh/non-interactive for deterministic verification.

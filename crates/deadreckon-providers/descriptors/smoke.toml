@@ -1,0 +1,22 @@
+id = "smoke"
+display_name = "Scripted smoke provider"
+kind = "scripted"
+allow_network_default = false
+default_model = "local-scripted-smoke"
+subscription = false
+
+[auth]
+kind = "none"
+
+[exec_template]
+timeout_seconds = 30
+
+[install_hint]
+url = "https://github.com/gregce/deadreckon"
+try_lines = ["deadreckon run --smoke \"tiny hello rust\""]
+
+[[model_catalog]]
+id = "local-scripted-smoke"
+aliases = ["smoke"]
+input_per_million = 0.0
+output_per_million = 0.0
