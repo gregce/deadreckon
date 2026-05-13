@@ -352,11 +352,20 @@ pub async fn run_turn_loop(
                 },
             )?;
             state.turn = turn;
+            save_history(state, &history)?;
+            save_state(state)?;
             complete_run_docs(state, router, &config).await?;
-            run_acceptance_gate(state)?;
-            validate_acceptance_marker(state)?;
+            if !acceptance_gate_passed_or_record_failure(
+                state,
+                config.event_sender.as_ref(),
+                turn,
+                &mut history,
+            )? {
+                continue;
+            }
             promote_if_ready(state)?;
             state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
+            state.failure_reason = None;
             save_state(state)?;
             emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Done)?;
             return Ok(RunLoopOutcome::Done);
@@ -584,6 +593,9 @@ pub async fn run_turn_loop(
             }
             Action::Done { summary } => {
                 state.turn = turn;
+                history.push(format!("done: {}", summary.clone().unwrap_or_default()));
+                save_history(state, &history)?;
+                save_state(state)?;
                 append_turn_doc_checkpoint(
                     state,
                     config.event_sender.as_ref(),
@@ -599,13 +611,18 @@ pub async fn run_turn_loop(
                     },
                 )?;
                 complete_run_docs(state, router, &config).await?;
-                run_acceptance_gate(state)?;
-                validate_acceptance_marker(state)?;
+                if !acceptance_gate_passed_or_record_failure(
+                    state,
+                    config.event_sender.as_ref(),
+                    turn,
+                    &mut history,
+                )? {
+                    continue;
+                }
                 promote_if_ready(state)?;
                 state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
+                state.failure_reason = None;
                 save_state(state)?;
-                history.push(format!("done: {}", summary.unwrap_or_default()));
-                save_history(state, &history)?;
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Done)?;
                 return Ok(RunLoopOutcome::Done);
             }
@@ -615,7 +632,10 @@ pub async fn run_turn_loop(
         save_state(state)?;
     }
 
-    state.failure_reason = Some("max turn budget exhausted".to_string());
+    state.failure_reason = Some(match state.failure_reason.take() {
+        Some(reason) => format!("{reason}; max turn budget exhausted"),
+        None => "max turn budget exhausted".to_string(),
+    });
     state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
     save_state(state)?;
     emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
@@ -1272,6 +1292,46 @@ fn run_acceptance_gate(state: &PipelineState) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn acceptance_gate_passed_or_record_failure(
+    state: &mut PipelineState,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+    turn: u32,
+    history: &mut Vec<String>,
+) -> Result<bool> {
+    match run_acceptance_gate(state).and_then(|()| validate_acceptance_marker(state)) {
+        Ok(_) => Ok(true),
+        Err(err) => {
+            let reason = err.to_string();
+            append_trace(
+                state,
+                &TraceRecord {
+                    timestamp: Utc::now(),
+                    run_id: state.run_id.clone(),
+                    turn,
+                    event: "acceptance.failed".to_string(),
+                    latency_ms: None,
+                    detail: json!({ "reason": reason }),
+                },
+            )?;
+            emit_event(
+                state,
+                sender,
+                RunEventKind::Error {
+                    turn: Some(turn),
+                    message: event_preview(format!("acceptance failed: {reason}")),
+                },
+            )?;
+            history.push(format!(
+                "acceptance failed after turn {turn}: {reason}. Continue by fixing the failing done criteria; do not declare done until dr-gate passes."
+            ));
+            state.failure_reason = Some(format!("acceptance failed after turn {turn}: {reason}"));
+            save_history(state, history)?;
+            save_state(state)?;
+            Ok(false)
+        }
+    }
 }
 
 fn commit_worktree_turn(state: &PipelineState, turn: u32, label: &str) -> Result<()> {

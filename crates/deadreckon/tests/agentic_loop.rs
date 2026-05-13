@@ -242,6 +242,150 @@ async fn cli_subagent_without_file_changes_fails_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acceptance_failure_restarts_cli_subagent_until_gate_passes() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("workspace");
+    let fake_codex = temp.path().join("fake-codex-acceptance-retry");
+    fs::write(
+        &fake_codex,
+        r#"#!/bin/sh
+if [ ! -f .provider-count ]; then
+  printf 1 > .provider-count
+  printf 'first attempt\n' > first.txt
+  printf 'first turn changed files\n'
+else
+  printf pass > required.txt
+  printf 'second turn fixed acceptance\n'
+fi
+"#,
+    )
+    .expect("fake codex");
+    chmod_exec(&fake_codex);
+    write_cli_config(temp.path(), &fake_codex);
+    let acceptance = temp.path().join("acceptance.yaml");
+    fs::write(
+        &acceptance,
+        "checks:\n  - kind: file_exists\n    path: \"{working_dir}/required.txt\"\n",
+    )
+    .expect("acceptance");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
+        .arg("cli acceptance retry")
+        .arg("--provider")
+        .arg("cli:codex")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--acceptance")
+        .arg(&acceptance)
+        .arg("--no-docs")
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("completed run"));
+    let paths = DeadreckonPaths::from_home(&home);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.status, RunStatus::Completed);
+    assert_eq!(state.turn, 2);
+    assert!(state.working_dir.join("required.txt").exists());
+    let traces = fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
+    assert!(traces.contains("acceptance.failed"));
+    assert!(state.run_root.join("proofs/turn-acceptance.json").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acceptance_failure_exhaustion_persists_failed_state() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("workspace");
+    let fake_codex = temp.path().join("fake-codex-acceptance-exhaust");
+    fs::write(
+        &fake_codex,
+        r#"#!/bin/sh
+count=$(cat .provider-count 2>/dev/null || printf 0)
+count=$((count + 1))
+printf '%s' "$count" > .provider-count
+printf 'attempt %s\n' "$count" > "attempt-$count.txt"
+printf 'changed attempt %s\n' "$count"
+"#,
+    )
+    .expect("fake codex");
+    chmod_exec(&fake_codex);
+    write_cli_config(temp.path(), &fake_codex);
+    let acceptance = temp.path().join("acceptance.yaml");
+    fs::write(
+        &acceptance,
+        "checks:\n  - kind: file_exists\n    path: \"{working_dir}/never-created.txt\"\n",
+    )
+    .expect("acceptance");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
+        .arg("cli acceptance exhaust")
+        .arg("--provider")
+        .arg("cli:codex")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--acceptance")
+        .arg(&acceptance)
+        .arg("--no-docs")
+        .env("DEADRECKON_HOME", &home)
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("failed run"));
+    let paths = DeadreckonPaths::from_home(&home);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert_eq!(state.turn, 12);
+    assert!(state.child_pids.is_empty());
+    assert!(
+        state
+            .failure_reason
+            .as_deref()
+            .expect("failure reason")
+            .contains("acceptance failed after turn 12")
+    );
+    assert!(!state.run_root.join("proofs/turn-acceptance.json").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn init_config_and_default_spend_work() {
     let _gate = env!("CARGO_BIN_EXE_dr-gate");
     let temp = repo_tempdir();
