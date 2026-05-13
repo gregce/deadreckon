@@ -963,7 +963,30 @@ async fn stress_5_concurrent_10min() {
     fs::write(
         &fake_codex,
         format!(
-            "#!/bin/sh\nprintf 'scope:%s\\n' \"$PWD\" > notes.md\nsleep {seconds}\nprintf 'done\\n'\n"
+            r#"#!/bin/sh
+prompt="$*"
+case "$prompt" in
+  *narrator-overview*)
+    printf '%s\n' '{{"why_now":"The stress harness is verifying concurrent run completion.","high_level_approach":"Five concurrent runs wrote notes.md after the configured provider delay.","open_threads":[],"cross_references":["stress harness"]}}'
+    exit 0
+    ;;
+  *narrator-phases*)
+    printf '%s\n' '{{"phases_markdown":"Stress runs\n\n- notes.md was written by the fake provider in each concurrent run.\n"}}'
+    exit 0
+    ;;
+  *narrator-as-built*)
+    printf '%s\n' '{{"system_overview":"The stress harness exercises concurrent CLI provider runs.","source_layout":"notes.md records the isolated run scope.\n","components":[],"load_bearing_paths":"notes.md","seams":"CLI provider invocation and run-state locking."}}'
+    exit 0
+    ;;
+  *narrator-decisions*)
+    printf '%s\n' '{{"decisions":[]}}'
+    exit 0
+    ;;
+esac
+printf 'scope:%s\n' "$PWD" > notes.md
+sleep {seconds}
+printf 'done\n'
+"#
         ),
     )
     .expect("fake codex");
