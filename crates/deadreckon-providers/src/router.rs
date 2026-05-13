@@ -48,7 +48,7 @@ impl ProviderRouter {
         override_provider: Option<&str>,
         override_model: Option<&str>,
     ) -> Result<Self> {
-        let mut providers = builtin_entries();
+        let mut providers = builtin_entries()?;
         for (name, entry) in config.providers {
             if let Some(base) = providers.get_mut(&name) {
                 merge_provider_entry(base, entry);
@@ -73,12 +73,9 @@ impl ProviderRouter {
             if let Some(model) = override_model {
                 entry.model = Some(model.to_string());
             }
-            let kind = entry
-                .kind
-                .or_else(|| kind_from_name(&name))
-                .ok_or_else(|| ProviderError::InvalidConfig(format!("missing kind for {name}")))?;
-            entry.kind = Some(kind);
-            routes.push(build_provider(name, kind, entry));
+            let kind = entry.kind.unwrap_or_else(|| kind_from_name(&name));
+            entry.kind = Some(kind.clone());
+            routes.push(build_provider(name, kind, entry)?);
         }
 
         Ok(Self { routes })
@@ -164,13 +161,20 @@ fn configured_route_names(
     route_names
 }
 
-fn build_provider(name: String, kind: ProviderKind, entry: ProviderEntry) -> Box<dyn Provider> {
+fn build_provider(
+    name: String,
+    kind: ProviderKind,
+    entry: ProviderEntry,
+) -> Result<Box<dyn Provider>> {
     match kind {
-        ProviderKind::CliClaudeCode => Box::new(CliClaudeCodeProvider::new(name, entry)),
-        ProviderKind::CliCodex => Box::new(CliCodexProvider::new(name, entry)),
-        ProviderKind::ScriptedSmoke => Box::new(ScriptedSmokeProvider::new()),
+        ProviderKind::CliClaudeCode => Ok(Box::new(CliClaudeCodeProvider::new(name, entry))),
+        ProviderKind::CliCodex => Ok(Box::new(CliCodexProvider::new(name, entry))),
+        ProviderKind::ScriptedSmoke => Ok(Box::new(ScriptedSmokeProvider::new())),
         ProviderKind::Anthropic | ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => {
-            Box::new(ProviderAdapter::new(name, kind, entry))
+            Ok(Box::new(ProviderAdapter::new(name, kind, entry)))
         }
+        ProviderKind::Generic(id) => Err(ProviderError::InvalidConfig(format!(
+            "generic provider {id} is registered but not wired for dispatch yet"
+        ))),
     }
 }

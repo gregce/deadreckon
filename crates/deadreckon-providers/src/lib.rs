@@ -30,6 +30,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use super::config::builtin_entries;
     use super::{
         Provider, ProviderAdapter, ProviderConfigFile, ProviderEntry, ProviderKind, ProviderRouter,
         ProviderUsage, read_config,
@@ -100,6 +101,55 @@ api_key = "test"
             )
             .expect("spend");
         assert_eq!(spend.cost_usd, 11.25);
+    }
+
+    #[test]
+    fn migrated_cli_codex_uses_descriptor_default_binary() {
+        let entries = builtin_entries().expect("descriptor builtins");
+        let codex = entries.get("cli:codex").expect("codex provider entry");
+        assert_eq!(codex.binary.as_deref(), Some("codex"));
+        assert_eq!(codex.model.as_deref(), None);
+        assert_eq!(codex.kind, Some(ProviderKind::CliCodex));
+    }
+
+    #[test]
+    fn migrated_anthropic_uses_descriptor_default_endpoint() {
+        let entries = builtin_entries().expect("descriptor builtins");
+        let anthropic = entries.get("anthropic").expect("anthropic provider entry");
+        assert_eq!(
+            anthropic.base_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        assert_eq!(anthropic.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(anthropic.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn existing_provider_router_tests_pass_post_migration() {
+        let router = ProviderRouter::from_config(
+            ProviderConfigFile {
+                default_provider: None,
+                fallback: None,
+                providers: Default::default(),
+            },
+            None,
+        )
+        .expect("router");
+        let names = router
+            .route_info()
+            .into_iter()
+            .map(|route| route.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "cli:claude-code",
+                "cli:codex",
+                "anthropic",
+                "openai",
+                "openai-compatible"
+            ]
+        );
     }
 
     #[test]

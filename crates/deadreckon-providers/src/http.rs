@@ -26,8 +26,8 @@ impl ProviderAdapter {
         let api_key = entry
             .api_key
             .or_else(|| entry.api_key_env.as_deref().and_then(env_value));
-        let base_url = entry.base_url.unwrap_or_else(|| default_base_url(kind));
-        let model = entry.model.unwrap_or_else(|| default_model(kind));
+        let base_url = entry.base_url.unwrap_or_else(|| default_base_url(&kind));
+        let model = entry.model.unwrap_or_else(|| default_model(&kind));
         Self {
             name,
             kind,
@@ -46,7 +46,7 @@ impl ProviderAdapter {
         };
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        match self.kind {
+        match &self.kind {
             ProviderKind::Anthropic => {
                 let key = HeaderValue::from_str(api_key).map_err(|err| {
                     ProviderError::InvalidConfig(format!("invalid Anthropic API key header: {err}"))
@@ -61,27 +61,33 @@ impl ProviderAdapter {
                     })?;
                 headers.insert(AUTHORIZATION, bearer);
             }
-            ProviderKind::CliClaudeCode | ProviderKind::CliCodex | ProviderKind::ScriptedSmoke => {}
+            ProviderKind::CliClaudeCode
+            | ProviderKind::CliCodex
+            | ProviderKind::ScriptedSmoke
+            | ProviderKind::Generic(_) => {}
         }
         Ok(headers)
     }
 
     fn endpoint(&self) -> String {
-        match self.kind {
+        match &self.kind {
             ProviderKind::Anthropic => {
                 format!("{}/v1/messages", self.base_url.trim_end_matches('/'))
             }
             ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => {
                 format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
             }
-            ProviderKind::CliClaudeCode | ProviderKind::CliCodex | ProviderKind::ScriptedSmoke => {
+            ProviderKind::CliClaudeCode
+            | ProviderKind::CliCodex
+            | ProviderKind::ScriptedSmoke
+            | ProviderKind::Generic(_) => {
                 unreachable!("CLI providers do not use HTTP endpoints")
             }
         }
     }
 
     fn payload(&self, request: &ProviderRequest) -> Value {
-        match self.kind {
+        match &self.kind {
             ProviderKind::Anthropic => json!({
                 "model": self.model,
                 "max_tokens": request.max_output_tokens,
@@ -93,7 +99,10 @@ impl ProviderAdapter {
                 "max_tokens": request.max_output_tokens,
                 "stream": false,
             }),
-            ProviderKind::CliClaudeCode | ProviderKind::CliCodex | ProviderKind::ScriptedSmoke => {
+            ProviderKind::CliClaudeCode
+            | ProviderKind::CliCodex
+            | ProviderKind::ScriptedSmoke
+            | ProviderKind::Generic(_) => {
                 unreachable!("CLI providers do not use HTTP payloads")
             }
         }
@@ -143,10 +152,13 @@ impl ProviderAdapter {
             provider: self.name.clone(),
             detail: err.to_string(),
         })?;
-        let (content, usage) = match self.kind {
+        let (content, usage) = match &self.kind {
             ProviderKind::Anthropic => parse_anthropic_response(&value),
             ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => parse_openai_response(&value),
-            ProviderKind::CliClaudeCode | ProviderKind::CliCodex | ProviderKind::ScriptedSmoke => {
+            ProviderKind::CliClaudeCode
+            | ProviderKind::CliCodex
+            | ProviderKind::ScriptedSmoke
+            | ProviderKind::Generic(_) => {
                 unreachable!("CLI providers do not parse HTTP responses")
             }
         };
@@ -168,7 +180,7 @@ impl Provider for ProviderAdapter {
     }
 
     fn kind(&self) -> ProviderKind {
-        self.kind
+        self.kind.clone()
     }
 
     fn model(&self) -> &str {
@@ -202,18 +214,19 @@ fn env_value(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
-fn default_base_url(kind: ProviderKind) -> String {
+fn default_base_url(kind: &ProviderKind) -> String {
     match kind {
         ProviderKind::Anthropic => "https://api.anthropic.com".to_string(),
         ProviderKind::OpenAi => "https://api.openai.com/v1".to_string(),
         ProviderKind::OpenAiCompatible => "http://127.0.0.1:11434/v1".to_string(),
-        ProviderKind::CliClaudeCode | ProviderKind::CliCodex | ProviderKind::ScriptedSmoke => {
-            String::new()
-        }
+        ProviderKind::CliClaudeCode
+        | ProviderKind::CliCodex
+        | ProviderKind::ScriptedSmoke
+        | ProviderKind::Generic(_) => String::new(),
     }
 }
 
-fn default_model(kind: ProviderKind) -> String {
+fn default_model(kind: &ProviderKind) -> String {
     match kind {
         ProviderKind::Anthropic => "claude-sonnet-4-5".to_string(),
         ProviderKind::OpenAi => "gpt-5.1-codex".to_string(),
@@ -221,6 +234,7 @@ fn default_model(kind: ProviderKind) -> String {
         ProviderKind::CliClaudeCode => "cli:claude-code".to_string(),
         ProviderKind::CliCodex => "cli:codex".to_string(),
         ProviderKind::ScriptedSmoke => "local-scripted-smoke".to_string(),
+        ProviderKind::Generic(id) => id.clone(),
     }
 }
 

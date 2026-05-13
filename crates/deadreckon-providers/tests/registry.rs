@@ -1,5 +1,6 @@
 use std::fs;
 
+use deadreckon_providers::ProviderKind;
 use deadreckon_providers::registry::ProviderDescriptor;
 use deadreckon_providers::registry::ProviderRegistry;
 use deadreckon_providers::registry::parse_custom_command;
@@ -135,4 +136,13 @@ fn parse_custom_command_handles_escaped_chars() {
         parse_custom_command(r#"claude --msg "It\'s \"working\"""#).expect("parse command");
     assert_eq!(binary, "claude");
     assert_eq!(args, ["--msg", "It's \"working\""]);
+}
+
+#[test]
+fn provider_kind_generic_variant_round_trips_serde() {
+    let value = ProviderKind::Generic("cli:cursor-agent".to_string());
+    let encoded = serde_json::to_string(&value).expect("serialize generic kind");
+    assert_eq!(encoded, "\"cli:cursor-agent\"");
+    let decoded: ProviderKind = serde_json::from_str(&encoded).expect("deserialize generic kind");
+    assert_eq!(decoded, value);
 }

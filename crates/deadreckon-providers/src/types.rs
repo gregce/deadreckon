@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use deadreckon_sandbox::SandboxBackend;
+use serde::Deserializer;
+use serde::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -12,8 +14,7 @@ use crate::error::Result;
 
 pub type ProviderFuture<'a> = Pin<Box<dyn Future<Output = Result<ProviderResponse>> + Send + 'a>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderKind {
     Anthropic,
     OpenAi,
@@ -21,6 +22,48 @@ pub enum ProviderKind {
     CliClaudeCode,
     CliCodex,
     ScriptedSmoke,
+    Generic(String),
+}
+
+impl ProviderKind {
+    pub fn as_config_str(&self) -> &str {
+        match self {
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::OpenAi => "open-ai",
+            ProviderKind::OpenAiCompatible => "open-ai-compatible",
+            ProviderKind::CliClaudeCode => "cli-claude-code",
+            ProviderKind::CliCodex => "cli-codex",
+            ProviderKind::ScriptedSmoke => "scripted-smoke",
+            ProviderKind::Generic(id) => id,
+        }
+    }
+}
+
+impl Serialize for ProviderKind {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_config_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderKind {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "anthropic" => ProviderKind::Anthropic,
+            "open-ai" | "openai" => ProviderKind::OpenAi,
+            "open-ai-compatible" | "openai-compatible" => ProviderKind::OpenAiCompatible,
+            "cli-claude-code" | "cli:claude-code" => ProviderKind::CliClaudeCode,
+            "cli-codex" | "cli:codex" => ProviderKind::CliCodex,
+            "scripted-smoke" | "smoke" => ProviderKind::ScriptedSmoke,
+            _ => ProviderKind::Generic(value),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

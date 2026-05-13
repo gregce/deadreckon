@@ -938,7 +938,7 @@ fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> 
         println!(
             "{marker} {}  kind={}  model={}  credential={credential}",
             ui_id(route.name),
-            format_provider_kind(route.kind),
+            format_provider_kind(&route.kind),
             route.model
         );
     }
@@ -997,15 +997,8 @@ fn set_provider_model(root: &mut toml::Value, provider: &str, model: &str) {
     }
 }
 
-fn format_provider_kind(kind: deadreckon_providers::ProviderKind) -> &'static str {
-    match kind {
-        deadreckon_providers::ProviderKind::Anthropic => "anthropic",
-        deadreckon_providers::ProviderKind::OpenAi => "openai",
-        deadreckon_providers::ProviderKind::OpenAiCompatible => "openai-compatible",
-        deadreckon_providers::ProviderKind::CliClaudeCode => "cli-claude-code",
-        deadreckon_providers::ProviderKind::CliCodex => "cli-codex",
-        deadreckon_providers::ProviderKind::ScriptedSmoke => "smoke",
-    }
+fn format_provider_kind(kind: &deadreckon_providers::ProviderKind) -> &str {
+    kind.as_config_str()
 }
 
 fn print_chain_help(topic: Option<&str>) {

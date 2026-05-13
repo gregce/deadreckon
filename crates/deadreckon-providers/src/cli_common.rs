@@ -7,6 +7,7 @@ use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as 
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+use crate::registry::ProviderRegistry;
 use crate::{ProviderError, Result};
 
 #[derive(Debug)]
@@ -161,6 +162,17 @@ fn cli_provider_write_allowlist(provider: &str) -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
     };
+    if let Ok(registry) = ProviderRegistry::builtin()
+        && let Some(descriptor) = registry.get(provider)
+    {
+        let mut paths = descriptor
+            .sandbox_writes
+            .iter()
+            .map(|path| expand_home_path(path, &home))
+            .collect::<Vec<_>>();
+        dedup_paths(&mut paths);
+        return paths;
+    }
     let mut paths = Vec::new();
     if provider.contains("codex") {
         paths.push(home.join(".codex"));
@@ -169,6 +181,16 @@ fn cli_provider_write_allowlist(provider: &str) -> Vec<PathBuf> {
         paths.push(home.join(".claude"));
     }
     paths
+}
+
+fn expand_home_path(path: &Path, home: &Path) -> PathBuf {
+    if path == Path::new("~") {
+        return home.to_path_buf();
+    }
+    if let Ok(rest) = path.strip_prefix("~") {
+        return home.join(rest);
+    }
+    path.to_path_buf()
 }
 
 fn push_existing_parent_roots(paths: &mut Vec<PathBuf>, path: &Path) {
@@ -230,4 +252,16 @@ pub(crate) fn ensure_success(provider: &str, output: &CliOutput) -> Result<()> {
             output.status_code, output.stdout, output.stderr
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_provider_write_allowlist;
+
+    #[test]
+    fn migrated_cli_codex_uses_descriptor_sandbox_writes() {
+        let paths = cli_provider_write_allowlist("cli:codex");
+        assert!(paths.iter().any(|path| path.ends_with(".codex")));
+        assert!(!paths.iter().any(|path| path.ends_with(".claude")));
+    }
 }

@@ -3,6 +3,7 @@
 ## Provider registry (alpha) — 2026-05-13
 
 - P1: Added descriptor TOML, `ProviderDescriptor`, `ProviderRegistry`, override loading from `providers.d`, and shell-like custom command parsing; existing built-in providers now have compiled-in descriptors.
+- P2: Existing provider defaults now come from descriptor TOML, `ProviderKind` supports generic descriptor IDs, and CLI sandbox write allowlists are descriptor-backed while preserving current adapter behavior.
 
 ## Workspace hygiene (alpha) — 2026-05-12
 

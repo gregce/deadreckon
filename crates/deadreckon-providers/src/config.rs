@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::Path;
 
+use crate::registry::{DescriptorKind, ProviderDescriptor, ProviderRegistry};
 use crate::{ProviderConfigFile, ProviderEntry, ProviderError, ProviderKind, Result};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/Users/gdc/.deadreckon/config.toml";
@@ -41,93 +42,56 @@ fn defaults_provider(raw: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-pub(crate) fn builtin_entries() -> BTreeMap<String, ProviderEntry> {
-    BTreeMap::from([
-        (
-            "smoke".to_string(),
-            ProviderEntry {
-                kind: Some(ProviderKind::ScriptedSmoke),
-                api_key: None,
-                api_key_env: None,
-                base_url: None,
-                model: Some("local-scripted-smoke".to_string()),
-                input_cost_per_million: Some(0.0),
-                output_cost_per_million: Some(0.0),
-                binary: None,
-                extra_args: Vec::new(),
-            },
-        ),
-        (
-            "cli:claude-code".to_string(),
-            ProviderEntry {
-                kind: Some(ProviderKind::CliClaudeCode),
-                api_key: None,
-                api_key_env: None,
-                base_url: None,
-                model: None,
-                input_cost_per_million: Some(0.0),
-                output_cost_per_million: Some(0.0),
-                binary: Some("claude".to_string()),
-                extra_args: Vec::new(),
-            },
-        ),
-        (
-            "cli:codex".to_string(),
-            ProviderEntry {
-                kind: Some(ProviderKind::CliCodex),
-                api_key: None,
-                api_key_env: None,
-                base_url: None,
-                model: None,
-                input_cost_per_million: Some(0.0),
-                output_cost_per_million: Some(0.0),
-                binary: Some("codex".to_string()),
-                extra_args: Vec::new(),
-            },
-        ),
-        (
-            "anthropic".to_string(),
-            ProviderEntry {
-                kind: Some(ProviderKind::Anthropic),
-                api_key: None,
-                api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
-                base_url: Some("https://api.anthropic.com".to_string()),
-                model: Some("claude-sonnet-4-5".to_string()),
-                input_cost_per_million: Some(3.0),
-                output_cost_per_million: Some(15.0),
-                binary: None,
-                extra_args: Vec::new(),
-            },
-        ),
-        (
-            "openai".to_string(),
-            ProviderEntry {
-                kind: Some(ProviderKind::OpenAi),
-                api_key: None,
-                api_key_env: Some("OPENAI_API_KEY".to_string()),
-                base_url: Some("https://api.openai.com/v1".to_string()),
-                model: Some("gpt-5.1-codex".to_string()),
-                input_cost_per_million: Some(1.25),
-                output_cost_per_million: Some(10.0),
-                binary: None,
-                extra_args: Vec::new(),
-            },
-        ),
-        (
-            "openai-compatible".to_string(),
-            ProviderEntry {
-                kind: Some(ProviderKind::OpenAiCompatible),
-                api_key: None,
-                api_key_env: Some("OPENAI_COMPATIBLE_API_KEY".to_string()),
-                base_url: env::var("OPENAI_COMPATIBLE_BASE_URL").ok(),
-                model: env::var("OPENAI_COMPATIBLE_MODEL").ok(),
-                input_cost_per_million: Some(0.0),
-                output_cost_per_million: Some(0.0),
-                binary: None,
-                extra_args: Vec::new(),
-            },
-        ),
-    ])
+pub(crate) fn builtin_entries() -> Result<BTreeMap<String, ProviderEntry>> {
+    let registry = ProviderRegistry::builtin()?;
+    Ok(registry
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.id.clone(),
+                provider_entry_from_descriptor(descriptor),
+            )
+        })
+        .collect())
+}
+
+fn provider_entry_from_descriptor(descriptor: &ProviderDescriptor) -> ProviderEntry {
+    let default_model = if descriptor.kind == DescriptorKind::Cli {
+        None
+    } else if descriptor.id == "openai-compatible" {
+        env::var("OPENAI_COMPATIBLE_MODEL")
+            .ok()
+            .or_else(|| descriptor.default_model.clone())
+    } else {
+        descriptor.default_model.clone()
+    };
+    let default_endpoint = if descriptor.id == "openai-compatible" {
+        env::var("OPENAI_COMPATIBLE_BASE_URL")
+            .ok()
+            .or_else(|| descriptor.default_endpoint.clone())
+    } else {
+        descriptor.default_endpoint.clone()
+    };
+    let default_model_pricing = default_model
+        .as_deref()
+        .and_then(|model| {
+            descriptor
+                .model_catalog
+                .iter()
+                .find(|entry| entry.id == model)
+        })
+        .or_else(|| descriptor.model_catalog.first());
+    ProviderEntry {
+        kind: Some(kind_from_name(&descriptor.id)),
+        api_key: None,
+        api_key_env: descriptor.auth.env_var.clone(),
+        base_url: default_endpoint,
+        model: default_model,
+        input_cost_per_million: default_model_pricing.and_then(|entry| entry.input_per_million),
+        output_cost_per_million: default_model_pricing.and_then(|entry| entry.output_per_million),
+        binary: descriptor.default_binary.clone(),
+        extra_args: Vec::new(),
+    }
 }
 
 pub(crate) fn merge_provider_entry(base: &mut ProviderEntry, entry: ProviderEntry) {
@@ -160,14 +124,14 @@ pub(crate) fn merge_provider_entry(base: &mut ProviderEntry, entry: ProviderEntr
     }
 }
 
-pub(crate) fn kind_from_name(name: &str) -> Option<ProviderKind> {
+pub(crate) fn kind_from_name(name: &str) -> ProviderKind {
     match name {
-        "anthropic" => Some(ProviderKind::Anthropic),
-        "openai" => Some(ProviderKind::OpenAi),
-        "openai-compatible" | "openrouter" | "llama-cpp" => Some(ProviderKind::OpenAiCompatible),
-        "cli:claude-code" | "cli-claude-code" => Some(ProviderKind::CliClaudeCode),
-        "cli:codex" | "cli-codex" => Some(ProviderKind::CliCodex),
-        "smoke" => Some(ProviderKind::ScriptedSmoke),
-        _ => None,
+        "anthropic" => ProviderKind::Anthropic,
+        "openai" => ProviderKind::OpenAi,
+        "openai-compatible" | "openrouter" | "llama-cpp" => ProviderKind::OpenAiCompatible,
+        "cli:claude-code" | "cli-claude-code" => ProviderKind::CliClaudeCode,
+        "cli:codex" | "cli-codex" => ProviderKind::CliCodex,
+        "smoke" => ProviderKind::ScriptedSmoke,
+        _ => ProviderKind::Generic(name.to_string()),
     }
 }
