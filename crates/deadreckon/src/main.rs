@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
 use std::fs;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -159,6 +160,10 @@ fn ui_ok(text: impl AsRef<str>) -> String {
 
 fn ui_warn(text: impl AsRef<str>) -> String {
     ui_style(text, "1;33", UiStream::Stdout)
+}
+
+fn ui_prompt_prefix() -> String {
+    ui_style("?", "1;36", UiStream::Stdout)
 }
 
 fn ui_status(text: impl AsRef<str>) -> String {
@@ -1243,8 +1248,9 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
         options.model.as_deref(),
     )?;
     let prompt = chain_planner_prompt(&options.root_goal, n);
-    let response = router
-        .complete(&ProviderRequest {
+    let response = with_cli_wait_status(
+        "drafting chain plan",
+        router.complete(&ProviderRequest {
             prompt,
             max_output_tokens: u32::from(n) * 96,
             cwd: Some(std::env::current_dir()?),
@@ -1252,14 +1258,15 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
-        })
-        .await
-        .map_err(|err| {
-            CliError::Core(deadreckon_core::user_error(
-                &format!("chain planner provider failed: {err}"),
-                "deadreckon chain \"step one\" \"step two\"",
-            ))
-        })?;
+        }),
+    )
+    .await
+    .map_err(|err| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("chain planner provider failed: {err}"),
+            "deadreckon chain \"step one\" \"step two\"",
+        ))
+    })?;
     let goals = parse_planner_goals(&response.content, n)?;
     let chain_id = chain_create_command(ChainCreateOptions { goals, ..options }).await?;
     append_chain_planner_spend(&paths, &chain_id, &response)?;
@@ -3805,32 +3812,39 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         doc_provider_selection.provider.as_deref(),
         doc_provider_selection.source.as_str(),
     );
-    let outcome = run_turn_loop(
-        &mut state,
-        &router,
-        RunLoopConfig {
-            provider: effective_provider.clone(),
-            max_spend_usd: effective_max_spend,
-            max_wall_seconds: effective_max_wall_seconds,
-            sandbox_backend: backend,
-            max_turns: 12,
-            from_turn: None,
-            event_sender: None,
-            cancellation_token: None,
-            docs: RunLoopDocsConfig {
-                home: paths.home().to_path_buf(),
-                config_path: Some(paths.config_path()),
-                doc_provider: doc_provider_selection.provider.clone(),
-                doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
-                doc_subskills: effective_doc_subskills(&defaults),
-                token_budget: defaults
-                    .doc_polish_token_budget
-                    .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
-                budget_cap_usd: defaults.doc_polish_budget_cap_usd,
-                doc_skill: effective_doc_skill,
-                no_docs,
+    let wait_label = format!(
+        "run {} executing; attach in another terminal",
+        run_prefix(&state.run_id)
+    );
+    let outcome = with_cli_wait_status(
+        &wait_label,
+        run_turn_loop(
+            &mut state,
+            &router,
+            RunLoopConfig {
+                provider: effective_provider.clone(),
+                max_spend_usd: effective_max_spend,
+                max_wall_seconds: effective_max_wall_seconds,
+                sandbox_backend: backend,
+                max_turns: 12,
+                from_turn: None,
+                event_sender: None,
+                cancellation_token: None,
+                docs: RunLoopDocsConfig {
+                    home: paths.home().to_path_buf(),
+                    config_path: Some(paths.config_path()),
+                    doc_provider: doc_provider_selection.provider.clone(),
+                    doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
+                    doc_subskills: effective_doc_subskills(&defaults),
+                    token_budget: defaults
+                        .doc_polish_token_budget
+                        .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
+                    budget_cap_usd: defaults.doc_polish_budget_cap_usd,
+                    doc_skill: effective_doc_skill,
+                    no_docs,
+                },
             },
-        },
+        ),
     )
     .await?;
     state.child_pids.clear();
@@ -4096,8 +4110,12 @@ async fn acceptance_agent_command_in_dir(
         existing_yaml.as_deref(),
         existing_md.as_deref(),
     )?;
-    let response = router
-        .complete(&ProviderRequest {
+    let response = with_cli_wait_status(
+        match mode {
+            AcceptanceAgentMode::Draft => "compiling done criteria",
+            AcceptanceAgentMode::Refine => "refining done criteria",
+        },
+        router.complete(&ProviderRequest {
             prompt,
             max_output_tokens: 6_000,
             cwd: Some(cwd.to_path_buf()),
@@ -4105,14 +4123,15 @@ async fn acceptance_agent_command_in_dir(
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
-        })
-        .await
-        .map_err(|err| {
-            CliError::Core(deadreckon_core::user_error(
-                &format!("acceptance provider failed: {err}"),
-                "deadreckon done \"builds and passes tests\"",
-            ))
-        })?;
+        }),
+    )
+    .await
+    .map_err(|err| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("acceptance provider failed: {err}"),
+            "deadreckon done \"builds and passes tests\"",
+        ))
+    })?;
     let draft = parse_acceptance_agent_response(&response.content)?;
     acceptance_check_count(&draft.yaml)?;
     write_project_acceptance(cwd, &draft, true, true)?;
@@ -5456,10 +5475,7 @@ fn confirm_spend_cap(
                 .to_string(),
         )));
     }
-    print!("--max-spend is ${max_spend:.2}. Continue? [y/N] ");
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
+    let answer = prompt(&format!("--max-spend is ${max_spend:.2}. Continue? [y/N] "))?;
     if matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
         Ok(())
     } else {
@@ -6102,11 +6118,79 @@ fn prompt_non_git_mode() -> Result<NonGitChoice> {
 }
 
 fn prompt(message: &str) -> Result<String> {
-    print!("{message}");
+    print!("{} {message}", ui_prompt_prefix());
     io::stdout().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     Ok(answer.trim().to_string())
+}
+
+async fn with_cli_wait_status<F, T>(label: &str, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    if !ui_enabled(UiStream::Stderr) {
+        return future.await;
+    }
+    tokio::pin!(future);
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(180));
+    let started = std::time::Instant::now();
+    let mut tick = 0usize;
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                clear_cli_wait_status();
+                return result;
+            }
+            _ = interval.tick() => {
+                tick = tick.wrapping_add(1);
+                print_cli_wait_status(label, started.elapsed(), tick);
+            }
+        }
+    }
+}
+
+fn print_cli_wait_status(label: &str, elapsed: std::time::Duration, tick: usize) {
+    let line = cli_wait_status_line(label, elapsed, tick);
+    eprint!("\r{line}\x1b[K");
+    let _ = io::stderr().flush();
+}
+
+fn clear_cli_wait_status() {
+    eprint!("\r\x1b[K");
+    let _ = io::stderr().flush();
+}
+
+fn cli_wait_status_line(label: &str, elapsed: std::time::Duration, tick: usize) -> String {
+    let course = deadreckoning_course_ascii(18, tick);
+    format!(
+        "{} {} {}  {}s",
+        ui_style("deadreckoning", "1;36", UiStream::Stderr),
+        ui_style(course, "1;34", UiStream::Stderr),
+        label,
+        elapsed.as_secs()
+    )
+}
+
+fn deadreckoning_course_ascii(width: usize, tick: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut chars = Vec::with_capacity(width);
+    let cursor = tick % width;
+    for index in 0..width {
+        let ch = if index == cursor {
+            '*'
+        } else if (index + tick).is_multiple_of(7) {
+            '^'
+        } else if (index + tick).is_multiple_of(3) {
+            '.'
+        } else {
+            '-'
+        };
+        chars.push(ch);
+    }
+    chars.into_iter().collect()
 }
 
 fn init_config_text(
@@ -6510,6 +6594,10 @@ fn apply_command_inner(
         return Ok(());
     }
     if !quiet {
+        eprintln!(
+            "{}",
+            ui_style("changes to apply:", "1;36", UiStream::Stderr)
+        );
         eprintln!("{diff_stat}");
     }
 
@@ -6642,7 +6730,14 @@ fn prepare_apply_autostash(
         return Ok(None);
     }
 
-    eprintln!("working tree has uncommitted changes:");
+    eprintln!(
+        "{}",
+        ui_style(
+            "working tree has uncommitted changes:",
+            "1;33",
+            UiStream::Stderr
+        )
+    );
     for line in dirty.lines().take(30) {
         eprintln!("  {line}");
     }
@@ -7160,30 +7255,37 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
-    let outcome = run_turn_loop(
-        &mut state,
-        &router,
-        RunLoopConfig {
-            provider: effective_provider,
-            max_spend_usd: effective_max_spend,
-            max_wall_seconds: effective_max_wall_seconds,
-            sandbox_backend: backend,
-            max_turns: 12,
-            from_turn: None,
-            event_sender: None,
-            cancellation_token: None,
-            docs: RunLoopDocsConfig {
-                home: paths.home().to_path_buf(),
-                config_path: Some(paths.config_path()),
-                doc_provider: doc_provider_selection.provider.clone(),
-                doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
-                doc_subskills,
-                token_budget: doc_token_budget,
-                budget_cap_usd: doc_budget_cap,
-                doc_skill: effective_doc_skill,
-                no_docs,
+    let wait_label = format!(
+        "extended run {} executing; attach in another terminal",
+        run_prefix(&state.run_id)
+    );
+    let outcome = with_cli_wait_status(
+        &wait_label,
+        run_turn_loop(
+            &mut state,
+            &router,
+            RunLoopConfig {
+                provider: effective_provider,
+                max_spend_usd: effective_max_spend,
+                max_wall_seconds: effective_max_wall_seconds,
+                sandbox_backend: backend,
+                max_turns: 12,
+                from_turn: None,
+                event_sender: None,
+                cancellation_token: None,
+                docs: RunLoopDocsConfig {
+                    home: paths.home().to_path_buf(),
+                    config_path: Some(paths.config_path()),
+                    doc_provider: doc_provider_selection.provider.clone(),
+                    doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
+                    doc_subskills,
+                    token_budget: doc_token_budget,
+                    budget_cap_usd: doc_budget_cap,
+                    doc_skill: effective_doc_skill,
+                    no_docs,
+                },
             },
-        },
+        ),
     )
     .await?;
     state.child_pids.clear();
@@ -7333,30 +7435,37 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
-    let outcome = run_turn_loop(
-        &mut state,
-        &router,
-        RunLoopConfig {
-            provider: effective_provider,
-            max_spend_usd: effective_max_spend,
-            max_wall_seconds: effective_max_wall_seconds,
-            sandbox_backend: backend,
-            max_turns: 12,
-            from_turn: None,
-            event_sender: None,
-            cancellation_token: None,
-            docs: RunLoopDocsConfig {
-                home: paths.home().to_path_buf(),
-                config_path: Some(paths.config_path()),
-                doc_provider,
-                doc_provider_source,
-                doc_subskills,
-                token_budget: doc_token_budget,
-                budget_cap_usd: doc_budget_cap,
-                doc_skill,
-                no_docs,
+    let wait_label = format!(
+        "extended run {} executing; attach in another terminal",
+        run_prefix(&state.run_id)
+    );
+    let outcome = with_cli_wait_status(
+        &wait_label,
+        run_turn_loop(
+            &mut state,
+            &router,
+            RunLoopConfig {
+                provider: effective_provider,
+                max_spend_usd: effective_max_spend,
+                max_wall_seconds: effective_max_wall_seconds,
+                sandbox_backend: backend,
+                max_turns: 12,
+                from_turn: None,
+                event_sender: None,
+                cancellation_token: None,
+                docs: RunLoopDocsConfig {
+                    home: paths.home().to_path_buf(),
+                    config_path: Some(paths.config_path()),
+                    doc_provider,
+                    doc_provider_source,
+                    doc_subskills,
+                    token_budget: doc_token_budget,
+                    budget_cap_usd: doc_budget_cap,
+                    doc_skill,
+                    no_docs,
+                },
             },
-        },
+        ),
     )
     .await?;
     state.child_pids.clear();
@@ -8293,22 +8402,25 @@ async fn doc_command(args: DocCommandArgs) -> Result<()> {
                 &format!("deadreckon doc {} --polish --no-confirm", state.run_id),
             )));
         }
-        polish_run_docs(
-            &mut state,
-            &router,
-            &PolishConfig {
-                home: paths.home().to_path_buf(),
-                doc_skill: doc_skill
-                    .or(defaults.doc_skill)
-                    .unwrap_or_else(|| "run-narrator".to_string()),
-                doc_provider: Some(provider),
-                doc_provider_source: Some(selection.source.as_str().to_string()),
-                doc_subskills: subskills,
-                token_budget,
-                budget_cap_usd: budget_cap,
-                no_llm: false,
-                force,
-            },
+        with_cli_wait_status(
+            "polishing run docs",
+            polish_run_docs(
+                &mut state,
+                &router,
+                &PolishConfig {
+                    home: paths.home().to_path_buf(),
+                    doc_skill: doc_skill
+                        .or(defaults.doc_skill)
+                        .unwrap_or_else(|| "run-narrator".to_string()),
+                    doc_provider: Some(provider),
+                    doc_provider_source: Some(selection.source.as_str().to_string()),
+                    doc_subskills: subskills,
+                    token_budget,
+                    budget_cap_usd: budget_cap,
+                    no_llm: false,
+                    force,
+                },
+            ),
         )
         .await?;
         if completion_hints_enabled(false)
@@ -8608,34 +8720,41 @@ async fn resume_command(
     let doc_provider_selection = resolve_doc_provider(None, &defaults, provider.as_deref());
     let max_spend_usd = state.max_spend_usd;
     let max_wall_seconds = state.max_wall_seconds;
-    let outcome = run_turn_loop(
-        &mut state,
-        &router,
-        RunLoopConfig {
-            provider,
-            max_spend_usd,
-            max_wall_seconds,
-            sandbox_backend: backend,
-            max_turns: 12,
-            from_turn,
-            event_sender: None,
-            cancellation_token: None,
-            docs: RunLoopDocsConfig {
-                home: paths.home().to_path_buf(),
-                config_path: Some(paths.config_path()),
-                doc_provider: doc_provider_selection.provider,
-                doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
-                doc_subskills: effective_doc_subskills(&defaults),
-                token_budget: defaults
-                    .doc_polish_token_budget
-                    .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
-                budget_cap_usd: defaults.doc_polish_budget_cap_usd,
-                doc_skill: defaults
-                    .doc_skill
-                    .unwrap_or_else(|| "run-narrator".to_string()),
-                no_docs: false,
+    let wait_label = format!(
+        "resuming run {} from durable state",
+        run_prefix(&state.run_id)
+    );
+    let outcome = with_cli_wait_status(
+        &wait_label,
+        run_turn_loop(
+            &mut state,
+            &router,
+            RunLoopConfig {
+                provider,
+                max_spend_usd,
+                max_wall_seconds,
+                sandbox_backend: backend,
+                max_turns: 12,
+                from_turn,
+                event_sender: None,
+                cancellation_token: None,
+                docs: RunLoopDocsConfig {
+                    home: paths.home().to_path_buf(),
+                    config_path: Some(paths.config_path()),
+                    doc_provider: doc_provider_selection.provider,
+                    doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
+                    doc_subskills: effective_doc_subskills(&defaults),
+                    token_budget: defaults
+                        .doc_polish_token_budget
+                        .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
+                    budget_cap_usd: defaults.doc_polish_budget_cap_usd,
+                    doc_skill: defaults
+                        .doc_skill
+                        .unwrap_or_else(|| "run-narrator".to_string()),
+                    no_docs: false,
+                },
             },
-        },
+        ),
     )
     .await?;
     state.child_pids.clear();
@@ -9843,7 +9962,7 @@ fn attach_panel_layout(area: ratatui::layout::Rect) -> AttachPanelLayout {
             Constraint::Length(5),
             Constraint::Min(10),
             Constraint::Length(4),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(area);
     let center = Layout::default()
@@ -10322,8 +10441,18 @@ fn render_attach(
     }
     render_live_files(frame, layout.files, live, tui_state);
     render_processes(frame, layout.processes, live, tui_state);
+    let tick = (Utc::now().timestamp_millis() / 180).max(0) as usize;
+    let status_line = deadreckoning_status_line(
+        state,
+        &turn_timer(events, spend, traces, state),
+        layout.footer.width,
+        tick,
+    );
     frame.render_widget(
-        Paragraph::new(footer_for_state(state, tui_state)),
+        Paragraph::new(vec![
+            status_line,
+            Line::from(footer_for_state(state, tui_state)),
+        ]),
         layout.footer,
     );
 }
@@ -10370,6 +10499,53 @@ fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTu
         "Detach: q Esc Ctrl-D  |  Focus: Tab  |  Scroll: j/k Up/Down PgUp/PgDn mouse".to_string()
     };
     format!("{base}{chain_suffix}")
+}
+
+fn deadreckoning_status_line(
+    state: &deadreckon_core::PipelineState,
+    turn_label: &str,
+    width: u16,
+    tick: usize,
+) -> Line<'static> {
+    let text = deadreckoning_status_text(state, turn_label, width, tick);
+    let split = text.find("  ").unwrap_or(text.len());
+    let (prefix, rest) = text.split_at(split);
+    Line::from(vec![
+        Span::styled(
+            prefix.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(rest.to_string(), Style::default().fg(Color::Blue)),
+    ])
+}
+
+fn deadreckoning_status_text(
+    state: &deadreckon_core::PipelineState,
+    turn_label: &str,
+    width: u16,
+    tick: usize,
+) -> String {
+    let status = match state.status {
+        RunStatus::Pending | RunStatus::Planned => "preparing",
+        RunStatus::Executing => "running",
+        RunStatus::Completed => "complete",
+        RunStatus::Failed => "failed",
+        RunStatus::Killed => "killed",
+    };
+    let phase = state
+        .active_phase()
+        .map(|phase| phase.name.as_str())
+        .unwrap_or("phase");
+    let prefix = format!("deadreckoning {status}  turn {turn_label}  {phase}  ");
+    let max_width = usize::from(width).saturating_sub(1);
+    let course_width = max_width.saturating_sub(prefix.chars().count()).max(8);
+    let mut text = format!("{prefix}{}", deadreckoning_course_ascii(course_width, tick));
+    if max_width > 0 {
+        text = truncate_text(&text, max_width);
+    }
+    text
 }
 
 fn render_spend(
@@ -11074,8 +11250,9 @@ mod tui_tests {
         AttachActionNotice, AttachLive, AttachPanel, AttachPanelCounts, AttachPanelRows,
         AttachTuiState, ChainAttachTuiState, CompletionAction, chain_activity_lines,
         chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
-        chain_timeline_lines, chain_wall_cap_hit, completion_action_from_input,
-        completion_hints_enabled, doc_polish_preview_text, live_file_lines, markdown_to_tui_lines,
+        chain_timeline_lines, chain_wall_cap_hit, cli_wait_status_line,
+        completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
+        deadreckoning_status_text, doc_polish_preview_text, live_file_lines, markdown_to_tui_lines,
         max_panel_scroll, per_step_wall_cap, threshold_color,
     };
     use chrono::Utc;
@@ -11283,6 +11460,43 @@ mod tui_tests {
         assert_eq!(threshold_color(0.60), Color::Yellow);
         assert_eq!(threshold_color(0.79), Color::Yellow);
         assert_eq!(threshold_color(0.80), Color::Red);
+    }
+
+    #[test]
+    fn deadreckoning_course_animation_moves() {
+        let first = deadreckoning_course_ascii(16, 0);
+        let second = deadreckoning_course_ascii(16, 1);
+
+        assert_ne!(first, second);
+        assert!(first.contains('*'));
+        assert_eq!(first.chars().count(), 16);
+    }
+
+    #[test]
+    fn attach_footer_status_names_running_state() {
+        let (_temp, mut state) = doc_preview_state();
+        state.status = deadreckon_core::RunStatus::Executing;
+        state.current_phase_id = deadreckon_core::PhaseId(40);
+
+        let text = deadreckoning_status_text(&state, "42s running", 100, 3);
+
+        assert!(text.contains("deadreckoning running"), "{text}");
+        assert!(text.contains("turn 42s running"), "{text}");
+        assert!(text.contains("execute"), "{text}");
+        assert!(text.contains('*'), "{text}");
+    }
+
+    #[test]
+    fn cli_wait_status_mentions_work_and_elapsed_seconds() {
+        let text = cli_wait_status_line(
+            "compiling done criteria",
+            std::time::Duration::from_secs(7),
+            2,
+        );
+
+        assert!(text.contains("deadreckoning"), "{text}");
+        assert!(text.contains("compiling done criteria"), "{text}");
+        assert!(text.contains("7s"), "{text}");
     }
 
     #[test]
