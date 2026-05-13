@@ -26,6 +26,42 @@ pub enum DeadreckonError {
     },
 }
 
+impl DeadreckonError {
+    /// Transient — the operation may succeed on a retry.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            DeadreckonError::Io { source, .. } => is_retryable_io_kind(source.kind()),
+            DeadreckonError::Json { .. } => false,
+            DeadreckonError::InvalidInput(_) => false,
+            DeadreckonError::NotFound(_) => false,
+            DeadreckonError::LockHeld { .. } => true,
+        }
+    }
+
+    /// Unrecoverable — the watchdog should escalate, not retry.
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            DeadreckonError::Io { source, .. } => !is_retryable_io_kind(source.kind()),
+            DeadreckonError::Json { .. } => true,
+            DeadreckonError::InvalidInput(_) => true,
+            DeadreckonError::NotFound(_) => true,
+            DeadreckonError::LockHeld { .. } => false,
+        }
+    }
+}
+
+pub(crate) fn is_retryable_io_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
 pub type Result<T> = std::result::Result<T, DeadreckonError>;
 
 pub(crate) trait IoContext<T> {

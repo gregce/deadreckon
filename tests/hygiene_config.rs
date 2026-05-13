@@ -2,6 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use deadreckon_core::DeadreckonError;
+use deadreckon_providers::ProviderError;
+use deadreckon_sandbox::SandboxError;
 use serde_json::Value;
 
 const CRATE_MANIFESTS: &[&str] = &[
@@ -303,10 +306,169 @@ fn every_library_lib_rs_pub_use_set_unchanged_from_p1() {
     );
 }
 
+#[test]
+fn deadreckon_error_every_variant_is_retryable_or_fatal() {
+    assert_taxonomy(deadreckon_error_variants());
+}
+
+#[test]
+fn provider_error_every_variant_is_retryable_or_fatal() {
+    assert_taxonomy(provider_error_variants());
+}
+
+#[test]
+fn sandbox_error_every_variant_is_retryable_or_fatal() {
+    assert_taxonomy(sandbox_error_variants());
+}
+
+#[test]
+fn deadreckon_error_io_interrupted_is_retryable() {
+    let error = DeadreckonError::Io {
+        path: "path".into(),
+        source: std::io::Error::new(std::io::ErrorKind::Interrupted, "interrupted"),
+    };
+    assert!(error.is_retryable());
+    assert!(!error.is_fatal());
+}
+
+#[test]
+fn provider_error_no_route_is_fatal() {
+    let error = ProviderError::NoRoute("none".to_string());
+    assert!(!error.is_retryable());
+    assert!(error.is_fatal());
+}
+
+#[test]
+fn provider_error_http_is_fatal_with_v1_followup_noted() {
+    let error = ProviderError::Http {
+        provider: "openai".to_string(),
+        detail: "429".to_string(),
+    };
+    assert!(!error.is_retryable());
+    assert!(error.is_fatal());
+    let notes =
+        fs::read_to_string(workspace_root().join("docs/V1-CANDIDATES.md")).expect("read V1 notes");
+    assert!(
+        notes.contains("ProviderError::Http") && notes.contains("status"),
+        "V1 notes must record ProviderError::Http needs a status field"
+    );
+}
+
+#[test]
+fn runtime_error_taxonomy_present() {
+    let error = DeadreckonError::InvalidInput("runtime uses core errors".to_string());
+    assert!(error.is_fatal());
+    assert!(!error.is_retryable());
+}
+
 fn assert_lint_level(lint: &str, level: &str) {
     let text = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read Cargo.toml");
     let needle = format!("{lint} = \"{level}\"");
     assert!(text.contains(&needle), "missing `{needle}`");
+}
+
+trait Taxonomy {
+    fn is_retryable(&self) -> bool;
+    fn is_fatal(&self) -> bool;
+}
+
+impl Taxonomy for DeadreckonError {
+    fn is_retryable(&self) -> bool {
+        DeadreckonError::is_retryable(self)
+    }
+
+    fn is_fatal(&self) -> bool {
+        DeadreckonError::is_fatal(self)
+    }
+}
+
+impl Taxonomy for ProviderError {
+    fn is_retryable(&self) -> bool {
+        ProviderError::is_retryable(self)
+    }
+
+    fn is_fatal(&self) -> bool {
+        ProviderError::is_fatal(self)
+    }
+}
+
+impl Taxonomy for SandboxError {
+    fn is_retryable(&self) -> bool {
+        SandboxError::is_retryable(self)
+    }
+
+    fn is_fatal(&self) -> bool {
+        SandboxError::is_fatal(self)
+    }
+}
+
+fn assert_taxonomy<T: Taxonomy>(errors: Vec<T>) {
+    for error in errors {
+        assert!(
+            error.is_retryable() || error.is_fatal(),
+            "error variant must be retryable or fatal"
+        );
+        assert!(
+            !(error.is_retryable() && error.is_fatal()),
+            "error variant cannot be both retryable and fatal"
+        );
+    }
+}
+
+fn deadreckon_error_variants() -> Vec<DeadreckonError> {
+    vec![
+        DeadreckonError::Io {
+            path: "path".into(),
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
+        },
+        DeadreckonError::Json {
+            path: "path".into(),
+            source: serde_json::from_str::<Value>("{").expect_err("invalid json"),
+        },
+        DeadreckonError::InvalidInput("bad".to_string()),
+        DeadreckonError::NotFound("missing".to_string()),
+        DeadreckonError::LockHeld {
+            task_key: "task".to_string(),
+            run_id: "run".to_string(),
+            phase: "phase".to_string(),
+        },
+    ]
+}
+
+fn provider_error_variants() -> Vec<ProviderError> {
+    vec![
+        ProviderError::Io {
+            path: "path".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
+        },
+        ProviderError::Toml {
+            path: "path".to_string(),
+            source: toml::from_str::<toml::Value>("=").expect_err("invalid toml"),
+        },
+        ProviderError::MissingCredential("missing".to_string()),
+        ProviderError::NoRoute("none".to_string()),
+        ProviderError::Http {
+            provider: "openai".to_string(),
+            detail: "detail".to_string(),
+        },
+        ProviderError::Cli {
+            provider: "cli".to_string(),
+            detail: "detail".to_string(),
+        },
+        ProviderError::InvalidConfig("bad".to_string()),
+    ]
+}
+
+fn sandbox_error_variants() -> Vec<SandboxError> {
+    vec![
+        SandboxError::InvalidBackend("bad".to_string()),
+        SandboxError::Unavailable("sandbox".to_string()),
+        SandboxError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        )),
+        SandboxError::Cancelled,
+    ]
 }
 
 fn lib_rs_text(rel: &str) -> String {
