@@ -166,6 +166,12 @@ async fn extend_creates_new_run_with_parent_artifacts() {
         .expect("extend");
 
     assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("started run "), "{stdout}");
+    assert!(stdout.contains("provider mock"), "{stdout}");
+    assert!(stdout.contains("model mock-agent"), "{stdout}");
+    assert!(stdout.contains("attach: deadreckon attach "), "{stdout}");
+    assert!(stdout.contains("state "), "{stdout}");
     let child = load_run(&paths, &extended_run_id(&output)).expect("child");
     assert_eq!(child.status, RunStatus::Completed);
     assert_eq!(child.scope, parent.scope);

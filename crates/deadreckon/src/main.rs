@@ -7178,6 +7178,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             no_docs,
             backend,
             router,
+            selected_route: selected_route.clone(),
             post_actions,
             context_turns,
         })
@@ -7255,6 +7256,12 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
+    print_run_started(
+        &state,
+        selected_route.as_ref(),
+        doc_provider_selection.provider.as_deref(),
+        doc_provider_selection.source.as_str(),
+    );
     let wait_label = format!(
         "extended run {} executing; attach in another terminal",
         run_prefix(&state.run_id)
@@ -7328,6 +7335,7 @@ struct ExtendWorktreeArgs {
     no_docs: bool,
     backend: SandboxBackend,
     router: ProviderRouter,
+    selected_route: Option<ProviderRouteInfo>,
     post_actions: bool,
     context_turns: Option<u32>,
 }
@@ -7350,6 +7358,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         no_docs,
         backend,
         router,
+        selected_route,
         post_actions,
         context_turns,
     } = args;
@@ -7435,6 +7444,12 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
+    print_run_started(
+        &state,
+        selected_route.as_ref(),
+        doc_provider.as_deref(),
+        doc_provider_source.as_deref().unwrap_or("none"),
+    );
     let wait_label = format!(
         "extended run {} executing; attach in another terminal",
         run_prefix(&state.run_id)
@@ -8646,6 +8661,11 @@ fn kill_loaded_run(
             let _ = terminate_pid(*pid, true);
         }
     }
+    state.status = RunStatus::Killed;
+    state.failure_reason = Some("killed by user".to_string());
+    state.killed_at = state.killed_at.or_else(|| Some(Utc::now()));
+    state.updated_at = Utc::now();
+    save_state(state)?;
     Ok(())
 }
 
@@ -8716,6 +8736,7 @@ async fn resume_command(
     let provider = state.provider.clone();
     let backend: SandboxBackend = state.sandbox.parse()?;
     let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
+    let selected_route = router.selected_route_info();
     let defaults = config_defaults(&paths)?;
     let doc_provider_selection = resolve_doc_provider(None, &defaults, provider.as_deref());
     let max_spend_usd = state.max_spend_usd;
@@ -8723,6 +8744,13 @@ async fn resume_command(
     let wait_label = format!(
         "resuming run {} from durable state",
         run_prefix(&state.run_id)
+    );
+    print_run_started_with_label(
+        "resumed run",
+        &state,
+        selected_route.as_ref(),
+        doc_provider_selection.provider.as_deref(),
+        doc_provider_selection.source.as_str(),
     );
     let outcome = with_cli_wait_status(
         &wait_label,
@@ -9302,9 +9330,25 @@ fn print_run_started(
     doc_provider: Option<&str>,
     doc_provider_source: &str,
 ) {
+    print_run_started_with_label(
+        "started run",
+        state,
+        route,
+        doc_provider,
+        doc_provider_source,
+    );
+}
+
+fn print_run_started_with_label(
+    label: &str,
+    state: &deadreckon_core::PipelineState,
+    route: Option<&ProviderRouteInfo>,
+    doc_provider: Option<&str>,
+    doc_provider_source: &str,
+) {
     println!(
         "{} {}",
-        ui_ok("started run"),
+        ui_ok(label),
         ui_id(format!("{} ({})", run_prefix(&state.run_id), state.run_id))
     );
     if let Some(route) = route {
