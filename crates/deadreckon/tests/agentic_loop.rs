@@ -1152,15 +1152,13 @@ fn kill_storm_script(count: usize) -> Vec<FixtureResponse> {
 fn wait_for_run_id(paths: &DeadreckonPaths) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(run) = list_runs(paths, None).expect("runs").into_iter().next() {
-            if load_run(paths, &run.run_id)
+        if let Some(run) = list_runs(paths, None).expect("runs").into_iter().next()
+            && !load_run(paths, &run.run_id)
                 .expect("state")
                 .child_pids
-                .first()
-                .is_some()
-            {
-                return run.run_id;
-            }
+                .is_empty()
+        {
+            return run.run_id;
         }
         assert!(Instant::now() < deadline, "run state did not appear");
         std::thread::sleep(Duration::from_millis(25));

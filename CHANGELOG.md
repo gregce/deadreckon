@@ -1,5 +1,9 @@
 # Changelog
 
+## Workspace hygiene (alpha) — 2026-05-12
+
+- P1: Captured smoke and public-surface baselines, added invariant tests, and made `make smoke` run fresh/non-interactive for deterministic verification.
+
 ## Doc depth (alpha) — 2026-05-12
 
 - Per-turn capture extended: full provider response (50 KB cap), per-file diff samples with largest-hunk excerpts, and bash stdout/stderr (10 KB cap each).
