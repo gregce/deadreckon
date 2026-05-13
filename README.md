@@ -6,7 +6,7 @@
 
 **A harness around the agent CLI you already use, so you can actually walk away.**
 
-Codex, Claude Code, Aider, and the rest are good at writing code. They are not built to run unattended for hours and tell you, honestly, whether the work got done. deadreckon is.
+Claude Code, Codex, Cursor CLI, and the rest are good at writing code. They are not built to run unattended for hours and tell you, honestly, whether the work got done. deadreckon is.
 
 You bring the agent CLI you already trust. You tell deadreckon what "done" looks like in plain English. It runs the work in an isolated sandbox, saves every turn, and uses a separate watchdog process to decide when the job is actually finished — a watchdog the agent cannot fool.
 
@@ -30,59 +30,22 @@ The loop is the product. The agent CLI does the coding. deadreckon decides when 
 ## Why this matters
 
 - **You can leave a long run going and trust the result.** The agent can't lie its way out of the gate.
-- **Use whichever agent CLI you prefer.** Claude Code, Codex, Aider, or direct Anthropic / OpenAI API — deadreckon supervises any of them.
+- **Use whichever agent CLI you prefer.** Claude Code, Codex, Cursor CLI, or direct Anthropic / OpenAI API — deadreckon supervises any of them.
 - **You get an auditable artifact, not a chat transcript.** Narrative, decisions, file lineage, spend, traces — all on disk.
 - **If anything dies — terminal, network, the model — the run survives.** Attach from a new terminal, resume from any turn, undo a bad step.
 
 ## Why "deadreckon"?
 
-Dead reckoning is navigation without perfect visibility: start from a known
-position, keep a continuous record of movement, and use that record to know
-where you are now.
+Dead reckoning is navigation without perfect visibility: track every move so you know where you are now. Unattended agents are the same problem — long task, partial context, the terminal may be gone when you look back. The name is the contract: don't trust the final answer, navigate by evidence.
 
-That is the problem with unattended coding agents. The model is probabilistic,
-the task can run for a long time, context is partial, and the terminal may be
-gone by the time you inspect the result. deadreckon keeps the course anyway:
-every turn writes state, spend, traces, provenance, snapshots, docs, and
-acceptance evidence.
+The questions deadreckon is built to answer:
 
-The name is the contract: do not trust a final answer alone. Navigate agent work
-by evidence.
-
-## Why This Exists
-
-Agentic coding CLIs are good at the inner loop: talk to a model, inspect files, run commands, edit code, and produce a patch. Amp, Rovo Dev, Cursor CLI, Codex, Claude Code, Aider, deepseek-tui, GitHub Copilot CLI, and similar tools are racing on model UX, tool UX, context handling, and terminal/editor ergonomics.
-
-deadreckon focuses on the layer around that CLI: the unattended run lifecycle.
-
-The painful part of unattended coding is different:
-
-- Where exactly did the agent run?
-- What did it spend?
-- Which files did each turn touch?
+- Where did the agent run, and what did it spend?
 - Can I attach after closing my laptop?
-- Can I kill it without leaving orphaned processes?
-- Can I resume after a crash?
 - Can I undo turn 7 without rolling back the whole project?
 - Can I prove the agent did not mark its own work as accepted?
-- Can I apply the result only after I inspect it?
 
-deadreckon is built around those questions. It treats an agentic CLI as the worker, then adds the control plane that makes unattended work reviewable, recoverable, auditable, and safe to apply.
-
-## The Printing Press Contract
-
-deadreckon borrows a simple idea from the CLI Printing Press pattern: split
-judgment from enforcement.
-
-The agentic CLI and Markdown skills own the judgment layer: what to inspect,
-what to try, what to edit, and when to say the work is done. The Rust binary owns
-the enforcement layer: state, locks, sandboxes, provider routing, cancellation,
-snapshots, provenance, spend, traces, gates, promotion, and recovery.
-
-That split matters. The agent can write code, but it cannot forge completion,
-skip the audit trail, bypass run state, or silently publish its own work.
-
-## The Unique Feature Set
+## Features
 
 ### Your Checkout Is Never Touched (Isolated Worktrees By Default)
 
@@ -105,56 +68,25 @@ deadreckon run "goal" --in-place --i-know-its-a-lot
 
 ### Use The Agent CLI You Already Trust
 
-deadreckon routes turns through configurable providers. Today, the first-class local CLI adapters are:
+Route turns through whichever provider you prefer:
 
-- `cli:codex`
-- `cli:claude-code`
+- **Local CLIs** (subscription): `cli:claude-code`, `cli:codex`
+- **Direct APIs** (BYOK): `anthropic`, `openai`, OpenAI-compatible endpoints
+- **Smoke** (keyless): `--smoke` for local verification
 
-It also supports direct model routes:
-
-- `anthropic`
-- `openai`
-- OpenAI-compatible endpoints
-- `--smoke` for keyless local verification
-
-That means subscription users can route through supported local agentic CLIs, while API users can route through direct HTTP providers. The CLI does the coding; deadreckon owns the run boundary around it.
+The CLI does the coding; deadreckon owns the run boundary around it.
 
 ### Crash-Proof: Every Turn Is Saved To Disk
 
-Each run writes a complete local record under `~/.deadreckon/runstate/`:
-
-```text
-state.json
-history.json
-events.jsonl
-traces.jsonl
-spend.jsonl
-provenance.jsonl
-snapshots/turn-<N>/
-proofs/turn-acceptance.json
-working/ or promoted library artifact
-```
-
-If the terminal dies, the run state is still there. If a provider call completes, the trace is there. If a tool edits a file, the provenance is there.
+Every turn writes state, traces, spend, file provenance, and a working-directory snapshot under `~/.deadreckon/runstate/`. If the terminal dies, attach from another. If the run itself crashes, resume from the last completed turn.
 
 ### Walk Away, Attach From Any Terminal
-
-Start a run, walk away, then attach from another terminal:
 
 ```bash
 deadreckon attach latest
 ```
 
-The TUI shows compact run status, phase, goal, working directory, per-turn timer,
-spend or context telemetry, provider/tool activity, generated files, process
-status, and completion actions. Completed runs can toggle a styled Markdown
-rendering of `RUN-NARRATIVE.md` directly in the main panel.
-
-Detach without killing the run:
-
-```text
-Ctrl-D
-```
+The TUI shows live status, current step, spend, recent file edits, and provider activity. Completed runs render `RUN-NARRATIVE.md` inline. Press `Ctrl-D` to detach without killing the run.
 
 ### Set A Budget And A Time Limit, Then Walk Away
 
@@ -189,13 +121,11 @@ deadreckon done check
 deadreckon run "finish the app"
 ```
 
-`deadreckon run` and `deadreckon chain run` prompt interactively when a project has no acceptance file yet. Generated files live under `.deadreckon/acceptance.yaml`, `.deadreckon/acceptance.md`, and optional helper scripts in `.deadreckon/acceptance/`.
+`deadreckon run` and `deadreckon chain run` prompt interactively when a project has no acceptance file yet. Generated files live under `.deadreckon/`.
 
-**Why the watchdog matters.** Completion requires a marker file written by the separate `dr-gate` binary. That binary holds a secret (a per-run nonce) that lives outside the agent's sandbox-readable paths. It hashes the secret together with the check results to sign the marker. deadreckon refuses any marker whose signature doesn't validate against that secret — so even if the agent fabricates a perfect-looking "I'm done" file, it gets rejected.
+**Why the watchdog matters.** The watchdog holds a secret the agent process cannot read. It stamps the result with that secret. Without a valid stamp, the run can't terminate — and the agent can't produce the stamp itself.
 
-The agent runs the code. The watchdog decides whether the code passed. They are different processes with different filesystem reach. The agent cannot become the watchdog.
-
-If no acceptance file is configured, the default is the working directory exists and `cargo test` passes (when `Cargo.toml` is present).
+If no acceptance file is configured, the default is "the working directory exists and `cargo test` passes" (when `Cargo.toml` is present).
 
 You can still edit the compiled YAML directly:
 
@@ -230,7 +160,7 @@ Each accepted run produces a review packet:
 - `RUN-AS-BUILT.md` captures the subsystem shape after the run.
 - `RUN-DECISIONS.md` records meaningful decisions.
 - `AS-BUILT-DELTA.md` proposes architecture-doc updates when the run is broad enough.
-- `manifest.json` records the promoted artifact identity and provenance hash.
+- `manifest.json` records what was built and from what.
 
 Agentic CLIs usually leave you with a patch and a transcript. deadreckon turns
 the session into a local published artifact you can inspect, materialize, extend,
@@ -304,162 +234,77 @@ your branch or library
 
 For multi-step work, `deadreckon chain` wraps this whole loop and runs N of them in order, stopping on the first gate failure.
 
-deadreckon owns the boring but load-bearing parts: state, locks, sandboxes, provider routing, cancellation, snapshots, provenance, gates, and promotion.
-
-The agent owns the coding work.
-
-## The Trust Contract
-
-With deadreckon, `completed` means more than "the agent stopped." It means:
-
-- the run state was persisted
-- the work happened in an isolated workspace
-- spend and traces were written
-- file provenance was recorded
-- snapshots exist for rollback
-- run docs were generated
-- `dr-gate` signed acceptance
-- the artifact was promoted atomically
-
-That is the difference between an agent transcript and an auditable run.
+The agent owns the coding. deadreckon owns the boundary.
 
 ## Quickstart
 
-Build the release binary:
+Build once:
 
 ```bash
 cargo build --release
 ```
 
-Initialize local config:
+The binary is `./target/release/deadreckon`. Add it to your `PATH` or alias it; the rest of this README just says `deadreckon`.
+
+Configure and run a task end-to-end:
 
 ```bash
-./target/release/deadreckon init
+deadreckon init --provider cli:claude-code --sandbox auto --max-spend 10
+
+deadreckon done   "users can sign up, log in, and save a drawing"
+deadreckon run    "build the app"
+deadreckon attach latest    # watch live, Ctrl-D to detach
+deadreckon doc    latest    # read the narrative once done
+deadreckon apply  latest --autostash --cleanup
 ```
 
-Run a task:
+`run` prints the run id and attach command immediately, and shows a preview of mode, branch, base ref, and worktree path before creating anything. Use `--preview` to print the preview and exit.
 
-```bash
-./target/release/deadreckon run "make a realtime chess app"
-```
-
-Attach to the run:
-
-```bash
-./target/release/deadreckon attach <run-id>
-```
-
-Inspect the result:
-
-```bash
-./target/release/deadreckon show <run-id>
-./target/release/deadreckon doc <run-id>
-```
-
-Apply a completed worktree run:
-
-```bash
-./target/release/deadreckon apply latest --autostash --cleanup
-```
-
-## Keyless Smoke Test
-
-Use `--smoke` to prove the harness works without API keys or subscription-backed CLIs:
+### Try It Without API Keys
 
 ```bash
 DEADRECKON_HOME=$PWD/.deadreckon-smoke \
-  ./target/release/deadreckon run "tiny hello rust" \
-  --smoke \
-  --sandbox none \
-  --max-spend 1
+  deadreckon run "tiny hello rust" --smoke --sandbox none --max-spend 1
 ```
 
-This still exercises the real turn loop, sandbox dispatch, snapshots, spend records, traces, provenance, docs, and acceptance gate. The only fake part is the provider response.
+The provider response is faked, but every other moving part — turn loop, sandbox, snapshots, spend, traces, gate — is real.
 
-## Normal Coding Run
+## Configuration
 
-After `init`, the default path in a git repo is:
+Switch providers, models, or defaults:
 
 ```bash
-deadreckon run "make a full task productivity tracker in nodejs that allows me to manage my day"
-deadreckon attach latest
-deadreckon status
-deadreckon doc latest
-deadreckon apply latest --autostash --cleanup
-```
-
-`run` prints the run id and attach command immediately:
-
-```text
-started run <short-id> (<full-id>)
-attach: deadreckon attach <short-id>
-```
-
-Before creating state or files, `run` prints a preview showing the mode, branch, base ref, and worktree path. Use `--preview` to print the preview and exit.
-
-## Provider Configuration
-
-Examples:
-
-```bash
-deadreckon init --provider cli:codex --sandbox auto --max-spend 10 --no-confirm
-deadreckon init --provider cli:claude-code --sandbox auto --max-spend 10 --no-confirm
-deadreckon init --provider anthropic --api-key "$ANTHROPIC_API_KEY" --sandbox auto --max-spend 10 --no-confirm
-deadreckon init --provider openai --api-key "$OPENAI_API_KEY" --sandbox auto --max-spend 10 --no-confirm
-```
-
-Inspect or edit config:
-
-```bash
-deadreckon config get defaults.provider
-deadreckon config provider
-deadreckon config provider cli:codex
-deadreckon config model
-deadreckon config model gpt-5.1-codex --provider cli:codex
+deadreckon init --provider cli:codex --sandbox auto --max-spend 10
+deadreckon init --provider anthropic --api-key "$ANTHROPIC_API_KEY"
+deadreckon config provider cli:claude-code
+deadreckon config model sonnet --provider cli:claude-code
 deadreckon config set defaults.max_spend 15
-deadreckon config set defaults.sandbox auto
-deadreckon config set providers.anthropic.api_key "$ANTHROPIC_API_KEY"
 ```
 
-Before a run, `deadreckon run --preview "goal"` shows the provider route and
-model that will be used. For one run, override both directly:
+Override per run:
 
 ```bash
 deadreckon run "goal" --provider cli:codex --model gpt-5.1-codex
-deadreckon run "goal" --provider cli:claude-code --model sonnet
+deadreckon run --preview "goal"     # show route and model, don't start
 ```
 
-Runtime config defaults to:
+Runtime config lives at `~/.deadreckon/config.toml`. Set `DEADRECKON_HOME` for isolated local runs or tests.
 
-```text
-~/.deadreckon/config.toml
-```
+### Sandbox Backends
 
-Set `DEADRECKON_HOME` for isolated local runs or tests.
+| Backend | What it is |
+|---|---|
+| `auto` | Picks the right native sandbox for your OS (default) |
+| `sandbox-exec` | macOS native |
+| `bwrap` | Linux native (bubblewrap) |
+| `docker` | Opt-in container sandbox |
+| `none` | Off — unsafe for real unattended work |
 
-## Sandbox Backends
-
-Supported backends:
-
-```text
-auto
-sandbox-exec
-bwrap
-docker
-none
-```
-
-`auto` chooses `sandbox-exec` on macOS when available and `bwrap` on Linux when available. `docker` is opt-in. `none` is explicit and warns because it is unsafe for real unattended work.
-
-Check the current machine:
-
-```bash
-deadreckon doctor
-```
+Check what your machine supports with `deadreckon doctor`.
 
 ## Compared With Agentic Coding CLIs
 
-deadreckon is not a replacement for agentic CLIs like Amp, Rovo Dev, Cursor CLI, Codex, Claude Code, Aider, deepseek-tui, or GitHub Copilot CLI. It is the supervisor you put around that class of tool when the task is too long, risky, or expensive for "run the agent in my checkout and hope I can reconstruct what happened."
+deadreckon doesn't replace Claude Code, Codex, or Cursor CLI — it supervises them. Use deadreckon when the task is too long, risky, or expensive to "run the agent in my checkout and hope I can reconstruct what happened."
 
 | Operational concern | Agentic CLI alone | deadreckon supervising the CLI |
 |---|---|---|
@@ -478,34 +323,31 @@ Use the agentic CLI for intelligence. Use deadreckon for isolation, supervision,
 
 ## Command Surface
 
+Core lifecycle:
+
 ```text
 init          create local config
 config        inspect or edit config keys
 run           start an unattended coding run
 attach        open the live dashboard
-status/next   show the current project's latest run and next action
-list          show current-project runs by default; --all shows every scope
+status        latest run and next action for this project
+list          list runs (current project; --all for every scope)
 show          inspect state, lineage, spend, files
 doc           print or export run documentation
-finish        choose apply or export from the completed run mode
 apply         apply a completed worktree run to your branch
-keep          alias for apply
 abandon       remove a worktree run and temporary branch
-discard       alias for abandon
 materialize   copy a completed artifact to a normal directory
-export        alias for materialize
-cleanup       clean abandoned, stale, or completed worktrees
-prune         alias for cleanup
 extend        continue from a completed run
-follow-up     alias for extend
 resume        continue an interrupted run
-continue      alias for resume
 kill          stop a live run and child processes
-stop          alias for kill
 undo          restore a previous turn snapshot
+cleanup       clean abandoned, stale, or completed worktrees
+finish        choose apply or export from completed run
 import        normalize histories from other coding tools
 doctor        check config, providers, sandboxes, disk, runtime
 ```
+
+Aliases: `keep` → `apply`, `discard` → `abandon`, `export` → `materialize`, `prune` → `cleanup`, `follow-up` → `extend`, `continue` → `resume`, `stop` → `kill`, `next` → `status`.
 
 ## Verification
 
@@ -528,9 +370,9 @@ The workspace test suite covers provider routing, mock OpenAI-compatible runs, C
 
 ## Status
 
-deadreckon is alpha software. The core lifecycle is implemented and tested, but the project is intentionally conservative about claims: local-first state, worktree isolation, provider routing, sandbox dispatch, durable traces/spend/provenance, signed gates, undo, docs, apply/abandon/materialize/extend, and smoke verification are the current product.
+deadreckon is alpha software. The core lifecycle — isolated runs, signed gates, durable state, undo, docs, and apply — is implemented and tested.
 
-The V1 candidate list is deliberately short. The biggest known next feature is explicit sub-agent forking:
+The V1 candidate list is deliberately short. The next big feature is explicit sub-agent forking:
 
 ```text
 deadreckon fork <run-id> --prompt "..."
