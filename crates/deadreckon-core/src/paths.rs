@@ -63,6 +63,46 @@ impl DeadreckonPaths {
         self.home.join("chains")
     }
 
+    pub fn plans_dir(&self) -> PathBuf {
+        self.home.join("plans")
+    }
+
+    pub fn plan_dir(&self, plan_id: &str) -> PathBuf {
+        self.plans_dir().join(plan_id)
+    }
+
+    pub fn plan_json(&self, plan_id: &str) -> PathBuf {
+        self.plan_dir(plan_id).join("plan.json")
+    }
+
+    pub fn coordinator_json(&self, plan_id: &str) -> PathBuf {
+        self.plan_dir(plan_id).join("coordinator.json")
+    }
+
+    pub fn plan_messages(&self, plan_id: &str) -> PathBuf {
+        self.plan_dir(plan_id).join("messages.jsonl")
+    }
+
+    pub fn worker_spec(&self, plan_id: &str, task_id: &str) -> PathBuf {
+        self.plan_dir(plan_id)
+            .join("worker-specs")
+            .join(format!("{}.md", sanitize_slug(task_id)))
+    }
+
+    pub fn child_summary(&self, plan_id: &str, task_id: &str) -> PathBuf {
+        self.plan_dir(plan_id)
+            .join("summaries")
+            .join(format!("{}.md", sanitize_slug(task_id)))
+    }
+
+    pub fn merge_working(&self, plan_id: &str) -> PathBuf {
+        self.plan_dir(plan_id).join("merge-working")
+    }
+
+    pub fn merge_proofs(&self, plan_id: &str) -> PathBuf {
+        self.plan_dir(plan_id).join("merge-proofs")
+    }
+
     pub fn chain_dir(&self, chain_id: &str) -> PathBuf {
         self.chains_dir().join(chain_id)
     }

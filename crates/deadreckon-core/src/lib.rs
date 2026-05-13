@@ -13,6 +13,7 @@ pub mod events;
 pub mod gate;
 pub mod lock;
 pub mod paths;
+pub mod plan;
 pub mod polish_subcalls;
 pub mod promotion;
 pub mod state;
@@ -68,6 +69,15 @@ pub use lock::{
     terminate_pid,
 };
 pub use paths::{DEFAULT_DEADRECKON_HOME, DeadreckonPaths, SOURCE_ROOT};
+pub use plan::{
+    COORDINATOR_JSON, CapabilityPreview, CoordinatorChild, CoordinatorState, NetworkCapability,
+    PLAN_CHILD_PARENT_JSON, PLAN_JSON, PLAN_MESSAGES_JSONL, Plan, PlanChildMarker, PlanMessage,
+    PlanMessageKind, PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus,
+    SUMMARIES_DIR, WORKER_SPECS_DIR, append_plan_message, child_summary_relative_path, load_plan,
+    plan_task_key, read_plan_messages, save_plan, validate_task_count, validate_task_graph,
+    worker_spec_relative_path, write_child_summary, write_coordinator_state,
+    write_plan_child_marker, write_worker_spec,
+};
 pub use polish_subcalls::{
     DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DocProviderSelection,
     DocProviderSource, PolishDiffCoverage, PolishSubcallRecord,
