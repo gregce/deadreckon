@@ -4,20 +4,35 @@
 
 # deadreckon
 
-**The control plane for unattended agentic coding CLIs.**
+**A harness around the agent CLI you already use, so you can actually walk away.**
 
-deadreckon runs long coding tasks the way you wish agentic CLIs already did: in an isolated workspace, with durable state, live attach, spend and wall-clock caps, per-turn undo, provenance, traces, self-documenting run artifacts, and a signed acceptance gate before anything is promoted.
+Codex, Claude Code, Aider, and the rest are good at writing code. They are not built to run unattended for hours and tell you, honestly, whether the work got done. deadreckon is.
 
-It is not trying to out-code Amp, Rovo Dev, Cursor CLI, Codex, Claude Code, Aider, deepseek-tui, GitHub Copilot CLI, or the next terminal agent. Use the agentic CLI you already trust. deadreckon wraps it in the missing operational harness.
+You bring the agent CLI you already trust. You tell deadreckon what "done" looks like in plain English. It runs the work in an isolated sandbox, saves every turn, and uses a separate watchdog process to decide when the job is actually finished — a watchdog the agent cannot fool.
 
 ```bash
-deadreckon run "replace the legacy billing flow with Stripe Checkout"
+deadreckon done "users can sign up, log in, and save a drawing"
+deadreckon run "build the app"
+# walk away, attach later from any terminal
 deadreckon attach latest
-deadreckon status
-deadreckon doc latest
-deadreckon finish latest
-deadreckon apply latest --autostash --cleanup
 ```
+
+## How it works
+
+1. **You write "done" in plain English.** deadreckon compiles it into executable checks — tests that must pass, files that must exist, scripts that must succeed.
+2. **The agent runs in an isolated worktree**, inside a sandbox. Your real checkout is never touched.
+3. **Every turn is saved** — state, spend, traces, file provenance, snapshots — so you can attach, kill, resume, undo, or audit any moment.
+4. **A separate watchdog process (`dr-gate`) decides when the work is done.** It holds a secret the agent process cannot read, and signs the result with that secret. The agent cannot forge the signature, so it cannot mark its own work as accepted.
+5. **If the checks fail, the loop keeps going.** The agent gets another turn. When the watchdog finally signs off for real, the run is atomically promoted to a reviewable artifact — narrative, decisions, file provenance, full audit trail.
+
+The loop is the product. The agent CLI does the coding. deadreckon decides when "done" actually means done.
+
+## Why this matters
+
+- **You can leave a long run going and trust the result.** The agent can't lie its way out of the gate.
+- **Use whichever agent CLI you prefer.** Claude Code, Codex, Aider, or direct Anthropic / OpenAI API — deadreckon supervises any of them.
+- **You get an auditable artifact, not a chat transcript.** Narrative, decisions, file lineage, spend, traces — all on disk.
+- **If anything dies — terminal, network, the model — the run survives.** Attach from a new terminal, resume from any turn, undo a bad step.
 
 ## Why "deadreckon"?
 
@@ -69,7 +84,7 @@ skip the audit trail, bypass run state, or silently publish its own work.
 
 ## The Unique Feature Set
 
-### Isolated Worktrees By Default
+### Your Checkout Is Never Touched (Isolated Worktrees By Default)
 
 In a git repo, `deadreckon run` creates a separate `git worktree` on a `dr/...` branch under `~/.deadreckon/worktrees/`. Your checkout is left untouched until you explicitly run:
 
@@ -88,7 +103,7 @@ deadreckon run "goal" --fresh
 deadreckon run "goal" --in-place --i-know-its-a-lot
 ```
 
-### Wrap The Agentic CLI You Already Use
+### Use The Agent CLI You Already Trust
 
 deadreckon routes turns through configurable providers. Today, the first-class local CLI adapters are:
 
@@ -104,7 +119,7 @@ It also supports direct model routes:
 
 That means subscription users can route through supported local agentic CLIs, while API users can route through direct HTTP providers. The CLI does the coding; deadreckon owns the run boundary around it.
 
-### Durable State After Every Turn
+### Crash-Proof: Every Turn Is Saved To Disk
 
 Each run writes a complete local record under `~/.deadreckon/runstate/`:
 
@@ -122,7 +137,7 @@ working/ or promoted library artifact
 
 If the terminal dies, the run state is still there. If a provider call completes, the trace is there. If a tool edits a file, the provenance is there.
 
-### Live Attach Without Owning The Process
+### Walk Away, Attach From Any Terminal
 
 Start a run, walk away, then attach from another terminal:
 
@@ -141,7 +156,7 @@ Detach without killing the run:
 Ctrl-D
 ```
 
-### Spend And Wall-Clock Guardrails
+### Set A Budget And A Time Limit, Then Walk Away
 
 Every provider response appends a spend record and updates totals. API routes track token cost. Subscription CLI routes can be capped by wall-clock time.
 
@@ -152,7 +167,7 @@ deadreckon run "large refactor" --max-wall-seconds 1800
 
 High spend requires explicit confirmation, so scripts do not accidentally launch expensive runs.
 
-### Per-Turn Undo
+### Undo A Single Bad Turn Without Losing The Rest
 
 deadreckon snapshots the working directory at turn boundaries:
 
@@ -163,13 +178,9 @@ deadreckon undo --run <run-id> --turn 3
 
 This is not just `git reset`. It works against the run's own snapshot trail and records the undo in the run trace.
 
-### Signed Done Criteria
+### Write "Done" In English, Verified By A Watchdog
 
-The agent cannot declare its own work accepted.
-
-Completion requires a marker written by the separate `dr-gate` binary and bound to the run id with a run-local nonce. deadreckon refuses forged or self-written markers.
-
-Default acceptance checks that the working directory exists and runs `cargo test` when `Cargo.toml` is present. For real work, write the definition of done in English and let deadreckon compile it into the `dr-gate` format:
+Tell deadreckon what success looks like in plain language. It compiles your sentence into executable checks that an independent watchdog runs:
 
 ```bash
 deadreckon done "build, load in a browser, and show no console errors"
@@ -178,7 +189,13 @@ deadreckon done check
 deadreckon run "finish the app"
 ```
 
-`deadreckon run` and `deadreckon chain run` prompt interactively when a project has no acceptance file yet. The generated files live under `.deadreckon/acceptance.yaml`, `.deadreckon/acceptance.md`, and optional helper scripts in `.deadreckon/acceptance/`.
+`deadreckon run` and `deadreckon chain run` prompt interactively when a project has no acceptance file yet. Generated files live under `.deadreckon/acceptance.yaml`, `.deadreckon/acceptance.md`, and optional helper scripts in `.deadreckon/acceptance/`.
+
+**Why the watchdog matters.** Completion requires a marker file written by the separate `dr-gate` binary. That binary holds a secret (a per-run nonce) that lives outside the agent's sandbox-readable paths. It hashes the secret together with the check results to sign the marker. deadreckon refuses any marker whose signature doesn't validate against that secret — so even if the agent fabricates a perfect-looking "I'm done" file, it gets rejected.
+
+The agent runs the code. The watchdog decides whether the code passed. They are different processes with different filesystem reach. The agent cannot become the watchdog.
+
+If no acceptance file is configured, the default is the working directory exists and `cargo test` passes (when `Cargo.toml` is present).
 
 You can still edit the compiled YAML directly:
 
@@ -196,7 +213,7 @@ checks:
 
 Supported executable check kinds are `cargo_test`, `file_exists`, `content_match`, `build_success`, and `shell`. `content_match` treats `pattern` as a regex when valid, with substring fallback for simple text.
 
-### Provenance, Traces, And Run Docs
+### Get An Auditable Artifact, Not A Transcript
 
 deadreckon records which model/tool call touched which files, then writes self-documenting artifacts for the completed run:
 
@@ -219,7 +236,7 @@ Agentic CLIs usually leave you with a patch and a transcript. deadreckon turns
 the session into a local published artifact you can inspect, materialize, extend,
 or apply.
 
-### Resume, Kill, Extend, Materialize
+### Resume, Kill, Extend, Or Export Any Run
 
 Runs are lifecycle objects, not one terminal session:
 
@@ -238,27 +255,54 @@ deadreckon cleanup --completed
 
 Resume reconstructs history from durable traces and ignores incomplete trailing trace entries.
 
+### Autonomous Chains For Multi-Step Work
+
+Some tasks are too big for one goal. Chains let you break work into ordered steps that run end-to-end, with the same gate enforcement and the same lifecycle commands per step:
+
+```bash
+deadreckon chain plan "ship a working SaaS billing flow" --n 4
+deadreckon chain run latest
+deadreckon chain attach latest
+deadreckon chain kill latest
+```
+
+Each chain step is a real run with its own signed acceptance gate. If a step fails its gate, the chain stops there — later steps don't start. Killing a chain cascades to whatever step is live. The attach TUI shows the whole chain timeline, not just the current turn, so you can see where you are in the plan without leaving the dashboard.
+
+You can also extend a finished run into a follow-up step instead of planning the whole chain up front:
+
+```bash
+deadreckon chain extend latest "add billing webhooks and retry logic"
+```
+
 ## The Mental Model
 
 ```text
 your repo
   |
-  | deadreckon run "goal"
+  | deadreckon done "what 'finished' looks like, in English"
+  | deadreckon run  "what to build"
   v
-isolated worktree or copy
+isolated worktree or copy   ◄── your real checkout untouched
   |
-  | provider route: cli:codex, cli:claude-code, anthropic, openai, compatible
+  | provider route: cli:codex, cli:claude-code, anthropic, openai, ...
   v
-sandboxed turn loop
+sandboxed turn loop         ◄── agent works here
   |
   | every turn: trace, spend, provenance, snapshot, docs
+  | check fails? agent gets another turn
   v
-signed acceptance gate
+dr-gate watchdog            ◄── separate process, holds hidden nonce
+  |                              agent CANNOT produce a valid marker
+  | checks pass + signature valid?
+  v
+promoted artifact           ◄── narrative, decisions, file lineage
   |
   | inspect, doc, apply, discard, extend, export, cleanup
   v
-your branch or artifact
+your branch or library
 ```
+
+For multi-step work, `deadreckon chain` wraps this whole loop and runs N of them in order, stopping on the first gate failure.
 
 deadreckon owns the boring but load-bearing parts: state, locks, sandboxes, provider routing, cancellation, snapshots, provenance, gates, and promotion.
 
