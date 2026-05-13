@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::process::Command;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -140,6 +144,53 @@ pub struct ProviderRegistry {
     descriptors: BTreeMap<String, ProviderDescriptor>,
 }
 
+pub type ProviderProbeFuture<'a> = Pin<Box<dyn Future<Output = ProviderProbeResult> + Send + 'a>>;
+
+pub trait ProviderProbe {
+    fn probe<'a>(&'a self, options: ProviderProbeOptions) -> ProviderProbeFuture<'a>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProviderProbeOptions {
+    pub ping: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeStatus {
+    Ok,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeErrorKind {
+    NotFound,
+    PermissionDenied,
+    VersionMismatch,
+    AuthMissing,
+    EndpointUnreachable,
+    ProbeFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderProbeResult {
+    pub id: String,
+    pub display_name: String,
+    pub kind: DescriptorKind,
+    pub status: ProbeStatus,
+    pub location: Option<String>,
+    pub version: Option<String>,
+    pub credential: String,
+    pub subscription: bool,
+    pub metering: String,
+    pub fs_artifacts: Vec<String>,
+    pub error_kind: Option<ProbeErrorKind>,
+    pub message: Option<String>,
+    pub try_lines: Vec<String>,
+}
+
 impl ProviderRegistry {
     pub fn builtin() -> Result<Self> {
         let mut registry = Self::default();
@@ -188,6 +239,14 @@ impl ProviderRegistry {
         self.descriptors.keys().cloned().collect()
     }
 
+    pub async fn probe_all(&self, options: ProviderProbeOptions) -> Vec<ProviderProbeResult> {
+        let mut results = Vec::new();
+        for descriptor in self.iter() {
+            results.push(descriptor.probe(options).await);
+        }
+        results
+    }
+
     fn load_override(&mut self, path: &Path) -> Result<()> {
         let raw = fs::read_to_string(path).map_err(|source| ProviderError::Io {
             path: path.display().to_string(),
@@ -231,6 +290,352 @@ pub fn parse_custom_command(command: &str) -> Result<(String, Vec<String>)> {
         ));
     };
     Ok((binary.clone(), rest.to_vec()))
+}
+
+impl ProviderProbe for ProviderDescriptor {
+    fn probe<'a>(&'a self, options: ProviderProbeOptions) -> ProviderProbeFuture<'a> {
+        Box::pin(async move { probe_descriptor(self, options).await })
+    }
+}
+
+async fn probe_descriptor(
+    descriptor: &ProviderDescriptor,
+    options: ProviderProbeOptions,
+) -> ProviderProbeResult {
+    match descriptor.kind {
+        DescriptorKind::Cli => probe_cli_descriptor(descriptor),
+        DescriptorKind::Http => probe_http_descriptor(descriptor, options).await,
+        DescriptorKind::LocalHttp => probe_local_http_descriptor(descriptor, options).await,
+        DescriptorKind::Scripted => base_probe_result(
+            descriptor,
+            ProbeStatus::Ok,
+            Some("built-in".to_string()),
+            None,
+            "ready",
+            None,
+            None,
+        ),
+    }
+}
+
+fn probe_cli_descriptor(descriptor: &ProviderDescriptor) -> ProviderProbeResult {
+    let Some(binary) = descriptor.default_binary.as_deref() else {
+        return base_probe_result(
+            descriptor,
+            ProbeStatus::Failed,
+            None,
+            None,
+            "missing",
+            Some(ProbeErrorKind::NotFound),
+            Some("no default binary configured".to_string()),
+        );
+    };
+    let Some(location) = resolve_binary(binary) else {
+        return base_probe_result(
+            descriptor,
+            ProbeStatus::Failed,
+            Some(binary.to_string()),
+            None,
+            "missing",
+            Some(ProbeErrorKind::NotFound),
+            Some(format!("{binary} not on PATH")),
+        );
+    };
+    if let Some(probe) = descriptor.version_probe.as_ref()
+        && !probe.args.is_empty()
+    {
+        match Command::new(&location).args(&probe.args).output() {
+            Ok(output) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return base_probe_result(
+                        descriptor,
+                        ProbeStatus::Failed,
+                        Some(location.display().to_string()),
+                        None,
+                        "missing",
+                        Some(ProbeErrorKind::ProbeFailed),
+                        Some(trim_probe_message(&stderr)),
+                    );
+                }
+                let version = trim_probe_message(&format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+                if let Some(expected) = probe.expect_substring.as_deref()
+                    && !version.contains(expected)
+                {
+                    return base_probe_result(
+                        descriptor,
+                        ProbeStatus::Failed,
+                        Some(location.display().to_string()),
+                        Some(version),
+                        "missing",
+                        Some(ProbeErrorKind::VersionMismatch),
+                        Some(format!("version output did not contain {expected}")),
+                    );
+                }
+                if let Some(min) = probe.min_known_good.as_deref()
+                    && !version_at_least(&version, min)
+                {
+                    return base_probe_result(
+                        descriptor,
+                        ProbeStatus::Failed,
+                        Some(location.display().to_string()),
+                        Some(version),
+                        "missing",
+                        Some(ProbeErrorKind::VersionMismatch),
+                        Some(format!("version below known-good {min}")),
+                    );
+                }
+                return base_probe_result(
+                    descriptor,
+                    ProbeStatus::Ok,
+                    Some(location.display().to_string()),
+                    Some(version),
+                    "ready",
+                    None,
+                    None,
+                );
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::PermissionDenied => {
+                return base_probe_result(
+                    descriptor,
+                    ProbeStatus::Failed,
+                    Some(location.display().to_string()),
+                    None,
+                    "missing",
+                    Some(ProbeErrorKind::PermissionDenied),
+                    Some(format!("permission denied running {binary}")),
+                );
+            }
+            Err(source) => {
+                return base_probe_result(
+                    descriptor,
+                    ProbeStatus::Failed,
+                    Some(location.display().to_string()),
+                    None,
+                    "missing",
+                    Some(ProbeErrorKind::ProbeFailed),
+                    Some(source.to_string()),
+                );
+            }
+        }
+    }
+    base_probe_result(
+        descriptor,
+        ProbeStatus::Ok,
+        Some(location.display().to_string()),
+        None,
+        "ready",
+        None,
+        None,
+    )
+}
+
+async fn probe_http_descriptor(
+    descriptor: &ProviderDescriptor,
+    options: ProviderProbeOptions,
+) -> ProviderProbeResult {
+    if let AuthKind::ApiKey = descriptor.auth.kind {
+        let Some(env_var) = descriptor.auth.env_var.as_deref() else {
+            return base_probe_result(
+                descriptor,
+                ProbeStatus::Failed,
+                descriptor.default_endpoint.clone(),
+                None,
+                "missing",
+                Some(ProbeErrorKind::AuthMissing),
+                Some("api-key provider has no env var configured".to_string()),
+            );
+        };
+        if std::env::var(env_var)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            return base_probe_result(
+                descriptor,
+                ProbeStatus::Failed,
+                descriptor.default_endpoint.clone(),
+                None,
+                "missing",
+                Some(ProbeErrorKind::AuthMissing),
+                Some(format!("{env_var} missing")),
+            );
+        }
+    }
+    if options.ping {
+        return ping_endpoint(descriptor).await;
+    }
+    base_probe_result(
+        descriptor,
+        ProbeStatus::Ok,
+        descriptor.default_endpoint.clone(),
+        Some("ping skipped".to_string()),
+        "ready",
+        None,
+        None,
+    )
+}
+
+async fn probe_local_http_descriptor(
+    descriptor: &ProviderDescriptor,
+    options: ProviderProbeOptions,
+) -> ProviderProbeResult {
+    if options.ping {
+        return ping_endpoint(descriptor).await;
+    }
+    base_probe_result(
+        descriptor,
+        ProbeStatus::Skipped,
+        descriptor.default_endpoint.clone(),
+        Some("ping required".to_string()),
+        "unknown",
+        None,
+        Some("local endpoint probe skipped; pass --ping".to_string()),
+    )
+}
+
+async fn ping_endpoint(descriptor: &ProviderDescriptor) -> ProviderProbeResult {
+    let endpoint = descriptor.default_endpoint.clone().unwrap_or_default();
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(source) => {
+            return base_probe_result(
+                descriptor,
+                ProbeStatus::Failed,
+                Some(endpoint),
+                None,
+                "missing",
+                Some(ProbeErrorKind::ProbeFailed),
+                Some(source.to_string()),
+            );
+        }
+    };
+    match client.get(&endpoint).send().await {
+        Ok(response) => base_probe_result(
+            descriptor,
+            ProbeStatus::Ok,
+            Some(endpoint),
+            Some(format!("HTTP {}", response.status())),
+            "ready",
+            None,
+            None,
+        ),
+        Err(source) => base_probe_result(
+            descriptor,
+            ProbeStatus::Failed,
+            Some(endpoint),
+            None,
+            "missing",
+            Some(ProbeErrorKind::EndpointUnreachable),
+            Some(source.to_string()),
+        ),
+    }
+}
+
+fn base_probe_result(
+    descriptor: &ProviderDescriptor,
+    status: ProbeStatus,
+    location: Option<String>,
+    version: Option<String>,
+    credential: &str,
+    error_kind: Option<ProbeErrorKind>,
+    message: Option<String>,
+) -> ProviderProbeResult {
+    ProviderProbeResult {
+        id: descriptor.id.clone(),
+        display_name: descriptor.display_name.clone(),
+        kind: descriptor.kind.clone(),
+        status,
+        location,
+        version,
+        credential: credential.to_string(),
+        subscription: descriptor.subscription,
+        metering: if descriptor.subscription {
+            "subscription".to_string()
+        } else {
+            "metered".to_string()
+        },
+        fs_artifacts: descriptor
+            .fs_detection_paths
+            .iter()
+            .map(|path| expand_home_path(path).display().to_string())
+            .collect(),
+        error_kind,
+        message,
+        try_lines: descriptor.install_hint.try_lines.clone(),
+    }
+}
+
+fn resolve_binary(binary: &str) -> Option<PathBuf> {
+    let configured = PathBuf::from(binary);
+    if configured.components().count() > 1 || configured.is_absolute() {
+        return configured.exists().then_some(configured);
+    }
+    which::which(binary).ok()
+}
+
+fn expand_home_path(path: &Path) -> PathBuf {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return path.to_path_buf();
+    };
+    if path == Path::new("~") {
+        return home;
+    }
+    if let Ok(rest) = path.strip_prefix("~") {
+        return home.join(rest);
+    }
+    path.to_path_buf()
+}
+
+fn trim_probe_message(message: &str) -> String {
+    let first_line = message
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let trimmed = first_line.trim();
+    if trimmed.len() > 120 {
+        format!("{}...", &trimmed[..120])
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn version_at_least(output: &str, minimum: &str) -> bool {
+    let observed = first_version_tuple(output);
+    let required = first_version_tuple(minimum);
+    if observed.is_empty() || required.is_empty() {
+        return output >= minimum;
+    }
+    compare_version_tuples(&observed, &required) != std::cmp::Ordering::Less
+}
+
+fn first_version_tuple(text: &str) -> Vec<u64> {
+    text.split(|ch: char| !ch.is_ascii_digit() && ch != '.')
+        .find(|part| part.chars().any(|ch| ch.is_ascii_digit()))
+        .unwrap_or("")
+        .split('.')
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+fn compare_version_tuples(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
+    let len = left.len().max(right.len());
+    for index in 0..len {
+        let l = left.get(index).copied().unwrap_or(0);
+        let r = right.get(index).copied().unwrap_or(0);
+        match l.cmp(&r) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 fn split_command_line(command: &str) -> Vec<String> {

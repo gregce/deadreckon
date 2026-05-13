@@ -78,6 +78,17 @@ Subcommands:
 Lifecycle:
   Configure once, then `deadreckon run \"goal\"`. Per-run flags override these defaults.";
 
+const DETECT_HELP: &str = "\
+Lifecycle:
+  deadreckon detect
+  deadreckon detect cli:codex
+  deadreckon detect --json
+  deadreckon detect ollama --ping
+
+Detect probes registered providers from descriptor data. CLI providers check PATH
+and version output; API providers check credentials by default and only touch
+endpoints when `--ping` is supplied.";
+
 const RUN_HELP: &str = "\
 Lifecycle:
   deadreckon run \"build the thing\"
@@ -604,6 +615,19 @@ pub(crate) enum Commands {
         after_help = DOCTOR_HELP
     )]
     Doctor,
+    #[command(
+        next_help_heading = "Setup",
+        about = "Probe registered providers from descriptor data",
+        after_help = DETECT_HELP
+    )]
+    Detect {
+        #[arg(help = "Provider id to probe, for example cli:codex")]
+        id: Option<String>,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+        #[arg(long, help = "Probe HTTP/local endpoints instead of only credentials")]
+        ping: bool,
+    },
     #[command(
         next_help_heading = "Run Lifecycle",
         visible_alias = "runs",

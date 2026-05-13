@@ -35,6 +35,9 @@ use deadreckon_core::{
     resolve_mode, restore_snapshot, save_chain, save_state, terminate_pid,
     validate_acceptance_marker, write_cancel_marker, write_chain_step_marker,
 };
+use deadreckon_providers::registry::{
+    ProbeStatus, ProviderProbe, ProviderProbeOptions, ProviderProbeResult, ProviderRegistry,
+};
 use deadreckon_providers::{
     ProviderRequest, ProviderRouteInfo, ProviderRouter, ProviderUsage, SpendEstimate,
 };
@@ -380,6 +383,7 @@ async fn main_inner() -> Result<()> {
             .await
         }
         Commands::Doctor => doctor_command().await,
+        Commands::Detect { id, json, ping } => detect_command(id, json, ping).await,
         Commands::List { scope, all } => list_command(scope, all),
         Commands::Library { command } => library_command(command),
         Commands::Finish {
@@ -999,6 +1003,64 @@ fn set_provider_model(root: &mut toml::Value, provider: &str, model: &str) {
 
 fn format_provider_kind(kind: &deadreckon_providers::ProviderKind) -> &str {
     kind.as_config_str()
+}
+
+async fn detect_command(id: Option<String>, json_output: bool, ping: bool) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let options = ProviderProbeOptions { ping };
+    let results = if let Some(id) = id {
+        let Some(descriptor) = registry.get(&id) else {
+            let message = format!("no provider '{id}' in registry");
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &message,
+                "deadreckon providers list",
+            )));
+        };
+        vec![descriptor.probe(options).await]
+    } else {
+        registry.probe_all(options).await
+    };
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "providers": results }))?
+        );
+    } else {
+        print_detect_results(&results);
+    }
+    Ok(())
+}
+
+fn print_detect_results(results: &[ProviderProbeResult]) {
+    println!("{}", ui_heading("provider detection"));
+    for result in results {
+        let symbol = match result.status {
+            ProbeStatus::Ok => ui_ok("✓"),
+            ProbeStatus::Failed => ui_warn("✗"),
+            ProbeStatus::Skipped => ui_muted("-"),
+        };
+        let location = result.location.as_deref().unwrap_or("-");
+        let version = result.version.as_deref().unwrap_or("-");
+        let message = result.message.as_deref().unwrap_or("");
+        println!(
+            "{:<20} {}  {:<14} {:<36} {:<18} {}",
+            ui_id(&result.id),
+            symbol,
+            result.credential,
+            location,
+            version,
+            result.metering
+        );
+        if !message.is_empty() {
+            println!("    {}", ui_muted(message));
+        }
+        if result.status == ProbeStatus::Failed {
+            for line in &result.try_lines {
+                println!("    {} {}", ui_command("try:"), ui_command(line));
+            }
+        }
+    }
 }
 
 fn print_chain_help(topic: Option<&str>) {
