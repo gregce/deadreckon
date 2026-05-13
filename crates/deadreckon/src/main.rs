@@ -10607,24 +10607,64 @@ struct ProviderActivity {
     context_window: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ProviderJsonlSchema {
+    CodexCli,
+    ClaudeCode,
+}
+
+#[derive(Debug)]
+struct ProviderJsonlLogSpec {
+    schema: ProviderJsonlSchema,
+    roots: Vec<PathBuf>,
+    since: DateTime<Utc>,
+}
+
 fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> ProviderActivity {
-    if state.provider.as_deref() != Some("cli:codex") {
-        return ProviderActivity::default();
-    }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(spec) = provider_jsonl_log_spec(state) else {
         return ProviderActivity::default();
     };
-    let sessions_root = home.join(".codex/sessions");
+    collect_jsonl_provider_activity(state, &spec)
+}
+
+fn provider_jsonl_log_spec(state: &deadreckon_core::PipelineState) -> Option<ProviderJsonlLogSpec> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let since = state.started_at - ChronoDuration::minutes(2);
+    match state.provider.as_deref()? {
+        "cli:codex" => Some(ProviderJsonlLogSpec {
+            schema: ProviderJsonlSchema::CodexCli,
+            roots: vec![home.join(".codex/sessions")],
+            since,
+        }),
+        "cli:claude-code" => {
+            let mut seen_roots = BTreeSet::new();
+            let roots = run_working_dirs(state)
+                .iter()
+                .map(|working_dir| claude_project_dir_for_workdir(&home, working_dir))
+                .filter(|root| seen_roots.insert(root.clone()))
+                .collect::<Vec<_>>();
+            Some(ProviderJsonlLogSpec {
+                schema: ProviderJsonlSchema::ClaudeCode,
+                roots,
+                since,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn collect_jsonl_provider_activity(
+    state: &deadreckon_core::PipelineState,
+    spec: &ProviderJsonlLogSpec,
+) -> ProviderActivity {
+    let working_dirs = run_working_dirs(state);
     let mut candidates = Vec::new();
-    collect_recent_jsonl_files(&sessions_root, since, &mut candidates, 0);
+    for root in &spec.roots {
+        collect_recent_jsonl_files(root, spec.since, &mut candidates, 0);
+    }
     candidates.sort_by(|left, right| right.1.cmp(&left.1));
-    let working_dirs = [
-        state.working_dir.to_string_lossy().to_string(),
-        state.run_root.join("working").to_string_lossy().to_string(),
-    ];
     for (path, _) in candidates {
-        if !codex_session_matches_run(&path, &working_dirs) {
+        if !provider_jsonl_session_matches_run(spec.schema, &path, &working_dirs) {
             continue;
         }
         let Ok(raw) = fs::read_to_string(&path) else {
@@ -10632,38 +10672,76 @@ fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> Provider
         };
         let mut activity = ProviderActivity::default();
         for line in raw.lines() {
-            if let Some(line) = codex_activity_line(line, &mut activity) {
-                activity.lines.push(line);
-            }
+            let mut parsed = provider_jsonl_activity_lines(spec.schema, line, &mut activity);
+            activity.lines.append(&mut parsed);
         }
         if activity.lines.is_empty() {
             continue;
         }
-        activity.lines.push(format!(
-            "{} provider log {}",
-            format_age(
-                fs::metadata(&path)
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok())
-                    .map(DateTime::<Utc>::from),
-            ),
-            path.display()
-        ));
-        activity.lines = activity
-            .lines
-            .into_iter()
-            .rev()
-            .take(240)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        return activity;
+        append_provider_log_line(&mut activity, &path);
+        return cap_provider_activity(activity, 240);
     }
     ProviderActivity::default()
 }
 
-fn codex_session_matches_run(path: &Path, working_dirs: &[String]) -> bool {
+fn run_working_dirs(state: &deadreckon_core::PipelineState) -> Vec<String> {
+    vec![
+        state.working_dir.to_string_lossy().to_string(),
+        state.run_root.join("working").to_string_lossy().to_string(),
+    ]
+}
+
+fn provider_jsonl_session_matches_run(
+    schema: ProviderJsonlSchema,
+    path: &Path,
+    working_dirs: &[String],
+) -> bool {
+    match schema {
+        ProviderJsonlSchema::CodexCli => jsonl_session_meta_cwd_matches(path, working_dirs),
+        ProviderJsonlSchema::ClaudeCode => jsonl_top_level_cwd_matches(path, working_dirs, 80),
+    }
+}
+
+fn provider_jsonl_activity_lines(
+    schema: ProviderJsonlSchema,
+    line: &str,
+    activity: &mut ProviderActivity,
+) -> Vec<String> {
+    match schema {
+        ProviderJsonlSchema::CodexCli => codex_activity_line(line, activity)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ProviderJsonlSchema::ClaudeCode => claude_activity_lines(line, activity),
+    }
+}
+
+fn append_provider_log_line(activity: &mut ProviderActivity, path: &Path) {
+    activity.lines.push(format!(
+        "{} provider log {}",
+        format_age(
+            fs::metadata(path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(DateTime::<Utc>::from),
+        ),
+        path.display()
+    ));
+}
+
+fn cap_provider_activity(mut activity: ProviderActivity, cap: usize) -> ProviderActivity {
+    activity.lines = activity
+        .lines
+        .into_iter()
+        .rev()
+        .take(cap)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    activity
+}
+
+fn jsonl_session_meta_cwd_matches(path: &Path, working_dirs: &[String]) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
     };
@@ -10685,6 +10763,45 @@ fn codex_session_matches_run(path: &Path, working_dirs: &[String]) -> bool {
         return working_dirs.iter().any(|working_dir| working_dir == cwd);
     }
     false
+}
+
+fn jsonl_top_level_cwd_matches(path: &Path, working_dirs: &[String], scan_lines: usize) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let reader = io::BufReader::new(file);
+    for line in reader
+        .lines()
+        .map_while(std::result::Result::ok)
+        .take(scan_lines)
+    {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(Value::as_str)
+            && working_dirs.iter().any(|working_dir| working_dir == cwd)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn claude_project_dir_for_workdir(home: &Path, working_dir: &str) -> PathBuf {
+    let resolved = fs::canonicalize(working_dir).unwrap_or_else(|_| PathBuf::from(working_dir));
+    let raw = resolved.to_string_lossy();
+    let mut name = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            name.push(ch);
+        } else {
+            name.push('-');
+        }
+    }
+    if !name.starts_with('-') {
+        name.insert(0, '-');
+    }
+    home.join(".claude/projects").join(name)
 }
 
 fn collect_recent_jsonl_files(
@@ -10772,6 +10889,203 @@ fn codex_activity_line(line: &str, activity: &mut ProviderActivity) -> Option<St
             .and_then(Value::as_str)
             .map(|output| format!("{timestamp} result {}", one_line(output, 140))),
         _ => None,
+    }
+}
+
+fn claude_activity_lines(line: &str, activity: &mut ProviderActivity) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    let timestamp = short_timestamp(value.get("timestamp").and_then(Value::as_str));
+    let row_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+    match row_type {
+        "assistant" => claude_assistant_activity_lines(&value, &timestamp, activity),
+        "user" => claude_user_activity_lines(&value, &timestamp),
+        "attachment" => claude_attachment_activity_line(&value, &timestamp)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn claude_assistant_activity_lines(
+    value: &Value,
+    timestamp: &str,
+    activity: &mut ProviderActivity,
+) -> Vec<String> {
+    let Some(message) = value.get("message") else {
+        return Vec::new();
+    };
+    if let Some(usage) = message.get("usage")
+        && let Some(tokens) = claude_usage_tokens(usage)
+    {
+        activity.context_tokens = Some(tokens);
+        activity.context_window = Some(200_000);
+    }
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for part in content {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    lines.push(format!("{timestamp} agent {}", one_line(text, 140)));
+                }
+            }
+            Some("thinking") => {
+                if let Some(text) = part.get("thinking").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    lines.push(format!("{timestamp} thinking {}", one_line(text, 140)));
+                }
+            }
+            Some("tool_use") => {
+                let name = part.get("name").and_then(Value::as_str).unwrap_or("tool");
+                let input = part.get("input").unwrap_or(&Value::Null);
+                lines.push(format!(
+                    "{timestamp} tool {name} {}",
+                    one_line(&claude_tool_summary(name, input), 140)
+                ));
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
+fn claude_user_activity_lines(value: &Value, timestamp: &str) -> Vec<String> {
+    let Some(content) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for part in content {
+        if part.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let text = claude_content_text(part.get("content").unwrap_or(&Value::Null));
+        if text.trim().is_empty() {
+            continue;
+        }
+        let prefix = if part
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "error"
+        } else {
+            "result"
+        };
+        lines.push(format!("{timestamp} {prefix} {}", one_line(&text, 140)));
+    }
+    lines
+}
+
+fn claude_attachment_activity_line(value: &Value, timestamp: &str) -> Option<String> {
+    let attachment = value.get("attachment")?;
+    if attachment.get("type").and_then(Value::as_str) != Some("todo_reminder") {
+        return None;
+    }
+    let items = attachment.get("content")?.as_array()?;
+    let total = items.len();
+    let completed = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("completed"))
+        .count();
+    let active = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("in_progress"))
+        .count();
+    Some(format!(
+        "{timestamp} todo {completed}/{total} done  {active} active"
+    ))
+}
+
+fn claude_content_text(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    let Some(items) = value.as_array() else {
+        return String::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            item.get("text")
+                .or_else(|| item.get("content"))
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn claude_usage_tokens(usage: &Value) -> Option<u64> {
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = input + output + cache_creation + cache_read;
+    (total > 0).then_some(total)
+}
+
+fn claude_tool_summary(name: &str, input: &Value) -> String {
+    match name {
+        "Bash" => input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| input.to_string()),
+        "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => input
+            .get("file_path")
+            .or_else(|| input.get("notebook_path"))
+            .or_else(|| input.get("path"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| input.to_string()),
+        "Glob" => input
+            .get("pattern")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| input.to_string()),
+        "Grep" => {
+            let pattern = input.get("pattern").and_then(Value::as_str).unwrap_or("");
+            let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+            if path.is_empty() {
+                pattern.to_string()
+            } else {
+                format!("{pattern} in {path}")
+            }
+        }
+        "TodoWrite" => input
+            .get("todos")
+            .and_then(Value::as_array)
+            .map(|todos| format!("{} todos", todos.len()))
+            .unwrap_or_else(|| input.to_string()),
+        "Task" => input
+            .get("description")
+            .or_else(|| input.get("prompt"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| input.to_string()),
+        _ => input.to_string(),
     }
 }
 
@@ -11813,12 +12127,13 @@ mod tui_tests {
     use super::{
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachTuiState, ChainAttachTuiState, CompletionAction,
-        acceptance_activity_lines, attach_header_text, chain_activity_lines,
-        chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
-        chain_timeline_lines, chain_wall_cap_hit, cli_wait_status_line,
+        ProviderActivity, ProviderJsonlSchema, acceptance_activity_lines, attach_header_text,
+        chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
+        chain_should_auto_attach, chain_timeline_lines, chain_wall_cap_hit, cli_wait_status_line,
         completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
         deadreckoning_status_text, doc_polish_preview_text, live_file_lines, markdown_to_tui_lines,
-        max_panel_scroll, per_step_wall_cap, threshold_color,
+        max_panel_scroll, per_step_wall_cap, provider_jsonl_activity_lines,
+        provider_jsonl_session_matches_run, threshold_color,
     };
     use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -12090,6 +12405,68 @@ mod tui_tests {
         assert!(lines.contains("acceptance failed"), "{lines}");
         assert!(lines.contains("1 required failures"), "{lines}");
         assert!(lines.contains("npm test"), "{lines}");
+    }
+
+    #[test]
+    fn provider_jsonl_matchers_cover_session_meta_and_top_level_cwd() {
+        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
+        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let working_dir = temp.path().join("work");
+        let working_dirs = vec![working_dir.to_string_lossy().to_string()];
+
+        let codex = temp.path().join("codex.jsonl");
+        std::fs::write(
+            &codex,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                working_dir.display()
+            ),
+        )
+        .expect("codex jsonl");
+        assert!(provider_jsonl_session_matches_run(
+            ProviderJsonlSchema::CodexCli,
+            &codex,
+            &working_dirs
+        ));
+
+        let claude = temp.path().join("claude.jsonl");
+        std::fs::write(
+            &claude,
+            format!(
+                "{{\"type\":\"assistant\",\"cwd\":\"{}\",\"message\":{{\"content\":[]}}}}\n",
+                working_dir.display()
+            ),
+        )
+        .expect("claude jsonl");
+        assert!(provider_jsonl_session_matches_run(
+            ProviderJsonlSchema::ClaudeCode,
+            &claude,
+            &working_dirs
+        ));
+    }
+
+    #[test]
+    fn provider_jsonl_activity_dispatches_codex_and_claude_rows() {
+        let mut codex = ProviderActivity::default();
+        let codex_lines = provider_jsonl_activity_lines(
+            ProviderJsonlSchema::CodexCli,
+            r#"{"type":"event_msg","timestamp":"2026-05-13T02:34:17Z","payload":{"type":"agent_message","message":"Working on it"}}"#,
+            &mut codex,
+        );
+        assert_eq!(codex_lines.len(), 1);
+        assert!(codex_lines[0].contains("agent Working on it"));
+
+        let mut claude = ProviderActivity::default();
+        let claude_lines = provider_jsonl_activity_lines(
+            ProviderJsonlSchema::ClaudeCode,
+            r#"{"type":"assistant","timestamp":"2026-05-13T02:34:17.615Z","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4},"content":[{"type":"text","text":"Adding tests"},{"type":"tool_use","name":"Bash","input":{"command":"npm test"}}]}}"#,
+            &mut claude,
+        );
+        assert_eq!(claude.context_tokens, Some(10));
+        assert_eq!(claude.context_window, Some(200_000));
+        assert_eq!(claude_lines.len(), 2);
+        assert!(claude_lines[0].contains("agent Adding tests"));
+        assert!(claude_lines[1].contains("tool Bash npm test"));
     }
 
     #[test]

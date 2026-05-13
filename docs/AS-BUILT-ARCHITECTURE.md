@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-12
+**Last updated:** 2026-05-12 (post acceptance-progress / shell-completions / interactive-feedback pass)
 **Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -387,7 +387,8 @@ JSONL files (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) 
 │               ├── turns/
 │               │   └── turn-<N>/  # provider stdout, prompt.md
 │               ├── proofs/
-│               │   └── turn-acceptance.json   # AcceptanceMarker
+│               │   ├── turn-acceptance.json       # AcceptanceMarker
+│               │   └── acceptance-progress.jsonl  # streaming AcceptanceProgressEntry
 │               ├── gate/
 │               │   └── nonce      # uuid; only dr-gate can read for signing
 │               ├── child-pids/
@@ -777,10 +778,12 @@ The `--dangerously-skip-permissions` flag is non-negotiable (no human is in the 
 **`cli:codex` (`crates/deadreckon-providers/src/cli_codex.rs:1-143`).** Invocation:
 
 ```zsh
-codex --ask-for-approval never exec --skip-git-repo-check --sandbox <mode> "<prompt>"
+codex --ask-for-approval never exec --skip-git-repo-check --sandbox <mode> -- "<prompt>"
 ```
 
 `<mode>` (`cli_codex.rs:121-131`) is `workspace-write` when the outer sandbox is `None`/`SandboxBackend::None` (safer, codex limits itself to cwd), and `danger-full-access` when an outer sandbox is active (the outer sandbox is doing the isolating; codex needs full filesystem access inside).
+
+The trailing `--` delimiter is non-negotiable: doc-polish prompts often begin with YAML frontmatter (`---`), which `clap`-based Codex CLIs otherwise interpret as an option-like argument. Adding `--` forces the prompt to be parsed as the positional value.
 
 **Shared subprocess machinery (`cli_common.rs:22-120`).** Builds a `SandboxSpec` with explicit allowlists (`cli_common.rs:154-166`):
 
@@ -1025,7 +1028,23 @@ pub fn validate_acceptance_marker(state: &PipelineState) -> Result<AcceptanceMar
 
 A forged marker by the agent fails the signature check at line 114.
 
-### 13.5 Where the gate is invoked
+### 13.5 Streaming progress
+
+While checks are running, `evaluate_acceptance_checks_with_progress` (`gate.rs:228-244`) appends one `AcceptanceProgressEntry` per state transition to `proofs/acceptance-progress.jsonl`:
+
+```rust
+pub struct AcceptanceProgressEntry {
+    pub checked_at: DateTime<Utc>,
+    pub status: String,        // "started" | "running" | "passed" | "failed"
+    pub index: usize,
+    pub total: usize,
+    pub result: Option<AcceptanceCheckResult>,
+}
+```
+
+The progress file is truncated at the start of each evaluation so resumed/extended runs do not mix with prior attempts. The attach TUI tails this file (§18) so operators can see acceptance advance from "running 2/5" → "passed 2/5" while `dr-gate` works. The signed `AcceptanceMarker` is still the load-bearing artifact; progress is observational telemetry only.
+
+### 13.6 Where the gate is invoked
 
 The CLI sub-agent path and regular Done path in `crates/deadreckon-runtime/src/turn_loop.rs` both call:
 
@@ -1043,7 +1062,7 @@ Failure at any step prevents the run from reaching `Completed`.
 
 ## 14. Telemetry: Spend, Traces, Provenance, Events
 
-Four append-only JSONL files capture every run's history. All live under `<run_root>/`. All written via `append_json_line` (`state.rs:375-388`), which opens in append mode and `sync_all`s after each line.
+Five append-only JSONL files capture every run's history. Four (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) live under `<run_root>/` directly; the fifth (`proofs/acceptance-progress.jsonl`, see §13.5) is gate-scoped and truncated per evaluation. All are written via `append_json_line` (`state.rs:375-388`), which opens in append mode and `sync_all`s after each line.
 
 ### 14.1 `spend.jsonl`
 
@@ -1180,10 +1199,15 @@ The `Commands` enum in `crates/deadreckon/src/main.rs` defines the CLI surface. 
 | `show` | `main.rs:1025` | Pretty-print full state + provenance + traces |
 | `import` | `main.rs:1056` | Read-only import from claude/codex/cursor |
 | `chain` | `main.rs:1246` | Create, plan, run, attach, pause/resume/kill, undo, extend, and redo serial autonomous chains |
+| `completion` / `completions` | `main.rs` | Generate or install shell tab-completion scripts (bash, zsh, fish, elvish, powershell) |
 
 The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defaults to `$10` (with a confirmation gate above `$50`), `--provider` defaults to the highest-credentialed entry per the fallback chain, `--skill` defaults to `default-coding`.
 
 `run` now starts codebase-aware by default. In a git repo it previews and then creates a `git worktree` on a `dr/...` branch; `--fresh` preserves the old empty-working-dir behavior, `--from <path>` uses copy mode, and `--in-place --i-know-its-a-lot` edits the source tree directly. Completed worktree runs hint `apply` / `discard`; copy and fresh runs hint `export` / `extend`. Run-id arguments accept unique prefixes and `latest` / `last` resolves to the latest run in the current project scope.
+
+`completion install` is driven from the real clap command tree, so subcommand aliases, flags, and value-hint completions stay in sync with `deadreckon --help`. The handler detects the active shell via `$SHELL`, writes the script to a per-shell default path (e.g. `~/.zsh/completions/_deadreckon`, `~/.local/share/bash-completion/completions/deadreckon`), and for zsh adds a managed `# deadreckon completion` block to `~/.zshrc` unless `--no-rc` is passed. `init` invokes `try_install_completion_after_init` so first-time setup ships completions opt-out (`init --no-completion`). The per-shell stdout variants (`completion bash|zsh|fish|elvish|powershell`) print the script for users who manage their own shell config.
+
+`run` startup details (`print_run_started`) are now also emitted at the top of `extend` and `resume` so extended/resumed runs surface their selected provider route and doc-provider source the same way fresh runs do. Interactive terminals receive a `deadreckoning_course` ASCII progress strip and a polled `cli_wait_status` line while a long turn is in flight; the status is cleared as soon as the loop reports back. `kill` against a loaded run now also persists `RunStatus::Killed` + `killed_at` + `failure_reason = "killed by user"` before returning so downstream tooling sees a consistent terminal state.
 
 ---
 
@@ -1198,32 +1222,37 @@ The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defau
 
 ### 18.2 Layout
 
-`main.rs:1608-1616`:
+`attach_panel_layout` (`main.rs:~10225`):
 
 ```rust
 let vertical = Layout::default()
     .direction(Direction::Vertical)
     .constraints([
-        Constraint::Length(5),    // header + compact spend/context metrics
-        Constraint::Min(10),      // tool calls + provider activity
+        Constraint::Length(5),    // top band: header + spend (if metered) + context + acceptance
+        Constraint::Min(10),      // tool calls + provider activity + live files
         Constraint::Length(4),    // processes/status
-        Constraint::Length(1),    // keybindings footer
+        Constraint::Length(2),    // keybindings footer (multi-line during long ops)
     ])
     .split(area);
 ```
 
-- **Header** (short run id, status, phase, provider, sandbox, turn timer, truncated goal, working/artifact path).
+The top band is split horizontally into three panels for subscription providers (header 66 / context 17 / acceptance 17) and four for metered API providers (header 55 / spend 15 / context 15 / acceptance 15):
+
+- **Header** (short run id, status, phase, provider, sandbox, turn timer, truncated goal, working/artifact path; degrades to an identity strip when live status is unavailable).
 - **Spend meter** only for metered API providers; CLI subscription providers omit cost and emphasize context/wall time.
 - **Context meter**: compact token/window summary with green/yellow/red thresholds.
-- **Center, left**: wide streaming list of tool calls + provider activity + recent events, with priority ordering — turn summary → live working-tree diff → recent provider activity → recent `RunEvent`s → recent traces.
+- **Acceptance meter**: derived from `AcceptanceLive` (`collect_acceptance_live` in `main.rs:~10172`). When `proofs/acceptance-progress.jsonl` exists, the panel tails it and surfaces `running 2/5`, `passed`, or `failed` with the offending check; once `turn-acceptance.json` is signed, it pivots to a marker view (`acceptance_live_from_marker`). Color thresholds are owned by `acceptance_color`.
+- **Center, left**: wide streaming list of tool calls + provider activity + recent events. Acceptance lines from `acceptance_activity_lines` are interleaved so the operator sees the same progress in the activity stream and the meter.
 - **Completed docs view**: pressing `d` toggles the center-left panel from provider activity to `RUN-NARRATIVE.md` rendered through `pulldown-cmark` into ratatui `Line`/`Span`s. Headings, bullets, inline code, fenced code blocks, links, task markers, math, and horizontal rules receive terminal styles and remain scrollable.
 - **Center, right**: narrower live files list with count/bytes in the panel title.
 - **Bottom**: supervised PIDs + their `ps` lines (alive/dead annotation).
-- **Footer**: action-first completed footer (`[d] Docs` / `[d] Activity`, `[a] Apply`, `[b] Abandon`, `[s] Show`) or scroll/detach help while running.
+- **Footer**: action-first completed footer (`[d] Docs` / `[d] Activity`, `[a] Apply`, `[b] Abandon`, `[s] Show`) or scroll/detach help while running. The footer's second line carries `deadreckoning_status_line` while long operations are in flight.
 
 ### 18.3 Data source
 
-Today the TUI **polls** files on disk every 500 ms: `spend.jsonl`, `traces.jsonl`, `events.jsonl`, plus `~/.codex/sessions/` for codex-specific provider activity. The `RunEventBus` broadcast channel exists in `deadreckon-core::events` but the TUI does not yet subscribe to it — switching from poll-driven to stream-driven is a robustness-rider hardening target (§1 of `docs/goals/2026-05-11-1400-deadreckon-robust-rider.md`).
+Today the TUI **polls** files on disk every 500 ms: `spend.jsonl`, `traces.jsonl`, `events.jsonl`, `proofs/acceptance-progress.jsonl`, `proofs/turn-acceptance.json`, plus provider-native JSONL logs when the active provider writes them. `collect_provider_activity` now routes through a generic JSONL collector: each provider supplies a small `ProviderJsonlLogSpec` with candidate roots, a cwd-matching strategy, and a row decoder. `cli:codex` reads `~/.codex/sessions/**.jsonl` and matches `session_meta.payload.cwd`; `cli:claude-code` reads `~/.claude/projects/<cwd-slug>/*.jsonl` using Claude Code's path-to-project mapping and matches top-level `cwd`. The shared collector handles candidate discovery, recency filtering, run matching, stream capping, and context telemetry. Schema-specific adapters only decode rows into common activity lines (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`).
+
+Same-process attaches use the `RunEventBus` broadcast channel directly; cross-process attaches still poll. The mixed model is acknowledged in the robustness rider as a future consolidation target.
 
 ---
 
@@ -1285,6 +1314,8 @@ provider route and model before state is created; `run --model <model>` and
 defaults. CLI providers pass explicit model overrides through to the underlying
 tool (`codex exec --model ...`, `claude --model ...`) and otherwise display
 `provider default`.
+
+Route resolution (`configured_route_names` in `crates/deadreckon-providers/src/router.rs`) now puts `default_provider` at the head of the chain, then appends `fallback` entries that aren't already present, then falls back to the built-in chain (`cli:claude-code` → `cli:codex` → `anthropic` → `openai` → `openai-compatible`) only if neither is configured. `read_config` (`config.rs`) backfills `default_provider` from a top-level `[defaults] provider` key when it's omitted, so the same TOML stanza drives both `init`-style defaults and the router. `--provider` on the CLI still short-circuits the whole chain.
 
 ### 19.2 BYOK posture
 
@@ -1382,8 +1413,11 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Self-documenting run artifacts in stoa shape: `RUN-NARRATIVE.md`, `RUN-AS-BUILT.md`, `RUN-DECISIONS.md`, optional `AS-BUILT-DELTA.md`, per-turn `_incremental.jsonl`, explicit `docs_checkpoint` run events, and `polish.json` schema v2.
 - `deadreckon doc`, `list` DOCS status, doc-aware `apply` commit bodies, extend-parent narrative updates, diff coverage retry, the legacy repo/user/project `run-narrator` skill mechanism, and default split polish skills (`narrator-overview`, `narrator-phases`, `narrator-as-built`, `narrator-decisions`).
 - Acceptance gate with signed marker; anti-self-attestation actually enforced.
-- `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import`, `cleanup`/`prune` verbs.
-- `ratatui` attach TUI with spend/context telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer.
+- `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import`, `cleanup`/`prune`, `completion` verbs.
+- Shell tab-completion via `completion install` / `completion {bash,zsh,fish,elvish,powershell}` driven from the live clap command tree; `init` opt-out installs completions and (for zsh) appends a managed `.zshrc` block.
+- `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer. Long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
+- Streaming acceptance progress: `proofs/acceptance-progress.jsonl` reports per-check `started`/`running`/`passed`/`failed` transitions while `dr-gate` is mid-evaluation; the attach TUI tails it alongside the signed marker.
+- Extended runs carry the parent's `acceptance.yaml` into the child run and emit the same `print_run_started` startup details (provider route, doc-provider source) as fresh runs; resume does the same.
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.
 - Event-backed TUI attach: same-process attaches use `RunEventBus`; cross-process attaches replay `events.jsonl` incrementally.
 - Cross-process cancellation: `kill` writes a durable cancel marker before signaling; the run loop observes it while provider calls are in flight and reports killed status through events.
@@ -1506,6 +1540,10 @@ and source lines. `undo` restores the original source path for in-place runs.
 `extend` chains worktree children from the parent `dr/...` branch and records
 `parent_branch` in the child's `codebase.json`; copy/fresh extension keeps the
 library-seeding path, and in-place parents refuse with a `run --in-place` hint.
+Extend now also carries the parent's acceptance spec into the child run via
+`copy_existing_acceptance_into_run` (looking at `cwd` then `working_dir`),
+matching the behavior of a fresh `run` so an extended turn is held to the same
+gate as the original.
 Other lifecycle commands continue to use files-not-fields metadata and snapshot
 semantics.
 
@@ -1541,7 +1579,7 @@ Each turn record carries the full provider response capped at 50 KB, a short res
 
 Before acceptance/promotion, `polish_run_docs` first writes deterministic docs, then optionally runs provider-backed polish unless `--no-docs` is set. The default path resolves four repo/user/project skills in order: `narrator-overview`, `narrator-phases`, `narrator-as-built`, and `narrator-decisions`. Each subcall receives the same run evidence plus a focused prompt, uses a 16K output-token budget by default, retries once on malformed JSON, and contributes to the merged docs.
 
-The legacy `run-narrator` single-call path remains available for custom installs that do not opt into split `doc_subskills`. Provider, JSON, or skill failures are nonfatal; templated docs remain and `polish.json` records `failed_subcall:<name>` when a split subcall failed.
+The legacy `run-narrator` single-call path remains available for custom installs that do not opt into split `doc_subskills`. Provider, JSON, or skill failures are nonfatal; templated docs remain and `polish.json` records `failed_subcall:<name>` when a split subcall failed. `--smoke` now implies `effective_no_docs` unless `--doc-provider` is explicitly passed, so deterministic smoke runs no longer attempt to call a live doc provider. `print_status_card` reads `polish.json` when `docs_status_for_state` reports `Failed` and surfaces a `polish failed (<reason>); fallback docs are still available` line so the templated docs are visibly distinct from a successful polish.
 
 ### 25.5 Phase And Decision Detection
 
