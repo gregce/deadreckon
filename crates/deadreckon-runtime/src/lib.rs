@@ -1,3 +1,6 @@
+#![deny(clippy::print_stdout)]
+#![deny(clippy::print_stderr)]
+
 //! Runtime orchestration for provider turns, sandboxed tools, and run docs.
 
 pub mod polish;

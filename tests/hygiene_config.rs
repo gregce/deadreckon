@@ -12,6 +12,22 @@ const CRATE_MANIFESTS: &[&str] = &[
     "crates/deadreckon-sandbox/Cargo.toml",
 ];
 
+const LIB_CRATES: &[(&str, &str)] = &[
+    ("deadreckon-core", "crates/deadreckon-core/src/lib.rs"),
+    (
+        "deadreckon-providers",
+        "crates/deadreckon-providers/src/lib.rs",
+    ),
+    (
+        "deadreckon-runtime",
+        "crates/deadreckon-runtime/src/lib.rs",
+    ),
+    (
+        "deadreckon-sandbox",
+        "crates/deadreckon-sandbox/src/lib.rs",
+    ),
+];
+
 #[test]
 fn every_crate_inherits_workspace_lints() {
     let root = workspace_root();
@@ -201,10 +217,44 @@ fn cargo_metadata_resolves_same_dag() {
     assert_eq!(expected, actual, "internal cargo metadata DAG changed");
 }
 
+#[test]
+fn library_crate_lib_rs_denies_print_stdout() {
+    for (_, rel) in LIB_CRATES {
+        assert!(
+            lib_rs_text(rel).contains("#![deny(clippy::print_stdout)]"),
+            "{rel} must deny print_stdout"
+        );
+    }
+}
+
+#[test]
+fn library_crate_lib_rs_denies_print_stderr() {
+    for (_, rel) in LIB_CRATES {
+        assert!(
+            lib_rs_text(rel).contains("#![deny(clippy::print_stderr)]"),
+            "{rel} must deny print_stderr"
+        );
+    }
+}
+
+#[test]
+fn binary_crate_does_not_inherit_print_deny() {
+    let root = workspace_root();
+    let main_rs =
+        fs::read_to_string(root.join("crates/deadreckon/src/main.rs")).expect("read main.rs");
+    assert!(!main_rs.contains("clippy::print_stdout"));
+    assert!(!main_rs.contains("clippy::print_stderr"));
+    assert!(!root.join("crates/deadreckon/src/lib.rs").exists());
+}
+
 fn assert_lint_level(lint: &str, level: &str) {
     let text = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read Cargo.toml");
     let needle = format!("{lint} = \"{level}\"");
     assert!(text.contains(&needle), "missing `{needle}`");
+}
+
+fn lib_rs_text(rel: &str) -> String {
+    fs::read_to_string(workspace_root().join(rel)).expect("read library lib.rs")
 }
 
 fn assert_cargo_toml_contains(needle: &str) {

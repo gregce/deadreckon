@@ -1,3 +1,6 @@
+#![deny(clippy::print_stdout)]
+#![deny(clippy::print_stderr)]
+
 //! Core state, locking, and run artifacts for the deadreckon harness.
 
 pub mod artifacts;

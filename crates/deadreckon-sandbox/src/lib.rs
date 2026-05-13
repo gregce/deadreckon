@@ -1,3 +1,6 @@
+#![deny(clippy::print_stdout)]
+#![deny(clippy::print_stderr)]
+
 mod backend;
 mod commands;
 mod doctor;

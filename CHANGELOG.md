@@ -8,6 +8,7 @@
 - P4: Added `rustfmt.toml` and guard tests for the dedicated format commit and clean `cargo fmt --check`.
 - P5: Tuned release/dev profiles and captured a release binary size baseline with slack guard.
 - P6: Routed internal crates through `[workspace.dependencies]` and guarded the internal cargo metadata DAG.
+- P7: Added library-crate print refusal while keeping the binary crate exempt.
 
 ## Doc depth (alpha) — 2026-05-12
 

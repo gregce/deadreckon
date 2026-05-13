@@ -1,3 +1,6 @@
+#![deny(clippy::print_stdout)]
+#![deny(clippy::print_stderr)]
+
 pub mod cli_claude_code;
 pub mod cli_codex;
 mod cli_common;
