@@ -1,5 +1,14 @@
 # Changelog
 
+## Orchestration milestone (alpha) — 2026-05-13
+
+- Added file-backed orchestration plans with task DAG validation, provider roles, worker specs, coordinator messages, child summaries, and plan child markers without changing `PipelineState`.
+- Added `deadreckon plan`, `fork`, `merge`, and review-mode `orchestrate` so a common coder -> reviewer -> merge flow can complete end to end.
+- Added explicit planner/default-child/per-child/coder/reviewer provider resolution and persisted overrides into `plan.json`.
+- Added merge conflict detection with `--strategy prefer-child --prefer-child <idx>` and promoted merge artifacts with `deadreckon-plan-manifest.json`.
+- Added plan-aware `attach`, `show`, and `kill` fallbacks so plan IDs participate in the normal lifecycle.
+- Verified with focused orchestration tests plus core plan round-trips and `cargo fmt --check`; full multi-pane TUI, concurrent child scheduling, plan-aware history grep, and `show --why-failed` remain future slices.
+
 ## Copilot and Pi providers (alpha) - 2026-05-13
 
 - Added built-in descriptor-backed `cli:copilot` and `cli:pi` providers with subscription auth, detection/install hints, model flags, sandbox read/write roots, and generic CLI routing coverage.

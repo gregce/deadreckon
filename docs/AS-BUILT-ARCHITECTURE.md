@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-12 (post workspace hygiene pass)
+**Last updated:** 2026-05-13 (post orchestration milestone)
 **Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -38,6 +38,7 @@ This document captures the system as built today — what's wired, what's load-b
 25. [Self-Documenting Runs](#25-self-documenting-runs)
 28. [Chains & Autonomous Goal Chaining](#28-chains--autonomous-goal-chaining)
 29. [Workspace Hygiene](#29-workspace-hygiene)
+30. [Plans & Multi-Agent Orchestration](#30-plans--multi-agent-orchestration)
 
 ---
 
@@ -1745,6 +1746,55 @@ Library crate roots deny `clippy::print_stdout` and `clippy::print_stderr`. User
 ### 29.8 Behavior Invariants
 
 `tests/smoke_invariant.rs` protects the smoke-run narrative hash, and `tests/public_surface.rs` protects the public library re-export set. `tests/hygiene_config.rs` adds targeted guards for lints, formatting config, profile settings, internal dependency routing, registry shape, print refusal, binary size, cargo metadata stability, and error taxonomy.
+
+---
+
+## 30. Plans & Multi-Agent Orchestration
+
+### 30.1 Mental Model
+
+An orchestration plan is a file-backed task graph under `~/.deadreckon/plans/<plan-id>/`. It does not add fields to `PipelineState`; child work is still executed by normal `deadreckon run` subprocesses. The coordinator process owns only plan files: `plan.json`, `coordinator.json` while live, `messages.jsonl`, worker specs, child summaries, merge working state, and merge proofs.
+
+Two modes are built:
+
+- `split`: `deadreckon plan <goal> --n <2..=6>` asks a planner provider for task JSON, records planner/default-child/per-child providers, writes worker specs, and later `fork` runs each ready task.
+- `review`: `deadreckon orchestrate <goal> --mode review --coder-provider <id> --reviewer-provider <id>` writes a coder task and a fresh reviewer task. The reviewer is launched after the coder completes and receives a review/fix prompt plus the worker spec.
+
+### 30.2 Plan Files
+
+`crates/deadreckon-core/src/plan.rs` defines `Plan`, `PlanTask`, `PlanProviders`, `PlanMessage`, `PlanChildMarker`, and `CoordinatorState`. The durable layout is:
+
+```text
+~/.deadreckon/plans/<plan-id>/
+  plan.json
+  coordinator.json          # present only while fork is supervising
+  messages.jsonl
+  worker-specs/task-0.md
+  summaries/task-0.md
+  merge-working/
+  merge-proofs/conflicts.json
+```
+
+Every child run receives an inline copy of its worker spec in the prompt. The spec includes root goal, exact task scope, provider, role, dependency context, capability preview, and hygiene rules such as staying within scope and not spawning subagents.
+
+### 30.3 Verbs
+
+- `plan <goal>` writes `plan.json` and worker specs. It previews provider roles, capability hints, task labels, dependencies, and next actions.
+- `fork <plan-id>` runs ready child tasks through `deadreckon run`, using distinct plan-child scopes via `DEADRECKON_SCOPE_ROOT`. It writes typed progress/blocker messages and child summaries.
+- `merge <plan-id>` composes completed child library artifacts into a new promoted run. It fails on conflicting file contents by default; `--strategy prefer-child --prefer-child <idx>` records the conflict and chooses that child.
+- `orchestrate <goal>` is the one-command wrapper. In review mode it performs plan -> fork -> merge end to end.
+- `attach <plan-id>` and `show <plan-id>` currently render a plain plan summary with task status, provider, child run prefixes, summaries, latest message, and next actions.
+- `kill <plan-id>` reads `coordinator.json` and child run state to signal the coordinator and live children.
+
+### 30.4 Merge Artifact
+
+Merge creates a normal promoted run so existing `materialize`, `library`, and run inspection paths keep working. The promoted library also gets `deadreckon-plan-manifest.json` with plan id, root goal, mode, provider roles, capability preview, task graph, child run ids, summaries, and recorded conflicts.
+
+Generated run artifacts are intentionally excluded from merge composition: `.deadreckon/*`, `docs/RUN-*`, `target`, `node_modules`, `.next`, `dist`, and `build`.
+
+### 30.5 Current Limits
+
+The first orchestration milestone is usable but not the full rider endpoint. Independent split tasks are supervised sequentially rather than concurrently. `attach <plan-id>` is a plain summary, not the planned multi-pane TUI. Review mode uses a fresh child run from the coder artifact rather than the older `extend` verb path. Plan-aware `history grep` and `show --why-failed` remain future slices.
 
 ---
 
