@@ -246,6 +246,15 @@ cargo build --release
 
 The binary is `./target/release/deadreckon`. Add it to your `PATH` or alias it; the rest of this README just says `deadreckon`.
 
+Install shell tab completion. `deadreckon init` does this automatically when it
+can detect your shell; this command repairs or installs it later:
+
+```bash
+deadreckon completion install
+```
+
+For raw generated scripts or shell overrides, run `deadreckon completion --help`.
+
 Configure and run a task end-to-end:
 
 ```bash

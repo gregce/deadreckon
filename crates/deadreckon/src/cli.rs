@@ -35,11 +35,28 @@ Continue or recover:
   cleanup     remove stale or completed worktrees
 
 More help:
+  completion  generate shell tab-completion scripts
   help-all    show every command, including advanced commands
   commands    alias for help-all
   <command> --help
 
 Run ids accept unique prefixes. `latest` means the newest run for the current project.";
+
+const COMPLETION_HELP: &str = "\
+Lifecycle:
+  deadreckon completion install
+  deadreckon completion install --shell zsh
+  deadreckon completion zsh > ~/.zsh/completions/_deadreckon
+  deadreckon completion bash > ~/.local/share/bash-completion/completions/deadreckon
+  deadreckon completion fish > ~/.config/fish/completions/deadreckon.fish
+
+The generated script comes from the real clap command tree, so subcommands,
+aliases, flags, and shell values stay in sync with `deadreckon --help`.
+
+`install` detects your shell, writes the completion file, and for zsh adds a
+managed `.zshrc` block when needed.
+
+Supported shells: bash, elvish, fish, powershell, zsh.";
 
 const INIT_HELP: &str = "\
 Lifecycle:
@@ -332,6 +349,8 @@ pub(crate) enum Commands {
         sandbox: String,
         #[arg(long, help = "Use detected defaults without interactive prompts")]
         no_confirm: bool,
+        #[arg(long, help = "Skip shell completion installation")]
+        no_completion: bool,
     },
     #[command(
         next_help_heading = "Setup",
@@ -350,6 +369,16 @@ pub(crate) enum Commands {
         after_help = "Lifecycle:\n  deadreckon help-all\n  deadreckon <command> --help"
     )]
     HelpAll,
+    #[command(
+        next_help_heading = "Setup",
+        visible_alias = "completions",
+        about = "Generate shell tab-completion scripts",
+        after_help = COMPLETION_HELP
+    )]
+    Completion {
+        #[command(subcommand)]
+        command: Option<CompletionCommand>,
+    },
     #[command(
         next_help_heading = "Acceptance",
         hide = true,
@@ -1026,6 +1055,36 @@ pub(crate) enum ConfigCommand {
         )]
         provider: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CompletionCommand {
+    #[command(about = "Detect the shell and install the generated completion script")]
+    Install {
+        #[arg(
+            long,
+            value_enum,
+            help = "Shell override; defaults to $SHELL detection"
+        )]
+        shell: Option<clap_complete::Shell>,
+        #[arg(long, value_name = "PATH", help = "Install path override")]
+        path: Option<PathBuf>,
+        #[arg(long, help = "Skip the managed zshrc block")]
+        no_rc: bool,
+    },
+    #[command(about = "Print bash completion script to stdout")]
+    Bash,
+    #[command(about = "Print elvish completion script to stdout")]
+    Elvish,
+    #[command(about = "Print fish completion script to stdout")]
+    Fish,
+    #[command(
+        name = "powershell",
+        about = "Print PowerShell completion script to stdout"
+    )]
+    PowerShell,
+    #[command(about = "Print zsh completion script to stdout")]
+    Zsh,
 }
 
 #[derive(Subcommand)]

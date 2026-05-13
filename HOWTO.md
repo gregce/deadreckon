@@ -19,6 +19,25 @@ The alias points to:
 /Users/gdc/deadreckon/target/release/deadreckon
 ```
 
+## Shell Tab Completion
+
+`deadreckon init` installs shell completion automatically when it can detect
+your shell. To install or repair it later:
+
+```bash
+deadreckon completion install
+```
+
+That writes the generated script to the normal location for your shell. For zsh
+it also adds a managed `.zshrc` block that loads `~/.zsh/completions`.
+
+Override detection or print a raw script:
+
+```bash
+deadreckon completion install --shell zsh
+deadreckon completion zsh > ~/.zsh/completions/_deadreckon
+```
+
 ## Make Targets
 
 ```bash

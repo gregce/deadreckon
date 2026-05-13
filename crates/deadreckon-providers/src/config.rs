@@ -8,10 +8,17 @@ pub const DEFAULT_CONFIG_PATH: &str = "/Users/gdc/.deadreckon/config.toml";
 
 pub fn read_config(path: &Path) -> Result<ProviderConfigFile> {
     match std::fs::read_to_string(path) {
-        Ok(raw) => toml::from_str(&raw).map_err(|source| ProviderError::Toml {
-            path: path.display().to_string(),
-            source,
-        }),
+        Ok(raw) => {
+            let mut config: ProviderConfigFile =
+                toml::from_str(&raw).map_err(|source| ProviderError::Toml {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+            if config.default_provider.is_none() {
+                config.default_provider = defaults_provider(&raw);
+            }
+            Ok(config)
+        }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(ProviderConfigFile {
             default_provider: None,
             fallback: None,
@@ -22,6 +29,16 @@ pub fn read_config(path: &Path) -> Result<ProviderConfigFile> {
             source,
         }),
     }
+}
+
+fn defaults_provider(raw: &str) -> Option<String> {
+    let root: toml::Value = toml::from_str(raw).ok()?;
+    root.as_table()?
+        .get("defaults")?
+        .as_table()?
+        .get("provider")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 pub(crate) fn builtin_entries() -> BTreeMap<String, ProviderEntry> {

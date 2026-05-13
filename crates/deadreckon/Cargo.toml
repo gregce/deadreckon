@@ -8,6 +8,7 @@ keywords.workspace = true
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 crossterm.workspace = true
 deadreckon-core = { path = "../deadreckon-core" }
 deadreckon-providers = { path = "../deadreckon-providers" }

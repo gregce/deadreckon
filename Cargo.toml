@@ -20,6 +20,7 @@ keywords = ["agent", "cli", "coding"]
 axum = "0.8.7"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.53", features = ["derive", "env"] }
+clap_complete = "4.5"
 crossterm = "0.29.0"
 fs2 = "0.4.3"
 ignore = "0.4.25"

@@ -5,7 +5,7 @@ BIN := $(ROOT)/target/release/deadreckon
 DEADRECKON_HOME ?= $(ROOT)/.deadreckon-smoke
 STRESS_SECONDS ?= 600
 
-.PHONY: help build release test clippy fmt fmt-check verify smoke doctor alias-zsh stress clean-runtime clean-target
+.PHONY: help build release test clippy fmt fmt-check verify smoke doctor alias-zsh completion-install stress clean-runtime clean-target
 
 help:
 	@printf '%s\n' \
@@ -15,6 +15,7 @@ help:
 		'  make smoke          Keyless smoke run using DEADRECKON_HOME under the repo' \
 		'  make doctor         Run deadreckon doctor' \
 		'  make alias-zsh      Add/update ~/.zshrc alias for deadreckon' \
+		'  make completion-install  Install shell tab completion' \
 		'  make stress         Run gated 5-concurrent-run stress test' \
 		'  make clean-runtime  Remove repo-local smoke runtime state'
 
@@ -46,6 +47,9 @@ doctor: build
 alias-zsh: build
 	@tmp=$$(mktemp); awk '!/^# deadreckon CLI alias$$/ && !/^alias deadreckon=/' /Users/gdc/.zshrc > $$tmp; printf '\n# deadreckon CLI alias\nalias deadreckon='\''/Users/gdc/deadreckon/target/release/deadreckon'\''\n' >> $$tmp; mv $$tmp /Users/gdc/.zshrc
 	@printf '%s\n' 'alias installed: open a new shell or run `source /Users/gdc/.zshrc`'
+
+completion-install: build
+	$(BIN) completion install
 
 stress:
 	cd $(ROOT) && DEADRECKON_STRESS=1 DEADRECKON_STRESS_SECONDS=$(STRESS_SECONDS) cargo test -p deadreckon --test agentic_loop stress_5_concurrent_10min -- --nocapture

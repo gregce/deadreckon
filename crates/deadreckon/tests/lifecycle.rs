@@ -836,6 +836,7 @@ fn help_lists_lifecycle_verbs() {
     assert!(stdout.contains("finish latest"));
     assert!(stdout.contains("status"));
     assert!(stdout.contains("cleanup"));
+    assert!(stdout.contains("completion"));
     assert!(stdout.contains("help-all"));
     assert!(!stdout.contains("acceptance"));
     assert!(stdout.contains("Run ids accept unique prefixes"));
@@ -861,6 +862,7 @@ fn every_top_level_help_shows_lifecycle_usage() {
     for command in [
         "init",
         "config",
+        "completion",
         "help-all",
         "done",
         "acceptance",
@@ -896,6 +898,83 @@ fn every_top_level_help_shows_lifecycle_usage() {
             "{command} help did not include lifecycle guidance:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn completion_scripts_cover_commands_flags_and_advanced_verbs() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let output = deadreckon(&paths)
+        .args(["completion", "zsh"])
+        .output()
+        .expect("completion");
+    assert_success(&output);
+    let zsh = stdout(&output);
+    assert!(zsh.contains("#compdef deadreckon"), "{zsh}");
+    assert!(zsh.contains("run:"), "{zsh}");
+    assert!(zsh.contains("--provider"), "{zsh}");
+    assert!(zsh.contains("completion:"), "{zsh}");
+    assert!(
+        zsh.contains("acceptance:") && zsh.contains("materialize:"),
+        "{zsh}"
+    );
+
+    let alias = deadreckon(&paths)
+        .args(["completions", "fish"])
+        .output()
+        .expect("completion alias");
+    assert_success(&alias);
+    assert!(stdout(&alias).contains("complete -c deadreckon"));
+}
+
+#[test]
+fn completion_install_detects_zsh_writes_script_and_managed_rc_block() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let output = deadreckon(&paths)
+        .env("HOME", temp.path())
+        .env("SHELL", "/bin/zsh")
+        .args(["completion", "install"])
+        .output()
+        .expect("completion install");
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("installed"), "{stdout}");
+    assert!(stdout.contains("_deadreckon"), "{stdout}");
+
+    let script = fs::read_to_string(temp.path().join(".zsh/completions/_deadreckon"))
+        .expect("completion script");
+    assert!(script.contains("#compdef deadreckon"), "{script}");
+    assert!(script.contains("run:"), "{script}");
+    assert!(script.contains("--provider"), "{script}");
+
+    let zshrc = fs::read_to_string(temp.path().join(".zshrc")).expect("zshrc");
+    assert!(zshrc.contains("# >>> deadreckon completion >>>"), "{zshrc}");
+    assert!(zshrc.contains(".zsh/completions"), "{zshrc}");
+}
+
+#[test]
+fn init_installs_shell_completion_by_default() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let output = deadreckon(&paths)
+        .env("HOME", temp.path())
+        .env("SHELL", "/bin/zsh")
+        .args([
+            "init",
+            "--provider",
+            "cli:codex",
+            "--sandbox",
+            "none",
+            "--no-confirm",
+        ])
+        .output()
+        .expect("init");
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("completion"), "{stdout}");
+    assert!(temp.path().join(".zsh/completions/_deadreckon").exists());
+    assert!(temp.path().join(".zshrc").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

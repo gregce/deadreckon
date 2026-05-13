@@ -567,6 +567,48 @@ fn config_provider_and_model_are_user_friendly_shortcuts() {
 }
 
 #[test]
+fn config_provider_reorders_fallback_routes_to_selected_default() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(
+        paths.config_path(),
+        r#"
+default_provider = "openai"
+fallback = ["openai", "anthropic"]
+
+[defaults]
+provider = "openai"
+
+[providers.openai]
+api_key = "openai-key"
+
+[providers.anthropic]
+api_key = "anthropic-key"
+"#,
+    )
+    .expect("config");
+
+    let set = deadreckon(&paths)
+        .arg("config")
+        .arg("provider")
+        .arg("anthropic")
+        .output()
+        .expect("set provider");
+    assert_success(&set);
+
+    let show = deadreckon(&paths)
+        .arg("config")
+        .arg("provider")
+        .output()
+        .expect("show provider");
+    assert_success(&show);
+    let stdout = stdout(&show);
+    assert!(stdout.contains("* anthropic"), "{stdout}");
+    assert!(!stdout.contains("* openai"), "{stdout}");
+}
+
+#[test]
 fn yes_flag_skips_confirm_prompt() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

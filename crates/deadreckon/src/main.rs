@@ -6,7 +6,8 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use clap::Parser;
+use clap::{Command as ClapCommand, CommandFactory, Parser};
+use clap_complete::{Shell, generate};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseEventKind,
@@ -61,7 +62,7 @@ mod tui_events;
 
 use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, Commands,
-    ConfigCommand, ExtendCommandArgs, LibraryCommand, RunCommandArgs,
+    CompletionCommand, ConfigCommand, ExtendCommandArgs, LibraryCommand, RunCommandArgs,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -216,12 +217,25 @@ async fn main_inner() -> Result<()> {
             max_spend,
             sandbox,
             no_confirm,
-        } => init_command(provider, api_key, base_url, max_spend, sandbox, no_confirm).await,
+            no_completion,
+        } => {
+            init_command(
+                provider,
+                api_key,
+                base_url,
+                max_spend,
+                sandbox,
+                no_confirm,
+                no_completion,
+            )
+            .await
+        }
         Commands::Config { command } => config_command(command),
         Commands::HelpAll => {
             print_help_all();
             Ok(())
         }
+        Commands::Completion { command } => completion_command(command),
         Commands::Acceptance { command } => acceptance_command(command).await,
         Commands::Done {
             args,
@@ -558,6 +572,7 @@ fn print_top_help() {
     println!();
     println!("{}", ui_heading("More help:"));
     for (name, purpose) in [
+        ("completion", "generate shell tab-completion scripts"),
         (
             "help-all",
             "show every command, including advanced commands",
@@ -621,6 +636,7 @@ fn print_help_all() {
         ("library", "inspect promoted artifacts"),
         ("show", "show raw state, traces, and provenance"),
         ("config", "read or update configuration"),
+        ("completion", "generate shell tab-completion scripts"),
         ("import", "import other tool history"),
         (
             "acceptance",
@@ -636,6 +652,158 @@ fn print_help_all() {
     );
 }
 
+fn completion_command(command: Option<CompletionCommand>) -> Result<()> {
+    match command.unwrap_or(CompletionCommand::Install {
+        shell: None,
+        path: None,
+        no_rc: false,
+    }) {
+        CompletionCommand::Install { shell, path, no_rc } => {
+            install_completion(shell, path, !no_rc)?;
+        }
+        CompletionCommand::Bash => write_completion_script(Shell::Bash, &mut io::stdout())?,
+        CompletionCommand::Elvish => write_completion_script(Shell::Elvish, &mut io::stdout())?,
+        CompletionCommand::Fish => write_completion_script(Shell::Fish, &mut io::stdout())?,
+        CompletionCommand::PowerShell => {
+            write_completion_script(Shell::PowerShell, &mut io::stdout())?;
+        }
+        CompletionCommand::Zsh => write_completion_script(Shell::Zsh, &mut io::stdout())?,
+    }
+    Ok(())
+}
+
+fn write_completion_script(shell: Shell, output: &mut dyn Write) -> io::Result<()> {
+    let mut command = completion_command_tree();
+    let bin_name = command.get_name().to_string();
+    generate(shell, &mut command, bin_name, output);
+    Ok(())
+}
+
+fn completion_command_tree() -> ClapCommand {
+    unhide_completion_commands(Cli::command())
+}
+
+fn unhide_completion_commands(command: ClapCommand) -> ClapCommand {
+    command
+        .hide(false)
+        .mut_subcommands(unhide_completion_commands)
+}
+
+fn install_completion(
+    shell: Option<Shell>,
+    path_override: Option<PathBuf>,
+    update_rc: bool,
+) -> Result<PathBuf> {
+    let shell = shell.or_else(detect_completion_shell).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            "could not detect your shell",
+            "deadreckon completion install --shell zsh",
+        ))
+    })?;
+    let path = path_override.unwrap_or_else(|| default_completion_path(shell));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut script = Vec::new();
+    write_completion_script(shell, &mut script)?;
+    fs::write(&path, script)?;
+    println!("{} completion {}", ui_ok("installed"), path.display());
+    if shell == Shell::Zsh && update_rc {
+        ensure_zsh_completion_rc(&path)?;
+    }
+    println!(
+        "{} {}",
+        ui_command("next:"),
+        ui_command("open a new shell, or source your shell rc file")
+    );
+    Ok(path)
+}
+
+fn try_install_completion_after_init() {
+    match install_completion(None, None, true) {
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("{} shell completion not installed: {err}", ui_warn("note"));
+            eprintln!(
+                "{} {}",
+                ui_command("try:"),
+                ui_command("deadreckon completion install --shell zsh")
+            );
+        }
+    }
+}
+
+fn detect_completion_shell() -> Option<Shell> {
+    let shell = std::env::var("SHELL").ok()?;
+    let name = Path::new(&shell).file_name()?.to_string_lossy();
+    match name.as_ref() {
+        "bash" => Some(Shell::Bash),
+        "elvish" => Some(Shell::Elvish),
+        "fish" => Some(Shell::Fish),
+        "pwsh" | "powershell" => Some(Shell::PowerShell),
+        "zsh" => Some(Shell::Zsh),
+        _ => None,
+    }
+}
+
+fn default_completion_path(shell: Shell) -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    match shell {
+        Shell::Bash => home
+            .join(".local")
+            .join("share")
+            .join("bash-completion")
+            .join("completions")
+            .join("deadreckon"),
+        Shell::Elvish => home
+            .join(".config")
+            .join("elvish")
+            .join("lib")
+            .join("deadreckon-completers.elv"),
+        Shell::Fish => home
+            .join(".config")
+            .join("fish")
+            .join("completions")
+            .join("deadreckon.fish"),
+        Shell::PowerShell => home
+            .join(".config")
+            .join("powershell")
+            .join("deadreckon-completions.ps1"),
+        Shell::Zsh => home.join(".zsh").join("completions").join("_deadreckon"),
+        _ => home.join(".deadreckon").join("completion"),
+    }
+}
+
+fn ensure_zsh_completion_rc(completion_path: &Path) -> Result<()> {
+    let Some(completion_dir) = completion_path.parent() else {
+        return Ok(());
+    };
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let zshrc = home.join(".zshrc");
+    let existing = fs::read_to_string(&zshrc).unwrap_or_default();
+    let completion_dir = completion_dir.display();
+    let block = format!(
+        "\n# >>> deadreckon completion >>>\nfpath=({completion_dir} $fpath)\nautoload -Uz compinit\ncompinit\n# <<< deadreckon completion <<<\n"
+    );
+    if existing.contains("# >>> deadreckon completion >>>")
+        || existing.contains(&format!("fpath=({completion_dir} $fpath)"))
+    {
+        println!("{} zshrc already loads completion dir", ui_ok("ready"));
+        return Ok(());
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&zshrc)?;
+    file.write_all(block.as_bytes())?;
+    println!("{} {}", ui_ok("updated"), zshrc.display());
+    Ok(())
+}
+
 async fn init_command(
     provider: Option<String>,
     api_key: Option<String>,
@@ -643,6 +811,7 @@ async fn init_command(
     max_spend: f64,
     sandbox: String,
     no_confirm: bool,
+    no_completion: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     fs::create_dir_all(paths.home())?;
@@ -670,6 +839,9 @@ async fn init_command(
     fs::write(paths.config_path(), config)?;
     println!("{} {}", ui_ok("wrote"), paths.config_path().display());
     doctor_command().await?;
+    if !no_completion {
+        try_install_completion_after_init();
+    }
     println!(
         "{} {}",
         ui_command("next:"),

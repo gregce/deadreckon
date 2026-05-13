@@ -59,18 +59,8 @@ impl ProviderRouter {
 
         let route_names = if let Some(provider) = override_provider {
             vec![provider.to_string()]
-        } else if let Some(fallback) = config.fallback {
-            fallback
-        } else if let Some(default_provider) = config.default_provider {
-            vec![default_provider]
         } else {
-            vec![
-                "cli:claude-code".to_string(),
-                "cli:codex".to_string(),
-                "anthropic".to_string(),
-                "openai".to_string(),
-                "openai-compatible".to_string(),
-            ]
+            configured_route_names(config.default_provider, config.fallback)
         };
 
         let mut routes = Vec::new();
@@ -145,6 +135,33 @@ impl ProviderRouter {
             .ok_or_else(|| ProviderError::NoRoute("empty provider route".to_string()))?;
         Ok(route.estimate_spend(usage))
     }
+}
+
+fn configured_route_names(
+    default_provider: Option<String>,
+    fallback: Option<Vec<String>>,
+) -> Vec<String> {
+    let mut route_names = Vec::new();
+    if let Some(default_provider) = default_provider {
+        route_names.push(default_provider);
+    }
+    if let Some(fallback) = fallback {
+        for provider in fallback {
+            if !route_names.iter().any(|route| route == &provider) {
+                route_names.push(provider);
+            }
+        }
+    }
+    if route_names.is_empty() {
+        route_names.extend([
+            "cli:claude-code".to_string(),
+            "cli:codex".to_string(),
+            "anthropic".to_string(),
+            "openai".to_string(),
+            "openai-compatible".to_string(),
+        ]);
+    }
+    route_names
 }
 
 fn build_provider(name: String, kind: ProviderKind, entry: ProviderEntry) -> Box<dyn Provider> {

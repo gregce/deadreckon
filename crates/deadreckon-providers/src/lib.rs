@@ -96,6 +96,88 @@ api_key = "test"
     }
 
     #[test]
+    fn default_provider_leads_fallback_routes() {
+        let router = ProviderRouter::from_config(
+            ProviderConfigFile {
+                default_provider: Some("anthropic".to_string()),
+                fallback: Some(vec!["openai".to_string(), "anthropic".to_string()]),
+                providers: [
+                    (
+                        "openai".to_string(),
+                        ProviderEntry {
+                            kind: None,
+                            api_key: Some("openai-key".to_string()),
+                            api_key_env: None,
+                            base_url: None,
+                            model: None,
+                            input_cost_per_million: None,
+                            output_cost_per_million: None,
+                            binary: None,
+                            extra_args: Vec::new(),
+                        },
+                    ),
+                    (
+                        "anthropic".to_string(),
+                        ProviderEntry {
+                            kind: None,
+                            api_key: Some("anthropic-key".to_string()),
+                            api_key_env: None,
+                            base_url: None,
+                            model: None,
+                            input_cost_per_million: None,
+                            output_cost_per_million: None,
+                            binary: None,
+                            extra_args: Vec::new(),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            None,
+        )
+        .expect("router");
+
+        let routes = router.route_info();
+        assert_eq!(routes[0].name, "anthropic");
+        assert_eq!(routes[1].name, "openai");
+        assert_eq!(
+            router.selected_route_info().map(|route| route.name),
+            Some("anthropic".to_string())
+        );
+    }
+
+    #[test]
+    fn defaults_provider_table_is_read_as_default_provider() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+fallback = ["openai"]
+
+[defaults]
+provider = "anthropic"
+
+[providers.openai]
+api_key = "openai-key"
+
+[providers.anthropic]
+api_key = "anthropic-key"
+"#,
+        )
+        .expect("write config");
+
+        let config = read_config(&path).expect("parse");
+        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+        let router = ProviderRouter::from_config(config, None).expect("router");
+        assert_eq!(
+            router.selected_route_info().map(|route| route.name),
+            Some("anthropic".to_string())
+        );
+    }
+
+    #[test]
     fn spend_estimate_uses_per_million_rates() {
         let adapter = ProviderAdapter::new(
             "openai",
