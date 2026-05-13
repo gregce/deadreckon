@@ -123,6 +123,26 @@ Modes:
   In a git repo, the default is an isolated worktree.
   Use `--fresh`, `--from <dir>`, `--worktree`, or `--in-place --i-know-its-a-lot` to force a mode.";
 
+const ORCHESTRATE_HELP: &str = "\
+Lifecycle:
+  deadreckon orchestrate \"build the thing\" --mode review --coder-provider cli:claude-code --reviewer-provider cli:codex
+  deadreckon attach <plan-id>
+  deadreckon merge <plan-id>
+
+Orchestrate is the one-command multi-agent wrapper. Review mode is the common
+path; split mode uses `plan` + `fork` + `merge` under the hood.";
+
+const PLAN_HELP: &str = "\
+Lifecycle:
+  deadreckon plan \"build the thing\" --mode review --coder-provider cli:claude-code --reviewer-provider cli:codex
+  deadreckon fork <plan-id>
+  deadreckon attach <plan-id>
+  deadreckon merge <plan-id>
+
+Plan writes ~/.deadreckon/plans/<plan-id>/plan.json plus worker specs. Split
+mode asks the planner provider for a task graph. Review mode writes a coder task
+followed by a fresh reviewer task.";
+
 const DONE_HELP: &str = "\
 Lifecycle:
   deadreckon def-done \"builds, opens in a browser, and has no console errors\"
@@ -517,6 +537,70 @@ pub(crate) enum Commands {
         no_docs: bool,
         #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Plan, fork, and merge a multi-agent run",
+        after_help = ORCHESTRATE_HELP
+    )]
+    Orchestrate {
+        #[arg(help = "Natural-language coding goal")]
+        goal: String,
+        #[arg(long, value_enum, default_value_t = CliPlanMode::Review, help = "Orchestration mode")]
+        mode: CliPlanMode,
+        #[arg(long, default_value_t = 3, help = "Split-mode task count, 2 through 6")]
+        n: u8,
+        #[arg(long, help = "Split-mode planner provider")]
+        planner_provider: Option<String>,
+        #[arg(long, help = "Default split child provider")]
+        provider: Option<String>,
+        #[arg(
+            long,
+            value_name = "IDX=PROVIDER",
+            help = "Per-child provider override"
+        )]
+        child_provider: Vec<String>,
+        #[arg(long, help = "Review-mode coding provider")]
+        coder_provider: Option<String>,
+        #[arg(long, help = "Review-mode reviewer provider")]
+        reviewer_provider: Option<String>,
+        #[arg(long, help = "Suppress post-action hints")]
+        no_hints: bool,
+        #[arg(long, help = "Suppress success stdout")]
+        quiet: bool,
+        #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+        plain: bool,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Write an orchestration plan without starting child runs",
+        after_help = PLAN_HELP
+    )]
+    Plan {
+        #[arg(help = "Natural-language coding goal")]
+        goal: String,
+        #[arg(long, default_value_t = 3, help = "Split-mode task count, 2 through 6")]
+        n: u8,
+        #[arg(long, value_enum, default_value_t = CliPlanMode::Split, help = "Plan mode")]
+        mode: CliPlanMode,
+        #[arg(long, help = "Split-mode planner provider")]
+        planner_provider: Option<String>,
+        #[arg(long, help = "Default split child provider")]
+        provider: Option<String>,
+        #[arg(
+            long,
+            value_name = "IDX=PROVIDER",
+            help = "Per-child provider override"
+        )]
+        child_provider: Vec<String>,
+        #[arg(long, help = "Review-mode coding provider")]
+        coder_provider: Option<String>,
+        #[arg(long, help = "Review-mode reviewer provider")]
+        reviewer_provider: Option<String>,
+        #[arg(long, help = "Suppress post-action hints")]
+        no_hints: bool,
+        #[arg(long, help = "Suppress success stdout")]
+        quiet: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -956,6 +1040,12 @@ pub(crate) enum CliDocKind {
     Delta,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliPlanMode {
+    Split,
+    Review,
+}
+
 impl From<CliDocKind> for DocKind {
     fn from(value: CliDocKind) -> Self {
         match value {
@@ -1225,6 +1315,19 @@ pub(crate) struct RunCommandArgs {
     pub(crate) no_hints: bool,
     pub(crate) no_docs: bool,
     pub(crate) doc_skill: Option<String>,
+}
+
+pub(crate) struct PlanCommandArgs {
+    pub(crate) goal: String,
+    pub(crate) n: u8,
+    pub(crate) mode: CliPlanMode,
+    pub(crate) planner_provider: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) child_provider: Vec<String>,
+    pub(crate) coder_provider: Option<String>,
+    pub(crate) reviewer_provider: Option<String>,
+    pub(crate) no_hints: bool,
+    pub(crate) quiet: bool,
 }
 
 pub(crate) struct ChainCommandArgs {

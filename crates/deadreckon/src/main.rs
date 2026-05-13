@@ -31,18 +31,19 @@ use deadreckon_core::{
     ChainEvent, ChainEventKind, ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus,
     CodebaseMode, CodebaseRecord, ConductorState, DEFAULT_DOC_POLISH_TOKEN_BUDGET,
     DEFAULT_DOC_SUBSKILLS, DeadreckonError, DeadreckonPaths, DocKind, DocProviderSelection,
-    DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId, PhaseStatus, PromotionManifest,
-    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunOptions, RunStatus, SpendRecord,
-    TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
-    acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
-    append_parent_narrative_update, append_provenance, append_trace, apply_commit_body,
-    cancel_marker_present, clear_cancel_marker, copy_source_to_working, copy_tree, create_run,
-    create_worktree, doc_path_for_kind, docs_status_for_state, emit_event,
+    DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId, PhaseStatus, Plan, PlanMode,
+    PlanProviders, PlanRole, PlanTask, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL,
+    ResolvedMode, RunEvent, RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions,
+    acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root, acquire_lock,
+    append_chain_event, append_parent_narrative_update, append_provenance, append_trace,
+    apply_commit_body, cancel_marker_present, clear_cancel_marker, copy_source_to_working,
+    copy_tree, create_run, create_worktree, doc_path_for_kind, docs_status_for_state, emit_event,
     evaluate_acceptance_checks, inventory_files, list_runs, load_chain, load_run,
     marker_path_for_run_root, pid_is_alive, prepare_worktree_record, preview_git_state,
     read_chain_step_marker, read_codebase_record, record_for_resolved_mode, release_lock_file,
-    resolve_mode, restore_snapshot, save_chain, save_state, terminate_pid,
-    validate_acceptance_marker, write_cancel_marker, write_chain_step_marker,
+    resolve_mode, restore_snapshot, save_chain, save_plan, save_state, terminate_pid,
+    validate_acceptance_marker, validate_task_count, write_cancel_marker, write_chain_step_marker,
+    write_worker_spec,
 };
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
@@ -75,9 +76,9 @@ mod cli;
 mod tui_events;
 
 use crate::cli::{
-    AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, Commands,
-    CompletionCommand, ConfigCommand, ExtendCommandArgs, LibraryCommand, ProvidersCommand,
-    RunCommandArgs,
+    AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, CliPlanMode, Commands,
+    CompletionCommand, ConfigCommand, ExtendCommandArgs, LibraryCommand, PlanCommandArgs,
+    ProvidersCommand, RunCommandArgs,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -315,6 +316,59 @@ async fn main_inner() -> Result<()> {
                 no_hints,
                 no_docs,
                 doc_skill,
+            })
+            .await
+        }
+        Commands::Orchestrate {
+            goal,
+            mode,
+            n,
+            planner_provider,
+            provider,
+            child_provider,
+            coder_provider,
+            reviewer_provider,
+            no_hints,
+            quiet,
+            plain: _,
+        } => {
+            orchestrate_command(PlanCommandArgs {
+                goal,
+                n,
+                mode,
+                planner_provider,
+                provider,
+                child_provider,
+                coder_provider,
+                reviewer_provider,
+                no_hints,
+                quiet,
+            })
+            .await
+        }
+        Commands::Plan {
+            goal,
+            n,
+            mode,
+            planner_provider,
+            provider,
+            child_provider,
+            coder_provider,
+            reviewer_provider,
+            no_hints,
+            quiet,
+        } => {
+            plan_command(PlanCommandArgs {
+                goal,
+                n,
+                mode,
+                planner_provider,
+                provider,
+                child_provider,
+                coder_provider,
+                reviewer_provider,
+                no_hints,
+                quiet,
             })
             .await
         }
@@ -6511,6 +6565,464 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         }
     }
     lines.join("\n")
+}
+
+async fn orchestrate_command(args: PlanCommandArgs) -> Result<()> {
+    let quiet = args.quiet;
+    let no_hints = args.no_hints;
+    let plan = create_orchestration_plan(args).await?;
+    if !quiet {
+        print_plan_created(&plan, no_hints);
+        println!(
+            "{} full orchestration starts with {}",
+            ui_warn("pending"),
+            ui_command(format!("deadreckon fork {}", run_prefix(&plan.plan_id)))
+        );
+    }
+    Ok(())
+}
+
+async fn plan_command(args: PlanCommandArgs) -> Result<()> {
+    let quiet = args.quiet;
+    let no_hints = args.no_hints;
+    let plan = create_orchestration_plan(args).await?;
+    if !quiet {
+        print_plan_created(&plan, no_hints);
+    }
+    Ok(())
+}
+
+async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
+    let PlanCommandArgs {
+        goal,
+        n,
+        mode,
+        planner_provider,
+        provider,
+        child_provider,
+        coder_provider,
+        reviewer_provider,
+        no_hints: _,
+        quiet: _,
+    } = args;
+    let goal = goal.trim().to_string();
+    if goal.is_empty() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "--goal must be non-empty",
+            "deadreckon plan \"your goal\"",
+        )));
+    }
+    let paths = DeadreckonPaths::discover();
+    let defaults = config_defaults(&paths)?;
+    let cwd = std::env::current_dir()?;
+    let scope = workspace_scope(&cwd)?;
+    let plan_mode = match mode {
+        CliPlanMode::Split => PlanMode::Split,
+        CliPlanMode::Review => PlanMode::Review,
+    };
+    let mut providers = resolve_plan_providers(
+        &paths,
+        &defaults,
+        plan_mode,
+        planner_provider,
+        provider,
+        coder_provider,
+        reviewer_provider,
+    )?;
+    let mut tasks = match plan_mode {
+        PlanMode::Split => {
+            validate_task_count(usize::from(n)).map_err(CliError::Core)?;
+            let overrides = parse_child_provider_overrides(&child_provider, n)?;
+            providers.children = overrides.clone();
+            build_split_plan_tasks(&paths, &goal, n, &providers, &overrides, &cwd).await?
+        }
+        PlanMode::Review => build_review_plan_tasks(&goal, &providers),
+    };
+    for task in &mut tasks {
+        task.worker_spec = deadreckon_core::worker_spec_relative_path(&task.task_id);
+    }
+    let mut plan = Plan::new(
+        goal,
+        plan_mode,
+        tasks,
+        providers,
+        Some(scope),
+        env!("CARGO_PKG_VERSION"),
+    )
+    .map_err(CliError::Core)?;
+    plan.capability_preview = infer_capability_preview(&plan.root_goal);
+    for task in &plan.tasks {
+        let spec = render_worker_spec(&plan, task);
+        write_worker_spec(&paths, &plan.plan_id, &task.task_id, &spec)?;
+    }
+    save_plan(&paths, &plan)?;
+    Ok(plan)
+}
+
+fn resolve_plan_providers(
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+    mode: PlanMode,
+    planner_provider: Option<String>,
+    provider: Option<String>,
+    coder_provider: Option<String>,
+    reviewer_provider: Option<String>,
+) -> Result<PlanProviders> {
+    let default_child = resolve_provider_name(paths, provider.or(defaults.provider.clone()))?;
+    let planner = match mode {
+        PlanMode::Split => resolve_provider_name(
+            paths,
+            planner_provider
+                .or(default_child.clone())
+                .or(defaults.provider.clone()),
+        )?,
+        PlanMode::Review => None,
+    };
+    let coder = match mode {
+        PlanMode::Review => resolve_provider_name(
+            paths,
+            coder_provider
+                .or(default_child.clone())
+                .or(defaults.provider.clone()),
+        )?,
+        PlanMode::Split => None,
+    };
+    let reviewer = match mode {
+        PlanMode::Review => resolve_provider_name(
+            paths,
+            reviewer_provider
+                .or(default_child.clone())
+                .or(defaults.provider.clone()),
+        )?,
+        PlanMode::Split => None,
+    };
+    Ok(PlanProviders {
+        planner,
+        default_child,
+        coder,
+        reviewer,
+        children: BTreeMap::new(),
+    })
+}
+
+fn resolve_provider_name(
+    paths: &DeadreckonPaths,
+    provider: Option<String>,
+) -> Result<Option<String>> {
+    if provider
+        .as_deref()
+        .is_some_and(|provider| provider == "smoke" || provider.starts_with("smoke:"))
+    {
+        return Ok(provider);
+    }
+    let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
+    Ok(router
+        .selected_route_info()
+        .map(|route| route.name)
+        .or(provider))
+}
+
+fn parse_child_provider_overrides(values: &[String], n: u8) -> Result<BTreeMap<u32, String>> {
+    let mut overrides = BTreeMap::new();
+    for value in values {
+        let Some((idx, provider)) = value.split_once('=') else {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("child provider override must be IDX=PROVIDER: {value}"),
+                "--child-provider 1=cli:codex",
+            )));
+        };
+        let index = idx.trim().parse::<u32>().map_err(|_| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!("child provider index is not a number: {idx}"),
+                "--child-provider 1=cli:codex",
+            ))
+        })?;
+        if index >= u32::from(n) {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("child provider index {index} outside 0..{n}"),
+                "--child-provider 1=cli:codex",
+            )));
+        }
+        let provider = provider.trim();
+        if provider.is_empty() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "child provider must be non-empty",
+                "--child-provider 1=cli:codex",
+            )));
+        }
+        overrides.insert(index, provider.to_string());
+    }
+    Ok(overrides)
+}
+
+async fn build_split_plan_tasks(
+    paths: &DeadreckonPaths,
+    goal: &str,
+    n: u8,
+    providers: &PlanProviders,
+    overrides: &BTreeMap<u32, String>,
+    cwd: &Path,
+) -> Result<Vec<PlanTask>> {
+    let drafts = if providers
+        .planner
+        .as_deref()
+        .is_some_and(|provider| provider == "smoke" || provider.starts_with("smoke:"))
+    {
+        deterministic_plan_drafts(goal, n)
+    } else {
+        provider_plan_drafts(paths, goal, n, providers.planner.as_deref(), cwd).await?
+    };
+    if drafts.len() != usize::from(n) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("provider returned {} tasks; need {n}", drafts.len()),
+            "deadreckon plan ... --provider <other>",
+        )));
+    }
+    let mut tasks = Vec::new();
+    for (index, draft) in drafts.into_iter().enumerate() {
+        let index = index as u32;
+        let provider = overrides
+            .get(&index)
+            .cloned()
+            .or_else(|| providers.default_child.clone());
+        let mut task = PlanTask::new(index, draft.subject, draft.goal, PlanRole::Child, provider);
+        task.active_form = draft.active_form.unwrap_or_else(|| task.subject.clone());
+        task.depends_on = draft.depends_on;
+        tasks.push(task);
+    }
+    Ok(tasks)
+}
+
+fn build_review_plan_tasks(goal: &str, providers: &PlanProviders) -> Vec<PlanTask> {
+    let mut coder = PlanTask::new(
+        0,
+        "Implement requested change",
+        goal,
+        PlanRole::Coder,
+        providers.coder.clone(),
+    );
+    coder.active_form = "Coding implementation".to_string();
+    let mut reviewer = PlanTask::new(
+        1,
+        "Review and fix implementation",
+        format!(
+            "Review the completed implementation for: {goal}. Write .deadreckon/REVIEW.md first, then apply only fixes tied to findings and acceptance."
+        ),
+        PlanRole::Reviewer,
+        providers.reviewer.clone(),
+    );
+    reviewer.active_form = "Reviewing implementation".to_string();
+    reviewer.depends_on = vec![coder.task_id.clone()];
+    vec![coder, reviewer]
+}
+
+#[derive(Debug, Deserialize)]
+struct PlannerDraft {
+    subject: String,
+    goal: String,
+    #[serde(default)]
+    active_form: Option<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlannerObjectDraft {
+    tasks: Vec<PlannerDraft>,
+}
+
+async fn provider_plan_drafts(
+    paths: &DeadreckonPaths,
+    goal: &str,
+    n: u8,
+    planner_provider: Option<&str>,
+    cwd: &Path,
+) -> Result<Vec<PlannerDraft>> {
+    let router = ProviderRouter::from_config_path(&paths.config_path(), planner_provider)?;
+    let prompt = planner_prompt(goal, n);
+    let request = ProviderRequest {
+        prompt,
+        max_output_tokens: 4096,
+        cwd: Some(cwd.to_path_buf()),
+        output_path: None,
+        sandbox_backend: None,
+        pid_file: None,
+        cancellation_token: None,
+    };
+    let response = with_cli_wait_status("planning task graph", router.complete(&request)).await?;
+    parse_planner_response(&response.content)
+}
+
+fn planner_prompt(goal: &str, n: u8) -> String {
+    format!(
+        "You are a read-only planning agent for deadreckon. Do not write files, create temporary files, install packages, commit, delete, move, or mutate state. Inspect only if your provider supports read-only tools.\n\nReturn JSON only. Shape: {{\"tasks\":[{{\"subject\":\"imperative label\",\"goal\":\"self-contained task goal\",\"active_form\":\"present-progress text\",\"depends_on\":[\"task-0\"]}}]}}. Return exactly {n} tasks. Dependencies must refer to earlier task ids task-0..task-{} and form a DAG. Goal: {goal}",
+        n.saturating_sub(1)
+    )
+}
+
+fn parse_planner_response(content: &str) -> Result<Vec<PlannerDraft>> {
+    if let Ok(object) = serde_json::from_str::<PlannerObjectDraft>(content) {
+        return Ok(object.tasks);
+    }
+    if let Ok(tasks) = serde_json::from_str::<Vec<PlannerDraft>>(content) {
+        return Ok(tasks);
+    }
+    if let Some(slice) = json_slice(content, '{', '}')
+        && let Ok(object) = serde_json::from_str::<PlannerObjectDraft>(slice)
+    {
+        return Ok(object.tasks);
+    }
+    if let Some(slice) = json_slice(content, '[', ']')
+        && let Ok(tasks) = serde_json::from_str::<Vec<PlannerDraft>>(slice)
+    {
+        return Ok(tasks);
+    }
+    Err(CliError::Core(deadreckon_core::user_error(
+        "planner provider did not return a valid task JSON object",
+        "deadreckon plan ... --planner-provider <other>",
+    )))
+}
+
+fn json_slice(content: &str, open: char, close: char) -> Option<&str> {
+    let start = content.find(open)?;
+    let end = content.rfind(close)?;
+    (end >= start).then_some(&content[start..=end])
+}
+
+fn deterministic_plan_drafts(goal: &str, n: u8) -> Vec<PlannerDraft> {
+    (0..n)
+        .map(|index| PlannerDraft {
+            subject: match index {
+                0 => "Create foundation".to_string(),
+                1 => "Add behavior".to_string(),
+                _ => format!("Complete slice {}", index + 1),
+            },
+            goal: format!("{goal} (task {} of {n})", index + 1),
+            active_form: Some(match index {
+                0 => "Creating foundation".to_string(),
+                1 => "Adding behavior".to_string(),
+                _ => format!("Completing slice {}", index + 1),
+            }),
+            depends_on: Vec::new(),
+        })
+        .collect()
+}
+
+fn infer_capability_preview(goal: &str) -> deadreckon_core::CapabilityPreview {
+    let lower = goal.to_ascii_lowercase();
+    let deploy = ["deploy", "vercel", "netlify", "production"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let global_install = ["install globally", "global install", "npm -g"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let network = if deploy || lower.contains("api") || lower.contains("websocket") {
+        deadreckon_core::NetworkCapability::Allowlist
+    } else {
+        deadreckon_core::NetworkCapability::Deny
+    };
+    let mut notes = Vec::new();
+    if deploy {
+        notes.push(
+            "goal mentions deployment; require explicit capability before deploy".to_string(),
+        );
+    }
+    if global_install {
+        notes.push("goal mentions global install; require explicit capability".to_string());
+    }
+    deadreckon_core::CapabilityPreview {
+        network,
+        deploy,
+        global_install,
+        filesystem: vec!["working directory".to_string()],
+        notes,
+    }
+}
+
+fn render_worker_spec(plan: &Plan, task: &PlanTask) -> String {
+    let dependencies = if task.depends_on.is_empty() {
+        "none".to_string()
+    } else {
+        task.depends_on.join(", ")
+    };
+    format!(
+        "# deadreckon worker spec: {}\n\nRoot goal: {}\nTask id: {}\nRole: {:?}\nProvider: {}\nDependencies satisfied before start: {}\n\n## Scope\n{}\n\n## Capability constraints\n- network: {:?}\n- deploy: {}\n- global install: {}\n- filesystem: {}\n\n## Done criteria\n- Stay within this task's scope.\n- Verify relevant behavior before reporting done.\n- Do not spawn subagents or orchestrate more children.\n- Do not editorialize between tool calls.\n- Report scope, result, key files, files changed, and issues.\n",
+        task.subject,
+        plan.root_goal,
+        task.task_id,
+        task.role,
+        task.provider.as_deref().unwrap_or("config default"),
+        dependencies,
+        task.goal,
+        plan.capability_preview.network,
+        plan.capability_preview.deploy,
+        plan.capability_preview.global_install,
+        plan.capability_preview.filesystem.join(", ")
+    )
+}
+
+fn print_plan_created(plan: &Plan, no_hints: bool) {
+    println!(
+        "{} {} ({})",
+        ui_ok("plan"),
+        ui_id(run_prefix(&plan.plan_id)),
+        plan.plan_id
+    );
+    println!("mode: {:?}", plan.mode);
+    println!("tasks: {}", plan.tasks.len());
+    match plan.mode {
+        PlanMode::Split => {
+            println!(
+                "providers: planner={} default-child={}",
+                plan.providers.planner.as_deref().unwrap_or("-"),
+                plan.providers.default_child.as_deref().unwrap_or("-")
+            );
+        }
+        PlanMode::Review => {
+            println!(
+                "providers: coder={} reviewer={}",
+                plan.providers.coder.as_deref().unwrap_or("-"),
+                plan.providers.reviewer.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    println!(
+        "capabilities: network={:?} deploy={} install={}",
+        plan.capability_preview.network,
+        plan.capability_preview.deploy,
+        plan.capability_preview.global_install
+    );
+    for task in &plan.tasks {
+        let deps = if task.depends_on.is_empty() {
+            "-".to_string()
+        } else {
+            task.depends_on.join(",")
+        };
+        println!(
+            "  {} {} [{}] provider={} deps={}",
+            task.task_id,
+            task.subject,
+            format!("{:?}", task.role).to_ascii_lowercase(),
+            task.provider.as_deref().unwrap_or("-"),
+            deps
+        );
+    }
+    if !no_hints {
+        println!(
+            "{} {}",
+            ui_command("edit:"),
+            format!(
+                "{}/plans/{}/plan.json",
+                DeadreckonPaths::discover().home().display(),
+                plan.plan_id
+            )
+        );
+        println!(
+            "{} deadreckon fork {}",
+            ui_command("fork:"),
+            run_prefix(&plan.plan_id)
+        );
+    }
 }
 
 fn format_wall_cap(max_wall_seconds: Option<f64>) -> String {

@@ -1,0 +1,246 @@
+#![allow(clippy::expect_used)]
+
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+use deadreckon_core::{DeadreckonPaths, Plan, PlanMode, PlanRole, load_plan};
+use tempfile::TempDir;
+
+#[test]
+fn plan_writes_plan_json_with_n_tasks() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust in two files",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "3",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.mode, PlanMode::Split);
+    assert_eq!(plan.tasks.len(), 3);
+    assert_eq!(plan.providers.planner.as_deref(), Some("smoke"));
+    assert_eq!(plan.providers.default_child.as_deref(), Some("smoke"));
+}
+
+#[test]
+fn plan_writes_worker_specs_for_each_task() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    for task in &plan.tasks {
+        let spec = fs::read_to_string(paths.worker_spec(&plan.plan_id, &task.task_id))
+            .expect("worker spec");
+        assert!(spec.contains("Root goal: tiny hello rust"), "{spec}");
+        assert!(spec.contains("Do not spawn subagents"), "{spec}");
+        assert!(spec.contains(&task.task_id), "{spec}");
+    }
+}
+
+#[test]
+fn plan_review_mode_writes_coder_reviewer_plan_without_decomposition() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--mode",
+            "review",
+            "--coder-provider",
+            "smoke:coder",
+            "--reviewer-provider",
+            "smoke:reviewer",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.mode, PlanMode::Review);
+    assert_eq!(plan.tasks.len(), 2);
+    assert_eq!(plan.tasks[0].role, PlanRole::Coder);
+    assert_eq!(plan.tasks[0].provider.as_deref(), Some("smoke:coder"));
+    assert_eq!(plan.tasks[1].role, PlanRole::Reviewer);
+    assert_eq!(plan.tasks[1].provider.as_deref(), Some("smoke:reviewer"));
+    assert_eq!(
+        plan.tasks[1].depends_on,
+        vec![plan.tasks[0].task_id.clone()]
+    );
+}
+
+#[test]
+fn plan_preview_prints_capabilities_and_provider_table() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "deploy websocket app",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(
+        out.contains("providers: planner=smoke default-child=smoke"),
+        "{out}"
+    );
+    assert!(out.contains("capabilities:"), "{out}");
+    assert!(out.contains("deploy=true"), "{out}");
+}
+
+#[test]
+fn plan_records_explicit_child_provider_overrides() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke:default",
+            "--child-provider",
+            "1=smoke:reviewer",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    assert_eq!(
+        plan.providers.default_child.as_deref(),
+        Some("smoke:default")
+    );
+    assert_eq!(
+        plan.providers.children.get(&1).map(String::as_str),
+        Some("smoke:reviewer")
+    );
+    assert_eq!(plan.tasks[0].provider.as_deref(), Some("smoke:default"));
+    assert_eq!(plan.tasks[1].provider.as_deref(), Some("smoke:reviewer"));
+}
+
+fn repo_tempdir() -> TempDir {
+    let root = PathBuf::from("/Users/gdc/deadreckon/.test-tmp");
+    fs::create_dir_all(&root).expect("test tmp root");
+    TempDir::new_in(root).expect("tempdir")
+}
+
+fn clean_git_repo(temp: &TempDir) -> PathBuf {
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    git(&repo, &["init"]).expect("git init");
+    fs::write(repo.join("README.md"), "hello").expect("readme");
+    git(&repo, &["add", "-A"]).expect("add");
+    git(&repo, &["commit", "-m", "initial"]).expect("commit");
+    repo
+}
+
+fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
+    let output = Command::new("git").arg("-C").arg(cwd).args(args).output()?;
+    assert!(
+        output.status.success(),
+        "git {:?}\n{}{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+fn newest_plan(paths: &DeadreckonPaths) -> Plan {
+    let mut plans = fs::read_dir(paths.plans_dir())
+        .expect("plans dir")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path().join("plan.json"))
+        .filter(|path| path.exists())
+        .map(|path| {
+            let plan_id = path
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .expect("plan id")
+                .to_string();
+            load_plan(paths, &plan_id).expect("plan")
+        })
+        .collect::<Vec<_>>();
+    plans.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    plans.into_iter().next().expect("plan")
+}
+
+fn deadreckon(paths: &DeadreckonPaths) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
+    command.env("DEADRECKON_HOME", paths.home());
+    command
+}
+
+fn assert_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(output),
+        stderr(output)
+    );
+}
+
+fn stdout(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
