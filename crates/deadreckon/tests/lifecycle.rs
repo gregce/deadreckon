@@ -838,7 +838,7 @@ fn help_lists_lifecycle_verbs() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("Core lifecycle:"));
-    assert!(stdout.contains("done \""));
+    assert!(stdout.contains("def-done \""));
     assert!(stdout.contains("finish latest"));
     assert!(stdout.contains("status"));
     assert!(stdout.contains("cleanup"));
@@ -870,7 +870,7 @@ fn every_top_level_help_shows_lifecycle_usage() {
         "config",
         "completion",
         "help-all",
-        "done",
+        "def-done",
         "acceptance",
         "run",
         "chain",
@@ -918,6 +918,7 @@ fn completion_scripts_cover_commands_flags_and_advanced_verbs() {
     let zsh = stdout(&output);
     assert!(zsh.contains("#compdef deadreckon"), "{zsh}");
     assert!(zsh.contains("run:"), "{zsh}");
+    assert!(zsh.contains("def-done:"), "{zsh}");
     assert!(zsh.contains("--provider"), "{zsh}");
     assert!(zsh.contains("completion:"), "{zsh}");
     assert!(
@@ -1005,9 +1006,9 @@ async fn done_plain_english_uses_configured_provider() {
 
     let output = deadreckon(&paths)
         .current_dir(&workspace)
-        .args(["done", "README exists", "--provider", "mock"])
+        .args(["def-done", "README exists", "--provider", "mock"])
         .output()
-        .expect("done");
+        .expect("def-done");
 
     assert_success(&output);
     assert!(stdout(&output).contains("done criteria configured"));
@@ -1028,19 +1029,33 @@ fn done_check_and_show_are_user_facing() {
 
     let check = deadreckon(&paths)
         .current_dir(&workspace)
-        .args(["done", "check"])
+        .args(["def-done", "check"])
         .output()
-        .expect("done check");
+        .expect("def-done check");
     assert_success(&check);
     assert!(stdout(&check).contains("done criteria passed"));
 
     let show = deadreckon(&paths)
         .current_dir(&workspace)
-        .args(["done", "show"])
+        .args(["def-done", "show"])
         .output()
-        .expect("done show");
+        .expect("def-done show");
     assert_success(&show);
     assert!(stdout(&show).contains("done criteria"));
+}
+
+#[test]
+fn done_is_not_kept_as_a_compatibility_alias() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let output = deadreckon(&paths)
+        .arg("done")
+        .arg("--help")
+        .output()
+        .expect("old done command");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("unrecognized subcommand"));
 }
 
 #[test]

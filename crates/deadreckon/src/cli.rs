@@ -14,7 +14,7 @@ Options:
 
 const TOP_LEVEL_HELP: &str = "\
 Typical flow:
-  deadreckon done \"builds, tests pass, and opens in a browser\"
+  deadreckon def-done \"builds, tests pass, and opens in a browser\"
   deadreckon run \"build the thing\"
   deadreckon attach latest
   deadreckon finish latest
@@ -22,7 +22,7 @@ Typical flow:
 Core lifecycle:
   init        configure deadreckon
   doctor      check provider, sandbox, and local setup
-  done        write/check done criteria in English
+  def-done    write/check done criteria in English
   run         start unattended coding work
   attach      watch a run in the TUI
   status      see the latest run and next action
@@ -114,10 +114,10 @@ Common provider/model changes:
   deadreckon config model gpt-5.1-codex --provider cli:codex
 
 Done criteria:
-  deadreckon done \"build, test, and open in a browser\"
-  deadreckon done add \"users can save drawings\"
-  deadreckon done check
-  deadreckon done show
+  deadreckon def-done \"build, test, and open in a browser\"
+  deadreckon def-done add \"users can save drawings\"
+  deadreckon def-done check
+  deadreckon def-done show
 
 Modes:
   In a git repo, the default is an isolated worktree.
@@ -125,22 +125,22 @@ Modes:
 
 const DONE_HELP: &str = "\
 Lifecycle:
-  deadreckon done \"builds, opens in a browser, and has no console errors\"
+  deadreckon def-done \"builds, opens in a browser, and has no console errors\"
   deadreckon run \"finish the app\"
 
 Common actions:
-  deadreckon done \"plain-English definition of done\"
-  deadreckon done add \"one more thing that must be true\"
-  deadreckon done add browser
-  deadreckon done check
-  deadreckon done show
+  deadreckon def-done \"plain-English definition of done\"
+  deadreckon def-done add \"one more thing that must be true\"
+  deadreckon def-done add browser
+  deadreckon def-done check
+  deadreckon def-done show
 
 What it means:
   Write done criteria in English. deadreckon compiles them into checks for dr-gate.
   `deadreckon run` and `deadreckon chain run` prompt for this when criteria are missing.";
 
 const ACCEPTANCE_HELP: &str = "\
-Advanced compatibility command. Most users should use `deadreckon done`.
+Advanced compatibility command. Most users should use `deadreckon def-done`.
 
 Subcommands:
   deadreckon acceptance setup
@@ -411,6 +411,7 @@ pub(crate) enum Commands {
         command: AcceptanceCommand,
     },
     #[command(
+        name = "def-done",
         next_help_heading = "Done Criteria",
         about = "Write, add, show, and check done criteria in English",
         after_help = DONE_HELP

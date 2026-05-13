@@ -556,7 +556,7 @@ fn print_top_help() {
     println!();
     println!("{}", ui_heading("Typical flow:"));
     for command in [
-        "deadreckon done \"builds, tests pass, and opens in a browser\"",
+        "deadreckon def-done \"builds, tests pass, and opens in a browser\"",
         "deadreckon run \"build the thing\"",
         "deadreckon attach latest",
         "deadreckon finish latest",
@@ -568,7 +568,7 @@ fn print_top_help() {
     for (name, purpose) in [
         ("init", "configure deadreckon"),
         ("doctor", "check provider, sandbox, and local setup"),
-        ("done", "write/check done criteria in English"),
+        ("def-done", "write/check done criteria in English"),
         ("run", "start unattended coding work"),
         ("attach", "watch a run in the TUI"),
         ("status", "see the latest run and next action"),
@@ -622,7 +622,7 @@ fn print_help_all() {
     for (name, purpose) in [
         ("init", "configure deadreckon"),
         ("doctor", "check provider, sandbox, and local setup"),
-        ("done", "write/check done criteria in English"),
+        ("def-done", "write/check done criteria in English"),
         ("run", "start unattended coding work"),
         ("chain", "run several coding steps in sequence"),
         ("attach", "watch a run in the TUI"),
@@ -4425,7 +4425,7 @@ async fn done_command(
             if request.is_empty() {
                 return Err(CliError::Core(deadreckon_core::user_error(
                     "done add needs a criterion",
-                    "deadreckon done add \"users can save drawings\"",
+                    "deadreckon def-done add \"users can save drawings\"",
                 )));
             }
             acceptance_add_command(request, provider, model, force).await
@@ -4437,7 +4437,7 @@ async fn done_command(
             if request.is_empty() {
                 return Err(CliError::Core(deadreckon_core::user_error(
                     "done edit needs a requested change",
-                    "deadreckon done edit \"also require the gallery to persist\"",
+                    "deadreckon def-done edit \"also require the gallery to persist\"",
                 )));
             }
             acceptance_agent_command(AcceptanceAgentMode::Refine, request, provider, model, force)
@@ -4454,18 +4454,18 @@ async fn done_command(
 }
 
 fn print_done_help() {
-    println!("{}", ui_heading("deadreckon done"));
+    println!("{}", ui_heading("deadreckon def-done"));
     println!("usage:");
     println!(
         "  {}",
-        ui_command("deadreckon done \"builds, opens in a browser, and has no console errors\"")
+        ui_command("deadreckon def-done \"builds, opens in a browser, and has no console errors\"")
     );
     println!(
         "  {}",
-        ui_command("deadreckon done add \"users can save drawings\"")
+        ui_command("deadreckon def-done add \"users can save drawings\"")
     );
-    println!("  {}", ui_command("deadreckon done check"));
-    println!("  {}", ui_command("deadreckon done show"));
+    println!("  {}", ui_command("deadreckon def-done check"));
+    println!("  {}", ui_command("deadreckon def-done show"));
 }
 
 #[derive(Clone, Copy)]
@@ -4512,14 +4512,14 @@ async fn acceptance_agent_command_in_dir(
     if matches!(mode, AcceptanceAgentMode::Refine) && existing_yaml.is_none() {
         return Err(CliError::Core(deadreckon_core::user_error(
             "no project acceptance spec found",
-            "deadreckon done \"what should count as done\"",
+            "deadreckon def-done \"what should count as done\"",
         )));
     }
     let request = acceptance_request_text(&request, mode)?;
     if !force && yaml_path.exists() && matches!(mode, AcceptanceAgentMode::Draft) {
         return Err(CliError::Core(deadreckon_core::user_error(
             ".deadreckon/acceptance.yaml already exists",
-            "deadreckon done add \"one more criterion\" or rerun with --force",
+            "deadreckon def-done add \"one more criterion\" or rerun with --force",
         )));
     }
     let paths = DeadreckonPaths::discover();
@@ -4557,7 +4557,7 @@ async fn acceptance_agent_command_in_dir(
     .map_err(|err| {
         CliError::Core(deadreckon_core::user_error(
             &format!("acceptance provider failed: {err}"),
-            "deadreckon done \"builds and passes tests\"",
+            "deadreckon def-done \"builds and passes tests\"",
         ))
     })?;
     let draft = parse_acceptance_agent_response(&response.content)?;
@@ -4708,7 +4708,7 @@ fn acceptance_explain_command(spec: Option<PathBuf>) -> Result<()> {
         println!();
         println!(
             "{}",
-            ui_command("deadreckon done \"what should count as done\"")
+            ui_command("deadreckon def-done \"what should count as done\"")
         );
     }
     Ok(())
@@ -4753,14 +4753,14 @@ fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> 
             {
                 return Err(CliError::Core(deadreckon_core::user_error(
                     &format!("required done criterion failed: {}", failed.detail),
-                    "fix the project or run `deadreckon done edit \"tighten or correct the checks\"`",
+                    "fix the project or run `deadreckon def-done edit \"tighten or correct the checks\"`",
                 )));
             }
             Ok(())
         }
         Err(err) => Err(CliError::Core(deadreckon_core::user_error(
             &format!("done criteria check failed: {err}"),
-            "fix the project or edit .deadreckon/acceptance.yaml, then rerun `deadreckon done check`",
+            "fix the project or edit .deadreckon/acceptance.yaml, then rerun `deadreckon def-done check`",
         ))),
     }
 }
@@ -4827,7 +4827,7 @@ fn acceptance_request_text(request: &[String], mode: AcceptanceAgentMode) -> Res
         ),
         AcceptanceAgentMode::Refine => Err(CliError::Core(deadreckon_core::user_error(
             "refine needs a requested change",
-            "deadreckon done add \"also require tests for the gallery\"",
+            "deadreckon def-done add \"also require tests for the gallery\"",
         ))),
     }
 }
@@ -4977,7 +4977,7 @@ fn parse_acceptance_agent_response(content: &str) -> Result<AcceptanceDraft> {
     }
     Err(CliError::Core(deadreckon_core::user_error(
         "provider did not return acceptance JSON or YAML",
-        "rerun `deadreckon done ...` or use `deadreckon done check` after editing criteria",
+        "rerun `deadreckon def-done ...` or use `deadreckon def-done check` after editing criteria",
     )))
 }
 
@@ -5138,7 +5138,7 @@ fn resolve_acceptance_source(
         if !path.is_file() {
             return Err(CliError::Core(deadreckon_core::user_error(
                 &format!("acceptance spec not found: {}", path.display()),
-                "deadreckon done \"what should count as done\"",
+                "deadreckon def-done \"what should count as done\"",
             )));
         }
         return Ok(Some(AcceptanceSource {
@@ -5242,7 +5242,7 @@ fn resolve_acceptance_path_for_command(cwd: &Path, spec: Option<&Path>) -> Resul
         if !path.is_file() {
             return Err(CliError::Core(deadreckon_core::user_error(
                 &format!("acceptance spec not found: {}", path.display()),
-                "deadreckon done \"what should count as done\"",
+                "deadreckon def-done \"what should count as done\"",
             )));
         }
         return Ok(Some(path));
@@ -5280,7 +5280,7 @@ fn write_project_acceptance(
     if !allow_existing && !force && (yaml_path.exists() || md_path.exists()) {
         return Err(CliError::Core(deadreckon_core::user_error(
             ".deadreckon/acceptance files already exist",
-            "deadreckon done add \"one more criterion\" or rerun with --force",
+            "deadreckon def-done add \"one more criterion\" or rerun with --force",
         )));
     }
     fs::create_dir_all(&dir)?;
@@ -5334,7 +5334,7 @@ fn print_acceptance_written(cwd: &Path, source: &str, checks: usize) {
     println!(
         "{} {}",
         ui_command("next:"),
-        ui_command("deadreckon done check")
+        ui_command("deadreckon def-done check")
     );
     println!(
         "{} {}",
@@ -5538,13 +5538,13 @@ fn append_acceptance_checks(existing_raw: &str, addition_raw: &str) -> Result<St
     if checks.is_empty() {
         return Err(CliError::Core(deadreckon_core::user_error(
             "acceptance pack did not contain checks",
-            "try `deadreckon done add browser` or `deadreckon done \"what should count as done\"`",
+            "try `deadreckon def-done add browser` or `deadreckon def-done \"what should count as done\"`",
         )));
     }
     let mapping = existing.as_mapping_mut().ok_or_else(|| {
         CliError::Core(deadreckon_core::user_error(
             "acceptance.yaml must be a mapping",
-            "run `deadreckon done \"what should count as done\" --force`",
+            "run `deadreckon def-done \"what should count as done\" --force`",
         ))
     })?;
     let key = serde_yaml::Value::String("checks".to_string());
@@ -5562,7 +5562,7 @@ fn append_acceptance_checks(existing_raw: &str, addition_raw: &str) -> Result<St
     serde_yaml::to_string(&existing).map_err(|source| {
         CliError::Core(deadreckon_core::user_error(
             &format!("failed to write acceptance.yaml: {source}"),
-            "run `deadreckon done \"what should count as done\" --force`",
+            "run `deadreckon def-done \"what should count as done\" --force`",
         ))
     })
 }
@@ -5648,9 +5648,9 @@ test('app loads without browser console errors', async ({ page }) => {
 fn acceptance_markdown_from_yaml(raw: &str) -> String {
     match acceptance_check_count(raw) {
         Ok(count) => format!(
-            "Configured checks: {count}. Run `deadreckon done check` before starting long work."
+            "Configured checks: {count}. Run `deadreckon def-done check` before starting long work."
         ),
-        Err(_) => "Run `deadreckon done check` before starting long work.".to_string(),
+        Err(_) => "Run `deadreckon def-done check` before starting long work.".to_string(),
     }
 }
 
@@ -5740,7 +5740,7 @@ fn acceptance_check_count(raw: &str) -> Result<usize> {
     if count == 0 {
         return Err(CliError::Core(deadreckon_core::user_error(
             "acceptance.yaml does not contain any recognized checks",
-            "run `deadreckon done \"what should count as done\"`",
+            "run `deadreckon def-done \"what should count as done\"`",
         )));
     }
     Ok(count)
@@ -5750,7 +5750,7 @@ fn acceptance_yaml_value(raw: &str) -> Result<serde_yaml::Value> {
     serde_yaml::from_str(raw).map_err(|source| {
         CliError::Core(deadreckon_core::user_error(
             &format!("invalid acceptance.yaml: {source}"),
-            "deadreckon done \"what should count as done\"",
+            "deadreckon def-done \"what should count as done\"",
         ))
     })
 }

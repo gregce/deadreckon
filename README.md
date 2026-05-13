@@ -11,7 +11,7 @@ Claude Code, Codex, Cursor CLI, and the rest are good at writing code. They are 
 You bring the agent CLI you already trust. You tell deadreckon what "done" looks like in plain English. It runs the work in an isolated sandbox, saves every turn, and uses a separate watchdog process to decide when the job is actually finished — a watchdog the agent cannot fool.
 
 ```bash
-deadreckon done "users can sign up, log in, and save a drawing"
+deadreckon def-done "users can sign up, log in, and save a drawing"
 deadreckon run "build the app"
 # walk away, attach later from any terminal
 deadreckon attach latest
@@ -115,9 +115,9 @@ This is not just `git reset`. It works against the run's own snapshot trail and 
 Tell deadreckon what success looks like in plain language. It compiles your sentence into executable checks that an independent watchdog runs:
 
 ```bash
-deadreckon done "build, load in a browser, and show no console errors"
-deadreckon done add "users can save drawings"
-deadreckon done check
+deadreckon def-done "build, load in a browser, and show no console errors"
+deadreckon def-done add "users can save drawings"
+deadreckon def-done check
 deadreckon run "finish the app"
 ```
 
@@ -209,7 +209,7 @@ deadreckon chain extend latest "add billing webhooks and retry logic"
 ```text
 your repo
   |
-  | deadreckon done "what 'finished' looks like, in English"
+  | deadreckon def-done "what 'finished' looks like, in English"
   | deadreckon run  "what to build"
   v
 isolated worktree or copy   ◄── your real checkout untouched
@@ -260,7 +260,7 @@ Configure and run a task end-to-end:
 ```bash
 deadreckon init --provider cli:claude-code --sandbox auto --max-spend 10
 
-deadreckon done   "users can sign up, log in, and save a drawing"
+deadreckon def-done   "users can sign up, log in, and save a drawing"
 deadreckon run    "build the app"
 deadreckon attach latest    # watch live, Ctrl-D to detach
 deadreckon doc    latest    # read the narrative once done
