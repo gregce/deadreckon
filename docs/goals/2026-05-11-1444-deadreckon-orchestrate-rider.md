@@ -9,8 +9,9 @@ It supersedes nothing in prior riders
 `2026-05-11-1400-deadreckon-usability-rider.md`) — their invariants, dependency
 policy, sandbox defaults, CLI surface, lifecycle hints, and existing
 verbs still apply. This rider adds **plans**, **children**, a
-**coordinator**, four new top-level verbs, multi-pane TUI, and the
-ergonomic conventions the multi-agent view requires.
+**coordinator**, explicit provider assignment, a coder/reviewer
+orchestration lane, multi-pane TUI, and the ergonomic conventions the
+multi-agent view requires.
 
 **All paths absolute.** Source `/Users/gdc/deadreckon/`, runtime
 `/Users/gdc/.deadreckon/`.
@@ -42,9 +43,18 @@ Path: `/Users/gdc/.deadreckon/plans/<plan-id>/plan.json`.
   "schema_version": 1,
   "plan_id": "<uuid>",
   "root_goal": "<original user goal>",
+  "mode": "split|review",
   "n": 3,
+  "providers": {
+    "planner": "cli:codex",
+    "default_child": "cli:claude-code",
+    "coder": null,
+    "reviewer": null,
+    "children": { "0": "cli:claude-code", "1": "cli:codex" }
+  },
   "sub_goals": [
     { "index": 0, "goal": "<sub-goal text>",
+      "provider": "cli:claude-code", "role": "child",
       "child_run_id": null, "child_scope": null, "status": "pending" }
   ],
   "parent_scope": "<canonical parent-scope or null>",
@@ -57,8 +67,15 @@ Path: `/Users/gdc/.deadreckon/plans/<plan-id>/plan.json`.
 }
 ```
 
-`sub_goals[i].status` transitions: `pending → running → completed | failed | killed`.
+`mode = "split"` uses provider-decomposed sub-goals. `mode = "review"` uses two
+logical sub-goals without provider planning: a coder run followed by a reviewer
+extend/review run. `sub_goals[i].status` transitions:
+`pending → running → completed | failed | killed`.
 `plan.status` transitions: `pending → forked → merged | failed`.
+
+Provider entries are resolved at plan creation and copied into the plan file so
+that a later `fork` is reproducible. CLI flags may override them at fork time,
+but the override is recorded back into `plan.json` before any child starts.
 
 ### Child `.deadreckon/parent.json` (extends usability-rider schema)
 
@@ -73,6 +90,8 @@ A child's working dir contains:
   "parent_goal": "<root goal>",
   "child_index": 0,
   "sub_goal": "<this child's sub-goal>",
+  "provider": "cli:claude-code",
+  "role": "child|coder|reviewer",
   "created_at": "<RFC3339>",
   "deadreckon_version": "<crate version>"
 }
@@ -80,7 +99,7 @@ A child's working dir contains:
 
 The `kind` field distinguishes from `materialized` and `extended` per
 `usability-rider`. `deadreckon show <run-id>` reads this and reports
-`Child <index> of plan <plan-id>` in the header.
+`Child <index> of plan <plan-id>` in the header, including provider and role.
 
 ### `coordinator.json`
 
@@ -95,7 +114,8 @@ Written by `deadreckon fork` while running; deleted on clean exit.
   "started_at": "<RFC3339>",
   "children": [
     { "child_index": 0, "run_id": "<uuid>", "pid": 12346,
-      "scope": "<scope>", "status": "running" }
+      "scope": "<scope>", "provider": "cli:claude-code",
+      "role": "child|coder|reviewer", "status": "running" }
   ]
 }
 ```
@@ -120,7 +140,54 @@ Children themselves live under the normal
 `~/.deadreckon/runstate/<sub-scope>/runs/<child-run-id>/`. The plan
 directory contains pointers, never copies of child state.
 
-## Eleven phases
+## Provider assignment model
+
+Provider choice is a first-class part of orchestration. The user must be able to
+see and override each role before work starts.
+
+Resolution order:
+
+1. Explicit role flags on `orchestrate`, `plan`, or `fork`.
+2. Per-child flags in the form `--child-provider <idx=id>`.
+3. `plan.json.providers.children[idx]`.
+4. `plan.json.providers.default_child`.
+5. Existing deadreckon provider config default.
+
+Roles:
+
+- `planner` - provider used only to decompose a split-mode goal.
+- `default_child` - provider used for split children without an explicit
+  override.
+- `child:<idx>` - provider for one split child.
+- `coder` - provider used for the implementation run in review mode.
+- `reviewer` - provider used for the review/fix run in review mode.
+
+The preview must print the resolved provider table:
+
+```text
+providers
+  planner:       cli:codex
+  default child: cli:claude-code
+  child 0:       cli:claude-code
+  child 1:       cli:codex
+```
+
+Review mode preview:
+
+```text
+providers
+  coder:    cli:claude-code
+  reviewer: cli:codex
+```
+
+Review mode is intentionally conservative: the coder run produces the initial
+artifact, then the reviewer provider is launched through the existing `extend`
+path with a prompt that asks it to inspect, write `.deadreckon/REVIEW.md`, and
+apply only review-fix changes needed to satisfy acceptance. The final reviewed
+run is the promoted output. If the reviewer only writes findings and no code
+changes, the coordinator still gates the coder artifact and records the review.
+
+## Phases
 
 Each phase: (1) write the named depth test(s) **first** and watch them
 fail; (2) implement; (3) run
@@ -157,19 +224,27 @@ Depth tests (in `crates/deadreckon/tests/orchestrate.rs`):
   `plan_json(plan_id)`, `coordinator_json(plan_id)`,
   `merge_working(plan_id)`.
 - Extend the child-side `parent.json` writer to support `kind:
-  "plan_child"` per the schema above.
+  "plan_child"` per the schema above, including provider and role.
 
 Depth tests:
 - `plan_json_serializes_roundtrip` — write/read a fully-populated
   `Plan`; equality on round-trip.
 - `child_parent_json_plan_kind` — write/read with `kind: "plan_child"`;
   required fields present.
+- `plan_json_preserves_provider_role_assignments` — round-trip split and review
+  plans with planner/default-child/per-child/coder/reviewer providers intact.
 
-### P3 — `plan` verb (provider-driven decomposition)
+### P3 — `plan` verb (provider-driven decomposition + role preview)
 
 - New verb. Provider prompt template (in
   `crates/deadreckon-core/src/plan.rs`): asks for a JSON array of N
   short sub-goals, each ≤ 120 chars, distinct, parallelizable.
+- `--planner-provider` selects the provider used to decompose the goal.
+- `--provider` is an alias for `--default-child-provider` in split mode.
+- `--child-provider <idx=id>` records per-child provider overrides after the
+  provider returns sub-goals and before writing `plan.json`.
+- `--mode review` skips provider decomposition and writes a two-role plan:
+  coder then reviewer.
 - Validate provider output: ≥ 2 sub-goals, each non-empty after trim,
   no duplicates after lowercase/whitespace-normalize.
 - Write `plan.json` with status `pending`.
@@ -182,17 +257,31 @@ Depth tests:
   assert exit non-zero, error text + `try:` line, no plan.json
   written.
 - `plan_n_flag_clamped_to_2_through_6` — `--n 1` and `--n 7` rejected.
+- `plan_records_explicit_planner_and_child_providers` — mock plan with
+  `--planner-provider cli:codex --provider cli:claude-code --child-provider 1=cli:codex`
+  records the provider table and child override.
+- `plan_review_mode_writes_coder_reviewer_plan_without_decomposition` —
+  `--mode review` does not call the planner provider and records coder/reviewer
+  roles.
 
-### P4 — `fork` verb (spawn children)
+### P4 — `fork` verb (spawn split children + review lane)
 
 - New verb. Loads `plan.json`, refuses if status != `pending`.
 - For each sub-goal, spawns a child `deadreckon run` subprocess with:
   - `--goal "<sub-goal>"`
   - `--scope <parent-scope>-c<index>`
   - the inherited resource flags (`--max-spend`, `--max-wall-seconds`,
-    `--sandbox`, `--provider`)
+    `--sandbox`, resolved `--provider`)
   - `--parent-plan-id <plan-uuid>` (new internal flag; rider §"Verb
     signatures" lists)
+- In split mode, children with no explicit provider use
+  `providers.default_child`; children with `sub_goals[i].provider` use that
+  provider.
+- In review mode, child 0 runs with `providers.coder`; child 1 is launched only
+  after child 0 completes and passes acceptance. Child 1 is an `extend` of the
+  coder artifact using `providers.reviewer`; its prompt is review-focused and
+  includes the coder run id, artifact path, acceptance summary, and request to
+  write `.deadreckon/REVIEW.md`.
 - Acquires each child's task lock per existing `lock.rs` semantics.
 - Writes `coordinator.json` with all child PIDs.
 - Foregrounds as the coordinator until all children terminate.
@@ -205,17 +294,24 @@ Depth tests:
 Depth tests:
 - `fork_spawns_n_children_with_distinct_scopes` — fixture plan;
   fork; assert N child runstate dirs exist, distinct scopes.
+- `fork_launches_each_child_with_resolved_provider` — fixture plan with child
+  provider overrides; fake binaries assert each child used the expected route.
 - `fork_refuses_when_plan_already_forked` — re-fork yields the
   expected error + `try:` line.
 - `fork_writes_coordinator_json_with_child_pids` — assert each PID
   alive at write time.
+- `review_mode_runs_coder_then_reviewer_extend` — fake coder completes,
+  reviewer starts only after coder acceptance, reviewer parent points at coder
+  run, and final plan status references the reviewed run.
+- `review_mode_stops_before_reviewer_when_coder_fails_gate` — coder failure
+  pauses the plan with a `try: deadreckon show <coder-run-id> --why-failed`.
 
 ### P5 — Multi-pane attach TUI
 
 - `deadreckon attach <plan-id>` opens a plan TUI: grid of N panes
   (auto-layout up to 6 children; ≥4 children → 2-row grid).
 - Each pane shows: child index, sub-goal (truncated), status, current
-  turn, spend, progress bar (turns / estimated total ≈ unknown so use
+  turn, provider, role, spend, progress bar (turns / estimated total ≈ unknown so use
   spend / cap; if `--max-spend` absent, render activity dots), latest
   trace line.
 - Keys: `Enter` drills into the focused child (existing single-run
@@ -230,6 +326,8 @@ Depth tests:
 Depth tests:
 - `attach_plan_shows_n_panes` — TUI snapshot test using crossterm's
   test backend; assert N panes rendered.
+- `attach_plan_shows_provider_and_role_per_pane` — split and review fixtures
+  render child/coder/reviewer labels and provider ids.
 - `attach_plan_enter_drills_then_esc_returns` — synthesize input
   events; assert view changes.
 - `attach_plan_ctrl_d_detaches_does_not_kill` — children survive
@@ -252,7 +350,7 @@ Depth tests:
   pass-by-default). Failure aborts before promotion.
 - On gate success: atomic rename `merge-working/` →
   `library/<merged-scope>/<merged-run-id>/`, write
-  `manifest.json` with the plan_id + child run_ids, mark
+  `manifest.json` with the plan_id + child run_ids + provider roles, mark
   `plan.status = merged`, write `plan.merged_run_id`.
 - Print materialize hint.
 
@@ -266,6 +364,8 @@ Depth tests:
   picks child 1's content; conflicts.json recorded.
 - `merge_promotes_to_new_library_entry` — assert
   `library/<scope>/<merged-id>/` exists with manifest.json.
+- `merge_manifest_records_child_provider_roles` — manifest includes the provider
+  used by each child and, for review mode, identifies the reviewed run.
 - `merge_refuses_running_child` — child still running → error with
   `try: kill or wait`.
 
@@ -368,6 +468,8 @@ Depth tests:
   | `conflict at <path>` | `--strategy prefer-child <idx>` |
   | `merge promotion blocked by gate` | `deadreckon show <plan-id> --why-failed` |
   | `no provider configured` | `deadreckon init` |
+  | `provider role missing` | `deadreckon orchestrate "goal" --mode review --coder-provider cli:claude-code --reviewer-provider cli:codex` |
+  | `child provider index out of range` | `--child-provider 1=cli:codex` |
   | `lock held by pid <P>` | `kill <P> or wait` |
   | `--n must be 2..=6` | `deadreckon plan ... --n 3` |
   | `--goal must be non-empty` | `deadreckon plan "your goal"` |
@@ -391,7 +493,15 @@ Depth tests:
   After `plan`:
   ```
   plan: <plan-id> with <N> sub-goals
+  providers: planner=<id> default-child=<id>
   edit: vim /Users/gdc/.deadreckon/plans/<plan-id>/plan.json
+  fork: deadreckon fork <plan-id>
+  ```
+
+  After review-mode plan:
+  ```
+  plan: <plan-id> review mode
+  providers: coder=<id> reviewer=<id>
   fork: deadreckon fork <plan-id>
   ```
 
@@ -417,7 +527,7 @@ Depth tests:
 
 - **Task-first `--help` grouping** (do not rewrite; add clap
   group attributes):
-  - Lifecycle: `init`, `plan`, `fork`, `run`, `attach`, `merge`,
+  - Lifecycle: `init`, `orchestrate`, `plan`, `fork`, `run`, `attach`, `merge`,
     `list`, `kill`, `resume`, `materialize`, `extend`
   - Inspection: `show`, `history`, `doctor`
   - Recovery: `undo`, `import`
@@ -433,6 +543,8 @@ Depth tests:
   no ANSI escapes in output.
 - `quiet_plain_combined_emits_only_final_line` — assert exactly one
   matching line in output.
+- `review_mode_post_action_hints_name_coder_and_reviewer` — hints show both
+  providers and the next attach/merge command.
 
 ### P11 — AS-BUILT update + CHANGELOG (doc only; no depth test)
 
@@ -445,14 +557,16 @@ Depth tests:
 
   18.1 Mental model (one plan → N children → one merge)
   18.2 plan.json schema (verbatim quote from plan.rs)
-  18.3 Child lineage (parent.json with kind: plan_child)
-  18.4 Coordinator process (coordinator.json, supervision lifecycle)
-  18.5 Sub-scope naming
-  18.6 Multi-pane TUI (layout sketch)
-  18.7 Merge strategy & conflict resolution
-  18.8 Cancellation cascade
-  18.9 Plan-aware history grep
-  18.10 What's not yet built (e.g., team-context WriteToTeam action,
+  18.3 Provider roles and assignment precedence
+  18.4 Child lineage (parent.json with kind: plan_child)
+  18.5 Coordinator process (coordinator.json, supervision lifecycle)
+  18.6 Review mode (coder provider → reviewer provider → final gate)
+  18.7 Sub-scope naming
+  18.8 Multi-pane TUI (layout sketch)
+  18.9 Merge strategy & conflict resolution
+  18.10 Cancellation cascade
+  18.11 Plan-aware history grep
+  18.12 What's not yet built (e.g., team-context WriteToTeam action,
         auto-decompose-during-run)
   ```
 
@@ -477,6 +591,8 @@ Depth tests:
   ## Orchestration milestone (alpha) — <YYYY-MM-DD>
 
   - plan/fork/merge/kill/attach<plan-id> verbs landed (P3–P7)
+  - explicit planner/default-child/per-child/coder/reviewer provider roles
+  - review mode runs one provider as coder and a second as reviewer/fixer
   - history grep + show --why-failed landed (P8–P9)
   - TUI event streaming via RunEventBus (P1)
   - Cross-process cancellation cascade (P7)
@@ -488,9 +604,31 @@ Depth tests:
 ## Verb signatures
 
 ```
+deadreckon orchestrate <goal>
+    [--mode split|review]                 # default review for normal one-goal review lane
+    [--n <2..=6>]                         # split mode only; default 3
+    [--planner-provider <id>]             # split-mode decomposition provider
+    [--provider <id>]                     # default split child provider
+    [--child-provider <idx=id>]...        # split child override
+    [--coder-provider <id>]               # review mode
+    [--reviewer-provider <id>]            # review mode
+    [--max-spend <USD>]
+    [--max-wall-seconds <N>]
+    [--sandbox <auto|sandbox-exec|bwrap|docker|none>]
+    [--plain]
+    [--quiet]
+    [--no-hints]
+```
+
+```
 deadreckon plan <goal>
     [--n <2..=6>]              # default 3
-    [--provider <id>]
+    [--mode split|review]      # default split for explicit plan
+    [--planner-provider <id>]
+    [--provider <id>]          # default child provider in split mode
+    [--child-provider <idx=id>]...
+    [--coder-provider <id>]    # review mode
+    [--reviewer-provider <id>] # review mode
     [--out <path>]             # default ~/.deadreckon/plans/<plan-id>/plan.json
     [--no-hints]
     [--quiet]
@@ -501,7 +639,10 @@ deadreckon fork <plan-id>
     [--max-spend <USD>]        # per-child
     [--max-wall-seconds <N>]   # per-child (CLI providers)
     [--sandbox <auto|sandbox-exec|bwrap|docker|none>]
-    [--provider <id>]          # overrides plan default for all children
+    [--provider <id>]          # overrides split-mode default for all children
+    [--child-provider <idx=id>]...
+    [--coder-provider <id>]    # review mode override
+    [--reviewer-provider <id>] # review mode override
     [--no-hints]
     [--quiet]
     [--plain]
@@ -550,6 +691,7 @@ Internal-only flag added to `deadreckon run` for use by `fork`:
 deadreckon run <goal>
     --parent-plan-id <plan-uuid>      # hidden from --help; sets parent.json kind
     --child-index <N>                 # hidden from --help; same
+    --plan-role <child|coder|reviewer> # hidden from --help; same
     [...existing flags...]
 ```
 
@@ -560,6 +702,8 @@ deadreckon run <goal>
 | `plan` | empty goal | `--goal must be non-empty` | `deadreckon plan "your goal"` |
 | `plan` | N out of range | `--n must be 2..=6` | `deadreckon plan ... --n 3` |
 | `plan` | < 2 valid sub-goals | `provider returned <K> sub-goals; need >=2` | `deadreckon plan ... --provider <other>` |
+| `plan`/`fork` | provider role missing | `provider role <role> is not configured` | `deadreckon orchestrate "goal" --mode review --coder-provider cli:claude-code --reviewer-provider cli:codex` |
+| `plan`/`fork` | child provider index out of range | `child provider index <idx> outside 0..<N>` | `--child-provider 1=cli:codex` |
 | `fork` | plan not found | `no plan <id>` | `deadreckon plan list` (or `ls ~/.deadreckon/plans/`) |
 | `fork` | plan status != pending | `plan <id> is <status>` | status-specific (`merge`, `attach`, `kill`) |
 | `fork` | child lock held | `lock held by pid <P>` | `kill <P> or wait` |
@@ -574,13 +718,19 @@ deadreckon run <goal>
 
 ## Coordinator process model
 
+- `deadreckon orchestrate` is the one-command wrapper around `plan` + `fork` +
+  `merge` for the selected mode. It uses the same files and coordinator model;
+  there is no separate orchestration state.
 - `deadreckon fork` is a foreground process that becomes the
   coordinator. It writes `coordinator.json`, spawns N child
   subprocesses, and waits.
 - Each child is launched with `Command::new(<self>)` arguments
   reconstructed from the parent invocation, with the parent flag
-  set. The child writes its `state.json` and runs the normal turn
+  set, including resolved provider and role. The child writes its `state.json` and runs the normal turn
   loop.
+- In review mode, the coordinator runs the coder child first, waits for gate
+  success, then launches the reviewer through the existing extend path with the
+  reviewer provider. The reviewed run becomes the merge/promote candidate.
 - Supervision: every 500 ms the coordinator polls each child's
   `state.json` status field and `kill(pid, 0)` liveness; updates
   `coordinator.json.children[i].status`.
@@ -644,8 +794,10 @@ Also out of scope:
   V1-CANDIDATE.
 - N > 6 children. The current TUI layout caps useful display at 6;
   larger N stays a future concern.
-- Heterogeneous providers per child (one provider per plan for now;
-  same `--provider` applies to all children).
+- Automatic provider selection by cost/benchmark/latency. Providers are
+  explicit or config-derived; the coordinator does not guess "best" providers.
+- Multi-round reviewer debate loops. Review mode is coder -> reviewer/fixer ->
+  final gate. If more loops are needed, use chain/extend after the reviewed run.
 - Distributed coordination across machines. All children + coordinator
   live on one host.
 
