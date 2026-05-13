@@ -10,6 +10,7 @@
 - P6: Routed internal crates through `[workspace.dependencies]` and guarded the internal cargo metadata DAG.
 - P7: Added library-crate print refusal while keeping the binary crate exempt.
 - P8: Added registry-shape guard tests for `deadreckon-core`'s library root; no public surface changed.
+- P9: Regrouped provider/runtime/sandbox library roots into registry shape and preserved the public re-export set.
 
 ## Doc depth (alpha) — 2026-05-12
 

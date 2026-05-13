@@ -272,6 +272,37 @@ fn core_lib_rs_contains_no_fn_definition() {
     );
 }
 
+#[test]
+fn providers_lib_rs_module_declarations_grouped() {
+    assert_lib_rs_module_declarations_grouped("crates/deadreckon-providers/src/lib.rs");
+}
+
+#[test]
+fn runtime_lib_rs_module_declarations_grouped() {
+    assert_lib_rs_module_declarations_grouped("crates/deadreckon-runtime/src/lib.rs");
+}
+
+#[test]
+fn sandbox_lib_rs_module_declarations_grouped() {
+    assert_lib_rs_module_declarations_grouped("crates/deadreckon-sandbox/src/lib.rs");
+}
+
+#[test]
+fn every_library_lib_rs_pub_use_set_unchanged_from_p1() {
+    let root = workspace_root();
+    let output = Command::new("cargo")
+        .args(["test", "-p", "deadreckon", "--test", "public_surface"])
+        .current_dir(&root)
+        .output()
+        .expect("run public surface test");
+    assert!(
+        output.status.success(),
+        "public surface changed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn assert_lint_level(lint: &str, level: &str) {
     let text = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read Cargo.toml");
     let needle = format!("{lint} = \"{level}\"");
@@ -333,7 +364,9 @@ fn registry_lines(text: &str, wanted: RegistryKind) -> Vec<String> {
 
 fn registry_kind(line: &str) -> Option<RegistryKind> {
     let line = line.trim();
-    if line.starts_with("pub use ") {
+    if line.starts_with("mod tests") {
+        None
+    } else if line.starts_with("pub use ") {
         Some(RegistryKind::PubUse)
     } else if line.starts_with("pub mod ") {
         Some(RegistryKind::PubMod)

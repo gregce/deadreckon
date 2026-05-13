@@ -1,8 +1,8 @@
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 
-pub mod cli_claude_code;
-pub mod cli_codex;
+//! Provider routing and adapters for deadreckon.
+
 mod cli_common;
 mod config;
 mod error;
@@ -10,6 +10,9 @@ mod http;
 mod router;
 mod smoke;
 mod types;
+
+pub mod cli_claude_code;
+pub mod cli_codex;
 
 pub use config::{DEFAULT_CONFIG_PATH, read_config};
 pub use error::{ProviderError, Result};

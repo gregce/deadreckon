@@ -3,25 +3,10 @@
 
 //! Runtime orchestration for provider turns, sandboxed tools, and run docs.
 
+mod error;
+
 pub mod polish;
 pub mod turn_loop;
-
-mod error {
-    use std::path::PathBuf;
-
-    use deadreckon_core::error::{DeadreckonError, Result};
-
-    pub(crate) trait IoContext<T> {
-        fn with_path(self, path: impl Into<PathBuf>) -> Result<T>;
-    }
-
-    impl<T> IoContext<T> for std::io::Result<T> {
-        fn with_path(self, path: impl Into<PathBuf>) -> Result<T> {
-            let path = path.into();
-            self.map_err(|source| DeadreckonError::Io { path, source })
-        }
-    }
-}
 
 pub use polish::{
     PolishConfig, PolishRecord, PolishedDocs, ResolvedSkill, SkillSource,

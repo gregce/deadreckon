@@ -1,6 +1,8 @@
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 
+//! Sandbox backend selection, policy, and subprocess execution.
+
 mod backend;
 mod commands;
 mod doctor;
