@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
-use crate::state::PipelineState;
+use crate::state::{PipelineState, append_json_line};
 
 pub const ACCEPTANCE_MARKER: &str = "turn-acceptance.json";
+pub const ACCEPTANCE_PROGRESS_JSONL: &str = "acceptance-progress.jsonl";
 pub const ACCEPTANCE_SPEC: &str = "acceptance.yaml";
 const GATE_NONCE: &str = "gate/nonce";
 
@@ -90,12 +91,26 @@ pub struct AcceptanceCheckResult {
     pub stderr: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceProgressEntry {
+    pub checked_at: DateTime<Utc>,
+    pub status: String,
+    pub index: usize,
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<AcceptanceCheckResult>,
+}
+
 pub fn marker_path(state: &PipelineState) -> PathBuf {
     state.run_root.join("proofs").join(ACCEPTANCE_MARKER)
 }
 
 pub fn marker_path_for_run_root(run_root: &Path) -> PathBuf {
     run_root.join("proofs").join(ACCEPTANCE_MARKER)
+}
+
+pub fn acceptance_progress_path_for_run_root(run_root: &Path) -> PathBuf {
+    run_root.join("proofs").join(ACCEPTANCE_PROGRESS_JSONL)
 }
 
 pub fn acceptance_spec_path_for_run_root(run_root: &Path) -> PathBuf {
@@ -212,18 +227,104 @@ pub fn evaluate_acceptance_checks(
     run_root: &Path,
     working_dir: &Path,
 ) -> Result<Vec<AcceptanceCheckResult>> {
+    evaluate_acceptance_checks_inner(run_root, working_dir, None)
+}
+
+pub fn evaluate_acceptance_checks_with_progress(
+    run_root: &Path,
+    working_dir: &Path,
+) -> Result<Vec<AcceptanceCheckResult>> {
+    let progress_path = acceptance_progress_path_for_run_root(run_root);
+    match std::fs::remove_file(&progress_path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: progress_path,
+                source,
+            });
+        }
+    }
+    evaluate_acceptance_checks_inner(run_root, working_dir, Some(&progress_path))
+}
+
+fn evaluate_acceptance_checks_inner(
+    run_root: &Path,
+    working_dir: &Path,
+    progress_path: Option<&Path>,
+) -> Result<Vec<AcceptanceCheckResult>> {
     let spec_path = acceptance_spec_path_for_run_root(run_root);
     if !spec_path.exists() {
-        return evaluate_default_acceptance(working_dir);
+        return evaluate_default_acceptance_with_progress(working_dir, progress_path);
     }
     let raw = std::fs::read_to_string(&spec_path).with_path(&spec_path)?;
     let checks = parse_acceptance_checks(&raw)?;
+    let total = checks.len();
+    emit_acceptance_progress(progress_path, "started", 0, total, None)?;
     let mut results = Vec::new();
-    for check in checks {
+    for (idx, check) in checks.into_iter().enumerate() {
+        let index = idx + 1;
+        emit_acceptance_progress(progress_path, "running", index, total, None)?;
         let result = evaluate_check(working_dir, check)?;
+        let status = if result.passed { "passed" } else { "failed" };
+        emit_acceptance_progress(progress_path, status, index, total, Some(result.clone()))?;
         results.push(result);
     }
+    let status = if results
+        .iter()
+        .any(|result| result.must_pass && !result.passed)
+    {
+        "failed"
+    } else {
+        "passed"
+    };
+    emit_acceptance_progress(progress_path, status, total, total, None)?;
     Ok(results)
+}
+
+fn evaluate_default_acceptance_with_progress(
+    working_dir: &Path,
+    progress_path: Option<&Path>,
+) -> Result<Vec<AcceptanceCheckResult>> {
+    emit_acceptance_progress(progress_path, "started", 0, 1, None)?;
+    emit_acceptance_progress(progress_path, "running", 1, 1, None)?;
+    let results = evaluate_default_acceptance(working_dir)?;
+    if let Some(result) = results.first().cloned() {
+        let status = if result.passed { "passed" } else { "failed" };
+        emit_acceptance_progress(progress_path, status, 1, 1, Some(result))?;
+    }
+    let status = if results
+        .iter()
+        .any(|result| result.must_pass && !result.passed)
+    {
+        "failed"
+    } else {
+        "passed"
+    };
+    emit_acceptance_progress(progress_path, status, 1, 1, None)?;
+    Ok(results)
+}
+
+fn emit_acceptance_progress(
+    progress_path: Option<&Path>,
+    status: &str,
+    index: usize,
+    total: usize,
+    result: Option<AcceptanceCheckResult>,
+) -> Result<()> {
+    let Some(progress_path) = progress_path else {
+        return Ok(());
+    };
+    append_json_line(
+        progress_path,
+        &AcceptanceProgressEntry {
+            checked_at: Utc::now(),
+            status: status.to_string(),
+            index,
+            total,
+            result,
+        },
+    )
 }
 
 fn evaluate_default_acceptance(working_dir: &Path) -> Result<Vec<AcceptanceCheckResult>> {
@@ -853,6 +954,70 @@ checks:
                 .stdout
                 .as_deref()
                 .is_some_and(|stdout| stdout.contains("second-ran"))
+        );
+    }
+
+    #[test]
+    fn acceptance_progress_jsonl_records_running_and_result_rows() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "spec-progress".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(state.working_dir.join("notes.md"), "dead reckoning").expect("notes");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            r#"
+checks:
+  - kind: file_exists
+    path: "{working_dir}/notes.md"
+  - kind: shell
+    command: "test -f notes.md"
+"#,
+        )
+        .expect("spec");
+
+        let results =
+            super::evaluate_acceptance_checks_with_progress(&state.run_root, &state.working_dir)
+                .expect("checks");
+        let raw = std::fs::read_to_string(super::acceptance_progress_path_for_run_root(
+            &state.run_root,
+        ))
+        .expect("progress");
+        let progress = raw
+            .lines()
+            .map(|line| serde_json::from_str::<super::AcceptanceProgressEntry>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            progress
+                .iter()
+                .any(|entry| entry.status == "running" && entry.index == 1 && entry.total == 2),
+            "{progress:?}"
+        );
+        assert_eq!(
+            progress
+                .iter()
+                .filter(|entry| entry.result.as_ref().is_some_and(|result| result.passed))
+                .count(),
+            2
+        );
+        assert_eq!(
+            progress.last().map(|entry| entry.status.as_str()),
+            Some("passed")
         );
     }
 

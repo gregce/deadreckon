@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use deadreckon_core::gate::{evaluate_acceptance_checks, write_acceptance_marker_with_results};
+use deadreckon_core::gate::{
+    evaluate_acceptance_checks_with_progress, write_acceptance_marker_with_results,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut run_id = None;
@@ -21,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(run_root) => run_root,
         None => infer_run_root(&working_dir)?,
     };
-    let results = evaluate_acceptance_checks(&run_root, &working_dir)?;
+    let results = evaluate_acceptance_checks_with_progress(&run_root, &working_dir)?;
     if let Some(failed) = results
         .iter()
         .find(|result| result.must_pass && !result.passed)

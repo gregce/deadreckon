@@ -17,12 +17,13 @@ use crossterm::terminal::{
 };
 use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
-    AcceptanceMarker, ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainEvent, ChainEventKind,
-    ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus, CodebaseMode, CodebaseRecord,
-    ConductorState, DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DeadreckonError,
-    DeadreckonPaths, DocKind, DocProviderSelection, DocProviderSource, ModeFlags, OnFail, PhaseId,
-    PhaseStatus, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent,
-    RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions,
+    AcceptanceMarker, AcceptanceProgressEntry, ApplyMode, ApplyStrategy, BranchPolicy, Chain,
+    ChainEvent, ChainEventKind, ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus,
+    CodebaseMode, CodebaseRecord, ConductorState, DEFAULT_DOC_POLISH_TOKEN_BUDGET,
+    DEFAULT_DOC_SUBSKILLS, DeadreckonError, DeadreckonPaths, DocKind, DocProviderSelection,
+    DocProviderSource, ModeFlags, OnFail, PhaseId, PhaseStatus, PromotionManifest,
+    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunOptions, RunStatus, SpendRecord,
+    TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
     acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
     append_parent_narrative_update, append_provenance, append_trace, apply_commit_body,
     cancel_marker_present, clear_cancel_marker, copy_source_to_working, copy_tree, create_run,
@@ -10091,7 +10092,44 @@ struct AttachLive {
     provider_activity: Vec<String>,
     provider_context_tokens: Option<u64>,
     provider_context_window: Option<u64>,
+    acceptance: AcceptanceLive,
     working_dir_exists: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AcceptanceLive {
+    status: AcceptanceUiStatus,
+    total: usize,
+    completed: usize,
+    passed: usize,
+    failed: usize,
+    required_failed: usize,
+    latest_detail: Option<String>,
+    progress_lines: Vec<String>,
+}
+
+impl Default for AcceptanceLive {
+    fn default() -> Self {
+        Self {
+            status: AcceptanceUiStatus::DefaultGate,
+            total: 0,
+            completed: 0,
+            passed: 0,
+            failed: 0,
+            required_failed: 0,
+            latest_detail: None,
+            progress_lines: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptanceUiStatus {
+    DefaultGate,
+    Configured,
+    Running,
+    Passed,
+    Failed,
 }
 
 #[derive(Debug)]
@@ -10125,6 +10163,7 @@ fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
         .map(live_pid)
         .collect::<Vec<_>>();
     let provider_activity = collect_provider_activity(state);
+    let acceptance = collect_acceptance_live(state);
     AttachLive {
         file_count,
         total_bytes,
@@ -10133,8 +10172,168 @@ fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
         provider_context_tokens: provider_activity.context_tokens,
         provider_context_window: provider_activity.context_window,
         provider_activity: provider_activity.lines,
+        acceptance,
         working_dir_exists: state.working_dir.exists(),
     }
+}
+
+fn collect_acceptance_live(state: &deadreckon_core::PipelineState) -> AcceptanceLive {
+    let marker_path = marker_path_for_run_root(&state.run_root);
+    if marker_path.exists()
+        && let Ok(bytes) = fs::read(&marker_path)
+        && let Ok(marker) = serde_json::from_slice::<AcceptanceMarker>(&bytes)
+    {
+        return acceptance_live_from_marker(marker);
+    }
+
+    let progress_path = acceptance_progress_path_for_run_root(&state.run_root);
+    if progress_path.exists()
+        && let Ok(entries) = read_jsonl::<AcceptanceProgressEntry>(&progress_path)
+        && !entries.is_empty()
+    {
+        return acceptance_live_from_progress(entries);
+    }
+
+    let spec_path = acceptance_spec_path_for_run_root(&state.run_root);
+    if spec_path.exists()
+        && let Ok(raw) = fs::read_to_string(&spec_path)
+        && let Ok(count) = acceptance_check_count(&raw)
+    {
+        return AcceptanceLive {
+            status: AcceptanceUiStatus::Configured,
+            total: count,
+            latest_detail: Some("runs after provider completion".to_string()),
+            ..AcceptanceLive::default()
+        };
+    }
+
+    AcceptanceLive {
+        latest_detail: Some("inferred from project files".to_string()),
+        ..AcceptanceLive::default()
+    }
+}
+
+fn acceptance_live_from_marker(marker: AcceptanceMarker) -> AcceptanceLive {
+    let total = marker.checks.len().max(marker.check_count);
+    let passed = if marker.checks.is_empty() {
+        marker.check_count
+    } else {
+        marker.checks.iter().filter(|result| result.passed).count()
+    };
+    let failed = marker.checks.iter().filter(|result| !result.passed).count();
+    let required_failed = marker
+        .checks
+        .iter()
+        .filter(|result| result.must_pass && !result.passed)
+        .count();
+    let status = if required_failed > 0 {
+        AcceptanceUiStatus::Failed
+    } else {
+        AcceptanceUiStatus::Passed
+    };
+    AcceptanceLive {
+        status,
+        total,
+        completed: marker.checks.len().max(marker.check_count),
+        passed,
+        failed,
+        required_failed,
+        latest_detail: marker.checks.last().map(|result| result.detail.clone()),
+        progress_lines: marker
+            .checks
+            .iter()
+            .rev()
+            .take(8)
+            .map(acceptance_result_line)
+            .collect(),
+    }
+}
+
+fn acceptance_live_from_progress(entries: Vec<AcceptanceProgressEntry>) -> AcceptanceLive {
+    let total = entries.iter().map(|entry| entry.total).max().unwrap_or(0);
+    let mut results = entries
+        .iter()
+        .filter_map(|entry| entry.result.clone())
+        .collect::<Vec<_>>();
+    if results.len() > total && total > 0 {
+        results = results.split_off(results.len() - total);
+    }
+    let passed = results.iter().filter(|result| result.passed).count();
+    let failed = results.iter().filter(|result| !result.passed).count();
+    let required_failed = results
+        .iter()
+        .filter(|result| result.must_pass && !result.passed)
+        .count();
+    let completed = results.len();
+    let latest = entries.last();
+    let status = if required_failed > 0 {
+        AcceptanceUiStatus::Failed
+    } else if completed >= total && total > 0 {
+        AcceptanceUiStatus::Passed
+    } else if latest.is_some_and(|entry| entry.status == "running" || entry.status == "started") {
+        AcceptanceUiStatus::Running
+    } else {
+        AcceptanceUiStatus::Configured
+    };
+    let latest_detail = latest.and_then(|entry| {
+        entry
+            .result
+            .as_ref()
+            .map(|result| result.detail.clone())
+            .or_else(|| {
+                if entry.status == "running" && entry.total > 0 {
+                    Some(format!("checking {} of {}", entry.index, entry.total))
+                } else {
+                    None
+                }
+            })
+    });
+    let mut progress_lines = entries
+        .iter()
+        .rev()
+        .filter_map(|entry| {
+            entry
+                .result
+                .as_ref()
+                .map(acceptance_result_line)
+                .or_else(|| {
+                    if entry.status == "running" && entry.total > 0 {
+                        Some(format!(
+                            "• checking {} of {}",
+                            entry.index.min(entry.total),
+                            entry.total
+                        ))
+                    } else {
+                        None
+                    }
+                })
+        })
+        .take(8)
+        .collect::<Vec<_>>();
+    if progress_lines.is_empty() && total > 0 {
+        progress_lines.push(format!("• waiting to check {total} criteria"));
+    }
+    AcceptanceLive {
+        status,
+        total,
+        completed,
+        passed,
+        failed,
+        required_failed,
+        latest_detail,
+        progress_lines,
+    }
+}
+
+fn acceptance_result_line(result: &deadreckon_core::AcceptanceCheckResult) -> String {
+    let mark = if result.passed {
+        "✓"
+    } else if result.must_pass {
+        "✗"
+    } else {
+        "!"
+    };
+    format!("{mark} {} {}", result.kind, one_line(&result.detail, 120))
 }
 
 fn live_file(root: &Path, path: PathBuf) -> Option<LiveFile> {
@@ -10407,54 +10606,32 @@ fn render_attach(
     let metered_provider = provider_is_metered(state);
     let top_constraints = if metered_provider {
         vec![
-            Constraint::Percentage(60),
-            Constraint::Percentage(18),
-            Constraint::Percentage(22),
+            Constraint::Percentage(55),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
         ]
     } else {
-        vec![Constraint::Percentage(74), Constraint::Percentage(26)]
+        vec![
+            Constraint::Percentage(66),
+            Constraint::Percentage(17),
+            Constraint::Percentage(17),
+        ]
     };
     let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(top_constraints)
         .split(layout.header);
-    let phase = state
-        .active_phase()
-        .map(|phase| format!("{} {}", phase.id.0, phase.name))
-        .unwrap_or_else(|| "-".to_string());
-    let path_label = if state.promoted_library_dir.is_some() {
-        "artifact"
-    } else {
-        "working"
-    };
-    let chain_line = chain_context_line_for_working(&state.working_dir)
-        .ok()
-        .flatten()
-        .map(|line| format!("{line}\n"))
-        .unwrap_or_default();
-    let header = Paragraph::new(format!(
-        "{}run {}  status {}  phase {}  turn {}  provider {}  sandbox {}\ngoal {}\n{} {}",
-        chain_line,
-        run_prefix(&state.run_id),
-        state.status,
-        phase,
-        turn_timer(events, spend, traces, state),
-        state.provider.as_deref().unwrap_or("-"),
-        state.sandbox,
-        one_line(&state.goal, top[0].width.saturating_sub(8) as usize),
-        path_label,
-        one_line(
-            &state.working_dir.display().to_string(),
-            top[0].width.saturating_sub(12) as usize
-        )
-    ))
-    .block(Block::default().borders(Borders::ALL).title("deadreckon"));
+    let header = Paragraph::new(attach_header_text(state, top[0].width))
+        .block(Block::default().borders(Borders::ALL).title("deadreckon"));
     frame.render_widget(header, top[0]);
     if metered_provider {
         render_spend(frame, top[1], state);
         render_context(frame, top[2], spend, live);
+        render_acceptance(frame, top[3], live);
     } else {
         render_context(frame, top[1], spend, live);
+        render_acceptance(frame, top[2], live);
     }
 
     if tui_state.docs_open && state.status == RunStatus::Completed {
@@ -10506,6 +10683,36 @@ fn provider_is_metered(state: &deadreckon_core::PipelineState) -> bool {
         .provider
         .as_deref()
         .is_some_and(|provider| provider.starts_with("cli:") || provider.starts_with("import:"))
+}
+
+fn attach_header_text(state: &deadreckon_core::PipelineState, width: u16) -> String {
+    let path_label = if state.promoted_library_dir.is_some() {
+        "artifact"
+    } else {
+        "working"
+    };
+    let chain_prefix = chain_context_line_for_working(&state.working_dir)
+        .ok()
+        .flatten()
+        .map(|line| format!("{line}  |  "))
+        .unwrap_or_default();
+    let usable_width = usize::from(width).saturating_sub(4);
+    let run_line = one_line(
+        &format!(
+            "{}run {}  provider {}  sandbox {}",
+            chain_prefix,
+            run_prefix(&state.run_id),
+            state.provider.as_deref().unwrap_or("-"),
+            state.sandbox
+        ),
+        usable_width,
+    );
+    let goal_line = one_line(&format!("goal {}", state.goal), usable_width);
+    let path_line = one_line(
+        &format!("{} {}", path_label, state.working_dir.display()),
+        usable_width,
+    );
+    format!("{run_line}\n{goal_line}\n{path_line}")
 }
 
 fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTuiState) -> String {
@@ -10655,6 +10862,63 @@ fn render_context(
     );
 }
 
+fn render_acceptance(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    live: &AttachLive,
+) {
+    let acceptance = &live.acceptance;
+    let color = acceptance_color(acceptance.status);
+    let latest = acceptance
+        .latest_detail
+        .as_deref()
+        .map(|detail| one_line(detail, usize::from(area.width).saturating_sub(4)));
+    let detail = match acceptance.status {
+        AcceptanceUiStatus::DefaultGate => {
+            "default gate\ninferred checks\nno project spec".to_string()
+        }
+        AcceptanceUiStatus::Configured => format!(
+            "configured\n{} checks\n{}",
+            acceptance.total,
+            latest.as_deref().unwrap_or("waiting for verify")
+        ),
+        AcceptanceUiStatus::Running => format!(
+            "running\n{} / {} checked\n{}",
+            acceptance.completed,
+            acceptance.total,
+            latest.as_deref().unwrap_or("checking criteria")
+        ),
+        AcceptanceUiStatus::Passed => format!(
+            "passed\n{} / {} checks\n{}",
+            acceptance.passed,
+            acceptance.total,
+            latest.as_deref().unwrap_or("dr-gate accepted")
+        ),
+        AcceptanceUiStatus::Failed => format!(
+            "failed\n{} pass  {} fail\n{}",
+            acceptance.passed,
+            acceptance.failed,
+            latest.as_deref().unwrap_or("required check failed")
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(detail)
+            .block(Block::default().borders(Borders::ALL).title("acceptance"))
+            .style(Style::default().fg(color))
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+fn acceptance_color(status: AcceptanceUiStatus) -> Color {
+    match status {
+        AcceptanceUiStatus::DefaultGate | AcceptanceUiStatus::Configured => Color::Yellow,
+        AcceptanceUiStatus::Running => Color::Cyan,
+        AcceptanceUiStatus::Passed => Color::Green,
+        AcceptanceUiStatus::Failed => Color::Red,
+    }
+}
+
 fn context_totals(spend: &[SpendRecord], live: &AttachLive) -> (u64, u64) {
     let token_total = live.provider_context_tokens.unwrap_or_else(|| {
         spend
@@ -10723,6 +10987,7 @@ fn attach_activity_lines(
 ) -> Vec<String> {
     let metered_provider = provider_is_metered(state);
     let mut lines = render_turn_summary(spend, metered_provider);
+    lines.extend(acceptance_activity_lines(&live.acceptance));
     if state.status == RunStatus::Executing && live.file_count > 0 {
         lines.push(format!(
             "live working tree: {} files, latest changes visible before provider exit",
@@ -10743,6 +11008,39 @@ fn attach_activity_lines(
         )
     }));
     lines
+}
+
+fn acceptance_activity_lines(acceptance: &AcceptanceLive) -> Vec<String> {
+    match acceptance.status {
+        AcceptanceUiStatus::DefaultGate | AcceptanceUiStatus::Configured => Vec::new(),
+        AcceptanceUiStatus::Running => {
+            let mut lines = vec![format!(
+                "acceptance running: {} / {} checked",
+                acceptance.completed, acceptance.total
+            )];
+            lines.extend(acceptance.progress_lines.iter().cloned());
+            lines.push(String::new());
+            lines
+        }
+        AcceptanceUiStatus::Passed => {
+            let mut lines = vec![format!(
+                "acceptance passed: {} / {} checks",
+                acceptance.passed, acceptance.total
+            )];
+            lines.extend(acceptance.progress_lines.iter().take(4).cloned());
+            lines.push(String::new());
+            lines
+        }
+        AcceptanceUiStatus::Failed => {
+            let mut lines = vec![format!(
+                "acceptance failed: {} required failures, {} / {} passed",
+                acceptance.required_failed, acceptance.passed, acceptance.total
+            )];
+            lines.extend(acceptance.progress_lines.iter().cloned());
+            lines.push(String::new());
+            lines
+        }
+    }
 }
 
 fn render_run_docs(
@@ -11291,8 +11589,9 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
 #[cfg(test)]
 mod tui_tests {
     use super::{
-        AttachActionNotice, AttachLive, AttachPanel, AttachPanelCounts, AttachPanelRows,
-        AttachTuiState, ChainAttachTuiState, CompletionAction, chain_activity_lines,
+        AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
+        AttachPanelCounts, AttachPanelRows, AttachTuiState, ChainAttachTuiState, CompletionAction,
+        acceptance_activity_lines, attach_header_text, chain_activity_lines,
         chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
         chain_timeline_lines, chain_wall_cap_hit, cli_wait_status_line,
         completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
@@ -11528,6 +11827,47 @@ mod tui_tests {
         assert!(text.contains("turn 42s running"), "{text}");
         assert!(text.contains("execute"), "{text}");
         assert!(text.contains('*'), "{text}");
+    }
+
+    #[test]
+    fn attach_header_is_identity_strip_without_live_status() {
+        let (_temp, mut state) = doc_preview_state();
+        state.status = deadreckon_core::RunStatus::Executing;
+        state.current_phase_id = deadreckon_core::PhaseId(40);
+
+        let text = attach_header_text(&state, 96);
+
+        assert!(text.contains("run "), "{text}");
+        assert!(text.contains("provider cli:codex"), "{text}");
+        assert!(text.contains("sandbox none"), "{text}");
+        assert!(text.contains("goal preview docs"), "{text}");
+        assert!(text.contains("working "), "{text}");
+        assert!(!text.contains("status executing"), "{text}");
+        assert!(!text.contains("phase 40"), "{text}");
+        assert!(!text.contains("turn "), "{text}");
+    }
+
+    #[test]
+    fn acceptance_activity_lines_surface_running_and_failed_checks() {
+        let acceptance = AcceptanceLive {
+            status: AcceptanceUiStatus::Failed,
+            total: 3,
+            completed: 2,
+            passed: 1,
+            failed: 1,
+            required_failed: 1,
+            latest_detail: Some("npm test exited with status 1".to_string()),
+            progress_lines: vec![
+                "✗ shell npm test exited with status 1".to_string(),
+                "✓ file_exists package.json exists".to_string(),
+            ],
+        };
+
+        let lines = acceptance_activity_lines(&acceptance).join("\n");
+
+        assert!(lines.contains("acceptance failed"), "{lines}");
+        assert!(lines.contains("1 required failures"), "{lines}");
+        assert!(lines.contains("npm test"), "{lines}");
     }
 
     #[test]

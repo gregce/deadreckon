@@ -53,10 +53,12 @@ pub use events::{
     RUN_EVENTS_JSONL, RunEvent, RunEventBus, RunEventKind, emit_event, event_preview,
 };
 pub use gate::{
-    AcceptanceCheck, AcceptanceCheckResult, AcceptanceMarker, AcceptanceSpec,
+    ACCEPTANCE_PROGRESS_JSONL, AcceptanceCheck, AcceptanceCheckResult, AcceptanceMarker,
+    AcceptanceProgressEntry, AcceptanceSpec, acceptance_progress_path_for_run_root,
     acceptance_spec_path_for_run_root, evaluate_acceptance, evaluate_acceptance_checks,
-    gate_nonce_path_for_run_root, marker_path_for_run_root, validate_acceptance_marker,
-    write_acceptance_marker, write_acceptance_marker_with_results,
+    evaluate_acceptance_checks_with_progress, gate_nonce_path_for_run_root,
+    marker_path_for_run_root, validate_acceptance_marker, write_acceptance_marker,
+    write_acceptance_marker_with_results,
 };
 pub use lock::{
     LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,
