@@ -10,9 +10,9 @@ workspace = true
 
 [dependencies]
 chrono.workspace = true
-deadreckon-core = { path = "../deadreckon-core" }
-deadreckon-providers = { path = "../deadreckon-providers" }
-deadreckon-sandbox = { path = "../deadreckon-sandbox" }
+deadreckon-core = { workspace = true }
+deadreckon-providers = { workspace = true }
+deadreckon-sandbox = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

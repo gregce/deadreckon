@@ -13,10 +13,10 @@ chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 crossterm.workspace = true
-deadreckon-core = { path = "../deadreckon-core" }
-deadreckon-providers = { path = "../deadreckon-providers" }
-deadreckon-runtime = { path = "../deadreckon-runtime" }
-deadreckon-sandbox = { path = "../deadreckon-sandbox" }
+deadreckon-core = { workspace = true }
+deadreckon-providers = { workspace = true }
+deadreckon-runtime = { workspace = true }
+deadreckon-sandbox = { workspace = true }
 pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde.workspace = true
@@ -32,6 +32,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
-deadreckon-core = { path = "../deadreckon-core" }
+deadreckon-core = { workspace = true }
 sha2.workspace = true
 tempfile.workspace = true

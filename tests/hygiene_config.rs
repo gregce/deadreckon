@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use serde_json::Value;
+
 const CRATE_MANIFESTS: &[&str] = &[
     "crates/deadreckon/Cargo.toml",
     "crates/deadreckon-core/Cargo.toml",
@@ -162,6 +164,43 @@ fn release_binary_size_within_baseline_slack() {
     );
 }
 
+#[test]
+fn internal_crates_listed_in_workspace_dependencies() {
+    let text = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read Cargo.toml");
+    for (name, path) in [
+        ("deadreckon-core", "crates/deadreckon-core"),
+        ("deadreckon-providers", "crates/deadreckon-providers"),
+        ("deadreckon-runtime", "crates/deadreckon-runtime"),
+        ("deadreckon-sandbox", "crates/deadreckon-sandbox"),
+    ] {
+        let needle = format!("{name} = {{ path = \"{path}\" }}");
+        assert!(text.contains(&needle), "missing workspace dep `{needle}`");
+    }
+}
+
+#[test]
+fn no_crate_uses_relative_path_for_internal_dep() {
+    let root = workspace_root();
+    for manifest in CRATE_MANIFESTS {
+        let text = fs::read_to_string(root.join(manifest)).expect("read crate Cargo.toml");
+        for line in text.lines() {
+            assert!(
+                !(line.contains("deadreckon-") && line.contains("path = \"../")),
+                "{manifest} still uses a relative internal dependency: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cargo_metadata_resolves_same_dag() {
+    let root = workspace_root();
+    let expected = fs::read_to_string(root.join("tests/.metadata-dag-baseline"))
+        .expect("read metadata DAG baseline");
+    let actual = internal_metadata_dag(&root).join("\n") + "\n";
+    assert_eq!(expected, actual, "internal cargo metadata DAG changed");
+}
+
 fn assert_lint_level(lint: &str, level: &str) {
     let text = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read Cargo.toml");
     let needle = format!("{lint} = \"{level}\"");
@@ -213,6 +252,40 @@ fn git_stdout(root: &PathBuf, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("git stdout utf8")
+}
+
+fn internal_metadata_dag(root: &PathBuf) -> Vec<String> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .current_dir(root)
+        .output()
+        .expect("run cargo metadata");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: Value = serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
+    let mut edges = Vec::new();
+    for package in metadata["packages"].as_array().expect("packages array") {
+        let name = package["name"].as_str().expect("package name");
+        if !name.starts_with("deadreckon") {
+            continue;
+        }
+        for dependency in package["dependencies"]
+            .as_array()
+            .expect("dependencies array")
+        {
+            let dep_name = dependency["name"].as_str().expect("dependency name");
+            if dep_name.starts_with("deadreckon") {
+                let kind = dependency["kind"].as_str().unwrap_or("normal");
+                edges.push(format!("{name} -> {dep_name} [{kind}]"));
+            }
+        }
+    }
+    edges.sort();
+    edges
 }
 
 fn workspace_root() -> PathBuf {
