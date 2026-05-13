@@ -152,6 +152,15 @@ Lifecycle:
 Fork starts the plan coordinator. Each child is still a normal deadreckon run,
 using the provider recorded in plan.json unless you override it here.";
 
+const MERGE_HELP: &str = "\
+Lifecycle:
+  deadreckon merge <plan-id>
+  deadreckon materialize <merged-run-id> --dest ./result
+
+Merge composes completed child artifacts into one promoted deadreckon library
+entry. Conflicting files fail by default; use --strategy prefer-child
+--prefer-child <idx> to pick one child deliberately.";
+
 const DONE_HELP: &str = "\
 Lifecycle:
   deadreckon def-done \"builds, opens in a browser, and has no console errors\"
@@ -640,6 +649,31 @@ pub(crate) enum Commands {
         coder_provider: Option<String>,
         #[arg(long, help = "Review-mode reviewer provider override")]
         reviewer_provider: Option<String>,
+        #[arg(long, help = "Suppress post-action hints")]
+        no_hints: bool,
+        #[arg(long, help = "Suppress success stdout")]
+        quiet: bool,
+        #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+        plain: bool,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Compose completed plan children into one promoted artifact",
+        after_help = MERGE_HELP
+    )]
+    Merge {
+        #[arg(help = "Plan id or unique prefix")]
+        plan_id: String,
+        #[arg(
+            long,
+            default_value = "fail-on-conflict",
+            help = "Merge strategy: fail-on-conflict or prefer-child"
+        )]
+        strategy: String,
+        #[arg(long, help = "Child index to prefer when --strategy prefer-child")]
+        prefer_child: Option<u32>,
+        #[arg(long, help = "Skip the merge gate marker warning path")]
+        no_gate: bool,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
@@ -1384,6 +1418,15 @@ pub(crate) struct ForkCommandArgs {
     pub(crate) child_provider: Vec<String>,
     pub(crate) coder_provider: Option<String>,
     pub(crate) reviewer_provider: Option<String>,
+    pub(crate) no_hints: bool,
+    pub(crate) quiet: bool,
+}
+
+pub(crate) struct MergeCommandArgs {
+    pub(crate) plan_id: String,
+    pub(crate) strategy: String,
+    pub(crate) prefer_child: Option<u32>,
+    pub(crate) no_gate: bool,
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
 }

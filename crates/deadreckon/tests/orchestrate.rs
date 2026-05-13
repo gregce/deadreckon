@@ -232,6 +232,85 @@ fn fork_spawns_children_with_distinct_scopes_and_messages() {
     assert!(messages.len() >= 4, "{messages:#?}");
 }
 
+#[test]
+fn merge_fails_on_conflict_then_prefer_child_promotes() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let second = &plan.tasks[1];
+    let second_run = second.child_run_id.as_ref().expect("second run");
+    let second_state = deadreckon_core::load_run(&paths, second_run).expect("second state");
+    let second_library = paths.library_dir(&second_state.scope, &second_state.run_id);
+    fs::write(second_library.join("README.md"), "# preferred child\n").expect("conflict write");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("conflict at README.md"),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--strategy",
+            "prefer-child",
+            "--prefer-child",
+            "1",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge prefer");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    assert_eq!(merged.status, PlanStatus::Merged);
+    let merged_run_id = merged.merged_run_id.as_ref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    assert!(library.join("deadreckon-plan-manifest.json").is_file());
+    assert_eq!(
+        fs::read_to_string(library.join("README.md")).expect("read merged"),
+        "# preferred child\n"
+    );
+}
+
+fn plan_and_fork_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> Plan {
+    let output = deadreckon(paths)
+        .current_dir(repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(paths);
+    let output = deadreckon(paths)
+        .current_dir(repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+    load_plan(paths, &plan.plan_id).expect("forked plan")
+}
+
 fn repo_tempdir() -> TempDir {
     let root = PathBuf::from("/Users/gdc/deadreckon/.test-tmp");
     fs::create_dir_all(&root).expect("test tmp root");

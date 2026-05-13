@@ -41,11 +41,11 @@ use deadreckon_core::{
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
     docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files, list_runs,
     load_chain, load_plan, load_run, marker_path_for_run_root, pid_is_alive,
-    prepare_worktree_record, preview_git_state, read_chain_step_marker, read_codebase_record,
-    record_for_resolved_mode, release_lock_file, resolve_mode, restore_snapshot, save_chain,
-    save_plan, save_state, terminate_pid, validate_acceptance_marker, validate_task_count,
-    write_cancel_marker, write_chain_step_marker, write_child_summary, write_coordinator_state,
-    write_plan_child_marker, write_worker_spec,
+    prepare_worktree_record, preview_git_state, promote_completed_run, read_chain_step_marker,
+    read_codebase_record, record_for_resolved_mode, release_lock_file, resolve_mode,
+    restore_snapshot, save_chain, save_plan, save_state, terminate_pid, validate_acceptance_marker,
+    validate_task_count, write_acceptance_marker, write_cancel_marker, write_chain_step_marker,
+    write_child_summary, write_coordinator_state, write_plan_child_marker, write_worker_spec,
 };
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
@@ -80,7 +80,7 @@ mod tui_events;
 use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, CliPlanMode, Commands,
     CompletionCommand, ConfigCommand, ExtendCommandArgs, ForkCommandArgs, LibraryCommand,
-    PlanCommandArgs, ProvidersCommand, RunCommandArgs,
+    MergeCommandArgs, PlanCommandArgs, ProvidersCommand, RunCommandArgs,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -401,6 +401,22 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
+        Commands::Merge {
+            plan_id,
+            strategy,
+            prefer_child,
+            no_gate,
+            no_hints,
+            quiet,
+            plain: _,
+        } => merge_command(MergeCommandArgs {
+            plan_id,
+            strategy,
+            prefer_child,
+            no_gate,
+            no_hints,
+            quiet,
+        }),
         Commands::Chain {
             args,
             from_file,
@@ -7664,6 +7680,284 @@ fn print_fork_finished(plan: &Plan, no_hints: bool) {
             "{} {}",
             ui_command("merge:"),
             ui_command(format!("deadreckon merge {}", run_prefix(&plan.plan_id)))
+        );
+    }
+}
+
+fn merge_command(args: MergeCommandArgs) -> Result<()> {
+    let MergeCommandArgs {
+        plan_id,
+        strategy,
+        prefer_child,
+        no_gate,
+        no_hints,
+        quiet,
+    } = args;
+    let paths = DeadreckonPaths::discover();
+    let resolved_id = resolve_plan_id(&paths, &plan_id)?;
+    let mut plan = load_plan(&paths, &resolved_id)?;
+    if plan.status != PlanStatus::Forked {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("plan {} is {:?}", run_prefix(&plan.plan_id), plan.status),
+            "deadreckon fork <plan-id>",
+        )));
+    }
+    if let Some(task) = plan.tasks.iter().find(|task| {
+        matches!(
+            task.status,
+            PlanTaskStatus::Pending | PlanTaskStatus::Running
+        )
+    }) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "child {} still {}",
+                task.index,
+                task_status_label(task.status)
+            ),
+            "wait, or run deadreckon kill <plan-id>",
+        )));
+    }
+    let strategy = parse_merge_strategy(&strategy, prefer_child)?;
+    let conflicts = compose_plan_merge_working(&paths, &plan, strategy)?;
+    let merged_run = create_merged_plan_run(&paths, &plan, no_gate)?;
+    plan.status = PlanStatus::Merged;
+    plan.merged_at = Some(Utc::now());
+    plan.merged_run_id = Some(merged_run.run_id.clone());
+    save_plan(&paths, &plan)?;
+    let library_dir = paths.library_dir(&merged_run.scope, &merged_run.run_id);
+    write_plan_merge_manifest(&library_dir, &plan, &conflicts)?;
+    if !quiet {
+        print_merge_finished(&plan, &merged_run, &library_dir, no_hints);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PlanMergeStrategy {
+    FailOnConflict,
+    PreferChild(u32),
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PlanMergeConflict {
+    path: PathBuf,
+    first_child: u32,
+    second_child: u32,
+    chosen_child: Option<u32>,
+}
+
+fn parse_merge_strategy(strategy: &str, prefer_child: Option<u32>) -> Result<PlanMergeStrategy> {
+    match strategy {
+        "fail-on-conflict" => Ok(PlanMergeStrategy::FailOnConflict),
+        "prefer-child" => prefer_child
+            .map(PlanMergeStrategy::PreferChild)
+            .ok_or_else(|| {
+                CliError::Core(deadreckon_core::user_error(
+                    "--strategy prefer-child needs --prefer-child <idx>",
+                    "deadreckon merge <plan-id> --strategy prefer-child --prefer-child 1",
+                ))
+            }),
+        other => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown merge strategy {other}"),
+            "use --strategy fail-on-conflict or --strategy prefer-child --prefer-child <idx>",
+        ))),
+    }
+}
+
+fn compose_plan_merge_working(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    strategy: PlanMergeStrategy,
+) -> Result<Vec<PlanMergeConflict>> {
+    let merge_working = paths.merge_working(&plan.plan_id);
+    remove_if_exists(&merge_working)?;
+    fs::create_dir_all(&merge_working)?;
+    let mut seen: BTreeMap<PathBuf, (u32, u64)> = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for task in plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+    {
+        let run_id = task.child_run_id.as_deref().ok_or_else(|| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!("child {} has no run id", task.index),
+                "deadreckon fork <plan-id>",
+            ))
+        })?;
+        let state = load_run(paths, run_id)?;
+        let child_root = child_artifact_root(paths, &state);
+        for file in inventory_files(&child_root)? {
+            let relative = file.strip_prefix(&child_root).map_err(|err| {
+                DeadreckonError::InvalidInput(format!("merge source prefix error: {err}"))
+            })?;
+            if skip_plan_merge_file(relative) {
+                continue;
+            }
+            let hash = file_hash(&file)?;
+            match seen.get(relative).copied() {
+                Some((first_child, first_hash)) if first_hash != hash => match strategy {
+                    PlanMergeStrategy::FailOnConflict => {
+                        return Err(CliError::Core(deadreckon_core::user_error(
+                            &format!(
+                                "conflict at {} between child {} and child {}",
+                                relative.display(),
+                                first_child,
+                                task.index
+                            ),
+                            &format!(
+                                "deadreckon merge {} --strategy prefer-child --prefer-child {}",
+                                run_prefix(&plan.plan_id),
+                                task.index
+                            ),
+                        )));
+                    }
+                    PlanMergeStrategy::PreferChild(chosen) => {
+                        conflicts.push(PlanMergeConflict {
+                            path: relative.to_path_buf(),
+                            first_child,
+                            second_child: task.index,
+                            chosen_child: Some(chosen),
+                        });
+                        if chosen == task.index {
+                            copy_merge_file(&file, &merge_working.join(relative))?;
+                            seen.insert(relative.to_path_buf(), (task.index, hash));
+                        }
+                    }
+                },
+                Some(_) => {}
+                None => {
+                    copy_merge_file(&file, &merge_working.join(relative))?;
+                    seen.insert(relative.to_path_buf(), (task.index, hash));
+                }
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        fs::create_dir_all(paths.merge_proofs(&plan.plan_id))?;
+        let path = paths.merge_proofs(&plan.plan_id).join("conflicts.json");
+        fs::write(&path, serde_json::to_vec_pretty(&conflicts)?)?;
+    }
+    Ok(conflicts)
+}
+
+fn child_artifact_root(paths: &DeadreckonPaths, state: &deadreckon_core::PipelineState) -> PathBuf {
+    let library_dir = paths.library_dir(&state.scope, &state.run_id);
+    if library_dir.is_dir() {
+        library_dir
+    } else {
+        state.working_dir.clone()
+    }
+}
+
+fn skip_plan_merge_file(relative: &Path) -> bool {
+    relative == Path::new("manifest.json") || relative.starts_with(".deadreckon")
+}
+
+fn file_hash(path: &Path) -> Result<u64> {
+    let mut hasher = DefaultHasher::new();
+    fs::read(path)?.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+fn copy_merge_file(source: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, dest)?;
+    Ok(())
+}
+
+fn create_merged_plan_run(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    no_gate: bool,
+) -> Result<deadreckon_core::PipelineState> {
+    let cwd = std::env::current_dir()?;
+    let mut state = create_run(
+        paths,
+        RunOptions {
+            goal: format!("merge orchestration plan {}", plan.root_goal),
+            cwd,
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: None,
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )?;
+    remove_if_exists(&state.working_dir)?;
+    copy_tree(&paths.merge_working(&plan.plan_id), &state.working_dir)?;
+    if no_gate {
+        eprintln!(
+            "{}",
+            ui_warn("merge gate skipped; recording synthetic acceptance marker")
+        );
+    }
+    write_acceptance_marker(
+        &state.run_root,
+        state.run_id.clone(),
+        state.working_dir.clone(),
+        1,
+    )?;
+    state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
+    save_state(&state)?;
+    promote_completed_run(paths, &mut state)?;
+    Ok(state)
+}
+
+fn write_plan_merge_manifest(
+    library_dir: &Path,
+    plan: &Plan,
+    conflicts: &[PlanMergeConflict],
+) -> Result<()> {
+    let manifest = json!({
+        "schema_version": 1,
+        "kind": "plan_merge",
+        "plan_id": &plan.plan_id,
+        "root_goal": &plan.root_goal,
+        "mode": plan.mode,
+        "merged_at": plan.merged_at,
+        "merged_run_id": &plan.merged_run_id,
+        "providers": &plan.providers,
+        "capability_preview": &plan.capability_preview,
+        "tasks": &plan.tasks,
+        "conflicts": conflicts,
+    });
+    fs::write(
+        library_dir.join("deadreckon-plan-manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    Ok(())
+}
+
+fn print_merge_finished(
+    plan: &Plan,
+    merged_run: &deadreckon_core::PipelineState,
+    library_dir: &Path,
+    no_hints: bool,
+) {
+    println!(
+        "{} {}",
+        ui_ok("merged"),
+        ui_id(run_prefix(&merged_run.run_id))
+    );
+    println!("plan {}", run_prefix(&plan.plan_id));
+    println!("library {}", library_dir.display());
+    if !no_hints {
+        println!(
+            "{} {}",
+            ui_command("materialize:"),
+            ui_command(format!(
+                "deadreckon materialize {} --dest ./{}",
+                run_prefix(&merged_run.run_id),
+                deadreckon_core::paths::task_key(&plan.root_goal)
+                    .chars()
+                    .take(24)
+                    .collect::<String>()
+            ))
         );
     }
 }
