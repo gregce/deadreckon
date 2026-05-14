@@ -7,8 +7,9 @@ use std::process::Command;
 
 use chrono::Utc;
 use deadreckon_core::{
-    DeadreckonPaths, Plan, PlanMode, PlanRole, PlanStatus, PlanTaskStatus, RunOptions, TraceRecord,
-    append_trace, create_run, load_plan, read_plan_messages, save_plan,
+    DeadreckonPaths, Plan, PlanMessage, PlanMessageKind, PlanMode, PlanRole, PlanStatus,
+    PlanTaskStatus, RunOptions, RunStatus, TraceRecord, append_plan_message, append_trace,
+    create_run, load_plan, read_plan_messages, save_plan, save_state,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -958,6 +959,127 @@ fn show_why_failed_plan_names_blocking_child() {
     assert!(out.contains("child 0 task-0 status failed"), "{out}");
     assert!(
         out.contains("deadreckon show abc12345 --why-failed"),
+        "{out}"
+    );
+}
+
+#[test]
+fn show_why_failed_completed_says_no_failures() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut state = create_test_run(
+        &paths,
+        &repo,
+        "ccccddddccccdddd1111222233334444",
+        "completed why failed",
+    );
+    state.status = RunStatus::Completed;
+    save_state(&state).expect("save state");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["show", &state.run_id[..8], "--why-failed"])
+        .output()
+        .expect("show why failed");
+    assert_success(&output);
+    assert_eq!(stdout(&output).trim(), "no failures detected");
+}
+
+#[test]
+fn show_why_failed_failed_emits_rca() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut state = create_test_run(
+        &paths,
+        &repo,
+        "ddddccccddddcccc1111222233334444",
+        "failed why failed",
+    );
+    state.status = RunStatus::Failed;
+    state.failure_reason = Some("acceptance failed".to_string());
+    save_state(&state).expect("save state");
+    append_trace(
+        &state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn: 3,
+            event: "tool.failed".to_string(),
+            latency_ms: Some(42),
+            detail: json!({
+                "tool": "shell",
+                "exit_code": 2,
+                "stderr": "boom from failing test",
+            }),
+        },
+    )
+    .expect("trace");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["show", &state.run_id[..8], "--why-failed"])
+        .output()
+        .expect("show why failed");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("run ddddcccc status failed"), "{out}");
+    assert!(out.contains("reason acceptance failed"), "{out}");
+    assert!(out.contains("turn 3 tool.failed"), "{out}");
+    assert!(out.contains("boom from failing test"), "{out}");
+}
+
+#[test]
+fn show_why_failed_plan_includes_blocker_message() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.status = PlanStatus::Forked;
+    plan.tasks[1].status = PlanTaskStatus::Failed;
+    save_plan(&paths, &plan).expect("save plan");
+    append_plan_message(
+        &paths,
+        &plan.plan_id,
+        &PlanMessage::new(
+            "coordinator",
+            "task-1",
+            PlanMessageKind::Blocker,
+            "task-1 blocked by failed dependency",
+            json!({ "missing_dependencies": ["task-0"] }),
+        )
+        .expect("message"),
+    )
+    .expect("append message");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["show", &plan.plan_id[..8], "--why-failed"])
+        .output()
+        .expect("show why failed");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("child 1 task-1 status failed"), "{out}");
+    assert!(
+        out.contains("blocker coordinator -> task-1: task-1 blocked by failed dependency"),
         "{out}"
     );
 }
