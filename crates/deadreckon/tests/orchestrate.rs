@@ -10,7 +10,7 @@ use deadreckon_core::{
     DeadreckonPaths, Plan, PlanMode, PlanRole, PlanStatus, PlanTaskStatus, RunOptions, TraceRecord,
     append_trace, create_run, load_plan, read_plan_messages, save_plan,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 #[test]
@@ -674,6 +674,162 @@ fn merge_fails_on_conflict_then_prefer_child_promotes() {
     assert_eq!(
         fs::read_to_string(library.join("README.md")).expect("read merged"),
         "# preferred child\n"
+    );
+}
+
+#[test]
+fn merge_composes_disjoint_children() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    for task in &plan.tasks {
+        let run_id = task.child_run_id.as_deref().expect("run id");
+        let state = deadreckon_core::load_run(&paths, run_id).expect("child run");
+        let library = paths.library_dir(&state.scope, &state.run_id);
+        fs::write(
+            library.join(format!("child-{}.txt", task.index)),
+            format!("from {}", task.task_id),
+        )
+        .expect("child marker");
+    }
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    assert_eq!(
+        fs::read_to_string(library.join("child-0.txt")).expect("child 0"),
+        "from task-0"
+    );
+    assert_eq!(
+        fs::read_to_string(library.join("child-1.txt")).expect("child 1"),
+        "from task-1"
+    );
+}
+
+#[test]
+fn merge_manifest_records_child_provider_roles_and_task_graph() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke:planner",
+            "--provider",
+            "smoke:default",
+            "--child-provider",
+            "1=smoke:reviewer",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.tasks[1].depends_on = vec![plan.tasks[0].task_id.clone()];
+    save_plan(&paths, &plan).expect("save dependency");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(library.join("deadreckon-plan-manifest.json")).expect("manifest"),
+    )
+    .expect("manifest json");
+
+    assert_eq!(manifest["providers"]["planner"], "smoke:planner");
+    assert_eq!(manifest["providers"]["default_child"], "smoke:default");
+    assert_eq!(manifest["providers"]["children"]["1"], "smoke:reviewer");
+    assert_eq!(manifest["tasks"][0]["provider"], "smoke:default");
+    assert_eq!(manifest["tasks"][1]["provider"], "smoke:reviewer");
+    assert_eq!(manifest["task_graph"][1]["depends_on"][0], "task-0");
+    assert_eq!(manifest["summary_paths"]["task-0"], "summaries/task-0.md");
+    assert_eq!(manifest["summary_paths"]["task-1"], "summaries/task-1.md");
+    assert!(
+        manifest["coordinator_messages"]["total"]
+            .as_u64()
+            .expect("total messages")
+            >= 4,
+        "{manifest:#}"
+    );
+    assert!(
+        manifest["coordinator_messages"]["by_type"]["progress"]
+            .as_u64()
+            .expect("progress messages")
+            >= 4,
+        "{manifest:#}"
+    );
+}
+
+#[test]
+fn merge_refuses_running_child() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.status = PlanStatus::Forked;
+    plan.tasks[0].status = PlanTaskStatus::Running;
+    save_plan(&paths, &plan).expect("save plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("child 0 still running"), "{err}");
+    assert!(
+        err.contains("try: wait, or run deadreckon kill <plan-id>"),
+        "{err}"
     );
 }
 

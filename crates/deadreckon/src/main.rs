@@ -7939,7 +7939,7 @@ fn merge_command(args: MergeCommandArgs) -> Result<()> {
     plan.merged_run_id = Some(merged_run.run_id.clone());
     save_plan(&paths, &plan)?;
     let library_dir = paths.library_dir(&merged_run.scope, &merged_run.run_id);
-    write_plan_merge_manifest(&library_dir, &plan, &conflicts)?;
+    write_plan_merge_manifest(&paths, &library_dir, &plan, &conflicts)?;
     if !quiet {
         print_merge_finished(&plan, &merged_run, &library_dir, no_hints);
     }
@@ -8135,10 +8135,40 @@ fn create_merged_plan_run(
 }
 
 fn write_plan_merge_manifest(
+    paths: &DeadreckonPaths,
     library_dir: &Path,
     plan: &Plan,
     conflicts: &[PlanMergeConflict],
 ) -> Result<()> {
+    let messages = read_plan_messages(paths, &plan.plan_id).unwrap_or_default();
+    let mut message_counts_by_type = BTreeMap::<String, usize>::new();
+    for message in &messages {
+        let key = format!("{:?}", message.kind).to_ascii_lowercase();
+        *message_counts_by_type.entry(key).or_default() += 1;
+    }
+    let task_graph = plan
+        .tasks
+        .iter()
+        .map(|task| {
+            json!({
+                "task_id": &task.task_id,
+                "index": task.index,
+                "role": task.role,
+                "provider": &task.provider,
+                "depends_on": &task.depends_on,
+            })
+        })
+        .collect::<Vec<_>>();
+    let summary_paths = plan
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            Some((
+                task.task_id.clone(),
+                task.summary_path.as_ref()?.display().to_string(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
     let manifest = json!({
         "schema_version": 1,
         "kind": "plan_merge",
@@ -8150,6 +8180,12 @@ fn write_plan_merge_manifest(
         "providers": &plan.providers,
         "capability_preview": &plan.capability_preview,
         "tasks": &plan.tasks,
+        "task_graph": task_graph,
+        "summary_paths": summary_paths,
+        "coordinator_messages": {
+            "total": messages.len(),
+            "by_type": message_counts_by_type,
+        },
         "conflicts": conflicts,
     });
     fs::write(

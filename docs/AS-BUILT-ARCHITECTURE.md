@@ -1791,7 +1791,7 @@ Every child run receives an inline copy of its worker spec in the prompt. The sp
 
 ### 30.4 Merge Artifact
 
-Merge creates a normal promoted run so existing `materialize`, `library`, and run inspection paths keep working. The promoted library also gets `deadreckon-plan-manifest.json` with plan id, root goal, mode, provider roles, capability preview, task graph, child run ids, summaries, and recorded conflicts.
+Merge creates a normal promoted run so existing `materialize`, `library`, and run inspection paths keep working. The promoted library also gets `deadreckon-plan-manifest.json` with plan id, root goal, mode, provider roles, capability preview, task graph, child run ids, summary paths, coordinator message counts, and recorded conflicts.
 
 Generated run artifacts are intentionally excluded from merge composition: `.deadreckon/*`, `docs/RUN-*`, `target`, `node_modules`, `.next`, `dist`, and `build`.
 
