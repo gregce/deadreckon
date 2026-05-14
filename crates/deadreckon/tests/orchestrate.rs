@@ -495,6 +495,137 @@ fn fork_spawns_children_with_distinct_scopes_and_messages() {
 }
 
 #[test]
+fn fork_respects_task_dependencies() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    let first_task_id = plan.tasks[0].task_id.clone();
+    plan.tasks[1].depends_on = vec![first_task_id];
+    save_plan(&paths, &plan).expect("save dependency");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+
+    let plan = load_plan(&paths, &plan.plan_id).expect("forked plan");
+    let messages = read_plan_messages(&paths, &plan.plan_id).expect("messages");
+    let summaries = messages
+        .iter()
+        .map(|message| message.summary.as_str())
+        .collect::<Vec<_>>();
+    let first_completed = summaries
+        .iter()
+        .position(|summary| *summary == "task-0 completed")
+        .expect("task 0 completed");
+    let second_started = summaries
+        .iter()
+        .position(|summary| *summary == "task-1 started")
+        .expect("task 1 started");
+    assert!(first_completed < second_started, "{summaries:#?}");
+
+    let second_run_id = plan.tasks[1].child_run_id.as_deref().expect("second run");
+    let second_state = deadreckon_core::load_run(&paths, second_run_id).expect("second state");
+    assert!(
+        second_state.goal.contains("## Dependency summaries"),
+        "{}",
+        second_state.goal
+    );
+    assert!(
+        second_state
+            .goal
+            .contains("Child Summary: Create foundation"),
+        "{}",
+        second_state.goal
+    );
+    assert!(
+        second_state.goal.contains(
+            plan.tasks[0]
+                .child_run_id
+                .as_deref()
+                .expect("first child run")
+        ),
+        "{}",
+        second_state.goal
+    );
+}
+
+#[test]
+fn fork_passes_worker_spec_to_child_prompt() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+    let first = &plan.tasks[0];
+    let run_id = first.child_run_id.as_deref().expect("first run");
+    let state = deadreckon_core::load_run(&paths, run_id).expect("child run");
+    let spec_path = paths.worker_spec(&plan.plan_id, &first.task_id);
+    let spec = fs::read_to_string(&spec_path).expect("worker spec");
+
+    assert!(state.goal.contains("Worker spec path:"), "{}", state.goal);
+    assert!(
+        state.goal.contains(&spec_path.display().to_string()),
+        "{}",
+        state.goal
+    );
+    assert!(
+        state.goal.contains("Root goal: tiny hello rust"),
+        "{}",
+        state.goal
+    );
+    assert!(
+        state.goal.contains("Do not spawn subagents"),
+        "{}",
+        state.goal
+    );
+    assert!(
+        state.goal.contains(spec.trim()),
+        "child prompt should include exact worker spec\n{}",
+        state.goal
+    );
+}
+
+#[test]
+fn fork_refuses_when_plan_already_forked() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("plan"), "{err}");
+    assert!(err.contains("Forked"), "{err}");
+    assert!(err.contains("try: deadreckon merge <plan-id>"), "{err}");
+}
+
+#[test]
 fn merge_fails_on_conflict_then_prefer_child_promotes() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

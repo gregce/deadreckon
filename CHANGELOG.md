@@ -13,6 +13,7 @@
 - Plan attach now surfaces child turn/status, spend or token accounting, latest trace activity, acceptance/gate state, capability preview, and final merged gate status in both the TUI and non-TTY summary.
 - Headless orchestration flags now apply consistently: `run --plain --quiet` is accepted, `run --quiet` emits no success stdout, `attach --plain` bypasses the TUI, and `plan`/`fork`/`merge` preserve plain output.
 - Added provider-backed planning depth coverage: planner prompts are asserted read-only, `--n` outside `2..=6` refuses before saving, one-task provider decompositions are rejected, and explicit planner/default-child/per-child providers are persisted.
+- Coordinator launches now refresh each child worker spec with completed dependency summaries, so dependent child prompts include concrete predecessor context instead of only a plan-time dependency id.
 - Verified with focused orchestration tests plus core plan round-trips, clippy on the orchestration target, and `cargo fmt --check`; a broadcast-backed plan event stream remains a future slice.
 
 ## Copilot and Pi providers (alpha) - 2026-05-13

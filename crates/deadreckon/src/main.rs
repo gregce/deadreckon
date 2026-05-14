@@ -7107,6 +7107,46 @@ fn render_worker_spec(plan: &Plan, task: &PlanTask) -> String {
     )
 }
 
+fn render_launch_worker_spec(paths: &DeadreckonPaths, plan: &Plan, task: &PlanTask) -> String {
+    let mut spec = render_worker_spec(plan, task);
+    let dependency_summaries = task
+        .depends_on
+        .iter()
+        .filter_map(|dependency| plan.task_by_id(dependency))
+        .filter_map(|dependency| {
+            let summary_path = dependency.summary_path.as_ref()?;
+            let absolute = paths.plan_dir(&plan.plan_id).join(summary_path);
+            let raw = fs::read_to_string(&absolute).ok()?;
+            Some((dependency, absolute, truncate_for_worker_spec(&raw)))
+        })
+        .collect::<Vec<_>>();
+    if dependency_summaries.is_empty() {
+        return spec;
+    }
+    spec.push_str("\n## Dependency summaries\n");
+    for (dependency, absolute, summary) in dependency_summaries {
+        spec.push_str(&format!(
+            "\n### {} - {}\n\nSummary path: {}\n\n{}\n",
+            dependency.task_id,
+            dependency.subject,
+            absolute.display(),
+            summary.trim()
+        ));
+    }
+    spec
+}
+
+fn truncate_for_worker_spec(raw: &str) -> String {
+    const MAX_CHARS: usize = 4_000;
+    let mut chars = raw.chars();
+    let truncated = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}\n\n... truncated ...")
+    } else {
+        truncated
+    }
+}
+
 fn print_plan_created(plan: &Plan, no_hints: bool) {
     println!(
         "{} {} ({})",
@@ -7555,7 +7595,8 @@ fn run_plan_child(
 ) -> Result<String> {
     let task = &plan.tasks[task_index];
     let worker_spec_path = paths.worker_spec(&plan.plan_id, &task.task_id);
-    let worker_spec = fs::read_to_string(&worker_spec_path)?;
+    let worker_spec = render_launch_worker_spec(paths, plan, task);
+    write_worker_spec(paths, &plan.plan_id, &task.task_id, &worker_spec)?;
     let prompt = plan_child_prompt(plan, task, &worker_spec, &worker_spec_path);
     let launch_dir = paths
         .plan_dir(&plan.plan_id)
