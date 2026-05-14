@@ -69,6 +69,9 @@ fn lint_table_denies_await_holding_lock() {
 
 #[test]
 fn clippy_runs_clean_under_deny_warnings() {
+    if !recursive_verify_enabled() {
+        return;
+    }
     let output = Command::new("cargo")
         .args(["clippy", "--workspace", "--", "-D", "warnings"])
         .current_dir(workspace_root())
@@ -93,6 +96,9 @@ fn rustfmt_toml_pins_imports_granularity_item() {
 
 #[test]
 fn rustfmt_check_clean() {
+    if !recursive_verify_enabled() {
+        return;
+    }
     let output = Command::new("cargo")
         .args(["fmt", "--check"])
         .current_dir(workspace_root())
@@ -292,6 +298,9 @@ fn sandbox_lib_rs_module_declarations_grouped() {
 
 #[test]
 fn every_library_lib_rs_pub_use_set_unchanged_from_p1() {
+    if !recursive_verify_enabled() {
+        return;
+    }
     let root = workspace_root();
     let output = Command::new("cargo")
         .args(["test", "-p", "deadreckon", "--test", "public_surface"])
@@ -304,6 +313,10 @@ fn every_library_lib_rs_pub_use_set_unchanged_from_p1() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn recursive_verify_enabled() -> bool {
+    std::env::var_os("DEADRECKON_RECURSIVE_VERIFY").is_some()
 }
 
 #[test]

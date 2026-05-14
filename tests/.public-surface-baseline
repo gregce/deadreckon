@@ -132,6 +132,18 @@ crate: deadreckon-core
   gate::validate_acceptance_marker
   gate::write_acceptance_marker
   gate::write_acceptance_marker_with_results
+  glossary::chain_status_label
+  glossary::chain_step_status_label
+  glossary::NOUN_CHAIN
+  glossary::NOUN_CHILD
+  glossary::NOUN_PLAN
+  glossary::NOUN_RUN
+  glossary::phase_status_label
+  glossary::plan_status_label
+  glossary::plan_task_status_label
+  glossary::run_status_label
+  glossary::StatusLabel
+  glossary::status_label
   lock::acquire_lock
   lock::lock_status
   lock::LockGuard
@@ -143,6 +155,39 @@ crate: deadreckon-core
   paths::DeadreckonPaths
   paths::DEFAULT_DEADRECKON_HOME
   paths::SOURCE_ROOT
+  plan::append_plan_message
+  plan::CapabilityPreview
+  plan::child_summary_relative_path
+  plan::COORDINATOR_JSON
+  plan::CoordinatorChild
+  plan::CoordinatorState
+  plan::load_plan
+  plan::NetworkCapability
+  plan::PLAN_CHILD_PARENT_JSON
+  plan::plan_task_key
+  plan::PLAN_JSON
+  plan::PLAN_MESSAGES_JSONL
+  plan::Plan
+  plan::PlanChildMarker
+  plan::PlanMessage
+  plan::PlanMessageKind
+  plan::PlanMode
+  plan::PlanProviders
+  plan::PlanRole
+  plan::PlanStatus
+  plan::PlanTask
+  plan::PlanTaskStatus
+  plan::read_plan_messages
+  plan::save_plan
+  plan::SUMMARIES_DIR
+  plan::validate_task_count
+  plan::validate_task_graph
+  plan::worker_spec_relative_path
+  plan::WORKER_SPECS_DIR
+  plan::write_child_summary
+  plan::write_coordinator_state
+  plan::write_plan_child_marker
+  plan::write_worker_spec
   polish_subcalls::DEFAULT_DOC_POLISH_TOKEN_BUDGET
   polish_subcalls::DEFAULT_DOC_SUBSKILLS
   polish_subcalls::DocProviderSelection

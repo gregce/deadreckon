@@ -10446,7 +10446,7 @@ fn list_command(scope: Option<String>, all: bool, json_output: bool) -> Result<(
     for entry in entries {
         match entry {
             ListEntry::Run(run) => {
-                print_list_row(ListRow {
+                print_list_row(&ListRow {
                     id: run_prefix(&run.run_id),
                     status: run_status_label(run.status).to_string(),
                     age: relative_age(run.updated_at),
@@ -10460,7 +10460,7 @@ fn list_command(scope: Option<String>, all: bool, json_output: bool) -> Result<(
                 });
             }
             ListEntry::Plan(plan) => {
-                print_list_row(ListRow {
+                print_list_row(&ListRow {
                     id: run_prefix(&plan.plan_id),
                     status: plan_status_label(plan.status).to_string(),
                     age: relative_age(plan.updated_at),
@@ -10521,7 +10521,7 @@ fn list_header() -> String {
     )
 }
 
-fn print_list_row(row: ListRow) {
+fn print_list_row(row: &ListRow) {
     let first_prefix = format!(
         "{}  {}  {}  {}  {}  {}  {}  ",
         pad_rendered(&row.id, LIST_ID_WIDTH, Some(ui_id)),
