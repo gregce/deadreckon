@@ -1,5 +1,23 @@
 # Changelog
 
+## Orchestration prompt polish (alpha) - 2026-05-14
+
+- Mined Claude Code's coordinator guidance into deadreckon worker specs: self-contained briefs, no sibling transcript peeking, concrete dependency summaries, correction vs fresh-review guidance, and skeptical reviewer posture.
+- Planner prompts now ask for execution-order child DAGs with enough context for each child to run without the parent conversation.
+- Plan children now run with `--no-docs`; plan-level summaries remain responsible for orchestration docs, avoiding accidental provider-backed narrator work in child runs.
+- The coordinator now records each child run id under `plans/<plan-id>/launch/<task-id>/run-id`, so plan kill can map live child PIDs back to run state before marking children killed.
+- Added/kept exact orchestration depth coverage for review-mode extension, child PID snapshots, kill cascade, prompt hygiene, and plan lifecycle friendliness.
+
+## Coherence pass (alpha) - 2026-05-14
+
+- Added one glossary for status words; `running` replaces `executing` in user-visible run and phase surfaces while stored enum variants stay unchanged.
+- Added one style module and prompt builder; raw ANSI escapes now live in `ui.rs`, and every confirmation prompt uses the same `? question [Y/n]: ` or `? question [y/N]: ` shape.
+- Added one key/value block for run and plan summaries, with lowercase keys and aligned colons.
+- Standardized alpha flag names with hidden aliases: `--escalate`, `--overwrite`, `--anyway`, `--all-scopes`, `--global`, `--branch-name`, `--into`, `--max-spend`, and `--git-strategy`.
+- Preserved the cyan `deadreckoning` banner, course strip, magenta IDs, spend gauge colors, and chain glyphs, with applied steps now using `◉`.
+- Aligned attach and kill banners across runs, chains, and plans.
+- Aligned `show --why-failed` and `chain show --why-failed` through one failure-summary layout, and added JSON output for list/status/show/doctor/provider/library inspection surfaces.
+
 ## Orchestration milestone (alpha) — 2026-05-13
 
 - Added file-backed orchestration plans with task DAG validation, provider roles, worker specs, coordinator messages, child summaries, and plan child markers without changing `PipelineState`.

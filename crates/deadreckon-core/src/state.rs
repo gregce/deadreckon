@@ -29,15 +29,7 @@ pub enum RunStatus {
 
 impl fmt::Display for RunStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            RunStatus::Pending => "pending",
-            RunStatus::Planned => "planned",
-            RunStatus::Executing => "executing",
-            RunStatus::Completed => "completed",
-            RunStatus::Failed => "failed",
-            RunStatus::Killed => "killed",
-        };
-        f.write_str(value)
+        f.write_str(crate::glossary::run_status_label(*self))
     }
 }
 
@@ -56,14 +48,7 @@ pub enum PhaseStatus {
 
 impl fmt::Display for PhaseStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            PhaseStatus::Pending => "pending",
-            PhaseStatus::Planned => "planned",
-            PhaseStatus::Executing => "executing",
-            PhaseStatus::Completed => "completed",
-            PhaseStatus::Failed => "failed",
-        };
-        f.write_str(value)
+        f.write_str(crate::glossary::phase_status_label(*self))
     }
 }
 

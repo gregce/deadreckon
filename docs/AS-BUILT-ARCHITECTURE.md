@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-13 (post orchestration milestone)
+**Last updated:** 2026-05-14 (coherence pass alpha)
 **Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -36,6 +36,7 @@ This document captures the system as built today — what's wired, what's load-b
 23. [Glossary](#23-glossary)
 24. [Codebase Modes](#24-codebase-modes)
 25. [Self-Documenting Runs](#25-self-documenting-runs)
+26. [Coherence Pass (alpha)](#26-coherence-pass-alpha)
 28. [Chains & Autonomous Goal Chaining](#28-chains--autonomous-goal-chaining)
 29. [Workspace Hygiene](#29-workspace-hygiene)
 30. [Plans & Multi-Agent Orchestration](#30-plans--multi-agent-orchestration)
@@ -963,11 +964,11 @@ Multiple sources contribute PIDs to track:
 - `state.child_pids: Vec<u32>` — populated by the CLI itself (`main.rs:333`).
 - Per-subprocess PID files at `run_root/child-pids/*.pid` — written by the sandbox layer (`lib.rs:129`) and read by `supervised_pids()` (`main.rs:923`).
 
-`kill_command` (`main.rs:885-921`) reads both, releases the lock, sets `state.status = Killed`, and signals every PID via `terminate_pid(pid, force)`. Non-force: graceful (default signal), wait 1.5s, then SIGKILL anything still alive.
+`kill_command` reads both, releases the lock, sets `state.status = Killed`, and signals every PID. Without `--escalate`, it tries the graceful signal, waits 1.5s, then SIGKILLs anything still alive.
 
 ### 12.3 What `kill` cannot do
 
-`kill` does **not** flip a cancellation token in a running deadreckon process. If a deadreckon `run` is still executing, `kill` only signals its child PIDs; the deadreckon process itself relies on its own cancellation token tree, which `kill` doesn't reach across processes. In practice this works because killing the children causes the providers/sandbox to error out, which the turn loop sees and propagates as a failure — but the seam is not as clean as it could be (this is named in the robustness rider as a hardening target).
+`kill` does **not** flip a cancellation token in a running deadreckon process. If a deadreckon `run` is still running, `kill` only signals its child PIDs; the deadreckon process itself relies on its own cancellation token tree, which `kill` doesn't reach across processes. In practice this works because killing the children causes the providers/sandbox to error out, which the turn loop sees and propagates as a failure. This remains a hardening target.
 
 ---
 
@@ -1539,8 +1540,10 @@ artifact/worktree locations, and the next recommended action. Running
 `deadreckon` with no subcommand dispatches to `status`.
 
 `cleanup` (alias `prune`) removes worktrees and temporary branches for already
-abandoned runs by default, with opt-in `--completed`, `--stale`, `--all`, and
-`--force` selectors. It leaves promoted library artifacts intact.
+abandoned runs by default, with opt-in `--completed`, `--stale`,
+`--all-scopes`, `--escalate`, and `--overwrite` selectors. It leaves promoted
+library artifacts intact. The older `--all` and `--force` spellings remain
+hidden alpha aliases.
 
 ### 24.11 Integration With Existing Verbs
 
@@ -1609,7 +1612,7 @@ When `deadreckon apply` builds the default squash or merge message, it reads `RU
 
 ### 25.9 `deadreckon doc`
 
-`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another artifact, `--export <path>` writes it to disk, and `--force` overwrites exports or a prior polish result. `--polish` prints a preview listing provider, provider source, subskills, token budget, budget cap, and inputs hash before it calls the doc provider; `--no-confirm` skips the prompt for scripts. `--doc-provider <route>` overrides the automatic doc provider and `--budget-cap <usd>` limits the polish pass.
+`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another artifact, `--export <path>` writes it to disk, and `--overwrite` overwrites exports or a prior polish result. `--polish` prints a preview listing provider, provider source, subskills, token budget, max spend, and inputs hash before it calls the doc provider; `--no-confirm` skips the prompt for scripts. `--doc-provider <route>` overrides the automatic doc provider and `--max-spend <usd>` limits the polish pass. The older `--force` and `--budget-cap` spellings remain hidden alpha aliases.
 
 ### 25.10 Cost And Idempotency
 
@@ -1631,9 +1634,53 @@ Doc polish chooses `--doc-provider`, then `[defaults].doc_provider`, then in-PAT
 
 The deterministic as-built seed maps changed paths into concrete layers such as Rust crates, frontend components/routes, tests, documentation, manifests, migrations, and CI. Unmapped files are omitted instead of grouped under `Project files`; topology ASCII is emitted only when at least three top-level directories changed.
 
-### 25.15 Polish Preview And Budget Cap
+### 25.15 Polish Preview And Max Spend
 
-`deadreckon doc <id> --polish` estimates the maximum output-token cost before calling the provider. Paid API routes are refused when the estimate exceeds `--budget-cap` or `[defaults].doc_polish_budget_cap_usd`; subscription CLI routes estimate as `$0.00 (subscription)`.
+`deadreckon doc <id> --polish` estimates the maximum output-token cost before calling the provider. Paid API routes are refused when the estimate exceeds `--max-spend` or `[defaults].doc_polish_budget_cap_usd`; subscription CLI routes estimate as `$0.00 (subscription)`.
+
+---
+
+## 26. Coherence Pass (alpha)
+
+### 26.1 Glossary
+
+`crates/deadreckon-core/src/glossary.rs` is the display vocabulary source for statuses and primary nouns. Stored enum variants keep their alpha schema names, including `RunStatus::Executing`, but user-facing run and phase text now renders `running`. Chains, chain steps, plan status, and plan-child status use the same helper family, so `attach <plan-id> --plain`, `merge <plan-id>`, and `status <run-id>` agree on `running`.
+
+### 26.2 Style Helpers
+
+`crates/deadreckon/src/ui.rs` owns ANSI rendering through `Tone`, `Stream`, `write`, `writeln`, `hint`, and `kv_block`. Raw ANSI escapes are confined to that file. The cyan `deadreckoning` banner, blue `* ^ . -` course strip, magenta IDs, spend gauge gradient, and chain glyph family remain product affordances.
+
+### 26.3 Key/Value Layout
+
+`print_kv_block` wraps `ui::kv_block` for CLI cards. Run summaries, run locations, status cards, plan creation, and plan summaries now use lowercase keys, padded colons, and six-decimal spend where applicable.
+
+### 26.4 Flag Truth
+
+The alpha CLI names intent before force. Kill paths use `--escalate`; destination overwrites use `--overwrite`; abandon uses `--anyway`; chain and cleanup cross-scope commands use `--all-scopes`; status uses `--global`; run branch naming uses `--branch-name`; apply/finish targets use `--into`; doc polish uses `--max-spend`; apply and finish git behavior use `--git-strategy`. The old spellings stay as hidden aliases for one alpha. Chain branch policy displays `linear-merge` while accepting the old `merge` value.
+
+### 26.5 Prompts
+
+`crates/deadreckon/src/prompt.rs` owns `prompt::open` and `prompt::confirm`. Every `Y/n` and `y/N` confirmation now renders with the same `? question [Y/n]: ` shape. The high-spend prompt says `continue with --max-spend $N? [y/N]:`, and doc polish now treats Enter as the displayed yes default.
+
+### 26.6 Attach And Kill Parity
+
+`attach <id>` prints `attaching to run|chain|plan <prefix>` to stderr before opening a TUI. `kill <run-id>`, `chain kill`, and `kill <plan-id>` route through one banner shape; plan kill keeps the plan-only process count.
+
+### 26.7 TUI Parity
+
+The chain attach poll cadence matches the run TUI at 200 ms. Applied chain steps render `◉`, so applied and running no longer share `●`. The spend gauge keeps the green, yellow, red, and cap-paused magenta thresholds; above 60 percent, the title exposes the budget percentage so the label remains readable at narrow widths.
+
+### 26.8 Provider And Failure Vocabulary
+
+Provider displays use the provider/route/model/kind vocabulary consistently. Human provider lists and detection rows use the same `kind=cli|http|local-http|scripted` tokens, and the configured route is marked with `*` in the selection and registry views. `show --why-failed` and `chain show --why-failed` now route through one failure-summary renderer with shared `status:`, `reason:`, `evidence:`, and `try:` sections.
+
+### 26.9 JSON Parity
+
+Inspection surfaces that already read durable state now expose `--json`: `list`, `chain list`, `providers list`, `library list`, `status`, `show`, and `doctor`. Each JSON response is a top-level object with a named payload and `try_lines`, matching the existing `detect --json` shape.
+
+### 26.10 Deferred V1 Work
+
+Mass renaming stored enum variants, themable palettes, localization hooks, and a template engine for status cards stay in `docs/V1-CANDIDATES.md`.
 
 ---
 
@@ -1664,7 +1711,7 @@ deadreckon chain plan "build a chess app" --n 6 --yes
 
 ### 28.4 Branch Policy
 
-`stack` bases step N+1 on the SHA applied by step N. `base` bases every step on the original chain base SHA. `merge` follows stack semantics but forces `apply --strategy merge`, producing merge commits instead of squash commits.
+`stack` bases step N+1 on the SHA applied by step N. `base` bases every step on the original chain base SHA. `linear-merge` follows stack semantics but forces `apply --git-strategy merge`, producing merge commits instead of squash commits. The old `merge` branch-policy value remains accepted as a hidden alpha alias.
 
 ### 28.5 Apply-Mode Green Policy
 
@@ -1775,17 +1822,19 @@ Two modes are built:
   merge-proofs/conflicts.json
 ```
 
-Every child run receives an inline copy of its worker spec in the prompt. The spec includes root goal, exact task scope, provider, role, dependency context, capability preview, and hygiene rules such as staying within scope and not spawning subagents. At launch time the coordinator rewrites the spec for dependent tasks with completed predecessor summaries, so later children receive concrete run ids, summary paths, changed-file context, and predecessor status rather than only a bare dependency id.
+Every child run receives an inline copy of its worker spec in the prompt. The spec includes root goal, exact task scope, provider, role, dependency context, capability preview, and hygiene rules such as staying within scope and not spawning subagents. The current worker-spec posture borrows Claude Code's coordinator rules: the spec is the complete brief, children should not inspect sibling transcripts, corrections stay with the worker that has the failure context, and reviewer lanes verify independently rather than inheriting coder assumptions.
+
+At launch time the coordinator rewrites the spec for dependent tasks with completed predecessor summaries, so later children receive concrete run ids, summary paths, changed-file context, and predecessor status rather than only a bare dependency id. Plan children also run with `--no-docs`; orchestration docs come from plan summaries and merge manifests, not from each child invoking provider-backed narrator work.
 
 ### 30.3 Verbs
 
 - `plan <goal>` writes `plan.json` and worker specs. It previews provider roles, capability hints, task labels, dependencies, and next actions.
-- `fork <plan-id>` runs ready child tasks through `deadreckon run`, using distinct plan-child scopes via `DEADRECKON_SCOPE_ROOT`. It writes typed progress/blocker messages and child summaries.
+- `fork <plan-id>` runs ready child tasks through `deadreckon run`, using distinct plan-child scopes via `DEADRECKON_SCOPE_ROOT`. It writes typed progress/blocker messages and child summaries. While a child starts, the coordinator records the run id in `plans/<plan-id>/launch/<task-id>/run-id` so later plan-level kill/recovery commands can map a live process back to durable run state.
 - `merge <plan-id>` composes completed child library artifacts into a new promoted run. It fails on conflicting file contents by default; `--strategy prefer-child --prefer-child <idx>` records the conflict and chooses that child.
 - `orchestrate <goal>` is the one-command wrapper. In review mode it performs plan -> fork -> merge end to end.
 - `attach <plan-id>` opens a plan TUI on TTYs and renders a plain summary off-TTY. The TUI shows child panes with provider/role/status, run prefixes, dependency state, turn/status, spend or token accounting, latest trace activity, acceptance/gate state, summary paths, and coordinator messages; `Enter` drills into the selected child run.
 - Headless flags are honored across this surface: `run --quiet` emits no success stdout, `run --plain --quiet` emits only the final plain status line, and `attach --plain` forces summary output instead of ratatui.
-- `kill <plan-id>` reads `coordinator.json` and child run state to signal the coordinator and live children.
+- `kill <plan-id>` reads `coordinator.json`, launch run-id sidecars, and child run state to signal the coordinator and live children, then marks discovered child states killed and releases their locks.
 - `history grep <pattern>` searches durable trace or provenance JSONL, can restrict to a plan's child runs with `--plan <plan-id>`, and supports regex, scope, age, and limit filters.
 - `show <id> --why-failed` explains the likely failure surface for a run or plan, including non-completed children, blocker messages, and recent trace errors.
 
@@ -1797,7 +1846,7 @@ Generated run artifacts are intentionally excluded from merge composition: `.dea
 
 ### 30.5 Current Limits
 
-The first orchestration milestone is usable but not the full rider endpoint. The plan TUI reads child state/traces from disk on refresh; a broadcast-backed plan event stream remains future work.
+The first orchestration milestone is usable but not the full rider endpoint. The plan TUI reads child state/traces from disk on refresh; a broadcast-backed plan event stream remains future work. There is also no arbitrary child-to-child chat surface: children communicate through durable summaries and typed coordinator messages only.
 
 ---
 

@@ -31,7 +31,7 @@ Core lifecycle:
 Continue or recover:
   extend      continue from a completed run
   resume      resume an incomplete run
-  kill        cancel a running task
+  kill        cancel a run
   cleanup     remove stale or completed worktrees
 
 More help:
@@ -144,8 +144,8 @@ Lifecycle:
   deadreckon merge <plan-id>
 
 Plan writes ~/.deadreckon/plans/<plan-id>/plan.json plus worker specs. Split
-mode asks the planner provider for a task graph. Review mode writes a coder task
-followed by a fresh reviewer task.";
+mode asks the planner route for a child graph. Review mode writes a coder child
+followed by a fresh reviewer child.";
 
 const FORK_HELP: &str = "\
 Lifecycle:
@@ -292,7 +292,7 @@ Discard removes a run's temporary worktree and branch after you decide not to ke
 const CLEANUP_HELP: &str = "\
 Lifecycle:
   deadreckon cleanup --completed
-  deadreckon cleanup --stale --force
+  deadreckon cleanup --stale --escalate
   deadreckon cleanup <run-id>
 
 Cleanup handles abandoned, stale, or completed temporary worktrees. It does not delete promoted library artifacts.";
@@ -315,8 +315,8 @@ Lifecycle:
 Docs are generated as part of accepted runs and are also shown in the TUI after completion.
 Docs can be regenerated with a provider-backed polish pass:
   deadreckon doc latest --polish
-  deadreckon doc latest --polish --doc-provider cli:codex --force
-  deadreckon doc latest --polish --budget-cap 0.25 --no-confirm";
+  deadreckon doc latest --polish --doc-provider cli:codex --overwrite
+  deadreckon doc latest --polish --max-spend 0.25 --no-confirm";
 
 const ATTACH_HELP: &str = "\
 Lifecycle:
@@ -389,7 +389,7 @@ searches the current project's run traces. Use --all to search every project.";
     name = "deadreckon",
     version,
     about = "Unattended agentic coding harness",
-    long_about = "deadreckon runs long coding tasks in an isolated worktree or sandbox, tracks durable state, and gives you explicit apply/export/cleanup steps.",
+    long_about = "deadreckon runs long coding goals in an isolated worktree or sandbox, tracks durable state, and gives you explicit apply/export/cleanup steps.",
     help_template = TOP_LEVEL_TEMPLATE,
     after_help = TOP_LEVEL_HELP
 )]
@@ -479,7 +479,11 @@ pub(crate) enum Commands {
         provider: Option<String>,
         #[arg(long, help = "Model override for drafting")]
         model: Option<String>,
-        #[arg(long, help = "Overwrite generated criteria/helper files")]
+        #[arg(
+            long = "overwrite",
+            alias = "force",
+            help = "Overwrite generated criteria/helper files"
+        )]
         force: bool,
         #[arg(
             long,
@@ -518,7 +522,11 @@ pub(crate) enum Commands {
         in_place: bool,
         #[arg(long, help = "Base git ref for worktree runs")]
         base: Option<String>,
-        #[arg(long, help = "Branch name for worktree runs")]
+        #[arg(
+            long = "branch-name",
+            alias = "branch",
+            help = "Branch name for worktree runs"
+        )]
         branch: Option<String>,
         #[arg(long, help = "Seed current dirty/untracked files into the worktree")]
         allow_dirty: bool,
@@ -587,7 +595,11 @@ pub(crate) enum Commands {
         goal: String,
         #[arg(long, value_enum, default_value_t = CliPlanMode::Review, help = "Orchestration mode")]
         mode: CliPlanMode,
-        #[arg(long, default_value_t = 3, help = "Split-mode task count, 2 through 6")]
+        #[arg(
+            long,
+            default_value_t = 3,
+            help = "Split-mode child count, 2 through 6"
+        )]
         n: u8,
         #[arg(long, help = "Per-child spend cap in USD")]
         max_spend: Option<f64>,
@@ -627,7 +639,11 @@ pub(crate) enum Commands {
     Plan {
         #[arg(help = "Natural-language coding goal")]
         goal: String,
-        #[arg(long, default_value_t = 3, help = "Split-mode task count, 2 through 6")]
+        #[arg(
+            long,
+            default_value_t = 3,
+            help = "Split-mode child count, 2 through 6"
+        )]
         n: u8,
         #[arg(long, value_enum, default_value_t = CliPlanMode::Split, help = "Plan mode")]
         mode: CliPlanMode,
@@ -734,7 +750,7 @@ pub(crate) enum Commands {
         #[arg(
             long,
             default_value = "stack",
-            help = "Branch policy: stack, base, or merge"
+            help = "Branch policy: stack, base, or linear-merge"
         )]
         branch_policy: String,
         #[arg(
@@ -795,7 +811,11 @@ pub(crate) enum Commands {
         max_spend_add: Option<f64>,
         #[arg(long, help = "Reset the circuit breaker on resume")]
         reset_breaker: bool,
-        #[arg(long, help = "Force kill without SIGTERM grace")]
+        #[arg(
+            long = "escalate",
+            alias = "force",
+            help = "Escalate kill without SIGTERM grace"
+        )]
         force: bool,
         #[arg(long, help = "Step index for redo")]
         step: Option<u32>,
@@ -809,10 +829,16 @@ pub(crate) enum Commands {
         no_confirm: bool,
         #[arg(long, help = "Print exact IDs and paths")]
         full: bool,
-        #[arg(long, help = "Show chains from all scopes")]
+        #[arg(
+            long = "all-scopes",
+            alias = "all",
+            help = "Show chains from all scopes"
+        )]
         all: bool,
         #[arg(long, help = "Explain the failure reason in chain show")]
         why_failed: bool,
+        #[arg(long, help = "Emit machine-readable JSON for list/show/status")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Setup",
@@ -820,7 +846,10 @@ pub(crate) enum Commands {
         about = "Check providers, sandboxing, disk, and local prerequisites",
         after_help = DOCTOR_HELP
     )]
-    Doctor,
+    Doctor {
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
     #[command(
         next_help_heading = "Setup",
         about = "Probe registered providers from descriptor data",
@@ -854,6 +883,8 @@ pub(crate) enum Commands {
         scope: Option<String>,
         #[arg(long, help = "Show runs from all projects")]
         all: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Completed Run Actions",
@@ -876,17 +907,27 @@ pub(crate) enum Commands {
         run_id: Option<String>,
         #[arg(long, help = "Destination directory for fresh/copy exports")]
         dest: Option<PathBuf>,
-        #[arg(long, help = "Overwrite a non-empty export destination")]
+        #[arg(
+            long = "overwrite",
+            alias = "force",
+            help = "Overwrite a non-empty export destination"
+        )]
         force: bool,
         #[arg(long, help = "Keep manifest.json in exported output")]
         include_manifest: bool,
         #[arg(
             long,
             default_value = "squash",
-            help = "Worktree apply strategy: squash, merge, or cherry-pick"
+            long = "git-strategy",
+            alias = "strategy",
+            help = "Git apply strategy: squash, merge, or cherry-pick"
         )]
         strategy: String,
-        #[arg(long, help = "Apply target branch; defaults to the current branch")]
+        #[arg(
+            long = "into",
+            alias = "branch",
+            help = "Apply target branch; defaults to the current branch"
+        )]
         branch: Option<String>,
         #[arg(
             long,
@@ -915,7 +956,11 @@ pub(crate) enum Commands {
         run_id: String,
         #[arg(long, help = "Destination directory")]
         dest: Option<PathBuf>,
-        #[arg(long, help = "Overwrite a non-empty destination")]
+        #[arg(
+            long = "overwrite",
+            alias = "force",
+            help = "Overwrite a non-empty destination"
+        )]
         force: bool,
         #[arg(long, help = "Keep manifest.json in the exported output")]
         include_manifest: bool,
@@ -933,10 +978,16 @@ pub(crate) enum Commands {
         #[arg(
             long,
             default_value = "squash",
-            help = "Apply strategy: squash, merge, or cherry-pick"
+            long = "git-strategy",
+            alias = "strategy",
+            help = "Git apply strategy: squash, merge, or cherry-pick"
         )]
         strategy: String,
-        #[arg(long, help = "Target branch; defaults to the current branch")]
+        #[arg(
+            long = "into",
+            alias = "branch",
+            help = "Target branch; defaults to the current branch"
+        )]
         branch: Option<String>,
         #[arg(long, help = "Skip interactive confirmation")]
         no_confirm: bool,
@@ -965,7 +1016,11 @@ pub(crate) enum Commands {
         run_id: String,
         #[arg(long, help = "Keep the temporary branch")]
         keep_branch: bool,
-        #[arg(long, help = "Clean even if the run is still marked executing")]
+        #[arg(
+            long = "anyway",
+            alias = "force",
+            help = "Clean even if the run is still marked running"
+        )]
         force: bool,
     },
     #[command(
@@ -977,16 +1032,22 @@ pub(crate) enum Commands {
     Cleanup {
         #[arg(help = "Optional run id, unique prefix, or latest")]
         run_id: Option<String>,
-        #[arg(long, help = "Search all project scopes")]
+        #[arg(long = "all-scopes", alias = "all", help = "Search all project scopes")]
         all: bool,
         #[arg(long, help = "Include completed worktree runs not already abandoned")]
         completed: bool,
-        #[arg(long, help = "Include stale executing runs")]
+        #[arg(long, help = "Include stale running runs")]
         stale: bool,
         #[arg(long, help = "Skip interactive confirmation")]
         no_confirm: bool,
-        #[arg(long, help = "Pass --force to git worktree remove and kill stale runs")]
+        #[arg(
+            long = "escalate",
+            alias = "force",
+            help = "Escalate stale run termination"
+        )]
         force: bool,
+        #[arg(long, help = "Force git worktree removal")]
+        overwrite: bool,
         #[arg(long, help = "Keep temporary branches")]
         keep_branch: bool,
     },
@@ -1040,13 +1101,21 @@ pub(crate) enum Commands {
         polish: bool,
         #[arg(long, help = "Skip polish confirmation")]
         no_confirm: bool,
-        #[arg(long, help = "Overwrite existing export or polish output")]
+        #[arg(
+            long = "overwrite",
+            alias = "force",
+            help = "Overwrite existing export or polish output"
+        )]
         force: bool,
         #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
         #[arg(long, help = "Provider route for documentation polish")]
         doc_provider: Option<String>,
-        #[arg(long, help = "Budget cap in USD for documentation polish")]
+        #[arg(
+            long = "max-spend",
+            alias = "budget-cap",
+            help = "Spend cap in USD for documentation polish"
+        )]
         budget_cap: Option<f64>,
     },
     #[command(
@@ -1066,13 +1135,17 @@ pub(crate) enum Commands {
     #[command(
         next_help_heading = "Run Lifecycle",
         visible_alias = "stop",
-        about = "Cancel a running task",
+        about = "Cancel a run",
         after_help = KILL_HELP
     )]
     Kill {
         #[arg(help = "Run id, unique prefix, or latest")]
         run_id: String,
-        #[arg(long, help = "Escalate subprocess termination")]
+        #[arg(
+            long = "escalate",
+            alias = "force",
+            help = "Escalate subprocess termination"
+        )]
         force: bool,
     },
     #[command(
@@ -1119,6 +1192,8 @@ pub(crate) enum Commands {
         turn: Option<u32>,
         #[arg(long, help = "Explain the most likely failure cause")]
         why_failed: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Inspect And Import",
@@ -1140,9 +1215,13 @@ pub(crate) enum Commands {
         run_id: Option<String>,
         #[arg(
             long,
+            long = "global",
+            alias = "all",
             help = "Use the global latest run instead of the current project"
         )]
         all: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Inspect And Import",
@@ -1223,7 +1302,11 @@ pub(crate) enum AcceptanceCommand {
         provider: Option<String>,
         #[arg(long, help = "Model override for drafting")]
         model: Option<String>,
-        #[arg(long, help = "Overwrite existing .deadreckon/acceptance files")]
+        #[arg(
+            long = "overwrite",
+            alias = "force",
+            help = "Overwrite existing .deadreckon/acceptance files"
+        )]
         force: bool,
     },
     #[command(
@@ -1241,7 +1324,11 @@ pub(crate) enum AcceptanceCommand {
         provider: Option<String>,
         #[arg(long, help = "Model override for English criteria")]
         model: Option<String>,
-        #[arg(long, help = "Overwrite generated helper files")]
+        #[arg(
+            long = "overwrite",
+            alias = "force",
+            help = "Overwrite generated helper files"
+        )]
         force: bool,
     },
     #[command(about = "Write a local acceptance template", after_help = ACCEPTANCE_HELP)]
@@ -1252,7 +1339,11 @@ pub(crate) enum AcceptanceCommand {
             help = "Template: auto, rust, node, static-site, or basic"
         )]
         preset: AcceptancePreset,
-        #[arg(long, help = "Overwrite existing .deadreckon/acceptance files")]
+        #[arg(
+            long = "overwrite",
+            alias = "force",
+            help = "Overwrite existing .deadreckon/acceptance files"
+        )]
         force: bool,
     },
     #[command(
@@ -1266,7 +1357,11 @@ pub(crate) enum AcceptanceCommand {
         provider: Option<String>,
         #[arg(long, help = "Model override for drafting")]
         model: Option<String>,
-        #[arg(long, help = "Overwrite existing .deadreckon/acceptance files")]
+        #[arg(
+            long = "overwrite",
+            alias = "force",
+            help = "Overwrite existing .deadreckon/acceptance files"
+        )]
         force: bool,
     },
     #[command(
@@ -1280,7 +1375,11 @@ pub(crate) enum AcceptanceCommand {
         provider: Option<String>,
         #[arg(long, help = "Model override for drafting")]
         model: Option<String>,
-        #[arg(long, help = "Overwrite existing .deadreckon/acceptance files")]
+        #[arg(
+            long = "overwrite",
+            alias = "force",
+            help = "Overwrite existing .deadreckon/acceptance files"
+        )]
         force: bool,
     },
     #[command(about = "Explain the active acceptance criteria", after_help = ACCEPTANCE_HELP)]
@@ -1357,6 +1456,8 @@ pub(crate) enum ProvidersCommand {
         all: bool,
         #[arg(long, help = "Print exact IDs and paths for scripts")]
         full: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
 }
 
@@ -1412,6 +1513,8 @@ pub(crate) enum LibraryCommand {
         until: Option<String>,
         #[arg(long, help = "Print full TSV-style values for scripts")]
         full: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
     #[command(about = "Search promoted artifact goals, scopes, and run ids")]
     Search {
@@ -1549,6 +1652,7 @@ pub(crate) struct ChainCommandArgs {
     pub(crate) full: bool,
     pub(crate) all: bool,
     pub(crate) why_failed: bool,
+    pub(crate) json: bool,
 }
 
 pub(crate) struct ExtendCommandArgs {

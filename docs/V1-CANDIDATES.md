@@ -5,3 +5,8 @@
 - OpenCode SQLite ingest: current provider CLI ingest reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON only. Add SQLite-backed discovery/parsing after choosing a dependency-light strategy and fixture shape.
 - Provider transcript undo/bulk-agent registration: provider-owned logs stay read-only in alpha. Any undo/replay, mass registration, or transcript mutation workflow needs a separate design that preserves provenance and provider ownership boundaries.
 - CLI stdout/run-output ingest and stdin prompt transport: Copilot and Pi now use saved provider sessions for the attach TUI. If a future provider needs `--no-session`, run-local JSONL stdout parsing, per-run `--session-dir`, or stdin prompt delivery for very large prompts, extend the descriptor schema with focused fixtures instead of adding one-off adapters.
+- Mass rename of stored status variants, especially `RunStatus::Executing` to `RunStatus::Running`. The coherence pass changed display text only.
+- Themable palettes via config. Alpha keeps one hard-coded palette in `ui.rs`.
+- Localization hooks for status words, nouns, prompts, and command hints.
+- Migration from hand-built status cards to a small template engine once the alpha CLI layout settles.
+- Full command-family renames beyond hidden alpha aliases, including removing `--force`, `--all`, `--branch`, and `--budget-cap` after the alias window closes.

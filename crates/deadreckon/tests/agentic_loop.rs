@@ -77,7 +77,7 @@ async fn mock_provider_records_three_turns_and_artifacts_match() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cross_process_kill_writes_cancel_marker_before_signal() {
+async fn kill_run_across_processes_terminates_in_5s() {
     let _gate = env!("CARGO_BIN_EXE_dr-gate");
     let temp = repo_tempdir();
     let server = MockServer::start(kill_script()).await;
@@ -121,7 +121,7 @@ async fn cross_process_kill_writes_cancel_marker_before_signal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn provider_http_call_aborts_when_cancel_marker_appears() {
+async fn kill_during_http_streaming_aborts_request() {
     let _gate = env!("CARGO_BIN_EXE_dr-gate");
     let temp = repo_tempdir();
     let server = MockServer::start(kill_script()).await;

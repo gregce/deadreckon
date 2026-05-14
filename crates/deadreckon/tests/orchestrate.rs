@@ -6,10 +6,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use chrono::Utc;
+use deadreckon_core::lock::lock_path;
 use deadreckon_core::{
-    DeadreckonPaths, Plan, PlanMessage, PlanMessageKind, PlanMode, PlanRole, PlanStatus,
-    PlanTaskStatus, RunOptions, RunStatus, TraceRecord, append_plan_message, append_trace,
-    create_run, load_plan, read_plan_messages, save_plan, save_state,
+    CoordinatorState, DeadreckonPaths, Plan, PlanMessage, PlanMessageKind, PlanMode, PlanRole,
+    PlanStatus, PlanTaskStatus, RunOptions, RunStatus, TraceRecord, append_plan_message,
+    append_trace, create_run, list_runs, load_plan, pid_is_alive, read_plan_messages, save_plan,
+    save_state,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -71,6 +73,14 @@ fn plan_writes_worker_specs_for_each_task() {
         let spec = fs::read_to_string(paths.worker_spec(&plan.plan_id, &task.task_id))
             .expect("worker spec");
         assert!(spec.contains("Root goal: tiny hello rust"), "{spec}");
+        assert!(
+            spec.contains("Treat this file as the complete brief"),
+            "{spec}"
+        );
+        assert!(
+            spec.contains("Do not inspect, tail, or summarize sibling child transcripts"),
+            "{spec}"
+        );
         assert!(spec.contains("Do not spawn subagents"), "{spec}");
         assert!(spec.contains(&task.task_id), "{spec}");
     }
@@ -135,10 +145,8 @@ fn plan_preview_prints_capabilities_and_provider_table() {
 
     assert_success(&output);
     let out = stdout(&output);
-    assert!(
-        out.contains("providers: planner=smoke default-child=smoke"),
-        "{out}"
-    );
+    assert!(out.contains("planner=smoke"), "{out}");
+    assert!(out.contains("default-child=smoke"), "{out}");
     assert!(out.contains("capabilities:"), "{out}");
     assert!(out.contains("deploy=true"), "{out}");
 }
@@ -221,7 +229,7 @@ fn planner_prompt_is_read_only() {
     assert!(prompt.contains("commit"), "{prompt}");
     assert!(prompt.contains("Return JSON only"), "{prompt}");
     assert!(
-        prompt.contains("Dependencies must refer to earlier task ids"),
+        prompt.contains("Dependencies must refer to earlier child ids"),
         "{prompt}"
     );
 }
@@ -259,7 +267,10 @@ fn plan_refuses_one_task_response() {
 
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
-    assert!(err.contains("provider returned 1 tasks; need 2"), "{err}");
+    assert!(
+        err.contains("provider returned 1 children; need 2"),
+        "{err}"
+    );
     assert!(
         err.contains("try: deadreckon plan ... --provider <other>"),
         "{err}"
@@ -290,9 +301,9 @@ fn plan_n_flag_clamped_to_2_through_6() {
         .expect("plan n 1");
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
-    assert!(err.contains("plan must have >= 2 tasks"), "{err}");
+    assert!(err.contains("plan must have >= 2 children"), "{err}");
     assert!(
-        err.contains("try: deadreckon run \"<the only task>\""),
+        err.contains("try: deadreckon run \"<the only child>\""),
         "{err}"
     );
 
@@ -313,7 +324,7 @@ fn plan_n_flag_clamped_to_2_through_6() {
         .expect("plan n 7");
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
-    assert!(err.contains("plan capped at 6 tasks; got 7"), "{err}");
+    assert!(err.contains("plan capped at 6 children; got 7"), "{err}");
     assert!(err.contains("try: split the goal into a chain"), "{err}");
     assert_eq!(saved_plan_count(&paths), 0);
 }
@@ -462,10 +473,8 @@ fn review_mode_post_action_hints_name_coder_and_reviewer() {
 
     assert_success(&output);
     let out = stdout(&output);
-    assert!(
-        out.contains("providers: coder=smoke:coder reviewer=smoke:reviewer"),
-        "{out}"
-    );
+    assert!(out.contains("coder=smoke:coder"), "{out}");
+    assert!(out.contains("reviewer=smoke:reviewer"), "{out}");
     assert!(out.contains("fork:"), "{out}");
     assert!(out.contains("deadreckon fork"), "{out}");
 }
@@ -494,10 +503,13 @@ fn plan_hints_name_capabilities_and_ready_tasks() {
     assert_success(&output);
     let out = stdout(&output);
     assert!(
-        out.contains("capabilities: network=Allowlist deploy=true install=false"),
+        out.contains("network=Allowlist deploy=true install=false"),
         "{out}"
     );
-    assert!(out.contains("tasks: 2 (2 ready / 0 blocked)"), "{out}");
+    assert!(
+        out.contains("children    : 2 (2 ready / 0 blocked)"),
+        "{out}"
+    );
     assert!(out.contains("fork:"), "{out}");
 }
 
@@ -524,8 +536,8 @@ fn error_messages_end_with_try_footer() {
                 "1",
                 "--quiet",
             ],
-            "plan must have >= 2 tasks",
-            "try: deadreckon run \"<the only task>\"",
+            "plan must have >= 2 children",
+            "try: deadreckon run \"<the only child>\"",
         ),
         (
             vec!["history", "grep", "[", "--regex"],
@@ -548,7 +560,7 @@ fn error_messages_end_with_try_footer() {
 }
 
 #[test]
-fn fork_spawns_children_with_distinct_scopes_and_messages() {
+fn fork_spawns_n_children_with_distinct_scopes() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -626,10 +638,205 @@ fn fork_spawns_children_with_distinct_scopes_and_messages() {
         .expect("attach");
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("capabilities network="), "{out}");
+    assert!(out.contains("capabilities:"), "{out}");
     assert!(out.contains("gate passed by dr-gate"), "{out}");
     assert!(out.contains("latest turn"), "{out}");
     assert!(out.contains("tokens"), "{out}");
+}
+
+#[test]
+fn fork_launches_each_child_with_resolved_provider() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke:default",
+            "--child-provider",
+            "1=smoke:reviewer",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+
+    let plan = load_plan(&paths, &plan.plan_id).expect("plan");
+    assert_eq!(plan.tasks[0].provider.as_deref(), Some("smoke:default"));
+    assert_eq!(plan.tasks[1].provider.as_deref(), Some("smoke:reviewer"));
+    assert!(
+        plan.tasks
+            .iter()
+            .all(|task| task.status == PlanTaskStatus::Completed)
+    );
+}
+
+#[test]
+fn fork_writes_progress_messages_jsonl() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let messages = read_plan_messages(&paths, &plan.plan_id).expect("messages");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.kind == PlanMessageKind::Progress
+                && message.summary == "task-0 started"),
+        "{messages:#?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.kind == PlanMessageKind::Progress
+                && message.summary == "task-1 completed"),
+        "{messages:#?}"
+    );
+}
+
+#[test]
+fn fork_writes_coordinator_json_with_child_pids() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_fake_cli_subagent_provider(
+        &paths,
+        temp.path(),
+        "cli:slow-child",
+        "sleep 2\nprintf 'changed by slow child\\n' > slow-child.txt\nprintf 'slow child done\\n'\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "cli:slow-child",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+
+    let mut child = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .spawn()
+        .expect("fork spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut live_pid_seen = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(raw) = fs::read_to_string(paths.coordinator_json(&plan.plan_id))
+            && let Ok(coordinator) = serde_json::from_str::<CoordinatorState>(&raw)
+            && coordinator
+                .children
+                .iter()
+                .filter_map(|child| child.pid)
+                .any(pid_is_alive)
+        {
+            live_pid_seen = true;
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("try wait") {
+            panic!("fork exited before live pid snapshot: {status}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let output = child.wait_with_output().expect("fork output");
+    assert_success(&output);
+    assert!(
+        live_pid_seen,
+        "coordinator.json never contained a live child pid"
+    );
+}
+
+#[test]
+fn kill_plan_cascade_cleans_all_children_in_under_5s() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_fake_cli_subagent_provider(
+        &paths,
+        temp.path(),
+        "cli:slow-kill-child",
+        "sleep 10\nprintf 'changed by slow child\\n' > slow-child.txt\nprintf 'slow child done\\n'\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "cli:slow-kill-child",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    let mut fork = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .spawn()
+        .expect("fork spawn");
+
+    let pids = wait_for_plan_child_pids(&paths, &plan.plan_id);
+    let started = std::time::Instant::now();
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["kill", &plan.plan_id[..8], "--force"])
+        .output()
+        .expect("kill plan");
+    assert_success(&output);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let _ = fork.wait();
+
+    for pid in pids {
+        assert!(!pid_is_alive(pid), "pid {pid} still alive");
+    }
+    let plan = load_plan(&paths, &plan.plan_id).expect("killed plan");
+    assert_eq!(plan.status, PlanStatus::Failed);
+    assert!(
+        plan.tasks
+            .iter()
+            .all(|task| task.status == PlanTaskStatus::Killed),
+        "{plan:#?}"
+    );
+    for task in &plan.tasks {
+        let run_id = task.child_run_id.as_deref().expect("child run id");
+        let state = deadreckon_core::load_run(&paths, run_id).expect("child state");
+        assert_eq!(state.status, RunStatus::Killed);
+        assert!(!lock_path(&paths, &state.scope, &state.task_key).exists());
+    }
 }
 
 #[test]
@@ -759,7 +966,7 @@ fn fork_refuses_when_plan_already_forked() {
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
     assert!(err.contains("plan"), "{err}");
-    assert!(err.contains("Forked"), "{err}");
+    assert!(err.contains("running"), "{err}");
     assert!(err.contains("try: deadreckon merge <plan-id>"), "{err}");
 }
 
@@ -855,7 +1062,87 @@ fn merge_composes_disjoint_children() {
 }
 
 #[test]
-fn merge_manifest_records_child_provider_roles_and_task_graph() {
+fn merge_fails_on_conflict_default() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("conflict at README.md"), "{err}");
+    assert!(err.contains("--strategy prefer-child"), "{err}");
+}
+
+#[test]
+fn merge_prefer_child_resolves_conflict() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--strategy",
+            "prefer-child",
+            "--prefer-child",
+            "1",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge prefer");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    assert_eq!(
+        fs::read_to_string(library.join("README.md")).expect("read merged"),
+        "# preferred child\n"
+    );
+    assert!(
+        paths
+            .merge_proofs(&plan.plan_id)
+            .join("conflicts.json")
+            .is_file()
+    );
+}
+
+#[test]
+fn merge_promotes_to_new_library_entry() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    assert!(library.is_dir(), "{}", library.display());
+    assert!(library.join("manifest.json").is_file());
+    assert!(library.join("deadreckon-plan-manifest.json").is_file());
+}
+
+#[test]
+fn merge_manifest_records_child_provider_roles() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -930,6 +1217,66 @@ fn merge_manifest_records_child_provider_roles_and_task_graph() {
 }
 
 #[test]
+fn merge_manifest_records_task_graph_and_summaries() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.tasks[1].depends_on = vec![plan.tasks[0].task_id.clone()];
+    save_plan(&paths, &plan).expect("save dependency");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(library.join("deadreckon-plan-manifest.json")).expect("manifest"),
+    )
+    .expect("manifest json");
+
+    assert_eq!(manifest["task_graph"][1]["depends_on"][0], "task-0");
+    assert_eq!(manifest["summary_paths"]["task-0"], "summaries/task-0.md");
+    assert_eq!(manifest["summary_paths"]["task-1"], "summaries/task-1.md");
+    assert!(
+        manifest["coordinator_messages"]["total"]
+            .as_u64()
+            .expect("total messages")
+            >= 4,
+        "{manifest:#}"
+    );
+}
+
+#[test]
 fn merge_refuses_running_child() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -972,7 +1319,7 @@ fn merge_refuses_running_child() {
 }
 
 #[test]
-fn orchestrate_review_mode_runs_fork_and_merge() {
+fn review_mode_runs_coder_then_reviewer_extend() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1010,6 +1357,71 @@ fn orchestrate_review_mode_runs_fork_and_merge() {
         "{reviewer_traces}"
     );
     assert!(reviewer_traces.contains(coder_run_id), "{reviewer_traces}");
+}
+
+#[test]
+fn review_mode_stops_before_reviewer_when_coder_fails_gate() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(repo.join(".deadreckon")).expect("acceptance dir");
+    fs::write(
+        repo.join(".deadreckon/acceptance.yaml"),
+        "name: impossible\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/never-created.txt\"\n",
+    )
+    .expect("acceptance");
+    write_fake_cli_subagent_provider(
+        &paths,
+        temp.path(),
+        "cli:review-fixture",
+        "printf 'generated once\\n' > coder-output.txt\nprintf 'coder wrote files\\n'\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--mode",
+            "review",
+            "--coder-provider",
+            "cli:review-fixture",
+            "--reviewer-provider",
+            "cli:review-fixture",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+
+    let plan = load_plan(&paths, &plan.plan_id).expect("plan");
+    let coder_run_id = plan.tasks[0].child_run_id.as_deref().expect("coder run");
+    assert_eq!(plan.tasks[0].status, PlanTaskStatus::Failed);
+    assert_eq!(plan.tasks[1].status, PlanTaskStatus::Failed);
+    assert!(plan.tasks[1].child_run_id.is_none());
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["show", &plan.plan_id[..8], "--why-failed"])
+        .output()
+        .expect("why failed");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(
+        out.contains(&format!(
+            "try: deadreckon show {} --why-failed",
+            &coder_run_id[..8]
+        )),
+        "{out}"
+    );
 }
 
 #[test]
@@ -1161,8 +1573,9 @@ fn show_why_failed_failed_emits_rca() {
         .expect("show why failed");
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("run ddddcccc status failed"), "{out}");
-    assert!(out.contains("reason acceptance failed"), "{out}");
+    assert!(out.contains("run ddddcccc failure summary"), "{out}");
+    assert!(out.contains("status: failed"), "{out}");
+    assert!(out.contains("reason: acceptance failed"), "{out}");
     assert!(out.contains("turn 3 tool.failed"), "{out}");
     assert!(out.contains("boom from failing test"), "{out}");
 }
@@ -1222,7 +1635,7 @@ fn show_why_failed_plan_includes_blocker_message() {
 }
 
 #[test]
-fn history_grep_substring_finds_pattern_across_runs() {
+fn history_grep_substring_finds_pattern_across_library() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1251,7 +1664,7 @@ fn history_grep_substring_finds_pattern_across_runs() {
 }
 
 #[test]
-fn history_grep_plan_scope_excludes_unrelated_runs() {
+fn history_grep_plan_scope_excludes_others() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1379,6 +1792,57 @@ fn plan_and_fork_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> Plan 
     load_plan(paths, &plan.plan_id).expect("forked plan")
 }
 
+fn plan_with_readme_conflict(paths: &DeadreckonPaths, repo: &std::path::Path) -> Plan {
+    let plan = plan_and_fork_smoke(paths, repo);
+    let second = &plan.tasks[1];
+    let second_run = second.child_run_id.as_ref().expect("second run");
+    let second_state = deadreckon_core::load_run(paths, second_run).expect("second state");
+    let second_library = paths.library_dir(&second_state.scope, &second_state.run_id);
+    fs::write(second_library.join("README.md"), "# preferred child\n").expect("conflict write");
+    plan
+}
+
+fn wait_for_plan_child_pids(paths: &DeadreckonPaths, plan_id: &str) -> Vec<u32> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Ok(raw) = fs::read_to_string(paths.coordinator_json(plan_id))
+            && let Ok(coordinator) = serde_json::from_str::<CoordinatorState>(&raw)
+        {
+            let pids = coordinator
+                .children
+                .iter()
+                .filter_map(|child| child.pid)
+                .filter(|pid| pid_is_alive(*pid))
+                .collect::<Vec<_>>();
+            if !pids.is_empty() && plan_child_runs_exist(paths, plan_id) {
+                return pids;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("no live child pids recorded for plan {plan_id}");
+}
+
+fn plan_child_runs_exist(paths: &DeadreckonPaths, plan_id: &str) -> bool {
+    let Ok(plan) = load_plan(paths, plan_id) else {
+        return false;
+    };
+    plan.tasks.iter().all(|task| {
+        let launch_dir = paths.plan_dir(plan_id).join("launch").join(&task.task_id);
+        if let Ok(run_id) = fs::read_to_string(launch_dir.join("run-id"))
+            && deadreckon_core::load_run(paths, run_id.trim()).is_ok()
+        {
+            return true;
+        }
+        let Ok(scope) = deadreckon_core::paths::workspace_scope(&launch_dir) else {
+            return false;
+        };
+        list_runs(paths, Some(scope.as_str()))
+            .map(|runs| !runs.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 fn write_fake_planner_provider(
     paths: &DeadreckonPaths,
     root: &std::path::Path,
@@ -1421,6 +1885,54 @@ args_template = ["{{prompt}}"]
         binary = binary.display()
     );
     fs::write(providers_dir.join("planner-fixture.toml"), descriptor).expect("descriptor");
+    fs::write(
+        paths.config_path(),
+        format!(
+            r#"
+default_provider = "{id}"
+fallback = ["{id}"]
+
+[providers."{id}"]
+binary = "{binary}"
+"#,
+            binary = binary.display()
+        ),
+    )
+    .expect("config");
+}
+
+fn write_fake_cli_subagent_provider(
+    paths: &DeadreckonPaths,
+    root: &std::path::Path,
+    id: &str,
+    script_body: &str,
+) {
+    fs::create_dir_all(paths.home()).expect("home");
+    let providers_dir = paths.home().join("providers.d");
+    fs::create_dir_all(&providers_dir).expect("providers dir");
+    let slug = id.replace(':', "-");
+    let binary = root.join(format!("{slug}.sh"));
+    fs::write(&binary, format!("#!/bin/sh\n{script_body}")).expect("fake cli");
+    let mut perms = fs::metadata(&binary).expect("fake metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&binary, perms).expect("fake chmod");
+    let descriptor = format!(
+        r#"
+id = "{id}"
+display_name = "Fake CLI Subagent"
+kind = "cli"
+default_binary = "{binary}"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["{{prompt}}"]
+"#,
+        binary = binary.display()
+    );
+    fs::write(providers_dir.join(format!("{slug}.toml")), descriptor).expect("descriptor");
     fs::write(
         paths.config_path(),
         format!(

@@ -121,7 +121,7 @@ impl PlanTask {
         let task_id = format!("task-{index}");
         let subject = subject.into();
         let active_form = if subject.trim().is_empty() {
-            format!("Running task {index}")
+            format!("Running child {index}")
         } else {
             subject.clone()
         };
@@ -319,11 +319,11 @@ pub struct CoordinatorState {
 pub fn validate_task_count(count: usize) -> Result<()> {
     match count {
         0 | 1 => Err(DeadreckonError::InvalidInput(
-            "plan must have >= 2 tasks\ntry: deadreckon run \"<the only task>\"".to_string(),
+            "plan must have >= 2 children\ntry: deadreckon run \"<the only child>\"".to_string(),
         )),
         2..=6 => Ok(()),
         _ => Err(DeadreckonError::InvalidInput(format!(
-            "plan capped at 6 tasks; got {count}\ntry: split the goal into a chain"
+            "plan capped at 6 children; got {count}\ntry: split the goal into a chain"
         ))),
     }
 }
@@ -335,7 +335,7 @@ pub fn validate_task_graph(tasks: &[PlanTask]) -> Result<()> {
     for (expected_index, task) in tasks.iter().enumerate() {
         if task.index != expected_index as u32 {
             return Err(DeadreckonError::InvalidInput(format!(
-                "task {} has index {}; expected {expected_index}",
+                "child {} has index {}; expected {expected_index}",
                 task.task_id, task.index
             )));
         }
@@ -344,7 +344,7 @@ pub fn validate_task_graph(tasks: &[PlanTask]) -> Result<()> {
         validate_nonempty(&task.goal, "goal")?;
         if !ids.insert(task.task_id.as_str()) {
             return Err(DeadreckonError::InvalidInput(format!(
-                "duplicate task id {}",
+                "duplicate child id {}",
                 task.task_id
             )));
         }
@@ -356,7 +356,7 @@ pub fn validate_task_graph(tasks: &[PlanTask]) -> Result<()> {
             .to_ascii_lowercase();
         if !subjects.insert(normalized_subject) {
             return Err(DeadreckonError::InvalidInput(format!(
-                "duplicate task subject {}",
+                "duplicate child subject {}",
                 task.subject
             )));
         }
@@ -365,13 +365,13 @@ pub fn validate_task_graph(tasks: &[PlanTask]) -> Result<()> {
         for dependency in &task.depends_on {
             if !ids.contains(dependency.as_str()) {
                 return Err(DeadreckonError::InvalidInput(format!(
-                    "task {} depends on unknown task {dependency}",
+                    "child {} depends on unknown child {dependency}",
                     task.task_id
                 )));
             }
             if dependency == &task.task_id {
                 return Err(DeadreckonError::InvalidInput(format!(
-                    "task {} depends on itself",
+                    "child {} depends on itself",
                     task.task_id
                 )));
             }
@@ -470,7 +470,7 @@ pub fn child_summary_relative_path(task_id: &str) -> PathBuf {
 fn validate_nonempty(value: &str, field: &str) -> Result<()> {
     if value.trim().is_empty() {
         return Err(DeadreckonError::InvalidInput(format!(
-            "task {field} must be non-empty"
+            "child {field} must be non-empty"
         )));
     }
     Ok(())
@@ -507,7 +507,7 @@ fn detect_task_cycle(tasks: &[PlanTask]) -> Result<()> {
         match marks.get(id) {
             Some(Mark::Visiting) => {
                 return Err(DeadreckonError::InvalidInput(format!(
-                    "task dependency cycle at {id}\ntry: remove one depends_on edge"
+                    "child dependency cycle at {id}\ntry: remove one depends_on edge"
                 )));
             }
             Some(Mark::Done) => return Ok(()),
@@ -627,6 +627,37 @@ mod tests {
     }
 
     #[test]
+    fn child_parent_json_plan_kind() {
+        let temp = TempDir::new().expect("tempdir");
+        let marker = PlanChildMarker {
+            schema_version: 1,
+            kind: "plan_child".to_string(),
+            parent_plan_id: "plan-123".to_string(),
+            parent_scope: "scope-a".to_string(),
+            parent_goal: "build a tiny app".to_string(),
+            task_id: "task-1".to_string(),
+            child_index: 1,
+            task_goal: "add behavior".to_string(),
+            worker_spec: PathBuf::from("worker-specs/task-1.md"),
+            provider: Some("cli:codex".to_string()),
+            role: PlanRole::Child,
+            created_at: Utc::now(),
+            deadreckon_version: "0.1.0".to_string(),
+        };
+
+        let path = write_plan_child_marker(temp.path(), &marker).expect("marker");
+        let decoded =
+            serde_json::from_slice::<PlanChildMarker>(&std::fs::read(path).expect("read"))
+                .expect("decode");
+
+        assert_eq!(decoded.kind, "plan_child");
+        assert_eq!(decoded.parent_plan_id, "plan-123");
+        assert_eq!(decoded.task_id, "task-1");
+        assert_eq!(decoded.provider.as_deref(), Some("cli:codex"));
+        assert_eq!(decoded.role, PlanRole::Child);
+    }
+
+    #[test]
     fn plan_messages_jsonl_roundtrips_typed_requests() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -648,14 +679,49 @@ mod tests {
             serde_json::json!({ "run": "abc" }),
         )
         .expect("review");
+        let review_response = PlanMessage::new(
+            "task-1",
+            "coordinator",
+            PlanMessageKind::ReviewResponse,
+            "review completed",
+            serde_json::json!({ "findings": 0 }),
+        )
+        .expect("review response");
+        let shutdown = PlanMessage::new(
+            "coordinator",
+            "task-0",
+            PlanMessageKind::ShutdownRequest,
+            "shutdown requested",
+            serde_json::json!({ "reason": "test" }),
+        )
+        .expect("shutdown");
+        let shutdown_response = PlanMessage::new(
+            "task-0",
+            "coordinator",
+            PlanMessageKind::ShutdownResponse,
+            "shutdown completed",
+            serde_json::json!({ "ok": true }),
+        )
+        .expect("shutdown response");
 
         append_plan_message(&paths, &plan.plan_id, &progress).expect("append progress");
         append_plan_message(&paths, &plan.plan_id, &review).expect("append review");
+        append_plan_message(&paths, &plan.plan_id, &review_response)
+            .expect("append review response");
+        append_plan_message(&paths, &plan.plan_id, &shutdown).expect("append shutdown");
+        append_plan_message(&paths, &plan.plan_id, &shutdown_response)
+            .expect("append shutdown response");
         let messages = read_plan_messages(&paths, &plan.plan_id).expect("read");
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 5);
         assert_eq!(messages[0].kind, PlanMessageKind::Progress);
         assert!(messages[1].request_id.is_some());
+        assert_eq!(messages[2].kind, PlanMessageKind::ReviewResponse);
+        assert!(messages[2].request_id.is_some());
+        assert_eq!(messages[3].kind, PlanMessageKind::ShutdownRequest);
+        assert!(messages[3].request_id.is_some());
+        assert_eq!(messages[4].kind, PlanMessageKind::ShutdownResponse);
+        assert!(messages[4].request_id.is_some());
     }
 
     #[test]
