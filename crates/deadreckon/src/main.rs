@@ -10493,7 +10493,7 @@ const LIST_SCOPE_WIDTH: usize = 24;
 const LIST_KIND_WIDTH: usize = 13;
 const LIST_MODE_WIDTH: usize = 10;
 const LIST_ACTION_WIDTH: usize = 16;
-const LIST_GOAL_MAX_LINES: usize = 2;
+const LIST_GOAL_MAX_LINES: usize = 4;
 
 struct ListRow {
     id: String,
@@ -10565,9 +10565,7 @@ fn list_goal_width() -> usize {
     let terminal_width = crossterm::terminal::size()
         .map(|(width, _)| width as usize)
         .unwrap_or(180);
-    terminal_width
-        .saturating_sub(list_prefix_width())
-        .clamp(24, 96)
+    terminal_width.saturating_sub(list_prefix_width()).max(24)
 }
 
 fn pad_plain(value: &str, width: usize) -> String {

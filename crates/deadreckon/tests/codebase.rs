@@ -1826,6 +1826,47 @@ fn list_default_is_compact_and_points_to_show_for_details() {
 }
 
 #[test]
+fn list_wraps_goal_farther_before_ellipsizing() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let goal = concat!(
+        "segment one starts a long readable list goal with enough words to wrap ",
+        "segment two keeps the goal useful instead of clipping too early ",
+        "segment three should still be visible in the compact list output ",
+        "segment four should also be visible before the final ellipsis appears ",
+        "segment five should be hidden after the row budget"
+    );
+    create_run(
+        &paths,
+        RunOptions {
+            goal: goal.to_string(),
+            cwd: temp.path().to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            run_id: None,
+            codebase: Some(CodebaseRecord::fresh()),
+        },
+    )
+    .expect("run");
+
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .arg("list")
+        .output()
+        .expect("list");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("three should still be visible"), "{stdout}");
+    assert!(stdout.contains("segment four"), "{stdout}");
+    assert!(stdout.contains("should also be visible"), "{stdout}");
+    assert!(!stdout.contains("after the row budget"), "{stdout}");
+}
+
+#[test]
 fn list_defaults_to_current_scope_and_all_shows_other_scopes() {
     let temp = repo_tempdir();
     let repo_a = clean_git_repo_in(&temp, "repo-a");
