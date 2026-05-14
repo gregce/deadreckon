@@ -12980,9 +12980,9 @@ fn render_plan_attach(
                         .title(title)
                         .borders(Borders::ALL)
                         .border_style(if is_selected {
-                            Style::default().fg(Color::Cyan)
+                            Style::default().fg(ui::TUI_PALETTE.border_focused)
                         } else {
-                            Style::default()
+                            Style::default().fg(ui::TUI_PALETTE.border_idle)
                         }),
                 )
                 .wrap(Wrap { trim: true }),
@@ -15550,10 +15550,11 @@ fn render_acceptance(
 
 fn acceptance_color(status: AcceptanceUiStatus) -> Color {
     match status {
-        AcceptanceUiStatus::DefaultGate | AcceptanceUiStatus::Configured => Color::Yellow,
-        AcceptanceUiStatus::Running => Color::Cyan,
-        AcceptanceUiStatus::Passed => Color::Green,
-        AcceptanceUiStatus::Failed => Color::Red,
+        AcceptanceUiStatus::DefaultGate => ui::TUI_PALETTE.acceptance_default,
+        AcceptanceUiStatus::Configured => ui::TUI_PALETTE.acceptance_configured,
+        AcceptanceUiStatus::Running => ui::TUI_PALETTE.acceptance_running,
+        AcceptanceUiStatus::Passed => ui::TUI_PALETTE.acceptance_passed,
+        AcceptanceUiStatus::Failed => ui::TUI_PALETTE.acceptance_failed,
     }
 }
 
@@ -16149,7 +16150,7 @@ fn turn_timer(
 
 fn meter_color(ratio: f64, state: &deadreckon_core::PipelineState) -> Color {
     if state.pause_reason.as_deref() == Some("spend cap reached") {
-        Color::Magenta
+        ui::TUI_PALETTE.spend_pause_cap
     } else {
         threshold_color(ratio)
     }
@@ -16157,11 +16158,11 @@ fn meter_color(ratio: f64, state: &deadreckon_core::PipelineState) -> Color {
 
 fn threshold_color(ratio: f64) -> Color {
     if ratio >= 0.8 {
-        Color::Red
+        ui::TUI_PALETTE.spend_high
     } else if ratio >= 0.6 {
-        Color::Yellow
+        ui::TUI_PALETTE.spend_mid
     } else {
-        Color::Green
+        ui::TUI_PALETTE.spend_low
     }
 }
 

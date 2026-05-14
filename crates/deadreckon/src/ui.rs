@@ -1,6 +1,8 @@
 use std::io::{self, IsTerminal, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ratatui::style::Color;
+
 static PLAIN_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +25,41 @@ pub(crate) enum Tone {
     Prompt,
     Hint,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TuiPalette {
+    pub(crate) border_focused: Color,
+    pub(crate) border_idle: Color,
+    pub(crate) status_running: Color,
+    pub(crate) status_completed: Color,
+    pub(crate) status_failed: Color,
+    pub(crate) acceptance_default: Color,
+    pub(crate) acceptance_configured: Color,
+    pub(crate) acceptance_running: Color,
+    pub(crate) acceptance_passed: Color,
+    pub(crate) acceptance_failed: Color,
+    pub(crate) spend_low: Color,
+    pub(crate) spend_mid: Color,
+    pub(crate) spend_high: Color,
+    pub(crate) spend_pause_cap: Color,
+}
+
+pub(crate) const TUI_PALETTE: TuiPalette = TuiPalette {
+    border_focused: Color::Cyan,
+    border_idle: Color::Reset,
+    status_running: Color::Cyan,
+    status_completed: Color::Green,
+    status_failed: Color::Red,
+    acceptance_default: Color::DarkGray,
+    acceptance_configured: Color::Yellow,
+    acceptance_running: Color::Cyan,
+    acceptance_passed: Color::Green,
+    acceptance_failed: Color::Red,
+    spend_low: Color::Green,
+    spend_mid: Color::Yellow,
+    spend_high: Color::Red,
+    spend_pause_cap: Color::Magenta,
+};
 
 pub(crate) fn set_plain_output(plain: bool) {
     PLAIN_OUTPUT.store(plain, Ordering::Relaxed);

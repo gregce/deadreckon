@@ -1666,9 +1666,9 @@ The alpha CLI names intent before force. Kill paths use `--escalate`; destinatio
 
 `attach <id>` prints `attaching to run|chain|plan <prefix>` to stderr before opening a TUI. `kill <run-id>`, `chain kill`, and `kill <plan-id>` route through one banner shape; plan kill keeps the plan-only process count.
 
-### 26.7 TUI Parity
+### 26.7 TUI Palette And Parity
 
-The chain attach poll cadence matches the run TUI at 200 ms. Applied chain steps render `◉`, so applied and running no longer share `●`. The spend gauge keeps the green, yellow, red, and cap-paused magenta thresholds; above 60 percent, the title exposes the budget percentage so the label remains readable at narrow widths.
+`ui::TUI_PALETTE` names the shared TUI color slots for focused borders, acceptance states, run states, and spend thresholds. The chain attach poll cadence matches the run TUI at 200 ms. Applied chain steps render `◉`, so applied and running no longer share `●`. The spend gauge keeps the green, yellow, red, and cap-paused magenta thresholds; above 60 percent, the title exposes the budget percentage so the label remains readable at narrow widths.
 
 ### 26.8 Provider And Failure Vocabulary
 
