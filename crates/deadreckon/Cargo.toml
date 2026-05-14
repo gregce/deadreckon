@@ -19,6 +19,7 @@ deadreckon-runtime = { workspace = true }
 deadreckon-sandbox = { workspace = true }
 pulldown-cmark.workspace = true
 ratatui.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

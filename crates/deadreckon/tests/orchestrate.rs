@@ -4,10 +4,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use chrono::Utc;
 use deadreckon_core::{
-    DeadreckonPaths, Plan, PlanMode, PlanRole, PlanStatus, PlanTaskStatus, load_plan,
-    read_plan_messages, save_plan,
+    DeadreckonPaths, Plan, PlanMode, PlanRole, PlanStatus, PlanTaskStatus, RunOptions, TraceRecord,
+    append_trace, create_run, load_plan, read_plan_messages, save_plan,
 };
+use serde_json::json;
 use tempfile::TempDir;
 
 #[test]
@@ -403,6 +405,137 @@ fn show_why_failed_plan_names_blocking_child() {
     );
 }
 
+#[test]
+fn history_grep_substring_finds_pattern_across_runs() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    seed_trace_run(
+        &paths,
+        &repo,
+        "aaaabbbbccccdddd1111222233334444",
+        "first needle-from-history",
+    );
+    seed_trace_run(
+        &paths,
+        &repo,
+        "bbbbccccddddaaaa1111222233335555",
+        "second needle-from-history",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["history", "grep", "needle-from-history"])
+        .output()
+        .expect("history grep");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("aaaabbbb"), "{out}");
+    assert!(out.contains("bbbbcccc"), "{out}");
+}
+
+#[test]
+fn history_grep_plan_scope_excludes_unrelated_runs() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let child = "11112222333344445555666677778888";
+    let unrelated = "99998888777766665555444433332222";
+    seed_trace_run(&paths, &repo, child, "shared-plan-needle child");
+    seed_trace_run(&paths, &repo, unrelated, "shared-plan-needle unrelated");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.status = PlanStatus::Forked;
+    plan.tasks[0].child_run_id = Some(child.to_string());
+    save_plan(&paths, &plan).expect("save plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "history",
+            "grep",
+            "shared-plan-needle",
+            "--plan",
+            &plan.plan_id[..8],
+        ])
+        .output()
+        .expect("history grep");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("11112222"), "{out}");
+    assert!(!out.contains("99998888"), "{out}");
+}
+
+#[test]
+fn history_grep_regex_invalid_pattern_errors() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["history", "grep", "[", "--regex"])
+        .output()
+        .expect("history grep");
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("invalid regex"), "{err}");
+    assert!(err.contains("try: re-quote"), "{err}");
+}
+
+#[test]
+fn history_grep_limit_respected() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let state = create_test_run(
+        &paths,
+        &repo,
+        "abcdabcdabcdabcd1111222233334444",
+        "history limit",
+    );
+    for index in 0..20 {
+        append_trace(
+            &state,
+            &TraceRecord {
+                timestamp: Utc::now(),
+                run_id: state.run_id.clone(),
+                turn: index + 1,
+                event: "limit-check".to_string(),
+                latency_ms: None,
+                detail: json!({ "message": format!("limit-needle-{index}") }),
+            },
+        )
+        .expect("trace");
+    }
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["history", "grep", "limit-needle", "--limit", "5"])
+        .output()
+        .expect("history grep");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert_eq!(out.matches("limit-needle").count(), 5, "{out}");
+    assert!(out.contains("... (15 more)"), "{out}");
+}
+
 fn plan_and_fork_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> Plan {
     let output = deadreckon(paths)
         .current_dir(repo)
@@ -444,6 +577,45 @@ fn clean_git_repo(temp: &TempDir) -> PathBuf {
     git(&repo, &["add", "-A"]).expect("add");
     git(&repo, &["commit", "-m", "initial"]).expect("commit");
     repo
+}
+
+fn seed_trace_run(paths: &DeadreckonPaths, repo: &std::path::Path, run_id: &str, message: &str) {
+    let state = create_test_run(paths, repo, run_id, message);
+    append_trace(
+        &state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn: 1,
+            event: "test-trace".to_string(),
+            latency_ms: Some(1),
+            detail: json!({ "message": message }),
+        },
+    )
+    .expect("trace");
+}
+
+fn create_test_run(
+    paths: &DeadreckonPaths,
+    repo: &std::path::Path,
+    run_id: &str,
+    goal: &str,
+) -> deadreckon_core::PipelineState {
+    create_run(
+        paths,
+        RunOptions {
+            goal: goal.to_string(),
+            cwd: repo.to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "deadreckon".to_string(),
+            max_spend_usd: Some(10.0),
+            max_wall_seconds: None,
+            run_id: Some(run_id.to_string()),
+            codebase: None,
+        },
+    )
+    .expect("run")
 }
 
 fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {

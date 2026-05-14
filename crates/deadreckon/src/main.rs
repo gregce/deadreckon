@@ -70,6 +70,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
+use regex::Regex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
@@ -80,8 +81,9 @@ mod tui_events;
 
 use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, CliPlanMode, Commands,
-    CompletionCommand, ConfigCommand, ExtendCommandArgs, ForkCommandArgs, LibraryCommand,
-    MergeCommandArgs, PlanCommandArgs, ProvidersCommand, RunCommandArgs,
+    CompletionCommand, ConfigCommand, ExtendCommandArgs, ForkCommandArgs, HistoryCommand,
+    HistoryKind, LibraryCommand, MergeCommandArgs, PlanCommandArgs, ProvidersCommand,
+    RunCommandArgs,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -638,6 +640,7 @@ async fn main_inner() -> Result<()> {
             turn,
             why_failed,
         } => show_command(run_id, turn, why_failed),
+        Commands::History { command } => history_command(command),
         Commands::Status { run_id, all } => status_command(run_id, all),
         Commands::Import { source } => import_command(source),
     }
@@ -765,6 +768,7 @@ fn print_help_all() {
         ("doc", "read or regenerate run docs"),
         ("library", "inspect promoted artifacts"),
         ("show", "show raw state, traces, and provenance"),
+        ("history", "search trace and provenance evidence"),
         ("config", "read or update configuration"),
         ("completion", "generate shell tab-completion scripts"),
         ("import", "import other tool history"),
@@ -9924,6 +9928,216 @@ fn list_command(scope: Option<String>, all: bool) -> Result<()> {
         ui_command("deadreckon show <run>")
     );
     Ok(())
+}
+
+enum HistoryMatcher {
+    Substring(String),
+    Regex(Regex),
+}
+
+impl HistoryMatcher {
+    fn new(pattern: String, regex: bool) -> Result<Self> {
+        if regex {
+            let compiled = Regex::new(&pattern).map_err(|err| {
+                CliError::Core(deadreckon_core::user_error(
+                    &format!("invalid regex: {err}"),
+                    "re-quote or escape the pattern",
+                ))
+            })?;
+            Ok(Self::Regex(compiled))
+        } else {
+            Ok(Self::Substring(pattern))
+        }
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Substring(pattern) => line.contains(pattern),
+            Self::Regex(pattern) => pattern.is_match(line),
+        }
+    }
+}
+
+fn history_command(command: HistoryCommand) -> Result<()> {
+    match command {
+        HistoryCommand::Grep {
+            pattern,
+            plan,
+            scope,
+            all,
+            since,
+            kind,
+            limit,
+            regex,
+        } => history_grep_command(pattern, plan, scope, all, since, kind, limit, regex),
+    }
+}
+
+fn history_grep_command(
+    pattern: String,
+    plan: Option<String>,
+    scope: Option<String>,
+    all: bool,
+    since: Option<String>,
+    kind: HistoryKind,
+    limit: usize,
+    regex: bool,
+) -> Result<()> {
+    if limit == 0 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "--limit must be at least 1",
+            "deadreckon history grep \"pattern\" --limit 20",
+        )));
+    }
+    let paths = DeadreckonPaths::discover();
+    let matcher = HistoryMatcher::new(pattern.clone(), regex)?;
+    let cutoff = parse_history_since(since)?;
+    let plan_children = plan
+        .as_deref()
+        .map(|plan_id| history_plan_children(&paths, plan_id))
+        .transpose()?;
+    let effective_scope = if plan_children.is_some() || all {
+        scope
+    } else {
+        Some(scope.unwrap_or(current_scope()?))
+    };
+    let runs = list_runs(&paths, effective_scope.as_deref())?;
+    let mut printed = 0usize;
+    let mut total_matches = 0usize;
+    println!(
+        "{} {} {}",
+        ui_heading("history grep"),
+        ui_muted(history_kind_label(kind)),
+        ui_muted(if regex { "regex" } else { "substring" })
+    );
+    for run in runs {
+        if let Some(children) = plan_children.as_ref()
+            && !children.contains(&run.run_id)
+        {
+            continue;
+        }
+        let state = load_run(&paths, &run.run_id)?;
+        let path = state.run_root.join(history_kind_file(kind));
+        if !path.exists() || !history_file_within_cutoff(&path, cutoff)? {
+            continue;
+        }
+        let fallback_timestamp = history_file_timestamp(&path)?;
+        for line in fs::read_to_string(&path)?.lines() {
+            if !matcher.is_match(line) {
+                continue;
+            }
+            total_matches += 1;
+            if printed >= limit {
+                continue;
+            }
+            let timestamp = history_line_timestamp(kind, line).unwrap_or(fallback_timestamp);
+            println!(
+                "{} {} {} | {}",
+                ui_id(run_prefix(&run.run_id)),
+                timestamp.to_rfc3339(),
+                run.scope,
+                one_line(line.trim(), 220)
+            );
+            printed += 1;
+        }
+    }
+    if total_matches == 0 {
+        println!("no matches for {pattern:?}");
+        println!(
+            "{} try `{}` or `{}`",
+            ui_muted("hint:"),
+            ui_command("deadreckon history grep <pattern> --all"),
+            ui_command("deadreckon show <run-id>")
+        );
+    } else if total_matches > printed {
+        println!("... ({} more)", total_matches - printed);
+    }
+    Ok(())
+}
+
+fn history_plan_children(paths: &DeadreckonPaths, plan_id: &str) -> Result<BTreeSet<String>> {
+    let plan_id = resolve_plan_id(paths, plan_id)?;
+    let plan = load_plan(paths, &plan_id)?;
+    Ok(plan
+        .tasks
+        .iter()
+        .filter_map(|task| task.child_run_id.clone())
+        .collect())
+}
+
+fn history_kind_file(kind: HistoryKind) -> &'static str {
+    match kind {
+        HistoryKind::Trace => "traces.jsonl",
+        HistoryKind::Provenance => "provenance.jsonl",
+    }
+}
+
+fn history_kind_label(kind: HistoryKind) -> &'static str {
+    match kind {
+        HistoryKind::Trace => "trace",
+        HistoryKind::Provenance => "provenance",
+    }
+}
+
+fn parse_history_since(value: Option<String>) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.len() < 2 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "invalid --since duration",
+            "use a duration like 7d, 24h, or 30m",
+        )));
+    }
+    let (amount, unit) = value.split_at(value.len() - 1);
+    let amount = amount.parse::<i64>().map_err(|_| {
+        CliError::Core(deadreckon_core::user_error(
+            "invalid --since duration",
+            "use a duration like 7d, 24h, or 30m",
+        ))
+    })?;
+    if amount < 0 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "invalid --since duration",
+            "use a positive duration like 7d, 24h, or 30m",
+        )));
+    }
+    let duration = match unit {
+        "d" => ChronoDuration::days(amount),
+        "h" => ChronoDuration::hours(amount),
+        "m" => ChronoDuration::minutes(amount),
+        _ => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "invalid --since duration unit",
+                "use d, h, or m, for example 7d",
+            )));
+        }
+    };
+    Ok(Some(Utc::now() - duration))
+}
+
+fn history_file_within_cutoff(path: &Path, cutoff: Option<DateTime<Utc>>) -> Result<bool> {
+    let Some(cutoff) = cutoff else {
+        return Ok(true);
+    };
+    Ok(history_file_timestamp(path)? >= cutoff)
+}
+
+fn history_file_timestamp(path: &Path) -> Result<DateTime<Utc>> {
+    let modified = fs::metadata(path)?.modified()?;
+    Ok(DateTime::<Utc>::from(modified))
+}
+
+fn history_line_timestamp(kind: HistoryKind, line: &str) -> Option<DateTime<Utc>> {
+    match kind {
+        HistoryKind::Trace => serde_json::from_str::<TraceRecord>(line)
+            .ok()
+            .map(|record| record.timestamp),
+        HistoryKind::Provenance => serde_json::from_str::<ProvenanceRecord>(line)
+            .ok()
+            .map(|record| record.timestamp),
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -36,6 +36,7 @@ Continue or recover:
 
 More help:
   completion  generate shell tab-completion scripts
+  history     search run traces and provenance
   help-all    show every command, including advanced commands
   commands    alias for help-all
   <command> --help
@@ -369,6 +370,16 @@ Lifecycle:
   deadreckon show <imported-run-id>
 
 Import is read-only and normalizes other tool histories into deadreckon trace/provenance shape.";
+
+const HISTORY_HELP: &str = "\
+Lifecycle:
+  deadreckon history grep \"failed build\"
+  deadreckon history grep \"TODO\" --kind provenance
+  deadreckon history grep \"review\" --plan <plan-id>
+  deadreckon history grep \"error|failed\" --regex --limit 20
+
+History searches durable JSONL evidence, not terminal scrollback. By default it
+searches the current project's run traces. Use --all to search every project.";
 
 #[derive(Parser)]
 #[command(
@@ -1096,6 +1107,15 @@ pub(crate) enum Commands {
         why_failed: bool,
     },
     #[command(
+        next_help_heading = "Inspect And Import",
+        about = "Search run traces and provenance history",
+        after_help = HISTORY_HELP
+    )]
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
+    },
+    #[command(
         next_help_heading = "Run Lifecycle",
         visible_alias = "next",
         about = "Explain the current project's latest run and next action",
@@ -1134,6 +1154,35 @@ pub(crate) enum CliDocKind {
 pub(crate) enum CliPlanMode {
     Split,
     Review,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum HistoryKind {
+    Trace,
+    Provenance,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum HistoryCommand {
+    #[command(about = "Search trace or provenance JSONL")]
+    Grep {
+        #[arg(help = "Substring or regex to search for")]
+        pattern: String,
+        #[arg(long, help = "Restrict to children of this orchestration plan")]
+        plan: Option<String>,
+        #[arg(long, help = "Restrict to one project scope")]
+        scope: Option<String>,
+        #[arg(long, help = "Search all project scopes")]
+        all: bool,
+        #[arg(long, help = "Only search files modified within 7d, 24h, or 30m")]
+        since: Option<String>,
+        #[arg(long, value_enum, default_value_t = HistoryKind::Trace, help = "Search trace or provenance JSONL")]
+        kind: HistoryKind,
+        #[arg(long, default_value_t = 100, help = "Maximum matches to print")]
+        limit: usize,
+        #[arg(long, help = "Treat the pattern as a regular expression")]
+        regex: bool,
+    },
 }
 
 impl From<CliDocKind> for DocKind {
