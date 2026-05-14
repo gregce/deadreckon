@@ -1758,7 +1758,7 @@ An orchestration plan is a file-backed task graph under `~/.deadreckon/plans/<pl
 Two modes are built:
 
 - `split`: `deadreckon plan <goal> --n <2..=6>` asks a planner provider for task JSON, records planner/default-child/per-child providers, writes worker specs, and later `fork` runs each ready task.
-- `review`: `deadreckon orchestrate <goal> --mode review --coder-provider <id> --reviewer-provider <id>` writes a coder task and a fresh reviewer task. The reviewer is launched after the coder completes and receives a review/fix prompt plus the worker spec.
+- `review`: `deadreckon orchestrate <goal> --mode review --coder-provider <id> --reviewer-provider <id>` writes a coder task and a reviewer task. The reviewer is launched with `deadreckon extend <coder-run-id> ...` after the coder completes, so parent history and `extended_from_parent` trace lineage are preserved.
 
 ### 30.2 Plan Files
 
@@ -1796,7 +1796,7 @@ Generated run artifacts are intentionally excluded from merge composition: `.dea
 
 ### 30.5 Current Limits
 
-The first orchestration milestone is usable but not the full rider endpoint. Independent split tasks are supervised sequentially rather than concurrently. The plan TUI is a basic pane grid rather than the full event-streamed dashboard. Review mode uses a fresh child run from the coder artifact rather than the older `extend` verb path.
+The first orchestration milestone is usable but not the full rider endpoint. Independent split tasks are supervised sequentially rather than concurrently. The plan TUI is a basic pane grid rather than the full event-streamed dashboard.
 
 ---
 

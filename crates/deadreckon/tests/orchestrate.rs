@@ -315,6 +315,16 @@ fn orchestrate_review_mode_runs_fork_and_merge() {
     assert_eq!(plan.mode, PlanMode::Review);
     assert_eq!(plan.status, PlanStatus::Merged);
     assert!(plan.merged_run_id.is_some());
+    let coder_run_id = plan.tasks[0].child_run_id.as_deref().expect("coder run");
+    let reviewer_run_id = plan.tasks[1].child_run_id.as_deref().expect("reviewer run");
+    let reviewer_state = deadreckon_core::load_run(&paths, reviewer_run_id).expect("reviewer run");
+    let reviewer_traces =
+        fs::read_to_string(reviewer_state.run_root.join("traces.jsonl")).expect("review traces");
+    assert!(
+        reviewer_traces.contains("extended_from_parent"),
+        "{reviewer_traces}"
+    );
+    assert!(reviewer_traces.contains(coder_run_id), "{reviewer_traces}");
 }
 
 #[test]

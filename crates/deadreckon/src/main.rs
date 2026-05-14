@@ -7455,16 +7455,22 @@ async fn run_plan_child(
     command
         .current_dir(source_dir)
         .env("DEADRECKON_HOME", paths.home())
-        .env("DEADRECKON_SCOPE_ROOT", &launch_dir)
-        .arg("run")
-        .arg(prompt)
-        .arg("--from")
-        .arg(source_dir)
-        .arg("--yes")
-        .arg("--no-confirm")
-        .arg("--no-hints")
-        .arg("--sandbox")
-        .arg(sandbox);
+        .env("DEADRECKON_HINTS", "0")
+        .env("DEADRECKON_SCOPE_ROOT", &launch_dir);
+    let review_parent_run_id = review_parent_run_id(plan, task);
+    if let Some(parent_run_id) = review_parent_run_id.as_deref() {
+        command.arg("extend").arg(parent_run_id).arg(prompt);
+    } else {
+        command
+            .arg("run")
+            .arg(prompt)
+            .arg("--from")
+            .arg(source_dir)
+            .arg("--yes")
+            .arg("--no-confirm")
+            .arg("--no-hints");
+    }
+    command.arg("--sandbox").arg(sandbox);
     if let Some(max_spend) = max_spend {
         command.arg("--max-spend").arg(format!("{max_spend:.6}"));
     }
@@ -7478,7 +7484,11 @@ async fn run_plan_child(
         .as_deref()
         .is_some_and(|provider| provider == "smoke" || provider.starts_with("smoke:"))
     {
-        command.arg("--smoke");
+        if review_parent_run_id.is_some() {
+            command.arg("--provider").arg("smoke").arg("--no-docs");
+        } else {
+            command.arg("--smoke");
+        }
     } else if let Some(provider) = task.provider.as_deref() {
         command.arg("--provider").arg(provider);
     }
@@ -7542,6 +7552,16 @@ async fn run_plan_child(
             "deadreckon list",
         ))
     })
+}
+
+fn review_parent_run_id(plan: &Plan, task: &PlanTask) -> Option<String> {
+    if task.role != PlanRole::Reviewer {
+        return None;
+    }
+    task.depends_on
+        .first()
+        .and_then(|dependency| plan.task_by_id(dependency))
+        .and_then(|parent_task| parent_task.child_run_id.clone())
 }
 
 fn plan_child_prompt(plan: &Plan, task: &PlanTask, spec: &str, spec_path: &Path) -> String {
