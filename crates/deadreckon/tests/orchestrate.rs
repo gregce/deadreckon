@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -167,6 +168,182 @@ fn plan_records_explicit_child_provider_overrides() {
 
     assert_success(&output);
     let plan = newest_plan(&paths);
+    assert_eq!(
+        plan.providers.default_child.as_deref(),
+        Some("smoke:default")
+    );
+    assert_eq!(
+        plan.providers.children.get(&1).map(String::as_str),
+        Some("smoke:reviewer")
+    );
+    assert_eq!(plan.tasks[0].provider.as_deref(), Some("smoke:default"));
+    assert_eq!(plan.tasks[1].provider.as_deref(), Some("smoke:reviewer"));
+}
+
+#[test]
+fn planner_prompt_is_read_only() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let capture = temp.path().join("planner-prompt.txt");
+    write_fake_planner_provider(
+        &paths,
+        temp.path(),
+        "cli:planner-capture",
+        &capture,
+        r#"{"tasks":[{"subject":"Edit README","goal":"Edit README for tiny hello rust","active_form":"Editing README","depends_on":[]},{"subject":"Add source","goal":"Add source for tiny hello rust","active_form":"Adding source","depends_on":["task-0"]}]}"#,
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "cli:planner-capture",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+            "--plain",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let prompt = fs::read_to_string(&capture).expect("planner prompt");
+    assert!(prompt.contains("read-only planning agent"), "{prompt}");
+    assert!(prompt.contains("Do not write files"), "{prompt}");
+    assert!(prompt.contains("create temporary files"), "{prompt}");
+    assert!(prompt.contains("install packages"), "{prompt}");
+    assert!(prompt.contains("commit"), "{prompt}");
+    assert!(prompt.contains("Return JSON only"), "{prompt}");
+    assert!(
+        prompt.contains("Dependencies must refer to earlier task ids"),
+        "{prompt}"
+    );
+}
+
+#[test]
+fn plan_refuses_one_task_response() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let capture = temp.path().join("planner-prompt.txt");
+    write_fake_planner_provider(
+        &paths,
+        temp.path(),
+        "cli:planner-one-task",
+        &capture,
+        r#"{"tasks":[{"subject":"Only task","goal":"Do everything in one task","active_form":"Doing everything","depends_on":[]}]}"#,
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "cli:planner-one-task",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+            "--plain",
+        ])
+        .output()
+        .expect("plan");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("provider returned 1 tasks; need 2"), "{err}");
+    assert!(
+        err.contains("try: deadreckon plan ... --provider <other>"),
+        "{err}"
+    );
+    assert_eq!(saved_plan_count(&paths), 0);
+}
+
+#[test]
+fn plan_n_flag_clamped_to_2_through_6() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "1",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan n 1");
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("plan must have >= 2 tasks"), "{err}");
+    assert!(
+        err.contains("try: deadreckon run \"<the only task>\""),
+        "{err}"
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "7",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan n 7");
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("plan capped at 6 tasks; got 7"), "{err}");
+    assert!(err.contains("try: split the goal into a chain"), "{err}");
+    assert_eq!(saved_plan_count(&paths), 0);
+}
+
+#[test]
+fn plan_records_explicit_planner_and_child_providers() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke:planner",
+            "--provider",
+            "smoke:default",
+            "--child-provider",
+            "1=smoke:reviewer",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.providers.planner.as_deref(), Some("smoke:planner"));
     assert_eq!(
         plan.providers.default_child.as_deref(),
         Some("smoke:default")
@@ -656,6 +833,64 @@ fn plan_and_fork_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> Plan 
     load_plan(paths, &plan.plan_id).expect("forked plan")
 }
 
+fn write_fake_planner_provider(
+    paths: &DeadreckonPaths,
+    root: &std::path::Path,
+    id: &str,
+    capture: &std::path::Path,
+    response_json: &str,
+) {
+    fs::create_dir_all(paths.home()).expect("home");
+    let providers_dir = paths.home().join("providers.d");
+    fs::create_dir_all(&providers_dir).expect("providers dir");
+    let binary = root.join("fake-planner");
+    let response = root.join("fake-planner-response.json");
+    fs::write(&response, response_json).expect("response");
+    fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\n{{\n  for arg in \"$@\"; do\n    printf '%s\\n' \"$arg\"\n  done\n}} > '{}'\ncat '{}'\n",
+            capture.display(),
+            response.display()
+        ),
+    )
+    .expect("fake planner");
+    let mut perms = fs::metadata(&binary).expect("fake metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&binary, perms).expect("fake chmod");
+    let descriptor = format!(
+        r#"
+id = "{id}"
+display_name = "Planner Fixture"
+kind = "cli"
+default_binary = "{binary}"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["{{prompt}}"]
+"#,
+        binary = binary.display()
+    );
+    fs::write(providers_dir.join("planner-fixture.toml"), descriptor).expect("descriptor");
+    fs::write(
+        paths.config_path(),
+        format!(
+            r#"
+default_provider = "{id}"
+fallback = ["{id}"]
+
+[providers."{id}"]
+binary = "{binary}"
+"#,
+            binary = binary.display()
+        ),
+    )
+    .expect("config");
+}
+
 fn repo_tempdir() -> TempDir {
     let root = PathBuf::from("/Users/gdc/deadreckon/.test-tmp");
     fs::create_dir_all(&root).expect("test tmp root");
@@ -741,6 +976,17 @@ fn newest_plan(paths: &DeadreckonPaths) -> Plan {
         .collect::<Vec<_>>();
     plans.sort_by(|left, right| right.created_at.cmp(&left.created_at));
     plans.into_iter().next().expect("plan")
+}
+
+fn saved_plan_count(paths: &DeadreckonPaths) -> usize {
+    match fs::read_dir(paths.plans_dir()) {
+        Ok(entries) => entries
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().join("plan.json").exists())
+            .count(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(source) => panic!("plans dir: {source}"),
+    }
 }
 
 fn deadreckon(paths: &DeadreckonPaths) -> Command {

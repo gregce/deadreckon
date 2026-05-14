@@ -1757,7 +1757,7 @@ An orchestration plan is a file-backed task graph under `~/.deadreckon/plans/<pl
 
 Two modes are built:
 
-- `split`: `deadreckon plan <goal> --n <2..=6>` asks a planner provider for task JSON, records planner/default-child/per-child providers, writes worker specs, and later `fork` starts independent ready tasks as a concurrent batch.
+- `split`: `deadreckon plan <goal> --n <2..=6>` asks a read-only planner provider for task JSON, records planner/default-child/per-child providers, writes worker specs, and later `fork` starts independent ready tasks as a concurrent batch. Planner output must contain exactly the requested task count; single-task decompositions and values outside `2..=6` are refused before `plan.json` is saved.
 - `review`: `deadreckon orchestrate <goal> --mode review --coder-provider <id> --reviewer-provider <id>` writes a coder task and a reviewer task. The reviewer is launched with `deadreckon extend <coder-run-id> ...` after the coder completes, so parent history and `extended_from_parent` trace lineage are preserved.
 
 ### 30.2 Plan Files
