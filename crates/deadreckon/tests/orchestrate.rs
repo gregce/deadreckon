@@ -152,6 +152,45 @@ fn plan_preview_prints_capabilities_and_provider_table() {
 }
 
 #[test]
+fn list_includes_orchestration_plans_with_clear_kind() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("list")
+        .output()
+        .expect("list");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains(&plan.plan_id[..8]), "{out}");
+    assert!(out.contains("orchestrate"), "{out}");
+    assert!(out.contains("split"), "{out}");
+    assert!(out.contains("fork"), "{out}");
+    assert!(out.contains("deadreckon attach <id>"), "{out}");
+}
+
+#[test]
 fn plan_records_explicit_child_provider_overrides() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

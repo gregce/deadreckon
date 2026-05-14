@@ -7,6 +7,7 @@
     )
 )]
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
 use std::fs;
 use std::future::Future;
@@ -34,11 +35,11 @@ use deadreckon_core::{
     DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId,
     PhaseStatus, Plan, PlanChildMarker, PlanMessage, PlanMessageKind, PlanMode, PlanProviders,
     PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest, ProvenanceRecord,
-    RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunOptions, RunStatus, SpendRecord, TraceRecord,
-    WorktreeOptions, acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root,
-    acquire_lock, append_chain_event, append_parent_narrative_update, append_plan_message,
-    append_provenance, append_trace, apply_commit_body, cancel_marker_present,
-    chain_status_label as glossary_chain_status_label,
+    RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunListEntry, RunOptions, RunStatus, SpendRecord,
+    TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
+    acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
+    append_parent_narrative_update, append_plan_message, append_provenance, append_trace,
+    apply_commit_body, cancel_marker_present, chain_status_label as glossary_chain_status_label,
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
     docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files, list_runs,
@@ -10351,6 +10352,7 @@ fn list_command(scope: Option<String>, all: bool, json_output: bool) -> Result<(
         Some(scope.unwrap_or(current_scope()?))
     };
     let runs = list_runs(&paths, effective_scope.as_deref())?;
+    let plans = list_plan_entries(&paths, effective_scope.as_deref())?;
     if json_output {
         let runs = runs
             .iter()
@@ -10365,16 +10367,41 @@ fn list_command(scope: Option<String>, all: bool, json_output: bool) -> Result<(
                 })
             })
             .collect::<Vec<_>>();
+        let plans = plans
+            .iter()
+            .map(|plan| {
+                json!({
+                    "plan_id": &plan.plan_id,
+                    "scope": &plan.scope,
+                    "goal": &plan.goal,
+                    "status": plan_status_label(plan.status),
+                    "mode": plan_mode_label(plan.mode),
+                    "updated_at": plan.updated_at,
+                    "plan_path": &plan.plan_path,
+                    "children": {
+                        "completed": plan.completed_children,
+                        "total": plan.total_children,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "runs": runs,
+                "plans": plans,
                 "try_lines": Vec::<String>::new(),
             }))?
         );
         return Ok(());
     }
-    if runs.is_empty() {
+    let mut entries = runs
+        .into_iter()
+        .map(ListEntry::Run)
+        .chain(plans.into_iter().map(ListEntry::Plan))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| Reverse(entry.updated_at()));
+    if entries.is_empty() {
         match effective_scope.as_deref() {
             Some(scope) => {
                 println!("no runs for current project ({scope})");
@@ -10385,30 +10412,140 @@ fn list_command(scope: Option<String>, all: bool, json_output: bool) -> Result<(
         return Ok(());
     }
     let header = format!(
-        "{:<8}  {:<10}  {:<7}  {:<26}  {:<10}  {:<16}  GOAL",
-        "RUN", "STATUS", "AGE", "SCOPE", "MODE", "ACTION"
+        "{:<8}  {:<10}  {:<7}  {:<24}  {:<13}  {:<10}  {:<16}  GOAL",
+        "ID", "STATUS", "AGE", "SCOPE", "KIND", "MODE", "ACTION"
     );
     println!("{}", ui_heading(header));
-    for run in runs {
-        println!(
-            "{:<8}  {:<10}  {:<7}  {:<26}  {:<10}  {:<16}  {}",
-            ui_id(run_prefix(&run.run_id)),
-            truncate_text(&run.status.to_string(), 10),
-            relative_age(run.updated_at),
-            truncate_text(&run.scope, 26),
-            truncate_text(&codebase_mode_status(&paths, &run), 10),
-            truncate_text(&next_action_label_for_entry(&paths, &run), 16),
-            truncate_text(&one_line(&run.goal, 80), 80)
-        );
+    for entry in entries {
+        match entry {
+            ListEntry::Run(run) => {
+                println!(
+                    "{:<8}  {:<10}  {:<7}  {:<24}  {:<13}  {:<10}  {:<16}  {}",
+                    ui_id(run_prefix(&run.run_id)),
+                    truncate_text(&run.status.to_string(), 10),
+                    relative_age(run.updated_at),
+                    truncate_text(&run.scope, 24),
+                    "run",
+                    truncate_text(&codebase_mode_status(&paths, &run), 10),
+                    truncate_text(&next_action_label_for_entry(&paths, &run), 16),
+                    truncate_text(&one_line(&run.goal, 80), 80)
+                );
+            }
+            ListEntry::Plan(plan) => {
+                println!(
+                    "{:<8}  {:<10}  {:<7}  {:<24}  {:<13}  {:<10}  {:<16}  {}",
+                    ui_id(run_prefix(&plan.plan_id)),
+                    truncate_text(plan_status_label(plan.status), 10),
+                    relative_age(plan.updated_at),
+                    truncate_text(&plan.scope, 24),
+                    ui_warn("orchestrate"),
+                    plan_mode_label(plan.mode),
+                    truncate_text(&plan_action_label(&plan), 16),
+                    truncate_text(&one_line(&plan.goal, 80), 80)
+                );
+            }
+        }
     }
     println!(
-        "{} run ids accept prefixes; use `{}`, `{}`, or `{}`",
+        "{} run and plan ids accept prefixes; use `{}`, `{}`, `{}`, or `{}`",
         ui_muted("hint:"),
         ui_command("deadreckon status latest"),
         ui_command("deadreckon list --all"),
-        ui_command("deadreckon show <run>")
+        ui_command("deadreckon attach <id>"),
+        ui_command("deadreckon show <id>")
     );
     Ok(())
+}
+
+#[derive(Debug)]
+enum ListEntry {
+    Run(RunListEntry),
+    Plan(PlanListEntry),
+}
+
+impl ListEntry {
+    fn updated_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Run(run) => run.updated_at,
+            Self::Plan(plan) => plan.updated_at,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PlanListEntry {
+    plan_id: String,
+    scope: String,
+    goal: String,
+    status: PlanStatus,
+    mode: PlanMode,
+    updated_at: DateTime<Utc>,
+    plan_path: PathBuf,
+    completed_children: usize,
+    total_children: usize,
+}
+
+fn list_plan_entries(
+    paths: &DeadreckonPaths,
+    scope_filter: Option<&str>,
+) -> Result<Vec<PlanListEntry>> {
+    let root = paths.plans_dir();
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut plans = Vec::new();
+    for entry in fs::read_dir(&root).map_err(|source| DeadreckonError::Io {
+        path: root.clone(),
+        source,
+    })? {
+        let entry = entry?;
+        let plan_path = entry.path().join("plan.json");
+        if !plan_path.is_file() {
+            continue;
+        }
+        let Some(plan_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let plan = load_plan(paths, &plan_id)?;
+        if scope_filter.is_some_and(|scope| plan.parent_scope.as_deref() != Some(scope)) {
+            continue;
+        }
+        let updated_at = fs::metadata(&plan_path)
+            .and_then(|metadata| metadata.modified())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(|_| plan.merged_at.or(plan.forked_at).unwrap_or(plan.created_at));
+        let completed_children = plan
+            .tasks
+            .iter()
+            .filter(|task| task.status == PlanTaskStatus::Completed)
+            .count();
+        let total_children = plan.tasks.len();
+        plans.push(PlanListEntry {
+            plan_id: plan.plan_id,
+            scope: plan.parent_scope.unwrap_or_else(|| "global".to_string()),
+            goal: plan.root_goal,
+            status: plan.status,
+            mode: plan.mode,
+            updated_at,
+            plan_path,
+            completed_children,
+            total_children,
+        });
+    }
+    plans.sort_by_key(|plan| Reverse(plan.updated_at));
+    Ok(plans)
+}
+
+fn plan_action_label(plan: &PlanListEntry) -> String {
+    match plan.status {
+        PlanStatus::Pending => "fork".to_string(),
+        PlanStatus::Forked if plan.completed_children == plan.total_children => {
+            format!("merge {}/{}", plan.completed_children, plan.total_children)
+        }
+        PlanStatus::Forked => format!("attach {}/{}", plan.completed_children, plan.total_children),
+        PlanStatus::Merged => "done".to_string(),
+        PlanStatus::Failed => "show failure".to_string(),
+    }
 }
 
 enum HistoryMatcher {
