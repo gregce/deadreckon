@@ -1783,7 +1783,7 @@ Every child run receives an inline copy of its worker spec in the prompt. The sp
 - `fork <plan-id>` runs ready child tasks through `deadreckon run`, using distinct plan-child scopes via `DEADRECKON_SCOPE_ROOT`. It writes typed progress/blocker messages and child summaries.
 - `merge <plan-id>` composes completed child library artifacts into a new promoted run. It fails on conflicting file contents by default; `--strategy prefer-child --prefer-child <idx>` records the conflict and chooses that child.
 - `orchestrate <goal>` is the one-command wrapper. In review mode it performs plan -> fork -> merge end to end.
-- `attach <plan-id>` opens a plan TUI on TTYs and renders a plain summary off-TTY. The TUI shows child panes with provider/role/status, run prefixes, summaries, and coordinator messages; `Enter` drills into the selected child run.
+- `attach <plan-id>` opens a plan TUI on TTYs and renders a plain summary off-TTY. The TUI shows child panes with provider/role/status, run prefixes, dependency state, turn/status, spend or token accounting, latest trace activity, acceptance/gate state, summary paths, and coordinator messages; `Enter` drills into the selected child run.
 - `kill <plan-id>` reads `coordinator.json` and child run state to signal the coordinator and live children.
 - `history grep <pattern>` searches durable trace or provenance JSONL, can restrict to a plan's child runs with `--plan <plan-id>`, and supports regex, scope, age, and limit filters.
 - `show <id> --why-failed` explains the likely failure surface for a run or plan, including non-completed children, blocker messages, and recent trace errors.
@@ -1796,7 +1796,7 @@ Generated run artifacts are intentionally excluded from merge composition: `.dea
 
 ### 30.5 Current Limits
 
-The first orchestration milestone is usable but not the full rider endpoint. The plan TUI is a basic pane grid rather than the full event-streamed dashboard.
+The first orchestration milestone is usable but not the full rider endpoint. The plan TUI reads child state/traces from disk on refresh; a broadcast-backed plan event stream remains future work.
 
 ---
 

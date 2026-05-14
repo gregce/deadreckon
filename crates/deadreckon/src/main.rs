@@ -8105,6 +8105,15 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) ->
             );
         }
     }
+    println!(
+        "capabilities network={:?} deploy={} install={}",
+        plan.capability_preview.network,
+        plan.capability_preview.deploy,
+        plan.capability_preview.global_install
+    );
+    if let Some(line) = plan_final_gate_line(paths, plan) {
+        println!("final gate {line}");
+    }
     println!("tasks");
     for task in &plan.tasks {
         println!(
@@ -8119,11 +8128,11 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) ->
                 .unwrap_or_else(|| "-".to_string()),
             one_line(&task.subject, 60)
         );
-        if let Some(summary) = task.summary_path.as_ref() {
-            println!(
-                "    summary {}",
-                paths.plan_dir(&plan.plan_id).join(summary).display()
-            );
+        for detail in plan_task_detail_lines(paths, plan, task, 100)
+            .into_iter()
+            .skip(4)
+        {
+            println!("    {detail}");
         }
     }
     let messages = read_plan_messages(paths, &plan.plan_id).unwrap_or_default();
@@ -12225,7 +12234,7 @@ fn render_plan_attach(
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(10),
             Constraint::Length(7),
             Constraint::Length(2),
@@ -12253,6 +12262,15 @@ fn render_plan_attach(
             area.width.saturating_sub(4) as usize,
         )),
         Line::from(plan_provider_summary(plan)),
+        Line::from(format!(
+            "capabilities network={:?} deploy={} install={}{}",
+            plan.capability_preview.network,
+            plan.capability_preview.deploy,
+            plan.capability_preview.global_install,
+            plan_final_gate_line(paths, plan)
+                .map(|line| format!("  final {line}"))
+                .unwrap_or_default()
+        )),
     ];
     frame.render_widget(
         Paragraph::new(header)
@@ -12278,43 +12296,30 @@ fn render_plan_attach(
             task.task_id,
             task_status_label(task.status)
         );
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("{:?}", task.role).to_ascii_lowercase(),
-                    Style::default().fg(Color::Magenta),
-                ),
-                Span::raw(format!(
-                    "  provider {}",
-                    task.provider.as_deref().unwrap_or("-")
-                )),
-            ]),
-            Line::from(one_line(
-                &task.subject,
-                rect.width.saturating_sub(4) as usize,
-            )),
-            Line::from(format!(
-                "run {}",
-                task.child_run_id
-                    .as_deref()
-                    .map(run_prefix)
-                    .unwrap_or_else(|| "-".to_string())
-            )),
-            Line::from(format!(
-                "deps {}",
-                if task.depends_on.is_empty() {
-                    "-".to_string()
-                } else {
-                    task.depends_on.join(",")
-                }
-            )),
-        ];
-        if let Some(summary) = task.summary_path.as_ref() {
-            lines.push(Line::from(format!(
-                "summary {}",
-                paths.plan_dir(&plan.plan_id).join(summary).display()
-            )));
-        }
+        let lines =
+            plan_task_detail_lines(paths, plan, task, rect.width.saturating_sub(4) as usize)
+                .into_iter()
+                .enumerate()
+                .map(|(line_index, line)| {
+                    if line_index == 0 {
+                        Line::from(vec![
+                            Span::styled(
+                                line.split_once("  ")
+                                    .map(|(role, _)| role.to_string())
+                                    .unwrap_or_else(|| line.clone()),
+                                Style::default().fg(Color::Magenta),
+                            ),
+                            Span::raw(
+                                line.split_once("  ")
+                                    .map(|(_, rest)| format!("  {rest}"))
+                                    .unwrap_or_default(),
+                            ),
+                        ])
+                    } else {
+                        Line::from(line)
+                    }
+                })
+                .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines)
                 .block(
@@ -12428,6 +12433,110 @@ fn plan_activity_lines(messages: &[PlanMessage], max: usize) -> Vec<ListItem<'st
         lines.push(ListItem::new(Line::from("no coordinator messages yet")));
     }
     lines
+}
+
+fn plan_final_gate_line(paths: &DeadreckonPaths, plan: &Plan) -> Option<String> {
+    let run_id = plan.merged_run_id.as_deref()?;
+    let state = load_run(paths, run_id).ok()?;
+    Some(acceptance_status_line(&state))
+}
+
+fn plan_task_detail_lines(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task: &PlanTask,
+    width: usize,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "{}  provider {}",
+            format!("{:?}", task.role).to_ascii_lowercase(),
+            task.provider.as_deref().unwrap_or("-")
+        ),
+        one_line(&task.subject, width),
+        format!(
+            "status {}  run {}",
+            task_status_label(task.status),
+            task.child_run_id
+                .as_deref()
+                .map(run_prefix)
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        format!(
+            "deps {}",
+            if task.depends_on.is_empty() {
+                "ready".to_string()
+            } else {
+                task.depends_on.join(",")
+            }
+        ),
+    ];
+    if let Some(run_id) = task.child_run_id.as_deref()
+        && let Ok(state) = load_run(paths, run_id)
+    {
+        lines.push(format!("turn {}  run-status {}", state.turn, state.status));
+        lines.extend(plan_child_accounting_lines(&state));
+        if let Some(trace) = latest_trace_line(&state) {
+            lines.push(trace);
+        }
+        lines.push(format!("gate {}", acceptance_status_line(&state)));
+    }
+    if let Some(summary) = task.summary_path.as_ref() {
+        lines.push(format!(
+            "summary {}",
+            paths.plan_dir(&plan.plan_id).join(summary).display()
+        ));
+    }
+    lines
+}
+
+fn plan_child_accounting_lines(state: &deadreckon_core::PipelineState) -> Vec<String> {
+    let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl")).unwrap_or_default();
+    if spend.is_empty() {
+        return vec![format!(
+            "spend ${:.6}  context waiting",
+            state.total_spend_usd
+        )];
+    }
+    let total_cost = spend
+        .last()
+        .map(|record| record.total_cost_usd)
+        .unwrap_or(state.total_spend_usd);
+    let total_tokens = spend
+        .iter()
+        .map(|record| record.input_tokens + record.output_tokens)
+        .sum::<u64>();
+    let wall = spend
+        .last()
+        .and_then(|record| record.wall_time_seconds)
+        .map(|seconds| format!("  wall {seconds:.0}s"))
+        .unwrap_or_default();
+    if spend.iter().any(|record| record.subscription)
+        || state
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider.starts_with("cli:"))
+    {
+        vec![format!("tokens {}{wall}", format_count(total_tokens))]
+    } else {
+        vec![format!(
+            "spend ${total_cost:.6}  tokens {}{wall}",
+            format_count(total_tokens)
+        )]
+    }
+}
+
+fn latest_trace_line(state: &deadreckon_core::PipelineState) -> Option<String> {
+    let trace = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))
+        .unwrap_or_default()
+        .into_iter()
+        .last()?;
+    Some(format!(
+        "latest turn {} {} {}",
+        trace.turn,
+        trace.event,
+        one_line(&trace.detail.to_string(), 80)
+    ))
 }
 
 async fn attach_tui(

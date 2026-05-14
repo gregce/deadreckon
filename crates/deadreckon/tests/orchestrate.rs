@@ -250,6 +250,18 @@ fn fork_spawns_children_with_distinct_scopes_and_messages() {
         .expect("completion message");
     assert!(task_0_started < first_completed, "{summaries:#?}");
     assert!(task_1_started < first_completed, "{summaries:#?}");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["attach", &plan.plan_id[..8], "--no-hints"])
+        .output()
+        .expect("attach");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("capabilities network="), "{out}");
+    assert!(out.contains("gate passed by dr-gate"), "{out}");
+    assert!(out.contains("latest turn"), "{out}");
+    assert!(out.contains("tokens"), "{out}");
 }
 
 #[test]
