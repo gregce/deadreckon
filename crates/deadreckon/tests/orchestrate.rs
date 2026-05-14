@@ -232,6 +232,24 @@ fn fork_spawns_children_with_distinct_scopes_and_messages() {
     }
     let messages = read_plan_messages(&paths, &plan.plan_id).expect("messages");
     assert!(messages.len() >= 4, "{messages:#?}");
+    let summaries = messages
+        .iter()
+        .map(|message| message.summary.as_str())
+        .collect::<Vec<_>>();
+    let task_0_started = summaries
+        .iter()
+        .position(|summary| *summary == "task-0 started")
+        .expect("task 0 started");
+    let task_1_started = summaries
+        .iter()
+        .position(|summary| *summary == "task-1 started")
+        .expect("task 1 started");
+    let first_completed = summaries
+        .iter()
+        .position(|summary| summary.contains("completed"))
+        .expect("completion message");
+    assert!(task_0_started < first_completed, "{summaries:#?}");
+    assert!(task_1_started < first_completed, "{summaries:#?}");
 }
 
 #[test]

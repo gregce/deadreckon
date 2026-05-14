@@ -9,7 +9,8 @@
 - Added plan-aware `attach`, `show`, and `kill` so plan IDs participate in the normal lifecycle, including a basic multi-pane plan TUI with child drill-in.
 - Added `deadreckon history grep <pattern>` for plan-aware trace/provenance search and `deadreckon show <id> --why-failed` for run or plan failure summaries.
 - Review-mode orchestration now launches the reviewer lane as an `extend` of the coder run, preserving parent context and `extended_from_parent` trace lineage.
-- Verified with focused orchestration tests plus core plan round-trips, clippy on the orchestration target, and `cargo fmt --check`; concurrent child scheduling and a fuller event-streamed plan TUI remain future slices.
+- Independent split children now start as ready batches, with coordinator PID snapshots for every live child in the batch.
+- Verified with focused orchestration tests plus core plan round-trips, clippy on the orchestration target, and `cargo fmt --check`; a fuller event-streamed plan TUI remains a future slice.
 
 ## Copilot and Pi providers (alpha) - 2026-05-13
 

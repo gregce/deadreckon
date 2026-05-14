@@ -7159,8 +7159,10 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     while made_progress {
         made_progress = false;
         let ready = plan.ready_pending_task_indices();
-        for task_index in ready {
+        if !ready.is_empty() {
             made_progress = true;
+        }
+        for &task_index in &ready {
             let task_id = plan.tasks[task_index].task_id.clone();
             mark_plan_task_status(&mut plan, task_index, PlanTaskStatus::Running)?;
             append_plan_message(
@@ -7174,21 +7176,57 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                     json!({ "task_index": task_index }),
                 )?,
             )?;
-            save_plan(&paths, &plan)?;
-            write_coordinator_snapshot(&paths, &plan, None)?;
+        }
+        if ready.is_empty() {
+            continue;
+        }
+        save_plan(&paths, &plan)?;
+        write_coordinator_snapshot(&paths, &plan, None)?;
 
+        let (pid_tx, pid_rx) = std::sync::mpsc::channel::<(usize, u32)>();
+        let mut handles = Vec::new();
+        for task_index in ready {
             let source_dir = plan_child_source_dir(&paths, &plan, task_index, &parent_cwd)?;
-            let outcome = run_plan_child(
-                &paths,
-                &plan,
+            let paths_for_child = paths.clone();
+            let plan_for_child = plan.clone();
+            let sandbox_for_child = sandbox.clone();
+            let pid_tx_for_child = pid_tx.clone();
+            handles.push((
                 task_index,
-                &source_dir,
-                &sandbox,
-                max_spend,
-                max_wall_seconds,
-                quiet,
-            )
-            .await;
+                tokio::task::spawn_blocking(move || {
+                    run_plan_child(
+                        &paths_for_child,
+                        &plan_for_child,
+                        task_index,
+                        &source_dir,
+                        &sandbox_for_child,
+                        max_spend,
+                        max_wall_seconds,
+                        quiet,
+                        Some(pid_tx_for_child),
+                    )
+                }),
+            ));
+        }
+        drop(pid_tx);
+        let mut live_children = BTreeMap::new();
+        while live_children.len() < handles.len() {
+            match pid_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok((task_index, pid)) => {
+                    live_children.insert(task_index, pid);
+                    write_coordinator_snapshot_live(&paths, &plan, &live_children)?;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        for (task_index, handle) in handles {
+            let outcome = handle.await.map_err(|err| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "child task join failed: {err}"
+                )))
+            })?;
+            let task_id = plan.tasks[task_index].task_id.clone();
             match outcome {
                 Ok(run_id) => {
                     let state = load_run(&paths, &run_id)?;
@@ -7374,6 +7412,15 @@ fn write_coordinator_snapshot(
     plan: &Plan,
     live_child: Option<(usize, u32)>,
 ) -> Result<()> {
+    let live_children = live_child.into_iter().collect::<BTreeMap<_, _>>();
+    write_coordinator_snapshot_live(paths, plan, &live_children)
+}
+
+fn write_coordinator_snapshot_live(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    live_children: &BTreeMap<usize, u32>,
+) -> Result<()> {
     let children = plan
         .tasks
         .iter()
@@ -7382,7 +7429,7 @@ fn write_coordinator_snapshot(
             child_index: task.index,
             task_id: task.task_id.clone(),
             run_id: task.child_run_id.clone(),
-            pid: live_child.and_then(|(live_index, pid)| (live_index == index).then_some(pid)),
+            pid: live_children.get(&index).copied(),
             scope: task.child_scope.clone(),
             provider: task.provider.clone(),
             role: task.role,
@@ -7431,7 +7478,7 @@ fn plan_child_source_dir(
     }
 }
 
-async fn run_plan_child(
+fn run_plan_child(
     paths: &DeadreckonPaths,
     plan: &Plan,
     task_index: usize,
@@ -7440,6 +7487,7 @@ async fn run_plan_child(
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
     quiet: bool,
+    pid_sender: Option<std::sync::mpsc::Sender<(usize, u32)>>,
 ) -> Result<String> {
     let task = &plan.tasks[task_index];
     let worker_spec_path = paths.worker_spec(&plan.plan_id, &task.task_id);
@@ -7496,7 +7544,11 @@ async fn run_plan_child(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;
-    write_coordinator_snapshot(paths, plan, Some((task_index, child.id())))?;
+    if let Some(sender) = pid_sender {
+        let _ = sender.send((task_index, child.id()));
+    } else {
+        write_coordinator_snapshot(paths, plan, Some((task_index, child.id())))?;
+    }
     let stdout = child.stdout.take().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(
             "failed to capture child stdout".to_string(),
