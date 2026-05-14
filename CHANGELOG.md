@@ -20,6 +20,7 @@
 
 ## Orchestration milestone (alpha) — 2026-05-13
 
+- Renamed the multi-child orchestration mode from `split` to `full-plan`, added `deadreckon orchestrate review` and `deadreckon orchestrate full-plan` mode subcommands, and require `--yes` after the preflight in headless execution.
 - Added file-backed orchestration plans with task DAG validation, provider roles, worker specs, coordinator messages, child summaries, and plan child markers without changing `PipelineState`.
 - Added `deadreckon plan`, `fork`, `merge`, and review-mode `orchestrate` so a common coder -> reviewer -> merge flow can complete end to end.
 - Added explicit planner/default-child/per-child/coder/reviewer provider resolution and persisted overrides into `plan.json`.
@@ -27,7 +28,7 @@
 - Added plan-aware `attach`, `show`, and `kill` so plan IDs participate in the normal lifecycle, including a basic multi-pane plan TUI with child drill-in.
 - Added `deadreckon history grep <pattern>` for plan-aware trace/provenance search and `deadreckon show <id> --why-failed` for run or plan failure summaries.
 - Review-mode orchestration now launches the reviewer lane as an `extend` of the coder run, preserving parent context and `extended_from_parent` trace lineage.
-- Independent split children now start as ready batches, with coordinator PID snapshots for every live child in the batch.
+- Independent full-plan children now start as ready batches, with coordinator PID snapshots for every live child in the batch.
 - Plan attach now surfaces child turn/status, spend or token accounting, latest trace activity, acceptance/gate state, capability preview, and final merged gate status in both the TUI and non-TTY summary.
 - Headless orchestration flags now apply consistently: `run --plain --quiet` is accepted, `run --quiet` emits no success stdout, `attach --plain` bypasses the TUI, and `plan`/`fork`/`merge` preserve plain output.
 - Added provider-backed planning depth coverage: planner prompts are asserted read-only, `--n` outside `2..=6` refuses before saving, one-task provider decompositions are rejected, and explicit planner/default-child/per-child providers are persisted.

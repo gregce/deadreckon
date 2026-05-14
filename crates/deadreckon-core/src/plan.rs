@@ -21,7 +21,7 @@ pub const PLAN_CHILD_PARENT_JSON: &str = ".deadreckon/parent.json";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanMode {
-    Split,
+    FullPlan,
     Review,
 }
 
@@ -560,7 +560,7 @@ mod tests {
         task1.worker_spec = worker_spec_relative_path(&task1.task_id);
         Plan::new(
             "build a tiny app",
-            PlanMode::Split,
+            PlanMode::FullPlan,
             vec![task0, task1],
             PlanProviders {
                 planner: Some("cli:codex".to_string()),

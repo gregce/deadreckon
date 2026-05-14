@@ -88,8 +88,8 @@ mod ui;
 use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, CliPlanMode, Commands,
     CompletionCommand, ConfigCommand, ExtendCommandArgs, ForkCommandArgs, HistoryCommand,
-    HistoryKind, LibraryCommand, MergeCommandArgs, PlanCommandArgs, ProvidersCommand,
-    RunCommandArgs,
+    HistoryKind, LibraryCommand, MergeCommandArgs, OrchestrateCommand, PlanCommandArgs,
+    ProvidersCommand, RunCommandArgs,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -312,39 +312,34 @@ async fn main_inner() -> Result<()> {
             .await
         }
         Commands::Orchestrate {
+            command,
             goal,
-            mode,
-            n,
             max_spend,
             max_wall_seconds,
             sandbox,
-            planner_provider,
-            provider,
-            child_provider,
-            coder_provider,
-            reviewer_provider,
+            preview,
+            yes,
             no_hints,
             quiet,
             plain,
         } => {
             ui::set_plain_output(plain);
-            orchestrate_command(PlanCommandArgs {
-                goal,
-                n,
-                mode,
-                max_spend,
-                max_wall_seconds,
-                sandbox,
-                planner_provider,
-                provider,
-                child_provider,
-                coder_provider,
-                reviewer_provider,
-                no_hints,
-                quiet,
-                plain,
-            })
-            .await
+            let request = orchestrate_request_from_cli(
+                command,
+                BareOrchestrateArgs {
+                    goal,
+                    max_spend,
+                    max_wall_seconds,
+                    sandbox,
+                    preview,
+                    yes,
+                    no_hints,
+                    quiet,
+                    plain,
+                },
+            )?;
+            ui::set_plain_output(request.plan.plain);
+            orchestrate_command(request).await
         }
         Commands::Plan {
             goal,
@@ -698,7 +693,7 @@ fn print_top_help() {
         ("run", "start unattended coding work"),
         (
             "orchestrate",
-            "run coder/reviewer or split multi-agent work",
+            "run coder/reviewer or full-plan multi-agent work",
         ),
         ("chain", "run several coding steps in sequence"),
         ("attach", "watch a run in the TUI"),
@@ -768,7 +763,7 @@ fn print_help_all() {
         ("run", "start unattended coding work"),
         (
             "orchestrate",
-            "run coder/reviewer or split multi-agent work",
+            "run coder/reviewer or full-plan multi-agent work",
         ),
         ("chain", "run several coding steps in sequence"),
         ("attach", "watch a run in the TUI"),
@@ -6814,18 +6809,196 @@ fn run_preview(input: &RunPreview<'_>) -> String {
     lines.join("\n")
 }
 
-async fn orchestrate_command(args: PlanCommandArgs) -> Result<()> {
-    let quiet = args.quiet;
-    let plain = args.plain;
-    let no_hints = args.no_hints;
-    let max_spend = args.max_spend;
-    let max_wall_seconds = args.max_wall_seconds;
-    let sandbox = args.sandbox.clone();
-    let plan = create_orchestration_plan(args).await?;
+struct OrchestrateRunArgs {
+    plan: PlanCommandArgs,
+    preview: bool,
+    yes: bool,
+}
+
+struct BareOrchestrateArgs {
+    goal: Option<String>,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    sandbox: Option<String>,
+    preview: bool,
+    yes: bool,
+    no_hints: bool,
+    quiet: bool,
+    plain: bool,
+}
+
+fn orchestrate_request_from_cli(
+    command: Option<OrchestrateCommand>,
+    bare: BareOrchestrateArgs,
+) -> Result<OrchestrateRunArgs> {
+    match command {
+        Some(OrchestrateCommand::Review(args)) => Ok(OrchestrateRunArgs {
+            plan: PlanCommandArgs {
+                goal: args.goal,
+                n: 2,
+                mode: CliPlanMode::Review,
+                max_spend: args.max_spend.or(bare.max_spend),
+                max_wall_seconds: args.max_wall_seconds.or(bare.max_wall_seconds),
+                sandbox: args.sandbox.or(bare.sandbox),
+                planner_provider: None,
+                provider: None,
+                child_provider: Vec::new(),
+                coder_provider: args.coder_provider,
+                reviewer_provider: args.reviewer_provider,
+                no_hints: args.no_hints || bare.no_hints,
+                quiet: args.quiet || bare.quiet,
+                plain: args.plain || bare.plain,
+            },
+            preview: args.preview || bare.preview,
+            yes: args.yes || bare.yes,
+        }),
+        Some(OrchestrateCommand::FullPlan(args)) => Ok(OrchestrateRunArgs {
+            plan: PlanCommandArgs {
+                goal: args.goal,
+                n: args.n,
+                mode: CliPlanMode::FullPlan,
+                max_spend: args.max_spend.or(bare.max_spend),
+                max_wall_seconds: args.max_wall_seconds.or(bare.max_wall_seconds),
+                sandbox: args.sandbox.or(bare.sandbox),
+                planner_provider: args.planner_provider,
+                provider: args.provider,
+                child_provider: args.child_provider,
+                coder_provider: None,
+                reviewer_provider: None,
+                no_hints: args.no_hints || bare.no_hints,
+                quiet: args.quiet || bare.quiet,
+                plain: args.plain || bare.plain,
+            },
+            preview: args.preview || bare.preview,
+            yes: args.yes || bare.yes,
+        }),
+        None => interactive_orchestrate_request(bare),
+    }
+}
+
+fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<OrchestrateRunArgs> {
+    let BareOrchestrateArgs {
+        goal,
+        max_spend,
+        max_wall_seconds,
+        sandbox,
+        preview,
+        yes,
+        no_hints,
+        quiet,
+        plain,
+    } = bare;
+    let Some(goal) = goal else {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "orchestrate requires a mode or goal",
+            "deadreckon orchestrate review \"goal\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes",
+        )));
+    };
+    if !io::stdin().is_terminal() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "non-interactive orchestrate requires an explicit mode",
+            "deadreckon orchestrate review \"goal\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes",
+        )));
+    }
+    let paths = DeadreckonPaths::discover();
+    let defaults = config_defaults(&paths)?;
+    let default_provider = resolve_provider_name(&paths, defaults.provider)?;
+    println!("{}", ui_heading("Orchestration mode"));
+    println!(
+        "  {} one coder provider, then a fresh reviewer/fixer",
+        ui_command("review")
+    );
+    println!(
+        "  {} planner provider decomposes child work before fork and merge",
+        ui_command("full-plan")
+    );
+    let mode = prompt_orchestration_mode()?;
+    let mut plan = PlanCommandArgs {
+        goal,
+        n: 3,
+        mode,
+        max_spend,
+        max_wall_seconds,
+        sandbox,
+        planner_provider: None,
+        provider: None,
+        child_provider: Vec::new(),
+        coder_provider: None,
+        reviewer_provider: None,
+        no_hints,
+        quiet,
+        plain,
+    };
+    match mode {
+        CliPlanMode::FullPlan => {
+            plan.n = prompt_child_count(3)?;
+            plan.planner_provider = prompt_provider_role("planner", default_provider.as_deref())?;
+            plan.provider = prompt_provider_role("default child", default_provider.as_deref())?;
+        }
+        CliPlanMode::Review => {
+            plan.coder_provider = prompt_provider_role("coder", default_provider.as_deref())?;
+            plan.reviewer_provider = prompt_provider_role("reviewer", default_provider.as_deref())?;
+        }
+    }
+    Ok(OrchestrateRunArgs { plan, preview, yes })
+}
+
+fn prompt_orchestration_mode() -> Result<CliPlanMode> {
+    let answer = prompt::open("mode [review]: ", None)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "r" | "review" => Ok(CliPlanMode::Review),
+        "f" | "full" | "full-plan" | "full_plan" | "plan" => Ok(CliPlanMode::FullPlan),
+        other => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown orchestration mode {other}"),
+            "choose review or full-plan",
+        ))),
+    }
+}
+
+fn prompt_child_count(default: u8) -> Result<u8> {
+    let answer = prompt::open(&format!("children [{default}]: "), None)?;
+    if answer.trim().is_empty() {
+        return Ok(default);
+    }
+    let n = answer.trim().parse::<u8>().map_err(|_| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("child count is not a number: {answer}"),
+            "enter a value from 2 through 6",
+        ))
+    })?;
+    validate_task_count(usize::from(n)).map_err(CliError::Core)?;
+    Ok(n)
+}
+
+fn prompt_provider_role(role: &str, default: Option<&str>) -> Result<Option<String>> {
+    let prompt_text = match default {
+        Some(default) => format!("{role} provider [{default}]: "),
+        None => format!("{role} provider: "),
+    };
+    let answer = prompt::open(&prompt_text, None)?;
+    let provider = answer.trim();
+    if provider.is_empty() {
+        return Ok(default.map(ToString::to_string));
+    }
+    Ok(Some(provider.to_string()))
+}
+
+async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
+    let quiet = args.plan.quiet;
+    let plain = args.plan.plain;
+    let no_hints = args.plan.no_hints;
+    let max_spend = args.plan.max_spend;
+    let max_wall_seconds = args.plan.max_wall_seconds;
+    let sandbox = args.plan.sandbox.clone();
+    let plan = create_orchestration_plan(args.plan).await?;
     let plan_id = plan.plan_id.clone();
     if !quiet {
-        print_plan_created(&plan, no_hints);
+        print_orchestrate_preflight(&plan, max_spend, max_wall_seconds, sandbox.as_deref());
     }
+    if args.preview {
+        return Ok(());
+    }
+    confirm_orchestration_start(&plan, args.yes)?;
     fork_command(ForkCommandArgs {
         plan_id: plan_id.clone(),
         max_spend,
@@ -6890,7 +7063,7 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
     let cwd = std::env::current_dir()?;
     let scope = workspace_scope(&cwd)?;
     let plan_mode = match mode {
-        CliPlanMode::Split => PlanMode::Split,
+        CliPlanMode::FullPlan => PlanMode::FullPlan,
         CliPlanMode::Review => PlanMode::Review,
     };
     let mut providers = resolve_plan_providers(
@@ -6903,11 +7076,11 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
         reviewer_provider,
     )?;
     let mut tasks = match plan_mode {
-        PlanMode::Split => {
+        PlanMode::FullPlan => {
             validate_task_count(usize::from(n)).map_err(CliError::Core)?;
             let overrides = parse_child_provider_overrides(&child_provider, n)?;
             providers.children = overrides.clone();
-            build_split_plan_tasks(&paths, &goal, n, &providers, &overrides, &cwd, plain).await?
+            build_full_plan_tasks(&paths, &goal, n, &providers, &overrides, &cwd, plain).await?
         }
         PlanMode::Review => build_review_plan_tasks(&goal, &providers),
     };
@@ -6943,7 +7116,7 @@ fn resolve_plan_providers(
 ) -> Result<PlanProviders> {
     let default_child = resolve_provider_name(paths, provider.or(defaults.provider.clone()))?;
     let planner = match mode {
-        PlanMode::Split => resolve_provider_name(
+        PlanMode::FullPlan => resolve_provider_name(
             paths,
             planner_provider
                 .or(default_child.clone())
@@ -6958,7 +7131,7 @@ fn resolve_plan_providers(
                 .or(default_child.clone())
                 .or(defaults.provider.clone()),
         )?,
-        PlanMode::Split => None,
+        PlanMode::FullPlan => None,
     };
     let reviewer = match mode {
         PlanMode::Review => resolve_provider_name(
@@ -6967,7 +7140,7 @@ fn resolve_plan_providers(
                 .or(default_child.clone())
                 .or(defaults.provider.clone()),
         )?,
-        PlanMode::Split => None,
+        PlanMode::FullPlan => None,
     };
     Ok(PlanProviders {
         planner,
@@ -6988,7 +7161,18 @@ fn resolve_provider_name(
     {
         return Ok(provider);
     }
-    let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
+    let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())
+        .map_err(|err| match err {
+            deadreckon_providers::ProviderError::InvalidConfig(message)
+                if message.contains("unknown provider route") =>
+            {
+                CliError::Core(deadreckon_core::user_error(
+                    &message,
+                    "deadreckon providers list --all",
+                ))
+            }
+            other => CliError::Provider(other),
+        })?;
     Ok(router
         .selected_route_info()
         .map(|route| route.name)
@@ -7028,7 +7212,7 @@ fn parse_child_provider_overrides(values: &[String], n: u8) -> Result<BTreeMap<u
     Ok(overrides)
 }
 
-async fn build_split_plan_tasks(
+async fn build_full_plan_tasks(
     paths: &DeadreckonPaths,
     goal: &str,
     n: u8,
@@ -7299,7 +7483,7 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
         blocked
     );
     let providers = match plan.mode {
-        PlanMode::Split => format!(
+        PlanMode::FullPlan => format!(
             "planner={} default-child={}",
             plan.providers.planner.as_deref().unwrap_or("-"),
             plan.providers.default_child.as_deref().unwrap_or("-")
@@ -7352,6 +7536,103 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
             run_prefix(&plan.plan_id)
         );
     }
+}
+
+fn print_orchestrate_preflight(
+    plan: &Plan,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    sandbox: Option<&str>,
+) {
+    println!(
+        "{} {} ({})",
+        ui_heading("orchestrate preflight"),
+        ui_id(run_prefix(&plan.plan_id)),
+        plan.plan_id
+    );
+    let children = format!(
+        "{} ({})",
+        plan.tasks.len(),
+        orchestration_mode_summary(plan)
+    );
+    let spend = max_spend
+        .map(|value| format!("${value:.2} per child"))
+        .unwrap_or_else(|| "config default".to_string());
+    let wall = max_wall_seconds
+        .map(|value| format!("{value:.0}s per child"))
+        .unwrap_or_else(|| "config default".to_string());
+    let sandbox = sandbox.unwrap_or("config default").to_string();
+    let capabilities = format!(
+        "network={:?} deploy={} install={}",
+        plan.capability_preview.network,
+        plan.capability_preview.deploy,
+        plan.capability_preview.global_install
+    );
+    let providers = plan_provider_summary(plan);
+    let items = [
+        ("mode", plan_mode_label(plan.mode)),
+        ("children", children.as_str()),
+        ("providers", providers.as_str()),
+        ("sandbox", sandbox.as_str()),
+        ("spend", spend.as_str()),
+        ("wall", wall.as_str()),
+        ("capabilities", capabilities.as_str()),
+    ];
+    print_kv_block(&items);
+    for task in &plan.tasks {
+        let deps = if task.depends_on.is_empty() {
+            "-".to_string()
+        } else {
+            task.depends_on.join(",")
+        };
+        println!(
+            "  {} {} [{}] provider={} deps={}",
+            task.task_id,
+            task.subject,
+            format!("{:?}", task.role).to_ascii_lowercase(),
+            task.provider.as_deref().unwrap_or("-"),
+            deps
+        );
+    }
+    println!(
+        "{} {}/plans/{}/plan.json",
+        ui_command("plan:"),
+        DeadreckonPaths::discover().home().display(),
+        plan.plan_id
+    );
+}
+
+fn orchestration_mode_summary(plan: &Plan) -> &'static str {
+    match plan.mode {
+        PlanMode::FullPlan => "planner -> children -> merge -> final gate",
+        PlanMode::Review => "coder -> reviewer/fixer -> final gate",
+    }
+}
+
+fn confirm_orchestration_start(plan: &Plan, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        let command = match plan.mode {
+            PlanMode::FullPlan => {
+                "deadreckon orchestrate full-plan \"goal\" --planner-provider cli:codex --provider cli:claude-code --yes"
+            }
+            PlanMode::Review => {
+                "deadreckon orchestrate review \"goal\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes"
+            }
+        };
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "non-interactive orchestrate requires --yes after reviewing preflight",
+            command,
+        )));
+    }
+    if !prompt::confirm("start this orchestration?", true)? {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "orchestration cancelled by user".to_string(),
+        )));
+    }
+    Ok(())
 }
 
 async fn fork_command(args: ForkCommandArgs) -> Result<()> {
@@ -7601,7 +7882,7 @@ fn apply_fork_provider_overrides(
     reviewer_provider: Option<String>,
 ) -> Result<()> {
     match plan.mode {
-        PlanMode::Split => {
+        PlanMode::FullPlan => {
             if let Some(provider) = provider {
                 plan.providers.default_child = Some(provider.clone());
                 for task in &mut plan.tasks {
@@ -7901,7 +8182,7 @@ fn plan_child_prompt(plan: &Plan, task: &PlanTask, spec: &str, spec_path: &Path)
             "This is a fresh review/fix lane. Write .deadreckon/REVIEW.md first, then apply only fixes tied to findings and acceptance."
         }
         PlanRole::Coder => "This is the coding lane for review-mode orchestration.",
-        PlanRole::Child => "This is one split child run in a larger plan.",
+        PlanRole::Child => "This is one full-plan child run in a larger plan.",
     };
     format!(
         "{role_note}\n\nRoot goal: {}\nPlan: {}\nTask: {}\nWorker spec path: {}\n\n{}\n",
@@ -8037,7 +8318,7 @@ fn task_status_label(status: PlanTaskStatus) -> &'static str {
 
 fn plan_mode_label(mode: PlanMode) -> &'static str {
     match mode {
-        PlanMode::Split => "split",
+        PlanMode::FullPlan => "full-plan",
         PlanMode::Review => "review",
     }
 }
@@ -8409,7 +8690,7 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
     );
     let goal = one_line(&plan.root_goal, 120);
     let providers = match plan.mode {
-        PlanMode::Split => format!(
+        PlanMode::FullPlan => format!(
             "planner={} default-child={}",
             plan.providers.planner.as_deref().unwrap_or("-"),
             plan.providers.default_child.as_deref().unwrap_or("-")
@@ -13356,7 +13637,7 @@ fn plan_task_counts(plan: &Plan) -> (usize, usize) {
 
 fn plan_provider_summary(plan: &Plan) -> String {
     match plan.mode {
-        PlanMode::Split => format!(
+        PlanMode::FullPlan => format!(
             "planner {}  default child {}",
             plan.providers.planner.as_deref().unwrap_or("-"),
             plan.providers.default_child.as_deref().unwrap_or("-")
@@ -16648,7 +16929,7 @@ mod tui_tests {
         (temp, state)
     }
 
-    fn split_plan_fixture(task_count: usize) -> (tempfile::TempDir, DeadreckonPaths, Plan) {
+    fn full_plan_fixture(task_count: usize) -> (tempfile::TempDir, DeadreckonPaths, Plan) {
         std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
         let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -16669,7 +16950,7 @@ mod tui_tests {
             .collect::<Vec<_>>();
         let mut plan = Plan::new(
             "build orchestrated app",
-            PlanMode::Split,
+            PlanMode::FullPlan,
             tasks,
             PlanProviders {
                 planner: Some("smoke:planner".to_string()),
@@ -16786,7 +17067,7 @@ mod tui_tests {
 
     #[test]
     fn attach_plan_shows_n_panes() {
-        let (_temp, paths, plan) = split_plan_fixture(4);
+        let (_temp, paths, plan) = full_plan_fixture(4);
 
         let text = render_plan_attach_text(&paths, &plan, &[], 0);
 
@@ -16813,7 +17094,7 @@ mod tui_tests {
 
     #[test]
     fn attach_plan_shows_task_dependency_and_message_summary() {
-        let (_temp, paths, mut plan) = split_plan_fixture(2);
+        let (_temp, paths, mut plan) = full_plan_fixture(2);
         plan.tasks[1].depends_on = vec!["task-0".to_string()];
         plan.tasks[1].status = PlanTaskStatus::Failed;
         plan.status = PlanStatus::Forked;
@@ -16837,7 +17118,7 @@ mod tui_tests {
 
     #[test]
     fn attach_plan_shows_capability_preview() {
-        let (_temp, paths, plan) = split_plan_fixture(2);
+        let (_temp, paths, plan) = full_plan_fixture(2);
 
         let text = render_plan_attach_text(&paths, &plan, &[], 0);
 
@@ -16853,7 +17134,7 @@ mod tui_tests {
 
     #[test]
     fn attach_plan_enter_drills_then_esc_returns() {
-        let (_temp, paths, plan) = split_plan_fixture(2);
+        let (_temp, paths, plan) = full_plan_fixture(2);
 
         let text = render_plan_attach_text(&paths, &plan, &[], 0);
 

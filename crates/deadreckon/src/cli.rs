@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use deadreckon_core::DocKind;
 
 const TOP_LEVEL_TEMPLATE: &str = "\
@@ -24,7 +24,7 @@ Core lifecycle:
   doctor      check provider, sandbox, and local setup
   def-done    write/check done criteria in English
   run         start unattended coding work
-  orchestrate run coder/reviewer or split multi-agent work
+  orchestrate run coder/reviewer or full-plan multi-agent work
   chain       run several coding steps in sequence
   attach      watch a run in the TUI
   status      see the latest run and next action
@@ -134,12 +134,15 @@ Modes:
 
 const ORCHESTRATE_HELP: &str = "\
 Lifecycle:
-  deadreckon orchestrate \"build the thing\" --mode review --coder-provider cli:claude-code --reviewer-provider cli:codex
+  deadreckon orchestrate review \"build the thing\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes
+  deadreckon orchestrate full-plan \"build the thing\" --planner-provider cli:codex --provider cli:claude-code --yes
+  deadreckon orchestrate \"build the thing\"
   deadreckon attach <plan-id>
   deadreckon merge <plan-id>
 
-Orchestrate is the one-command multi-agent wrapper. Review mode is the common
-path; split mode uses `plan` + `fork` + `merge` under the hood.";
+Orchestrate is the one-command multi-agent wrapper. Review mode is a coder
+provider followed by a fresh reviewer/fixer. Full-plan mode asks a planner
+provider for child work before fork and merge.";
 
 const PLAN_HELP: &str = "\
 Lifecycle:
@@ -148,7 +151,7 @@ Lifecycle:
   deadreckon attach <plan-id>
   deadreckon merge <plan-id>
 
-Plan writes ~/.deadreckon/plans/<plan-id>/plan.json plus worker specs. Split
+Plan writes ~/.deadreckon/plans/<plan-id>/plan.json plus worker specs. Full-plan
 mode asks the planner route for a child graph. Review mode writes a coder child
 followed by a fresh reviewer child.";
 
@@ -598,39 +601,29 @@ pub(crate) enum Commands {
         after_help = ORCHESTRATE_HELP
     )]
     Orchestrate {
-        #[arg(help = "Natural-language coding goal")]
-        goal: String,
-        #[arg(long, value_enum, default_value_t = CliPlanMode::Review, help = "Orchestration mode")]
-        mode: CliPlanMode,
+        #[command(subcommand)]
+        command: Option<OrchestrateCommand>,
+        #[arg(help = "Natural-language coding goal for the interactive mode chooser")]
+        goal: Option<String>,
+        #[arg(long, help = "Per-child spend cap in USD for the interactive chooser")]
+        max_spend: Option<f64>,
         #[arg(
             long,
-            default_value_t = 3,
-            help = "Split-mode child count, 2 through 6"
+            help = "Per-child wall-clock cap for CLI-backed turns in the interactive chooser"
         )]
-        n: u8,
-        #[arg(long, help = "Per-child spend cap in USD")]
-        max_spend: Option<f64>,
-        #[arg(long, help = "Per-child wall-clock cap for CLI-backed turns")]
         max_wall_seconds: Option<f64>,
         #[arg(
             long,
-            help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
+            help = "Sandbox backend for the interactive chooser: auto, sandbox-exec, bwrap, docker, or none"
         )]
         sandbox: Option<String>,
-        #[arg(long, help = "Split-mode planner provider")]
-        planner_provider: Option<String>,
-        #[arg(long, help = "Default split child provider")]
-        provider: Option<String>,
         #[arg(
             long,
-            value_name = "IDX=PROVIDER",
-            help = "Per-child provider override"
+            help = "Show the resolved orchestration preflight without starting work"
         )]
-        child_provider: Vec<String>,
-        #[arg(long, help = "Review-mode coding provider")]
-        coder_provider: Option<String>,
-        #[arg(long, help = "Review-mode reviewer provider")]
-        reviewer_provider: Option<String>,
+        preview: bool,
+        #[arg(long, help = "Skip the orchestration preflight confirmation")]
+        yes: bool,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
@@ -646,17 +639,13 @@ pub(crate) enum Commands {
     Plan {
         #[arg(help = "Natural-language coding goal")]
         goal: String,
-        #[arg(
-            long,
-            default_value_t = 3,
-            help = "Split-mode child count, 2 through 6"
-        )]
+        #[arg(long, default_value_t = 3, help = "Full-plan child count, 2 through 6")]
         n: u8,
-        #[arg(long, value_enum, default_value_t = CliPlanMode::Split, help = "Plan mode")]
+        #[arg(long, value_enum, default_value_t = CliPlanMode::FullPlan, help = "Plan mode")]
         mode: CliPlanMode,
-        #[arg(long, help = "Split-mode planner provider")]
+        #[arg(long, help = "Full-plan planner provider")]
         planner_provider: Option<String>,
-        #[arg(long, help = "Default split child provider")]
+        #[arg(long, help = "Default full-plan child provider")]
         provider: Option<String>,
         #[arg(
             long,
@@ -692,7 +681,7 @@ pub(crate) enum Commands {
             help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
         )]
         sandbox: Option<String>,
-        #[arg(long, help = "Override the split default child provider")]
+        #[arg(long, help = "Override the full-plan default child provider")]
         provider: Option<String>,
         #[arg(
             long,
@@ -1252,8 +1241,95 @@ pub(crate) enum CliDocKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum CliPlanMode {
-    Split,
+    FullPlan,
     Review,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum OrchestrateCommand {
+    #[command(
+        about = "Run one coder provider, then a fresh reviewer/fixer provider",
+        after_help = "Example:\n  deadreckon orchestrate review \"build the thing\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes"
+    )]
+    Review(OrchestrateReviewArgs),
+    #[command(
+        name = "full-plan",
+        about = "Ask a planner provider for child work, then fork and merge",
+        after_help = "Example:\n  deadreckon orchestrate full-plan \"build the thing\" --planner-provider cli:codex --provider cli:claude-code --n 4 --yes"
+    )]
+    FullPlan(OrchestrateFullPlanArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct OrchestrateReviewArgs {
+    #[arg(help = "Natural-language coding goal")]
+    pub(crate) goal: String,
+    #[arg(long, help = "Per-child spend cap in USD")]
+    pub(crate) max_spend: Option<f64>,
+    #[arg(long, help = "Per-child wall-clock cap for CLI-backed turns")]
+    pub(crate) max_wall_seconds: Option<f64>,
+    #[arg(
+        long,
+        help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
+    )]
+    pub(crate) sandbox: Option<String>,
+    #[arg(long, help = "Review-mode coding provider")]
+    pub(crate) coder_provider: Option<String>,
+    #[arg(long, help = "Review-mode reviewer provider")]
+    pub(crate) reviewer_provider: Option<String>,
+    #[arg(
+        long,
+        help = "Show the resolved orchestration preflight without starting work"
+    )]
+    pub(crate) preview: bool,
+    #[arg(long, help = "Skip the orchestration preflight confirmation")]
+    pub(crate) yes: bool,
+    #[arg(long, help = "Suppress post-action hints")]
+    pub(crate) no_hints: bool,
+    #[arg(long, help = "Suppress success stdout")]
+    pub(crate) quiet: bool,
+    #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+    pub(crate) plain: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct OrchestrateFullPlanArgs {
+    #[arg(help = "Natural-language coding goal")]
+    pub(crate) goal: String,
+    #[arg(long, default_value_t = 3, help = "Full-plan child count, 2 through 6")]
+    pub(crate) n: u8,
+    #[arg(long, help = "Per-child spend cap in USD")]
+    pub(crate) max_spend: Option<f64>,
+    #[arg(long, help = "Per-child wall-clock cap for CLI-backed turns")]
+    pub(crate) max_wall_seconds: Option<f64>,
+    #[arg(
+        long,
+        help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
+    )]
+    pub(crate) sandbox: Option<String>,
+    #[arg(long, help = "Full-plan planner provider")]
+    pub(crate) planner_provider: Option<String>,
+    #[arg(long, help = "Default full-plan child provider")]
+    pub(crate) provider: Option<String>,
+    #[arg(
+        long,
+        value_name = "IDX=PROVIDER",
+        help = "Per-child provider override"
+    )]
+    pub(crate) child_provider: Vec<String>,
+    #[arg(
+        long,
+        help = "Show the resolved orchestration preflight without starting work"
+    )]
+    pub(crate) preview: bool,
+    #[arg(long, help = "Skip the orchestration preflight confirmation")]
+    pub(crate) yes: bool,
+    #[arg(long, help = "Suppress post-action hints")]
+    pub(crate) no_hints: bool,
+    #[arg(long, help = "Suppress success stdout")]
+    pub(crate) quiet: bool,
+    #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+    pub(crate) plain: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

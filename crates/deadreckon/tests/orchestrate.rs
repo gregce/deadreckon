@@ -39,7 +39,7 @@ fn plan_writes_plan_json_with_n_tasks() {
 
     assert_success(&output);
     let plan = newest_plan(&paths);
-    assert_eq!(plan.mode, PlanMode::Split);
+    assert_eq!(plan.mode, PlanMode::FullPlan);
     assert_eq!(plan.tasks.len(), 3);
     assert_eq!(plan.providers.planner.as_deref(), Some("smoke"));
     assert_eq!(plan.providers.default_child.as_deref(), Some("smoke"));
@@ -152,6 +152,128 @@ fn plan_preview_prints_capabilities_and_provider_table() {
 }
 
 #[test]
+fn orchestrate_review_preview_shows_coder_reviewer_providers_without_forking() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "orchestrate",
+            "review",
+            "tiny hello rust",
+            "--coder-provider",
+            "smoke:coder",
+            "--reviewer-provider",
+            "smoke:reviewer",
+            "--preview",
+        ])
+        .output()
+        .expect("orchestrate preview");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("orchestrate preflight"), "{out}");
+    assert!(out.contains("mode        : review"), "{out}");
+    assert!(out.contains("coder smoke:coder"), "{out}");
+    assert!(out.contains("reviewer smoke:reviewer"), "{out}");
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.mode, PlanMode::Review);
+    assert_eq!(plan.status, PlanStatus::Pending);
+    assert!(plan.tasks.iter().all(|task| task.child_run_id.is_none()));
+}
+
+#[test]
+fn orchestrate_full_plan_preview_shows_planner_child_providers_without_forking() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "orchestrate",
+            "full-plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke:planner",
+            "--provider",
+            "smoke:child",
+            "--child-provider",
+            "1=smoke:reviewer",
+            "--n",
+            "2",
+            "--preview",
+        ])
+        .output()
+        .expect("orchestrate preview");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("orchestrate preflight"), "{out}");
+    assert!(out.contains("mode        : full-plan"), "{out}");
+    assert!(out.contains("planner smoke:planner"), "{out}");
+    assert!(out.contains("default child smoke:child"), "{out}");
+    assert!(out.contains("provider=smoke:reviewer"), "{out}");
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.mode, PlanMode::FullPlan);
+    assert_eq!(plan.status, PlanStatus::Pending);
+    assert!(plan.tasks.iter().all(|task| task.child_run_id.is_none()));
+}
+
+#[test]
+fn orchestrate_headless_without_mode_refuses_with_try_line() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["orchestrate", "tiny hello rust"])
+        .output()
+        .expect("orchestrate");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("non-interactive orchestrate requires an explicit mode"),
+        "{err}"
+    );
+    assert!(err.contains("deadreckon orchestrate review"), "{err}");
+    assert_eq!(saved_plan_count(&paths), 0);
+}
+
+#[test]
+fn plan_rejects_unknown_role_provider_before_writing_plan() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "made-up",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("unknown provider route made-up"), "{err}");
+    assert!(err.contains("deadreckon providers list --all"), "{err}");
+    assert_eq!(saved_plan_count(&paths), 0);
+}
+
+#[test]
 fn list_includes_orchestration_plans_with_clear_kind() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -185,7 +307,7 @@ fn list_includes_orchestration_plans_with_clear_kind() {
     let out = stdout(&output);
     assert!(out.contains(&plan.plan_id[..8]), "{out}");
     assert!(out.contains("orchestrate"), "{out}");
-    assert!(out.contains("split"), "{out}");
+    assert!(out.contains("full-plan"), "{out}");
     assert!(out.contains("fork"), "{out}");
     assert!(out.contains("deadreckon attach <id>"), "{out}");
 }
@@ -1367,15 +1489,15 @@ fn review_mode_runs_coder_then_reviewer_extend() {
         .current_dir(&repo)
         .args([
             "orchestrate",
-            "tiny hello rust",
-            "--mode",
             "review",
+            "tiny hello rust",
             "--coder-provider",
             "smoke",
             "--reviewer-provider",
             "smoke",
             "--sandbox",
             "none",
+            "--yes",
             "--quiet",
         ])
         .output()
