@@ -180,6 +180,59 @@ fn plan_records_explicit_child_provider_overrides() {
 }
 
 #[test]
+fn run_accepts_plain_quiet_headless_smoke_flags() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "run",
+            "tiny hello rust",
+            "--smoke",
+            "--plain",
+            "--quiet",
+            "--sandbox",
+            "none",
+            "--no-hints",
+        ])
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    let lines = out.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{out}");
+    assert!(lines[0].contains("completed"), "{out}");
+    assert!(!out.contains("\x1b["), "{out:?}");
+}
+
+#[test]
+fn run_quiet_emits_no_stdout_on_success() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "run",
+            "tiny hello rust",
+            "--smoke",
+            "--quiet",
+            "--sandbox",
+            "none",
+            "--no-hints",
+        ])
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    assert_eq!(stdout(&output), "");
+}
+
+#[test]
 fn fork_spawns_children_with_distinct_scopes_and_messages() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

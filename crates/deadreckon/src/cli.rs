@@ -114,6 +114,9 @@ Common provider/model changes:
   deadreckon config provider cli:codex
   deadreckon config model gpt-5.1-codex --provider cli:codex
 
+Headless:
+  deadreckon run \"goal\" --plain --quiet --sandbox none
+
 Done criteria:
   deadreckon def-done \"build, test, and open in a browser\"
   deadreckon def-done add \"users can save drawings\"
@@ -527,6 +530,13 @@ pub(crate) enum Commands {
         preview: bool,
         #[arg(long, help = "Print a single-line preview")]
         brief: bool,
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
+        plain: bool,
+        #[arg(
+            long,
+            help = "Suppress completion chatter and interactive follow-up prompts"
+        )]
+        quiet: bool,
         #[arg(long, help = "Spend cap in USD")]
         max_spend: Option<f64>,
         #[arg(long, help = "Wall-clock cap for CLI-backed turns")]
@@ -639,6 +649,8 @@ pub(crate) enum Commands {
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
         quiet: bool,
+        #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+        plain: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -1048,6 +1060,8 @@ pub(crate) enum Commands {
         run_id: String,
         #[arg(long, help = "Suppress post-completion action hints")]
         no_hints: bool,
+        #[arg(long, help = "Plain output without opening the TUI")]
+        plain: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -1440,6 +1454,8 @@ pub(crate) struct RunCommandArgs {
     pub(crate) yes: bool,
     pub(crate) preview: bool,
     pub(crate) brief: bool,
+    pub(crate) plain: bool,
+    pub(crate) quiet: bool,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
     pub(crate) sandbox: Option<String>,
@@ -1470,6 +1486,7 @@ pub(crate) struct PlanCommandArgs {
     pub(crate) reviewer_provider: Option<String>,
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
+    pub(crate) plain: bool,
 }
 
 pub(crate) struct ForkCommandArgs {
@@ -1483,6 +1500,7 @@ pub(crate) struct ForkCommandArgs {
     pub(crate) reviewer_provider: Option<String>,
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
+    pub(crate) plain: bool,
 }
 
 pub(crate) struct MergeCommandArgs {
@@ -1492,6 +1510,7 @@ pub(crate) struct MergeCommandArgs {
     pub(crate) no_gate: bool,
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
+    pub(crate) plain: bool,
 }
 
 pub(crate) struct ChainCommandArgs {

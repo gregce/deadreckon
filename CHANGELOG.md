@@ -11,6 +11,7 @@
 - Review-mode orchestration now launches the reviewer lane as an `extend` of the coder run, preserving parent context and `extended_from_parent` trace lineage.
 - Independent split children now start as ready batches, with coordinator PID snapshots for every live child in the batch.
 - Plan attach now surfaces child turn/status, spend or token accounting, latest trace activity, acceptance/gate state, capability preview, and final merged gate status in both the TUI and non-TTY summary.
+- Headless orchestration flags now apply consistently: `run --plain --quiet` is accepted, `run --quiet` emits no success stdout, `attach --plain` bypasses the TUI, and `plan`/`fork`/`merge` preserve plain output.
 - Verified with focused orchestration tests plus core plan round-trips, clippy on the orchestration target, and `cargo fmt --check`; a broadcast-backed plan event stream remains a future slice.
 
 ## Copilot and Pi providers (alpha) - 2026-05-13

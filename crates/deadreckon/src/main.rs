@@ -13,6 +13,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::{Command as ClapCommand, CommandFactory, Parser};
@@ -86,6 +87,8 @@ use crate::cli::{
     RunCommandArgs,
 };
 
+static PLAIN_OUTPUT: AtomicBool = AtomicBool::new(false);
+
 #[derive(Debug, thiserror::Error)]
 enum CliError {
     #[error(transparent)]
@@ -140,6 +143,9 @@ enum UiStream {
 }
 
 fn ui_enabled(stream: UiStream) -> bool {
+    if PLAIN_OUTPUT.load(Ordering::Relaxed) {
+        return false;
+    }
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
@@ -279,6 +285,8 @@ async fn main_inner() -> Result<()> {
             yes,
             preview,
             brief,
+            plain,
+            quiet,
             max_spend,
             max_wall_seconds,
             sandbox,
@@ -294,6 +302,7 @@ async fn main_inner() -> Result<()> {
             no_docs,
             doc_skill,
         } => {
+            PLAIN_OUTPUT.store(plain, Ordering::Relaxed);
             run_command(RunCommandArgs {
                 goal,
                 fresh,
@@ -307,6 +316,8 @@ async fn main_inner() -> Result<()> {
                 yes,
                 preview,
                 brief,
+                plain,
+                quiet,
                 max_spend,
                 max_wall_seconds,
                 sandbox,
@@ -338,8 +349,9 @@ async fn main_inner() -> Result<()> {
             reviewer_provider,
             no_hints,
             quiet,
-            plain: _,
+            plain,
         } => {
+            PLAIN_OUTPUT.store(plain, Ordering::Relaxed);
             orchestrate_command(PlanCommandArgs {
                 goal,
                 n,
@@ -354,6 +366,7 @@ async fn main_inner() -> Result<()> {
                 reviewer_provider,
                 no_hints,
                 quiet,
+                plain,
             })
             .await
         }
@@ -368,7 +381,9 @@ async fn main_inner() -> Result<()> {
             reviewer_provider,
             no_hints,
             quiet,
+            plain,
         } => {
+            PLAIN_OUTPUT.store(plain, Ordering::Relaxed);
             plan_command(PlanCommandArgs {
                 goal,
                 n,
@@ -383,6 +398,7 @@ async fn main_inner() -> Result<()> {
                 reviewer_provider,
                 no_hints,
                 quiet,
+                plain,
             })
             .await
         }
@@ -397,8 +413,9 @@ async fn main_inner() -> Result<()> {
             reviewer_provider,
             no_hints,
             quiet,
-            plain: _,
+            plain,
         } => {
+            PLAIN_OUTPUT.store(plain, Ordering::Relaxed);
             fork_command(ForkCommandArgs {
                 plan_id,
                 max_spend,
@@ -410,6 +427,7 @@ async fn main_inner() -> Result<()> {
                 reviewer_provider,
                 no_hints,
                 quiet,
+                plain,
             })
             .await
         }
@@ -420,15 +438,19 @@ async fn main_inner() -> Result<()> {
             no_gate,
             no_hints,
             quiet,
-            plain: _,
-        } => merge_command(MergeCommandArgs {
-            plan_id,
-            strategy,
-            prefer_child,
-            no_gate,
-            no_hints,
-            quiet,
-        }),
+            plain,
+        } => {
+            PLAIN_OUTPUT.store(plain, Ordering::Relaxed);
+            merge_command(MergeCommandArgs {
+                plan_id,
+                strategy,
+                prefer_child,
+                no_gate,
+                no_hints,
+                quiet,
+                plain,
+            })
+        }
         Commands::Chain {
             args,
             from_file,
@@ -627,7 +649,14 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
-        Commands::Attach { run_id, no_hints } => attach_command(run_id, no_hints).await,
+        Commands::Attach {
+            run_id,
+            no_hints,
+            plain,
+        } => {
+            PLAIN_OUTPUT.store(plain, Ordering::Relaxed);
+            attach_command(run_id, no_hints, plain).await
+        }
         Commands::Kill { run_id, force } => kill_command(run_id, force),
         Commands::Resume {
             run_id,
@@ -4122,6 +4151,8 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         yes,
         preview,
         brief,
+        plain,
+        quiet,
         max_spend,
         max_wall_seconds,
         sandbox,
@@ -4137,6 +4168,8 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         no_docs,
         doc_skill,
     } = args;
+    let auto_confirm = yes || no_confirm || quiet;
+    let effective_no_hints = no_hints || quiet;
     if smoke && provider.is_some() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
             "--smoke selects the local scripted provider; omit --provider".to_string(),
@@ -4187,13 +4220,13 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
             source: DocProviderSource::None,
         };
     }
-    if max_spend.is_none() {
+    if max_spend.is_none() && !quiet {
         let cap = effective_max_spend.unwrap_or(10.0);
         println!(
             "using default --max-spend ${cap:.0} (override with --max-spend or in config defaults.max_spend)"
         );
     }
-    confirm_spend_cap(effective_max_spend, i_know_its_a_lot, no_confirm)?;
+    confirm_spend_cap(effective_max_spend, i_know_its_a_lot, auto_confirm)?;
     let cwd = std::env::current_dir()?;
     let acceptance_source = ensure_acceptance_before_start(
         &cwd,
@@ -4201,7 +4234,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         &goal,
         provider.clone(),
         model.clone(),
-        yes || no_confirm || preview,
+        auto_confirm || preview,
         "run",
     )
     .await?;
@@ -4276,11 +4309,11 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         eprintln!("{preview_text}");
         return Ok(());
     }
-    if !yes {
+    if !auto_confirm {
         if !io::stdin().is_terminal() {
             return Err(CliError::Core(deadreckon_core::user_error(
                 "non-interactive without --yes",
-                "--yes (skip confirm) or run interactively",
+                "--yes, --quiet, or run interactively",
             )));
         }
         eprintln!("{preview_text}");
@@ -4329,16 +4362,24 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
 
     if run_cancelled_before_turn_loop(&paths, &mut state)? {
         lock.release()?;
-        println!("{} {}", ui_warn("killed run"), state.run_id);
-        print_run_locations(&state);
+        if plain {
+            println!("{}", plain_run_final_line(&state, RunLoopOutcome::Killed));
+        } else if !quiet {
+            println!("{} {}", ui_warn("killed run"), state.run_id);
+            print_run_locations(&state);
+        }
         return Ok(());
     }
     state.set_phase_status(PhaseId(20), PhaseStatus::Executing)?;
     save_state(&state)?;
     if run_cancelled_before_turn_loop(&paths, &mut state)? {
         lock.release()?;
-        println!("{} {}", ui_warn("killed run"), state.run_id);
-        print_run_locations(&state);
+        if plain {
+            println!("{}", plain_run_final_line(&state, RunLoopOutcome::Killed));
+        } else if !quiet {
+            println!("{} {}", ui_warn("killed run"), state.run_id);
+            print_run_locations(&state);
+        }
         return Ok(());
     }
     lock.heartbeat("provider")?;
@@ -4346,66 +4387,78 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     save_state(&state)?;
     if run_cancelled_before_turn_loop(&paths, &mut state)? {
         lock.release()?;
-        println!("{} {}", ui_warn("killed run"), state.run_id);
-        print_run_locations(&state);
+        if plain {
+            println!("{}", plain_run_final_line(&state, RunLoopOutcome::Killed));
+        } else if !quiet {
+            println!("{} {}", ui_warn("killed run"), state.run_id);
+            print_run_locations(&state);
+        }
         return Ok(());
     }
     lock.heartbeat("turn-loop")?;
-    print_run_started(
-        &state,
-        selected_route.as_ref(),
-        doc_provider_selection.provider.as_deref(),
-        doc_provider_selection.source.as_str(),
-    );
+    if !quiet {
+        print_run_started(
+            &state,
+            selected_route.as_ref(),
+            doc_provider_selection.provider.as_deref(),
+            doc_provider_selection.source.as_str(),
+        );
+    }
     let wait_label = format!(
         "run {} executing; attach in another terminal",
         run_prefix(&state.run_id)
     );
-    let outcome = with_cli_wait_status(
-        &wait_label,
-        run_turn_loop(
-            &mut state,
-            &router,
-            RunLoopConfig {
-                provider: effective_provider.clone(),
-                max_spend_usd: effective_max_spend,
-                max_wall_seconds: effective_max_wall_seconds,
-                sandbox_backend: backend,
-                max_turns: 12,
-                from_turn: None,
-                event_sender: None,
-                cancellation_token: None,
-                docs: RunLoopDocsConfig {
-                    home: paths.home().to_path_buf(),
-                    config_path: Some(paths.config_path()),
-                    doc_provider: doc_provider_selection.provider.clone(),
-                    doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
-                    doc_subskills: effective_doc_subskills(&defaults),
-                    token_budget: defaults
-                        .doc_polish_token_budget
-                        .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
-                    budget_cap_usd: defaults.doc_polish_budget_cap_usd,
-                    doc_skill: effective_doc_skill,
-                    no_docs: effective_no_docs,
-                },
+    let run_id_for_plain = state.run_id.clone();
+    let turn_loop = run_turn_loop(
+        &mut state,
+        &router,
+        RunLoopConfig {
+            provider: effective_provider.clone(),
+            max_spend_usd: effective_max_spend,
+            max_wall_seconds: effective_max_wall_seconds,
+            sandbox_backend: backend,
+            max_turns: 12,
+            from_turn: None,
+            event_sender: None,
+            cancellation_token: None,
+            docs: RunLoopDocsConfig {
+                home: paths.home().to_path_buf(),
+                config_path: Some(paths.config_path()),
+                doc_provider: doc_provider_selection.provider.clone(),
+                doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
+                doc_subskills: effective_doc_subskills(&defaults),
+                token_budget: defaults
+                    .doc_polish_token_budget
+                    .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
+                budget_cap_usd: defaults.doc_polish_budget_cap_usd,
+                doc_skill: effective_doc_skill,
+                no_docs: effective_no_docs,
             },
-        ),
-    )
-    .await?;
+        },
+    );
+    let outcome = if plain && !quiet {
+        with_plain_run_wait_status(paths.clone(), run_id_for_plain, turn_loop).await?
+    } else {
+        maybe_with_cli_wait_status(!plain && !quiet, &wait_label, turn_loop).await?
+    };
     state.child_pids.clear();
     save_state(&state)?;
     lock.release()?;
 
     let completed = outcome == RunLoopOutcome::Done;
-    match outcome {
-        RunLoopOutcome::Done => println!("{} {}", ui_ok("completed run"), state.run_id),
-        RunLoopOutcome::PausedAtCap => println!("{} {}", ui_warn("paused run"), state.run_id),
-        RunLoopOutcome::Killed => println!("{} {}", ui_warn("killed run"), state.run_id),
-        RunLoopOutcome::Failed => println!("{} {}", ui_warn("failed run"), state.run_id),
+    if plain {
+        println!("{}", plain_run_final_line(&state, outcome));
+    } else if !quiet {
+        match outcome {
+            RunLoopOutcome::Done => println!("{} {}", ui_ok("completed run"), state.run_id),
+            RunLoopOutcome::PausedAtCap => println!("{} {}", ui_warn("paused run"), state.run_id),
+            RunLoopOutcome::Killed => println!("{} {}", ui_warn("killed run"), state.run_id),
+            RunLoopOutcome::Failed => println!("{} {}", ui_warn("failed run"), state.run_id),
+        }
+        print_run_locations(&state);
     }
-    print_run_locations(&state);
-    if completed && completion_hints_enabled(no_hints) {
-        complete_run_actions(&state, !no_confirm).await?;
+    if completed && completion_hints_enabled(effective_no_hints) {
+        complete_run_actions(&state, !auto_confirm).await?;
     }
     Ok(())
 }
@@ -6632,6 +6685,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
 
 async fn orchestrate_command(args: PlanCommandArgs) -> Result<()> {
     let quiet = args.quiet;
+    let plain = args.plain;
     let no_hints = args.no_hints;
     let max_spend = args.max_spend;
     let max_wall_seconds = args.max_wall_seconds;
@@ -6652,6 +6706,7 @@ async fn orchestrate_command(args: PlanCommandArgs) -> Result<()> {
         reviewer_provider: None,
         no_hints,
         quiet,
+        plain,
     })
     .await?;
     merge_command(MergeCommandArgs {
@@ -6661,6 +6716,7 @@ async fn orchestrate_command(args: PlanCommandArgs) -> Result<()> {
         no_gate: false,
         no_hints,
         quiet,
+        plain,
     })
 }
 
@@ -6689,6 +6745,7 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
         reviewer_provider,
         no_hints: _,
         quiet: _,
+        plain,
     } = args;
     let goal = goal.trim().to_string();
     if goal.is_empty() {
@@ -6719,7 +6776,7 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
             validate_task_count(usize::from(n)).map_err(CliError::Core)?;
             let overrides = parse_child_provider_overrides(&child_provider, n)?;
             providers.children = overrides.clone();
-            build_split_plan_tasks(&paths, &goal, n, &providers, &overrides, &cwd).await?
+            build_split_plan_tasks(&paths, &goal, n, &providers, &overrides, &cwd, plain).await?
         }
         PlanMode::Review => build_review_plan_tasks(&goal, &providers),
     };
@@ -6847,6 +6904,7 @@ async fn build_split_plan_tasks(
     providers: &PlanProviders,
     overrides: &BTreeMap<u32, String>,
     cwd: &Path,
+    plain: bool,
 ) -> Result<Vec<PlanTask>> {
     let drafts = if providers
         .planner
@@ -6855,7 +6913,7 @@ async fn build_split_plan_tasks(
     {
         deterministic_plan_drafts(goal, n)
     } else {
-        provider_plan_drafts(paths, goal, n, providers.planner.as_deref(), cwd).await?
+        provider_plan_drafts(paths, goal, n, providers.planner.as_deref(), cwd, plain).await?
     };
     if drafts.len() != usize::from(n) {
         return Err(CliError::Core(deadreckon_core::user_error(
@@ -6922,6 +6980,7 @@ async fn provider_plan_drafts(
     n: u8,
     planner_provider: Option<&str>,
     cwd: &Path,
+    plain: bool,
 ) -> Result<Vec<PlannerDraft>> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), planner_provider)?;
     let prompt = planner_prompt(goal, n);
@@ -6934,7 +6993,9 @@ async fn provider_plan_drafts(
         pid_file: None,
         cancellation_token: None,
     };
-    let response = with_cli_wait_status("planning task graph", router.complete(&request)).await?;
+    let response =
+        maybe_with_cli_wait_status(!plain, "planning task graph", router.complete(&request))
+            .await?;
     parse_planner_response(&response.content)
 }
 
@@ -7122,6 +7183,7 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         reviewer_provider,
         no_hints,
         quiet,
+        plain,
     } = args;
     let paths = DeadreckonPaths::discover();
     let resolved_id = resolve_plan_id(&paths, &plan_id)?;
@@ -7203,6 +7265,7 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                         max_spend,
                         max_wall_seconds,
                         quiet,
+                        plain,
                         Some(pid_tx_for_child),
                     )
                 }),
@@ -7487,6 +7550,7 @@ fn run_plan_child(
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
     quiet: bool,
+    plain: bool,
     pid_sender: Option<std::sync::mpsc::Sender<(usize, u32)>>,
 ) -> Result<String> {
     let task = &plan.tasks[task_index];
@@ -7517,6 +7581,9 @@ fn run_plan_child(
             .arg("--yes")
             .arg("--no-confirm")
             .arg("--no-hints");
+        if plain {
+            command.arg("--plain");
+        }
     }
     command.arg("--sandbox").arg(sandbox);
     if let Some(max_spend) = max_spend {
@@ -7797,6 +7864,7 @@ fn merge_command(args: MergeCommandArgs) -> Result<()> {
         no_gate,
         no_hints,
         quiet,
+        plain: _plain,
     } = args;
     let paths = DeadreckonPaths::discover();
     let resolved_id = resolve_plan_id(&paths, &plan_id)?;
@@ -8274,6 +8342,85 @@ where
                 print_cli_wait_status(label, started.elapsed(), tick);
             }
         }
+    }
+}
+
+async fn maybe_with_cli_wait_status<F, T>(enabled: bool, label: &str, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    if enabled {
+        with_cli_wait_status(label, future).await
+    } else {
+        future.await
+    }
+}
+
+async fn with_plain_run_wait_status<F, T>(paths: DeadreckonPaths, run_id: String, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    let started = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = interval.tick() => {
+                eprintln!("{}", plain_run_progress_line(&paths, &run_id, started.elapsed()));
+            }
+        }
+    }
+}
+
+fn plain_run_progress_line(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+    elapsed: std::time::Duration,
+) -> String {
+    match load_run(paths, run_id) {
+        Ok(state) => format!(
+            "[{}] turn={} tool=- spend=${:.6} status={} elapsed={}s",
+            run_prefix(&state.run_id),
+            state.turn,
+            state.total_spend_usd,
+            state.status,
+            elapsed.as_secs()
+        ),
+        Err(_) => format!(
+            "[{}] turn=? tool=- spend=? status=running elapsed={}s",
+            run_prefix(run_id),
+            elapsed.as_secs()
+        ),
+    }
+}
+
+fn plain_run_final_line(state: &deadreckon_core::PipelineState, outcome: RunLoopOutcome) -> String {
+    match outcome {
+        RunLoopOutcome::Done => format!(
+            "[{}] completed turns={} spend=${:.6}",
+            run_prefix(&state.run_id),
+            state.turn,
+            state.total_spend_usd
+        ),
+        RunLoopOutcome::PausedAtCap => format!(
+            "[{}] paused turns={} spend=${:.6}",
+            run_prefix(&state.run_id),
+            state.turn,
+            state.total_spend_usd
+        ),
+        RunLoopOutcome::Killed => format!(
+            "[{}] killed reason={} turn={}",
+            run_prefix(&state.run_id),
+            state.failure_reason.as_deref().unwrap_or("cancelled"),
+            state.turn
+        ),
+        RunLoopOutcome::Failed => format!(
+            "[{}] failed reason={} turn={}",
+            run_prefix(&state.run_id),
+            state.failure_reason.as_deref().unwrap_or("unknown"),
+            state.turn
+        ),
     }
 }
 
@@ -10947,7 +11094,7 @@ fn print_doc_polish_summary(record: &deadreckon_runtime::PolishRecord) {
     }
 }
 
-async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
+async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = match load_cli_run(&paths, &run_id) {
         Ok(state) => state,
@@ -10955,7 +11102,7 @@ async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
             if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
                 let plan = load_plan(&paths, &plan_id)?;
                 let show_hints = completion_hints_enabled(no_hints);
-                if io::stdout().is_terminal() {
+                if io::stdout().is_terminal() && !plain {
                     attach_plan_tui(&paths, &plan.plan_id, show_hints).await?;
                 } else {
                     print_plan_summary(&paths, &plan, show_hints)?;
@@ -10967,7 +11114,7 @@ async fn attach_command(run_id: String, no_hints: bool) -> Result<()> {
     };
     let run_id = state.run_id.clone();
     let show_hints = completion_hints_enabled(no_hints);
-    if io::stdout().is_terminal() {
+    if io::stdout().is_terminal() && !plain {
         attach_tui(&paths, &run_id, show_hints).await?;
         let state = load_run(&paths, &run_id)?;
         if state.status == RunStatus::Completed && show_hints {

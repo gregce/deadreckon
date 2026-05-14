@@ -1784,6 +1784,7 @@ Every child run receives an inline copy of its worker spec in the prompt. The sp
 - `merge <plan-id>` composes completed child library artifacts into a new promoted run. It fails on conflicting file contents by default; `--strategy prefer-child --prefer-child <idx>` records the conflict and chooses that child.
 - `orchestrate <goal>` is the one-command wrapper. In review mode it performs plan -> fork -> merge end to end.
 - `attach <plan-id>` opens a plan TUI on TTYs and renders a plain summary off-TTY. The TUI shows child panes with provider/role/status, run prefixes, dependency state, turn/status, spend or token accounting, latest trace activity, acceptance/gate state, summary paths, and coordinator messages; `Enter` drills into the selected child run.
+- Headless flags are honored across this surface: `run --quiet` emits no success stdout, `run --plain --quiet` emits only the final plain status line, and `attach --plain` forces summary output instead of ratatui.
 - `kill <plan-id>` reads `coordinator.json` and child run state to signal the coordinator and live children.
 - `history grep <pattern>` searches durable trace or provenance JSONL, can restrict to a plan's child runs with `--plan <plan-id>`, and supports regex, scope, age, and limit filters.
 - `show <id> --why-failed` explains the likely failure surface for a run or plan, including non-completed children, blocker messages, and recent trace errors.
