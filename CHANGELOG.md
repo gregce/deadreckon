@@ -16,6 +16,7 @@
 - Coordinator launches now refresh each child worker spec with completed dependency summaries, so dependent child prompts include concrete predecessor context instead of only a plan-time dependency id.
 - Merge manifests now include an explicit task graph, child summary paths, provider roles, and coordinator message counts for audit without replaying child transcripts.
 - Added `show --why-failed` depth coverage for completed runs, failed run RCA traces, and plan blocker messages.
+- Added P10 friendliness coverage for `try:` footers, quiet/plain headless output, review-mode provider hints, and plan ready/blocked task counts.
 - Verified with focused orchestration tests plus core plan round-trips, clippy on the orchestration target, and `cargo fmt --check`; a broadcast-backed plan event stream remains a future slice.
 
 ## Copilot and Pi providers (alpha) - 2026-05-13

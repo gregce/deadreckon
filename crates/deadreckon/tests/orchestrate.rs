@@ -358,7 +358,7 @@ fn plan_records_explicit_planner_and_child_providers() {
 }
 
 #[test]
-fn run_accepts_plain_quiet_headless_smoke_flags() {
+fn quiet_plain_combined_emits_only_final_line() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -387,7 +387,7 @@ fn run_accepts_plain_quiet_headless_smoke_flags() {
 }
 
 #[test]
-fn run_quiet_emits_no_stdout_on_success() {
+fn quiet_emits_no_stdout_on_success() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -408,6 +408,143 @@ fn run_quiet_emits_no_stdout_on_success() {
 
     assert_success(&output);
     assert_eq!(stdout(&output), "");
+}
+
+#[test]
+fn plain_mode_progress_works_without_tty() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .env("TERM", "dumb")
+        .env("DEADRECKON_FORCE_PLAIN", "1")
+        .args([
+            "run",
+            "tiny hello rust",
+            "--smoke",
+            "--plain",
+            "--sandbox",
+            "none",
+            "--yes",
+            "--no-hints",
+        ])
+        .output()
+        .expect("run");
+
+    assert_success(&output);
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(combined.contains("completed"), "{combined}");
+    assert!(!combined.contains("\x1b["), "{combined:?}");
+}
+
+#[test]
+fn review_mode_post_action_hints_name_coder_and_reviewer() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--mode",
+            "review",
+            "--coder-provider",
+            "smoke:coder",
+            "--reviewer-provider",
+            "smoke:reviewer",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(
+        out.contains("providers: coder=smoke:coder reviewer=smoke:reviewer"),
+        "{out}"
+    );
+    assert!(out.contains("fork:"), "{out}");
+    assert!(out.contains("deadreckon fork"), "{out}");
+}
+
+#[test]
+fn plan_hints_name_capabilities_and_ready_tasks() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "deploy websocket app",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(
+        out.contains("capabilities: network=Allowlist deploy=true install=false"),
+        "{out}"
+    );
+    assert!(out.contains("tasks: 2 (2 ready / 0 blocked)"), "{out}");
+    assert!(out.contains("fork:"), "{out}");
+}
+
+#[test]
+fn error_messages_end_with_try_footer() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cases: Vec<(Vec<&str>, &str, &str)> = vec![
+        (
+            vec!["plan", "", "--quiet"],
+            "--goal must be non-empty",
+            "try: deadreckon plan \"your goal\"",
+        ),
+        (
+            vec![
+                "plan",
+                "tiny hello rust",
+                "--planner-provider",
+                "smoke",
+                "--provider",
+                "smoke",
+                "--n",
+                "1",
+                "--quiet",
+            ],
+            "plan must have >= 2 tasks",
+            "try: deadreckon run \"<the only task>\"",
+        ),
+        (
+            vec!["history", "grep", "[", "--regex"],
+            "invalid regex",
+            "try: re-quote or escape",
+        ),
+    ];
+
+    for (args, message, hint) in cases {
+        let output = deadreckon(&paths)
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .expect("command");
+        assert!(!output.status.success(), "{}", stdout(&output));
+        let err = stderr(&output);
+        assert!(err.contains(message), "{err}");
+        assert!(err.contains(hint), "{err}");
+    }
 }
 
 #[test]

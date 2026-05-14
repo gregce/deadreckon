@@ -7155,7 +7155,19 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
         plan.plan_id
     );
     println!("mode: {:?}", plan.mode);
-    println!("tasks: {}", plan.tasks.len());
+    let ready = plan.ready_pending_task_indices().len();
+    let pending = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Pending)
+        .count();
+    let blocked = pending.saturating_sub(ready);
+    println!(
+        "tasks: {} ({} ready / {} blocked)",
+        plan.tasks.len(),
+        ready,
+        blocked
+    );
     match plan.mode {
         PlanMode::Split => {
             println!(
