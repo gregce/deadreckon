@@ -696,8 +696,14 @@ fn print_top_help() {
         ("doctor", "check provider, sandbox, and local setup"),
         ("def-done", "write/check done criteria in English"),
         ("run", "start unattended coding work"),
+        (
+            "orchestrate",
+            "run coder/reviewer or split multi-agent work",
+        ),
+        ("chain", "run several coding steps in sequence"),
         ("attach", "watch a run in the TUI"),
         ("status", "see the latest run and next action"),
+        ("list", "show runs and orchestration jobs"),
         ("finish", "apply or export completed work"),
     ] {
         println!("  {:<12} {}", ui_command(name), purpose);
@@ -744,17 +750,41 @@ fn print_top_help() {
 fn print_help_all() {
     println!("{}", ui_heading("deadreckon commands"));
     println!();
-    println!("{}", ui_heading("core lifecycle"));
+    println!("{}", ui_heading("setup and providers"));
     for (name, purpose) in [
         ("init", "configure deadreckon"),
         ("doctor", "check provider, sandbox, and local setup"),
+        ("detect", "probe registered providers"),
+        ("providers", "list provider routes and models"),
+        ("config", "read or update configuration"),
+        ("completion", "install or generate shell completions"),
+    ] {
+        println!("  {:<12} {}", ui_command(name), purpose);
+    }
+    println!();
+    println!("{}", ui_heading("core lifecycle"));
+    for (name, purpose) in [
         ("def-done", "write/check done criteria in English"),
         ("run", "start unattended coding work"),
+        (
+            "orchestrate",
+            "run coder/reviewer or split multi-agent work",
+        ),
         ("chain", "run several coding steps in sequence"),
         ("attach", "watch a run in the TUI"),
         ("status", "see the latest run and next action"),
-        ("list", "list runs for this project"),
+        ("list", "show runs and orchestration jobs"),
         ("finish", "route completed work to apply or export"),
+    ] {
+        println!("  {:<12} {}", ui_command(name), purpose);
+    }
+    println!();
+    println!("{}", ui_heading("orchestration"));
+    for (name, purpose) in [
+        ("orchestrate", "plan, fork, and merge in one command"),
+        ("plan", "write a multi-agent plan without starting it"),
+        ("fork", "start child runs for a plan"),
+        ("merge", "compose completed plan children"),
     ] {
         println!("  {:<12} {}", ui_command(name), purpose);
     }
@@ -775,12 +805,11 @@ fn print_help_all() {
     for (name, purpose) in [
         ("apply", "merge a completed worktree run"),
         ("export", "copy a completed fresh/copy run"),
+        ("materialize", "alias for export"),
         ("doc", "read or regenerate run docs"),
         ("library", "inspect promoted artifacts"),
         ("show", "show raw state, traces, and provenance"),
         ("history", "search trace and provenance evidence"),
-        ("config", "read or update configuration"),
-        ("completion", "generate shell tab-completion scripts"),
         ("import", "import other tool history"),
         (
             "acceptance",
@@ -10411,50 +10440,219 @@ fn list_command(scope: Option<String>, all: bool, json_output: bool) -> Result<(
         }
         return Ok(());
     }
-    let header = format!(
-        "{:<8}  {:<10}  {:<7}  {:<24}  {:<13}  {:<10}  {:<16}  GOAL",
-        "ID", "STATUS", "AGE", "SCOPE", "KIND", "MODE", "ACTION"
-    );
+    let header = list_header();
     println!("{}", ui_heading(header));
+    let goal_width = list_goal_width();
     for entry in entries {
         match entry {
             ListEntry::Run(run) => {
-                println!(
-                    "{:<8}  {:<10}  {:<7}  {:<24}  {:<13}  {:<10}  {:<16}  {}",
-                    ui_id(run_prefix(&run.run_id)),
-                    truncate_text(&run.status.to_string(), 10),
-                    relative_age(run.updated_at),
-                    truncate_text(&run.scope, 24),
-                    "run",
-                    truncate_text(&codebase_mode_status(&paths, &run), 10),
-                    truncate_text(&next_action_label_for_entry(&paths, &run), 16),
-                    truncate_text(&one_line(&run.goal, 80), 80)
-                );
+                print_list_row(ListRow {
+                    id: run_prefix(&run.run_id),
+                    status: run_status_label(run.status).to_string(),
+                    age: relative_age(run.updated_at),
+                    scope: run.scope.clone(),
+                    kind: "run".to_string(),
+                    mode: codebase_mode_status(&paths, &run),
+                    action: next_action_label_for_entry(&paths, &run),
+                    goal: run.goal.clone(),
+                    goal_width,
+                    orchestration: false,
+                });
             }
             ListEntry::Plan(plan) => {
-                println!(
-                    "{:<8}  {:<10}  {:<7}  {:<24}  {:<13}  {:<10}  {:<16}  {}",
-                    ui_id(run_prefix(&plan.plan_id)),
-                    truncate_text(plan_status_label(plan.status), 10),
-                    relative_age(plan.updated_at),
-                    truncate_text(&plan.scope, 24),
-                    ui_warn("orchestrate"),
-                    plan_mode_label(plan.mode),
-                    truncate_text(&plan_action_label(&plan), 16),
-                    truncate_text(&one_line(&plan.goal, 80), 80)
-                );
+                print_list_row(ListRow {
+                    id: run_prefix(&plan.plan_id),
+                    status: plan_status_label(plan.status).to_string(),
+                    age: relative_age(plan.updated_at),
+                    scope: plan.scope.clone(),
+                    kind: "orchestrate".to_string(),
+                    mode: plan_mode_label(plan.mode).to_string(),
+                    action: plan_action_label(&plan),
+                    goal: plan.goal.clone(),
+                    goal_width,
+                    orchestration: true,
+                });
             }
         }
     }
+    println!("{} run and plan ids accept prefixes", ui_muted("hint:"));
     println!(
-        "{} run and plan ids accept prefixes; use `{}`, `{}`, `{}`, or `{}`",
-        ui_muted("hint:"),
+        "      use `{}`, `{}`, `{}`, or `{}`",
         ui_command("deadreckon status latest"),
         ui_command("deadreckon list --all"),
         ui_command("deadreckon attach <id>"),
         ui_command("deadreckon show <id>")
     );
     Ok(())
+}
+
+const LIST_ID_WIDTH: usize = 8;
+const LIST_STATUS_WIDTH: usize = 10;
+const LIST_AGE_WIDTH: usize = 7;
+const LIST_SCOPE_WIDTH: usize = 24;
+const LIST_KIND_WIDTH: usize = 13;
+const LIST_MODE_WIDTH: usize = 10;
+const LIST_ACTION_WIDTH: usize = 16;
+const LIST_GOAL_MAX_LINES: usize = 2;
+
+struct ListRow {
+    id: String,
+    status: String,
+    age: String,
+    scope: String,
+    kind: String,
+    mode: String,
+    action: String,
+    goal: String,
+    goal_width: usize,
+    orchestration: bool,
+}
+
+fn list_header() -> String {
+    format!(
+        "{}  {}  {}  {}  {}  {}  {}  GOAL",
+        pad_plain("ID", LIST_ID_WIDTH),
+        pad_plain("STATUS", LIST_STATUS_WIDTH),
+        pad_plain("AGE", LIST_AGE_WIDTH),
+        pad_plain("SCOPE", LIST_SCOPE_WIDTH),
+        pad_plain("KIND", LIST_KIND_WIDTH),
+        pad_plain("MODE", LIST_MODE_WIDTH),
+        pad_plain("ACTION", LIST_ACTION_WIDTH)
+    )
+}
+
+fn print_list_row(row: ListRow) {
+    let first_prefix = format!(
+        "{}  {}  {}  {}  {}  {}  {}  ",
+        pad_rendered(&row.id, LIST_ID_WIDTH, Some(ui_id)),
+        pad_plain(&row.status, LIST_STATUS_WIDTH),
+        pad_plain(&row.age, LIST_AGE_WIDTH),
+        pad_plain(&row.scope, LIST_SCOPE_WIDTH),
+        pad_rendered(
+            &row.kind,
+            LIST_KIND_WIDTH,
+            row.orchestration.then_some(ui_warn),
+        ),
+        pad_plain(&row.mode, LIST_MODE_WIDTH),
+        pad_plain(&row.action, LIST_ACTION_WIDTH)
+    );
+    let continuation_prefix = " ".repeat(list_prefix_width());
+    let goal_lines = wrap_list_goal(&row.goal, row.goal_width);
+    for (index, line) in goal_lines.iter().enumerate() {
+        if index == 0 {
+            println!("{first_prefix}{line}");
+        } else {
+            println!("{continuation_prefix}{line}");
+        }
+    }
+}
+
+fn list_prefix_width() -> usize {
+    LIST_ID_WIDTH
+        + LIST_STATUS_WIDTH
+        + LIST_AGE_WIDTH
+        + LIST_SCOPE_WIDTH
+        + LIST_KIND_WIDTH
+        + LIST_MODE_WIDTH
+        + LIST_ACTION_WIDTH
+        + 14
+}
+
+fn list_goal_width() -> usize {
+    if !io::stdout().is_terminal() {
+        return 72;
+    }
+    let terminal_width = crossterm::terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(180);
+    terminal_width
+        .saturating_sub(list_prefix_width())
+        .clamp(24, 96)
+}
+
+fn pad_plain(value: &str, width: usize) -> String {
+    let plain = truncate_text(value, width);
+    let padding = width.saturating_sub(plain.chars().count());
+    format!("{plain}{}", " ".repeat(padding))
+}
+
+fn pad_rendered(value: &str, width: usize, render: Option<fn(String) -> String>) -> String {
+    let plain = truncate_text(value, width);
+    let padding = width.saturating_sub(plain.chars().count());
+    let rendered = render.map_or_else(|| plain.clone(), |render| render(plain.clone()));
+    format!("{rendered}{}", " ".repeat(padding))
+}
+
+fn wrap_list_goal(value: &str, width: usize) -> Vec<String> {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = wrap_words(&compact, width.max(8));
+    let truncated = lines.len() > LIST_GOAL_MAX_LINES;
+    if truncated {
+        lines.truncate(LIST_GOAL_MAX_LINES);
+        if let Some(last) = lines.last_mut() {
+            *last = ellipsize_goal_line(last, width);
+        }
+    }
+    lines
+}
+
+fn ellipsize_goal_line(value: &str, width: usize) -> String {
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let prefix = width - 3;
+    format!("{}...", value.chars().take(prefix).collect::<String>())
+}
+
+fn wrap_words(value: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split(' ') {
+        let word_len = word.chars().count();
+        if word_len > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            lines.extend(split_long_word(word, width));
+            continue;
+        }
+        let next_len = if current.is_empty() {
+            word_len
+        } else {
+            current.chars().count() + 1 + word_len
+        };
+        if next_len <= width {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn split_long_word(word: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in word.chars() {
+        if current.chars().count() >= width {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 #[derive(Debug)]

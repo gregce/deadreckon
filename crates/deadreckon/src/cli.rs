@@ -24,8 +24,11 @@ Core lifecycle:
   doctor      check provider, sandbox, and local setup
   def-done    write/check done criteria in English
   run         start unattended coding work
+  orchestrate run coder/reviewer or split multi-agent work
+  chain       run several coding steps in sequence
   attach      watch a run in the TUI
   status      see the latest run and next action
+  list        show runs and orchestration jobs
   finish      apply or export completed work
 
 Continue or recover:
@@ -36,6 +39,8 @@ Continue or recover:
 
 More help:
   completion  generate shell tab-completion scripts
+  detect      probe registered providers
+  providers   list provider routes and models
   history     search run traces and provenance
   help-all    show every command, including advanced commands
   commands    alias for help-all
@@ -242,7 +247,9 @@ Lifecycle:
   deadreckon attach <short-id>
   deadreckon finish <short-id>
 
-The default view is compact and scoped to the current project. Use `show` for full run details.";
+The default view is compact and scoped to the current project. It includes both
+normal runs and orchestration plans. Use `show` for full run details or
+`attach <plan-id>` for orchestration progress.";
 
 const LIBRARY_HELP: &str = "\
 Subcommands:

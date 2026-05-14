@@ -840,6 +840,7 @@ fn help_lists_lifecycle_verbs() {
     assert!(stdout.contains("Core lifecycle:"));
     assert!(stdout.contains("def-done \""));
     assert!(stdout.contains("finish latest"));
+    assert!(stdout.contains("orchestrate"));
     assert!(stdout.contains("status"));
     assert!(stdout.contains("cleanup"));
     assert!(stdout.contains("completion"));
@@ -873,8 +874,14 @@ fn every_top_level_help_shows_lifecycle_usage() {
         "def-done",
         "acceptance",
         "run",
+        "orchestrate",
+        "plan",
+        "fork",
+        "merge",
         "chain",
         "doctor",
+        "detect",
+        "providers",
         "list",
         "library",
         "finish",

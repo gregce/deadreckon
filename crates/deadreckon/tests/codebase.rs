@@ -1796,9 +1796,14 @@ fn list_default_is_compact_and_points_to_show_for_details() {
     assert_success(&compact);
     let compact_stdout = stdout(&compact);
     assert!(compact_stdout.contains("AGE"));
+    assert!(compact_stdout.contains("KIND"));
     assert!(compact_stdout.contains(&state.run_id[..8]));
     assert!(!compact_stdout.contains(&state.run_id));
-    assert!(compact_stdout.contains("..."));
+    assert!(
+        compact_stdout.contains("readable in list")
+            && compact_stdout.contains("output without wrapping"),
+        "{compact_stdout}"
+    );
     assert!(
         compact_stdout
             .lines()
@@ -1814,8 +1819,9 @@ fn list_default_is_compact_and_points_to_show_for_details() {
     assert_success(&help);
     let help_stdout = stdout(&help);
     assert!(help_stdout.contains("deadreckon show <short-id>"));
+    assert!(help_stdout.contains("orchestration plans"));
     assert!(!help_stdout.contains("--full"));
-    assert!(compact_stdout.contains("deadreckon show <run>"));
+    assert!(compact_stdout.contains("deadreckon show <id>"));
     assert!(!compact_stdout.contains("deadreckon list --full"));
 }
 
