@@ -1363,8 +1363,8 @@ fn doc_help_describes_force_and_budget_cap_flags() {
         .expect("help");
     assert_success(&help);
     let out = stdout(&help);
-    assert!(out.contains("--force"));
-    assert!(out.contains("--budget-cap"));
+    assert!(out.contains("--overwrite"));
+    assert!(out.contains("--max-spend"));
     assert!(out.contains("--doc-provider"));
 }
 

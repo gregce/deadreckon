@@ -1414,6 +1414,9 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Descriptor-backed CLI providers with generic `exec_template` launch, registry-driven detection/init/listing, descriptor sandbox writes, and built-in `cli:gemini`, `cli:opencode`, `cli:copilot`, and `cli:pi` providers.
 - Smoke provider (deterministic) for keyless tests.
 - Turn loop with action parsing (Bash / WriteFile / Done) and CLI sub-agent path.
+- Overnight UX: `run --prevent-sleep <auto|on|off>` previews sleep posture and arms macOS `caffeinate` or Linux `systemd-inhibit` around the run loop, with run-local `working/.deadreckon/sleep-prevention.json`; preview/status/show/list and run exit summaries use the shared `ui_card` renderer with `--plain` and `NO_COLOR` support.
+- Unattended git hardening: production git invocations route through `deadreckon-core::git`, export `GIT_TERMINAL_PROMPT=0`, and disable commit/tag GPG signing for commit-family verbs so global signing cannot hang on pinentry.
+- Honest spend summaries: `spend.jsonl` replay marks totals with `~` when any turn is subscription-priced or estimated while preserving the numeric total.
 - Codebase-default running: worktree mode, copy mode, in-place mode, fresh-mode preservation, preflight + preview UX, and `codebase.json` files-not-fields metadata.
 - `apply` and `abandon` for worktree rollback/apply lifecycle.
 - `materialize`, `extend`, `undo`, `list`, and `show` integration with codebase mode metadata, including worktree extension branches chained from parent `dr/...` branches.
@@ -1681,6 +1684,28 @@ Inspection surfaces that already read durable state now expose `--json`: `list`,
 ### 26.10 Deferred V1 Work
 
 Mass renaming stored enum variants, themable palettes, localization hooks, and a template engine for status cards stay in `docs/V1-CANDIDATES.md`.
+
+---
+
+## 27. Overnight UX
+
+### 27.1 Card Vocabulary
+
+`crates/deadreckon/src/ui_card.rs` is the shared CLI card renderer for preview, exit, status, show, and list surfaces. It has ANSI-aware visible-width helpers, deterministic layout, ASCII fallback under `--plain` / `NO_COLOR`, and a narrow-terminal fallback below 40 columns. `crates/deadreckon/src/cards/exit_summary.rs` builds the shared run outcome card used after run/resume/kill paths.
+
+### 27.2 Sleep Prevention
+
+`deadreckon run --prevent-sleep <auto|on|off>` defaults through `[defaults].prevent_sleep`. `auto` arms only for interactive runs; `on` forces a platform attempt; `off` skips. macOS launches `caffeinate -di` for the run-loop lifetime. Linux re-execs under `systemd-inhibit` with a trusted tmpdir ready-file handshake before run state is created, then writes run-local metadata from the inhibited child. Windows reports unsupported and remains a V1 candidate.
+
+Sleep state is file-based, not a `PipelineState` field: `working/.deadreckon/sleep-prevention.json` records mode, pid, binary, arm time, reason, and skip reason. The RAII handle removes the file and reaps the inhibitor on drop.
+
+### 27.3 Unattended-Git Hardening
+
+`crates/deadreckon-core/src/git.rs` is the production git boundary. It exports `GIT_TERMINAL_PROMPT=0` for every git child and inserts `-c commit.gpgsign=false -c tag.gpgsign=false -c gpg.format=` for commit-family verbs (`commit`, `merge`, `cherry-pick`, `rebase`, `tag`, `am`, `revert`). A grep-style depth test rejects raw production `Command::new("git")` outside that helper.
+
+### 27.4 Honest Spend Display
+
+`deadreckon_core::spend_summary` replays `spend.jsonl` and reports total USD, token totals, wall seconds, and sticky `any_subscription_turn` / `any_estimated_turn` flags. Exit cards render `~$N.NNNNNN` when either flag is true so subscription and estimated dollar displays do not imply more precision than the data has.
 
 ---
 

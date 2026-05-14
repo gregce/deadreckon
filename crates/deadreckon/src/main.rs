@@ -26,6 +26,13 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use deadreckon::cards::exit_summary::{
+    BranchDiffSummary, ExitSummaryInput, OutcomeKind, build_exit_summary_card,
+};
+use deadreckon::sleep::{self, SleepPrefs, SleepPrevention};
+use deadreckon::ui_card::{
+    Card, CardOptions, HintLine, Section, TitleGlyph, TitleLine, render_card,
+};
 use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
     AcceptanceMarker, AcceptanceProgressEntry, ApplyMode, ApplyStrategy, BranchPolicy, Chain,
@@ -210,6 +217,7 @@ async fn main_inner() -> Result<()> {
     let command = cli.command.unwrap_or(Commands::Status {
         run_id: None,
         all: false,
+        plain: false,
         json: false,
     });
     match command {
@@ -262,6 +270,7 @@ async fn main_inner() -> Result<()> {
             preview,
             brief,
             plain,
+            prevent_sleep,
             quiet,
             max_spend,
             max_wall_seconds,
@@ -293,6 +302,7 @@ async fn main_inner() -> Result<()> {
                 preview,
                 brief,
                 plain,
+                prevent_sleep,
                 quiet,
                 max_spend,
                 max_wall_seconds,
@@ -503,7 +513,16 @@ async fn main_inner() -> Result<()> {
         Commands::Doctor { json } => doctor_command(json).await,
         Commands::Detect { id, json, ping } => detect_command(id, json, ping).await,
         Commands::Providers { command } => providers_command(command).await,
-        Commands::List { scope, all, json } => list_command(scope, all, json),
+        Commands::List {
+            scope,
+            all,
+            full,
+            plain,
+            json,
+        } => {
+            ui::set_plain_output(plain);
+            list_command(scope, all, full, plain, json)
+        }
         Commands::Library { command } => library_command(command),
         Commands::Finish {
             run_id,
@@ -542,8 +561,9 @@ async fn main_inner() -> Result<()> {
             autostash,
             cleanup,
             message,
+            plain,
         } => apply_command(
-            run_id, strategy, branch, no_confirm, autostash, cleanup, message,
+            run_id, strategy, branch, no_confirm, autostash, cleanup, message, plain,
         ),
         Commands::Abandon {
             run_id,
@@ -632,21 +652,44 @@ async fn main_inner() -> Result<()> {
             ui::set_plain_output(plain);
             attach_command(run_id, no_hints, plain).await
         }
-        Commands::Kill { run_id, force } => kill_command(run_id, force),
+        Commands::Kill {
+            run_id,
+            force,
+            plain,
+        } => {
+            ui::set_plain_output(plain);
+            kill_command(run_id, force, plain)
+        }
         Commands::Resume {
             run_id,
             from_turn,
             max_wall_seconds,
-        } => resume_command(run_id, from_turn, max_wall_seconds).await,
+            plain,
+        } => {
+            ui::set_plain_output(plain);
+            resume_command(run_id, from_turn, max_wall_seconds, plain).await
+        }
         Commands::Undo { run, turn } => undo_command(run, turn),
         Commands::Show {
             run_id,
             turn,
             why_failed,
+            plain,
             json,
-        } => show_command(&run_id, turn, why_failed, json),
+        } => {
+            ui::set_plain_output(plain);
+            show_command(&run_id, turn, why_failed, plain, json)
+        }
         Commands::History { command } => history_command(command),
-        Commands::Status { run_id, all, json } => status_command(run_id, all, json),
+        Commands::Status {
+            run_id,
+            all,
+            plain,
+            json,
+        } => {
+            ui::set_plain_output(plain);
+            status_command(run_id, all, plain, json)
+        }
         Commands::Import { source } => import_command(source),
     }
 }
@@ -2686,6 +2729,7 @@ fn auto_apply_chain_step(
             true,
             false,
             None,
+            false,
         )?;
     }
     let applied_sha = git_stdout(git_root, &["rev-parse", "HEAD"])?;
@@ -3108,7 +3152,7 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
                             .get(tui_state.selected_step)
                             .and_then(|step| step.run_id.clone())
                         {
-                            let _ = show_command(&run_id, None, false, false);
+                            let _ = show_command(&run_id, None, false, false, false);
                         } else {
                             eprintln!("selected step has no run yet");
                         }
@@ -4254,6 +4298,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         preview,
         brief,
         plain,
+        prevent_sleep,
         quiet,
         max_spend,
         max_wall_seconds,
@@ -4284,6 +4329,17 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
+    let plain = plain || defaults.plain.unwrap_or(false) || std::env::var_os("NO_COLOR").is_some();
+    ui::set_plain_output(plain);
+    let prevent_sleep_prefs =
+        SleepPrefs::parse(prevent_sleep.as_deref(), defaults.prevent_sleep.as_deref())
+            .map_err(|err| CliError::Core(DeadreckonError::InvalidInput(err)))?;
+    if !preview
+        && let Some(exit_code) =
+            sleep::maybe_reexec_for_linux(prevent_sleep_prefs, io::stdin().is_terminal())?
+    {
+        std::process::exit(exit_code);
+    }
     let effective_provider = if smoke {
         Some("smoke".to_string())
     } else {
@@ -4341,6 +4397,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     )
     .await?;
     let acceptance_preview = acceptance_preview(&acceptance_source)?;
+    let sleep_preview = sleep::preview(prevent_sleep_prefs, io::stdin().is_terminal());
     let sandbox = sandbox
         .or(defaults.sandbox.clone())
         .unwrap_or_else(|| "auto".to_string());
@@ -4404,12 +4461,17 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         max_spend: effective_max_spend,
         max_wall_seconds: effective_max_wall_seconds,
         acceptance: &acceptance_preview,
+        sleep: &sleep_preview,
         brief,
+        plain,
         run_id: &run_id,
     });
     if preview {
         eprintln!("{preview_text}");
         return Ok(());
+    }
+    if !quiet {
+        eprintln!("{preview_text}");
     }
     if !auto_confirm {
         if !io::stdin().is_terminal() {
@@ -4418,7 +4480,6 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
                 "--yes, --quiet, or run interactively",
             )));
         }
-        eprintln!("{preview_text}");
         if !prompt::confirm("continue?", true)? {
             println!("cancelled");
             return Ok(());
@@ -4463,11 +4524,8 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
 
     if run_cancelled_before_turn_loop(&paths, &mut state)? {
         lock.release()?;
-        if plain {
-            println!("{}", plain_run_final_line(&state, &RunLoopOutcome::Killed));
-        } else if !quiet {
-            println!("{} {}", ui_warn("killed run"), state.run_id);
-            print_run_locations(&state);
+        if !quiet {
+            print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain);
         }
         return Ok(());
     }
@@ -4475,11 +4533,8 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     save_state(&state)?;
     if run_cancelled_before_turn_loop(&paths, &mut state)? {
         lock.release()?;
-        if plain {
-            println!("{}", plain_run_final_line(&state, &RunLoopOutcome::Killed));
-        } else if !quiet {
-            println!("{} {}", ui_warn("killed run"), state.run_id);
-            print_run_locations(&state);
+        if !quiet {
+            print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain);
         }
         return Ok(());
     }
@@ -4488,15 +4543,30 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     save_state(&state)?;
     if run_cancelled_before_turn_loop(&paths, &mut state)? {
         lock.release()?;
-        if plain {
-            println!("{}", plain_run_final_line(&state, &RunLoopOutcome::Killed));
-        } else if !quiet {
-            println!("{} {}", ui_warn("killed run"), state.run_id);
-            print_run_locations(&state);
+        if !quiet {
+            print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain);
         }
         return Ok(());
     }
     lock.heartbeat("turn-loop")?;
+    let _sleep_handle = match sleep::arm(prevent_sleep_prefs, &state.working_dir)? {
+        SleepPrevention::Active { handle } => Some(handle),
+        SleepPrevention::Skipped { reason } => {
+            if prevent_sleep_prefs == SleepPrefs::On && !quiet {
+                eprintln!(
+                    "sleep prevention skipped: {}",
+                    sleep::skip_reason_label(reason)
+                );
+                if let Some(try_line) = sleep_try_line(reason) {
+                    eprintln!("try: {try_line}");
+                }
+            }
+            None
+        }
+        SleepPrevention::Reexeced { exit_code } => {
+            std::process::exit(exit_code);
+        }
+    };
     if !quiet {
         print_run_started(
             &state,
@@ -4547,16 +4617,8 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     lock.release()?;
 
     let completed = outcome == RunLoopOutcome::Done;
-    if plain {
-        println!("{}", plain_run_final_line(&state, &outcome));
-    } else if !quiet {
-        match outcome {
-            RunLoopOutcome::Done => println!("{} {}", ui_ok("completed run"), state.run_id),
-            RunLoopOutcome::PausedAtCap => println!("{} {}", ui_warn("paused run"), state.run_id),
-            RunLoopOutcome::Killed => println!("{} {}", ui_warn("killed run"), state.run_id),
-            RunLoopOutcome::Failed => println!("{} {}", ui_warn("failed run"), state.run_id),
-        }
-        print_run_locations(&state);
+    if !quiet {
+        print_exit_summary_card(&state, &outcome, plain);
     }
     if completed && completion_hints_enabled(effective_no_hints) {
         complete_run_actions(&state, !auto_confirm).await?;
@@ -6072,6 +6134,8 @@ struct ConfigDefaults {
     sandbox: Option<String>,
     max_spend: Option<f64>,
     cli_max_wall_seconds: Option<f64>,
+    prevent_sleep: Option<String>,
+    plain: Option<bool>,
     doc_provider: Option<String>,
     doc_skill: Option<String>,
     doc_subskills: Option<Vec<String>>,
@@ -6103,6 +6167,10 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
                     .and_then(toml::Value::as_integer)
                     .map(|value| value as f64)
             }),
+        prevent_sleep: get_toml_path(&root, "defaults.prevent_sleep")
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string),
+        plain: get_toml_path(&root, "defaults.plain").and_then(toml::Value::as_bool),
         doc_provider: get_toml_path(&root, "defaults.doc_provider")
             .and_then(toml::Value::as_str)
             .map(ToString::to_string),
@@ -6330,9 +6398,42 @@ async fn doctor_command(json_output: bool) -> Result<()> {
     }
     doctor_disk_and_permissions(&paths);
     doctor_os();
+    doctor_sleep_prevention();
     doctor_subscription_binary("claude");
     doctor_subscription_binary("codex");
     Ok(())
+}
+
+fn doctor_sleep_prevention() {
+    let preview = sleep::preview(SleepPrefs::On, true);
+    match preview.mode {
+        sleep::SleepMode::Caffeinate | sleep::SleepMode::SystemdInhibit => {
+            println!(
+                "{} sleep prevention {} | {} deadreckon run \"goal\" --prevent-sleep auto",
+                ui_ok("✓"),
+                preview.label(),
+                ui_command("try:")
+            );
+        }
+        sleep::SleepMode::None => {
+            println!(
+                "{} sleep prevention disabled | {} deadreckon run \"goal\" --prevent-sleep on",
+                ui_warn("✗"),
+                ui_command("try:")
+            );
+        }
+        sleep::SleepMode::Unsupported => {
+            let fix = if cfg!(target_os = "linux") {
+                "sudo apt install systemd"
+            } else if cfg!(target_os = "macos") {
+                "check /usr/bin/caffeinate"
+            } else {
+                "--prevent-sleep off (Windows native prevention is a V1 candidate)"
+            };
+            println!("{} sleep prevention unsupported", ui_warn("✗"));
+            println!("    {} {fix}", ui_command("fix:"));
+        }
+    }
 }
 
 async fn doctor_providers(paths: &DeadreckonPaths, root: &toml::Value) -> Result<()> {
@@ -6611,11 +6712,7 @@ fn init_git_repo(cwd: &Path) -> Result<()> {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()?;
+    let output = deadreckon_core::git::run_git(cwd, args)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -6631,11 +6728,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()?;
+    let output = deadreckon_core::git::run_git(cwd, args)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
@@ -6649,12 +6742,8 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_ref_exists(cwd: &Path, reference: &str) -> bool {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["rev-parse", "--verify", "--quiet", reference])
-        .status()
-        .map(|status| status.success())
+    deadreckon_core::git::run_git(cwd, &["rev-parse", "--verify", "--quiet", reference])
+        .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
@@ -6683,7 +6772,9 @@ struct RunPreview<'a> {
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
     acceptance: &'a AcceptancePreview,
+    sleep: &'a sleep::SleepPreview,
     brief: bool,
+    plain: bool,
     run_id: &'a str,
 }
 
@@ -6700,7 +6791,9 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         max_spend,
         max_wall_seconds,
         acceptance,
+        sleep,
         brief,
+        plain,
         run_id,
     } = input;
     let mode = codebase.mode.to_string();
@@ -6742,71 +6835,161 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         Ok(Some(git)) => format!("git: clean, branch={} @ {}", git.branch, git.head_sha),
         _ => "not git".to_string(),
     };
-    let mut lines = vec![
-        "deadreckon: ready to run".to_string(),
-        String::new(),
-        format!("  goal:     {goal}"),
-        format!("  source:   {} ({git_label})", cwd.display()),
-        format!("  mode:     {mode}"),
+    let mut rows = vec![
+        ("goal".to_string(), goal.to_string()),
+        (
+            "source".to_string(),
+            format!("{} ({git_label})", cwd.display()),
+        ),
+        ("mode".to_string(), mode),
     ];
     if codebase.mode == CodebaseMode::Worktree {
-        lines.extend([
-            format!(
-                "    branch:   {}",
-                codebase.branch_name.as_deref().unwrap_or("-")
+        rows.extend([
+            (
+                "branch".to_string(),
+                codebase.branch_name.as_deref().unwrap_or("-").to_string(),
             ),
-            format!(
-                "    base:     {} ({})",
-                codebase.base_ref.as_deref().unwrap_or("-"),
-                codebase
-                    .base_sha
-                    .as_deref()
-                    .map(|sha| sha.chars().take(8).collect::<String>())
-                    .unwrap_or_else(|| "-".to_string())
+            (
+                "base ref".to_string(),
+                format!(
+                    "{} ({})",
+                    codebase.base_ref.as_deref().unwrap_or("-"),
+                    codebase
+                        .base_sha
+                        .as_deref()
+                        .map(|sha| sha.chars().take(8).collect::<String>())
+                        .unwrap_or_else(|| "-".to_string())
+                ),
             ),
-            format!(
-                "    worktree: {}",
+            (
+                "worktree".to_string(),
                 codebase
                     .worktree_path
                     .as_ref()
                     .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "-".to_string())
+                    .unwrap_or_else(|| "-".to_string()),
             ),
         ]);
     } else if let Some(source_path) = codebase.source_path.as_ref() {
-        lines.push(format!("    source-copy: {}", source_path.display()));
+        rows.push(("source-copy".to_string(), source_path.display().to_string()));
     }
     if codebase.mode == CodebaseMode::InPlace {
-        lines.push("    warning: SOURCE-IS-USER-TREE; undo uses runstate snapshots".to_string());
+        rows.push((
+            "warning".to_string(),
+            "SOURCE-IS-USER-TREE; undo uses runstate snapshots".to_string(),
+        ));
     }
-    lines.extend([
-        format!("  provider: {agent}"),
-        format!("  model:    {model}"),
-        format!(
-            "  docs:     {} ({doc_provider_source})",
-            doc_provider.unwrap_or("templated only")
+    rows.extend([
+        ("provider".to_string(), agent.to_string()),
+        ("model".to_string(), model.to_string()),
+        (
+            "docs".to_string(),
+            format!(
+                "{} ({doc_provider_source})",
+                doc_provider.unwrap_or("templated only")
+            ),
         ),
-        format!("  sandbox:  {sandbox}"),
-        format!("  caps:     {caps}"),
-        format!("  gate:     {}", acceptance.full_label()),
+        ("sandbox".to_string(), sandbox.to_string()),
+        ("caps".to_string(), caps),
+        ("sleep".to_string(), sleep.label()),
+        ("gate".to_string(), acceptance.full_label()),
     ]);
+    if max_spend.is_some_and(|cap| cap > 50.0) {
+        rows.push((
+            "confirmation".to_string(),
+            "high spend acknowledged before run state is created".to_string(),
+        ));
+    }
+    let mut sections = vec![Section::KeyValue { rows }];
     match codebase.mode {
         CodebaseMode::Worktree => {
-            lines.push(format!("  on success: deadreckon apply {run_id}"));
-            lines.push(format!("  on fail:    deadreckon abandon {run_id}"));
+            sections.push(Section::Blank);
+            sections.push(Section::Command {
+                label: "on success".to_string(),
+                command: format!("deadreckon apply {run_id}"),
+            });
+            sections.push(Section::Command {
+                label: "on fail".to_string(),
+                command: format!("deadreckon abandon {run_id}"),
+            });
         }
         CodebaseMode::Copy | CodebaseMode::Fresh => {
-            lines.push(format!(
-                "  on success: deadreckon materialize {run_id} --dest <path>"
-            ));
-            lines.push(format!("  inspect:    deadreckon show {run_id}"));
+            sections.push(Section::Blank);
+            sections.push(Section::Command {
+                label: "on success".to_string(),
+                command: format!("deadreckon materialize {run_id} --dest <path>"),
+            });
+            sections.push(Section::Command {
+                label: "inspect".to_string(),
+                command: format!("deadreckon show {run_id}"),
+            });
         }
         CodebaseMode::InPlace => {
-            lines.push(format!("  rollback:   deadreckon undo --run {run_id}"));
-            lines.push(format!("  inspect:    deadreckon show {run_id}"));
+            sections.push(Section::Blank);
+            sections.push(Section::Command {
+                label: "rollback".to_string(),
+                command: format!("deadreckon undo --run {run_id}"),
+            });
+            sections.push(Section::Command {
+                label: "inspect".to_string(),
+                command: format!("deadreckon show {run_id}"),
+            });
         }
     }
-    lines.join("\n")
+    render_card(
+        &Card {
+            title: TitleLine {
+                glyph: TitleGlyph::Preview,
+                label: "deadreckon run preview".to_string(),
+            },
+            subtitle: Some(goal.to_string()),
+            sections,
+            hints: vec![HintLine {
+                label: "run".to_string(),
+                command: "rerun with --yes to skip this confirmation".to_string(),
+            }],
+        },
+        &card_options(ui::Stream::Stderr, plain),
+    )
+}
+
+fn card_options(stream: ui::Stream, plain: bool) -> CardOptions {
+    let no_color_env = std::env::var_os("NO_COLOR").is_some();
+    CardOptions {
+        color: ui::enabled(stream),
+        plain: plain || no_color_env,
+        terminal_columns: terminal_columns(),
+        no_color_env,
+    }
+}
+
+fn terminal_columns() -> Option<usize> {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .or_else(|| {
+            crossterm::terminal::size()
+                .ok()
+                .map(|(cols, _)| cols as usize)
+        })
+}
+
+fn sleep_try_line(reason: sleep::SkipReason) -> Option<&'static str> {
+    match reason {
+        sleep::SkipReason::UnavailableBinary if cfg!(target_os = "macos") => {
+            Some("macOS bundles caffeinate; check $PATH or run \"/usr/bin/caffeinate -di\"")
+        }
+        sleep::SkipReason::UnavailableBinary if cfg!(target_os = "linux") => {
+            Some("sudo apt install systemd")
+        }
+        sleep::SkipReason::Unsupported => {
+            Some("--prevent-sleep off (Windows native prevention is a V1 candidate)")
+        }
+        sleep::SkipReason::AlreadyInhibited
+        | sleep::SkipReason::NonTty
+        | sleep::SkipReason::UserDisabled
+        | sleep::SkipReason::UnavailableBinary => None,
+    }
 }
 
 struct OrchestrateRunArgs {
@@ -8922,36 +9105,170 @@ fn plain_run_progress_line(
     }
 }
 
-fn plain_run_final_line(
+fn print_exit_summary_card(
     state: &deadreckon_core::PipelineState,
     outcome: &RunLoopOutcome,
+    plain: bool,
+) {
+    print!("{}", render_exit_summary_card(state, outcome, plain));
+}
+
+fn render_exit_summary_card(
+    state: &deadreckon_core::PipelineState,
+    outcome: &RunLoopOutcome,
+    plain: bool,
 ) -> String {
-    match outcome {
-        RunLoopOutcome::Done => format!(
-            "[{}] completed turns={} spend=${:.6}",
-            run_prefix(&state.run_id),
-            state.turn,
-            state.total_spend_usd
-        ),
-        RunLoopOutcome::PausedAtCap => format!(
-            "[{}] paused turns={} spend=${:.6}",
-            run_prefix(&state.run_id),
-            state.turn,
-            state.total_spend_usd
-        ),
-        RunLoopOutcome::Killed => format!(
-            "[{}] killed reason={} turn={}",
-            run_prefix(&state.run_id),
-            state.failure_reason.as_deref().unwrap_or("cancelled"),
-            state.turn
-        ),
-        RunLoopOutcome::Failed => format!(
-            "[{}] failed reason={} turn={}",
-            run_prefix(&state.run_id),
-            state.failure_reason.as_deref().unwrap_or("unknown"),
-            state.turn
-        ),
+    let input = exit_summary_input(state, outcome);
+    let card = build_exit_summary_card(&input);
+    render_card(&card, &card_options(ui::Stream::Stdout, plain))
+}
+
+fn exit_summary_input(
+    state: &deadreckon_core::PipelineState,
+    outcome: &RunLoopOutcome,
+) -> ExitSummaryInput {
+    let spend = deadreckon_core::state::spend_summary(state).unwrap_or_else(|_| {
+        deadreckon_core::state::SpendSummary {
+            total_usd: state.total_spend_usd,
+            wall_seconds: state.total_wall_seconds,
+            ..deadreckon_core::state::SpendSummary::default()
+        }
+    });
+    let codebase = read_codebase_record(&state.working_dir).ok();
+    let branch = codebase
+        .as_ref()
+        .and_then(|record| record.branch_name.clone());
+    let prefix = run_prefix(&state.run_id);
+    let outcome_kind = match outcome {
+        RunLoopOutcome::Done => OutcomeKind::Completed,
+        RunLoopOutcome::PausedAtCap => OutcomeKind::Paused,
+        RunLoopOutcome::Killed => OutcomeKind::Killed,
+        RunLoopOutcome::Failed => OutcomeKind::Failed,
+    };
+    let hints = exit_summary_hints(state, outcome_kind, codebase.as_ref(), &prefix);
+    ExitSummaryInput {
+        run_id: state.run_id.clone(),
+        goal: state.goal.clone(),
+        provider: state
+            .provider
+            .clone()
+            .unwrap_or_else(|| "provider".to_string()),
+        branch,
+        outcome: outcome_kind,
+        turns: state.turn,
+        input_tokens: spend.input_tokens,
+        output_tokens: spend.output_tokens,
+        spend_usd: spend.total_usd,
+        approximate_spend: spend.any_subscription_turn || spend.any_estimated_turn,
+        wall_seconds: spend.wall_seconds,
+        diff: codebase
+            .as_ref()
+            .and_then(|record| branch_diff_summary(state, record).ok().flatten()),
+        gate: acceptance_status_line(state),
+        working_dir: state.working_dir.clone(),
+        proof_path: marker_path_for_run_root(&state.run_root),
+        hints,
     }
+}
+
+fn exit_summary_hints(
+    state: &deadreckon_core::PipelineState,
+    outcome: OutcomeKind,
+    codebase: Option<&CodebaseRecord>,
+    prefix: &str,
+) -> Vec<(String, String)> {
+    match outcome {
+        OutcomeKind::Completed => {
+            let mut hints = vec![
+                ("attach".to_string(), format!("deadreckon attach {prefix}")),
+                ("show".to_string(), format!("deadreckon show {prefix}")),
+            ];
+            match codebase
+                .map(|record| record.mode)
+                .unwrap_or(CodebaseMode::Fresh)
+            {
+                CodebaseMode::Worktree => {
+                    hints.push(("apply".to_string(), format!("deadreckon apply {prefix}")));
+                }
+                CodebaseMode::Copy | CodebaseMode::Fresh => {
+                    hints.push((
+                        "export".to_string(),
+                        format!("deadreckon export {prefix} --dest <path>"),
+                    ));
+                }
+                CodebaseMode::InPlace => {
+                    hints.push((
+                        "undo".to_string(),
+                        format!("deadreckon undo --run {prefix}"),
+                    ));
+                }
+            }
+            hints
+        }
+        OutcomeKind::Paused => vec![
+            ("attach".to_string(), format!("deadreckon attach {prefix}")),
+            ("resume".to_string(), format!("deadreckon resume {prefix}")),
+            ("show".to_string(), format!("deadreckon show {prefix}")),
+        ],
+        OutcomeKind::Killed | OutcomeKind::Failed => vec![
+            (
+                "why".to_string(),
+                format!("deadreckon show {prefix} --why-failed"),
+            ),
+            ("resume".to_string(), format!("deadreckon resume {prefix}")),
+            (
+                "state".to_string(),
+                state.state_path().display().to_string(),
+            ),
+        ],
+    }
+}
+
+fn branch_diff_summary(
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
+) -> Result<Option<BranchDiffSummary>> {
+    if record.mode != CodebaseMode::Worktree {
+        return Ok(None);
+    }
+    let Some(base_ref) = record.base_ref.as_deref() else {
+        return Ok(None);
+    };
+    if !state.working_dir.join(".git").exists() {
+        return Ok(None);
+    }
+    let range = format!("{base_ref}...HEAD");
+    let numstat = git_stdout(&state.working_dir, &["diff", "--numstat", &range])?;
+    let name_status = git_stdout(&state.working_dir, &["diff", "--name-status", &range])?;
+    let mut summary = BranchDiffSummary::default();
+    for line in numstat.lines() {
+        let mut parts = line.split('\t');
+        let added = parts.next().unwrap_or("0");
+        let deleted = parts.next().unwrap_or("0");
+        if let Ok(value) = added.parse::<u64>() {
+            summary.lines_added = summary.lines_added.saturating_add(value);
+        }
+        if let Ok(value) = deleted.parse::<u64>() {
+            summary.lines_deleted = summary.lines_deleted.saturating_add(value);
+        }
+    }
+    for line in name_status.lines() {
+        let status = line.chars().next().unwrap_or('M');
+        match status {
+            'A' => summary.files_added += 1,
+            'D' => summary.files_deleted += 1,
+            _ => summary.files_updated += 1,
+        }
+    }
+    if summary.lines_added == 0
+        && summary.lines_deleted == 0
+        && summary.files_added == 0
+        && summary.files_updated == 0
+        && summary.files_deleted == 0
+    {
+        return Ok(None);
+    }
+    Ok(Some(summary))
 }
 
 fn print_cli_wait_status(label: &str, elapsed: std::time::Duration, tick: usize) {
@@ -9018,7 +9335,7 @@ fn init_config_text(
         _ => "[\"anthropic\", \"openai\", \"cli:claude-code\", \"cli:codex\"]".to_string(),
     };
     let mut out = format!(
-        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\ndoc_provider = \"{provider}\"\ndoc_skill = \"run-narrator\"\ndoc_subskills = [\"narrator-overview\", \"narrator-phases\", \"narrator-as-built\", \"narrator-decisions\"]\ndoc_polish_token_budget = 16384\nmax_spend = {max_spend}\ncli_max_wall_seconds = 3600\nsandbox = \"{sandbox}\"\n\n"
+        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\ndoc_provider = \"{provider}\"\ndoc_skill = \"run-narrator\"\ndoc_subskills = [\"narrator-overview\", \"narrator-phases\", \"narrator-as-built\", \"narrator-decisions\"]\ndoc_polish_token_budget = 16384\nmax_spend = {max_spend}\ncli_max_wall_seconds = 3600\nprevent_sleep = \"auto\"\nplain = false\nsandbox = \"{sandbox}\"\n\n"
     );
     match provider {
         "cli:claude-code" => {
@@ -9218,6 +9535,7 @@ fn finish_command(
                 autostash,
                 cleanup,
                 message,
+                false,
             )
         }
         CodebaseMode::Copy | CodebaseMode::Fresh => {
@@ -9329,6 +9647,7 @@ fn print_materialized(materialized: &MaterializedRun) {
     println!("  dest:   {}", materialized.dest.display());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_command(
     run_id: String,
     strategy: String,
@@ -9337,6 +9656,7 @@ fn apply_command(
     autostash: bool,
     cleanup: bool,
     message: Option<String>,
+    plain: bool,
 ) -> Result<()> {
     apply_command_inner(
         run_id,
@@ -9347,6 +9667,7 @@ fn apply_command(
         cleanup,
         message,
         false,
+        plain,
     )
 }
 
@@ -9368,6 +9689,7 @@ fn apply_command_quiet(
         cleanup,
         message,
         true,
+        false,
     )
 }
 
@@ -9383,6 +9705,7 @@ fn apply_command_inner(
     cleanup: bool,
     message: Option<String>,
     quiet: bool,
+    plain: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = load_cli_run(&paths, &run_id)?;
@@ -9417,7 +9740,12 @@ fn apply_command_inner(
         if !quiet {
             print_already_applied(&state, branch, &target);
         }
+        let summary =
+            (!quiet).then(|| render_exit_summary_card(&state, &RunLoopOutcome::Done, plain));
         finish_apply_cleanup(&state, &record, cleanup, no_confirm, quiet)?;
+        if let Some(summary) = summary {
+            print!("{summary}");
+        }
         return Ok(());
     }
     if !quiet {
@@ -9474,7 +9802,12 @@ fn apply_command_inner(
                 if !quiet {
                     print_already_applied(&state, branch, &target);
                 }
+                let summary = (!quiet)
+                    .then(|| render_exit_summary_card(&state, &RunLoopOutcome::Done, plain));
                 finish_apply_cleanup(&state, &record, cleanup, no_confirm, quiet)?;
+                if let Some(summary) = summary {
+                    print!("{summary}");
+                }
                 return Ok(());
             }
             if let Some(body) = commit_body.as_deref() {
@@ -9506,7 +9839,12 @@ fn apply_command_inner(
         );
         println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
     }
-    finish_apply_cleanup(&state, &record, cleanup, no_confirm, quiet)
+    let summary = (!quiet).then(|| render_exit_summary_card(&state, &RunLoopOutcome::Done, plain));
+    finish_apply_cleanup(&state, &record, cleanup, no_confirm, quiet)?;
+    if let Some(summary) = summary {
+        print!("{summary}");
+    }
+    Ok(())
 }
 
 fn print_already_applied(state: &deadreckon_core::PipelineState, branch: &str, target: &str) {
@@ -10652,7 +10990,13 @@ fn escape_toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn list_command(scope: Option<String>, all: bool, json_output: bool) -> Result<()> {
+fn list_command(
+    scope: Option<String>,
+    all: bool,
+    full: bool,
+    plain: bool,
+    json_output: bool,
+) -> Result<()> {
     // REPORT.md: Workspace Inventory & Run Queue is a local scan over durable
     // runstate, not a live daemon query.
     let paths = DeadreckonPaths::discover();
@@ -10722,6 +11066,40 @@ fn list_command(scope: Option<String>, all: bool, json_output: bool) -> Result<(
         return Ok(());
     }
     let header = list_header();
+    if !full {
+        println!(
+            "{}",
+            render_card(
+                &Card {
+                    title: TitleLine {
+                        glyph: TitleGlyph::Preview,
+                        label: "deadreckon list".to_string(),
+                    },
+                    subtitle: Some(format!("{} entries", entries.len())),
+                    sections: vec![Section::KeyValue {
+                        rows: std::iter::once(("columns".to_string(), header.clone()))
+                            .chain(entries.iter().take(24).map(|entry| {
+                                (
+                                    run_prefix(entry.id()),
+                                    format!(
+                                        "{} {} {}",
+                                        entry.status_label(),
+                                        relative_age(entry.updated_at()),
+                                        one_line(entry.goal(), 72)
+                                    ),
+                                )
+                            }))
+                            .collect(),
+                    }],
+                    hints: vec![HintLine {
+                        label: "show".to_string(),
+                        command: "deadreckon show <id>".to_string(),
+                    }],
+                },
+                &card_options(ui::Stream::Stdout, plain),
+            )
+        );
+    }
     println!("{}", ui_heading(header));
     let goal_width = list_goal_width();
     for entry in entries {
@@ -10945,6 +11323,27 @@ impl ListEntry {
         match self {
             Self::Run(run) => run.updated_at,
             Self::Plan(plan) => plan.updated_at,
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Self::Run(run) => &run.run_id,
+            Self::Plan(plan) => &plan.plan_id,
+        }
+    }
+
+    fn status_label(&self) -> &'static str {
+        match self {
+            Self::Run(run) => run_status_label(run.status),
+            Self::Plan(plan) => plan_status_label(plan.status),
+        }
+    }
+
+    fn goal(&self) -> &str {
+        match self {
+            Self::Run(run) => &run.goal,
+            Self::Plan(plan) => &plan.goal,
         }
     }
 }
@@ -12028,12 +12427,14 @@ async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<(
         attach_tui(&paths, &run_id, show_hints).await?;
         let state = load_run(&paths, &run_id)?;
         if state.status == RunStatus::Completed && show_hints {
+            print_exit_summary_card(&state, &RunLoopOutcome::Done, plain);
             print_lifecycle_hints(&state);
         }
         return Ok(());
     }
     print_run_summary(&state);
     if state.status == RunStatus::Completed && show_hints {
+        print_exit_summary_card(&state, &RunLoopOutcome::Done, plain);
         print_lifecycle_hints(&state);
     }
     Ok(())
@@ -12041,7 +12442,7 @@ async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<(
 
 // SAFETY: Kill arguments are owned clap values at the command boundary.
 #[allow(clippy::needless_pass_by_value)]
-fn kill_command(run_id: String, force: bool) -> Result<()> {
+fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = match load_cli_run(&paths, &run_id) {
         Ok(state) => state,
@@ -12054,6 +12455,7 @@ fn kill_command(run_id: String, force: bool) -> Result<()> {
     };
     kill_loaded_run(&paths, &mut state, force)?;
     print_kill_banner("run", &run_prefix(&state.run_id), force, None);
+    print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain);
     Ok(())
 }
 
@@ -12236,6 +12638,7 @@ async fn resume_command(
     run_id: String,
     from_turn: Option<u32>,
     max_wall_seconds: Option<f64>,
+    plain: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = load_cli_run(&paths, &run_id)?;
@@ -12318,12 +12721,7 @@ async fn resume_command(
     state.child_pids.clear();
     save_state(&state)?;
     lock.release()?;
-    match outcome {
-        RunLoopOutcome::Done => println!("resumed run {} to completion", state.run_id),
-        RunLoopOutcome::PausedAtCap => println!("resumed run {} paused at cap", state.run_id),
-        RunLoopOutcome::Killed => println!("resumed run {} was killed", state.run_id),
-        RunLoopOutcome::Failed => println!("resumed run {} failed", state.run_id),
-    }
+    print_exit_summary_card(&state, &outcome, plain);
     Ok(())
 }
 
@@ -12547,6 +12945,7 @@ fn show_command(
     run_id: &str,
     turn: Option<u32>,
     why_failed: bool,
+    plain: bool,
     json_output: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
@@ -12589,6 +12988,7 @@ fn show_command(
     if why_failed {
         return show_run_why_failed(&state);
     }
+    print_run_summary_card(&state, plain);
     if let Some(line) = chain_context_line_for_working(&state.working_dir)? {
         println!("{line}");
     }
@@ -12897,7 +13297,7 @@ fn latest_run(paths: &DeadreckonPaths, all: bool) -> Result<deadreckon_core::Pip
     load_run(paths, &latest.run_id).map_err(CliError::from)
 }
 
-fn status_command(run_id: Option<String>, all: bool, json_output: bool) -> Result<()> {
+fn status_command(run_id: Option<String>, all: bool, plain: bool, json_output: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = match run_id {
         Some(run_id) => load_cli_run_with_scope(&paths, &run_id, all)?,
@@ -12916,12 +13316,12 @@ fn status_command(run_id: Option<String>, all: bool, json_output: bool) -> Resul
         );
         return Ok(());
     }
-    print_status_card(&state);
+    print_status_card(&state, plain);
     print_lifecycle_hints(&state);
     Ok(())
 }
 
-fn print_status_card(state: &deadreckon_core::PipelineState) {
+fn print_status_card(state: &deadreckon_core::PipelineState, plain: bool) {
     let paths = DeadreckonPaths::discover();
     let short = run_prefix(&state.run_id);
     let phase = state
@@ -12935,9 +13335,18 @@ fn print_status_card(state: &deadreckon_core::PipelineState) {
     let run = format!("{short} ({})", state.run_id);
     let state_line = format!("{} -> {next_action}", run_status_label(state.status));
     let updated = format!("{} ago", relative_age(state.updated_at));
+    let spend_summary = deadreckon_core::state::spend_summary(state).ok();
+    let total_spend = spend_summary
+        .as_ref()
+        .map(|summary| summary.total_usd)
+        .unwrap_or(state.total_spend_usd);
+    let approximate_spend = spend_summary
+        .as_ref()
+        .is_some_and(|summary| summary.any_subscription_turn || summary.any_estimated_turn);
     let spend = format!(
-        "${:.6} / {}",
-        state.total_spend_usd,
+        "{}${:.6} / {}",
+        if approximate_spend { "~" } else { "" },
+        total_spend,
         state
             .max_spend_usd
             .map(|cap| format!("${cap:.6}"))
@@ -12950,19 +13359,45 @@ fn print_status_card(state: &deadreckon_core::PipelineState) {
     );
     let goal = one_line(&state.goal, 110);
     let provider = state.provider.as_deref().unwrap_or("-");
-    let items = [
-        ("run", run.as_str()),
-        ("state", state_line.as_str()),
-        ("phase", phase.as_str()),
-        ("scope", state.scope.as_str()),
-        ("updated", updated.as_str()),
-        ("provider", provider),
-        ("sandbox", state.sandbox.as_str()),
-        ("spend", spend.as_str()),
-        ("wall", wall.as_str()),
-        ("goal", goal.as_str()),
+    let glyph = match state.status {
+        RunStatus::Completed => TitleGlyph::Success,
+        RunStatus::Failed => TitleGlyph::Failed,
+        RunStatus::Killed => TitleGlyph::Stopped,
+        RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => TitleGlyph::Preview,
+    };
+    let mut rows = vec![
+        ("run".to_string(), run),
+        ("state".to_string(), state_line),
+        ("phase".to_string(), phase),
+        ("scope".to_string(), state.scope.clone()),
+        ("updated".to_string(), updated),
+        ("provider".to_string(), provider.to_string()),
+        ("sandbox".to_string(), state.sandbox.clone()),
+        ("spend".to_string(), spend),
+        ("wall".to_string(), wall),
+        ("goal".to_string(), goal),
     ];
-    print_kv_block(&items);
+    if let Some(sleep) = sleep_status_for_working(&state.working_dir) {
+        rows.push(("sleep".to_string(), sleep));
+    }
+    print!(
+        "{}",
+        render_card(
+            &Card {
+                title: TitleLine {
+                    glyph,
+                    label: "deadreckon status".to_string(),
+                },
+                subtitle: Some(format!("{short} -> {next_action}")),
+                sections: vec![Section::KeyValue { rows }],
+                hints: vec![HintLine {
+                    label: "next".to_string(),
+                    command: next_action.clone(),
+                }],
+            },
+            &card_options(ui::Stream::Stdout, plain),
+        )
+    );
     print_run_locations(state);
     if let Ok(Some(line)) = chain_context_line_for_working(&state.working_dir) {
         println!("  chain:    {line}");
@@ -13040,7 +13475,26 @@ fn print_status_card(state: &deadreckon_core::PipelineState) {
     }
 }
 
+fn sleep_status_for_working(working_dir: &Path) -> Option<String> {
+    let path = sleep::metadata_path(working_dir);
+    let raw = fs::read_to_string(path).ok()?;
+    let metadata: sleep::SleepMetadata = serde_json::from_str(&raw).ok()?;
+    let mode = match metadata.mode {
+        sleep::SleepMode::Caffeinate => "caffeinate",
+        sleep::SleepMode::SystemdInhibit => "systemd-inhibit",
+        sleep::SleepMode::None => "none",
+        sleep::SleepMode::Unsupported => "unsupported",
+    };
+    Some(match (metadata.pid, metadata.skip_reason) {
+        (Some(pid), _) if deadreckon_core::pid_is_alive(pid) => format!("{mode} pid={pid}"),
+        (Some(pid), _) => format!("{mode} pid={pid} stale"),
+        (None, Some(reason)) => format!("{mode} ({})", sleep::skip_reason_label(reason)),
+        (None, None) => mode.to_string(),
+    })
+}
+
 fn print_run_summary(state: &deadreckon_core::PipelineState) {
+    print_run_summary_card(state, true);
     if let Some(line) = chain_context_line_for_working(&state.working_dir)
         .ok()
         .flatten()
@@ -13053,22 +13507,69 @@ fn print_run_summary(state: &deadreckon_core::PipelineState) {
             );
         }
     }
-    println!("{} {}", ui_heading("run"), ui_id(&state.run_id));
+}
+
+fn print_run_summary_card(state: &deadreckon_core::PipelineState, plain: bool) {
     let status = run_status_label(state.status);
-    let spend = format!("{:.6}", state.total_spend_usd);
-    let mut phase_line = None;
-    if let Some(phase) = state.active_phase() {
-        phase_line = Some(format!("{} {}", phase.id.0, phase.name));
-    }
+    let spend_summary = deadreckon_core::state::spend_summary(state).ok();
+    let total_spend = spend_summary
+        .as_ref()
+        .map(|summary| summary.total_usd)
+        .unwrap_or(state.total_spend_usd);
+    let approximate_spend = spend_summary
+        .as_ref()
+        .is_some_and(|summary| summary.any_subscription_turn || summary.any_estimated_turn);
+    let spend = format!(
+        "{}${:.6}",
+        if approximate_spend { "~" } else { "" },
+        total_spend
+    );
+    let phase_line = state
+        .active_phase()
+        .map(|phase| format!("{} {}", phase.id.0, phase.name));
     let mut items = vec![
-        ("status", status),
-        ("goal", state.goal.as_str()),
-        ("spend", spend.as_str()),
+        ("status".to_string(), status.to_string()),
+        ("goal".to_string(), state.goal.clone()),
+        ("spend".to_string(), spend),
     ];
-    if let Some(phase) = phase_line.as_deref() {
-        items.push(("phase", phase));
+    if let Some(phase) = phase_line {
+        items.push(("phase".to_string(), phase));
     }
-    print_kv_block(&items);
+    if let Some(sleep) = sleep_status_for_working(&state.working_dir) {
+        items.push(("sleep".to_string(), sleep));
+    }
+    if let Ok(Some(marker)) = read_parent_marker(&state.working_dir) {
+        let label = match marker.kind.as_str() {
+            "extended" => format!("extended from {}", run_prefix(&marker.parent_run_id)),
+            "materialized" => format!("materialized from {}", run_prefix(&marker.parent_run_id)),
+            other => format!("{other} from {}", run_prefix(&marker.parent_run_id)),
+        };
+        items.push(("lineage".to_string(), label));
+    }
+    let glyph = match state.status {
+        RunStatus::Completed => TitleGlyph::Success,
+        RunStatus::Failed => TitleGlyph::Failed,
+        RunStatus::Killed => TitleGlyph::Stopped,
+        RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => TitleGlyph::Preview,
+    };
+    print!(
+        "{}",
+        render_card(
+            &Card {
+                title: TitleLine {
+                    glyph,
+                    label: format!("run {}", run_prefix(&state.run_id)),
+                },
+                subtitle: Some(state.run_id.clone()),
+                sections: vec![Section::KeyValue { rows: items }],
+                hints: vec![HintLine {
+                    label: "show".to_string(),
+                    command: format!("deadreckon show {}", run_prefix(&state.run_id)),
+                }],
+            },
+            &card_options(ui::Stream::Stdout, plain),
+        )
+    );
     print_run_locations(state);
 }
 
@@ -13286,6 +13787,7 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
                 false,
                 false,
                 None,
+                false,
             )?,
             Some(CompletionAction::Abandon) => abandon_command(state.run_id.clone(), false, false)?,
             Some(CompletionAction::Docs) => {
@@ -13302,7 +13804,7 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
                 }))
                 .await?
             }
-            Some(CompletionAction::Show) => show_command(&state.run_id, None, false, false)?,
+            Some(CompletionAction::Show) => show_command(&state.run_id, None, false, false, false)?,
             Some(CompletionAction::Quit) | None => break,
         }
     }
@@ -13930,6 +14432,7 @@ async fn handle_tui_completion_key(
             false,
             false,
             None,
+            false,
         ),
         CompletionAction::Abandon => abandon_command(state.run_id.clone(), false, false),
         CompletionAction::Docs => {
@@ -13946,7 +14449,7 @@ async fn handle_tui_completion_key(
             }))
             .await
         }
-        CompletionAction::Show => show_command(&state.run_id, None, false, false),
+        CompletionAction::Show => show_command(&state.run_id, None, false, false, false),
         CompletionAction::Quit => Ok(()),
     };
     if let Err(err) = &action_result {

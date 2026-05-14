@@ -1,0 +1,10 @@
+╭────────────────────────────────────────────────────────────╮
+│ ▸ deadreckon run preview                                   │
+│   builds, tests pass, and opens in a browser               │
+│   turns         3 total  2 done  1 waiting                 │
+│   provider      cli:codex                                  │
+│   sleep         caffeinate /usr/bin/caffeinate             │
+│   show          deadreckon show abc12345                   │
+│                                                            │
+│   next          deadreckon run "builds" --yes              │
+╰────────────────────────────────────────────────────────────╯

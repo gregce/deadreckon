@@ -421,10 +421,10 @@ fn preview_flag_exits_zero_without_state_change() {
 
     assert_success(&output);
     let stderr = stderr(&output);
-    assert!(stderr.contains("deadreckon: ready to run"));
-    assert!(stderr.contains("  goal:     preview run"));
-    assert!(stderr.contains("  mode:     worktree"));
-    assert!(stderr.contains("  on success: deadreckon apply "));
+    assert!(stderr.contains("deadreckon run preview"));
+    assert!(stderr.contains("goal          preview run"));
+    assert!(stderr.contains("mode          worktree"));
+    assert!(stderr.contains("on success    deadreckon apply "));
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 
@@ -446,19 +446,20 @@ fn preview_block_contains_required_fields_in_order() {
     assert_success(&output);
     let stderr = stderr(&output);
     let fields = [
-        "deadreckon: ready to run",
-        "  goal:",
-        "  source:",
-        "  mode:",
-        "    branch:",
-        "    base:",
-        "    worktree:",
-        "  provider:",
-        "  model:",
-        "  sandbox:",
-        "  caps:",
-        "  on success:",
-        "  on fail:",
+        "deadreckon run preview",
+        "goal",
+        "source",
+        "mode",
+        "branch",
+        "base ref",
+        "worktree",
+        "provider",
+        "model",
+        "sandbox",
+        "caps",
+        "sleep",
+        "on success",
+        "on fail",
     ];
     let mut cursor = 0;
     for field in fields {
@@ -530,8 +531,8 @@ model = "configured-model"
 
     assert_success(&output);
     let stderr = stderr(&output);
-    assert!(stderr.contains("  provider: openai"), "{stderr}");
-    assert!(stderr.contains("  model:    override-model"), "{stderr}");
+    assert!(stderr.contains("provider      openai"), "{stderr}");
+    assert!(stderr.contains("model         override-model"), "{stderr}");
 }
 
 #[test]
@@ -1480,6 +1481,7 @@ fn post_apply_hint_includes_git_log_one_stat() {
         .arg("apply")
         .arg(&run_id)
         .arg("--no-confirm")
+        .arg("--plain")
         .output()
         .expect("apply");
 
@@ -1489,6 +1491,8 @@ fn post_apply_hint_includes_git_log_one_stat() {
     assert!(stdout.contains("commit "));
     assert!(stdout.contains("Cargo.toml"));
     assert!(stdout.contains(&format!("next: deadreckon discard {}", &run_id[..8])));
+    assert!(stdout.contains("completed run"), "{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout}");
 }
 
 #[test]
@@ -1820,7 +1824,7 @@ fn list_default_is_compact_and_points_to_show_for_details() {
     let help_stdout = stdout(&help);
     assert!(help_stdout.contains("deadreckon show <short-id>"));
     assert!(help_stdout.contains("orchestration plans"));
-    assert!(!help_stdout.contains("--full"));
+    assert!(help_stdout.contains("--full"));
     assert!(compact_stdout.contains("deadreckon show <id>"));
     assert!(!compact_stdout.contains("deadreckon list --full"));
 }

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 use chrono::Utc;
@@ -24,6 +23,7 @@ use deadreckon_core::docs::{TurnDocInput, append_turn_doc, incremental_path};
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::events::{RunEvent, RunEventKind, emit_event, event_preview, tool_args_json};
 use deadreckon_core::gate::{acceptance_spec_path_for_run_root, validate_acceptance_marker};
+use deadreckon_core::git::run_git;
 use deadreckon_core::paths::DeadreckonPaths;
 use deadreckon_core::promotion::promote_completed_run;
 use deadreckon_core::state::{
@@ -215,6 +215,7 @@ pub async fn run_turn_loop(
                 total_cost_usd: state.total_spend_usd,
                 cap_usd: config.max_spend_usd,
                 subscription: response.spend.subscription,
+                estimated: false,
                 wall_time_seconds: response.spend.wall_time_seconds,
                 wall_time_cap_seconds: config.max_wall_seconds,
             },
@@ -1357,28 +1358,12 @@ fn commit_worktree_turn(state: &PipelineState, turn: u32, label: &str) -> Result
 }
 
 fn git_quiet(cwd: &Path, args: &[&str]) -> Result<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git(cwd, args)?;
     Ok(output.status.success())
 }
 
 fn git_status(cwd: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git(cwd, args)?;
     if output.status.success() {
         Ok(())
     } else {

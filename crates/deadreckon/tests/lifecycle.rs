@@ -762,8 +762,10 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .output()
         .expect("attach");
     assert_success(&attach);
-    assert!(stdout(&attach).contains("export:"));
-    assert!(stdout(&attach).contains("extend:"));
+    let attach_stdout = stdout(&attach);
+    assert!(attach_stdout.contains("completed run"), "{attach_stdout}");
+    assert!(attach_stdout.contains("export:"));
+    assert!(attach_stdout.contains("extend:"));
 
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1572,11 +1574,19 @@ fn extended_run_id(output: &std::process::Output) -> String {
 }
 
 fn run_id_from_stdout(output: &std::process::Output) -> String {
-    stdout(output)
+    let stdout = stdout(output);
+    stdout
         .lines()
-        .find_map(|line| line.strip_prefix("completed run "))
+        .find_map(|line| {
+            line.strip_prefix("completed run ")
+                .map(str::to_string)
+                .or_else(|| {
+                    line.strip_prefix("started run ")
+                        .and_then(|rest| rest.rsplit_once('('))
+                        .map(|(_, id)| id.trim_end_matches(')').to_string())
+                })
+        })
         .expect("run id")
-        .to_string()
 }
 
 fn assert_success(output: &std::process::Output) {

@@ -21,6 +21,8 @@ pub struct SpendRecord {
     pub cap_usd: Option<f64>,
     #[serde(default)]
     pub subscription: bool,
+    #[serde(default)]
+    pub estimated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_time_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

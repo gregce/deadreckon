@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
+use crate::git::{run_git, run_git_with_input};
 use crate::paths::{DeadreckonPaths, sanitize_slug, workspace_scope};
 
 pub const CODEBASE_RECORD_VERSION: u32 = 1;
@@ -397,15 +397,7 @@ pub fn read_codebase_record(working_dir: &Path) -> Result<CodebaseRecord> {
 }
 
 pub fn find_git_root(path: &Path) -> Result<Option<PathBuf>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git(path, &["rev-parse", "--show-toplevel"])?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -422,15 +414,7 @@ pub fn user_error(message: &str, try_hint: &str) -> DeadreckonError {
 }
 
 fn git_ref_exists(git_root: &Path, name: &str) -> Result<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(git_root)
-        .args(["rev-parse", "--verify", name])
-        .output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git(git_root, &["rev-parse", "--verify", name])?;
     Ok(output.status.success())
 }
 
@@ -457,15 +441,7 @@ fn append_git_exclude(git_root: &Path, pattern: &str) -> Result<()> {
 }
 
 fn git_stdout(git_root: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(git_root)
-        .args(args)
-        .output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git(git_root, args)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(DeadreckonError::InvalidInput(if stderr.is_empty() {
@@ -478,15 +454,7 @@ fn git_stdout(git_root: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_status(git_root: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(git_root)
-        .args(args)
-        .output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git(git_root, args)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -551,15 +519,7 @@ fn apply_dirty_diff(git_root: &Path, worktree_path: &Path, staged: bool) -> Resu
     if staged {
         diff_args.push("--cached");
     }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(git_root)
-        .args(&diff_args)
-        .output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git(git_root, &diff_args)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(DeadreckonError::InvalidInput(if stderr.is_empty() {
@@ -571,32 +531,11 @@ fn apply_dirty_diff(git_root: &Path, worktree_path: &Path, staged: bool) -> Resu
     if output.stdout.is_empty() {
         return Ok(());
     }
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .args(["apply", "--whitespace=nowarn", "-"])
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        use std::io::Write;
-        stdin
-            .write_all(&output.stdout)
-            .map_err(|source| DeadreckonError::Io {
-                path: worktree_path.to_path_buf(),
-                source,
-            })?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git_with_input(
+        worktree_path,
+        &["apply", "--whitespace=nowarn", "-"],
+        &output.stdout,
+    )?;
     if output.status.success() {
         Ok(())
     } else {

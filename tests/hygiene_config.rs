@@ -253,7 +253,10 @@ fn binary_crate_does_not_inherit_print_deny() {
         fs::read_to_string(root.join("crates/deadreckon/src/main.rs")).expect("read main.rs");
     assert!(!main_rs.contains("clippy::print_stdout"));
     assert!(!main_rs.contains("clippy::print_stderr"));
-    assert!(!root.join("crates/deadreckon/src/lib.rs").exists());
+    let lib_rs =
+        fs::read_to_string(root.join("crates/deadreckon/src/lib.rs")).expect("read lib.rs");
+    assert!(!lib_rs.contains("clippy::print_stdout"));
+    assert!(!lib_rs.contains("clippy::print_stderr"));
 }
 
 #[test]

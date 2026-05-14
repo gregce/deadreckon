@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
@@ -13,6 +12,7 @@ use serde_json::json;
 use crate::artifacts::{TraceRecord, append_trace, copy_tree, inventory_files};
 use crate::codebase::{CodebaseMode, read_codebase_record};
 use crate::error::{DeadreckonError, IoContext, Result};
+use crate::git::run_git;
 use crate::state::{PipelineState, append_json_line};
 
 pub const DOCS_DIR: &str = ".deadreckon/docs";
@@ -1880,15 +1880,7 @@ fn diff_numstat(state: &PipelineState, base: Option<&str>) -> Result<(u64, u64)>
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git(cwd, args)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
@@ -1902,15 +1894,7 @@ fn git_output(cwd: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_status(cwd: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git(cwd, args)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1953,15 +1937,7 @@ fn commit_docs_if_worktree(state: &PipelineState) -> Result<()> {
 }
 
 fn git_quiet(cwd: &Path, args: &[&str]) -> Result<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(|source| DeadreckonError::Io {
-            path: PathBuf::from("git"),
-            source,
-        })?;
+    let output = run_git(cwd, args)?;
     Ok(output.status.success())
 }
 

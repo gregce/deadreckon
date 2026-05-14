@@ -530,7 +530,7 @@ fn plan_records_explicit_planner_and_child_providers() {
 }
 
 #[test]
-fn quiet_plain_combined_emits_only_final_line() {
+fn quiet_plain_combined_emits_no_stdout() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -552,9 +552,7 @@ fn quiet_plain_combined_emits_only_final_line() {
 
     assert_success(&output);
     let out = stdout(&output);
-    let lines = out.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 1, "{out}");
-    assert!(lines[0].contains("completed"), "{out}");
+    assert_eq!(out, "");
     assert!(!out.contains("\x1b["), "{out:?}");
 }
 

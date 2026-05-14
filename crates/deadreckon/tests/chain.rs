@@ -2778,12 +2778,20 @@ fn single_run_attach_no_chain_banner_when_step_json_absent() {
     let output_stdout = stdout(&output);
     let run_id = output_stdout
         .lines()
-        .find_map(|line| line.strip_prefix("completed run "))
+        .find_map(|line| {
+            line.strip_prefix("completed run ")
+                .map(str::to_string)
+                .or_else(|| {
+                    line.strip_prefix("started run ")
+                        .and_then(|rest| rest.rsplit_once('('))
+                        .map(|(_, id)| id.trim_end_matches(')').to_string())
+                })
+        })
         .expect("run id");
 
     let attach = deadreckon(&paths)
         .current_dir(&repo)
-        .args(["attach", run_id])
+        .args(["attach", &run_id])
         .output()
         .expect("attach");
 

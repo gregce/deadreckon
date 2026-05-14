@@ -552,6 +552,12 @@ pub(crate) enum Commands {
         plain: bool,
         #[arg(
             long,
+            value_parser = ["auto", "on", "off"],
+            help = "Prevent system sleep during the run: auto, on, or off"
+        )]
+        prevent_sleep: Option<String>,
+        #[arg(
+            long,
             help = "Suppress completion chatter and interactive follow-up prompts"
         )]
         quiet: bool,
@@ -879,6 +885,13 @@ pub(crate) enum Commands {
         scope: Option<String>,
         #[arg(long, help = "Show runs from all projects")]
         all: bool,
+        #[arg(
+            long,
+            help = "Keep the script-friendly table layout without the summary card"
+        )]
+        full: bool,
+        #[arg(long, help = "Plain output without ANSI affordances")]
+        plain: bool,
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
     },
@@ -999,6 +1012,8 @@ pub(crate) enum Commands {
         cleanup: bool,
         #[arg(long, help = "Commit message override")]
         message: Option<String>,
+        #[arg(long, help = "Plain output without ANSI affordances")]
+        plain: bool,
     },
     #[command(
         next_help_heading = "Cleanup And Recovery",
@@ -1143,6 +1158,8 @@ pub(crate) enum Commands {
             help = "Escalate subprocess termination"
         )]
         force: bool,
+        #[arg(long, help = "Plain output without ANSI affordances")]
+        plain: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -1157,6 +1174,8 @@ pub(crate) enum Commands {
         from_turn: Option<u32>,
         #[arg(long, help = "Override wall-clock cap")]
         max_wall_seconds: Option<f64>,
+        #[arg(long, help = "Plain output without ANSI affordances")]
+        plain: bool,
     },
     #[command(
         next_help_heading = "Cleanup And Recovery",
@@ -1188,6 +1207,8 @@ pub(crate) enum Commands {
         turn: Option<u32>,
         #[arg(long, help = "Explain the most likely failure cause")]
         why_failed: bool,
+        #[arg(long, help = "Plain output without ANSI affordances")]
+        plain: bool,
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
     },
@@ -1216,6 +1237,8 @@ pub(crate) enum Commands {
             help = "Use the global latest run instead of the current project"
         )]
         all: bool,
+        #[arg(long, help = "Plain output without ANSI affordances")]
+        plain: bool,
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
     },
@@ -1641,6 +1664,7 @@ pub(crate) struct RunCommandArgs {
     pub(crate) preview: bool,
     pub(crate) brief: bool,
     pub(crate) plain: bool,
+    pub(crate) prevent_sleep: Option<String>,
     pub(crate) quiet: bool,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,

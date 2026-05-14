@@ -26,7 +26,11 @@ fn raw_ansi_escapes_stay_in_ui_module() {
     let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");
     assert!(!main.contains("\\x1b["), "main.rs contains raw ANSI");
     let ui = fs::read_to_string(manifest.join("src/ui.rs")).expect("ui");
-    assert!(ui.contains("\\x1b["), "ui.rs owns ANSI rendering");
+    let ui_card = fs::read_to_string(manifest.join("src/ui_card.rs")).expect("ui_card");
+    assert!(
+        ui.contains("\\x1b[") || ui_card.contains("\\u{1b}["),
+        "ui modules own ANSI rendering"
+    );
 }
 
 #[test]
@@ -77,7 +81,7 @@ fn attach_plain_displays_running_for_executing_run() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let stdout = stdout(&output);
-    assert!(stdout.contains("status: running"), "{stdout}");
+    assert!(stdout.contains("status        running"), "{stdout}");
     assert!(!stdout.contains("executing"), "{stdout}");
 }
 
@@ -102,7 +106,7 @@ fn attach_plan_plain_displays_running_for_inflight_child() {
     );
     let mut plan = Plan::new(
         "orchestrate running child",
-        PlanMode::Split,
+        PlanMode::FullPlan,
         vec![child, waiting],
         PlanProviders {
             planner: Some("smoke:planner".to_string()),

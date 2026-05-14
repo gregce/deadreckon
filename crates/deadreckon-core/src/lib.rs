@@ -11,6 +11,7 @@ pub mod docs;
 pub mod error;
 pub mod events;
 pub mod gate;
+pub mod git;
 pub mod glossary;
 pub mod lock;
 pub mod paths;

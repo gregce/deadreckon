@@ -9,6 +9,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use crate::artifacts::SpendRecord;
 use crate::codebase::{CodebaseMode, CodebaseRecord, write_codebase_record};
 use crate::docs::ensure_docs_started;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
@@ -129,6 +130,16 @@ pub struct RunListEntry {
     pub status: RunStatus,
     pub updated_at: DateTime<Utc>,
     pub state_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpendSummary {
+    pub total_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub wall_seconds: f64,
+    pub any_subscription_turn: bool,
+    pub any_estimated_turn: bool,
 }
 
 impl PipelineState {
@@ -268,6 +279,44 @@ pub fn save_state(state: &PipelineState) -> Result<()> {
 pub fn load_state(path: &Path) -> Result<PipelineState> {
     let data = fs::read(path).with_path(path)?;
     serde_json::from_slice(&data).with_json_path(path)
+}
+
+pub fn spend_summary(state: &PipelineState) -> Result<SpendSummary> {
+    let path = state.run_root.join("spend.jsonl");
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SpendSummary {
+                total_usd: state.total_spend_usd,
+                wall_seconds: state.total_wall_seconds,
+                ..SpendSummary::default()
+            });
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io { path, source });
+        }
+    };
+    let mut summary = SpendSummary::default();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let record: SpendRecord =
+            serde_json::from_str(line).map_err(|source| DeadreckonError::Json {
+                path: path.clone(),
+                source,
+            })?;
+        summary.total_usd = record.total_cost_usd;
+        summary.input_tokens = summary.input_tokens.saturating_add(record.input_tokens);
+        summary.output_tokens = summary.output_tokens.saturating_add(record.output_tokens);
+        summary.wall_seconds += record.wall_time_seconds.unwrap_or(0.0);
+        summary.any_subscription_turn |= record.subscription;
+        summary.any_estimated_turn |= record.estimated;
+    }
+    if summary.wall_seconds == 0.0 {
+        summary.wall_seconds = state.total_wall_seconds;
+    }
+    if summary.total_usd == 0.0 {
+        summary.total_usd = state.total_spend_usd;
+    }
+    Ok(summary)
 }
 
 pub fn write_current_pointer(paths: &DeadreckonPaths, state: &PipelineState) -> Result<()> {
