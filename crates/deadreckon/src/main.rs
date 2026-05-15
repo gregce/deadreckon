@@ -117,12 +117,34 @@ enum CliError {
     TomlDe(#[from] toml::de::Error),
     #[error("TOML encode error: {0}")]
     TomlSer(#[from] toml::ser::Error),
+    #[error("{message}")]
+    Exit {
+        code: i32,
+        message: String,
+        hint: String,
+    },
 }
 
 type Result<T> = std::result::Result<T, CliError>;
 
+impl CliError {
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::Exit { code, .. } => *code,
+            Self::Core(_)
+            | Self::Provider(_)
+            | Self::Sandbox(_)
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::TomlDe(_)
+            | Self::TomlSer(_) => 1,
+        }
+    }
+}
+
 fn error_hint(err: &CliError) -> String {
     match err {
+        CliError::Exit { hint, .. } => hint.clone(),
         CliError::Provider(deadreckon_providers::ProviderError::MissingCredential(_))
         | CliError::Provider(deadreckon_providers::ProviderError::NoRoute(_)) => {
             "run `deadreckon init` or `deadreckon config set providers.anthropic.api_key <KEY>`"
@@ -202,9 +224,10 @@ fn print_kv_block(items: &[(&str, &str)]) {
 #[tokio::main]
 async fn main() {
     if let Err(err) = main_inner().await {
+        let exit_code = err.exit_code();
         eprintln!("{} {err}", ui_error("error:"));
         let _ = ui::hint(ui::Stream::Stderr, error_hint(&err));
-        std::process::exit(1);
+        std::process::exit(exit_code);
     }
 }
 
@@ -1293,7 +1316,7 @@ async fn providers_command(command: ProvidersCommand) -> Result<()> {
 
 async fn update_command(
     check: bool,
-    _force: bool,
+    force: bool,
     allow_prerelease: bool,
     quiet: bool,
     _plain: bool,
@@ -1321,9 +1344,166 @@ async fn update_command(
         Channel::Source => Err(CliError::Core(DeadreckonError::InvalidInput(
             "update: channel = source; in-place swap not supported".to_string(),
         ))),
-        Channel::Shell => Err(CliError::Core(DeadreckonError::InvalidInput(
-            "update: shell channel binary swap is not implemented yet".to_string(),
-        ))),
+        Channel::Shell => {
+            update_shell_channel(&paths, &receipt, force, allow_prerelease, quiet).await
+        }
+    }
+}
+
+async fn update_shell_channel(
+    paths: &DeadreckonPaths,
+    receipt: &deadreckon_core::install_receipt::Receipt,
+    force: bool,
+    allow_prerelease: bool,
+    quiet: bool,
+) -> Result<()> {
+    if receipt.channel != Channel::Shell {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "update: shell updater requires shell receipt, got {}",
+            receipt.channel.as_str()
+        ))));
+    }
+    let backup_dir = create_shell_update_backup(paths, receipt)?;
+    match run_shell_swap(receipt, force, allow_prerelease, quiet).await {
+        Ok(()) => {
+            prune_shell_backups(paths)?;
+            if !quiet {
+                println!("channel: shell");
+                println!("current: {}", update_current_version(receipt));
+                println!("backup: {}", backup_dir.display());
+                println!("updated: {}", receipt.binary_path.display());
+            }
+            Ok(())
+        }
+        Err(source) => Err(shell_update_failure(receipt, &backup_dir, &source)),
+    }
+}
+
+fn create_shell_update_backup(
+    paths: &DeadreckonPaths,
+    receipt: &deadreckon_core::install_receipt::Receipt,
+) -> Result<PathBuf> {
+    let root = shell_backup_root(paths);
+    fs::create_dir_all(&root)?;
+    let backup_dir = unique_shell_backup_dir(&root);
+    fs::create_dir_all(&backup_dir)?;
+    fs::copy(&receipt.binary_path, backup_dir.join("deadreckon"))?;
+    fs::write(
+        backup_dir.join("receipt.json"),
+        serde_json::to_vec_pretty(receipt)?,
+    )?;
+    Ok(backup_dir)
+}
+
+fn shell_backup_root(paths: &DeadreckonPaths) -> PathBuf {
+    paths.home().join("update-backups")
+}
+
+fn unique_shell_backup_dir(root: &Path) -> PathBuf {
+    let stamp = Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
+    let mut candidate = root.join(&stamp);
+    let mut suffix = 1_u32;
+    while candidate.exists() {
+        candidate = root.join(format!("{stamp}-{suffix}"));
+        suffix += 1;
+    }
+    candidate
+}
+
+async fn run_shell_swap(
+    receipt: &deadreckon_core::install_receipt::Receipt,
+    force: bool,
+    allow_prerelease: bool,
+    quiet: bool,
+) -> std::result::Result<(), String> {
+    if std::env::var_os("DEADRECKON_UPDATE_TEST_SHELL_FAIL").is_some() {
+        return Err("test requested swap failure".to_string());
+    }
+    if let Ok(replacement) = std::env::var("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT") {
+        fs::copy(replacement, &receipt.binary_path).map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+    run_axoupdater_shell_update(receipt, force, allow_prerelease, quiet).await
+}
+
+#[cfg(feature = "selfupdate")]
+async fn run_axoupdater_shell_update(
+    receipt: &deadreckon_core::install_receipt::Receipt,
+    force: bool,
+    allow_prerelease: bool,
+    quiet: bool,
+) -> std::result::Result<(), String> {
+    let mut updater = axoupdater::AxoUpdater::new_for("deadreckon");
+    updater.set_release_source(axoupdater::ReleaseSource {
+        release_type: axoupdater::ReleaseSourceType::GitHub,
+        owner: "gdc".to_string(),
+        name: "deadreckon".to_string(),
+        app_name: "deadreckon".to_string(),
+    });
+    let version = update_current_version(receipt)
+        .parse::<axoupdater::Version>()
+        .map_err(|err| err.to_string())?;
+    updater
+        .set_current_version(version)
+        .map_err(|err| err.to_string())?;
+    if let Some(parent) = receipt.binary_path.parent() {
+        updater.set_install_dir(parent.to_string_lossy().to_string());
+    }
+    if allow_prerelease {
+        updater.configure_version_specifier(axoupdater::UpdateRequest::LatestMaybePrerelease);
+    }
+    if force {
+        updater.always_update(true);
+    }
+    if quiet {
+        updater.disable_installer_output();
+    }
+    updater.run().await.map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(feature = "selfupdate"))]
+async fn run_axoupdater_shell_update(
+    _receipt: &deadreckon_core::install_receipt::Receipt,
+    _force: bool,
+    _allow_prerelease: bool,
+    _quiet: bool,
+) -> std::result::Result<(), String> {
+    Err("selfupdate feature is disabled".to_string())
+}
+
+fn prune_shell_backups(paths: &DeadreckonPaths) -> Result<()> {
+    let root = shell_backup_root(paths);
+    let mut backups = fs::read_dir(&root)?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            entry.path().is_dir().then_some(entry.path())
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    let remove_count = backups.len().saturating_sub(3);
+    for backup in backups.into_iter().take(remove_count) {
+        fs::remove_dir_all(backup)?;
+    }
+    Ok(())
+}
+
+fn shell_update_failure(
+    receipt: &deadreckon_core::install_receipt::Receipt,
+    backup_dir: &Path,
+    source: &str,
+) -> CliError {
+    CliError::Exit {
+        code: 2,
+        message: format!(
+            "update: swap failed; prior binary preserved: {source}; backup {}",
+            backup_dir.display()
+        ),
+        hint: format!(
+            "try: cp {} {}",
+            backup_dir.join("deadreckon").display(),
+            receipt.binary_path.display()
+        ),
     }
 }
 

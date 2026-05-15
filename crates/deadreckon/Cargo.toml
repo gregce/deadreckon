@@ -8,7 +8,12 @@ keywords.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["selfupdate"]
+selfupdate = ["dep:axoupdater"]
+
 [dependencies]
+axoupdater = { workspace = true, optional = true }
 chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true

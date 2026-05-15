@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used)]
 
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -145,6 +146,105 @@ fn update_source_refuses_with_cargo_install_path() {
     );
 }
 
+#[test]
+fn update_shell_writes_backup_before_swap() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    let binary = temp.path().join("bin/deadreckon");
+    let replacement = temp.path().join("replacement/deadreckon");
+    write_file(&binary, b"old binary");
+    write_file(&replacement, b"new binary");
+    write_receipt(&paths, &shell_receipt(&binary)).expect("receipt");
+
+    let output = deadreckon(&paths)
+        .arg("update")
+        .env("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT", &replacement)
+        .output()
+        .expect("update");
+
+    assert_success(&output);
+    assert_eq!(fs::read(&binary).expect("binary"), b"new binary");
+    let backup = newest_backup(&paths);
+    assert_eq!(
+        fs::read(backup.join("deadreckon")).expect("backup binary"),
+        b"old binary"
+    );
+    assert!(backup.join("receipt.json").exists());
+}
+
+#[test]
+fn update_shell_prunes_backups_to_three() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    let binary = temp.path().join("bin/deadreckon");
+    let replacement = temp.path().join("replacement/deadreckon");
+    write_file(&binary, b"old binary");
+    write_file(&replacement, b"new binary");
+    write_receipt(&paths, &shell_receipt(&binary)).expect("receipt");
+    for index in 0..4 {
+        fs::create_dir_all(
+            paths
+                .home()
+                .join("update-backups")
+                .join(format!("2000010100000{index}")),
+        )
+        .expect("old backup");
+    }
+
+    let output = deadreckon(&paths)
+        .arg("update")
+        .env("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT", &replacement)
+        .output()
+        .expect("update");
+
+    assert_success(&output);
+    let backups = backup_dirs(&paths);
+    assert_eq!(backups.len(), 3, "{backups:?}");
+}
+
+#[test]
+fn update_shell_swap_failure_preserves_binary() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    let binary = temp.path().join("bin/deadreckon");
+    write_file(&binary, b"old binary");
+    write_receipt(&paths, &shell_receipt(&binary)).expect("receipt");
+
+    let output = deadreckon(&paths)
+        .arg("update")
+        .env("DEADRECKON_UPDATE_TEST_SHELL_FAIL", "1")
+        .output()
+        .expect("update");
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(fs::read(&binary).expect("binary"), b"old binary");
+    assert!(
+        stderr(&output).contains("update: swap failed"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(newest_backup(&paths).join("deadreckon").exists());
+}
+
+#[test]
+fn update_shell_rejects_swap_on_non_shell_receipt() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    let replacement = temp.path().join("replacement/deadreckon");
+    write_file(&replacement, b"new binary");
+    write_receipt(&paths, &receipt(Channel::Npm)).expect("receipt");
+
+    let output = deadreckon(&paths)
+        .arg("update")
+        .env("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT", &replacement)
+        .output()
+        .expect("update");
+
+    assert_success(&output);
+    assert!(stdout(&output).contains("try: bun update -g deadreckon"));
+    assert!(!paths.home().join("update-backups").exists());
+}
+
 fn paths(temp: &TempDir) -> DeadreckonPaths {
     DeadreckonPaths::from_home(temp.path().join("home"))
 }
@@ -159,6 +259,38 @@ fn receipt(channel: Channel) -> Receipt {
         platform_package: (channel == Channel::Npm).then(|| "deadreckon-darwin-arm64".to_string()),
         receipt_version: INSTALL_RECEIPT_VERSION,
     }
+}
+
+fn shell_receipt(binary_path: &std::path::Path) -> Receipt {
+    let mut receipt = receipt(Channel::Shell);
+    receipt.binary_path = binary_path.to_path_buf();
+    receipt.install_source = Some("https://github.com/gdc/deadreckon/releases".to_string());
+    receipt
+}
+
+fn write_file(path: &std::path::Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("parent");
+    }
+    fs::write(path, bytes).expect("write file");
+}
+
+fn newest_backup(paths: &DeadreckonPaths) -> PathBuf {
+    backup_dirs(paths)
+        .pop()
+        .expect("at least one update backup")
+}
+
+fn backup_dirs(paths: &DeadreckonPaths) -> Vec<PathBuf> {
+    let mut backups = fs::read_dir(paths.home().join("update-backups"))
+        .expect("backup dir")
+        .filter_map(|entry| {
+            let path = entry.expect("entry").path();
+            path.is_dir().then_some(path)
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    backups
 }
 
 fn deadreckon(paths: &DeadreckonPaths) -> Command {
