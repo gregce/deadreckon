@@ -2,6 +2,10 @@
 name = "deadreckon"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Long-running, BYOK, sandboxed agentic CLI harness."
+readme = "../../README.md"
 categories.workspace = true
 keywords.workspace = true
 

@@ -12,7 +12,7 @@ resolver = "3"
 edition = "2024"
 version = "0.1.0"
 license = "MIT"
-repository = "file:///Users/gdc/deadreckon"
+repository = "https://github.com/gdc/deadreckon"
 categories = ["development-tools"]
 keywords = ["agent", "cli", "coding"]
 
