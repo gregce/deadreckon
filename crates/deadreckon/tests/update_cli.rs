@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{Duration, Utc};
 use deadreckon_core::DeadreckonPaths;
@@ -245,6 +246,134 @@ fn update_shell_rejects_swap_on_non_shell_receipt() {
     assert!(!paths.home().join("update-backups").exists());
 }
 
+#[test]
+fn startup_check_skips_under_non_tty() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    write_receipt(&paths, &receipt(Channel::Npm)).expect("receipt");
+    write_update_available_cache(&paths, "0.2.3");
+
+    let output = deadreckon(&paths)
+        .args(["list", "--plain"])
+        .output()
+        .expect("list");
+
+    assert_success(&output);
+    assert!(
+        !stderr(&output).contains("deadreckon 0.2.3 is available"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn startup_check_skips_under_env_disable() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    write_receipt(&paths, &receipt(Channel::Npm)).expect("receipt");
+    write_update_available_cache(&paths, "0.2.3");
+
+    let output = deadreckon(&paths)
+        .args(["list", "--plain"])
+        .env("DEADRECKON_UPDATE_TEST_TTY", "1")
+        .env("DEADRECKON_UPDATE_CHECK", "0")
+        .output()
+        .expect("list");
+
+    assert_success(&output);
+    assert!(
+        !stderr(&output).contains("deadreckon 0.2.3 is available"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn startup_check_skips_for_source_channel() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    write_receipt(&paths, &receipt(Channel::Source)).expect("receipt");
+    write_update_available_cache(&paths, "0.2.3");
+
+    let output = deadreckon(&paths)
+        .args(["list", "--plain"])
+        .env("DEADRECKON_UPDATE_TEST_TTY", "1")
+        .output()
+        .expect("list");
+
+    assert_success(&output);
+    assert!(
+        !stderr(&output).contains("deadreckon 0.2.3 is available"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn startup_check_skips_for_update_subcommand() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    write_receipt(&paths, &receipt(Channel::Npm)).expect("receipt");
+    write_update_available_cache(&paths, "0.2.3");
+
+    let output = deadreckon(&paths)
+        .args(["update", "--check"])
+        .env("DEADRECKON_UPDATE_TEST_TTY", "1")
+        .output()
+        .expect("update");
+
+    assert_success(&output);
+    assert!(
+        !stderr(&output).contains("deadreckon 0.2.3 is available"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn startup_check_does_not_block_subcommand_exit() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    write_receipt(&paths, &receipt(Channel::Npm)).expect("receipt");
+
+    let started = Instant::now();
+    let output = deadreckon(&paths)
+        .args(["list", "--plain"])
+        .env("DEADRECKON_UPDATE_TEST_TTY", "1")
+        .env("DEADRECKON_UPDATE_TEST_FETCH_DELAY_MS", "2000")
+        .env("DEADRECKON_UPDATE_TEST_LATEST_VERSION", "0.2.3")
+        .output()
+        .expect("list");
+
+    assert_success(&output);
+    assert!(
+        started.elapsed() < StdDuration::from_millis(750),
+        "startup check blocked for {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn startup_check_prints_hint_when_cache_stale() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    write_receipt(&paths, &receipt(Channel::Npm)).expect("receipt");
+    write_update_available_cache(&paths, "0.2.3");
+
+    let output = deadreckon(&paths)
+        .args(["list", "--plain"])
+        .env("DEADRECKON_UPDATE_TEST_TTY", "1")
+        .output()
+        .expect("list");
+
+    assert_success(&output);
+    assert!(
+        stderr(&output).contains("deadreckon 0.2.3 is available. Run `deadreckon update`."),
+        "{}",
+        stderr(&output)
+    );
+}
+
 fn paths(temp: &TempDir) -> DeadreckonPaths {
     DeadreckonPaths::from_home(temp.path().join("home"))
 }
@@ -266,6 +395,22 @@ fn shell_receipt(binary_path: &std::path::Path) -> Receipt {
     receipt.binary_path = binary_path.to_path_buf();
     receipt.install_source = Some("https://github.com/gdc/deadreckon/releases".to_string());
     receipt
+}
+
+fn write_update_available_cache(paths: &DeadreckonPaths, latest_version: &str) {
+    write_cache(
+        paths,
+        &Cache {
+            checked_at: Utc::now(),
+            latest_version: latest_version.to_string(),
+            current_version: "0.1.0".to_string(),
+            release_url: format!(
+                "https://github.com/gdc/deadreckon/releases/tag/v{latest_version}"
+            ),
+            update_available: true,
+        },
+    )
+    .expect("cache");
 }
 
 fn write_file(path: &std::path::Path, bytes: &[u8]) {

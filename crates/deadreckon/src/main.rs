@@ -14,6 +14,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::{Command as ClapCommand, CommandFactory, Parser};
@@ -250,7 +251,8 @@ async fn main_inner() -> Result<()> {
         plain: false,
         json: false,
     });
-    match command {
+    let startup_update_check = start_startup_update_check(&command);
+    let result = match command {
         Commands::Init {
             provider,
             api_key,
@@ -728,6 +730,66 @@ async fn main_inner() -> Result<()> {
             status_command(run_id, all, plain, json)
         }
         Commands::Import { source } => import_command(source),
+    };
+    print_startup_update_hint(startup_update_check).await;
+    result
+}
+
+fn start_startup_update_check(
+    command: &Commands,
+) -> Option<tokio::task::JoinHandle<Option<String>>> {
+    if !startup_update_check_enabled(command) {
+        return None;
+    }
+    Some(tokio::spawn(async {
+        let paths = DeadreckonPaths::discover();
+        let Ok(receipt) = update_receipt_for_current_binary(&paths) else {
+            return None;
+        };
+        if receipt.channel == Channel::Source {
+            return None;
+        }
+
+        let now = Utc::now();
+        match read_cache(&paths) {
+            Ok(Some(cache)) if !cache.is_stale(now) => cache
+                .update_available
+                .then(|| startup_update_hint(&cache.latest_version)),
+            Ok(_) => {
+                let current = update_current_version(&receipt);
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        resolve_latest_update(&paths, &current, false),
+                    )
+                    .await;
+                });
+                None
+            }
+            Err(_) => None,
+        }
+    }))
+}
+
+fn startup_update_check_enabled(command: &Commands) -> bool {
+    std::env::var("DEADRECKON_UPDATE_CHECK").as_deref() != Ok("0")
+        && startup_update_stdout_is_tty()
+        && !matches!(command, Commands::Update { .. } | Commands::Doctor { .. })
+}
+
+fn startup_update_stdout_is_tty() -> bool {
+    std::env::var_os("DEADRECKON_UPDATE_TEST_TTY").is_some() || io::stdout().is_terminal()
+}
+
+fn startup_update_hint(version: &str) -> String {
+    format!("→ deadreckon {version} is available. Run `deadreckon update`.")
+}
+
+async fn print_startup_update_hint(check: Option<tokio::task::JoinHandle<Option<String>>>) {
+    if let Some(check) = check
+        && let Ok(Ok(Some(hint))) = tokio::time::timeout(Duration::from_millis(50), check).await
+    {
+        eprintln!("{hint}");
     }
 }
 
@@ -1602,6 +1664,11 @@ async fn resolve_latest_update(
 }
 
 async fn fetch_latest_update(allow_prerelease: bool) -> std::result::Result<LatestUpdate, String> {
+    if let Ok(delay_ms) = std::env::var("DEADRECKON_UPDATE_TEST_FETCH_DELAY_MS")
+        && let Ok(delay_ms) = delay_ms.parse::<u64>()
+    {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
     if std::env::var_os("DEADRECKON_UPDATE_TEST_OFFLINE").is_some() {
         return Err("offline test mode".to_string());
     }

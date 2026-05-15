@@ -5,6 +5,7 @@
 - Added install receipt and update-check cache files under `~/.deadreckon/` with channel detection for npm, Homebrew, shell, cargo, and source installs.
 - Added `deadreckon update --check` plus npm/Homebrew/cargo/source channel routing; source installs refuse with a `try: cargo install --path crates/deadreckon` hint.
 - Added shell-channel update backups and in-place swap plumbing through axoupdater, with deterministic backup/failure tests and pruning to the latest three backups.
+- Added the cached startup stale-version hint, disabled for non-TTYs, source installs, `doctor`, `update`, and `DEADRECKON_UPDATE_CHECK=0`.
 
 ## Overnight UX (alpha) - 2026-05-14
 
