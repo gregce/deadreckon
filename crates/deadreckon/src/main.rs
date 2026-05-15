@@ -34,7 +34,7 @@ use deadreckon::sleep::{self, SleepPrefs, SleepPrevention};
 use deadreckon::ui_card::{
     Card, CardOptions, HintLine, Section, TitleGlyph, TitleLine, render_card,
 };
-use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt};
+use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt, write_receipt};
 use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::update_cache::{read_cache, write_cache};
 use deadreckon_core::{
@@ -549,9 +549,10 @@ async fn main_inner() -> Result<()> {
             check,
             force,
             allow_prerelease,
+            yes,
             quiet,
             plain,
-        } => update_command(check, force, allow_prerelease, quiet, plain).await,
+        } => update_command(check, force, allow_prerelease, yes, quiet, plain).await,
         Commands::List {
             scope,
             all,
@@ -743,7 +744,7 @@ fn start_startup_update_check(
     }
     Some(tokio::spawn(async {
         let paths = DeadreckonPaths::discover();
-        let Ok(receipt) = update_receipt_for_current_binary(&paths) else {
+        let Ok(receipt) = update_receipt_for_current_binary(&paths, false) else {
             return None;
         };
         if receipt.channel == Channel::Source {
@@ -1380,11 +1381,13 @@ async fn update_command(
     check: bool,
     force: bool,
     allow_prerelease: bool,
+    yes: bool,
     quiet: bool,
-    _plain: bool,
+    plain: bool,
 ) -> Result<()> {
+    ui::set_plain_output(plain);
     let paths = DeadreckonPaths::discover();
-    let receipt = update_receipt_for_current_binary(&paths)?;
+    let receipt = update_receipt_for_current_binary(&paths, !check)?;
     let current = update_current_version(&receipt);
     if check {
         let latest = resolve_latest_update(&paths, &current, allow_prerelease).await?;
@@ -1407,7 +1410,7 @@ async fn update_command(
             "update: channel = source; in-place swap not supported".to_string(),
         ))),
         Channel::Shell => {
-            update_shell_channel(&paths, &receipt, force, allow_prerelease, quiet).await
+            update_shell_channel(&paths, &receipt, force, allow_prerelease, yes, quiet).await
         }
     }
 }
@@ -1417,6 +1420,7 @@ async fn update_shell_channel(
     receipt: &deadreckon_core::install_receipt::Receipt,
     force: bool,
     allow_prerelease: bool,
+    yes: bool,
     quiet: bool,
 ) -> Result<()> {
     if receipt.channel != Channel::Shell {
@@ -1425,15 +1429,23 @@ async fn update_shell_channel(
             receipt.channel.as_str()
         ))));
     }
-    let backup_dir = create_shell_update_backup(paths, receipt)?;
+    let current = update_current_version(receipt);
+    let latest = resolve_latest_update(paths, &current, allow_prerelease).await?;
+    let backup_dir = unique_shell_backup_dir(&shell_backup_root(paths));
+    if !quiet {
+        print_shell_update_preview(&current, &latest, &backup_dir);
+    }
+    confirm_shell_update(yes)?;
+    let backup_dir = create_shell_update_backup(paths, receipt, backup_dir)?;
     match run_shell_swap(receipt, force, allow_prerelease, quiet).await {
         Ok(()) => {
             prune_shell_backups(paths)?;
             if !quiet {
                 println!("channel: shell");
-                println!("current: {}", update_current_version(receipt));
+                println!("current: {current}");
                 println!("backup: {}", backup_dir.display());
                 println!("updated: {}", receipt.binary_path.display());
+                println!("try: deadreckon doctor");
             }
             Ok(())
         }
@@ -1444,10 +1456,10 @@ async fn update_shell_channel(
 fn create_shell_update_backup(
     paths: &DeadreckonPaths,
     receipt: &deadreckon_core::install_receipt::Receipt,
+    backup_dir: PathBuf,
 ) -> Result<PathBuf> {
     let root = shell_backup_root(paths);
     fs::create_dir_all(&root)?;
-    let backup_dir = unique_shell_backup_dir(&root);
     fs::create_dir_all(&backup_dir)?;
     fs::copy(&receipt.binary_path, backup_dir.join("deadreckon"))?;
     fs::write(
@@ -1455,6 +1467,34 @@ fn create_shell_update_backup(
         serde_json::to_vec_pretty(receipt)?,
     )?;
     Ok(backup_dir)
+}
+
+fn print_shell_update_preview(current: &str, latest: &LatestUpdate, backup_dir: &Path) {
+    println!("channel: shell");
+    println!("current: {current}");
+    println!("target: {}", latest.version);
+    println!("archive: {}", latest.archive_url());
+    println!("sha256: {}", latest.sha256());
+    println!("backup: {}", backup_dir.display());
+}
+
+fn confirm_shell_update(yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "non-interactive shell update requires --yes after reviewing preview",
+            "deadreckon update --yes",
+        )));
+    }
+    if prompt::confirm("apply this shell update?", false)? {
+        Ok(())
+    } else {
+        Err(CliError::Core(DeadreckonError::InvalidInput(
+            "update cancelled by user".to_string(),
+        )))
+    }
 }
 
 fn shell_backup_root(paths: &DeadreckonPaths) -> PathBuf {
@@ -1571,12 +1611,17 @@ fn shell_update_failure(
 
 fn update_receipt_for_current_binary(
     paths: &DeadreckonPaths,
+    persist_detected: bool,
 ) -> Result<deadreckon_core::install_receipt::Receipt> {
     if let Some(receipt) = read_receipt(paths)? {
         return Ok(receipt);
     }
     let binary = std::env::current_exe()?;
-    Ok(detect_receipt(&binary))
+    let receipt = detect_receipt(&binary);
+    if persist_detected {
+        write_receipt(paths, &receipt)?;
+    }
+    Ok(receipt)
 }
 
 fn update_current_version(receipt: &deadreckon_core::install_receipt::Receipt) -> String {
@@ -1613,7 +1658,24 @@ fn channel_native_update_command(channel: Channel) -> &'static str {
 struct LatestUpdate {
     version: String,
     release_url: String,
+    archive_url: Option<String>,
+    sha256: Option<String>,
     update_available: bool,
+}
+
+impl LatestUpdate {
+    fn archive_url(&self) -> String {
+        self.archive_url.clone().unwrap_or_else(|| {
+            format!(
+                "{}/download/deadreckon-installer.sh",
+                self.release_url.trim_end_matches('/')
+            )
+        })
+    }
+
+    fn sha256(&self) -> &str {
+        self.sha256.as_deref().unwrap_or("see release checksums")
+    }
 }
 
 async fn resolve_latest_update(
@@ -1629,6 +1691,8 @@ async fn resolve_latest_update(
         return Ok(LatestUpdate {
             version: cache.latest_version.clone(),
             release_url: cache.release_url.clone(),
+            archive_url: None,
+            sha256: None,
             update_available: cache.update_available,
         });
     }
@@ -1652,11 +1716,15 @@ async fn resolve_latest_update(
             || LatestUpdate {
                 version: current.to_string(),
                 release_url: "https://github.com/gdc/deadreckon/releases".to_string(),
+                archive_url: None,
+                sha256: None,
                 update_available: false,
             },
             |cache| LatestUpdate {
                 version: cache.latest_version,
                 release_url: cache.release_url,
+                archive_url: None,
+                sha256: None,
                 update_available: cache.update_available,
             },
         )),
@@ -1680,6 +1748,8 @@ async fn fetch_latest_update(allow_prerelease: bool) -> std::result::Result<Late
         return Ok(LatestUpdate {
             version,
             release_url,
+            archive_url: std::env::var("DEADRECKON_UPDATE_TEST_ARCHIVE_URL").ok(),
+            sha256: std::env::var("DEADRECKON_UPDATE_TEST_SHA256").ok(),
             update_available: false,
         });
     }
@@ -1736,6 +1806,8 @@ impl GithubRelease {
         LatestUpdate {
             version: self.tag_name.trim_start_matches('v').to_string(),
             release_url: self.html_url,
+            archive_url: None,
+            sha256: None,
             update_available: false,
         }
     }

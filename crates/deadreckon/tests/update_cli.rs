@@ -8,7 +8,7 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{Duration, Utc};
 use deadreckon_core::DeadreckonPaths;
 use deadreckon_core::install_receipt::{
-    Channel, INSTALL_RECEIPT_VERSION, Receipt, receipt_path, write_receipt,
+    Channel, INSTALL_RECEIPT_VERSION, Receipt, read_receipt, receipt_path, write_receipt,
 };
 use deadreckon_core::update_cache::{Cache, read_cache, write_cache};
 use tempfile::TempDir;
@@ -95,6 +95,21 @@ fn update_check_does_not_write_receipt() {
 }
 
 #[test]
+fn update_writes_receipt_when_missing_on_first_run() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+
+    let output = deadreckon(&paths).arg("update").output().expect("update");
+
+    assert!(!output.status.success());
+    let detected = read_receipt(&paths)
+        .expect("read receipt")
+        .expect("detected receipt");
+    assert_eq!(detected.channel, Channel::Source);
+    assert_eq!(detected.receipt_version, INSTALL_RECEIPT_VERSION);
+}
+
+#[test]
 fn update_npm_prints_bun_update_hint() {
     let temp = TempDir::new().expect("tempdir");
     let paths = paths(&temp);
@@ -158,7 +173,7 @@ fn update_shell_writes_backup_before_swap() {
     write_receipt(&paths, &shell_receipt(&binary)).expect("receipt");
 
     let output = deadreckon(&paths)
-        .arg("update")
+        .args(["update", "--yes"])
         .env("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT", &replacement)
         .output()
         .expect("update");
@@ -193,7 +208,7 @@ fn update_shell_prunes_backups_to_three() {
     }
 
     let output = deadreckon(&paths)
-        .arg("update")
+        .args(["update", "--yes"])
         .env("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT", &replacement)
         .output()
         .expect("update");
@@ -212,7 +227,7 @@ fn update_shell_swap_failure_preserves_binary() {
     write_receipt(&paths, &shell_receipt(&binary)).expect("receipt");
 
     let output = deadreckon(&paths)
-        .arg("update")
+        .args(["update", "--yes"])
         .env("DEADRECKON_UPDATE_TEST_SHELL_FAIL", "1")
         .output()
         .expect("update");
@@ -225,6 +240,122 @@ fn update_shell_swap_failure_preserves_binary() {
         stderr(&output)
     );
     assert!(newest_backup(&paths).join("deadreckon").exists());
+}
+
+#[test]
+fn update_shell_previews_before_swap() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    let binary = temp.path().join("bin/deadreckon");
+    let replacement = temp.path().join("replacement/deadreckon");
+    write_file(&binary, b"old binary");
+    write_file(&replacement, b"new binary");
+    write_receipt(&paths, &shell_receipt(&binary)).expect("receipt");
+
+    let output = deadreckon(&paths)
+        .args(["update", "--yes"])
+        .env("DEADRECKON_UPDATE_TEST_LATEST_VERSION", "0.2.3")
+        .env(
+            "DEADRECKON_UPDATE_TEST_ARCHIVE_URL",
+            "https://github.com/gdc/deadreckon/releases/download/v0.2.3/deadreckon.tar.xz",
+        )
+        .env("DEADRECKON_UPDATE_TEST_SHA256", "abc123")
+        .env("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT", &replacement)
+        .output()
+        .expect("update");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("target: 0.2.3"), "{out}");
+    assert!(
+        out.contains(
+            "archive: https://github.com/gdc/deadreckon/releases/download/v0.2.3/deadreckon.tar.xz"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("sha256: abc123"), "{out}");
+    assert!(out.contains("backup:"), "{out}");
+}
+
+#[test]
+fn update_shell_requires_yes_under_non_tty() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    let binary = temp.path().join("bin/deadreckon");
+    write_file(&binary, b"old binary");
+    write_receipt(&paths, &shell_receipt(&binary)).expect("receipt");
+
+    let output = deadreckon(&paths).arg("update").output().expect("update");
+
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(
+        err.contains("non-interactive shell update requires --yes"),
+        "{err}"
+    );
+    assert!(err.contains("try: deadreckon update --yes"), "{err}");
+    assert!(!paths.home().join("update-backups").exists());
+}
+
+#[test]
+fn update_success_prints_doctor_hint() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    let binary = temp.path().join("bin/deadreckon");
+    let replacement = temp.path().join("replacement/deadreckon");
+    write_file(&binary, b"old binary");
+    write_file(&replacement, b"new binary");
+    write_receipt(&paths, &shell_receipt(&binary)).expect("receipt");
+
+    let output = deadreckon(&paths)
+        .args(["update", "--yes"])
+        .env("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT", &replacement)
+        .output()
+        .expect("update");
+
+    assert_success(&output);
+    assert!(stdout(&output).contains("try: deadreckon doctor"));
+}
+
+#[test]
+fn update_quiet_suppresses_lifecycle_hint() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    let binary = temp.path().join("bin/deadreckon");
+    let replacement = temp.path().join("replacement/deadreckon");
+    write_file(&binary, b"old binary");
+    write_file(&replacement, b"new binary");
+    write_receipt(&paths, &shell_receipt(&binary)).expect("receipt");
+
+    let output = deadreckon(&paths)
+        .args(["update", "--yes", "--quiet"])
+        .env("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT", &replacement)
+        .output()
+        .expect("update");
+
+    assert_success(&output);
+    assert!(!stdout(&output).contains("deadreckon doctor"));
+}
+
+#[test]
+fn update_plain_strips_color() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = paths(&temp);
+    let binary = temp.path().join("bin/deadreckon");
+    let replacement = temp.path().join("replacement/deadreckon");
+    write_file(&binary, b"old binary");
+    write_file(&replacement, b"new binary");
+    write_receipt(&paths, &shell_receipt(&binary)).expect("receipt");
+
+    let output = deadreckon(&paths)
+        .args(["update", "--yes", "--plain"])
+        .env("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT", &replacement)
+        .output()
+        .expect("update");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(!out.contains("\u{1b}["), "{out}");
 }
 
 #[test]

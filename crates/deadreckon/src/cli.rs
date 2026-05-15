@@ -109,11 +109,12 @@ provider route; `--all` shows every built-in and override descriptor.";
 const UPDATE_HELP: &str = "\
 Lifecycle:
   deadreckon update --check
-  deadreckon update
+  deadreckon update --yes
 
 Update reads ~/.deadreckon/install-receipt.json to honor the channel that
 installed deadreckon. npm, Homebrew, and cargo installs print the native upgrade
-command; shell installs are updated in place by the self-updater.";
+command; shell installs preview the target and backup path, then update in
+place by the self-updater.";
 
 const RUN_HELP: &str = "\
 Lifecycle:
@@ -899,6 +900,8 @@ pub(crate) enum Commands {
         force: bool,
         #[arg(long, help = "Include prereleases when checking the latest release")]
         allow_prerelease: bool,
+        #[arg(long, help = "Confirm shell-channel updates without prompting")]
+        yes: bool,
         #[arg(long, help = "Suppress lifecycle hints")]
         quiet: bool,
         #[arg(long, help = "Plain output without ANSI affordances")]

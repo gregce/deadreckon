@@ -10,6 +10,7 @@
 - Added guarded macOS Developer ID codesign/notarization steps and public release setup docs for the required Apple secrets.
 - Added the npm wrapper package, five per-platform optional dependency templates, no-network receipt postinstall, and npm publish workflow wiring.
 - Added Homebrew tap publishing for `gdc/homebrew-tap`, including a formula patch that writes the brew install receipt.
+- Added first-run update receipt persistence plus shell-update previews, non-TTY `--yes` enforcement, and post-update doctor hints.
 
 ## Overnight UX (alpha) - 2026-05-14
 
