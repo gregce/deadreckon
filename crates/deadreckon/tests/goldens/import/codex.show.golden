@@ -1,13 +1,3 @@
-+------------------------------------------------------------+
-| * run imported                                             |
-|   <RUN_ID>                                |
-|   status        completed                                  |
-|   goal          imported codex history                     |
-|   spend         $0.000000                                  |
-|   phase         0 init                                     |
-|                                                            |
-|   show          deadreckon show imported                   |
-+------------------------------------------------------------+
 state     : <HOME>/runstate/<SCOPE>/runs/<RUN_ID>/state.json
 launch-dir: <CWD>
 working   : <HOME>/runstate/<SCOPE>/runs/<RUN_ID>/working

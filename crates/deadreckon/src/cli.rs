@@ -885,10 +885,7 @@ pub(crate) enum Commands {
         scope: Option<String>,
         #[arg(long, help = "Show runs from all projects")]
         all: bool,
-        #[arg(
-            long,
-            help = "Keep the script-friendly table layout without the summary card"
-        )]
+        #[arg(long, help = "Use the table layout (default; kept for compatibility)")]
         full: bool,
         #[arg(long, help = "Plain output without ANSI affordances")]
         plain: bool,

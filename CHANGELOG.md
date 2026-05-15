@@ -2,7 +2,8 @@
 
 ## Overnight UX (alpha) - 2026-05-14
 
-- Added a shared `ui_card` renderer and began routing run preview, run exit summaries, status, show, list, and attach/plain summaries through card-shaped output with `--plain` / `NO_COLOR` behavior.
+- Added a shared `ui_card` renderer for run preview, run exit summaries, and completed attach footers with `--plain` / `NO_COLOR` behavior.
+- Kept read-only inspection surfaces (`list`, `show`, and `status`) as quieter table/report output so they do not repeat the same run metadata inside card wrappers.
 - Added `run --prevent-sleep <auto|on|off>` with macOS `caffeinate`, Linux `systemd-inhibit` re-exec/ready-file handling, run-local sleep metadata, and doctor sleep checks.
 - Hardened production git invocations behind `deadreckon-core::git` with `GIT_TERMINAL_PROMPT=0` and commit-family GPG signing disabled.
 - Added `spend_summary` replay so subscription or estimated turns render approximate spend with `~` without changing the numeric total.

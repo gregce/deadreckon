@@ -13,7 +13,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 #[test]
-fn status_card_shows_sleep_mode_when_active() {
+fn status_report_shows_sleep_mode_when_active() {
     let temp = repo_tempdir();
     let (paths, state) = state(&temp, "sleep status");
     let metadata = SleepMetadata {
@@ -41,11 +41,11 @@ fn status_card_shows_sleep_mode_when_active() {
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("deadreckon status"), "{out}");
-    assert!(out.contains("sleep         caffeinate pid="), "{out}");
+    assert!(out.contains("sleep   : caffeinate pid="), "{out}");
 }
 
 #[test]
-fn show_card_includes_lineage_section_when_extend_parent() {
+fn show_output_includes_lineage_when_extend_parent() {
     let temp = repo_tempdir();
     let (paths, state) = state(&temp, "child goal");
     let parent_dir = state.working_dir.join(".deadreckon");
@@ -76,17 +76,20 @@ fn show_card_includes_lineage_section_when_extend_parent() {
 
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("lineage"), "{out}");
-    assert!(out.contains("extended from parent12"), "{out}");
+    assert!(!out.starts_with('+'), "{out}");
+    assert!(out.contains("Extended from parent1234567890"), "{out}");
 }
 
 #[test]
-fn list_compact_card_table_truncates_goal_with_ellipsis() {
+fn list_table_is_plain_and_truncates_very_long_goal() {
     let temp = repo_tempdir();
-    let (paths, state) = state(
-        &temp,
-        "this is a deliberately long goal that should be truncated in the compact card table because it cannot fit in one row forever",
-    );
+    let long_goal = std::iter::repeat(
+        "this is a deliberately long goal fragment that cannot fit in one row forever",
+    )
+    .take(18)
+    .collect::<Vec<_>>()
+    .join(" ");
+    let (paths, state) = state(&temp, &long_goal);
 
     let output = deadreckon(&paths)
         .current_dir(&state.cwd)
@@ -96,7 +99,11 @@ fn list_compact_card_table_truncates_goal_with_ellipsis() {
 
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("deadreckon list"), "{out}");
+    assert!(!out.starts_with('+'), "{out}");
+    assert!(
+        out.lines().next().is_some_and(|line| line.contains("ID")),
+        "{out}"
+    );
     assert!(out.contains("..."), "{out}");
 }
 
@@ -118,7 +125,7 @@ fn list_full_keeps_old_layout_for_scripts() {
 }
 
 #[test]
-fn status_card_marks_subscription_spend_with_tilde() {
+fn status_report_marks_subscription_spend_with_tilde() {
     let temp = repo_tempdir();
     let (paths, state) = state(&temp, "subscription spend");
     append_spend(

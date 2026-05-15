@@ -10993,8 +10993,8 @@ fn escape_toml_string(value: &str) -> String {
 fn list_command(
     scope: Option<String>,
     all: bool,
-    full: bool,
-    plain: bool,
+    _full: bool,
+    _plain: bool,
     json_output: bool,
 ) -> Result<()> {
     // REPORT.md: Workspace Inventory & Run Queue is a local scan over durable
@@ -11066,40 +11066,6 @@ fn list_command(
         return Ok(());
     }
     let header = list_header();
-    if !full {
-        println!(
-            "{}",
-            render_card(
-                &Card {
-                    title: TitleLine {
-                        glyph: TitleGlyph::Preview,
-                        label: "deadreckon list".to_string(),
-                    },
-                    subtitle: Some(format!("{} entries", entries.len())),
-                    sections: vec![Section::KeyValue {
-                        rows: std::iter::once(("columns".to_string(), header.clone()))
-                            .chain(entries.iter().take(24).map(|entry| {
-                                (
-                                    run_prefix(entry.id()),
-                                    format!(
-                                        "{} {} {}",
-                                        entry.status_label(),
-                                        relative_age(entry.updated_at()),
-                                        one_line(entry.goal(), 72)
-                                    ),
-                                )
-                            }))
-                            .collect(),
-                    }],
-                    hints: vec![HintLine {
-                        label: "show".to_string(),
-                        command: "deadreckon show <id>".to_string(),
-                    }],
-                },
-                &card_options(ui::Stream::Stdout, plain),
-            )
-        );
-    }
     println!("{}", ui_heading(header));
     let goal_width = list_goal_width();
     for entry in entries {
@@ -11323,27 +11289,6 @@ impl ListEntry {
         match self {
             Self::Run(run) => run.updated_at,
             Self::Plan(plan) => plan.updated_at,
-        }
-    }
-
-    fn id(&self) -> &str {
-        match self {
-            Self::Run(run) => &run.run_id,
-            Self::Plan(plan) => &plan.plan_id,
-        }
-    }
-
-    fn status_label(&self) -> &'static str {
-        match self {
-            Self::Run(run) => run_status_label(run.status),
-            Self::Plan(plan) => plan_status_label(plan.status),
-        }
-    }
-
-    fn goal(&self) -> &str {
-        match self {
-            Self::Run(run) => &run.goal,
-            Self::Plan(plan) => &plan.goal,
         }
     }
 }
@@ -12432,10 +12377,11 @@ async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<(
         }
         return Ok(());
     }
-    print_run_summary(&state);
     if state.status == RunStatus::Completed && show_hints {
         print_exit_summary_card(&state, &RunLoopOutcome::Done, plain);
         print_lifecycle_hints(&state);
+    } else {
+        print_run_summary(&state);
     }
     Ok(())
 }
@@ -12945,7 +12891,7 @@ fn show_command(
     run_id: &str,
     turn: Option<u32>,
     why_failed: bool,
-    plain: bool,
+    _plain: bool,
     json_output: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
@@ -12988,7 +12934,7 @@ fn show_command(
     if why_failed {
         return show_run_why_failed(&state);
     }
-    print_run_summary_card(&state, plain);
+    print_run_locations(&state);
     if let Some(line) = chain_context_line_for_working(&state.working_dir)? {
         println!("{line}");
     }
@@ -13316,12 +13262,12 @@ fn status_command(run_id: Option<String>, all: bool, plain: bool, json_output: b
         );
         return Ok(());
     }
-    print_status_card(&state, plain);
+    print_status_report(&state, plain);
     print_lifecycle_hints(&state);
     Ok(())
 }
 
-fn print_status_card(state: &deadreckon_core::PipelineState, plain: bool) {
+fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
     let paths = DeadreckonPaths::discover();
     let short = run_prefix(&state.run_id);
     let phase = state
@@ -13359,12 +13305,6 @@ fn print_status_card(state: &deadreckon_core::PipelineState, plain: bool) {
     );
     let goal = one_line(&state.goal, 110);
     let provider = state.provider.as_deref().unwrap_or("-");
-    let glyph = match state.status {
-        RunStatus::Completed => TitleGlyph::Success,
-        RunStatus::Failed => TitleGlyph::Failed,
-        RunStatus::Killed => TitleGlyph::Stopped,
-        RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => TitleGlyph::Preview,
-    };
     let mut rows = vec![
         ("run".to_string(), run),
         ("state".to_string(), state_line),
@@ -13380,24 +13320,11 @@ fn print_status_card(state: &deadreckon_core::PipelineState, plain: bool) {
     if let Some(sleep) = sleep_status_for_working(&state.working_dir) {
         rows.push(("sleep".to_string(), sleep));
     }
-    print!(
-        "{}",
-        render_card(
-            &Card {
-                title: TitleLine {
-                    glyph,
-                    label: "deadreckon status".to_string(),
-                },
-                subtitle: Some(format!("{short} -> {next_action}")),
-                sections: vec![Section::KeyValue { rows }],
-                hints: vec![HintLine {
-                    label: "next".to_string(),
-                    command: next_action.clone(),
-                }],
-            },
-            &card_options(ui::Stream::Stdout, plain),
-        )
-    );
+    let row_refs = rows
+        .iter()
+        .map(|(label, value)| (label.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    print_kv_block(&row_refs);
     print_run_locations(state);
     if let Ok(Some(line)) = chain_context_line_for_working(&state.working_dir) {
         println!("  chain:    {line}");
@@ -13494,22 +13421,7 @@ fn sleep_status_for_working(working_dir: &Path) -> Option<String> {
 }
 
 fn print_run_summary(state: &deadreckon_core::PipelineState) {
-    print_run_summary_card(state, true);
-    if let Some(line) = chain_context_line_for_working(&state.working_dir)
-        .ok()
-        .flatten()
-    {
-        println!("{line}");
-        if let Ok(Some(marker)) = read_chain_step_marker(&state.working_dir) {
-            println!(
-                "[c] Chain deadreckon chain attach {}",
-                chain_prefix(&marker.chain_id)
-            );
-        }
-    }
-}
-
-fn print_run_summary_card(state: &deadreckon_core::PipelineState, plain: bool) {
+    println!("run {} ({})", run_prefix(&state.run_id), state.run_id);
     let status = run_status_label(state.status);
     let spend_summary = deadreckon_core::state::spend_summary(state).ok();
     let total_spend = spend_summary
@@ -13524,15 +13436,15 @@ fn print_run_summary_card(state: &deadreckon_core::PipelineState, plain: bool) {
         if approximate_spend { "~" } else { "" },
         total_spend
     );
-    let phase_line = state
-        .active_phase()
-        .map(|phase| format!("{} {}", phase.id.0, phase.name));
     let mut items = vec![
         ("status".to_string(), status.to_string()),
         ("goal".to_string(), state.goal.clone()),
         ("spend".to_string(), spend),
     ];
-    if let Some(phase) = phase_line {
+    if let Some(phase) = state
+        .active_phase()
+        .map(|phase| format!("{} {}", phase.id.0, phase.name))
+    {
         items.push(("phase".to_string(), phase));
     }
     if let Some(sleep) = sleep_status_for_working(&state.working_dir) {
@@ -13546,31 +13458,24 @@ fn print_run_summary_card(state: &deadreckon_core::PipelineState, plain: bool) {
         };
         items.push(("lineage".to_string(), label));
     }
-    let glyph = match state.status {
-        RunStatus::Completed => TitleGlyph::Success,
-        RunStatus::Failed => TitleGlyph::Failed,
-        RunStatus::Killed => TitleGlyph::Stopped,
-        RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => TitleGlyph::Preview,
-    };
-    print!(
-        "{}",
-        render_card(
-            &Card {
-                title: TitleLine {
-                    glyph,
-                    label: format!("run {}", run_prefix(&state.run_id)),
-                },
-                subtitle: Some(state.run_id.clone()),
-                sections: vec![Section::KeyValue { rows: items }],
-                hints: vec![HintLine {
-                    label: "show".to_string(),
-                    command: format!("deadreckon show {}", run_prefix(&state.run_id)),
-                }],
-            },
-            &card_options(ui::Stream::Stdout, plain),
-        )
-    );
+    let item_refs = items
+        .iter()
+        .map(|(label, value)| (label.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    print_kv_block(&item_refs);
     print_run_locations(state);
+    if let Some(line) = chain_context_line_for_working(&state.working_dir)
+        .ok()
+        .flatten()
+    {
+        println!("{line}");
+        if let Ok(Some(marker)) = read_chain_step_marker(&state.working_dir) {
+            println!(
+                "[c] Chain deadreckon chain attach {}",
+                chain_prefix(&marker.chain_id)
+            );
+        }
+    }
 }
 
 fn print_run_locations(state: &deadreckon_core::PipelineState) {
