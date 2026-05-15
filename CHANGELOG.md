@@ -8,6 +8,7 @@
 - Added the cached startup stale-version hint, disabled for non-TTYs, source installs, `doctor`, `update`, and `DEADRECKON_UPDATE_CHECK=0`.
 - Added cargo-dist release scaffolding for five OS/arch targets, shell/PowerShell installers, glibc 2.28 Linux metadata, and a push-time `dist plan` workflow check.
 - Added guarded macOS Developer ID codesign/notarization steps and public release setup docs for the required Apple secrets.
+- Added the npm wrapper package, five per-platform optional dependency templates, no-network receipt postinstall, and npm publish workflow wiring.
 
 ## Overnight UX (alpha) - 2026-05-14
 

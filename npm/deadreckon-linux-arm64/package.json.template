@@ -1,0 +1,22 @@
+{
+  "name": "deadreckon-linux-arm64",
+  "version": "__VERSION__",
+  "description": "deadreckon binary for Linux arm64.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gdc/deadreckon.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "bin": {
+    "deadreckon": "bin/deadreckon"
+  },
+  "files": [
+    "bin/deadreckon"
+  ]
+}

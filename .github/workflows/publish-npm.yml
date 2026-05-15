@@ -1,0 +1,63 @@
+name: Publish npm
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      NPM_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish-npm:
+    name: publish npm packages
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Download GitHub release artifacts
+        run: |
+          mkdir -p target/distrib
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir target/distrib
+      - name: Repack npm packages
+        run: |
+          node npm/scripts/prepare-release.mjs --tag "$RELEASE_TAG" --artifacts target/distrib
+      - name: Check npm auth
+        run: |
+          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "::error::NPM_TOKEN is required to publish deadreckon npm packages"
+            exit 1
+          fi
+      - name: Publish platform packages
+        run: |
+          for package_dir in \
+            npm/deadreckon-darwin-arm64 \
+            npm/deadreckon-darwin-x64 \
+            npm/deadreckon-linux-arm64 \
+            npm/deadreckon-linux-x64 \
+            npm/deadreckon-win32-x64
+          do
+            npm publish "$package_dir" --access public
+          done
+      - name: Publish wrapper package
+        run: |
+          npm publish npm/deadreckon --access public

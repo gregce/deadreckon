@@ -1,0 +1,22 @@
+{
+  "name": "deadreckon-win32-x64",
+  "version": "__VERSION__",
+  "description": "deadreckon binary for Windows x64.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gdc/deadreckon.git"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "bin": {
+    "deadreckon": "bin/deadreckon.exe"
+  },
+  "files": [
+    "bin/deadreckon.exe"
+  ]
+}

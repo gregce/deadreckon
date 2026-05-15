@@ -213,3 +213,13 @@ jobs:
       - name: Upload and announce release
         run: |
           dist host --steps=upload,release,announce --tag=${{ github.ref_name }}
+
+  publish-npm:
+    name: publish npm packages
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - publish-github-release
+    uses: ./.github/workflows/publish-npm.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
