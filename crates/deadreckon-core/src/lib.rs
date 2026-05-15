@@ -13,12 +13,14 @@ pub mod events;
 pub mod gate;
 pub mod git;
 pub mod glossary;
+pub mod install_receipt;
 pub mod lock;
 pub mod paths;
 pub mod plan;
 pub mod polish_subcalls;
 pub mod promotion;
 pub mod state;
+pub mod update_cache;
 
 pub use artifacts::{
     ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,

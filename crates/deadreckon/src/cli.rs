@@ -41,6 +41,7 @@ More help:
   completion  generate shell tab-completion scripts
   detect      probe registered providers
   providers   list provider routes and models
+  update      check for or route self-updates
   history     search run traces and provenance
   help-all    show every command, including advanced commands
   commands    alias for help-all
@@ -104,6 +105,15 @@ Lifecycle:
 
 `providers list` is registry-backed. By default it shows the configured
 provider route; `--all` shows every built-in and override descriptor.";
+
+const UPDATE_HELP: &str = "\
+Lifecycle:
+  deadreckon update --check
+  deadreckon update
+
+Update reads ~/.deadreckon/install-receipt.json to honor the channel that
+installed deadreckon. npm, Homebrew, and cargo installs print the native upgrade
+command; shell installs are updated in place by the self-updater.";
 
 const RUN_HELP: &str = "\
 Lifecycle:
@@ -873,6 +883,26 @@ pub(crate) enum Commands {
     Providers {
         #[command(subcommand)]
         command: ProvidersCommand,
+    },
+    #[command(
+        next_help_heading = "Setup",
+        about = "Check for updates or route through the install channel",
+        after_help = UPDATE_HELP
+    )]
+    Update {
+        #[arg(long, help = "Only check and print current/latest version")]
+        check: bool,
+        #[arg(
+            long,
+            help = "Re-run the selected update path even at the same version"
+        )]
+        force: bool,
+        #[arg(long, help = "Include prereleases when checking the latest release")]
+        allow_prerelease: bool,
+        #[arg(long, help = "Suppress lifecycle hints")]
+        quiet: bool,
+        #[arg(long, help = "Plain output without ANSI affordances")]
+        plain: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",

@@ -1,5 +1,10 @@
 # Changelog
 
+## Distribution & self-update (alpha) - 2026-05-15
+
+- Added install receipt and update-check cache files under `~/.deadreckon/` with channel detection for npm, Homebrew, shell, cargo, and source installs.
+- Added `deadreckon update --check` plus npm/Homebrew/cargo/source channel routing; source installs refuse with a `try: cargo install --path crates/deadreckon` hint.
+
 ## Overnight UX (alpha) - 2026-05-14
 
 - Added a shared `ui_card` renderer for run preview, run exit summaries, and completed attach footers with `--plain` / `NO_COLOR` behavior.

@@ -81,7 +81,7 @@ fn attach_plain_displays_running_for_executing_run() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let stdout = stdout(&output);
-    assert!(stdout.contains("status        running"), "{stdout}");
+    assert!(stdout.contains("status: running"), "{stdout}");
     assert!(!stdout.contains("executing"), "{stdout}");
 }
 

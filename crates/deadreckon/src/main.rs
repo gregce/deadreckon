@@ -33,7 +33,9 @@ use deadreckon::sleep::{self, SleepPrefs, SleepPrevention};
 use deadreckon::ui_card::{
     Card, CardOptions, HintLine, Section, TitleGlyph, TitleLine, render_card,
 };
+use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt};
 use deadreckon_core::paths::workspace_scope;
+use deadreckon_core::update_cache::{read_cache, write_cache};
 use deadreckon_core::{
     AcceptanceMarker, AcceptanceProgressEntry, ApplyMode, ApplyStrategy, BranchPolicy, Chain,
     ChainEvent, ChainEventKind, ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus,
@@ -130,6 +132,11 @@ fn error_hint(err: &CliError) -> String {
             if message.contains("max spend above $50") =>
         {
             "rerun with `--i-know-its-a-lot` or lower `--max-spend`".to_string()
+        }
+        CliError::Core(DeadreckonError::InvalidInput(message))
+            if message.contains("update: channel = source") =>
+        {
+            "try: cargo install --path crates/deadreckon".to_string()
         }
         CliError::Core(DeadreckonError::NotFound(_)) => {
             "run `deadreckon list` to find valid run ids or config keys".to_string()
@@ -513,6 +520,13 @@ async fn main_inner() -> Result<()> {
         Commands::Doctor { json } => doctor_command(json).await,
         Commands::Detect { id, json, ping } => detect_command(id, json, ping).await,
         Commands::Providers { command } => providers_command(command).await,
+        Commands::Update {
+            check,
+            force,
+            allow_prerelease,
+            quiet,
+            plain,
+        } => update_command(check, force, allow_prerelease, quiet, plain).await,
         Commands::List {
             scope,
             all,
@@ -1274,6 +1288,221 @@ async fn providers_command(command: ProvidersCommand) -> Result<()> {
             full,
             json,
         } => providers_list_command(models, all, full, json).await,
+    }
+}
+
+async fn update_command(
+    check: bool,
+    _force: bool,
+    allow_prerelease: bool,
+    quiet: bool,
+    _plain: bool,
+) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let receipt = update_receipt_for_current_binary(&paths)?;
+    let current = update_current_version(&receipt);
+    if check {
+        let latest = resolve_latest_update(&paths, &current, allow_prerelease).await?;
+        if !quiet {
+            print_update_check(receipt.channel, &current, &latest);
+        }
+        return Ok(());
+    }
+
+    match receipt.channel {
+        Channel::Npm | Channel::Brew | Channel::Cargo => {
+            if !quiet {
+                println!("channel: {}", receipt.channel.as_str());
+                println!("current: {current}");
+                println!("try: {}", channel_native_update_command(receipt.channel));
+            }
+            Ok(())
+        }
+        Channel::Source => Err(CliError::Core(DeadreckonError::InvalidInput(
+            "update: channel = source; in-place swap not supported".to_string(),
+        ))),
+        Channel::Shell => Err(CliError::Core(DeadreckonError::InvalidInput(
+            "update: shell channel binary swap is not implemented yet".to_string(),
+        ))),
+    }
+}
+
+fn update_receipt_for_current_binary(
+    paths: &DeadreckonPaths,
+) -> Result<deadreckon_core::install_receipt::Receipt> {
+    if let Some(receipt) = read_receipt(paths)? {
+        return Ok(receipt);
+    }
+    let binary = std::env::current_exe()?;
+    Ok(detect_receipt(&binary))
+}
+
+fn update_current_version(receipt: &deadreckon_core::install_receipt::Receipt) -> String {
+    if receipt.channel_version.trim().is_empty() {
+        env!("CARGO_PKG_VERSION").to_string()
+    } else {
+        receipt.channel_version.clone()
+    }
+}
+
+fn print_update_check(channel: Channel, current: &str, latest: &LatestUpdate) {
+    println!("channel: {}", channel.as_str());
+    println!("current: {current}");
+    println!("latest: {}", latest.version);
+    println!("release: {}", latest.release_url);
+    if latest.update_available && matches!(channel, Channel::Npm | Channel::Brew | Channel::Cargo) {
+        println!("try: {}", channel_native_update_command(channel));
+    } else if latest.update_available && channel == Channel::Shell {
+        println!("try: deadreckon update");
+    }
+}
+
+fn channel_native_update_command(channel: Channel) -> &'static str {
+    match channel {
+        Channel::Npm => "bun update -g deadreckon",
+        Channel::Brew => "brew upgrade gdc/tap/deadreckon",
+        Channel::Cargo => "cargo binstall --force deadreckon",
+        Channel::Shell => "deadreckon update",
+        Channel::Source => "cargo install --path crates/deadreckon",
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LatestUpdate {
+    version: String,
+    release_url: String,
+    update_available: bool,
+}
+
+async fn resolve_latest_update(
+    paths: &DeadreckonPaths,
+    current: &str,
+    allow_prerelease: bool,
+) -> Result<LatestUpdate> {
+    let now = Utc::now();
+    let cache = read_cache(paths)?;
+    if let Some(cache) = cache.as_ref()
+        && !cache.is_stale(now)
+    {
+        return Ok(LatestUpdate {
+            version: cache.latest_version.clone(),
+            release_url: cache.release_url.clone(),
+            update_available: cache.update_available,
+        });
+    }
+
+    match fetch_latest_update(allow_prerelease).await {
+        Ok(mut latest) => {
+            latest.update_available = version_is_newer(current, &latest.version);
+            write_cache(
+                paths,
+                &deadreckon_core::update_cache::Cache {
+                    checked_at: now,
+                    latest_version: latest.version.clone(),
+                    current_version: current.to_string(),
+                    release_url: latest.release_url.clone(),
+                    update_available: latest.update_available,
+                },
+            )?;
+            Ok(latest)
+        }
+        Err(_) => Ok(cache.map_or_else(
+            || LatestUpdate {
+                version: current.to_string(),
+                release_url: "https://github.com/gdc/deadreckon/releases".to_string(),
+                update_available: false,
+            },
+            |cache| LatestUpdate {
+                version: cache.latest_version,
+                release_url: cache.release_url,
+                update_available: cache.update_available,
+            },
+        )),
+    }
+}
+
+async fn fetch_latest_update(allow_prerelease: bool) -> std::result::Result<LatestUpdate, String> {
+    if std::env::var_os("DEADRECKON_UPDATE_TEST_OFFLINE").is_some() {
+        return Err("offline test mode".to_string());
+    }
+    if let Ok(version) = std::env::var("DEADRECKON_UPDATE_TEST_LATEST_VERSION") {
+        let release_url =
+            std::env::var("DEADRECKON_UPDATE_TEST_RELEASE_URL").unwrap_or_else(|_| {
+                format!("https://github.com/gdc/deadreckon/releases/tag/v{version}")
+            });
+        return Ok(LatestUpdate {
+            version,
+            release_url,
+            update_available: false,
+        });
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|err| err.to_string())?;
+    if allow_prerelease {
+        let url = std::env::var("DEADRECKON_UPDATE_RELEASES_URL")
+            .unwrap_or_else(|_| "https://api.github.com/repos/gdc/deadreckon/releases".to_string());
+        let releases = client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, "deadreckon-update")
+            .send()
+            .await
+            .map_err(|err| err.to_string())?
+            .error_for_status()
+            .map_err(|err| err.to_string())?
+            .json::<Vec<GithubRelease>>()
+            .await
+            .map_err(|err| err.to_string())?;
+        let Some(release) = releases.into_iter().next() else {
+            return Err("no releases found".to_string());
+        };
+        return Ok(release.into_latest_update());
+    }
+
+    let url = std::env::var("DEADRECKON_UPDATE_RELEASES_URL").unwrap_or_else(|_| {
+        "https://api.github.com/repos/gdc/deadreckon/releases/latest".to_string()
+    });
+    client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "deadreckon-update")
+        .send()
+        .await
+        .map_err(|err| err.to_string())?
+        .error_for_status()
+        .map_err(|err| err.to_string())?
+        .json::<GithubRelease>()
+        .await
+        .map(GithubRelease::into_latest_update)
+        .map_err(|err| err.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+}
+
+impl GithubRelease {
+    fn into_latest_update(self) -> LatestUpdate {
+        LatestUpdate {
+            version: self.tag_name.trim_start_matches('v').to_string(),
+            release_url: self.html_url,
+            update_available: false,
+        }
+    }
+}
+
+fn version_is_newer(current: &str, latest: &str) -> bool {
+    let current = current.trim_start_matches('v');
+    let latest = latest.trim_start_matches('v');
+    match (
+        semver::Version::parse(current),
+        semver::Version::parse(latest),
+    ) {
+        (Ok(current), Ok(latest)) => latest > current,
+        _ => latest != current,
     }
 }
 
@@ -12373,12 +12602,14 @@ async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<(
         let state = load_run(&paths, &run_id)?;
         if state.status == RunStatus::Completed && show_hints {
             print_exit_summary_card(&state, &RunLoopOutcome::Done, plain);
+            print_chain_context_for_working(&state.working_dir);
             print_lifecycle_hints(&state);
         }
         return Ok(());
     }
     if state.status == RunStatus::Completed && show_hints {
         print_exit_summary_card(&state, &RunLoopOutcome::Done, plain);
+        print_chain_context_for_working(&state.working_dir);
         print_lifecycle_hints(&state);
     } else {
         print_run_summary(&state);
@@ -13464,12 +13695,13 @@ fn print_run_summary(state: &deadreckon_core::PipelineState) {
         .collect::<Vec<_>>();
     print_kv_block(&item_refs);
     print_run_locations(state);
-    if let Some(line) = chain_context_line_for_working(&state.working_dir)
-        .ok()
-        .flatten()
-    {
+    print_chain_context_for_working(&state.working_dir);
+}
+
+fn print_chain_context_for_working(working_dir: &Path) {
+    if let Some(line) = chain_context_line_for_working(working_dir).ok().flatten() {
         println!("{line}");
-        if let Ok(Some(marker)) = read_chain_step_marker(&state.working_dir) {
+        if let Ok(Some(marker)) = read_chain_step_marker(working_dir) {
             println!(
                 "[c] Chain deadreckon chain attach {}",
                 chain_prefix(&marker.chain_id)

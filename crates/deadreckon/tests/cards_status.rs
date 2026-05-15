@@ -83,10 +83,10 @@ fn show_output_includes_lineage_when_extend_parent() {
 #[test]
 fn list_table_is_plain_and_truncates_very_long_goal() {
     let temp = repo_tempdir();
-    let long_goal = std::iter::repeat(
+    let long_goal = std::iter::repeat_n(
         "this is a deliberately long goal fragment that cannot fit in one row forever",
+        18,
     )
-    .take(18)
     .collect::<Vec<_>>()
     .join(" ");
     let (paths, state) = state(&temp, &long_goal);

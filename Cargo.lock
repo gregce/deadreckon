@@ -461,6 +461,8 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "regex",
+ "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
