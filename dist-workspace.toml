@@ -4,7 +4,9 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.31.0"
 ci = ["github"]
-installers = ["shell", "powershell"]
+installers = ["shell", "powershell", "homebrew"]
+publish-jobs = ["homebrew"]
+tap = "gdc/homebrew-tap"
 targets = [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",

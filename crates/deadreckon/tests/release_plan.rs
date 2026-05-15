@@ -53,9 +53,13 @@ fn dist_plan_excludes_bundled_npm_installer() {
         .into_iter()
         .collect::<BTreeSet<_>>();
     assert_eq!(
-        ["powershell".to_string(), "shell".to_string()]
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
+        [
+            "homebrew".to_string(),
+            "powershell".to_string(),
+            "shell".to_string()
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>(),
         installers
     );
     assert!(
@@ -63,6 +67,108 @@ fn dist_plan_excludes_bundled_npm_installer() {
         "P8 owns the npm wrapper; dist's bundled npm installer must stay off"
     );
     assert_dist_plan_json_if_installed();
+}
+
+#[test]
+fn homebrew_formula_writes_install_receipt() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let formula = temp.path().join("deadreckon.rb");
+    fs::write(
+        &formula,
+        r#"class Deadreckon < Formula
+  version "9.8.7"
+  url "https://github.com/gdc/deadreckon/releases/download/v9.8.7/deadreckon.tar.xz"
+  sha256 "abc123"
+
+  def install_binary_aliases!
+  end
+
+  def install
+    bin.install "deadreckon"
+    install_binary_aliases!
+  end
+end
+"#,
+    )
+    .expect("write formula");
+    let output = Command::new("node")
+        .arg(workspace_root().join("release/homebrew/patch-formula.mjs"))
+        .arg(&formula)
+        .output()
+        .expect("patch formula");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let patched = fs::read_to_string(&formula).expect("patched formula");
+    assert!(patched.contains("install-receipt.json"), "{patched}");
+    assert!(patched.contains(r#""channel" => "brew""#), "{patched}");
+    assert!(
+        patched.contains(r#""install_source" => "brew:gdc/tap/deadreckon""#),
+        "{patched}"
+    );
+    assert!(patched.contains("write_deadreckon_receipt!"), "{patched}");
+}
+
+#[test]
+fn homebrew_formula_pins_release_sha256() {
+    let dist = dist_config();
+    assert_eq!(
+        Some("gdc/homebrew-tap"),
+        dist.get("tap").and_then(Value::as_str)
+    );
+    let publish_jobs = string_array(&dist, "publish-jobs");
+    assert_eq!(vec!["homebrew".to_string()], publish_jobs);
+
+    let workflow = release_workflow();
+    assert!(
+        workflow.contains("node release/homebrew/patch-formula.mjs target/distrib"),
+        "{workflow}"
+    );
+    assert!(
+        workflow.contains("repository: gdc/homebrew-tap"),
+        "{workflow}"
+    );
+    assert!(workflow.contains("HOMEBREW_TAP_TOKEN"), "{workflow}");
+
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let formula = temp.path().join("deadreckon.rb");
+    fs::write(
+        &formula,
+        r#"class Deadreckon < Formula
+  version "9.8.7"
+  url "https://github.com/gdc/deadreckon/releases/download/v9.8.7/deadreckon.tar.xz"
+  sha256 "abc123"
+
+  def install_binary_aliases!
+  end
+
+  def install
+    bin.install "deadreckon"
+    install_binary_aliases!
+  end
+end
+"#,
+    )
+    .expect("write formula");
+    let output = Command::new("node")
+        .arg(workspace_root().join("release/homebrew/patch-formula.mjs"))
+        .arg(&formula)
+        .output()
+        .expect("patch formula");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let template = fs::read_to_string(&formula).expect("patched formula");
+    assert!(
+        template.contains(r#"sha256 "abc123""#),
+        "formula patching must preserve cargo-dist release archive sha256s"
+    );
 }
 
 #[test]

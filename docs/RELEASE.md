@@ -21,16 +21,26 @@ If `APPLE_CERT_P12` is not present, the workflow skips macOS signing and
 notarization with a warning. That keeps forks and dry-runs usable, but release
 notes for any unsigned macOS artifact must call out that it is unsigned.
 
+## Package Manager Secrets
+
+The package-manager publishing jobs expect these additional repository secrets:
+
+| Secret | Purpose |
+| --- | --- |
+| `NPM_TOKEN` | npm automation token with publish rights for `deadreckon` and the five `deadreckon-*` platform packages. |
+| `HOMEBREW_TAP_TOKEN` | GitHub token with push rights to `gdc/homebrew-tap`. |
+
 ## Release Flow
 
 1. Confirm `cargo build --release`, `cargo test --workspace`, `cargo clippy
    --workspace -- -D warnings`, and `cargo fmt --check` are green.
-2. Confirm the Apple secrets above are configured before creating a public
-   macOS release.
+2. Confirm the Apple, npm, and Homebrew secrets above are configured before
+   creating a public release.
 3. Create the release tag locally.
 4. Push the tag to GitHub. The release workflow builds five target artifacts,
    signs and notarizes the two macOS binaries when secrets are present, builds
-   shell and PowerShell installers, and publishes the GitHub release.
+   shell and PowerShell installers, publishes the GitHub release, updates the
+   Homebrew tap, and publishes the npm wrapper/platform packages.
 
 The agent should not push tags. The first real release remains an operator
 action.
