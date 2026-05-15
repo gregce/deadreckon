@@ -91,6 +91,58 @@ jobs:
         run: |
           python3 -m pip install --user cargo-zigbuild
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build macOS binary for signing
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        run: |
+          cargo build --release --target=${{ matrix.target }} -p deadreckon
+      - name: Codesign and notarize macOS binary
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PWD: ${{ secrets.APPLE_CERT_PWD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PWD: ${{ secrets.APPLE_APP_PWD }}
+        run: |
+          if [[ -z "${APPLE_CERT_P12:-}" ]]; then
+            echo "::warning::APPLE_CERT_P12 is not configured; skipping macOS codesign/notarization"
+            exit 0
+          fi
+
+          missing=()
+          for name in APPLE_CERT_PWD APPLE_ID APPLE_TEAM_ID APPLE_APP_PWD; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::warning::missing Apple notarization secrets: ${missing[*]}; skipping macOS codesign/notarization"
+            exit 0
+          fi
+
+          binary="target/${{ matrix.target }}/release/deadreckon"
+          keychain="$RUNNER_TEMP/deadreckon-signing.keychain-db"
+          cert="$RUNNER_TEMP/developer-id.p12"
+          zip="$RUNNER_TEMP/deadreckon-${{ matrix.target }}.zip"
+
+          echo "$APPLE_CERT_P12" | base64 -D > "$cert"
+          security create-keychain -p "" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          security import "$cert" -k "$keychain" -P "$APPLE_CERT_PWD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$keychain"
+
+          codesign --sign "Developer ID Application" --options runtime --timestamp "$binary"
+          codesign --verify --verbose "$binary"
+          ditto -c -k --keepParent "$binary" "$zip"
+          xcrun notarytool submit "$zip" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PWD" \
+            --wait
       - name: Build target artifacts
         run: |
           dist build --tag=${{ github.ref_name }} --artifacts=local --target=${{ matrix.target }} --output-format=json > dist-manifest-${{ matrix.target }}.json

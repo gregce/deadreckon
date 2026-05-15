@@ -80,6 +80,57 @@ fn release_workflow_runs_dist_plan_on_every_push() {
     );
 }
 
+#[test]
+fn release_workflow_codesigns_only_on_apple_targets() {
+    let workflow = release_workflow();
+    let codesign_step = workflow
+        .split("- name: Codesign and notarize macOS binary")
+        .nth(1)
+        .expect("codesign step");
+    assert!(
+        codesign_step.contains("if: contains(matrix.target, 'apple-darwin')"),
+        "{codesign_step}"
+    );
+    assert!(codesign_step.contains("codesign --sign"), "{codesign_step}");
+    assert!(
+        codesign_step.contains("xcrun notarytool submit"),
+        "{codesign_step}"
+    );
+}
+
+#[test]
+fn release_workflow_skips_codesign_without_cert_secret() {
+    let workflow = release_workflow();
+    let codesign_step = workflow
+        .split("- name: Codesign and notarize macOS binary")
+        .nth(1)
+        .expect("codesign step");
+    assert!(codesign_step.contains("APPLE_CERT_P12"), "{codesign_step}");
+    assert!(
+        codesign_step.contains("skipping macOS codesign/notarization"),
+        "{codesign_step}"
+    );
+    assert!(codesign_step.contains("exit 0"), "{codesign_step}");
+}
+
+#[test]
+fn release_doc_lists_all_five_apple_secrets() {
+    let doc =
+        fs::read_to_string(workspace_root().join("docs/RELEASE.md")).expect("read docs/RELEASE.md");
+    for secret in [
+        "APPLE_CERT_P12",
+        "APPLE_CERT_PWD",
+        "APPLE_ID",
+        "APPLE_TEAM_ID",
+        "APPLE_APP_PWD",
+    ] {
+        assert!(
+            doc.contains(secret),
+            "{secret} missing from docs/RELEASE.md"
+        );
+    }
+}
+
 fn dist_config() -> toml::value::Table {
     let path = workspace_root().join("dist-workspace.toml");
     let text = fs::read_to_string(&path).expect("read dist-workspace.toml");
@@ -104,6 +155,11 @@ fn string_array(table: &toml::value::Table, key: &str) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+fn release_workflow() -> String {
+    fs::read_to_string(workspace_root().join(".github/workflows/release.yml"))
+        .expect("read release workflow")
 }
 
 fn assert_dist_plan_json_if_installed() {
