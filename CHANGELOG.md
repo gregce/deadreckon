@@ -11,6 +11,7 @@
 - Added the npm wrapper package, five per-platform optional dependency templates, no-network receipt postinstall, and npm publish workflow wiring.
 - Added Homebrew tap publishing for `gdc/homebrew-tap`, including a formula patch that writes the brew install receipt.
 - Added first-run update receipt persistence plus shell-update previews, non-TTY `--yes` enforcement, and post-update doctor hints.
+- Updated the as-built architecture docs with the distribution/self-update model and remaining operator release steps.
 
 ## Overnight UX (alpha) - 2026-05-14
 

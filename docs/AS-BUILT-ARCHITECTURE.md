@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-14 (coherence pass alpha)
+**Last updated:** 2026-05-15 (distribution and self-update alpha)
 **Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -37,9 +37,11 @@ This document captures the system as built today — what's wired, what's load-b
 24. [Codebase Modes](#24-codebase-modes)
 25. [Self-Documenting Runs](#25-self-documenting-runs)
 26. [Coherence Pass (alpha)](#26-coherence-pass-alpha)
+27. [Overnight UX](#27-overnight-ux)
 28. [Chains & Autonomous Goal Chaining](#28-chains--autonomous-goal-chaining)
 29. [Workspace Hygiene](#29-workspace-hygiene)
 30. [Plans & Multi-Agent Orchestration](#30-plans--multi-agent-orchestration)
+31. [Distribution & Self-Update](#31-distribution--self-update)
 
 ---
 
@@ -1414,9 +1416,11 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Descriptor-backed CLI providers with generic `exec_template` launch, registry-driven detection/init/listing, descriptor sandbox writes, and built-in `cli:gemini`, `cli:opencode`, `cli:copilot`, and `cli:pi` providers.
 - Smoke provider (deterministic) for keyless tests.
 - Turn loop with action parsing (Bash / WriteFile / Done) and CLI sub-agent path.
-- Overnight UX: `run --prevent-sleep <auto|on|off>` previews sleep posture and arms macOS `caffeinate` or Linux `systemd-inhibit` around the run loop, with run-local `working/.deadreckon/sleep-prevention.json`; preview/status/show/list and run exit summaries use the shared `ui_card` renderer with `--plain` and `NO_COLOR` support.
+- Overnight UX: `run --prevent-sleep <auto|on|off>` previews sleep posture and arms macOS `caffeinate` or Linux `systemd-inhibit` around the run loop, with run-local `working/.deadreckon/sleep-prevention.json`; run previews, run exit summaries, and completed attach footers use the shared `ui_card` renderer with `--plain` and `NO_COLOR` support, while read-only inspection commands stay in quieter table/report layouts.
 - Unattended git hardening: production git invocations route through `deadreckon-core::git`, export `GIT_TERMINAL_PROMPT=0`, and disable commit/tag GPG signing for commit-family verbs so global signing cannot hang on pinentry.
 - Honest spend summaries: `spend.jsonl` replay marks totals with `~` when any turn is subscription-priced or estimated while preserving the numeric total.
+- Distribution and self-update: install receipts and update-check caches live under `~/.deadreckon/`; `deadreckon update --check` and `deadreckon update` honor npm, Homebrew, shell, cargo, and source channels; shell installs preview the target/archive/checksum/backup path, require confirmation or `--yes`, keep the latest three backups, and print a post-update `deadreckon doctor` hint.
+- Release packaging: `cargo-dist` configuration covers five OS/architecture targets, shell and PowerShell installers, Linux glibc 2.28 metadata, guarded macOS signing/notarization, a no-network npm wrapper with five platform packages, and Homebrew tap publishing through `gdc/homebrew-tap`.
 - Codebase-default running: worktree mode, copy mode, in-place mode, fresh-mode preservation, preflight + preview UX, and `codebase.json` files-not-fields metadata.
 - `apply` and `abandon` for worktree rollback/apply lifecycle.
 - `materialize`, `extend`, `undo`, `list`, and `show` integration with codebase mode metadata, including worktree extension branches chained from parent `dr/...` branches.
@@ -1691,7 +1695,7 @@ Mass renaming stored enum variants, themable palettes, localization hooks, and a
 
 ### 27.1 Card Vocabulary
 
-`crates/deadreckon/src/ui_card.rs` is the shared CLI card renderer for preview, exit, status, show, and list surfaces. It has ANSI-aware visible-width helpers, deterministic layout, ASCII fallback under `--plain` / `NO_COLOR`, and a narrow-terminal fallback below 40 columns. `crates/deadreckon/src/cards/exit_summary.rs` builds the shared run outcome card used after run/resume/kill paths.
+`crates/deadreckon/src/ui_card.rs` is the shared CLI card renderer for run previews, run exit summaries, and completed attach footers. It has ANSI-aware visible-width helpers, deterministic layout, ASCII fallback under `--plain` / `NO_COLOR`, and a narrow-terminal fallback below 40 columns. `crates/deadreckon/src/cards/exit_summary.rs` builds the shared run outcome card used after run/resume/kill paths. Read-only inspection surfaces such as `list`, `show`, and `status` keep quieter table/report output so they do not duplicate the same metadata inside cards.
 
 ### 27.2 Sleep Prevention
 
@@ -1875,4 +1879,49 @@ The first orchestration milestone is usable but not the full rider endpoint. The
 
 ---
 
-*This document is canonical for the alpha-tier reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, and 22 in particular. Last regenerated by an agent team from a deep code map; cross-check against the current code before relying on any specific line number.*
+## 31. Distribution & Self-Update
+
+### 31.1 Install Receipts And Update Cache
+
+The install channel is durable, not guessed on every command. `crates/deadreckon-core/src/install_receipt.rs` defines `Receipt` with `channel`, `channel_version`, `binary_path`, optional install source/platform package, and `receipt_version`. The receipt is stored at `~/.deadreckon/install-receipt.json`.
+
+When a receipt is missing, normal `deadreckon update` detects the current binary path and persists the inferred receipt before routing the update. `deadreckon update --check` deliberately remains read-only and does not write that receipt. Detection recognizes npm package layouts, Homebrew Cellar paths, `~/.cargo/bin`, shell installer paths under `~/.local/share/deadreckon` or `%LOCALAPPDATA%/deadreckon`, and falls back to `source`.
+
+`crates/deadreckon-core/src/update_cache.rs` stores `~/.deadreckon/update-check.json` with a 24-hour TTL. Startup update checks are opportunistic: they skip non-TTYs, `doctor`, `update`, source installs, and `DEADRECKON_UPDATE_CHECK=0`, then print only a stale-version hint instead of blocking the requested command.
+
+### 31.2 User Update Flow
+
+`deadreckon update --check` prints the current channel/version and the latest GitHub release result when available. Network failure degrades to the cache or the current version rather than turning routine checks into hard failures.
+
+For native package-manager installs, `deadreckon update` prints the command the user should run:
+
+```text
+npm:  npm update -g deadreckon
+brew: brew upgrade deadreckon
+cargo: cargo binstall deadreckon || cargo install deadreckon
+source: cargo install --path crates/deadreckon
+```
+
+Shell-channel installs are updated in place through `axoupdater`. Before mutating anything, the CLI resolves the target release and prints the current version, target version, installer/archive URL, checksum note, and planned backup directory. Interactive shells prompt for confirmation; non-interactive shells must pass `--yes`. After confirmation, the current binary is copied into `~/.deadreckon/update-backups/<timestamp>-<n>/`, the swap runs, failed swaps restore the backup, and successful swaps prune old backups down to the newest three and print `try: deadreckon doctor`.
+
+### 31.3 Release Packaging
+
+`dist-workspace.toml` is the release manifest. It pins `cargo-dist` 0.31.0, enables shell, PowerShell, and Homebrew installers, targets macOS arm64/x64, Linux arm64/x64, and Windows x64, and records glibc 2.28 for the Linux GNU builds. The bundled cargo-dist npm installer is intentionally disabled because npm is owned by the explicit wrapper packages under `npm/`.
+
+`.github/workflows/release.yml` runs a dist plan on ordinary pushes and pull requests. Version tags build local artifacts per target, optionally sign and notarize macOS binaries when Apple secrets exist, build global installer artifacts, patch the generated Homebrew formula, publish the GitHub release, publish the tap formula to `gdc/homebrew-tap`, and call the reusable npm workflow.
+
+`docs/RELEASE.md` is the operator runbook. It names the Apple signing/notarization secrets, `NPM_TOKEN`, and `HOMEBREW_TAP_TOKEN`, and records that pushing a release tag is an operator action rather than something an agent should do.
+
+### 31.4 npm And Homebrew
+
+The npm distribution uses a small `deadreckon` wrapper package with optional dependencies on five platform packages: darwin-arm64, darwin-x64, linux-arm64, linux-x64, and win32-x64. `npm/scripts/prepare-release.mjs` repacks cargo-dist artifacts into those platform package directories and updates versions from the tag. The wrapper `postinstall` writes an npm receipt without network access, so future `deadreckon update` calls know they should route back to npm.
+
+Homebrew publishing uses cargo-dist formula output, then `release/homebrew/patch-formula.mjs` pins release archive SHA-256 values and injects receipt writing into the formula. The release workflow publishes the patched formula into `gdc/homebrew-tap` with `HOMEBREW_TAP_TOKEN`.
+
+### 31.5 Current Limits
+
+The release path is wired and depth-tested, but the first public release still requires operator setup: configure repository secrets, create/push the version tag, watch the GitHub Actions release, and verify npm/Homebrew/GitHub artifacts after publishing. Local tests skip `cargo dist plan` when `cargo-dist` is not installed, so installing cargo-dist locally gives one more pre-tag confidence check.
+
+---
+
+*This document is canonical for the alpha-tier reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, and 31 in particular. Last regenerated by an agent team from a deep code map; cross-check against the current code before relying on any specific line number.*
