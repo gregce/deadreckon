@@ -261,6 +261,43 @@ fn orchestrate_full_plan_preview_shows_planner_child_providers_without_forking()
 }
 
 #[test]
+fn orchestrate_start_prints_run_like_context() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "orchestrate",
+            "review",
+            "tiny hello rust",
+            "--coder-provider",
+            "smoke",
+            "--reviewer-provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--yes",
+        ])
+        .output()
+        .expect("orchestrate");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    let out = stdout(&output);
+    assert!(out.contains("started orchestration"), "{out}");
+    assert!(out.contains(&plan.plan_id[..8]), "{out}");
+    assert!(out.contains("attach:"), "{out}");
+    assert!(
+        out.contains(&format!("deadreckon attach {}", &plan.plan_id[..8])),
+        "{out}"
+    );
+    assert!(out.contains("providers"), "{out}");
+    assert!(out.contains("plan"), "{out}");
+}
+
+#[test]
 fn orchestrate_headless_without_mode_refuses_with_try_line() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

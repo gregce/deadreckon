@@ -7635,19 +7635,29 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
     let default_provider = resolve_provider_name(&paths, defaults.provider)?;
+    let recommended_mode = recommend_orchestration_mode(&goal);
     println!("{}", ui_heading("Orchestration mode"));
     println!(
-        "  {} one coder provider, then a fresh reviewer/fixer",
+        "  recommendation: {} - {}",
+        ui_command(plan_mode_label(match recommended_mode {
+            CliPlanMode::FullPlan => PlanMode::FullPlan,
+            CliPlanMode::Review => PlanMode::Review,
+        })),
+        orchestration_mode_recommendation_reason(&goal, recommended_mode)
+    );
+    println!(
+        "  {} focused implementation with one coder provider, then a fresh reviewer/fixer",
         ui_command("review")
     );
     println!(
-        "  {} planner provider decomposes child work before fork and merge",
+        "  {} planner provider decomposes broad product work into child implementation agents before fork and merge",
         ui_command("full-plan")
     );
-    let mode = prompt_orchestration_mode()?;
+    let mode = prompt_orchestration_mode(recommended_mode)?;
+    print_orchestrate_provider_choices(&paths, default_provider.as_deref())?;
     let mut plan = PlanCommandArgs {
         goal,
-        n: 3,
+        n: recommend_child_count_for_goal("", mode),
         mode,
         max_spend,
         max_wall_seconds,
@@ -7663,9 +7673,10 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
     };
     match mode {
         CliPlanMode::FullPlan => {
-            plan.n = prompt_child_count(3)?;
+            plan.n = prompt_child_count(recommend_child_count_for_goal(&plan.goal, mode))?;
             plan.planner_provider = prompt_provider_role("planner", default_provider.as_deref())?;
             plan.provider = prompt_provider_role("default child", default_provider.as_deref())?;
+            plan.child_provider = prompt_child_provider_overrides(plan.n)?;
         }
         CliPlanMode::Review => {
             plan.coder_provider = prompt_provider_role("coder", default_provider.as_deref())?;
@@ -7675,10 +7686,89 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
     Ok(OrchestrateRunArgs { plan, preview, yes })
 }
 
-fn prompt_orchestration_mode() -> Result<CliPlanMode> {
-    let answer = prompt::open("mode [review]: ", None)?;
+fn recommend_orchestration_mode(goal: &str) -> CliPlanMode {
+    let lower = goal.to_ascii_lowercase();
+    let broad_product = [
+        "make a full",
+        "build a full",
+        "create a full",
+        "fully",
+        "from scratch",
+        "app",
+        "game",
+        "site",
+        "multiplayer",
+        "realtime",
+        "real-time",
+        "live",
+        "server",
+        "client",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let focused_change = [
+        "fix ", "bug", "change ", "refactor", "review", "audit", "explain", "docs", "rename",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if broad_product && !focused_change {
+        CliPlanMode::FullPlan
+    } else {
+        CliPlanMode::Review
+    }
+}
+
+fn orchestration_mode_recommendation_reason(goal: &str, mode: CliPlanMode) -> &'static str {
+    match mode {
+        CliPlanMode::FullPlan => {
+            if goal.to_ascii_lowercase().contains("multiplayer") {
+                "goal looks like broad product work with separable implementation slices"
+            } else {
+                "goal looks broad enough to decompose before execution"
+            }
+        }
+        CliPlanMode::Review => "goal looks focused enough for coder plus reviewer",
+    }
+}
+
+fn recommend_child_count_for_goal(goal: &str, mode: CliPlanMode) -> u8 {
+    if mode == CliPlanMode::Review {
+        return 2;
+    }
+    let lower = goal.to_ascii_lowercase();
+    let complexity = [
+        "multiplayer",
+        "realtime",
+        "real-time",
+        "live",
+        "physics",
+        "terrain",
+        "server",
+        "database",
+        "auth",
+        "deploy",
+        "mobile",
+        "game",
+    ]
+    .iter()
+    .filter(|needle| lower.contains(*needle))
+    .count();
+    match complexity {
+        0 | 1 => 3,
+        2 | 3 => 4,
+        _ => 5,
+    }
+}
+
+fn prompt_orchestration_mode(default: CliPlanMode) -> Result<CliPlanMode> {
+    let default_label = match default {
+        CliPlanMode::Review => "review",
+        CliPlanMode::FullPlan => "full-plan",
+    };
+    let answer = prompt::open(&format!("mode [{default_label}]: "), None)?;
     match answer.trim().to_ascii_lowercase().as_str() {
-        "" | "r" | "review" => Ok(CliPlanMode::Review),
+        "" => Ok(default),
+        "r" | "review" => Ok(CliPlanMode::Review),
         "f" | "full" | "full-plan" | "full_plan" | "plan" => Ok(CliPlanMode::FullPlan),
         other => Err(CliError::Core(deadreckon_core::user_error(
             &format!("unknown orchestration mode {other}"),
@@ -7702,6 +7792,23 @@ fn prompt_child_count(default: u8) -> Result<u8> {
     Ok(n)
 }
 
+fn prompt_child_provider_overrides(n: u8) -> Result<Vec<String>> {
+    println!(
+        "  optional: route specific child indices 0..{} to another provider, e.g. 1=cli:codex",
+        n.saturating_sub(1)
+    );
+    let answer = prompt::open("child provider overrides []: ", None)?;
+    if answer.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(answer
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
 fn prompt_provider_role(role: &str, default: Option<&str>) -> Result<Option<String>> {
     let prompt_text = match default {
         Some(default) => format!("{role} provider [{default}]: "),
@@ -7713,6 +7820,32 @@ fn prompt_provider_role(role: &str, default: Option<&str>) -> Result<Option<Stri
         return Ok(default.map(ToString::to_string));
     }
     Ok(Some(provider.to_string()))
+}
+
+fn print_orchestrate_provider_choices(
+    paths: &DeadreckonPaths,
+    default_provider: Option<&str>,
+) -> Result<()> {
+    let configured = configured_provider_ids(paths)?;
+    println!("{}", ui_heading("Providers"));
+    println!(
+        "  default: {}",
+        default_provider
+            .map(ui_command)
+            .unwrap_or_else(|| ui_muted("none configured"))
+    );
+    if configured.is_empty() {
+        println!("  configured: none");
+        println!(
+            "  {} {}",
+            ui_command("try:"),
+            ui_command("deadreckon providers list --all")
+        );
+    } else {
+        println!("  configured: {}", configured.join(", "));
+    }
+    println!("  planner creates the child graph; child/coder/reviewer providers execute work.");
+    Ok(())
 }
 
 async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
@@ -7731,6 +7864,9 @@ async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
         return Ok(());
     }
     confirm_orchestration_start(&plan, args.yes)?;
+    if !quiet {
+        print_orchestrate_started(&plan, max_spend, max_wall_seconds, sandbox.as_deref());
+    }
     fork_command(ForkCommandArgs {
         plan_id: plan_id.clone(),
         max_spend,
@@ -8355,12 +8491,143 @@ fn print_orchestrate_preflight(
             deps
         );
     }
+    let warnings = implementation_plan_warnings(plan);
+    if !warnings.is_empty() {
+        println!("{}", ui_warn("preflight warnings"));
+        for warning in warnings {
+            println!("  - {warning}");
+        }
+        println!(
+            "  {} {}",
+            ui_command("try:"),
+            ui_command(format!(
+                "deadreckon attach {} --plain",
+                run_prefix(&plan.plan_id)
+            ))
+        );
+    }
     println!(
         "{} {}/plans/{}/plan.json",
         ui_command("plan:"),
         DeadreckonPaths::discover().home().display(),
         plan.plan_id
     );
+}
+
+fn print_orchestrate_started(
+    plan: &Plan,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    sandbox: Option<&str>,
+) {
+    println!(
+        "{} {}",
+        ui_ok("started orchestration"),
+        ui_id(format!("{} ({})", run_prefix(&plan.plan_id), plan.plan_id))
+    );
+    let children = plan.tasks.len().to_string();
+    let providers = plan_provider_summary(plan);
+    let sandbox = sandbox.unwrap_or("config default").to_string();
+    let spend = max_spend
+        .map(|value| format!("${value:.2} per child"))
+        .unwrap_or_else(|| "config default".to_string());
+    let wall = max_wall_seconds
+        .map(|value| format!("{value:.0}s per child"))
+        .unwrap_or_else(|| "config default".to_string());
+    let paths = DeadreckonPaths::discover();
+    let plan_path = paths.plan_json(&plan.plan_id);
+    let plan_path_display = plan_path.to_string_lossy().to_string();
+    let events_path_display = paths
+        .plan_events(&plan.plan_id)
+        .to_string_lossy()
+        .to_string();
+    let items = [
+        ("mode", plan_mode_label(plan.mode)),
+        ("children", children.as_str()),
+        ("providers", providers.as_str()),
+        ("sandbox", sandbox.as_str()),
+        ("spend", spend.as_str()),
+        ("wall", wall.as_str()),
+        ("plan", plan_path_display.as_str()),
+        ("events", events_path_display.as_str()),
+    ];
+    print_kv_block(&items);
+    println!(
+        "{} {}",
+        ui_command("attach:"),
+        ui_command(format!("deadreckon attach {}", run_prefix(&plan.plan_id)))
+    );
+    println!(
+        "{} {}",
+        ui_command("show:"),
+        ui_command(format!("deadreckon show {}", run_prefix(&plan.plan_id)))
+    );
+    println!(
+        "{} {}",
+        ui_command("history:"),
+        ui_command(format!(
+            "deadreckon history grep <pattern> --plan {}",
+            run_prefix(&plan.plan_id)
+        ))
+    );
+    let _ = io::stdout().flush();
+}
+
+fn implementation_plan_warnings(plan: &Plan) -> Vec<String> {
+    if plan.mode != PlanMode::FullPlan || user_requested_planning(&plan.root_goal) {
+        return Vec::new();
+    }
+    let weak_tasks = plan
+        .tasks
+        .iter()
+        .filter(|task| task_looks_non_implementation(task))
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+    if weak_tasks.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "{} task(s) look research/design/roadmap-only for a build goal: {}. Preview/edit/re-plan before starting if these should build working software.",
+        weak_tasks.len(),
+        weak_tasks.join(", ")
+    )]
+}
+
+fn user_requested_planning(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    ["research", "plan", "roadmap", "architecture", "design doc"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn task_looks_non_implementation(task: &PlanTask) -> bool {
+    let text = format!("{} {}", task.subject, task.goal).to_ascii_lowercase();
+    let planning_terms = [
+        "research",
+        "source ",
+        "sourcing",
+        "architecture",
+        "design ",
+        "roadmap",
+        "document",
+        "decision record",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    let implementation_terms = [
+        "implement ",
+        "build",
+        "create",
+        "add",
+        "wire",
+        "test",
+        "verify",
+        "fix",
+        "scaffold",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    planning_terms && !implementation_terms
 }
 
 fn orchestration_mode_summary(plan: &Plan) -> &'static str {
@@ -18318,12 +18585,14 @@ mod tui_tests {
         chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
         cli_wait_status_line, collect_jsonl_provider_activity, completion_action_from_input,
         completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
-        doc_polish_preview_text, live_file_lines, markdown_to_tui_lines, max_panel_scroll,
-        per_step_wall_cap, plan_attach_footer, provider_ingest_base_roots,
-        provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
-        provider_jsonl_session_matches_run, read_plan_events_lossy, render_attach,
-        render_plan_attach, threshold_color,
+        doc_polish_preview_text, implementation_plan_warnings, live_file_lines,
+        markdown_to_tui_lines, max_panel_scroll, per_step_wall_cap, plan_attach_footer,
+        provider_ingest_base_roots, provider_jsonl_activity_lines,
+        provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
+        read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
+        render_attach, render_plan_attach, threshold_color,
     };
+    use crate::cli::CliPlanMode;
     use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use deadreckon_core::{
@@ -18536,6 +18805,49 @@ mod tui_tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn orchestration_mode_recommendation_prefers_full_plan_for_broad_products() {
+        assert_eq!(
+            recommend_orchestration_mode("make a fully multiplayer live flight simulator"),
+            CliPlanMode::FullPlan
+        );
+        assert_eq!(
+            recommend_orchestration_mode("fix the provider table spacing"),
+            CliPlanMode::Review
+        );
+    }
+
+    #[test]
+    fn orchestration_child_count_scales_with_goal_complexity() {
+        assert_eq!(
+            recommend_child_count_for_goal("fix a typo", CliPlanMode::Review),
+            2
+        );
+        assert_eq!(
+            recommend_child_count_for_goal(
+                "make a multiplayer realtime physics terrain game with server",
+                CliPlanMode::FullPlan
+            ),
+            5
+        );
+    }
+
+    #[test]
+    fn preflight_warns_on_research_only_full_plan_tasks_for_build_goal() {
+        let (_temp, _paths, mut plan) = full_plan_fixture(2);
+        plan.root_goal = "make a fully multiplayer live flight simulator".to_string();
+        plan.tasks[0].subject = "research flight sim architecture".to_string();
+        plan.tasks[0].goal = "Research and document architecture options".to_string();
+        plan.tasks[1].subject = "produce phased implementation roadmap".to_string();
+        plan.tasks[1].goal = "Produce a roadmap document".to_string();
+
+        let warnings = implementation_plan_warnings(&plan);
+
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("task-0"), "{warnings:#?}");
+        assert!(warnings[0].contains("task-1"), "{warnings:#?}");
     }
 
     #[test]

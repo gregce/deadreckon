@@ -8,6 +8,7 @@
 - Hardened plan kill bookkeeping so discovered child run ids are preserved even if a child reaches a terminal state before the kill sweep inspects it.
 - Hardened plan attach and kill recovery for partial `plan-events.jsonl` lines, missing child run roots, explicit `b`/Backspace back navigation, terminal failed-plan events, and sidecar-recovered child run ids.
 - Hardened full-plan planning so build goals ask for implementation/verification child slices instead of research-only packets, and multiplayer/live/networked goals preview network capability correctly.
+- Improved interactive `orchestrate` setup with goal-based mode and child-count recommendations, configured-provider guidance, optional child provider overrides, preflight warnings for research-only build plans, and a run-like started banner with attach/show/plan paths.
 - Updated `docs/AS-BUILT-ARCHITECTURE.md` with `§32 Plan Observability` and amended `§22`/`§30` to reflect the file-backed plan event stream and remaining broadcast-bus limit.
 
 ## Distribution & self-update (alpha) - 2026-05-15
