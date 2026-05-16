@@ -8056,7 +8056,7 @@ async fn provider_plan_drafts(
 
 fn planner_prompt(goal: &str, n: u8) -> String {
     format!(
-        "You are a read-only planning agent for deadreckon. Do not write files, create temporary files, install packages, commit, delete, move, or mutate state. Inspect only if your provider supports read-only tools.\n\nReturn JSON only. Shape: {{\"tasks\":[{{\"subject\":\"imperative label\",\"goal\":\"self-contained child goal\",\"active_form\":\"present-progress text\",\"depends_on\":[\"task-0\"]}}]}}. Return exactly {n} child entries in the tasks array. Dependencies must refer to earlier child ids task-0..task-{} and form a DAG.\n\nChild hygiene:\n- Prefer child ids in execution order; earlier children should unblock later children.\n- Split independent research or implementation work into separate children.\n- Give each child enough context to run without seeing the user conversation.\n- Never write \"based on the other worker\"; include the concrete dependency output the child will need.\n\nGoal: {goal}",
+        "You are a read-only planning agent for deadreckon. Do not write files, create temporary files, install packages, commit, delete, move, or mutate state. Inspect only if your provider supports read-only tools.\n\nReturn JSON only. Shape: {{\"tasks\":[{{\"subject\":\"imperative label\",\"goal\":\"self-contained child goal\",\"active_form\":\"present-progress text\",\"depends_on\":[\"task-0\"]}}]}}. Return exactly {n} child entries in the tasks array. Dependencies must refer to earlier child ids task-0..task-{} and form a DAG.\n\nChild hygiene:\n- Prefer child ids in execution order; earlier children should unblock later children.\n- For build/product goals, child goals must be implementation or verification slices that create or edit project files and move toward runnable behavior.\n- Do not return research-only, sourcing-only, architecture-only, or roadmap-only children unless the user explicitly asked for planning or research documentation.\n- Split independent implementation work into separate children; use research only as a dependency that directly unblocks concrete implementation.\n- Give each child enough context to run without seeing the user conversation, including likely files/modules/features and acceptance checks.\n- Never write \"based on the other worker\"; include the concrete dependency output the child will need.\n\nGoal: {goal}",
         n.saturating_sub(1)
     )
 }
@@ -8117,7 +8117,28 @@ fn infer_capability_preview(goal: &str) -> deadreckon_core::CapabilityPreview {
     let global_install = ["install globally", "global install", "npm -g"]
         .iter()
         .any(|needle| lower.contains(needle));
-    let network = if deploy || lower.contains("api") || lower.contains("websocket") {
+    let networked = [
+        "api",
+        "websocket",
+        "web socket",
+        "multiplayer",
+        "online",
+        "networked",
+        "real-time",
+        "real time",
+        "realtime",
+        "live",
+        "server",
+        "client/server",
+        "asset source",
+        "asset sourcing",
+        "terrain data",
+        "mapbox",
+        "cesium",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let network = if deploy || networked {
         deadreckon_core::NetworkCapability::Allowlist
     } else {
         deadreckon_core::NetworkCapability::Deny

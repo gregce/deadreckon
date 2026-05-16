@@ -430,6 +430,11 @@ fn planner_prompt_is_read_only() {
         prompt.contains("Dependencies must refer to earlier child ids"),
         "{prompt}"
     );
+    assert!(
+        prompt.contains("child goals must be implementation or verification slices"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Do not return research-only"), "{prompt}");
 }
 
 #[test]
@@ -707,6 +712,35 @@ fn plan_hints_name_capabilities_and_ready_tasks() {
         "{out}"
     );
     assert!(out.contains("fork:"), "{out}");
+}
+
+#[test]
+fn plan_capability_preview_allows_network_for_multiplayer_live_goals() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "make a fully multiplayer live flight simulator",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(
+        out.contains("network=Allowlist deploy=false install=false"),
+        "{out}"
+    );
 }
 
 #[test]
