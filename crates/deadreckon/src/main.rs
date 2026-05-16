@@ -8898,9 +8898,9 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         let (pid_tx, pid_rx) = std::sync::mpsc::channel::<(usize, u32)>();
         let mut handles = Vec::new();
         for task_index in ready {
-            let source_dir = plan_child_source_dir(&paths, &plan, task_index, &parent_cwd)?;
             let paths_for_child = paths.clone();
             let plan_for_child = plan.clone();
+            let parent_cwd_for_child = parent_cwd.clone();
             let sandbox_for_child = sandbox.clone();
             let pid_tx_for_child = pid_tx.clone();
             handles.push((
@@ -8910,7 +8910,7 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                         paths: &paths_for_child,
                         plan: &plan_for_child,
                         task_index,
-                        source_dir: &source_dir,
+                        parent_cwd: &parent_cwd_for_child,
                         sandbox: &sandbox_for_child,
                         max_spend,
                         max_wall_seconds,
@@ -9244,32 +9244,169 @@ fn plan_child_source_dir(
 ) -> Result<PathBuf> {
     let task = &plan.tasks[task_index];
     let plan_cwd = plan.parent_cwd.as_deref().unwrap_or(parent_cwd);
-    if task.role != PlanRole::Reviewer {
+    if task.depends_on.is_empty() {
         return Ok(plan_cwd.to_path_buf());
     }
-    let Some(dependency) = task.depends_on.first() else {
-        return Ok(plan_cwd.to_path_buf());
-    };
-    let Some(parent_task) = plan.task_by_id(dependency) else {
-        return Ok(plan_cwd.to_path_buf());
-    };
-    let Some(run_id) = parent_task.child_run_id.as_deref() else {
-        return Ok(plan_cwd.to_path_buf());
-    };
-    let state = load_run(paths, run_id)?;
-    let library_dir = paths.library_dir(&state.scope, &state.run_id);
-    if library_dir.is_dir() {
-        Ok(library_dir)
+
+    let dependencies = plan_dependency_artifacts(paths, plan, task)?;
+    if task.role == PlanRole::Reviewer && dependencies.len() == 1 {
+        Ok(dependencies[0].root.clone())
     } else {
-        Ok(state.working_dir)
+        compose_dependency_source_dir(paths, plan, task, &dependencies)
     }
+}
+
+#[derive(Debug, Clone)]
+struct PlanDependencyArtifact {
+    task_id: String,
+    index: u32,
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct DependencySourceFile {
+    task_id: String,
+    hash: u64,
+}
+
+fn plan_dependency_artifacts(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task: &PlanTask,
+) -> Result<Vec<PlanDependencyArtifact>> {
+    let mut dependencies = Vec::new();
+    for dependency in &task.depends_on {
+        let dependency_task = plan.task_by_id(dependency).ok_or_else(|| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!("task {} depends on unknown {dependency}", task.task_id),
+                "edit the plan so depends_on references earlier task ids",
+            ))
+        })?;
+        if dependency_task.status != PlanTaskStatus::Completed {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "task {} dependency {} is {}",
+                    task.task_id,
+                    dependency_task.task_id,
+                    task_status_label(dependency_task.status)
+                ),
+                "wait for dependencies to complete before forking dependent children",
+            )));
+        }
+        let run_id = dependency_task.child_run_id.as_deref().ok_or_else(|| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "task {} dependency {} has no run id",
+                    task.task_id, dependency
+                ),
+                "deadreckon fork <plan-id>",
+            ))
+        })?;
+        let state = load_run(paths, run_id)?;
+        dependencies.push(PlanDependencyArtifact {
+            task_id: dependency_task.task_id.clone(),
+            index: dependency_task.index,
+            root: child_artifact_root(paths, &state),
+        });
+    }
+    dependencies.sort_by_key(|dependency| dependency.index);
+    Ok(dependencies)
+}
+
+fn compose_dependency_source_dir(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task: &PlanTask,
+    dependencies: &[PlanDependencyArtifact],
+) -> Result<PathBuf> {
+    let source_dir = paths
+        .plan_dir(&plan.plan_id)
+        .join("launch")
+        .join(&task.task_id)
+        .join("source");
+    remove_if_exists(&source_dir)?;
+    fs::create_dir_all(&source_dir)?;
+
+    let mut seen = BTreeMap::<PathBuf, DependencySourceFile>::new();
+    for dependency in dependencies {
+        for file in inventory_files(&dependency.root)? {
+            let relative = file.strip_prefix(&dependency.root).map_err(|err| {
+                DeadreckonError::InvalidInput(format!("dependency source prefix error: {err}"))
+            })?;
+            if skip_plan_merge_file(relative) {
+                continue;
+            }
+            let hash = file_hash(&file)?;
+            match seen.get(relative).cloned() {
+                Some(previous) if previous.hash == hash => {}
+                Some(previous)
+                    if plan_task_depends_on(plan, &dependency.task_id, &previous.task_id) =>
+                {
+                    copy_merge_file(&file, &source_dir.join(relative))?;
+                    seen.insert(
+                        relative.to_path_buf(),
+                        DependencySourceFile {
+                            task_id: dependency.task_id.clone(),
+                            hash,
+                        },
+                    );
+                }
+                Some(previous)
+                    if plan_task_depends_on(plan, &previous.task_id, &dependency.task_id) => {}
+                Some(previous) => {
+                    return Err(CliError::Core(deadreckon_core::user_error(
+                        &format!(
+                            "dependency source conflict at {} between {} and {}",
+                            relative.display(),
+                            previous.task_id,
+                            dependency.task_id
+                        ),
+                        "split the tasks so only one dependency owns that file, or merge them before the dependent child",
+                    )));
+                }
+                None => {
+                    copy_merge_file(&file, &source_dir.join(relative))?;
+                    seen.insert(
+                        relative.to_path_buf(),
+                        DependencySourceFile {
+                            task_id: dependency.task_id.clone(),
+                            hash,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    Ok(source_dir)
+}
+
+fn plan_task_depends_on(plan: &Plan, task_id: &str, dependency_id: &str) -> bool {
+    let mut stack = vec![task_id.to_string()];
+    let mut seen = BTreeSet::new();
+    while let Some(next) = stack.pop() {
+        if !seen.insert(next.clone()) {
+            continue;
+        }
+        let Some(task) = plan.task_by_id(&next) else {
+            continue;
+        };
+        if task
+            .depends_on
+            .iter()
+            .any(|dependency| dependency == dependency_id)
+        {
+            return true;
+        }
+        stack.extend(task.depends_on.iter().cloned());
+    }
+    false
 }
 
 struct PlanChildLaunch<'a> {
     paths: &'a DeadreckonPaths,
     plan: &'a Plan,
     task_index: usize,
-    source_dir: &'a Path,
+    parent_cwd: &'a Path,
     sandbox: &'a str,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
@@ -9283,7 +9420,7 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         paths,
         plan,
         task_index,
-        source_dir,
+        parent_cwd,
         sandbox,
         max_spend,
         max_wall_seconds,
@@ -9292,6 +9429,7 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         pid_sender,
     } = launch;
     let task = &plan.tasks[task_index];
+    let source_dir = plan_child_source_dir(paths, plan, task_index, parent_cwd)?;
     let worker_spec_path = paths.worker_spec(&plan.plan_id, &task.task_id);
     let worker_spec = render_launch_worker_spec(paths, plan, task);
     write_worker_spec(paths, &plan.plan_id, &task.task_id, &worker_spec)?;
@@ -9304,7 +9442,7 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
 
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
-        .current_dir(source_dir)
+        .current_dir(&source_dir)
         .env("DEADRECKON_HOME", paths.home())
         .env("DEADRECKON_HINTS", "0")
         .env("DEADRECKON_SCOPE_ROOT", &launch_dir);
@@ -9320,7 +9458,7 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
             .arg("run")
             .arg(prompt)
             .arg("--from")
-            .arg(source_dir)
+            .arg(&source_dir)
             .arg("--yes")
             .arg("--no-confirm")
             .arg("--no-hints")
@@ -9858,6 +9996,7 @@ fn child_artifact_root(paths: &DeadreckonPaths, state: &deadreckon_core::Pipelin
 fn skip_plan_merge_file(relative: &Path) -> bool {
     relative == Path::new("manifest.json")
         || relative.starts_with(".deadreckon")
+        || path_has_component(relative, ".git")
         || path_has_component(relative, "target")
         || path_has_component(relative, "node_modules")
         || path_has_component(relative, ".next")

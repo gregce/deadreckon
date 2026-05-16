@@ -11,8 +11,8 @@ use deadreckon_core::{
     CHAIN_EVENTS_JSONL, CoordinatorState, DeadreckonPaths, PLAN_EVENTS_JSONL, Plan, PlanEvent,
     PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanRole, PlanStatus, PlanTaskStatus,
     RUN_EVENTS_JSONL, RunOptions, RunStatus, TraceRecord, append_plan_event, append_plan_message,
-    append_trace, create_run, list_runs, load_plan, pid_is_alive, read_plan_events,
-    read_plan_messages, save_plan, save_state,
+    append_trace, create_run, list_runs, load_plan, pid_is_alive, read_codebase_record,
+    read_plan_events, read_plan_messages, save_plan, save_state,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -1606,6 +1606,219 @@ fn fork_respects_task_dependencies() {
         "{}",
         second_state.goal
     );
+}
+
+#[test]
+fn full_plan_dependent_child_starts_from_completed_dependency_artifact() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_fake_cli_subagent_provider(
+        &paths,
+        temp.path(),
+        "cli:source-chain",
+        r#"
+case "$1" in
+  *"Task: task-1"*)
+    test -f base.txt || { printf 'missing base from dependency\n' >&2; exit 42; }
+    printf 'task 1 saw dependency\n' > child-saw-base.txt
+    ;;
+  *"Task: task-0"*)
+    printf 'from task 0\n' > base.txt
+    ;;
+  *)
+    printf 'unknown task prompt\n' >&2
+    exit 43
+    ;;
+esac
+printf 'done\n'
+"#,
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "source chaining example",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "cli:source-chain",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.tasks[1].depends_on = vec![plan.tasks[0].task_id.clone()];
+    save_plan(&paths, &plan).expect("save dependency");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+
+    let plan = load_plan(&paths, &plan.plan_id).expect("forked plan");
+    assert_eq!(plan.tasks[1].status, PlanTaskStatus::Completed);
+    let second_run_id = plan.tasks[1].child_run_id.as_deref().expect("second run");
+    let second_state = deadreckon_core::load_run(&paths, second_run_id).expect("second state");
+    let second_library = paths.library_dir(&second_state.scope, &second_state.run_id);
+    assert!(second_library.join("base.txt").is_file());
+    assert!(second_library.join("child-saw-base.txt").is_file());
+
+    let codebase = read_codebase_record(&second_state.working_dir).expect("codebase");
+    let source_path = codebase.source_path.as_ref().expect("source path");
+    assert!(
+        source_path.starts_with(paths.plan_dir(&plan.plan_id)),
+        "{}",
+        source_path.display()
+    );
+    assert!(
+        source_path.ends_with("launch/task-1/source"),
+        "{}",
+        source_path.display()
+    );
+    assert!(source_path.join("base.txt").is_file());
+}
+
+#[test]
+fn full_plan_multi_dependency_child_uses_composed_dependency_artifacts() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_fake_cli_subagent_provider(
+        &paths,
+        temp.path(),
+        "cli:multi-source-chain",
+        r#"
+case "$1" in
+  *"Task: task-2"*)
+    test -f a.txt || { printf 'missing a.txt\n' >&2; exit 42; }
+    test -f b.txt || { printf 'missing b.txt\n' >&2; exit 43; }
+    printf 'saw both\n' > saw-a-and-b.txt
+    ;;
+  *"Task: task-0"*)
+    printf 'a\n' > a.txt
+    ;;
+  *"Task: task-1"*)
+    printf 'b\n' > b.txt
+    ;;
+  *)
+    printf 'unknown task prompt\n' >&2
+    exit 44
+    ;;
+esac
+printf 'done\n'
+"#,
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "multi source chaining example",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "cli:multi-source-chain",
+            "--n",
+            "3",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.tasks[2].depends_on = vec![plan.tasks[0].task_id.clone(), plan.tasks[1].task_id.clone()];
+    save_plan(&paths, &plan).expect("save dependency");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+
+    let plan = load_plan(&paths, &plan.plan_id).expect("forked plan");
+    assert_eq!(plan.tasks[2].status, PlanTaskStatus::Completed);
+    let third_run_id = plan.tasks[2].child_run_id.as_deref().expect("third run");
+    let third_state = deadreckon_core::load_run(&paths, third_run_id).expect("third state");
+    let third_library = paths.library_dir(&third_state.scope, &third_state.run_id);
+    assert!(third_library.join("a.txt").is_file());
+    assert!(third_library.join("b.txt").is_file());
+    assert!(third_library.join("saw-a-and-b.txt").is_file());
+}
+
+#[test]
+fn full_plan_multi_dependency_conflict_fails_before_launching_child() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_fake_cli_subagent_provider(
+        &paths,
+        temp.path(),
+        "cli:conflicting-source-chain",
+        r#"
+case "$1" in
+  *"Task: task-0"*)
+    printf 'from task 0\n' > shared.txt
+    ;;
+  *"Task: task-1"*)
+    printf 'from task 1\n' > shared.txt
+    ;;
+  *"Task: task-2"*)
+    printf 'task 2 should not launch\n' > should-not-exist.txt
+    ;;
+  *)
+    printf 'unknown task prompt\n' >&2
+    exit 44
+    ;;
+esac
+printf 'done\n'
+"#,
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "conflicting source chaining example",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "cli:conflicting-source-chain",
+            "--n",
+            "3",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.tasks[2].depends_on = vec![plan.tasks[0].task_id.clone(), plan.tasks[1].task_id.clone()];
+    save_plan(&paths, &plan).expect("save dependency");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+
+    let plan = load_plan(&paths, &plan.plan_id).expect("forked plan");
+    assert_eq!(plan.status, PlanStatus::Failed);
+    assert_eq!(plan.tasks[2].status, PlanTaskStatus::Failed);
+    assert!(plan.tasks[2].child_run_id.is_none());
+    let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        PlanEventKind::TaskFailed { task_id, reason, .. }
+            if task_id == "task-2" && reason.contains("dependency source conflict")
+    )));
 }
 
 #[test]
