@@ -181,8 +181,9 @@ Lifecycle:
   deadreckon materialize <merged-run-id> --dest ./result
 
 Merge composes completed child artifacts into one promoted deadreckon library
-entry. Conflicting files fail by default; use --strategy prefer-child
---prefer-child <idx> to pick one child deliberately.";
+entry. The default merge is DAG-aware and automatically attempts bounded repair
+for true parallel conflicts; use --no-repair for raw conflict refusal or
+--strategy prefer-child --prefer-child <idx> to pick one child deliberately.";
 
 const DONE_HELP: &str = "\
 Lifecycle:
@@ -746,12 +747,29 @@ pub(crate) enum Commands {
         plan_id: String,
         #[arg(
             long,
-            default_value = "fail-on-conflict",
-            help = "Merge strategy: fail-on-conflict or prefer-child"
+            default_value = "dag-aware",
+            help = "Merge strategy: dag-aware, fail-on-conflict, or prefer-child"
         )]
         strategy: String,
         #[arg(long, help = "Child index to prefer when --strategy prefer-child")]
         prefer_child: Option<u32>,
+        #[arg(long, help = "Disable automatic semantic merge repair")]
+        no_repair: bool,
+        #[arg(
+            long,
+            help = "Provider to use for merge repair planning and repair child runs"
+        )]
+        repair_provider: Option<String>,
+        #[arg(
+            long,
+            default_value = "auto",
+            help = "Repair mode: auto, prefer, synthesize, or child"
+        )]
+        repair_mode: String,
+        #[arg(long, default_value_t = 1, help = "Maximum automatic repair attempts")]
+        repair_attempts: u32,
+        #[arg(long, help = "Confirm automatic repair actions for this merge")]
+        yes: bool,
         #[arg(long, help = "Skip the merge gate marker warning path")]
         no_gate: bool,
         #[arg(long, help = "Suppress post-action hints")]
@@ -1791,6 +1809,11 @@ pub(crate) struct MergeCommandArgs {
     pub(crate) plan_id: String,
     pub(crate) strategy: String,
     pub(crate) prefer_child: Option<u32>,
+    pub(crate) no_repair: bool,
+    pub(crate) repair_provider: Option<String>,
+    pub(crate) repair_mode: String,
+    pub(crate) repair_attempts: u32,
+    pub(crate) yes: bool,
     pub(crate) no_gate: bool,
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,

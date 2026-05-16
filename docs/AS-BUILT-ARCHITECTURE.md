@@ -1447,6 +1447,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - CLI usability polish: root help includes command groups, `status` includes run health/library/disk blocks, and `DEADRECKON_HINTS=0` suppresses post-completion prompts.
 - Autonomous sequential chains: `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`, and `chain redo`; chains use `latest`/`last` aliases, `chain.json`, `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps, green-policy auto-apply, and a multi-step ratatui timeline with single-run chain context.
 - Plan observability: orchestration plans now write `plan-events.jsonl`; `attach <plan-id>` renders plan events, drills into child run attach, and returns to the plan context; plain attach, `history grep --plan`, and `show --why-failed <plan-id>` include plan event evidence.
+- Semantic merge repair: `merge <plan-id>` now defaults to DAG-aware composition, lets descendant tasks supersede ancestor file edits, writes conflict/repair sidecars under `merge-proofs/`, and automatically invokes a repair provider for true parallel conflicts unless `--no-repair` is set.
 - Mock HTTP server for tests; CLI provider tests with fake binaries; integration coverage for stress, import round-trips, lifecycle, codebase modes, docs, sandbox policy, and gate proof.
 
 The hygiene rider is purely structural; it does not close prior thin items, but it raises the floor for every future rider.
@@ -1852,9 +1853,12 @@ Two modes are built:
   summaries/task-0.md
   merge-working/
   merge-proofs/conflicts.json
+  merge-proofs/repair-request.json
+  merge-proofs/repair-plan.json
+  merge-proofs/repair-run.json
 ```
 
-`messages.jsonl` remains the typed coordinator mailbox. `plan-events.jsonl` is the append-only orchestration timeline: plan created/started, task ready/started/run-discovered/completed/blocked/failed/killed, merge started/conflicted/completed, and plan completed/failed/killed. It is file-backed like `chain-events.jsonl`; child turn/tool traces stay in each child run's normal `events.jsonl`, `traces.jsonl`, and `spend.jsonl`.
+`messages.jsonl` remains the typed coordinator mailbox. `plan-events.jsonl` is the append-only orchestration timeline: plan created/started, task ready/started/run-discovered/completed/blocked/failed/killed, merge started/conflicted/repair-planned/repair-started/repair-run-discovered/repaired/repair-failed/completed, and plan completed/failed/killed. It is file-backed like `chain-events.jsonl`; child turn/tool traces stay in each child run's normal `events.jsonl`, `traces.jsonl`, and `spend.jsonl`.
 
 Every child run receives an inline copy of its worker spec in the prompt. The spec includes root goal, exact task scope, provider, role, dependency context, capability preview, and hygiene rules such as staying within scope and not spawning subagents. The current worker-spec posture borrows Claude Code's coordinator rules: the spec is the complete brief, children should not inspect sibling transcripts, corrections stay with the worker that has the failure context, and reviewer lanes verify independently rather than inheriting coder assumptions.
 
@@ -1864,17 +1868,19 @@ At launch time the coordinator rewrites the spec for dependent tasks with comple
 
 - `plan <goal>` writes `plan.json` and worker specs. It previews provider roles, capability hints, task labels, dependencies, and next actions.
 - `fork <plan-id>` runs ready child tasks through `deadreckon run`, using distinct plan-child scopes via `DEADRECKON_SCOPE_ROOT`. It writes typed progress/blocker messages, child summaries, and plan events for ready/running/run-discovered/terminal child states. While a child starts, the coordinator records the run id in `plans/<plan-id>/launch/<task-id>/run-id` so later plan-level kill/recovery commands can map a live process back to durable run state.
-- `merge <plan-id>` composes completed child library artifacts into a new promoted run. It fails on conflicting file contents by default; `--strategy prefer-child --prefer-child <idx>` records the conflict and chooses that child. Merge start, conflict, success, and plan completion are also recorded as plan events.
-- `orchestrate review <goal>` and `orchestrate full-plan <goal>` are the one-command wrappers. Both print a preflight with mode, provider roles, sandbox, caps, capabilities, and task rows before starting child work; headless callers pass `--yes`, and `--preview` writes the plan and stops before `fork`.
+- `merge <plan-id>` composes completed child library artifacts into a new promoted run. The default strategy is `dag-aware`: if task B depends on task A and both changed the same file, B's version wins without prompting. True parallel conflicts write `merge-proofs/conflicts.json` and `merge-proofs/repair-request.json`, then automatically ask the repair provider for a JSON decision. Valid decisions can prefer a child file, synthesize only named conflict paths, or launch a normal repair child from `merge-working`; `--no-repair` restores raw conflict refusal, and `--repair-mode`, `--repair-provider`, and `--repair-attempts` are advanced controls. Merge start, conflict, repair, success, and plan completion are recorded as plan events.
+- `orchestrate review <goal>` and `orchestrate full-plan <goal>` are the one-command wrappers. Both print a preflight with mode, provider roles, sandbox, caps, capabilities, merge-repair posture, and task rows before starting child work; headless callers pass `--yes`, and `--preview` writes the plan and stops before `fork`.
 - `attach <plan-id>` opens a plan TUI on TTYs and renders a plain summary off-TTY. The TUI shows child panes with provider/role/status, run prefixes, dependency state, turn/status, spend or token accounting, latest trace activity, acceptance/gate state, summary paths, and plan events, falling back to coordinator messages before events exist. `Enter` drills into the selected child run using the normal run attach view; quitting the child view returns to the plan selection with a parent-plan breadcrumb and back hint.
 - Headless flags are honored across this surface: `run --quiet` emits no success stdout, `run --plain --quiet` emits only the final plain status line, and `attach --plain` forces summary output instead of ratatui.
 - `kill <plan-id>` reads `coordinator.json`, launch run-id sidecars, and child run state to signal the coordinator and live children, then marks discovered child states killed, releases their locks, and records task/plan kill events.
 - `history grep <pattern>` searches durable trace or provenance JSONL, can restrict to a plan's child runs with `--plan <plan-id>`, includes matching plan events, and supports regex, scope, age, and limit filters.
-- `show <id> --why-failed` explains the likely failure surface for a run or plan, including non-completed children, blocker messages, latest plan events, and recent trace errors.
+- `show <id> --why-failed` explains the likely failure surface for a run or plan, including non-completed children, blocker messages, latest plan events, merge repair sidecars, and recent trace errors.
 
 ### 30.4 Merge Artifact
 
 Merge creates a normal promoted run so existing `materialize`, `library`, and run inspection paths keep working. The promoted library also gets `deadreckon-plan-manifest.json` with plan id, root goal, mode, provider roles, capability preview, task graph, child run ids, summary paths, coordinator message counts, and recorded conflicts.
+
+Conflict bundles are versioned JSON objects. `conflicts.json` records the strategy, conflict path, child indexes, task ids, run ids, artifact roots, artifact file paths, content hashes, and dependency edges. `repair-request.json` adds root goal, task graph, worker-spec paths, child summary paths, recent plan events, and `merge-working` so the planner can decide without reading sibling transcripts. `repair-plan.json` stores the validated provider decision and rationale. If the planner chooses a repair child, `repair-run.json` stores the normal run id/scope/status, and the repaired promoted library is copied back into `merge-working` before the final plan merge run is created.
 
 Generated run artifacts are intentionally excluded from merge composition: `.deadreckon/*`, `docs/RUN-*`, `target`, `node_modules`, `.next`, `dist`, and `build`.
 
@@ -1935,17 +1941,17 @@ The release path is wired and depth-tested, but the first public release still r
 
 Plans now have their own append-only timeline at `~/.deadreckon/plans/<plan-id>/plan-events.jsonl`. Each row is a `PlanEvent` with UTC timestamp, `plan_id`, and a snake-case tagged `PlanEventKind`. The core helper pair is `append_plan_event` / `read_plan_events`, exported from `deadreckon-core`; the path helper is `DeadreckonPaths::plan_events`.
 
-The stream is orchestration-level only. It records plan and task lifecycle edges, child run discovery, merge edges, kill edges, and final failure/completion. It does not copy child turn/tool traces. A selected child remains a normal run with its own `events.jsonl`, `traces.jsonl`, provider logs, acceptance proofs, spend records, and attach renderer.
+The stream is orchestration-level only. It records plan and task lifecycle edges, child run discovery, merge edges, semantic repair planning/execution edges, kill edges, and final failure/completion. It does not copy child turn/tool traces. A selected child remains a normal run with its own `events.jsonl`, `traces.jsonl`, provider logs, acceptance proofs, spend records, and attach renderer.
 
 ### 32.2 Emission Points
 
-`plan` appends `plan_created` after `plan.json` is saved. `fork` appends `plan_started`, task ready/start events, child run discovery when a PID or run id becomes known, terminal task events, and dependency blocker events. `merge` appends merge start/conflict/completed plus plan completion. `kill <plan-id>` appends task killed, plan killed, and plan failed events while preserving discovered child run ids even if a child already reached a terminal state before the kill sweep loaded it.
+`plan` appends `plan_created` after `plan.json` is saved. `fork` appends `plan_started`, task ready/start events, child run discovery when a PID or run id becomes known, terminal task events, and dependency blocker events. `merge` appends merge start/conflict, optional repair planned/started/run-discovered/repaired/failed events, merge completed, and plan completion. `kill <plan-id>` appends task killed, plan killed, and plan failed events while preserving discovered child run ids even if a child already reached a terminal state before the kill sweep loaded it.
 
 ### 32.3 User Surfaces
 
 `attach <plan-id>` now renders plan events in the plan activity pane, falling back to coordinator messages only before the event file exists. `Enter` on a child with a run id suspends the plan TUI and opens the existing run attach view with a breadcrumb like `plan <prefix> / task-1`; `q`, `Esc`, or `Ctrl-D` returns to the same plan attach context.
 
-Plain/off-TTY `attach <plan-id>` prints the latest plan event and an explicit `deadreckon attach <plan-id>` hint. `history grep <pattern> --plan <plan-id>` searches `plan-events.jsonl` before child run trace/provenance files. `show <plan-id> --why-failed` includes the latest plan event alongside failed child rows and blocker messages.
+Plain/off-TTY `attach <plan-id>` prints the latest plan event, merge repair status when sidecars exist, and an explicit `deadreckon attach <plan-id>` hint. `history grep <pattern> --plan <plan-id>` searches `plan-events.jsonl` before child run trace/provenance files, so repair events are grep-visible. `show <plan-id> --why-failed` includes the latest plan event and merge repair sidecar paths alongside failed child rows and blocker messages.
 
 ### 32.4 Current Limits
 

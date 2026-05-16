@@ -302,6 +302,24 @@ pub enum PlanEventKind {
     MergeConflict {
         conflict_count: usize,
     },
+    MergeRepairPlanned {
+        conflict_count: usize,
+        provider: Option<String>,
+    },
+    MergeRepairStarted {
+        mode: String,
+    },
+    MergeRepairRunDiscovered {
+        run_id: String,
+        pid: Option<u32>,
+    },
+    MergeRepaired {
+        strategy: String,
+        repair_run_id: Option<String>,
+    },
+    MergeRepairFailed {
+        reason: String,
+    },
     MergeCompleted {
         merged_run_id: String,
     },
@@ -870,6 +888,24 @@ mod tests {
             },
             PlanEventKind::MergeStarted,
             PlanEventKind::MergeConflict { conflict_count: 2 },
+            PlanEventKind::MergeRepairPlanned {
+                conflict_count: 1,
+                provider: Some("cli:codex".to_string()),
+            },
+            PlanEventKind::MergeRepairStarted {
+                mode: "auto".to_string(),
+            },
+            PlanEventKind::MergeRepairRunDiscovered {
+                run_id: "repair".to_string(),
+                pid: Some(456),
+            },
+            PlanEventKind::MergeRepaired {
+                strategy: "spawn_repair_child".to_string(),
+                repair_run_id: Some("repair".to_string()),
+            },
+            PlanEventKind::MergeRepairFailed {
+                reason: "unsafe".to_string(),
+            },
             PlanEventKind::MergeCompleted {
                 merged_run_id: "merged".to_string(),
             },

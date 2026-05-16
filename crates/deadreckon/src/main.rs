@@ -458,6 +458,11 @@ async fn main_inner() -> Result<()> {
             plan_id,
             strategy,
             prefer_child,
+            no_repair,
+            repair_provider,
+            repair_mode,
+            repair_attempts,
+            yes,
             no_gate,
             no_hints,
             quiet,
@@ -468,11 +473,17 @@ async fn main_inner() -> Result<()> {
                 plan_id,
                 strategy,
                 prefer_child,
+                no_repair,
+                repair_provider,
+                repair_mode,
+                repair_attempts,
+                yes,
                 no_gate,
                 no_hints,
                 quiet,
                 plain,
             })
+            .await
         }
         Commands::Chain {
             args,
@@ -7918,13 +7929,19 @@ async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
     .await?;
     merge_command(MergeCommandArgs {
         plan_id,
-        strategy: "fail-on-conflict".to_string(),
+        strategy: "dag-aware".to_string(),
         prefer_child: None,
+        no_repair: false,
+        repair_provider: None,
+        repair_mode: "auto".to_string(),
+        repair_attempts: 1,
+        yes: true,
         no_gate: false,
         no_hints,
         quiet,
         plain,
     })
+    .await
 }
 
 async fn plan_command(args: PlanCommandArgs) -> Result<()> {
@@ -8597,12 +8614,14 @@ fn print_orchestrate_preflight(
     let providers = plan_provider_summary(plan);
     let source = plan_source_label(plan);
     let gate = plan_acceptance_label(plan);
+    let repair = plan_repair_label(plan);
     let items = [
         ("mode", plan_mode_label(plan.mode)),
         ("children", children.as_str()),
         ("providers", providers.as_str()),
         ("source", source.as_str()),
         ("gate", gate.as_str()),
+        ("merge repair", repair.as_str()),
         ("sandbox", sandbox.as_str()),
         ("spend", spend.as_str()),
         ("wall", wall.as_str()),
@@ -8662,6 +8681,7 @@ fn print_orchestrate_started(
     let providers = plan_provider_summary(plan);
     let source = plan_source_label(plan);
     let gate = plan_acceptance_label(plan);
+    let repair = plan_repair_label(plan);
     let sandbox = sandbox.unwrap_or("config default").to_string();
     let spend = max_spend
         .map(|value| format!("${value:.2} per child"))
@@ -8682,6 +8702,7 @@ fn print_orchestrate_started(
         ("providers", providers.as_str()),
         ("source", source.as_str()),
         ("gate", gate.as_str()),
+        ("merge repair", repair.as_str()),
         ("sandbox", sandbox.as_str()),
         ("spend", spend.as_str()),
         ("wall", wall.as_str()),
@@ -9787,11 +9808,16 @@ fn print_fork_finished(plan: &Plan, no_hints: bool) {
     }
 }
 
-fn merge_command(args: MergeCommandArgs) -> Result<()> {
+async fn merge_command(args: MergeCommandArgs) -> Result<()> {
     let MergeCommandArgs {
         plan_id,
         strategy,
         prefer_child,
+        no_repair,
+        repair_provider,
+        repair_mode,
+        repair_attempts,
+        yes: _yes,
         no_gate,
         no_hints,
         quiet,
@@ -9800,7 +9826,7 @@ fn merge_command(args: MergeCommandArgs) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let resolved_id = resolve_plan_id(&paths, &plan_id)?;
     let mut plan = load_plan(&paths, &resolved_id)?;
-    if plan.status != PlanStatus::Forked {
+    if !matches!(plan.status, PlanStatus::Forked | PlanStatus::Failed) {
         return Err(CliError::Core(deadreckon_core::user_error(
             &format!(
                 "plan {} is {}",
@@ -9810,32 +9836,132 @@ fn merge_command(args: MergeCommandArgs) -> Result<()> {
             "deadreckon fork <plan-id>",
         )));
     }
-    if let Some(task) = plan.tasks.iter().find(|task| {
-        matches!(
-            task.status,
-            PlanTaskStatus::Pending | PlanTaskStatus::Running
-        )
-    }) {
+    if let Some(task) = plan
+        .tasks
+        .iter()
+        .find(|task| task.status != PlanTaskStatus::Completed)
+    {
         return Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "child {} still {}",
-                task.index,
-                task_status_label(task.status)
-            ),
+            &format!("child {} is {}", task.index, task_status_label(task.status)),
             "wait, or run deadreckon kill <plan-id>",
         )));
     }
     append_plan_event(&paths, &plan.plan_id, PlanEventKind::MergeStarted)?;
     let strategy = parse_merge_strategy(&strategy, prefer_child)?;
-    let conflicts = compose_plan_merge_working(&paths, &plan, strategy)?;
-    if !conflicts.is_empty() {
+    if let PlanMergeStrategy::PreferChild(chosen) = strategy
+        && !plan.tasks.iter().any(|task| task.index == chosen)
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown child index {chosen}"),
+            "deadreckon merge <plan-id> --strategy prefer-child --prefer-child 1",
+        )));
+    }
+    let repair_mode = parse_merge_repair_mode(&repair_mode)?;
+    let mut merge = compose_plan_merge_working(&paths, &plan, strategy)?;
+    let unresolved_conflicts = merge.unresolved_conflicts();
+    if !unresolved_conflicts.is_empty() {
         append_plan_event(
             &paths,
             &plan.plan_id,
             PlanEventKind::MergeConflict {
-                conflict_count: conflicts.len(),
+                conflict_count: unresolved_conflicts.len(),
             },
         )?;
+        let repair_disabled = no_repair
+            || repair_attempts == 0
+            || matches!(strategy, PlanMergeStrategy::FailOnConflict);
+        let provider = if repair_disabled {
+            None
+        } else {
+            resolve_merge_repair_provider(&paths, &plan, repair_provider.as_deref())?
+        };
+        write_merge_repair_request(&paths, &plan, provider.as_deref(), &unresolved_conflicts)?;
+        if repair_disabled {
+            let reason = format!(
+                "merge conflict at {}",
+                unresolved_conflicts
+                    .iter()
+                    .map(|conflict| conflict.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            record_plan_merge_failure(&paths, &mut plan, &reason)?;
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("{reason}; automatic repair disabled"),
+                &format!(
+                    "inspect {}",
+                    paths
+                        .merge_proofs(&plan.plan_id)
+                        .join("conflicts.json")
+                        .display()
+                ),
+            )));
+        }
+        append_plan_event(
+            &paths,
+            &plan.plan_id,
+            PlanEventKind::MergeRepairPlanned {
+                conflict_count: unresolved_conflicts.len(),
+                provider: provider.clone(),
+            },
+        )?;
+        let Some(provider) = provider else {
+            let reason = "merge repair needs a configured provider".to_string();
+            append_plan_event(
+                &paths,
+                &plan.plan_id,
+                PlanEventKind::MergeRepairFailed {
+                    reason: reason.clone(),
+                },
+            )?;
+            record_plan_merge_failure(&paths, &mut plan, &reason)?;
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("{reason}; conflicts remain"),
+                "deadreckon providers list --all",
+            )));
+        };
+        append_plan_event(
+            &paths,
+            &plan.plan_id,
+            PlanEventKind::MergeRepairStarted {
+                mode: repair_mode.as_str().to_string(),
+            },
+        )?;
+        match run_merge_repair(
+            &paths,
+            &plan,
+            &provider,
+            repair_mode,
+            repair_attempts,
+            &mut merge,
+            quiet,
+        )
+        .await
+        {
+            Ok(repaired) => {
+                append_plan_event(
+                    &paths,
+                    &plan.plan_id,
+                    PlanEventKind::MergeRepaired {
+                        strategy: repaired.strategy,
+                        repair_run_id: repaired.repair_run_id,
+                    },
+                )?;
+                write_plan_merge_conflicts(&paths, &plan, strategy, &merge.conflicts)?;
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                append_plan_event(
+                    &paths,
+                    &plan.plan_id,
+                    PlanEventKind::MergeRepairFailed {
+                        reason: reason.clone(),
+                    },
+                )?;
+                record_plan_merge_failure(&paths, &mut plan, &reason)?;
+                return Err(error);
+            }
+        }
     }
     let merged_run = create_merged_plan_run(&paths, &plan, no_gate)?;
     plan.status = PlanStatus::Merged;
@@ -9851,7 +9977,7 @@ fn merge_command(args: MergeCommandArgs) -> Result<()> {
     )?;
     append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanCompleted)?;
     let library_dir = paths.library_dir(&merged_run.scope, &merged_run.run_id);
-    write_plan_merge_manifest(&paths, &library_dir, &plan, &conflicts)?;
+    write_plan_merge_manifest(&paths, &library_dir, &plan, &merge.conflicts)?;
     if !quiet {
         print_merge_finished(&plan, &merged_run, &library_dir, no_hints);
     }
@@ -9861,20 +9987,106 @@ fn merge_command(args: MergeCommandArgs) -> Result<()> {
 #[derive(Debug, Clone, Copy)]
 enum PlanMergeStrategy {
     FailOnConflict,
+    DagAware,
     PreferChild(u32),
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl PlanMergeStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FailOnConflict => "fail-on-conflict",
+            Self::DagAware => "dag-aware",
+            Self::PreferChild(_) => "prefer-child",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeRepairMode {
+    Auto,
+    Prefer,
+    Synthesize,
+    Child,
+}
+
+impl MergeRepairMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Prefer => "prefer",
+            Self::Synthesize => "synthesize",
+            Self::Child => "child",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanMergeConflict {
     path: PathBuf,
     first_child: u32,
     second_child: u32,
     chosen_child: Option<u32>,
+    #[serde(default)]
+    children: Vec<PlanMergeConflictChild>,
+    #[serde(default)]
+    deterministic_resolution: Option<PlanMergeDeterministicResolution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanMergeConflictChild {
+    task_id: String,
+    task_index: u32,
+    run_id: String,
+    artifact_root: PathBuf,
+    artifact_path: PathBuf,
+    hash: String,
+    depends_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanMergeDeterministicResolution {
+    kind: String,
+    chosen_task_id: Option<String>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PlanMergeConflictBundle<'a> {
+    schema_version: u32,
+    plan_id: &'a str,
+    strategy: &'a str,
+    conflicts: &'a [PlanMergeConflict],
+}
+
+#[derive(Debug, Clone)]
+struct PlanMergeSeenFile {
+    task_id: String,
+    task_index: u32,
+    run_id: String,
+    artifact_root: PathBuf,
+    artifact_path: PathBuf,
+    hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PlanMergeOutcome {
+    conflicts: Vec<PlanMergeConflict>,
+}
+
+impl PlanMergeOutcome {
+    fn unresolved_conflicts(&self) -> Vec<PlanMergeConflict> {
+        self.conflicts
+            .iter()
+            .filter(|conflict| conflict.chosen_child.is_none())
+            .cloned()
+            .collect()
+    }
 }
 
 fn parse_merge_strategy(strategy: &str, prefer_child: Option<u32>) -> Result<PlanMergeStrategy> {
     match strategy {
         "fail-on-conflict" => Ok(PlanMergeStrategy::FailOnConflict),
+        "dag-aware" => Ok(PlanMergeStrategy::DagAware),
         "prefer-child" => prefer_child
             .map(PlanMergeStrategy::PreferChild)
             .ok_or_else(|| {
@@ -9885,7 +10097,20 @@ fn parse_merge_strategy(strategy: &str, prefer_child: Option<u32>) -> Result<Pla
             }),
         other => Err(CliError::Core(deadreckon_core::user_error(
             &format!("unknown merge strategy {other}"),
-            "use --strategy fail-on-conflict or --strategy prefer-child --prefer-child <idx>",
+            "use --strategy dag-aware, fail-on-conflict, or prefer-child --prefer-child <idx>",
+        ))),
+    }
+}
+
+fn parse_merge_repair_mode(mode: &str) -> Result<MergeRepairMode> {
+    match mode {
+        "auto" => Ok(MergeRepairMode::Auto),
+        "prefer" => Ok(MergeRepairMode::Prefer),
+        "synthesize" => Ok(MergeRepairMode::Synthesize),
+        "child" => Ok(MergeRepairMode::Child),
+        other => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown repair mode {other}"),
+            "use --repair-mode auto|prefer|synthesize|child",
         ))),
     }
 }
@@ -9894,11 +10119,11 @@ fn compose_plan_merge_working(
     paths: &DeadreckonPaths,
     plan: &Plan,
     strategy: PlanMergeStrategy,
-) -> Result<Vec<PlanMergeConflict>> {
+) -> Result<PlanMergeOutcome> {
     let merge_working = paths.merge_working(&plan.plan_id);
     remove_if_exists(&merge_working)?;
     fs::create_dir_all(&merge_working)?;
-    let mut seen: BTreeMap<PathBuf, (u32, u64)> = BTreeMap::new();
+    let mut seen: BTreeMap<PathBuf, PlanMergeSeenFile> = BTreeMap::new();
     let mut conflicts = Vec::new();
     for task in plan
         .tasks
@@ -9921,67 +10146,761 @@ fn compose_plan_merge_working(
                 continue;
             }
             let hash = file_hash(&file)?;
-            match seen.get(relative).copied() {
-                Some((first_child, first_hash)) if first_hash != hash => match strategy {
+            let current = PlanMergeSeenFile {
+                task_id: task.task_id.clone(),
+                task_index: task.index,
+                run_id: run_id.to_string(),
+                artifact_root: child_root.clone(),
+                artifact_path: file.clone(),
+                hash,
+            };
+            match seen.get(relative).cloned() {
+                Some(previous) if previous.hash != hash => match strategy {
                     PlanMergeStrategy::FailOnConflict => {
-                        append_plan_event(
-                            paths,
-                            &plan.plan_id,
-                            PlanEventKind::MergeConflict { conflict_count: 1 },
-                        )?;
-                        append_plan_event(
-                            paths,
-                            &plan.plan_id,
-                            PlanEventKind::PlanFailed {
-                                reason: format!(
-                                    "merge conflict at {} between child {} and child {}",
-                                    relative.display(),
-                                    first_child,
-                                    task.index
-                                ),
-                            },
-                        )?;
-                        return Err(CliError::Core(deadreckon_core::user_error(
-                            &format!(
-                                "conflict at {} between child {} and child {}",
-                                relative.display(),
-                                first_child,
-                                task.index
-                            ),
-                            &format!(
-                                "deadreckon merge {} --strategy prefer-child --prefer-child {}",
-                                run_prefix(&plan.plan_id),
-                                task.index
-                            ),
-                        )));
+                        conflicts.push(plan_merge_conflict(
+                            plan, relative, &previous, &current, None,
+                        ));
                     }
                     PlanMergeStrategy::PreferChild(chosen) => {
-                        conflicts.push(PlanMergeConflict {
-                            path: relative.to_path_buf(),
-                            first_child,
-                            second_child: task.index,
-                            chosen_child: Some(chosen),
-                        });
+                        conflicts.push(plan_merge_conflict(
+                            plan,
+                            relative,
+                            &previous,
+                            &current,
+                            Some(chosen),
+                        ));
                         if chosen == task.index {
                             copy_merge_file(&file, &merge_working.join(relative))?;
-                            seen.insert(relative.to_path_buf(), (task.index, hash));
+                            seen.insert(relative.to_path_buf(), current);
                         }
+                    }
+                    PlanMergeStrategy::DagAware
+                        if plan_task_depends_on(plan, &current.task_id, &previous.task_id) =>
+                    {
+                        copy_merge_file(&file, &merge_working.join(relative))?;
+                        seen.insert(relative.to_path_buf(), current);
+                    }
+                    PlanMergeStrategy::DagAware
+                        if plan_task_depends_on(plan, &previous.task_id, &current.task_id) => {}
+                    PlanMergeStrategy::DagAware => {
+                        conflicts.push(plan_merge_conflict(
+                            plan, relative, &previous, &current, None,
+                        ));
                     }
                 },
                 Some(_) => {}
                 None => {
                     copy_merge_file(&file, &merge_working.join(relative))?;
-                    seen.insert(relative.to_path_buf(), (task.index, hash));
+                    seen.insert(relative.to_path_buf(), current);
                 }
             }
         }
     }
-    if !conflicts.is_empty() {
-        fs::create_dir_all(paths.merge_proofs(&plan.plan_id))?;
-        let path = paths.merge_proofs(&plan.plan_id).join("conflicts.json");
-        fs::write(&path, serde_json::to_vec_pretty(&conflicts)?)?;
+    write_plan_merge_conflicts(paths, plan, strategy, &conflicts)?;
+    Ok(PlanMergeOutcome { conflicts })
+}
+
+fn plan_merge_conflict(
+    plan: &Plan,
+    relative: &Path,
+    previous: &PlanMergeSeenFile,
+    current: &PlanMergeSeenFile,
+    chosen_child: Option<u32>,
+) -> PlanMergeConflict {
+    let deterministic_resolution = chosen_child.map(|chosen| PlanMergeDeterministicResolution {
+        kind: "manual_prefer_child".to_string(),
+        chosen_task_id: plan
+            .tasks
+            .iter()
+            .find(|task| task.index == chosen)
+            .map(|task| task.task_id.clone()),
+        reason: format!("user selected child {chosen}"),
+    });
+    PlanMergeConflict {
+        path: relative.to_path_buf(),
+        first_child: previous.task_index,
+        second_child: current.task_index,
+        chosen_child,
+        children: vec![
+            plan_merge_conflict_child(plan, previous),
+            plan_merge_conflict_child(plan, current),
+        ],
+        deterministic_resolution,
     }
-    Ok(conflicts)
+}
+
+fn plan_merge_conflict_child(plan: &Plan, file: &PlanMergeSeenFile) -> PlanMergeConflictChild {
+    let depends_on = plan
+        .task_by_id(&file.task_id)
+        .map(|task| task.depends_on.clone())
+        .unwrap_or_default();
+    PlanMergeConflictChild {
+        task_id: file.task_id.clone(),
+        task_index: file.task_index,
+        run_id: file.run_id.clone(),
+        artifact_root: file.artifact_root.clone(),
+        artifact_path: file.artifact_path.clone(),
+        hash: format!("{:016x}", file.hash),
+        depends_on,
+    }
+}
+
+fn write_plan_merge_conflicts(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    strategy: PlanMergeStrategy,
+    conflicts: &[PlanMergeConflict],
+) -> Result<()> {
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(paths.merge_proofs(&plan.plan_id))?;
+    let path = paths.merge_proofs(&plan.plan_id).join("conflicts.json");
+    let bundle = PlanMergeConflictBundle {
+        schema_version: 2,
+        plan_id: &plan.plan_id,
+        strategy: strategy.as_str(),
+        conflicts,
+    };
+    fs::write(&path, serde_json::to_vec_pretty(&bundle)?)?;
+    Ok(())
+}
+
+fn record_plan_merge_failure(paths: &DeadreckonPaths, plan: &mut Plan, reason: &str) -> Result<()> {
+    plan.status = PlanStatus::Failed;
+    save_plan(paths, plan)?;
+    append_plan_event(
+        paths,
+        &plan.plan_id,
+        PlanEventKind::PlanFailed {
+            reason: reason.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+fn resolve_merge_repair_provider(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    override_provider: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(provider) = override_provider {
+        return Ok(Some(provider.to_string()));
+    }
+    if let Some(provider) = plan.providers.planner.as_ref() {
+        return Ok(Some(provider.clone()));
+    }
+    if let Some(provider) = plan.providers.default_child.as_ref() {
+        return Ok(Some(provider.clone()));
+    }
+    Ok(config_defaults(paths)?.provider)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MergeRepairRequest<'a> {
+    schema_version: u32,
+    plan_id: &'a str,
+    root_goal: &'a str,
+    provider: Option<&'a str>,
+    created_at: DateTime<Utc>,
+    merge_working: PathBuf,
+    task_graph: Vec<Value>,
+    worker_specs: BTreeMap<String, String>,
+    summary_paths: BTreeMap<String, String>,
+    recent_events: Vec<PlanEvent>,
+    conflicts: &'a [PlanMergeConflict],
+}
+
+fn write_merge_repair_request(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    provider: Option<&str>,
+    conflicts: &[PlanMergeConflict],
+) -> Result<PathBuf> {
+    fs::create_dir_all(paths.merge_proofs(&plan.plan_id))?;
+    let worker_specs = plan
+        .tasks
+        .iter()
+        .map(|task| {
+            (
+                task.task_id.clone(),
+                paths
+                    .worker_spec(&plan.plan_id, &task.task_id)
+                    .display()
+                    .to_string(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let summary_paths = plan
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            Some((
+                task.task_id.clone(),
+                paths
+                    .plan_dir(&plan.plan_id)
+                    .join(task.summary_path.as_ref()?)
+                    .display()
+                    .to_string(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let task_graph = plan
+        .tasks
+        .iter()
+        .map(|task| {
+            json!({
+                "task_id": &task.task_id,
+                "index": task.index,
+                "subject": &task.subject,
+                "role": task.role,
+                "provider": &task.provider,
+                "depends_on": &task.depends_on,
+                "status": task.status,
+                "child_run_id": &task.child_run_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let recent_events = read_plan_events_lossy(paths, &plan.plan_id)
+        .into_iter()
+        .rev()
+        .take(40)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    let request = MergeRepairRequest {
+        schema_version: 1,
+        plan_id: &plan.plan_id,
+        root_goal: &plan.root_goal,
+        provider,
+        created_at: Utc::now(),
+        merge_working: paths.merge_working(&plan.plan_id),
+        task_graph,
+        worker_specs,
+        summary_paths,
+        recent_events,
+        conflicts,
+    };
+    let path = paths
+        .merge_proofs(&plan.plan_id)
+        .join("repair-request.json");
+    fs::write(&path, serde_json::to_vec_pretty(&request)?)?;
+    Ok(path)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MergeRepairPlan {
+    #[serde(default)]
+    schema_version: Option<u32>,
+    decision: String,
+    rationale: String,
+    #[serde(default)]
+    actions: Vec<MergeRepairAction>,
+    #[serde(default)]
+    repair_goal: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MergeRepairAction {
+    path: PathBuf,
+    action: String,
+    #[serde(default)]
+    chosen_task_id: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    preserve: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MergeRepairResult {
+    strategy: String,
+    repair_run_id: Option<String>,
+}
+
+async fn run_merge_repair(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    provider: &str,
+    mode: MergeRepairMode,
+    attempts: u32,
+    merge: &mut PlanMergeOutcome,
+    quiet: bool,
+) -> Result<MergeRepairResult> {
+    if attempts == 0 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "merge repair attempts are disabled",
+            "rerun without --repair-attempts 0",
+        )));
+    }
+    let request_path = paths
+        .merge_proofs(&plan.plan_id)
+        .join("repair-request.json");
+    let repair_plan =
+        invoke_merge_repair_planner(paths, plan, provider, mode, &request_path, quiet).await?;
+    validate_merge_repair_plan(&repair_plan, &merge.unresolved_conflicts(), mode)?;
+    let repair_plan_path = paths.merge_proofs(&plan.plan_id).join("repair-plan.json");
+    fs::write(&repair_plan_path, serde_json::to_vec_pretty(&repair_plan)?)?;
+    match repair_plan.decision.as_str() {
+        "prefer_child" => {
+            apply_prefer_child_repair(paths, plan, &repair_plan, merge)?;
+            Ok(MergeRepairResult {
+                strategy: "prefer_child".to_string(),
+                repair_run_id: None,
+            })
+        }
+        "synthesize" => {
+            apply_synthesized_repair(paths, plan, &repair_plan, merge)?;
+            Ok(MergeRepairResult {
+                strategy: "synthesize".to_string(),
+                repair_run_id: None,
+            })
+        }
+        "spawn_repair_child" => {
+            let run_id =
+                execute_merge_repair_child(paths, plan, provider, &repair_plan, quiet).await?;
+            for conflict in &mut merge.conflicts {
+                if conflict.chosen_child.is_none() {
+                    conflict.deterministic_resolution = Some(PlanMergeDeterministicResolution {
+                        kind: "planner_repair_child".to_string(),
+                        chosen_task_id: None,
+                        reason: repair_plan.rationale.clone(),
+                    });
+                }
+            }
+            Ok(MergeRepairResult {
+                strategy: "spawn_repair_child".to_string(),
+                repair_run_id: Some(run_id),
+            })
+        }
+        "refuse" => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("repair planner refused: {}", repair_plan.rationale),
+            &format!("inspect {}", repair_plan_path.display()),
+        ))),
+        other => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unsupported repair decision {other}"),
+            "rerun with another --repair-provider",
+        ))),
+    }
+}
+
+async fn invoke_merge_repair_planner(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    provider: &str,
+    mode: MergeRepairMode,
+    request_path: &Path,
+    quiet: bool,
+) -> Result<MergeRepairPlan> {
+    let request_json = fs::read_to_string(request_path)?;
+    let router = if provider == "smoke" || provider.starts_with("smoke:") {
+        ProviderRouter::smoke()
+    } else {
+        ProviderRouter::from_config_path(&paths.config_path(), Some(provider))?
+    };
+    let prompt = format!(
+        "You are a read-only merge repair planner for deadreckon. Do not write files or mutate state.\n\nReturn JSON only with this shape: {{\"decision\":\"prefer_child|synthesize|spawn_repair_child|refuse\",\"rationale\":\"short reason\",\"actions\":[{{\"path\":\"relative conflict path\",\"action\":\"prefer_child|write_synthesized|repair_child\",\"chosen_task_id\":\"task-id or null\",\"content\":\"only for write_synthesized\",\"preserve\":[\"semantic requirement\"]}}],\"repair_goal\":\"only for spawn_repair_child\"}}.\n\nAllowed repair mode: {}.\nOnly choose paths listed in the request conflicts. For prefer_child, chosen_task_id must be one of that conflict's child task ids. For synthesize, include full file content and only synthesize listed conflict paths. For spawn_repair_child, provide a precise repair_goal that preserves the root goal and child summaries.\n\nRepair request JSON:\n{}",
+        mode.as_str(),
+        request_json
+    );
+    let cwd = plan
+        .parent_cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| paths.home().to_path_buf()));
+    let request = ProviderRequest {
+        prompt,
+        max_output_tokens: 8192,
+        cwd: Some(cwd),
+        output_path: None,
+        sandbox_backend: None,
+        pid_file: None,
+        cancellation_token: None,
+    };
+    let response =
+        maybe_with_cli_wait_status(!quiet, "planning merge repair", router.complete(&request))
+            .await?;
+    parse_merge_repair_response(&response.content)
+}
+
+fn parse_merge_repair_response(content: &str) -> Result<MergeRepairPlan> {
+    if let Ok(plan) = serde_json::from_str::<MergeRepairPlan>(content) {
+        return Ok(plan);
+    }
+    if let Some(slice) = json_slice(content, '{', '}')
+        && let Ok(plan) = serde_json::from_str::<MergeRepairPlan>(slice)
+    {
+        return Ok(plan);
+    }
+    Err(CliError::Core(deadreckon_core::user_error(
+        "repair provider did not return valid repair JSON",
+        "rerun with another --repair-provider",
+    )))
+}
+
+fn validate_merge_repair_plan(
+    repair_plan: &MergeRepairPlan,
+    conflicts: &[PlanMergeConflict],
+    mode: MergeRepairMode,
+) -> Result<()> {
+    let decision = repair_plan.decision.as_str();
+    let allowed = match mode {
+        MergeRepairMode::Auto => matches!(
+            decision,
+            "prefer_child" | "synthesize" | "spawn_repair_child" | "refuse"
+        ),
+        MergeRepairMode::Prefer => matches!(decision, "prefer_child" | "refuse"),
+        MergeRepairMode::Synthesize => matches!(decision, "synthesize" | "refuse"),
+        MergeRepairMode::Child => matches!(decision, "spawn_repair_child" | "refuse"),
+    };
+    if !allowed {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "repair decision {decision} is not allowed by --repair-mode {}",
+                mode.as_str()
+            ),
+            "rerun with --repair-mode auto",
+        )));
+    }
+    if decision == "refuse" {
+        return Ok(());
+    }
+    if !matches!(
+        decision,
+        "prefer_child" | "synthesize" | "spawn_repair_child"
+    ) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown repair decision {decision}"),
+            "rerun with another --repair-provider",
+        )));
+    }
+    let conflict_paths = conflicts
+        .iter()
+        .map(|conflict| conflict.path.clone())
+        .collect::<BTreeSet<_>>();
+    for action in &repair_plan.actions {
+        validate_relative_repair_path(&action.path)?;
+        if !conflict_paths.contains(&action.path) {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "repair planner chose non-conflict path {}",
+                    action.path.display()
+                ),
+                "use --repair-mode child for broader integration work",
+            )));
+        }
+        match decision {
+            "prefer_child" => {
+                if action.action != "prefer_child" {
+                    return Err(CliError::Core(deadreckon_core::user_error(
+                        "prefer_child repair requires prefer_child actions",
+                        "rerun with --repair-mode auto",
+                    )));
+                }
+                let chosen = action.chosen_task_id.as_deref().ok_or_else(|| {
+                    CliError::Core(deadreckon_core::user_error(
+                        "prefer_child action missing chosen_task_id",
+                        "rerun with another --repair-provider",
+                    ))
+                })?;
+                let Some(conflict) = conflicts
+                    .iter()
+                    .find(|conflict| conflict.path == action.path)
+                else {
+                    continue;
+                };
+                if !conflict
+                    .children
+                    .iter()
+                    .any(|child| child.task_id == chosen)
+                {
+                    return Err(CliError::Core(deadreckon_core::user_error(
+                        &format!("repair planner chose unknown task id {chosen}"),
+                        "inspect merge-proofs/repair-plan.json",
+                    )));
+                }
+            }
+            "synthesize" => {
+                if action.action != "write_synthesized" || action.content.is_none() {
+                    return Err(CliError::Core(deadreckon_core::user_error(
+                        "synthesize repair requires write_synthesized actions with content",
+                        "rerun with another --repair-provider",
+                    )));
+                }
+            }
+            "spawn_repair_child" => {
+                if action.action != "repair_child" {
+                    return Err(CliError::Core(deadreckon_core::user_error(
+                        "repair child decisions require repair_child actions",
+                        "rerun with another --repair-provider",
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    if decision != "spawn_repair_child" && repair_plan.actions.is_empty() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "repair planner returned no actions",
+            "rerun with another --repair-provider",
+        )));
+    }
+    if decision == "spawn_repair_child"
+        && repair_plan
+            .repair_goal
+            .as_deref()
+            .is_none_or(|goal| goal.trim().is_empty())
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "repair child decision missing repair_goal",
+            "rerun with another --repair-provider",
+        )));
+    }
+    Ok(())
+}
+
+fn validate_relative_repair_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unsafe repair path {}", path.display()),
+            "planner must choose a relative conflict path",
+        )));
+    }
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        ) {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("unsafe repair path {}", path.display()),
+                "planner must choose a relative conflict path",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn apply_prefer_child_repair(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    repair_plan: &MergeRepairPlan,
+    merge: &mut PlanMergeOutcome,
+) -> Result<()> {
+    for action in &repair_plan.actions {
+        let chosen = action.chosen_task_id.as_deref().ok_or_else(|| {
+            CliError::Core(deadreckon_core::user_error(
+                "prefer_child action missing chosen_task_id",
+                "rerun with another --repair-provider",
+            ))
+        })?;
+        let conflict = merge
+            .conflicts
+            .iter_mut()
+            .find(|conflict| conflict.path == action.path)
+            .ok_or_else(|| {
+                CliError::Core(deadreckon_core::user_error(
+                    &format!("repair path {} is not a conflict", action.path.display()),
+                    "inspect merge-proofs/repair-plan.json",
+                ))
+            })?;
+        let child = conflict
+            .children
+            .iter()
+            .find(|child| child.task_id == chosen)
+            .cloned()
+            .ok_or_else(|| {
+                CliError::Core(deadreckon_core::user_error(
+                    &format!("repair planner chose unknown task id {chosen}"),
+                    "inspect merge-proofs/repair-plan.json",
+                ))
+            })?;
+        copy_merge_file(
+            &child.artifact_path,
+            &paths.merge_working(&plan.plan_id).join(&action.path),
+        )?;
+        conflict.chosen_child = Some(child.task_index);
+        conflict.deterministic_resolution = Some(PlanMergeDeterministicResolution {
+            kind: "planner_prefer_child".to_string(),
+            chosen_task_id: Some(child.task_id),
+            reason: repair_plan.rationale.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn apply_synthesized_repair(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    repair_plan: &MergeRepairPlan,
+    merge: &mut PlanMergeOutcome,
+) -> Result<()> {
+    for action in &repair_plan.actions {
+        let dest = paths.merge_working(&plan.plan_id).join(&action.path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            dest,
+            action.content.as_deref().ok_or_else(|| {
+                CliError::Core(deadreckon_core::user_error(
+                    "synthesize action missing content",
+                    "rerun with another --repair-provider",
+                ))
+            })?,
+        )?;
+        if let Some(conflict) = merge
+            .conflicts
+            .iter_mut()
+            .find(|conflict| conflict.path == action.path)
+        {
+            conflict.deterministic_resolution = Some(PlanMergeDeterministicResolution {
+                kind: "planner_synthesize".to_string(),
+                chosen_task_id: None,
+                reason: repair_plan.rationale.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn execute_merge_repair_child(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    provider: &str,
+    repair_plan: &MergeRepairPlan,
+    quiet: bool,
+) -> Result<String> {
+    let repair_scope = paths.merge_proofs(&plan.plan_id).join("repair-child");
+    fs::create_dir_all(&repair_scope)?;
+    let repair_goal = format!(
+        "{}\n\nRoot goal: {}\nPlan: {}\nRepair request: {}\nRepair plan: {}\n\nResolve only the merge conflict paths named in the repair plan unless a build/test update is strictly required to make the repaired artifact coherent. Preserve completed child behavior and report files changed.",
+        repair_plan
+            .repair_goal
+            .as_deref()
+            .unwrap_or("Resolve orchestration merge conflicts."),
+        plan.root_goal,
+        plan.plan_id,
+        paths
+            .merge_proofs(&plan.plan_id)
+            .join("repair-request.json")
+            .display(),
+        paths
+            .merge_proofs(&plan.plan_id)
+            .join("repair-plan.json")
+            .display()
+    );
+    let merge_working = paths.merge_working(&plan.plan_id);
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .current_dir(&merge_working)
+        .env("DEADRECKON_HOME", paths.home())
+        .env("DEADRECKON_HINTS", "0")
+        .env("DEADRECKON_SCOPE_ROOT", &repair_scope)
+        .arg("run")
+        .arg(repair_goal)
+        .arg("--from")
+        .arg(&merge_working)
+        .arg("--yes")
+        .arg("--no-confirm")
+        .arg("--no-hints")
+        .arg("--no-docs")
+        .arg("--sandbox")
+        .arg("none");
+    if provider == "smoke" || provider.starts_with("smoke:") {
+        command.arg("--smoke");
+    } else {
+        command.arg("--provider").arg(provider);
+    }
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = command.spawn()?;
+    let pid = child.id();
+    let output = maybe_with_cli_wait_status(!quiet, "running merge repair child", async move {
+        child.wait_with_output()
+    })
+    .await?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let run_id = parse_started_run_id(&stdout).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            "could not find repair run id",
+            "deadreckon list --all",
+        ))
+    })?;
+    append_plan_event(
+        paths,
+        &plan.plan_id,
+        PlanEventKind::MergeRepairRunDiscovered {
+            run_id: run_id.clone(),
+            pid: Some(pid),
+        },
+    )?;
+    let status = if output.status.success() {
+        "completed"
+    } else {
+        "failed"
+    };
+    write_merge_repair_run_record(paths, plan, &run_id, status)?;
+    if !output.status.success() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "repair child failed: {stdout}{stderr}"
+        ))));
+    }
+    let state = load_run(paths, &run_id)?;
+    let library = paths.library_dir(&state.scope, &state.run_id);
+    if !library.is_dir() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("repair run {} has no promoted library", run_prefix(&run_id)),
+            &format!("deadreckon attach {}", run_prefix(&run_id)),
+        )));
+    }
+    copy_repair_library_to_merge_working(paths, plan, &library)?;
+    Ok(run_id)
+}
+
+fn write_merge_repair_run_record(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    run_id: &str,
+    status: &str,
+) -> Result<()> {
+    let path = paths.merge_proofs(&plan.plan_id).join("repair-run.json");
+    let state = load_run(paths, run_id).ok();
+    let value = json!({
+        "schema_version": 1,
+        "plan_id": &plan.plan_id,
+        "run_id": run_id,
+        "scope": state.as_ref().map(|state| state.scope.clone()),
+        "status": status,
+        "source": paths.merge_working(&plan.plan_id),
+        "created_at": Utc::now(),
+        "updated_at": Utc::now(),
+    });
+    fs::write(path, serde_json::to_vec_pretty(&value)?)?;
+    Ok(())
+}
+
+fn copy_repair_library_to_merge_working(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    library: &Path,
+) -> Result<()> {
+    let merge_working = paths.merge_working(&plan.plan_id);
+    remove_if_exists(&merge_working)?;
+    fs::create_dir_all(&merge_working)?;
+    for file in inventory_files(library)? {
+        let relative = file.strip_prefix(library).map_err(|err| {
+            DeadreckonError::InvalidInput(format!("repair source prefix error: {err}"))
+        })?;
+        if skip_plan_merge_file(relative) {
+            continue;
+        }
+        copy_merge_file(&file, &merge_working.join(relative))?;
+    }
+    Ok(())
 }
 
 fn child_artifact_root(paths: &DeadreckonPaths, state: &deadreckon_core::PipelineState) -> PathBuf {
@@ -10195,6 +11114,9 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
     if let Some(event) = plan_events.last() {
         println!("latest plan event {}", plan_event_line(event));
     }
+    if let Some(line) = plan_merge_repair_status_line(paths, plan) {
+        println!("merge repair {line}");
+    }
     println!("children");
     for task in &plan.tasks {
         println!(
@@ -10277,6 +11199,46 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
             }
         }
     }
+}
+
+fn plan_merge_repair_status_line(paths: &DeadreckonPaths, plan: &Plan) -> Option<String> {
+    let proofs = paths.merge_proofs(&plan.plan_id);
+    let repair_plan = proofs.join("repair-plan.json");
+    let repair_run = proofs.join("repair-run.json");
+    let conflicts = proofs.join("conflicts.json");
+    if repair_run.is_file()
+        && let Ok(raw) = fs::read_to_string(&repair_run)
+        && let Ok(value) = serde_json::from_str::<Value>(&raw)
+    {
+        let status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("recorded");
+        let run = value
+            .get("run_id")
+            .and_then(Value::as_str)
+            .map(run_prefix)
+            .unwrap_or_else(|| "-".to_string());
+        return Some(format!("run {run} {status} ({})", repair_run.display()));
+    }
+    if repair_plan.is_file()
+        && let Ok(raw) = fs::read_to_string(&repair_plan)
+        && let Ok(value) = serde_json::from_str::<Value>(&raw)
+    {
+        let decision = value
+            .get("decision")
+            .and_then(Value::as_str)
+            .unwrap_or("recorded");
+        let rationale = value
+            .get("rationale")
+            .and_then(Value::as_str)
+            .map(|text| format!(": {}", one_line(text, 80)))
+            .unwrap_or_default();
+        return Some(format!("{decision}{rationale} ({})", repair_plan.display()));
+    }
+    conflicts
+        .is_file()
+        .then(|| format!("conflicts recorded ({})", conflicts.display()))
 }
 
 fn format_wall_cap(max_wall_seconds: Option<f64>) -> String {
@@ -14219,6 +15181,22 @@ fn show_plan_why_failed(paths: &DeadreckonPaths, plan: &Plan) {
     if let Some(event) = read_plan_events_lossy(paths, &plan.plan_id).last() {
         evidence.push(format!("latest plan event {}", plan_event_line(event)));
     }
+    if let Some(line) = plan_merge_repair_status_line(paths, plan) {
+        evidence.push(format!("merge repair {line}"));
+    }
+    let proofs = paths.merge_proofs(&plan.plan_id);
+    if proofs.join("conflicts.json").is_file() {
+        evidence.push(format!(
+            "merge conflicts {}",
+            proofs.join("conflicts.json").display()
+        ));
+    }
+    if proofs.join("repair-request.json").is_file() {
+        evidence.push(format!(
+            "repair request {}",
+            proofs.join("repair-request.json").display()
+        ));
+    }
     render_why_failed(WhyFailedReport {
         kind: "plan",
         id: run_prefix(&plan.plan_id),
@@ -15485,6 +16463,16 @@ fn plan_provider_summary(plan: &Plan) -> String {
     }
 }
 
+fn plan_repair_label(plan: &Plan) -> String {
+    let provider = plan
+        .providers
+        .planner
+        .as_deref()
+        .or(plan.providers.default_child.as_deref())
+        .unwrap_or("config default");
+    format!("automatic via {provider}")
+}
+
 fn plan_task_pane_layout(
     area: ratatui::layout::Rect,
     task_count: usize,
@@ -15618,6 +16606,37 @@ fn plan_event_summary(event: &PlanEventKind) -> String {
         PlanEventKind::MergeStarted => "merge started".to_string(),
         PlanEventKind::MergeConflict { conflict_count } => {
             format!("merge conflict count {conflict_count}")
+        }
+        PlanEventKind::MergeRepairPlanned {
+            conflict_count,
+            provider,
+        } => format!(
+            "merge repair planned for {conflict_count} conflict(s) with {}",
+            provider.as_deref().unwrap_or("no provider")
+        ),
+        PlanEventKind::MergeRepairStarted { mode } => {
+            format!("merge repair started mode {mode}")
+        }
+        PlanEventKind::MergeRepairRunDiscovered { run_id, pid } => {
+            format!(
+                "merge repair run {} pid {}",
+                run_prefix(run_id),
+                pid.map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            )
+        }
+        PlanEventKind::MergeRepaired {
+            strategy,
+            repair_run_id,
+        } => format!(
+            "merge repaired via {strategy}{}",
+            repair_run_id
+                .as_deref()
+                .map(|run_id| format!(" run {}", run_prefix(run_id)))
+                .unwrap_or_default()
+        ),
+        PlanEventKind::MergeRepairFailed { reason } => {
+            format!("merge repair failed: {reason}")
         }
         PlanEventKind::MergeCompleted { merged_run_id } => {
             format!("merge completed run {}", run_prefix(merged_run_id))

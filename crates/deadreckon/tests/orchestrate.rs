@@ -294,7 +294,59 @@ fn orchestrate_start_prints_run_like_context() {
         "{out}"
     );
     assert!(out.contains("providers"), "{out}");
+    assert!(out.contains("merge repair"), "{out}");
+    assert!(out.contains("automatic via"), "{out}");
     assert!(out.contains("plan"), "{out}");
+}
+
+#[test]
+fn orchestrate_headless_merge_conflict_auto_repairs_with_yes() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_fake_cli_subagent_provider(
+        &paths,
+        temp.path(),
+        "cli:orchestrate-repair",
+        "case \"$1\" in\n  *\"read-only planning agent\"*) printf '{\"tasks\":[{\"subject\":\"Write first README\",\"goal\":\"Write README from task zero\",\"active_form\":\"Writing first README\",\"depends_on\":[]},{\"subject\":\"Write second README\",\"goal\":\"Write README from task one\",\"active_form\":\"Writing second README\",\"depends_on\":[]}]}' ;;\n  *\"read-only merge repair planner\"*) printf '{\"decision\":\"synthesize\",\"rationale\":\"merge both README lanes\",\"actions\":[{\"path\":\"README.md\",\"action\":\"write_synthesized\",\"content\":\"# orchestrated repair\\\\n\",\"preserve\":[\"both README lanes\"]}]}' ;;\n  *\"Task: task-0\"*) printf '# task zero\\n' > README.md; printf 'task zero done\\n' ;;\n  *\"Task: task-1\"*) printf '# task one\\n' > README.md; printf 'task one done\\n' ;;\n  *) printf 'unexpected prompt\\n' >&2; exit 44 ;;\nesac\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "orchestrate",
+            "full-plan",
+            "build conflicting README lanes",
+            "--planner-provider",
+            "cli:orchestrate-repair",
+            "--provider",
+            "cli:orchestrate-repair",
+            "--n",
+            "2",
+            "--sandbox",
+            "none",
+            "--yes",
+            "--quiet",
+        ])
+        .output()
+        .expect("orchestrate");
+    assert_success(&output);
+
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.status, PlanStatus::Merged);
+    let merged_run_id = plan.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    assert_eq!(
+        fs::read_to_string(library.join("README.md")).expect("read merged"),
+        "# orchestrated repair\n"
+    );
+    assert!(
+        paths
+            .merge_proofs(&plan.plan_id)
+            .join("repair-plan.json")
+            .is_file()
+    );
 }
 
 #[test]
@@ -1891,12 +1943,12 @@ fn merge_fails_on_conflict_then_prefer_child_promotes() {
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
-        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .args(["merge", &plan.plan_id[..8], "--no-repair", "--quiet"])
         .output()
         .expect("merge");
     assert!(!output.status.success(), "{}", stdout(&output));
     assert!(
-        stderr(&output).contains("conflict at README.md"),
+        stderr(&output).contains("automatic repair disabled"),
         "{}",
         stderr(&output)
     );
@@ -2051,14 +2103,14 @@ fn merge_fails_on_conflict_default() {
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
-        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .args(["merge", &plan.plan_id[..8], "--no-repair", "--quiet"])
         .output()
         .expect("merge");
 
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
-    assert!(err.contains("conflict at README.md"), "{err}");
-    assert!(err.contains("--strategy prefer-child"), "{err}");
+    assert!(err.contains("merge conflict at README.md"), "{err}");
+    assert!(err.contains("automatic repair disabled"), "{err}");
     let events = read_plan_events(&paths, &plan.plan_id).expect("events");
     assert!(
         events
@@ -2083,7 +2135,7 @@ fn merge_conflict_emits_conflict_event_before_refusal() {
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
-        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .args(["merge", &plan.plan_id[..8], "--no-repair", "--quiet"])
         .output()
         .expect("merge");
     assert!(!output.status.success(), "{}", stdout(&output));
@@ -2096,6 +2148,485 @@ fn merge_conflict_emits_conflict_event_before_refusal() {
     });
 
     assert!(conflict < failed, "{events:#?}");
+}
+
+#[test]
+fn merge_conflict_bundle_records_all_child_versions() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--no-repair", "--quiet"])
+        .output()
+        .expect("merge");
+    assert!(!output.status.success(), "{}", stdout(&output));
+
+    let bundle: Value = serde_json::from_str(
+        &fs::read_to_string(paths.merge_proofs(&plan.plan_id).join("conflicts.json"))
+            .expect("conflicts"),
+    )
+    .expect("conflicts json");
+    assert_eq!(bundle["schema_version"], 2);
+    assert_eq!(bundle["plan_id"], plan.plan_id);
+    assert_eq!(bundle["strategy"], "dag-aware");
+    let conflict = &bundle["conflicts"][0];
+    assert_eq!(conflict["path"], "README.md");
+    assert_eq!(conflict["children"].as_array().expect("children").len(), 2);
+    assert_eq!(conflict["children"][0]["task_id"], "task-0");
+    assert_eq!(conflict["children"][1]["task_id"], "task-1");
+    assert!(
+        conflict["children"][0]["artifact_path"]
+            .as_str()
+            .expect("artifact path")
+            .ends_with("README.md"),
+        "{conflict:#}"
+    );
+}
+
+#[test]
+fn merge_repair_request_includes_task_graph_and_summaries() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--no-repair", "--quiet"])
+        .output()
+        .expect("merge");
+    assert!(!output.status.success(), "{}", stdout(&output));
+
+    let request: Value = serde_json::from_str(
+        &fs::read_to_string(
+            paths
+                .merge_proofs(&plan.plan_id)
+                .join("repair-request.json"),
+        )
+        .expect("request"),
+    )
+    .expect("request json");
+    assert_eq!(request["schema_version"], 1);
+    assert_eq!(request["plan_id"], plan.plan_id);
+    assert_eq!(request["task_graph"][0]["task_id"], "task-0");
+    assert_eq!(request["task_graph"][1]["task_id"], "task-1");
+    assert!(
+        request["summary_paths"]["task-0"]
+            .as_str()
+            .expect("summary")
+            .ends_with("summaries/task-0.md"),
+        "{request:#}"
+    );
+    assert_eq!(request["conflicts"][0]["path"], "README.md");
+}
+
+#[test]
+fn merge_allows_descendant_child_to_override_ancestor_file() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_with_dependency_readme_conflict(&paths, &repo, false);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    assert_eq!(
+        fs::read_to_string(library.join("README.md")).expect("read merged"),
+        "# descendant child\n"
+    );
+    assert!(
+        !paths
+            .merge_proofs(&plan.plan_id)
+            .join("conflicts.json")
+            .is_file()
+    );
+}
+
+#[test]
+fn merge_keeps_descendant_when_ancestor_seen_later() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_with_dependency_readme_conflict(&paths, &repo, true);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    assert_eq!(
+        fs::read_to_string(library.join("README.md")).expect("read merged"),
+        "# descendant child\n"
+    );
+}
+
+#[test]
+fn merge_parallel_children_still_conflict() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--no-repair", "--quiet"])
+        .output()
+        .expect("merge");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(stderr(&output).contains("merge conflict at README.md"));
+}
+
+#[test]
+fn merge_repair_prefer_child_records_rationale_and_promotes() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let provider_root = temp.path().join("providers");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "cli:repair-prefer",
+        "case \"$1\" in\n  *\"read-only merge repair planner\"*) printf '{\"decision\":\"prefer_child\",\"rationale\":\"task-1 contains the intended README\",\"actions\":[{\"path\":\"README.md\",\"action\":\"prefer_child\",\"chosen_task_id\":\"task-1\",\"preserve\":[\"README intent\"]}]}' ;;\n  *) printf 'unexpected repair provider invocation\\n' ;;\nesac\n",
+    );
+    let mut plan = plan_with_readme_conflict(&paths, &repo);
+    let first_run_id = plan.tasks[0].child_run_id.as_deref().expect("first run");
+    let first_state = deadreckon_core::load_run(&paths, first_run_id).expect("first state");
+    let first_library = paths.library_dir(&first_state.scope, &first_state.run_id);
+    let first_before = fs::read_to_string(first_library.join("README.md")).expect("first readme");
+    plan.providers.planner = Some("cli:repair-prefer".to_string());
+    save_plan(&paths, &plan).expect("save repair provider");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge repair");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    assert_eq!(merged.status, PlanStatus::Merged);
+    let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    assert_eq!(
+        fs::read_to_string(library.join("README.md")).expect("read merged"),
+        "# preferred child\n"
+    );
+    assert_eq!(
+        fs::read_to_string(first_library.join("README.md")).expect("first readme after"),
+        first_before
+    );
+    let repair_plan: Value = serde_json::from_str(
+        &fs::read_to_string(paths.merge_proofs(&plan.plan_id).join("repair-plan.json"))
+            .expect("repair plan"),
+    )
+    .expect("repair plan json");
+    assert_eq!(repair_plan["decision"], "prefer_child");
+    assert_eq!(
+        repair_plan["rationale"],
+        "task-1 contains the intended README"
+    );
+    let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        PlanEventKind::MergeRepairPlanned {
+            provider: Some(provider),
+            ..
+        } if provider == "cli:repair-prefer"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        PlanEventKind::MergeRepaired { strategy, .. } if strategy == "prefer_child"
+    )));
+}
+
+#[test]
+fn merge_repair_synthesizes_only_conflict_paths() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let provider_root = temp.path().join("providers");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "cli:repair-synthesize",
+        "case \"$1\" in\n  *\"read-only merge repair planner\"*) printf '{\"decision\":\"synthesize\",\"rationale\":\"combine README requirements\",\"actions\":[{\"path\":\"README.md\",\"action\":\"write_synthesized\",\"content\":\"# synthesized repair\\\\n\",\"preserve\":[\"both child summaries\"]}]}' ;;\n  *) printf 'unexpected repair provider invocation\\n' ;;\nesac\n",
+    );
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--repair-provider",
+            "cli:repair-synthesize",
+            "--repair-mode",
+            "synthesize",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge repair");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    assert_eq!(
+        fs::read_to_string(library.join("README.md")).expect("read merged"),
+        "# synthesized repair\n"
+    );
+}
+
+#[test]
+fn merge_repair_synthesize_rejects_path_traversal() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let provider_root = temp.path().join("providers");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "cli:repair-bad-path",
+        "case \"$1\" in\n  *\"read-only merge repair planner\"*) printf '{\"decision\":\"synthesize\",\"rationale\":\"bad path\",\"actions\":[{\"path\":\"../evil.txt\",\"action\":\"write_synthesized\",\"content\":\"bad\"}]}' ;;\n  *) printf 'unexpected repair provider invocation\\n' ;;\nesac\n",
+    );
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--repair-provider",
+            "cli:repair-bad-path",
+            "--repair-mode",
+            "synthesize",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge repair");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("unsafe repair path"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !paths
+            .merge_working(&plan.plan_id)
+            .join("../evil.txt")
+            .exists()
+    );
+}
+
+#[test]
+fn merge_repair_mode_refuses_unsupported_decision() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let provider_root = temp.path().join("providers");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "cli:repair-wrong-mode",
+        "case \"$1\" in\n  *\"read-only merge repair planner\"*) printf '{\"decision\":\"synthesize\",\"rationale\":\"needs synthesis\",\"actions\":[{\"path\":\"README.md\",\"action\":\"write_synthesized\",\"content\":\"# synthesized\\\\n\"}]}' ;;\n  *) printf 'unexpected repair provider invocation\\n' ;;\nesac\n",
+    );
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--repair-provider",
+            "cli:repair-wrong-mode",
+            "--repair-mode",
+            "prefer",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge repair");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("not allowed by --repair-mode prefer"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn merge_repair_rejects_unknown_conflict_path() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let provider_root = temp.path().join("providers");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "cli:repair-unknown-path",
+        "case \"$1\" in\n  *\"read-only merge repair planner\"*) printf '{\"decision\":\"synthesize\",\"rationale\":\"wrong path\",\"actions\":[{\"path\":\"OTHER.md\",\"action\":\"write_synthesized\",\"content\":\"# other\\\\n\"}]}' ;;\n  *) printf 'unexpected repair provider invocation\\n' ;;\nesac\n",
+    );
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--repair-provider",
+            "cli:repair-unknown-path",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge repair");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("non-conflict path OTHER.md"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn merge_repair_rejects_unknown_task_id() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let provider_root = temp.path().join("providers");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "cli:repair-unknown-task",
+        "case \"$1\" in\n  *\"read-only merge repair planner\"*) printf '{\"decision\":\"prefer_child\",\"rationale\":\"bad task\",\"actions\":[{\"path\":\"README.md\",\"action\":\"prefer_child\",\"chosen_task_id\":\"task-9\"}]}' ;;\n  *) printf 'unexpected repair provider invocation\\n' ;;\nesac\n",
+    );
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--repair-provider",
+            "cli:repair-unknown-task",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge repair");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("unknown task id task-9"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn merge_repair_rejects_malformed_planner_response() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let provider_root = temp.path().join("providers");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "cli:repair-malformed",
+        "case \"$1\" in\n  *\"read-only merge repair planner\"*) printf 'not json' ;;\n  *) printf 'unexpected repair provider invocation\\n' ;;\nesac\n",
+    );
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--repair-provider",
+            "cli:repair-malformed",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge repair");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("valid repair JSON"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn merge_repair_child_success_retries_merge_and_promotes() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let provider_root = temp.path().join("providers");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "cli:repair-child",
+        "case \"$1\" in\n  *\"read-only merge repair planner\"*) printf '{\"decision\":\"spawn_repair_child\",\"rationale\":\"repair child should integrate README\",\"actions\":[{\"path\":\"README.md\",\"action\":\"repair_child\",\"preserve\":[\"both README meanings\"]}],\"repair_goal\":\"Write the repaired README.\"}' ;;\n  *) printf '# repaired by child\\n' > README.md; printf 'repair child completed\\n' ;;\nesac\n",
+    );
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--repair-provider",
+            "cli:repair-child",
+            "--repair-mode",
+            "child",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge repair child");
+    assert_success(&output);
+
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    assert_eq!(merged.status, PlanStatus::Merged);
+    let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
+    let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    assert_eq!(
+        fs::read_to_string(library.join("README.md")).expect("read merged"),
+        "# repaired by child\n"
+    );
+    let repair_run: Value = serde_json::from_str(
+        &fs::read_to_string(paths.merge_proofs(&plan.plan_id).join("repair-run.json"))
+            .expect("repair run"),
+    )
+    .expect("repair run json");
+    assert_eq!(repair_run["status"], "completed");
+    assert!(repair_run["run_id"].as_str().is_some());
+    let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        PlanEventKind::MergeRepairRunDiscovered { run_id, .. } if !run_id.is_empty()
+    )));
 }
 
 #[test]
@@ -2329,7 +2860,7 @@ fn merge_refuses_running_child() {
 
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
-    assert!(err.contains("child 0 still running"), "{err}");
+    assert!(err.contains("child 0 is running"), "{err}");
     assert!(
         err.contains("try: wait, or run deadreckon kill <plan-id>"),
         "{err}"
@@ -3185,6 +3716,56 @@ fn plan_with_readme_conflict(paths: &DeadreckonPaths, repo: &std::path::Path) ->
     plan
 }
 
+fn plan_with_dependency_readme_conflict(
+    paths: &DeadreckonPaths,
+    repo: &std::path::Path,
+    reverse_task_order_after_fork: bool,
+) -> Plan {
+    let output = deadreckon(paths)
+        .current_dir(repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(paths);
+    plan.tasks[1].depends_on = vec![plan.tasks[0].task_id.clone()];
+    save_plan(paths, &plan).expect("save dependency");
+
+    let output = deadreckon(paths)
+        .current_dir(repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+    let mut plan = load_plan(paths, &plan.plan_id).expect("forked plan");
+    for task in &plan.tasks {
+        let run_id = task.child_run_id.as_ref().expect("run id");
+        let state = deadreckon_core::load_run(paths, run_id).expect("state");
+        let library = paths.library_dir(&state.scope, &state.run_id);
+        let content = if task.task_id == "task-0" {
+            "# ancestor child\n"
+        } else {
+            "# descendant child\n"
+        };
+        fs::write(library.join("README.md"), content).expect("write readme");
+    }
+    if reverse_task_order_after_fork {
+        plan.tasks.swap(0, 1);
+        save_plan(paths, &plan).expect("save reversed plan");
+    }
+    plan
+}
+
 fn wait_for_plan_child_pids(paths: &DeadreckonPaths, plan_id: &str) -> Vec<u32> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
@@ -3234,6 +3815,7 @@ fn write_fake_planner_provider(
     response_json: &str,
 ) {
     fs::create_dir_all(paths.home()).expect("home");
+    fs::create_dir_all(root).expect("provider root");
     let providers_dir = paths.home().join("providers.d");
     fs::create_dir_all(&providers_dir).expect("providers dir");
     let binary = root.join("fake-planner");
@@ -3291,6 +3873,7 @@ fn write_fake_cli_subagent_provider(
     script_body: &str,
 ) {
     fs::create_dir_all(paths.home()).expect("home");
+    fs::create_dir_all(root).expect("provider root");
     let providers_dir = paths.home().join("providers.d");
     fs::create_dir_all(&providers_dir).expect("providers dir");
     let slug = id.replace(':', "-");

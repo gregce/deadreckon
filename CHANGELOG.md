@@ -1,5 +1,15 @@
 # Changelog
 
+## Semantic merge repair (alpha) - 2026-05-16
+
+- Changed orchestration merge to default to DAG-aware composition, so descendant child artifacts can supersede ancestor file edits without a manual `prefer-child` retry.
+- Added automatic bounded merge repair for true parallel conflicts: `merge` writes conflict/request/plan/run sidecars under `merge-proofs/`, invokes a repair provider by default, and can prefer a child file, synthesize conflict paths, or run a normal repair child from `merge-working`.
+- Added repair controls for advanced/debug flows: `--no-repair`, `--repair-provider`, `--repair-mode auto|prefer|synthesize|child`, `--repair-attempts`, and `--strategy fail-on-conflict|dag-aware|prefer-child`.
+- Added plan events for repair planning, repair start, repair child discovery, repaired merges, and repair failure; `show --why-failed`, plain plan summaries, and `history grep --plan` surface the new repair evidence.
+- Updated `orchestrate` started/preflight output to say merge repair is automatic and to carry repair through the one-command flow.
+- Added orchestration integration coverage for conflict bundles, repair requests, DAG merge precedence, planner prefer/synthesize/child repair, refusal validation, and headless `orchestrate --yes` auto-repair.
+- Updated `docs/AS-BUILT-ARCHITECTURE.md` with the semantic merge repair model and sidecar layout.
+
 ## Plan observability (alpha) - 2026-05-15
 
 - Added `plan-events.jsonl` as the orchestration-level event timeline for plan, task, child discovery, merge, failure, completion, and kill lifecycle edges.
