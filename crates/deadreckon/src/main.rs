@@ -361,6 +361,8 @@ async fn main_inner() -> Result<()> {
             max_wall_seconds,
             sandbox,
             preview,
+            init_git,
+            acceptance,
             yes,
             no_hints,
             quiet,
@@ -375,6 +377,8 @@ async fn main_inner() -> Result<()> {
                     max_wall_seconds,
                     sandbox,
                     preview,
+                    init_git,
+                    acceptance,
                     yes,
                     no_hints,
                     quiet,
@@ -393,6 +397,8 @@ async fn main_inner() -> Result<()> {
             child_provider,
             coder_provider,
             reviewer_provider,
+            init_git,
+            acceptance,
             no_hints,
             quiet,
             plain,
@@ -410,6 +416,9 @@ async fn main_inner() -> Result<()> {
                 child_provider,
                 coder_provider,
                 reviewer_provider,
+                init_git,
+                acceptance,
+                skip_acceptance_prompt: quiet,
                 no_hints,
                 quiet,
                 plain,
@@ -7553,6 +7562,8 @@ struct BareOrchestrateArgs {
     max_wall_seconds: Option<f64>,
     sandbox: Option<String>,
     preview: bool,
+    init_git: bool,
+    acceptance: Option<PathBuf>,
     yes: bool,
     no_hints: bool,
     quiet: bool,
@@ -7577,6 +7588,14 @@ fn orchestrate_request_from_cli(
                 child_provider: Vec::new(),
                 coder_provider: args.coder_provider,
                 reviewer_provider: args.reviewer_provider,
+                init_git: args.init_git || bare.init_git,
+                acceptance: args.acceptance.or(bare.acceptance),
+                skip_acceptance_prompt: args.yes
+                    || args.preview
+                    || args.quiet
+                    || bare.yes
+                    || bare.preview
+                    || bare.quiet,
                 no_hints: args.no_hints || bare.no_hints,
                 quiet: args.quiet || bare.quiet,
                 plain: args.plain || bare.plain,
@@ -7597,6 +7616,14 @@ fn orchestrate_request_from_cli(
                 child_provider: args.child_provider,
                 coder_provider: None,
                 reviewer_provider: None,
+                init_git: args.init_git || bare.init_git,
+                acceptance: args.acceptance.or(bare.acceptance),
+                skip_acceptance_prompt: args.yes
+                    || args.preview
+                    || args.quiet
+                    || bare.yes
+                    || bare.preview
+                    || bare.quiet,
                 no_hints: args.no_hints || bare.no_hints,
                 quiet: args.quiet || bare.quiet,
                 plain: args.plain || bare.plain,
@@ -7615,6 +7642,8 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         max_wall_seconds,
         sandbox,
         preview,
+        init_git,
+        acceptance,
         yes,
         no_hints,
         quiet,
@@ -7667,6 +7696,9 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         child_provider: Vec::new(),
         coder_provider: None,
         reviewer_provider: None,
+        init_git,
+        acceptance,
+        skip_acceptance_prompt: yes || preview || quiet,
         no_hints,
         quiet,
         plain,
@@ -7855,6 +7887,9 @@ async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
     let max_spend = args.plan.max_spend;
     let max_wall_seconds = args.plan.max_wall_seconds;
     let sandbox = args.plan.sandbox.clone();
+    if !prepare_orchestration_source(args.plan.init_git, quiet)? {
+        return Ok(());
+    }
     let plan = create_orchestration_plan(args.plan).await?;
     let plan_id = plan.plan_id.clone();
     if !quiet {
@@ -7895,11 +7930,36 @@ async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
 async fn plan_command(args: PlanCommandArgs) -> Result<()> {
     let quiet = args.quiet;
     let no_hints = args.no_hints;
+    if !prepare_orchestration_source(args.init_git, quiet)? {
+        return Ok(());
+    }
     let plan = create_orchestration_plan(args).await?;
     if !quiet {
         print_plan_created(&plan, no_hints);
     }
     Ok(())
+}
+
+fn prepare_orchestration_source(init_git: bool, quiet: bool) -> Result<bool> {
+    let cwd = std::env::current_dir()?;
+    if init_git {
+        init_git_repo(&cwd)?;
+        return Ok(true);
+    }
+    if deadreckon_core::find_git_root(&cwd)?.is_some() || quiet || !io::stdin().is_terminal() {
+        return Ok(true);
+    }
+    match prompt_non_git_mode()? {
+        NonGitChoice::Init => {
+            init_git_repo(&cwd)?;
+            Ok(true)
+        }
+        NonGitChoice::Copy => Ok(true),
+        NonGitChoice::Cancel => {
+            println!("cancelled");
+            Ok(false)
+        }
+    }
 }
 
 async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
@@ -7915,8 +7975,11 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
         child_provider,
         coder_provider,
         reviewer_provider,
+        init_git: _,
+        acceptance,
+        skip_acceptance_prompt,
         no_hints: _,
-        quiet: _,
+        quiet,
         plain,
     } = args;
     let goal = goal.trim().to_string();
@@ -7930,6 +7993,7 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
     let defaults = config_defaults(&paths)?;
     let cwd = std::env::current_dir()?;
     let scope = workspace_scope(&cwd)?;
+    let plan_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
     let plan_mode = match mode {
         CliPlanMode::FullPlan => PlanMode::FullPlan,
         CliPlanMode::Review => PlanMode::Review,
@@ -7943,6 +8007,27 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
         coder_provider,
         reviewer_provider,
     )?;
+    let acceptance_provider = match plan_mode {
+        PlanMode::FullPlan => providers
+            .planner
+            .clone()
+            .or_else(|| providers.default_child.clone()),
+        PlanMode::Review => providers
+            .coder
+            .clone()
+            .or_else(|| providers.reviewer.clone())
+            .or_else(|| providers.default_child.clone()),
+    };
+    let acceptance_source = ensure_acceptance_before_start(
+        &cwd,
+        acceptance.as_deref(),
+        &goal,
+        acceptance_provider,
+        None,
+        skip_acceptance_prompt || quiet,
+        "orchestration",
+    )
+    .await?;
     let mut tasks = match plan_mode {
         PlanMode::FullPlan => {
             validate_task_count(usize::from(n)).map_err(CliError::Core)?;
@@ -7964,6 +8049,8 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
         env!("CARGO_PKG_VERSION"),
     )
     .map_err(CliError::Core)?;
+    plan.parent_cwd = Some(plan_cwd);
+    plan.acceptance_path = acceptance_source.as_ref().map(|source| source.path.clone());
     plan.capability_preview = infer_capability_preview(&plan.root_goal);
     for task in &plan.tasks {
         let spec = render_worker_spec(&plan, task);
@@ -8303,8 +8390,21 @@ fn render_worker_spec(plan: &Plan, task: &PlanTask) -> String {
     } else {
         task.depends_on.join(", ")
     };
+    let acceptance_line = plan
+        .acceptance_path
+        .as_ref()
+        .map(|path| {
+            format!(
+                "- dr-gate will enforce configured done criteria from {}.",
+                path.display()
+            )
+        })
+        .unwrap_or_else(|| {
+            "- dr-gate will use the default local gate if no project done criteria exist."
+                .to_string()
+        });
     format!(
-        "# deadreckon worker spec: {}\n\nRoot goal: {}\nChild id: {}\nRole: {:?}\nProvider: {}\nDependencies satisfied before start: {}\n\n## Scope\n{}\n\n## Capability constraints\n- network: {:?}\n- deploy: {}\n- global install: {}\n- filesystem: {}\n\n## Coordination rules\n- Treat this file as the complete brief; do not assume access to the parent conversation.\n- Do not inspect, tail, or summarize sibling child transcripts; wait for dependency summaries included below.\n- If correcting your own failed check, keep the same context and fix the root cause.\n- If acting as reviewer, approach the artifact with fresh assumptions and verify independently.\n- Report blockers as concrete file paths, command output, or acceptance failures.\n\n## Done criteria\n- Stay within this child's scope.\n- Verify relevant behavior before reporting done.\n- Do not spawn subagents or orchestrate more children.\n- Do not editorialize between tool calls.\n- Report scope, result, key files, files changed, and issues.\n",
+        "# deadreckon worker spec: {}\n\nRoot goal: {}\nChild id: {}\nRole: {:?}\nProvider: {}\nDependencies satisfied before start: {}\n\n## Scope\n{}\n\n## Capability constraints\n- network: {:?}\n- deploy: {}\n- global install: {}\n- filesystem: {}\n\n## Coordination rules\n- Treat this file as the complete brief; do not assume access to the parent conversation.\n- Do not inspect, tail, or summarize sibling child transcripts; wait for dependency summaries included below.\n- If correcting your own failed check, keep the same context and fix the root cause.\n- If acting as reviewer, approach the artifact with fresh assumptions and verify independently.\n- Report blockers as concrete file paths, command output, or acceptance failures.\n\n## Done criteria\n{}\n- Stay within this child's scope.\n- Verify relevant behavior before reporting done.\n- Do not spawn subagents or orchestrate more children.\n- Do not editorialize between tool calls.\n- Report scope, result, key files, files changed, and issues.\n",
         task.subject,
         plan.root_goal,
         task.task_id,
@@ -8315,7 +8415,8 @@ fn render_worker_spec(plan: &Plan, task: &PlanTask) -> String {
         plan.capability_preview.network,
         plan.capability_preview.deploy,
         plan.capability_preview.global_install,
-        plan.capability_preview.filesystem.join(", ")
+        plan.capability_preview.filesystem.join(", "),
+        acceptance_line
     )
 }
 
@@ -8359,6 +8460,30 @@ fn truncate_for_worker_spec(raw: &str) -> String {
     }
 }
 
+fn plan_source_label(plan: &Plan) -> String {
+    let Some(cwd) = plan.parent_cwd.as_ref() else {
+        return "current directory at fork time".to_string();
+    };
+    let git_label = match preview_git_state(cwd) {
+        Ok(Some(git)) => format!("git branch={} @ {}", git.branch, git.head_sha),
+        _ => "not git; child runs use copy mode".to_string(),
+    };
+    format!("{} ({git_label})", cwd.display())
+}
+
+fn plan_acceptance_label(plan: &Plan) -> String {
+    let Some(path) = plan.acceptance_path.as_ref() else {
+        return "default".to_string();
+    };
+    match fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| acceptance_check_count(&raw).ok())
+    {
+        Some(checks) => format!("configured ({checks} checks) from {}", path.display()),
+        None => format!("configured from {}", path.display()),
+    }
+}
+
 fn print_plan_created(plan: &Plan, no_hints: bool) {
     println!(
         "{} {} ({})",
@@ -8397,11 +8522,15 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
         plan.capability_preview.deploy,
         plan.capability_preview.global_install
     );
+    let source = plan_source_label(plan);
+    let gate = plan_acceptance_label(plan);
     let items = [
         ("status", plan_status_label(plan.status)),
         ("mode", plan_mode_label(plan.mode)),
         ("children", children.as_str()),
         ("providers", providers.as_str()),
+        ("source", source.as_str()),
+        ("gate", gate.as_str()),
         ("capabilities", capabilities.as_str()),
     ];
     print_kv_block(&items);
@@ -8466,10 +8595,14 @@ fn print_orchestrate_preflight(
         plan.capability_preview.global_install
     );
     let providers = plan_provider_summary(plan);
+    let source = plan_source_label(plan);
+    let gate = plan_acceptance_label(plan);
     let items = [
         ("mode", plan_mode_label(plan.mode)),
         ("children", children.as_str()),
         ("providers", providers.as_str()),
+        ("source", source.as_str()),
+        ("gate", gate.as_str()),
         ("sandbox", sandbox.as_str()),
         ("spend", spend.as_str()),
         ("wall", wall.as_str()),
@@ -8527,6 +8660,8 @@ fn print_orchestrate_started(
     );
     let children = plan.tasks.len().to_string();
     let providers = plan_provider_summary(plan);
+    let source = plan_source_label(plan);
+    let gate = plan_acceptance_label(plan);
     let sandbox = sandbox.unwrap_or("config default").to_string();
     let spend = max_spend
         .map(|value| format!("${value:.2} per child"))
@@ -8545,6 +8680,8 @@ fn print_orchestrate_started(
         ("mode", plan_mode_label(plan.mode)),
         ("children", children.as_str()),
         ("providers", providers.as_str()),
+        ("source", source.as_str()),
+        ("gate", gate.as_str()),
         ("sandbox", sandbox.as_str()),
         ("spend", spend.as_str()),
         ("wall", wall.as_str()),
@@ -9106,17 +9243,18 @@ fn plan_child_source_dir(
     parent_cwd: &Path,
 ) -> Result<PathBuf> {
     let task = &plan.tasks[task_index];
+    let plan_cwd = plan.parent_cwd.as_deref().unwrap_or(parent_cwd);
     if task.role != PlanRole::Reviewer {
-        return Ok(parent_cwd.to_path_buf());
+        return Ok(plan_cwd.to_path_buf());
     }
     let Some(dependency) = task.depends_on.first() else {
-        return Ok(parent_cwd.to_path_buf());
+        return Ok(plan_cwd.to_path_buf());
     };
     let Some(parent_task) = plan.task_by_id(dependency) else {
-        return Ok(parent_cwd.to_path_buf());
+        return Ok(plan_cwd.to_path_buf());
     };
     let Some(run_id) = parent_task.child_run_id.as_deref() else {
-        return Ok(parent_cwd.to_path_buf());
+        return Ok(plan_cwd.to_path_buf());
     };
     let state = load_run(paths, run_id)?;
     let library_dir = paths.library_dir(&state.scope, &state.run_id);
@@ -9189,6 +9327,9 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
             .arg("--no-docs");
         if plain {
             command.arg("--plain");
+        }
+        if let Some(acceptance_path) = plan.acceptance_path.as_deref() {
+            command.arg("--acceptance").arg(acceptance_path);
         }
     }
     command.arg("--sandbox").arg(sandbox);

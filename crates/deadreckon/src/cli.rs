@@ -639,6 +639,17 @@ pub(crate) enum Commands {
             help = "Show the resolved orchestration preflight without starting work"
         )]
         preview: bool,
+        #[arg(
+            long,
+            help = "Initialize git in a plain directory before orchestrating"
+        )]
+        init_git: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Acceptance spec for child runs; defaults to .deadreckon/acceptance.yaml when present"
+        )]
+        acceptance: Option<PathBuf>,
         #[arg(long, help = "Skip the orchestration preflight confirmation")]
         yes: bool,
         #[arg(long, help = "Suppress post-action hints")]
@@ -674,6 +685,14 @@ pub(crate) enum Commands {
         coder_provider: Option<String>,
         #[arg(long, help = "Review-mode reviewer provider")]
         reviewer_provider: Option<String>,
+        #[arg(long, help = "Initialize git in a plain directory before planning")]
+        init_git: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Acceptance spec for child runs; defaults to .deadreckon/acceptance.yaml when present"
+        )]
+        acceptance: Option<PathBuf>,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
@@ -1332,6 +1351,17 @@ pub(crate) struct OrchestrateReviewArgs {
     pub(crate) reviewer_provider: Option<String>,
     #[arg(
         long,
+        help = "Initialize git in a plain directory before orchestrating"
+    )]
+    pub(crate) init_git: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Acceptance spec for child runs; defaults to .deadreckon/acceptance.yaml when present"
+    )]
+    pub(crate) acceptance: Option<PathBuf>,
+    #[arg(
+        long,
         help = "Show the resolved orchestration preflight without starting work"
     )]
     pub(crate) preview: bool,
@@ -1370,6 +1400,17 @@ pub(crate) struct OrchestrateFullPlanArgs {
         help = "Per-child provider override"
     )]
     pub(crate) child_provider: Vec<String>,
+    #[arg(
+        long,
+        help = "Initialize git in a plain directory before orchestrating"
+    )]
+    pub(crate) init_git: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Acceptance spec for child runs; defaults to .deadreckon/acceptance.yaml when present"
+    )]
+    pub(crate) acceptance: Option<PathBuf>,
     #[arg(
         long,
         help = "Show the resolved orchestration preflight without starting work"
@@ -1724,6 +1765,9 @@ pub(crate) struct PlanCommandArgs {
     pub(crate) child_provider: Vec<String>,
     pub(crate) coder_provider: Option<String>,
     pub(crate) reviewer_provider: Option<String>,
+    pub(crate) init_git: bool,
+    pub(crate) acceptance: Option<PathBuf>,
+    pub(crate) skip_acceptance_prompt: bool,
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
     pub(crate) plain: bool,

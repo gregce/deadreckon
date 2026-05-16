@@ -156,6 +156,10 @@ pub struct Plan {
     pub capability_preview: CapabilityPreview,
     pub tasks: Vec<PlanTask>,
     pub parent_scope: Option<String>,
+    #[serde(default)]
+    pub parent_cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub acceptance_path: Option<PathBuf>,
     pub status: PlanStatus,
     pub created_at: DateTime<Utc>,
     pub forked_at: Option<DateTime<Utc>>,
@@ -184,6 +188,8 @@ impl Plan {
             capability_preview: CapabilityPreview::default(),
             tasks,
             parent_scope,
+            parent_cwd: None,
+            acceptance_path: None,
             status: PlanStatus::Pending,
             created_at: Utc::now(),
             forked_at: None,

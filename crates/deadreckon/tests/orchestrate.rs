@@ -298,6 +298,127 @@ fn orchestrate_start_prints_run_like_context() {
 }
 
 #[test]
+fn orchestrate_review_works_in_plain_directory_and_copies_done_criteria() {
+    let temp = TempDir::new().expect("tempdir");
+    let workspace = temp.path().join("plain-workspace");
+    fs::create_dir_all(workspace.join(".deadreckon")).expect("workspace");
+    fs::write(workspace.join("README.md"), "hello").expect("readme");
+    fs::write(
+        workspace.join(".deadreckon/acceptance.yaml"),
+        "name: plain acceptance\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("acceptance");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args([
+            "orchestrate",
+            "review",
+            "plain directory work",
+            "--coder-provider",
+            "smoke",
+            "--reviewer-provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--yes",
+            "--quiet",
+        ])
+        .output()
+        .expect("orchestrate");
+
+    assert_success(&output);
+    assert!(!workspace.join(".git").exists());
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.status, PlanStatus::Merged);
+    assert_eq!(
+        plan.parent_cwd.as_deref(),
+        Some(workspace.canonicalize().expect("canonical").as_path())
+    );
+    assert!(
+        plan.acceptance_path
+            .as_ref()
+            .is_some_and(|path| { path.ends_with(".deadreckon/acceptance.yaml") })
+    );
+    let coder_run_id = plan.tasks[0].child_run_id.as_deref().expect("coder run");
+    let coder_state = deadreckon_core::load_run(&paths, coder_run_id).expect("coder state");
+    let acceptance =
+        fs::read_to_string(coder_state.run_root.join("acceptance.yaml")).expect("run acceptance");
+    assert!(acceptance.contains("plain acceptance"), "{acceptance}");
+}
+
+#[test]
+fn orchestrate_acceptance_override_is_passed_to_child_runs() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let spec = temp.path().join("external-acceptance.yaml");
+    fs::write(
+        &spec,
+        "name: external acceptance\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("acceptance");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("orchestrate")
+        .arg("review")
+        .arg("override done criteria")
+        .arg("--coder-provider")
+        .arg("smoke")
+        .arg("--reviewer-provider")
+        .arg("smoke")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--acceptance")
+        .arg(&spec)
+        .arg("--yes")
+        .arg("--quiet")
+        .output()
+        .expect("orchestrate");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.acceptance_path.as_deref(), Some(spec.as_path()));
+    let coder_run_id = plan.tasks[0].child_run_id.as_deref().expect("coder run");
+    let coder_state = deadreckon_core::load_run(&paths, coder_run_id).expect("coder state");
+    let acceptance =
+        fs::read_to_string(coder_state.run_root.join("acceptance.yaml")).expect("run acceptance");
+    assert!(acceptance.contains("external acceptance"), "{acceptance}");
+}
+
+#[test]
+fn orchestrate_init_git_initializes_plain_directory_before_preview() {
+    let temp = TempDir::new().expect("tempdir");
+    let workspace = temp.path().join("plain-init");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(workspace.join("README.md"), "hello").expect("readme");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args([
+            "orchestrate",
+            "review",
+            "initialize before planning",
+            "--init-git",
+            "--preview",
+        ])
+        .output()
+        .expect("orchestrate preview");
+
+    assert_success(&output);
+    assert!(workspace.join(".git").is_dir());
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.status, PlanStatus::Pending);
+    assert_eq!(
+        plan.parent_cwd.as_deref(),
+        Some(workspace.canonicalize().expect("canonical").as_path())
+    );
+}
+
+#[test]
 fn orchestrate_headless_without_mode_refuses_with_try_line() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
