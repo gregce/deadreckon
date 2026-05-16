@@ -153,7 +153,8 @@ Lifecycle:
 
 Orchestrate is the one-command multi-agent wrapper. Review mode is a coder
 provider followed by a fresh reviewer/fixer. Full-plan mode asks a planner
-provider for child work before fork and merge.";
+provider for child work before fork and merge. Merge repair is automatic by
+default; --no-repair is only for debugging raw conflict bundles.";
 
 const PLAN_HELP: &str = "\
 Lifecycle:
@@ -653,6 +654,8 @@ pub(crate) enum Commands {
         acceptance: Option<PathBuf>,
         #[arg(long, help = "Skip the orchestration preflight confirmation")]
         yes: bool,
+        #[arg(long, help = "Debug only: disable automatic semantic merge repair")]
+        no_repair: bool,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
@@ -1385,6 +1388,8 @@ pub(crate) struct OrchestrateReviewArgs {
     pub(crate) preview: bool,
     #[arg(long, help = "Skip the orchestration preflight confirmation")]
     pub(crate) yes: bool,
+    #[arg(long, help = "Debug only: disable automatic semantic merge repair")]
+    pub(crate) no_repair: bool,
     #[arg(long, help = "Suppress post-action hints")]
     pub(crate) no_hints: bool,
     #[arg(long, help = "Suppress success stdout")]
@@ -1436,6 +1441,8 @@ pub(crate) struct OrchestrateFullPlanArgs {
     pub(crate) preview: bool,
     #[arg(long, help = "Skip the orchestration preflight confirmation")]
     pub(crate) yes: bool,
+    #[arg(long, help = "Debug only: disable automatic semantic merge repair")]
+    pub(crate) no_repair: bool,
     #[arg(long, help = "Suppress post-action hints")]
     pub(crate) no_hints: bool,
     #[arg(long, help = "Suppress success stdout")]

@@ -364,6 +364,7 @@ async fn main_inner() -> Result<()> {
             init_git,
             acceptance,
             yes,
+            no_repair,
             no_hints,
             quiet,
             plain,
@@ -380,6 +381,7 @@ async fn main_inner() -> Result<()> {
                     init_git,
                     acceptance,
                     yes,
+                    no_repair,
                     no_hints,
                     quiet,
                     plain,
@@ -7565,6 +7567,7 @@ struct OrchestrateRunArgs {
     plan: PlanCommandArgs,
     preview: bool,
     yes: bool,
+    no_repair: bool,
 }
 
 struct BareOrchestrateArgs {
@@ -7576,6 +7579,7 @@ struct BareOrchestrateArgs {
     init_git: bool,
     acceptance: Option<PathBuf>,
     yes: bool,
+    no_repair: bool,
     no_hints: bool,
     quiet: bool,
     plain: bool,
@@ -7613,6 +7617,7 @@ fn orchestrate_request_from_cli(
             },
             preview: args.preview || bare.preview,
             yes: args.yes || bare.yes,
+            no_repair: args.no_repair || bare.no_repair,
         }),
         Some(OrchestrateCommand::FullPlan(args)) => Ok(OrchestrateRunArgs {
             plan: PlanCommandArgs {
@@ -7641,6 +7646,7 @@ fn orchestrate_request_from_cli(
             },
             preview: args.preview || bare.preview,
             yes: args.yes || bare.yes,
+            no_repair: args.no_repair || bare.no_repair,
         }),
         None => interactive_orchestrate_request(bare),
     }
@@ -7656,6 +7662,7 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         init_git,
         acceptance,
         yes,
+        no_repair,
         no_hints,
         quiet,
         plain,
@@ -7726,7 +7733,12 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
             plan.reviewer_provider = prompt_provider_role("reviewer", default_provider.as_deref())?;
         }
     }
-    Ok(OrchestrateRunArgs { plan, preview, yes })
+    Ok(OrchestrateRunArgs {
+        plan,
+        preview,
+        yes,
+        no_repair,
+    })
 }
 
 fn recommend_orchestration_mode(goal: &str) -> CliPlanMode {
@@ -7904,14 +7916,26 @@ async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
     let plan = create_orchestration_plan(args.plan).await?;
     let plan_id = plan.plan_id.clone();
     if !quiet {
-        print_orchestrate_preflight(&plan, max_spend, max_wall_seconds, sandbox.as_deref());
+        print_orchestrate_preflight(
+            &plan,
+            max_spend,
+            max_wall_seconds,
+            sandbox.as_deref(),
+            args.no_repair,
+        );
     }
     if args.preview {
         return Ok(());
     }
     confirm_orchestration_start(&plan, args.yes)?;
     if !quiet {
-        print_orchestrate_started(&plan, max_spend, max_wall_seconds, sandbox.as_deref());
+        print_orchestrate_started(
+            &plan,
+            max_spend,
+            max_wall_seconds,
+            sandbox.as_deref(),
+            args.no_repair,
+        );
     }
     fork_command(ForkCommandArgs {
         plan_id: plan_id.clone(),
@@ -7931,7 +7955,7 @@ async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
         plan_id,
         strategy: "dag-aware".to_string(),
         prefer_child: None,
-        no_repair: false,
+        no_repair: args.no_repair,
         repair_provider: None,
         repair_mode: "auto".to_string(),
         repair_attempts: 1,
@@ -8586,6 +8610,7 @@ fn print_orchestrate_preflight(
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
     sandbox: Option<&str>,
+    no_repair: bool,
 ) {
     println!(
         "{} {} ({})",
@@ -8614,7 +8639,7 @@ fn print_orchestrate_preflight(
     let providers = plan_provider_summary(plan);
     let source = plan_source_label(plan);
     let gate = plan_acceptance_label(plan);
-    let repair = plan_repair_label(plan);
+    let repair = plan_repair_label(plan, no_repair);
     let items = [
         ("mode", plan_mode_label(plan.mode)),
         ("children", children.as_str()),
@@ -8671,6 +8696,7 @@ fn print_orchestrate_started(
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
     sandbox: Option<&str>,
+    no_repair: bool,
 ) {
     println!(
         "{} {}",
@@ -8681,7 +8707,7 @@ fn print_orchestrate_started(
     let providers = plan_provider_summary(plan);
     let source = plan_source_label(plan);
     let gate = plan_acceptance_label(plan);
-    let repair = plan_repair_label(plan);
+    let repair = plan_repair_label(plan, no_repair);
     let sandbox = sandbox.unwrap_or("config default").to_string();
     let spend = max_spend
         .map(|value| format!("${value:.2} per child"))
@@ -16463,7 +16489,10 @@ fn plan_provider_summary(plan: &Plan) -> String {
     }
 }
 
-fn plan_repair_label(plan: &Plan) -> String {
+fn plan_repair_label(plan: &Plan, no_repair: bool) -> String {
+    if no_repair {
+        return "disabled (--no-repair)".to_string();
+    }
     let provider = plan
         .providers
         .planner
