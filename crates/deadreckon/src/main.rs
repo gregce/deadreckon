@@ -56,11 +56,11 @@ use deadreckon_core::{
     docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files, list_runs,
     load_chain, load_plan, load_run, marker_path_for_run_root, pid_is_alive, plan_status_label,
     plan_task_status_label, prepare_worktree_record, preview_git_state, promote_completed_run,
-    read_chain_step_marker, read_codebase_record, read_plan_events, read_plan_messages,
-    record_for_resolved_mode, release_lock_file, resolve_mode, restore_snapshot, run_status_label,
-    save_chain, save_plan, save_state, terminate_pid, validate_acceptance_marker,
-    validate_task_count, write_acceptance_marker, write_cancel_marker, write_chain_step_marker,
-    write_child_summary, write_coordinator_state, write_plan_child_marker, write_worker_spec,
+    read_chain_step_marker, read_codebase_record, read_plan_messages, record_for_resolved_mode,
+    release_lock_file, resolve_mode, restore_snapshot, run_status_label, save_chain, save_plan,
+    save_state, terminate_pid, validate_acceptance_marker, validate_task_count,
+    write_acceptance_marker, write_cancel_marker, write_chain_step_marker, write_child_summary,
+    write_coordinator_state, write_plan_child_marker, write_worker_spec,
 };
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
@@ -8632,6 +8632,7 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     }
 
     mark_blocked_pending_tasks(&paths, &mut plan)?;
+    mark_failed_fork_plan_terminal(&paths, &mut plan)?;
     save_plan(&paths, &plan)?;
     let _ = fs::remove_file(paths.coordinator_json(&plan.plan_id));
     if !quiet {
@@ -9178,6 +9179,30 @@ fn mark_blocked_pending_tasks(paths: &DeadreckonPaths, plan: &mut Plan) -> Resul
     Ok(())
 }
 
+fn mark_failed_fork_plan_terminal(paths: &DeadreckonPaths, plan: &mut Plan) -> Result<()> {
+    let all_terminal = plan.tasks.iter().all(|task| {
+        !matches!(
+            task.status,
+            PlanTaskStatus::Pending | PlanTaskStatus::Running
+        )
+    });
+    let has_failure = plan
+        .tasks
+        .iter()
+        .any(|task| matches!(task.status, PlanTaskStatus::Failed | PlanTaskStatus::Killed));
+    if all_terminal && has_failure && plan.status != PlanStatus::Failed {
+        plan.status = PlanStatus::Failed;
+        append_plan_event(
+            paths,
+            &plan.plan_id,
+            PlanEventKind::PlanFailed {
+                reason: "one or more child tasks failed or were blocked".to_string(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn task_status_label(status: PlanTaskStatus) -> &'static str {
     plan_task_status_label(status)
 }
@@ -9619,7 +9644,7 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
     if let Some(line) = plan_final_gate_line(paths, plan) {
         println!("final gate {line}");
     }
-    let plan_events = read_plan_events(paths, &plan.plan_id).unwrap_or_default();
+    let plan_events = read_plan_events_lossy(paths, &plan.plan_id);
     if let Some(event) = plan_events.last() {
         println!("latest plan event {}", plan_event_line(event));
     }
@@ -12211,7 +12236,7 @@ fn history_grep_command(args: HistoryGrepRequest) -> Result<()> {
     );
     if let Some(plan_id) = plan.as_deref() {
         let plan_id = resolve_plan_id(&paths, plan_id)?;
-        for event in read_plan_events(&paths, &plan_id)? {
+        for event in read_plan_events_lossy(&paths, &plan_id) {
             if let Some(cutoff) = cutoff
                 && event.timestamp < cutoff
             {
@@ -13228,6 +13253,16 @@ fn kill_plan_command(paths: &DeadreckonPaths, plan_id: &str, force: bool) -> Res
             if let Ok(mut state) = load_run(paths, &run_id) {
                 if plan.tasks[task_index].child_run_id.is_none() {
                     plan.tasks[task_index].child_run_id = Some(state.run_id.clone());
+                    append_plan_event(
+                        paths,
+                        &plan.plan_id,
+                        PlanEventKind::TaskRunDiscovered {
+                            task_id: plan.tasks[task_index].task_id.clone(),
+                            task_index,
+                            run_id: Some(state.run_id.clone()),
+                            pid: None,
+                        },
+                    )?;
                 }
                 if plan.tasks[task_index].child_scope.is_none() {
                     plan.tasks[task_index].child_scope = Some(state.scope.clone());
@@ -13634,10 +13669,7 @@ fn show_plan_why_failed(paths: &DeadreckonPaths, plan: &Plan) {
             message.from, message.to, message.summary
         ));
     }
-    if let Some(event) = read_plan_events(paths, &plan.plan_id)
-        .unwrap_or_default()
-        .last()
-    {
+    if let Some(event) = read_plan_events_lossy(paths, &plan.plan_id).last() {
         evidence.push(format!("latest plan event {}", plan_event_line(event)));
     }
     render_why_failed(WhyFailedReport {
@@ -14644,7 +14676,7 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
     let result = loop {
         let plan = load_plan(paths, plan_id)?;
         let messages = read_plan_messages(paths, plan_id).unwrap_or_default();
-        let plan_events = read_plan_events(paths, plan_id).unwrap_or_default();
+        let plan_events = read_plan_events_lossy(paths, plan_id);
         if selected >= plan.tasks.len() {
             selected = plan.tasks.len().saturating_sub(1);
         }
@@ -14681,6 +14713,9 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
                         .get(selected)
                         .and_then(|task| task.child_run_id.as_deref())
                     {
+                        if load_run(paths, run_id).is_err() {
+                            continue;
+                        }
                         let parent_plan = plan.tasks.get(selected).map(|task| AttachParentPlan {
                             plan_id: plan.plan_id.clone(),
                             task_id: task.task_id.clone(),
@@ -14840,12 +14875,38 @@ fn render_plan_attach(
         List::new(activity).block(Block::default().title(activity_title).borders(Borders::ALL)),
         vertical[2],
     );
-    let footer = if show_hints {
-        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter drill into child  |  merge after fork"
-    } else {
-        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter drill into child"
-    };
+    let footer = plan_attach_footer(paths, plan, selected, show_hints);
     frame.render_widget(Paragraph::new(footer), vertical[3]);
+}
+
+fn plan_attach_footer(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    selected: usize,
+    show_hints: bool,
+) -> String {
+    let mut footer =
+        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter drill into child".to_string();
+    if let Some(task) = plan.tasks.get(selected) {
+        match task.child_run_id.as_deref() {
+            None => {
+                footer = format!(
+                    "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter waits for child run  |  try: deadreckon fork {}",
+                    run_prefix(&plan.plan_id)
+                );
+            }
+            Some(run_id) if load_run(paths, run_id).is_err() => {
+                footer =
+                    "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  child detail unavailable  |  try: deadreckon list --all"
+                        .to_string();
+            }
+            Some(_) => {}
+        }
+    }
+    if show_hints && !footer.contains("try:") {
+        footer.push_str("  |  merge after fork");
+    }
+    footer
 }
 
 fn plan_task_counts(plan: &Plan) -> (usize, usize) {
@@ -15065,6 +15126,8 @@ fn plan_task_detail_lines(
             lines.push(trace);
         }
         lines.push(format!("gate {}", acceptance_status_line(&state)));
+    } else if let Some(run_id) = task.child_run_id.as_deref() {
+        lines.push(format!("child detail unavailable {}", run_prefix(run_id)));
     }
     if let Some(summary) = task.summary_path.as_ref() {
         lines.push(format!(
@@ -15171,6 +15234,11 @@ async fn attach_tui_with_parent(
 
         if event::poll(std::time::Duration::from_millis(200))? {
             match event::read()? {
+                Event::Key(key)
+                    if tui_state.parent_plan.is_some() && attach_should_return_to_plan(key) =>
+                {
+                    break Ok(());
+                }
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key)
                     if key.code == KeyCode::Char('c')
@@ -15314,6 +15382,12 @@ fn resume_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(
 fn attach_should_quit(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
         || (key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn attach_should_return_to_plan(key: KeyEvent) -> bool {
+    attach_should_quit(key)
+        || matches!(key.code, KeyCode::Backspace)
+        || (key.code == KeyCode::Char('b') && key.modifiers.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17367,9 +17441,15 @@ fn parent_plan_footer(footer: String, parent_plan: Option<&AttachParentPlan>) ->
         return footer;
     };
     let mut footer = footer
-        .replace("q/Esc/Ctrl-D detach", "q/Esc/Ctrl-D back to plan")
-        .replace("Detach: q Esc Ctrl-D", "Back to plan: q Esc Ctrl-D")
-        .replace("q detach", "q back to plan");
+        .replace(
+            "q/Esc/Ctrl-D detach",
+            "b/Backspace/q/Esc/Ctrl-D back to plan",
+        )
+        .replace(
+            "Detach: q Esc Ctrl-D",
+            "Back to plan: b Backspace q Esc Ctrl-D",
+        )
+        .replace("q detach", "b/Backspace/q back to plan");
     footer.push_str(&format!(
         "  |  parent plan {} {}",
         run_prefix(&parent_plan.plan_id),
@@ -18221,20 +18301,27 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
         .collect::<Vec<T>>())
 }
 
+fn read_plan_events_lossy(paths: &DeadreckonPaths, plan_id: &str) -> Vec<PlanEvent> {
+    read_jsonl::<PlanEvent>(&paths.plan_events(plan_id)).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tui_tests {
+    use std::io::Write;
+
     use super::{
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, ChainAttachTuiState,
         CompletionAction, ProviderActivity, ProviderJsonlLogSpec, acceptance_activity_lines,
-        attach_header_text, chain_activity_lines, chain_attach_footer_text,
-        chain_attach_header_text, chain_should_auto_attach, chain_timeline_lines,
-        chain_wall_cap_hit, claude_project_name_for_workdir, cli_wait_status_line,
-        collect_jsonl_provider_activity, completion_action_from_input, completion_hints_enabled,
-        deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
-        live_file_lines, markdown_to_tui_lines, max_panel_scroll, per_step_wall_cap,
-        provider_ingest_base_roots, provider_jsonl_activity_lines,
-        provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run, render_attach,
+        attach_header_text, attach_should_return_to_plan, chain_activity_lines,
+        chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
+        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
+        cli_wait_status_line, collect_jsonl_provider_activity, completion_action_from_input,
+        completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
+        doc_polish_preview_text, live_file_lines, markdown_to_tui_lines, max_panel_scroll,
+        per_step_wall_cap, plan_attach_footer, provider_ingest_base_roots,
+        provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
+        provider_jsonl_session_matches_run, read_plan_events_lossy, render_attach,
         render_plan_attach, threshold_color,
     };
     use chrono::Utc;
@@ -18244,7 +18331,7 @@ mod tui_tests {
         ChainEventKind, ChainNewOptions, ChainStatus, ChainStepStatus, DeadreckonPaths,
         NetworkCapability, OnFail, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
         PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunOptions,
-        SpendRecord, create_run,
+        SpendRecord, append_plan_event, create_run, save_plan,
     };
     use deadreckon_providers::SpendEstimate;
     use deadreckon_providers::registry::{
@@ -18525,6 +18612,95 @@ mod tui_tests {
     }
 
     #[test]
+    fn plan_attach_tails_plan_events_without_restart() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+        save_plan(&paths, &plan).expect("save plan");
+        append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanStarted)
+            .expect("append started");
+
+        let text = render_plan_attach_text(
+            &paths,
+            &plan,
+            &[],
+            &read_plan_events_lossy(&paths, &plan.plan_id),
+            0,
+        );
+        assert!(text.contains("plan started"), "{text}");
+
+        append_plan_event(
+            &paths,
+            &plan.plan_id,
+            PlanEventKind::TaskBlocked {
+                task_id: "task-1".to_string(),
+                task_index: 1,
+                reason: "later event".to_string(),
+            },
+        )
+        .expect("append blocked");
+        let text = render_plan_attach_text(
+            &paths,
+            &plan,
+            &[],
+            &read_plan_events_lossy(&paths, &plan.plan_id),
+            0,
+        );
+
+        assert!(text.contains("task-1 blocked: later event"), "{text}");
+    }
+
+    #[test]
+    fn plan_attach_activity_prefers_plan_events_over_messages() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+        let message = PlanMessage::new(
+            "coordinator",
+            "task-1",
+            PlanMessageKind::Blocker,
+            "message-only blocker",
+            serde_json::json!({}),
+        )
+        .expect("message");
+        let event = PlanEvent {
+            timestamp: Utc::now(),
+            plan_id: plan.plan_id.clone(),
+            event: PlanEventKind::TaskBlocked {
+                task_id: "task-1".to_string(),
+                task_index: 1,
+                reason: "event blocker".to_string(),
+            },
+        };
+
+        let text = render_plan_attach_text(&paths, &plan, &[message], &[event], 1);
+
+        assert!(text.contains("plan events"), "{text}");
+        assert!(text.contains("event blocker"), "{text}");
+        assert!(!text.contains("message-only blocker"), "{text}");
+    }
+
+    #[test]
+    fn plan_attach_handles_partial_plan_event_line() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+        save_plan(&paths, &plan).expect("save plan");
+        append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanStarted)
+            .expect("append started");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.plan_events(&plan.plan_id))
+            .expect("open events")
+            .write_all(b"{\"kind\":\"partial\"\n")
+            .expect("partial line");
+
+        let text = render_plan_attach_text(
+            &paths,
+            &plan,
+            &[],
+            &read_plan_events_lossy(&paths, &plan.plan_id),
+            0,
+        );
+
+        assert!(text.contains("plan started"), "{text}");
+    }
+
+    #[test]
     fn attach_plan_shows_capability_preview() {
         let (_temp, paths, plan) = full_plan_fixture(2);
 
@@ -18546,8 +18722,73 @@ mod tui_tests {
 
         let text = render_plan_attach_text(&paths, &plan, &[], &[], 0);
 
-        assert!(text.contains("Enter drill into child"), "{text}");
+        assert!(text.contains("Enter waits for child run"), "{text}");
         assert!(text.contains("q/Esc/Ctrl-D detach"), "{text}");
+    }
+
+    #[test]
+    fn attach_plan_enter_opens_selected_child_run_detail() {
+        let (temp, paths, mut plan) = full_plan_fixture(2);
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "child detail".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        plan.tasks[0].child_run_id = Some(state.run_id);
+
+        let footer = plan_attach_footer(&paths, &plan, 0, true);
+
+        assert!(footer.contains("Enter drill into child"), "{footer}");
+        assert!(!footer.contains("try: deadreckon fork"), "{footer}");
+    }
+
+    #[test]
+    fn attach_plan_back_returns_to_same_selected_task() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+        let text = render_plan_attach_text(&paths, &plan, &[], &[], 1);
+
+        assert!(attach_should_return_to_plan(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE
+        )));
+        assert!(attach_should_return_to_plan(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE
+        )));
+        assert!(text.contains("* task-1"), "{text}");
+    }
+
+    #[test]
+    fn attach_plan_enter_without_run_id_shows_try_footer() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+
+        let text = render_plan_attach_text(&paths, &plan, &[], &[], 0);
+
+        assert!(text.contains("Enter waits for child run"), "{text}");
+        assert!(
+            text.contains(&format!("try: deadreckon fork {}", &plan.plan_id[..8])),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn plan_attach_overview_breadcrumb_names_plan() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+
+        let text = render_plan_attach_text(&paths, &plan, &[], &[], 0);
+
+        assert!(text.contains("deadreckon plan"), "{text}");
+        assert!(text.contains(&plan.plan_id[..8]), "{text}");
     }
 
     #[test]
@@ -18565,8 +18806,52 @@ mod tui_tests {
             render_attach_text_with_tui_state(&state, &[], &AttachLive::default(), tui_state);
 
         assert!(text.contains("plan 99998888 / task-1"), "{text}");
-        assert!(text.contains("Back to plan: q Esc Ctrl-D"), "{text}");
+        assert!(
+            text.contains("Back to plan: b Backspace q Esc Ctrl-D"),
+            "{text}"
+        );
         assert!(text.contains("parent plan 99998888 task-1"), "{text}");
+    }
+
+    #[test]
+    fn plan_attach_child_breadcrumb_names_task_and_run() {
+        let (_temp, state) = doc_preview_state();
+        let tui_state = AttachTuiState {
+            parent_plan: Some(AttachParentPlan {
+                plan_id: "99998888777766665555444433332222".to_string(),
+                task_id: "task-1".to_string(),
+            }),
+            ..AttachTuiState::default()
+        };
+
+        let text =
+            render_attach_text_with_tui_state(&state, &[], &AttachLive::default(), tui_state);
+
+        assert!(text.contains("plan 99998888 / task-1"), "{text}");
+        assert!(
+            text.contains(&format!("run {}", &state.run_id[..8])),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn plan_attach_child_footer_includes_back_hint() {
+        let (_temp, state) = doc_preview_state();
+        let tui_state = AttachTuiState {
+            parent_plan: Some(AttachParentPlan {
+                plan_id: "99998888777766665555444433332222".to_string(),
+                task_id: "task-1".to_string(),
+            }),
+            ..AttachTuiState::default()
+        };
+
+        let text =
+            render_attach_text_with_tui_state(&state, &[], &AttachLive::default(), tui_state);
+
+        assert!(
+            text.contains("Back to plan: b Backspace q Esc Ctrl-D"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -18574,6 +18859,37 @@ mod tui_tests {
         let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
 
         assert!(super::attach_should_quit(key));
+    }
+
+    #[test]
+    fn attach_plan_q_detaches_from_child_without_killing() {
+        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+
+        assert!(super::attach_should_quit(key));
+    }
+
+    #[test]
+    fn malformed_plan_event_line_does_not_break_attach() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+        save_plan(&paths, &plan).expect("save plan");
+        append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanStarted)
+            .expect("append started");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.plan_events(&plan.plan_id))
+            .expect("open events")
+            .write_all(b"not-json\n")
+            .expect("bad line");
+
+        let text = render_plan_attach_text(
+            &paths,
+            &plan,
+            &[],
+            &read_plan_events_lossy(&paths, &plan.plan_id),
+            0,
+        );
+
+        assert!(text.contains("plan started"), "{text}");
     }
 
     #[test]

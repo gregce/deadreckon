@@ -6,6 +6,7 @@
 - Added plan-event surfacing to `attach <plan-id>`, plain plan summaries, `history grep --plan`, and `show <plan-id> --why-failed`.
 - Added plan attach drill-down/back context so a user can enter a selected child run's normal attach view and return to the parent plan/task.
 - Hardened plan kill bookkeeping so discovered child run ids are preserved even if a child reaches a terminal state before the kill sweep inspects it.
+- Hardened plan attach and kill recovery for partial `plan-events.jsonl` lines, missing child run roots, explicit `b`/Backspace back navigation, terminal failed-plan events, and sidecar-recovered child run ids.
 - Hardened full-plan planning so build goals ask for implementation/verification child slices instead of research-only packets, and multiplayer/live/networked goals preview network capability correctly.
 - Updated `docs/AS-BUILT-ARCHITECTURE.md` with `§32 Plan Observability` and amended `§22`/`§30` to reflect the file-backed plan event stream and remaining broadcast-bus limit.
 
