@@ -155,6 +155,7 @@ crate: deadreckon-core
   paths::DeadreckonPaths
   paths::DEFAULT_DEADRECKON_HOME
   paths::SOURCE_ROOT
+  plan::append_plan_event
   plan::append_plan_message
   plan::CapabilityPreview
   plan::child_summary_relative_path
@@ -164,11 +165,14 @@ crate: deadreckon-core
   plan::load_plan
   plan::NetworkCapability
   plan::PLAN_CHILD_PARENT_JSON
+  plan::PLAN_EVENTS_JSONL
   plan::plan_task_key
   plan::PLAN_JSON
   plan::PLAN_MESSAGES_JSONL
   plan::Plan
   plan::PlanChildMarker
+  plan::PlanEvent
+  plan::PlanEventKind
   plan::PlanMessage
   plan::PlanMessageKind
   plan::PlanMode
@@ -177,6 +181,7 @@ crate: deadreckon-core
   plan::PlanStatus
   plan::PlanTask
   plan::PlanTaskStatus
+  plan::read_plan_events
   plan::read_plan_messages
   plan::save_plan
   plan::SUMMARIES_DIR

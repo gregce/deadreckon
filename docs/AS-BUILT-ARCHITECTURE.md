@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-15 (distribution and self-update alpha)
+**Last updated:** 2026-05-15 (plan observability alpha)
 **Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -42,6 +42,7 @@ This document captures the system as built today — what's wired, what's load-b
 29. [Workspace Hygiene](#29-workspace-hygiene)
 30. [Plans & Multi-Agent Orchestration](#30-plans--multi-agent-orchestration)
 31. [Distribution & Self-Update](#31-distribution--self-update)
+32. [Plan Observability](#32-plan-observability)
 
 ---
 
@@ -1445,6 +1446,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Import parity hardening: Claude Code/Codex JSONL and Cursor SQLite imports preserve source metadata, deterministic run IDs, stable row ordering, and provenance paths; committed goldens cover normalized `show` output.
 - CLI usability polish: root help includes command groups, `status` includes run health/library/disk blocks, and `DEADRECKON_HINTS=0` suppresses post-completion prompts.
 - Autonomous sequential chains: `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`, and `chain redo`; chains use `latest`/`last` aliases, `chain.json`, `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps, green-policy auto-apply, and a multi-step ratatui timeline with single-run chain context.
+- Plan observability: orchestration plans now write `plan-events.jsonl`; `attach <plan-id>` renders plan events, drills into child run attach, and returns to the plan context; plain attach, `history grep --plan`, and `show --why-failed <plan-id>` include plan event evidence.
 - Mock HTTP server for tests; CLI provider tests with fake binaries; integration coverage for stress, import round-trips, lifecycle, codebase modes, docs, sandbox policy, and gate proof.
 
 The hygiene rider is purely structural; it does not close prior thin items, but it raises the floor for every future rider.
@@ -1838,18 +1840,21 @@ Two modes are built:
 
 ### 30.2 Plan Files
 
-`crates/deadreckon-core/src/plan.rs` defines `Plan`, `PlanTask`, `PlanProviders`, `PlanMessage`, `PlanChildMarker`, and `CoordinatorState`. The durable layout is:
+`crates/deadreckon-core/src/plan.rs` defines `Plan`, `PlanTask`, `PlanProviders`, `PlanMessage`, `PlanEvent`, `PlanChildMarker`, and `CoordinatorState`. The durable layout is:
 
 ```text
 ~/.deadreckon/plans/<plan-id>/
   plan.json
   coordinator.json          # present only while fork is supervising
   messages.jsonl
+  plan-events.jsonl
   worker-specs/task-0.md
   summaries/task-0.md
   merge-working/
   merge-proofs/conflicts.json
 ```
+
+`messages.jsonl` remains the typed coordinator mailbox. `plan-events.jsonl` is the append-only orchestration timeline: plan created/started, task ready/started/run-discovered/completed/blocked/failed/killed, merge started/conflicted/completed, and plan completed/failed/killed. It is file-backed like `chain-events.jsonl`; child turn/tool traces stay in each child run's normal `events.jsonl`, `traces.jsonl`, and `spend.jsonl`.
 
 Every child run receives an inline copy of its worker spec in the prompt. The spec includes root goal, exact task scope, provider, role, dependency context, capability preview, and hygiene rules such as staying within scope and not spawning subagents. The current worker-spec posture borrows Claude Code's coordinator rules: the spec is the complete brief, children should not inspect sibling transcripts, corrections stay with the worker that has the failure context, and reviewer lanes verify independently rather than inheriting coder assumptions.
 
@@ -1858,14 +1863,14 @@ At launch time the coordinator rewrites the spec for dependent tasks with comple
 ### 30.3 Verbs
 
 - `plan <goal>` writes `plan.json` and worker specs. It previews provider roles, capability hints, task labels, dependencies, and next actions.
-- `fork <plan-id>` runs ready child tasks through `deadreckon run`, using distinct plan-child scopes via `DEADRECKON_SCOPE_ROOT`. It writes typed progress/blocker messages and child summaries. While a child starts, the coordinator records the run id in `plans/<plan-id>/launch/<task-id>/run-id` so later plan-level kill/recovery commands can map a live process back to durable run state.
-- `merge <plan-id>` composes completed child library artifacts into a new promoted run. It fails on conflicting file contents by default; `--strategy prefer-child --prefer-child <idx>` records the conflict and chooses that child.
+- `fork <plan-id>` runs ready child tasks through `deadreckon run`, using distinct plan-child scopes via `DEADRECKON_SCOPE_ROOT`. It writes typed progress/blocker messages, child summaries, and plan events for ready/running/run-discovered/terminal child states. While a child starts, the coordinator records the run id in `plans/<plan-id>/launch/<task-id>/run-id` so later plan-level kill/recovery commands can map a live process back to durable run state.
+- `merge <plan-id>` composes completed child library artifacts into a new promoted run. It fails on conflicting file contents by default; `--strategy prefer-child --prefer-child <idx>` records the conflict and chooses that child. Merge start, conflict, success, and plan completion are also recorded as plan events.
 - `orchestrate review <goal>` and `orchestrate full-plan <goal>` are the one-command wrappers. Both print a preflight with mode, provider roles, sandbox, caps, capabilities, and task rows before starting child work; headless callers pass `--yes`, and `--preview` writes the plan and stops before `fork`.
-- `attach <plan-id>` opens a plan TUI on TTYs and renders a plain summary off-TTY. The TUI shows child panes with provider/role/status, run prefixes, dependency state, turn/status, spend or token accounting, latest trace activity, acceptance/gate state, summary paths, and coordinator messages; `Enter` drills into the selected child run.
+- `attach <plan-id>` opens a plan TUI on TTYs and renders a plain summary off-TTY. The TUI shows child panes with provider/role/status, run prefixes, dependency state, turn/status, spend or token accounting, latest trace activity, acceptance/gate state, summary paths, and plan events, falling back to coordinator messages before events exist. `Enter` drills into the selected child run using the normal run attach view; quitting the child view returns to the plan selection with a parent-plan breadcrumb and back hint.
 - Headless flags are honored across this surface: `run --quiet` emits no success stdout, `run --plain --quiet` emits only the final plain status line, and `attach --plain` forces summary output instead of ratatui.
-- `kill <plan-id>` reads `coordinator.json`, launch run-id sidecars, and child run state to signal the coordinator and live children, then marks discovered child states killed and releases their locks.
-- `history grep <pattern>` searches durable trace or provenance JSONL, can restrict to a plan's child runs with `--plan <plan-id>`, and supports regex, scope, age, and limit filters.
-- `show <id> --why-failed` explains the likely failure surface for a run or plan, including non-completed children, blocker messages, and recent trace errors.
+- `kill <plan-id>` reads `coordinator.json`, launch run-id sidecars, and child run state to signal the coordinator and live children, then marks discovered child states killed, releases their locks, and records task/plan kill events.
+- `history grep <pattern>` searches durable trace or provenance JSONL, can restrict to a plan's child runs with `--plan <plan-id>`, includes matching plan events, and supports regex, scope, age, and limit filters.
+- `show <id> --why-failed` explains the likely failure surface for a run or plan, including non-completed children, blocker messages, latest plan events, and recent trace errors.
 
 ### 30.4 Merge Artifact
 
@@ -1875,7 +1880,7 @@ Generated run artifacts are intentionally excluded from merge composition: `.dea
 
 ### 30.5 Current Limits
 
-The first orchestration milestone is usable but not the full rider endpoint. The plan TUI reads child state/traces from disk on refresh; a broadcast-backed plan event stream remains future work. There is also no arbitrary child-to-child chat surface: children communicate through durable summaries and typed coordinator messages only.
+The plan TUI still reads child state/traces from disk on refresh and the plan event stream is file-backed rather than an in-process broadcast bus. There is also no arbitrary child-to-child chat surface: children communicate through durable summaries and typed coordinator messages only.
 
 ---
 
@@ -1924,4 +1929,28 @@ The release path is wired and depth-tested, but the first public release still r
 
 ---
 
-*This document is canonical for the alpha-tier reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, and 31 in particular. Last regenerated by an agent team from a deep code map; cross-check against the current code before relying on any specific line number.*
+## 32. Plan Observability
+
+### 32.1 Event Stream
+
+Plans now have their own append-only timeline at `~/.deadreckon/plans/<plan-id>/plan-events.jsonl`. Each row is a `PlanEvent` with UTC timestamp, `plan_id`, and a snake-case tagged `PlanEventKind`. The core helper pair is `append_plan_event` / `read_plan_events`, exported from `deadreckon-core`; the path helper is `DeadreckonPaths::plan_events`.
+
+The stream is orchestration-level only. It records plan and task lifecycle edges, child run discovery, merge edges, kill edges, and final failure/completion. It does not copy child turn/tool traces. A selected child remains a normal run with its own `events.jsonl`, `traces.jsonl`, provider logs, acceptance proofs, spend records, and attach renderer.
+
+### 32.2 Emission Points
+
+`plan` appends `plan_created` after `plan.json` is saved. `fork` appends `plan_started`, task ready/start events, child run discovery when a PID or run id becomes known, terminal task events, and dependency blocker events. `merge` appends merge start/conflict/completed plus plan completion. `kill <plan-id>` appends task killed, plan killed, and plan failed events while preserving discovered child run ids even if a child already reached a terminal state before the kill sweep loaded it.
+
+### 32.3 User Surfaces
+
+`attach <plan-id>` now renders plan events in the plan activity pane, falling back to coordinator messages only before the event file exists. `Enter` on a child with a run id suspends the plan TUI and opens the existing run attach view with a breadcrumb like `plan <prefix> / task-1`; `q`, `Esc`, or `Ctrl-D` returns to the same plan attach context.
+
+Plain/off-TTY `attach <plan-id>` prints the latest plan event and an explicit `deadreckon attach <plan-id>` hint. `history grep <pattern> --plan <plan-id>` searches `plan-events.jsonl` before child run trace/provenance files. `show <plan-id> --why-failed` includes the latest plan event alongside failed child rows and blocker messages.
+
+### 32.4 Current Limits
+
+The plan event stream is durable and replayable, but it is not yet a same-process broadcast bus. The plan TUI reloads plan events, plan state, and child run files on refresh rather than subscribing to a single live multiplexer.
+
+---
+
+*This document is canonical for the alpha-tier reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, and 32 in particular. Last regenerated by an agent team from a deep code map; cross-check against the current code before relying on any specific line number.*

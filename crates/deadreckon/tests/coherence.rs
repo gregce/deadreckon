@@ -97,6 +97,7 @@ fn attach_plan_plain_displays_running_for_inflight_child() {
         Some("smoke:child".to_string()),
     );
     child.status = PlanTaskStatus::Running;
+    child.child_run_id = Some("aaaabbbbccccdddd1111222233334444".to_string());
     let waiting = PlanTask::new(
         1,
         "Review child",
@@ -131,6 +132,14 @@ fn attach_plan_plain_displays_running_for_inflight_child() {
     let stdout = stdout(&output);
     assert!(stdout.contains("status      : running"), "{stdout}");
     assert!(stdout.contains("task-0"), "{stdout}");
+    assert!(
+        stdout.contains("attach: deadreckon attach aaaabbbb"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("show: deadreckon show aaaabbbb"),
+        "{stdout}"
+    );
 }
 
 #[test]

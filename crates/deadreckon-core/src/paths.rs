@@ -83,6 +83,10 @@ impl DeadreckonPaths {
         self.plan_dir(plan_id).join("messages.jsonl")
     }
 
+    pub fn plan_events(&self, plan_id: &str) -> PathBuf {
+        self.plan_dir(plan_id).join("plan-events.jsonl")
+    }
+
     pub fn worker_spec(&self, plan_id: &str, task_id: &str) -> PathBuf {
         self.plan_dir(plan_id)
             .join("worker-specs")

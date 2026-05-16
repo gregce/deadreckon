@@ -1,5 +1,13 @@
 # Changelog
 
+## Plan observability (alpha) - 2026-05-15
+
+- Added `plan-events.jsonl` as the orchestration-level event timeline for plan, task, child discovery, merge, failure, completion, and kill lifecycle edges.
+- Added plan-event surfacing to `attach <plan-id>`, plain plan summaries, `history grep --plan`, and `show <plan-id> --why-failed`.
+- Added plan attach drill-down/back context so a user can enter a selected child run's normal attach view and return to the parent plan/task.
+- Hardened plan kill bookkeeping so discovered child run ids are preserved even if a child reaches a terminal state before the kill sweep inspects it.
+- Updated `docs/AS-BUILT-ARCHITECTURE.md` with `§32 Plan Observability` and amended `§22`/`§30` to reflect the file-backed plan event stream and remaining broadcast-bus limit.
+
 ## Distribution & self-update (alpha) - 2026-05-15
 
 - Added install receipt and update-check cache files under `~/.deadreckon/` with channel detection for npm, Homebrew, shell, cargo, and source installs.

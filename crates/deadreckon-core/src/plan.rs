@@ -14,6 +14,7 @@ use crate::state::{append_json_line, atomic_write_json};
 pub const PLAN_JSON: &str = "plan.json";
 pub const COORDINATOR_JSON: &str = "coordinator.json";
 pub const PLAN_MESSAGES_JSONL: &str = "messages.jsonl";
+pub const PLAN_EVENTS_JSONL: &str = "plan-events.jsonl";
 pub const WORKER_SPECS_DIR: &str = "worker-specs";
 pub const SUMMARIES_DIR: &str = "summaries";
 pub const PLAN_CHILD_PARENT_JSON: &str = ".deadreckon/parent.json";
@@ -248,6 +249,70 @@ pub struct PlanMessage {
     pub body: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanEventKind {
+    PlanCreated {
+        mode: PlanMode,
+        task_count: usize,
+    },
+    PlanStarted,
+    TaskReady {
+        task_id: String,
+        task_index: usize,
+    },
+    TaskStarted {
+        task_id: String,
+        task_index: usize,
+    },
+    TaskRunDiscovered {
+        task_id: String,
+        task_index: usize,
+        run_id: Option<String>,
+        pid: Option<u32>,
+    },
+    TaskCompleted {
+        task_id: String,
+        task_index: usize,
+        run_id: Option<String>,
+        status: String,
+    },
+    TaskBlocked {
+        task_id: String,
+        task_index: usize,
+        reason: String,
+    },
+    TaskFailed {
+        task_id: String,
+        task_index: usize,
+        reason: String,
+    },
+    TaskKilled {
+        task_id: String,
+        task_index: usize,
+        run_id: Option<String>,
+    },
+    MergeStarted,
+    MergeConflict {
+        conflict_count: usize,
+    },
+    MergeCompleted {
+        merged_run_id: String,
+    },
+    PlanCompleted,
+    PlanFailed {
+        reason: String,
+    },
+    PlanKilled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanEvent {
+    pub timestamp: DateTime<Utc>,
+    pub plan_id: String,
+    pub event: PlanEventKind,
+}
+
 impl PlanMessage {
     pub fn new(
         from: impl Into<String>,
@@ -398,6 +463,32 @@ pub fn append_plan_message(
 ) -> Result<()> {
     validate_message_request_id(message)?;
     append_json_line(&paths.plan_messages(plan_id), message)
+}
+
+pub fn append_plan_event(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+    event: PlanEventKind,
+) -> Result<()> {
+    let event = PlanEvent {
+        timestamp: Utc::now(),
+        plan_id: plan_id.to_string(),
+        event,
+    };
+    append_json_line(&paths.plan_events(plan_id), &event)
+}
+
+pub fn read_plan_events(paths: &DeadreckonPaths, plan_id: &str) -> Result<Vec<PlanEvent>> {
+    let path = paths.plan_events(plan_id);
+    match fs::read_to_string(&path) {
+        Ok(raw) => raw
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).with_json_path(&path))
+            .collect(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(DeadreckonError::Io { path, source }),
+    }
 }
 
 pub fn read_plan_messages(paths: &DeadreckonPaths, plan_id: &str) -> Result<Vec<PlanMessage>> {
@@ -722,6 +813,114 @@ mod tests {
         assert!(messages[3].request_id.is_some());
         assert_eq!(messages[4].kind, PlanMessageKind::ShutdownResponse);
         assert!(messages[4].request_id.is_some());
+    }
+
+    #[test]
+    fn plan_event_jsonl_roundtrips_all_kinds() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let plan = sample_plan(&temp);
+        save_plan(&paths, &plan).expect("save");
+        let events = vec![
+            PlanEventKind::PlanCreated {
+                mode: PlanMode::FullPlan,
+                task_count: 2,
+            },
+            PlanEventKind::PlanStarted,
+            PlanEventKind::TaskReady {
+                task_id: "task-0".to_string(),
+                task_index: 0,
+            },
+            PlanEventKind::TaskStarted {
+                task_id: "task-0".to_string(),
+                task_index: 0,
+            },
+            PlanEventKind::TaskRunDiscovered {
+                task_id: "task-0".to_string(),
+                task_index: 0,
+                run_id: Some("run-0".to_string()),
+                pid: Some(123),
+            },
+            PlanEventKind::TaskCompleted {
+                task_id: "task-0".to_string(),
+                task_index: 0,
+                run_id: Some("run-0".to_string()),
+                status: "completed".to_string(),
+            },
+            PlanEventKind::TaskBlocked {
+                task_id: "task-1".to_string(),
+                task_index: 1,
+                reason: "waiting".to_string(),
+            },
+            PlanEventKind::TaskFailed {
+                task_id: "task-1".to_string(),
+                task_index: 1,
+                reason: "red".to_string(),
+            },
+            PlanEventKind::TaskKilled {
+                task_id: "task-1".to_string(),
+                task_index: 1,
+                run_id: None,
+            },
+            PlanEventKind::MergeStarted,
+            PlanEventKind::MergeConflict { conflict_count: 2 },
+            PlanEventKind::MergeCompleted {
+                merged_run_id: "merged".to_string(),
+            },
+            PlanEventKind::PlanCompleted,
+            PlanEventKind::PlanFailed {
+                reason: "blocked".to_string(),
+            },
+            PlanEventKind::PlanKilled,
+        ];
+
+        for event in events.clone() {
+            append_plan_event(&paths, &plan.plan_id, event).expect("append event");
+        }
+        let loaded = read_plan_events(&paths, &plan.plan_id).expect("read events");
+
+        assert_eq!(loaded.len(), events.len());
+        for (loaded, expected) in loaded.iter().zip(events) {
+            assert_eq!(loaded.plan_id, plan.plan_id);
+            assert_eq!(loaded.event, expected);
+        }
+    }
+
+    #[test]
+    fn append_plan_event_writes_under_plan_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let plan = sample_plan(&temp);
+        save_plan(&paths, &plan).expect("save");
+
+        append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanStarted).expect("append event");
+
+        let path = paths.plan_events(&plan.plan_id);
+        assert!(path.starts_with(paths.plan_dir(&plan.plan_id)));
+        assert!(path.ends_with(PLAN_EVENTS_JSONL));
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn plan_event_kind_uses_snake_case_tags() {
+        let event = PlanEvent {
+            timestamp: Utc::now(),
+            plan_id: "plan-1".to_string(),
+            event: PlanEventKind::TaskRunDiscovered {
+                task_id: "task-0".to_string(),
+                task_index: 0,
+                run_id: Some("run-1".to_string()),
+                pid: Some(7),
+            },
+        };
+        let value = serde_json::to_value(event).expect("json");
+
+        assert_eq!(
+            value
+                .pointer("/event/kind")
+                .and_then(serde_json::Value::as_str),
+            Some("task_run_discovered")
+        );
     }
 
     #[test]

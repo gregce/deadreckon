@@ -43,23 +43,24 @@ use deadreckon_core::{
     CodebaseMode, CodebaseRecord, ConductorState, CoordinatorChild, CoordinatorState,
     DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DeadreckonError, DeadreckonPaths,
     DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId,
-    PhaseStatus, Plan, PlanChildMarker, PlanMessage, PlanMessageKind, PlanMode, PlanProviders,
-    PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest, ProvenanceRecord,
-    RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunListEntry, RunOptions, RunStatus, SpendRecord,
-    TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
+    PhaseStatus, Plan, PlanChildMarker, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
+    PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest,
+    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunListEntry, RunOptions,
+    RunStatus, SpendRecord, TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
     acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
-    append_parent_narrative_update, append_plan_message, append_provenance, append_trace,
-    apply_commit_body, cancel_marker_present, chain_status_label as glossary_chain_status_label,
+    append_parent_narrative_update, append_plan_event, append_plan_message, append_provenance,
+    append_trace, apply_commit_body, cancel_marker_present,
+    chain_status_label as glossary_chain_status_label,
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
     docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files, list_runs,
     load_chain, load_plan, load_run, marker_path_for_run_root, pid_is_alive, plan_status_label,
     plan_task_status_label, prepare_worktree_record, preview_git_state, promote_completed_run,
-    read_chain_step_marker, read_codebase_record, read_plan_messages, record_for_resolved_mode,
-    release_lock_file, resolve_mode, restore_snapshot, run_status_label, save_chain, save_plan,
-    save_state, terminate_pid, validate_acceptance_marker, validate_task_count,
-    write_acceptance_marker, write_cancel_marker, write_chain_step_marker, write_child_summary,
-    write_coordinator_state, write_plan_child_marker, write_worker_spec,
+    read_chain_step_marker, read_codebase_record, read_plan_events, read_plan_messages,
+    record_for_resolved_mode, release_lock_file, resolve_mode, restore_snapshot, run_status_label,
+    save_chain, save_plan, save_state, terminate_pid, validate_acceptance_marker,
+    validate_task_count, write_acceptance_marker, write_cancel_marker, write_chain_step_marker,
+    write_child_summary, write_coordinator_state, write_plan_child_marker, write_worker_spec,
 };
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
@@ -7833,6 +7834,14 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
         write_worker_spec(&paths, &plan.plan_id, &task.task_id, &spec)?;
     }
     save_plan(&paths, &plan)?;
+    append_plan_event(
+        &paths,
+        &plan.plan_id,
+        PlanEventKind::PlanCreated {
+            mode: plan.mode,
+            task_count: plan.tasks.len(),
+        },
+    )?;
     Ok(plan)
 }
 
@@ -8414,6 +8423,7 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     plan.status = PlanStatus::Forked;
     plan.forked_at = Some(Utc::now());
     save_plan(&paths, &plan)?;
+    append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanStarted)?;
     write_coordinator_snapshot(&paths, &plan, None)?;
 
     let mut made_progress = true;
@@ -8425,7 +8435,23 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         }
         for &task_index in &ready {
             let task_id = plan.tasks[task_index].task_id.clone();
+            append_plan_event(
+                &paths,
+                &plan.plan_id,
+                PlanEventKind::TaskReady {
+                    task_id: task_id.clone(),
+                    task_index,
+                },
+            )?;
             mark_plan_task_status(&mut plan, task_index, PlanTaskStatus::Running)?;
+            append_plan_event(
+                &paths,
+                &plan.plan_id,
+                PlanEventKind::TaskStarted {
+                    task_id: task_id.clone(),
+                    task_index,
+                },
+            )?;
             append_plan_message(
                 &paths,
                 &plan.plan_id,
@@ -8476,6 +8502,18 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
             match pid_rx.recv_timeout(std::time::Duration::from_secs(2)) {
                 Ok((task_index, pid)) => {
                     live_children.insert(task_index, pid);
+                    if let Some(task) = plan.tasks.get(task_index) {
+                        append_plan_event(
+                            &paths,
+                            &plan.plan_id,
+                            PlanEventKind::TaskRunDiscovered {
+                                task_id: task.task_id.clone(),
+                                task_index,
+                                run_id: task.child_run_id.clone(),
+                                pid: Some(pid),
+                            },
+                        )?;
+                    }
                     write_coordinator_snapshot_live(&paths, &plan, &live_children)?;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
@@ -8510,6 +8548,17 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                             Some(deadreckon_core::child_summary_relative_path(&task.task_id));
                         task.status = status;
                     }
+                    append_plan_event(
+                        &paths,
+                        &plan.plan_id,
+                        PlanEventKind::TaskRunDiscovered {
+                            task_id: task_id.clone(),
+                            task_index,
+                            run_id: Some(run_id.clone()),
+                            pid: live_children.get(&task_index).copied(),
+                        },
+                    )?;
+                    append_task_terminal_plan_event(&paths, &plan, task_index, status, &run_id)?;
                     append_plan_message(
                         &paths,
                         &plan.plan_id,
@@ -8534,6 +8583,15 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                 }
                 Err(error) => {
                     mark_plan_task_status(&mut plan, task_index, PlanTaskStatus::Failed)?;
+                    append_plan_event(
+                        &paths,
+                        &plan.plan_id,
+                        PlanEventKind::TaskFailed {
+                            task_id: task_id.clone(),
+                            task_index,
+                            reason: error.to_string(),
+                        },
+                    )?;
                     append_plan_message(
                         &paths,
                         &plan.plan_id,
@@ -8655,6 +8713,46 @@ fn apply_fork_provider_overrides(
             }
         }
     }
+    Ok(())
+}
+
+fn append_task_terminal_plan_event(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task_index: usize,
+    status: PlanTaskStatus,
+    run_id: &str,
+) -> Result<()> {
+    let task = plan.tasks.get(task_index).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("no child index {task_index}"),
+            "deadreckon plan \"your goal\"",
+        ))
+    })?;
+    let event = match status {
+        PlanTaskStatus::Completed => PlanEventKind::TaskCompleted {
+            task_id: task.task_id.clone(),
+            task_index,
+            run_id: Some(run_id.to_string()),
+            status: "completed".to_string(),
+        },
+        PlanTaskStatus::Failed => PlanEventKind::TaskFailed {
+            task_id: task.task_id.clone(),
+            task_index,
+            reason: format!("run {run_id} failed"),
+        },
+        PlanTaskStatus::Killed => PlanEventKind::TaskKilled {
+            task_id: task.task_id.clone(),
+            task_index,
+            run_id: Some(run_id.to_string()),
+        },
+        PlanTaskStatus::Pending | PlanTaskStatus::Running => PlanEventKind::TaskBlocked {
+            task_id: task.task_id.clone(),
+            task_index,
+            reason: format!("run {run_id} ended {}", task_status_label(status)),
+        },
+    };
+    append_plan_event(paths, &plan.plan_id, event)?;
     Ok(())
 }
 
@@ -9028,6 +9126,22 @@ fn mark_blocked_pending_tasks(paths: &DeadreckonPaths, plan: &mut Plan) -> Resul
             .collect::<Vec<_>>();
         let task_id = plan.tasks[index].task_id.clone();
         plan.tasks[index].status = PlanTaskStatus::Failed;
+        append_plan_event(
+            paths,
+            &plan.plan_id,
+            PlanEventKind::TaskBlocked {
+                task_id: task_id.clone(),
+                task_index: index,
+                reason: format!(
+                    "missing dependencies: {}",
+                    if missing.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        missing.join(", ")
+                    }
+                ),
+            },
+        )?;
         append_plan_message(
             paths,
             &plan.plan_id,
@@ -9119,13 +9233,31 @@ fn merge_command(args: MergeCommandArgs) -> Result<()> {
             "wait, or run deadreckon kill <plan-id>",
         )));
     }
+    append_plan_event(&paths, &plan.plan_id, PlanEventKind::MergeStarted)?;
     let strategy = parse_merge_strategy(&strategy, prefer_child)?;
     let conflicts = compose_plan_merge_working(&paths, &plan, strategy)?;
+    if !conflicts.is_empty() {
+        append_plan_event(
+            &paths,
+            &plan.plan_id,
+            PlanEventKind::MergeConflict {
+                conflict_count: conflicts.len(),
+            },
+        )?;
+    }
     let merged_run = create_merged_plan_run(&paths, &plan, no_gate)?;
     plan.status = PlanStatus::Merged;
     plan.merged_at = Some(Utc::now());
     plan.merged_run_id = Some(merged_run.run_id.clone());
     save_plan(&paths, &plan)?;
+    append_plan_event(
+        &paths,
+        &plan.plan_id,
+        PlanEventKind::MergeCompleted {
+            merged_run_id: merged_run.run_id.clone(),
+        },
+    )?;
+    append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanCompleted)?;
     let library_dir = paths.library_dir(&merged_run.scope, &merged_run.run_id);
     write_plan_merge_manifest(&paths, &library_dir, &plan, &conflicts)?;
     if !quiet {
@@ -9200,6 +9332,23 @@ fn compose_plan_merge_working(
             match seen.get(relative).copied() {
                 Some((first_child, first_hash)) if first_hash != hash => match strategy {
                     PlanMergeStrategy::FailOnConflict => {
+                        append_plan_event(
+                            paths,
+                            &plan.plan_id,
+                            PlanEventKind::MergeConflict { conflict_count: 1 },
+                        )?;
+                        append_plan_event(
+                            paths,
+                            &plan.plan_id,
+                            PlanEventKind::PlanFailed {
+                                reason: format!(
+                                    "merge conflict at {} between child {} and child {}",
+                                    relative.display(),
+                                    first_child,
+                                    task.index
+                                ),
+                            },
+                        )?;
                         return Err(CliError::Core(deadreckon_core::user_error(
                             &format!(
                                 "conflict at {} between child {} and child {}",
@@ -9449,6 +9598,10 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
     if let Some(line) = plan_final_gate_line(paths, plan) {
         println!("final gate {line}");
     }
+    let plan_events = read_plan_events(paths, &plan.plan_id).unwrap_or_default();
+    if let Some(event) = plan_events.last() {
+        println!("latest plan event {}", plan_event_line(event));
+    }
     println!("children");
     for task in &plan.tasks {
         println!(
@@ -9469,6 +9622,18 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
         {
             println!("    {detail}");
         }
+        if show_hints && let Some(run_id) = task.child_run_id.as_deref() {
+            println!(
+                "    {} {}",
+                ui_command("attach:"),
+                ui_command(format!("deadreckon attach {}", run_prefix(run_id)))
+            );
+            println!(
+                "    {} {}",
+                ui_command("show:"),
+                ui_command(format!("deadreckon show {}", run_prefix(run_id)))
+            );
+        }
     }
     let messages = read_plan_messages(paths, &plan.plan_id).unwrap_or_default();
     if let Some(message) = messages.last() {
@@ -9481,6 +9646,11 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
         println!("merged run {}", run_prefix(merged_run_id));
     }
     if show_hints {
+        println!(
+            "{} {}",
+            ui_command("attach:"),
+            ui_command(format!("deadreckon attach {}", run_prefix(&plan.plan_id)))
+        );
         match plan.status {
             PlanStatus::Pending => {
                 println!(
@@ -12018,6 +12188,31 @@ fn history_grep_command(args: HistoryGrepRequest) -> Result<()> {
         ui_muted(history_kind_label(kind)),
         ui_muted(if regex { "regex" } else { "substring" })
     );
+    if let Some(plan_id) = plan.as_deref() {
+        let plan_id = resolve_plan_id(&paths, plan_id)?;
+        for event in read_plan_events(&paths, &plan_id)? {
+            if let Some(cutoff) = cutoff
+                && event.timestamp < cutoff
+            {
+                continue;
+            }
+            let line = plan_event_line(&event);
+            if !matcher.is_match(&line) {
+                continue;
+            }
+            total_matches += 1;
+            if printed >= limit {
+                continue;
+            }
+            println!(
+                "{} {} plan-events | {}",
+                ui_id(run_prefix(&plan_id)),
+                event.timestamp.to_rfc3339(),
+                one_line(&line, 220)
+            );
+            printed += 1;
+        }
+    }
     for run in runs {
         if let Some(children) = plan_children.as_ref()
             && !children.contains(&run.run_id)
@@ -13009,19 +13204,29 @@ fn kill_plan_command(paths: &DeadreckonPaths, plan_id: &str, force: bool) -> Res
         task_run_ids.sort();
         task_run_ids.dedup();
         for run_id in task_run_ids {
-            if let Ok(mut state) = load_run(paths, &run_id)
-                && matches!(
-                    state.status,
-                    RunStatus::Pending | RunStatus::Planned | RunStatus::Executing
-                )
-            {
-                kill_loaded_run(paths, &mut state, force)?;
+            if let Ok(mut state) = load_run(paths, &run_id) {
                 if plan.tasks[task_index].child_run_id.is_none() {
                     plan.tasks[task_index].child_run_id = Some(state.run_id.clone());
                 }
                 if plan.tasks[task_index].child_scope.is_none() {
                     plan.tasks[task_index].child_scope = Some(state.scope.clone());
                 }
+                if !matches!(
+                    state.status,
+                    RunStatus::Pending | RunStatus::Planned | RunStatus::Executing
+                ) {
+                    continue;
+                }
+                kill_loaded_run(paths, &mut state, force)?;
+                append_plan_event(
+                    paths,
+                    &plan.plan_id,
+                    PlanEventKind::TaskKilled {
+                        task_id: plan.tasks[task_index].task_id.clone(),
+                        task_index,
+                        run_id: Some(state.run_id.clone()),
+                    },
+                )?;
                 killed += 1;
             }
         }
@@ -13030,10 +13235,27 @@ fn kill_plan_command(paths: &DeadreckonPaths, plan_id: &str, force: bool) -> Res
             PlanTaskStatus::Pending | PlanTaskStatus::Running
         ) {
             plan.tasks[task_index].status = PlanTaskStatus::Killed;
+            append_plan_event(
+                paths,
+                &plan.plan_id,
+                PlanEventKind::TaskKilled {
+                    task_id: plan.tasks[task_index].task_id.clone(),
+                    task_index,
+                    run_id: plan.tasks[task_index].child_run_id.clone(),
+                },
+            )?;
         }
     }
     plan.status = PlanStatus::Failed;
     save_plan(paths, &plan)?;
+    append_plan_event(paths, &plan.plan_id, PlanEventKind::PlanKilled)?;
+    append_plan_event(
+        paths,
+        &plan.plan_id,
+        PlanEventKind::PlanFailed {
+            reason: "killed by user".to_string(),
+        },
+    )?;
     print_kill_banner("plan", &run_prefix(plan_id), force, Some(killed));
     Ok(())
 }
@@ -13390,6 +13612,12 @@ fn show_plan_why_failed(paths: &DeadreckonPaths, plan: &Plan) {
             "blocker {} -> {}: {}",
             message.from, message.to, message.summary
         ));
+    }
+    if let Some(event) = read_plan_events(paths, &plan.plan_id)
+        .unwrap_or_default()
+        .last()
+    {
+        evidence.push(format!("latest plan event {}", plan_event_line(event)));
     }
     render_why_failed(WhyFailedReport {
         kind: "plan",
@@ -14395,11 +14623,20 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
     let result = loop {
         let plan = load_plan(paths, plan_id)?;
         let messages = read_plan_messages(paths, plan_id).unwrap_or_default();
+        let plan_events = read_plan_events(paths, plan_id).unwrap_or_default();
         if selected >= plan.tasks.len() {
             selected = plan.tasks.len().saturating_sub(1);
         }
         terminal.draw(|frame| {
-            render_plan_attach(frame, paths, &plan, &messages, selected, show_hints)
+            render_plan_attach(
+                frame,
+                paths,
+                &plan,
+                &messages,
+                &plan_events,
+                selected,
+                show_hints,
+            )
         })?;
         if event::poll(std::time::Duration::from_millis(250))? {
             match event::read()? {
@@ -14423,8 +14660,13 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
                         .get(selected)
                         .and_then(|task| task.child_run_id.as_deref())
                     {
+                        let parent_plan = plan.tasks.get(selected).map(|task| AttachParentPlan {
+                            plan_id: plan.plan_id.clone(),
+                            task_id: task.task_id.clone(),
+                        });
                         suspend_tui(&mut terminal)?;
-                        let child_result = attach_tui(paths, run_id, show_hints).await;
+                        let child_result =
+                            attach_tui_with_parent(paths, run_id, show_hints, parent_plan).await;
                         if let Err(err) = &child_result {
                             eprintln!("error: {err}");
                             let _ = prompt::open("press Enter to return to plan attach...", None);
@@ -14452,6 +14694,7 @@ fn render_plan_attach(
     paths: &DeadreckonPaths,
     plan: &Plan,
     messages: &[PlanMessage],
+    plan_events: &[PlanEvent],
     selected: usize,
     show_hints: bool,
 ) {
@@ -14562,13 +14805,18 @@ fn render_plan_attach(
         );
     }
 
-    let activity = plan_activity_lines(messages, vertical[2].height.saturating_sub(2) as usize);
+    let activity = plan_activity_lines(
+        plan_events,
+        messages,
+        vertical[2].height.saturating_sub(2) as usize,
+    );
+    let activity_title = if plan_events.is_empty() {
+        "coordinator messages"
+    } else {
+        "plan events"
+    };
     frame.render_widget(
-        List::new(activity).block(
-            Block::default()
-                .title("coordinator messages")
-                .borders(Borders::ALL),
-        ),
+        List::new(activity).block(Block::default().title(activity_title).borders(Borders::ALL)),
         vertical[2],
     );
     let footer = if show_hints {
@@ -14642,22 +14890,113 @@ fn plan_task_pane_layout(
     rects
 }
 
-fn plan_activity_lines(messages: &[PlanMessage], max: usize) -> Vec<ListItem<'static>> {
-    let mut lines = messages
-        .iter()
-        .rev()
-        .take(max.max(1))
-        .map(|message| {
-            ListItem::new(Line::from(format!(
-                "{} -> {} {:?}: {}",
-                message.from, message.to, message.kind, message.summary
-            )))
-        })
-        .collect::<Vec<_>>();
+fn plan_activity_lines(
+    plan_events: &[PlanEvent],
+    messages: &[PlanMessage],
+    max: usize,
+) -> Vec<ListItem<'static>> {
+    let mut lines = if plan_events.is_empty() {
+        messages
+            .iter()
+            .rev()
+            .take(max.max(1))
+            .map(|message| {
+                ListItem::new(Line::from(format!(
+                    "{} -> {} {:?}: {}",
+                    message.from, message.to, message.kind, message.summary
+                )))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        plan_events
+            .iter()
+            .rev()
+            .take(max.max(1))
+            .map(|event| ListItem::new(Line::from(plan_event_line(event))))
+            .collect::<Vec<_>>()
+    };
     if lines.is_empty() {
-        lines.push(ListItem::new(Line::from("no coordinator messages yet")));
+        lines.push(ListItem::new(Line::from("no plan activity yet")));
     }
     lines
+}
+
+fn plan_event_line(event: &PlanEvent) -> String {
+    format!(
+        "{} {}",
+        event.timestamp.format("%H:%M:%S"),
+        plan_event_summary(&event.event)
+    )
+}
+
+fn plan_event_summary(event: &PlanEventKind) -> String {
+    match event {
+        PlanEventKind::PlanCreated { mode, task_count } => {
+            format!(
+                "plan created mode {} tasks {task_count}",
+                plan_mode_label(*mode)
+            )
+        }
+        PlanEventKind::PlanStarted => "plan started".to_string(),
+        PlanEventKind::TaskReady { task_id, .. } => format!("{task_id} ready"),
+        PlanEventKind::TaskStarted { task_id, .. } => format!("{task_id} started"),
+        PlanEventKind::TaskRunDiscovered {
+            task_id,
+            run_id,
+            pid,
+            ..
+        } => {
+            let run = run_id
+                .as_deref()
+                .map(run_prefix)
+                .unwrap_or_else(|| "-".to_string());
+            let pid = pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            format!("{task_id} run discovered run {run} pid {pid}")
+        }
+        PlanEventKind::TaskCompleted {
+            task_id,
+            run_id,
+            status,
+            ..
+        } => {
+            let run = run_id
+                .as_deref()
+                .map(run_prefix)
+                .unwrap_or_else(|| "-".to_string());
+            format!("{task_id} completed run {run} status {status}")
+        }
+        PlanEventKind::TaskBlocked {
+            task_id, reason, ..
+        } => {
+            format!("{task_id} blocked: {reason}")
+        }
+        PlanEventKind::TaskFailed {
+            task_id, reason, ..
+        } => {
+            format!("{task_id} failed: {reason}")
+        }
+        PlanEventKind::TaskKilled {
+            task_id, run_id, ..
+        } => {
+            let run = run_id
+                .as_deref()
+                .map(run_prefix)
+                .unwrap_or_else(|| "-".to_string());
+            format!("{task_id} killed run {run}")
+        }
+        PlanEventKind::MergeStarted => "merge started".to_string(),
+        PlanEventKind::MergeConflict { conflict_count } => {
+            format!("merge conflict count {conflict_count}")
+        }
+        PlanEventKind::MergeCompleted { merged_run_id } => {
+            format!("merge completed run {}", run_prefix(merged_run_id))
+        }
+        PlanEventKind::PlanCompleted => "plan completed".to_string(),
+        PlanEventKind::PlanFailed { reason } => format!("plan failed: {reason}"),
+        PlanEventKind::PlanKilled => "plan killed".to_string(),
+    }
 }
 
 fn plan_final_gate_line(paths: &DeadreckonPaths, plan: &Plan) -> Option<String> {
@@ -14769,6 +15108,15 @@ async fn attach_tui(
     run_id: &str,
     show_completion_actions: bool,
 ) -> Result<()> {
+    attach_tui_with_parent(paths, run_id, show_completion_actions, None).await
+}
+
+async fn attach_tui_with_parent(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+    show_completion_actions: bool,
+    parent_plan: Option<AttachParentPlan>,
+) -> Result<()> {
     let initial_state = load_run(paths, run_id)?;
     let mut event_feed =
         tui_events::TuiEventFeed::file_tail(initial_state.run_root.join(RUN_EVENTS_JSONL));
@@ -14780,6 +15128,7 @@ async fn attach_tui(
     let mut terminal = Terminal::new(backend)?;
     let mut tui_state = AttachTuiState {
         show_completion_actions,
+        parent_plan,
         ..AttachTuiState::default()
     };
 
@@ -14971,6 +15320,12 @@ impl AttachPanel {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AttachParentPlan {
+    plan_id: String,
+    task_id: String,
+}
+
 #[derive(Debug)]
 struct AttachTuiState {
     focused_panel: AttachPanel,
@@ -14981,6 +15336,7 @@ struct AttachTuiState {
     processes_scroll: usize,
     show_completion_actions: bool,
     post_action_notice: Option<AttachActionNotice>,
+    parent_plan: Option<AttachParentPlan>,
 }
 
 impl Default for AttachTuiState {
@@ -14994,6 +15350,7 @@ impl Default for AttachTuiState {
             processes_scroll: 0,
             show_completion_actions: true,
             post_action_notice: None,
+            parent_plan: None,
         }
     }
 }
@@ -16825,8 +17182,12 @@ fn render_attach(
         .direction(Direction::Horizontal)
         .constraints(top_constraints)
         .split(layout.header);
-    let header = Paragraph::new(attach_header_text(state, top[0].width))
-        .block(Block::default().borders(Borders::ALL).title("deadreckon"));
+    let header = Paragraph::new(attach_header_text_for_state(
+        state,
+        top[0].width,
+        tui_state.parent_plan.as_ref(),
+    ))
+    .block(Block::default().borders(Borders::ALL).title("deadreckon"));
     frame.render_widget(header, top[0]);
     if metered_provider {
         render_spend(frame, top[1], state);
@@ -16888,7 +17249,16 @@ fn provider_is_metered(state: &deadreckon_core::PipelineState) -> bool {
         .is_some_and(|provider| provider.starts_with("cli:") || provider.starts_with("import:"))
 }
 
+#[cfg(test)]
 fn attach_header_text(state: &deadreckon_core::PipelineState, width: u16) -> String {
+    attach_header_text_for_state(state, width, None)
+}
+
+fn attach_header_text_for_state(
+    state: &deadreckon_core::PipelineState,
+    width: u16,
+    parent_plan: Option<&AttachParentPlan>,
+) -> String {
     let path_label = if state.promoted_library_dir.is_some() {
         "artifact"
     } else {
@@ -16897,13 +17267,25 @@ fn attach_header_text(state: &deadreckon_core::PipelineState, width: u16) -> Str
     let chain_prefix = chain_context_line_for_working(&state.working_dir)
         .ok()
         .flatten()
-        .map(|line| format!("{line}  |  "))
         .unwrap_or_default();
+    let plan_prefix = parent_plan
+        .map(|parent| format!("plan {} / {}", run_prefix(&parent.plan_id), parent.task_id))
+        .unwrap_or_default();
+    let context = [plan_prefix, chain_prefix]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("  |  ");
+    let context_prefix = if context.is_empty() {
+        String::new()
+    } else {
+        format!("{context}  |  ")
+    };
     let usable_width = usize::from(width).saturating_sub(4);
     let run_line = one_line(
         &format!(
             "{}run {}  provider {}  sandbox {}",
-            chain_prefix,
+            context_prefix,
             run_prefix(&state.run_id),
             state.provider.as_deref().unwrap_or("-"),
             state.sandbox
@@ -16929,9 +17311,10 @@ fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTu
         ""
     };
     if state.run_root.join("abandoned.json").exists() {
-        return format!(
+        let footer = format!(
             "worktree cleaned or abandoned  |  q detach  |  deadreckon status/list{chain_suffix}"
         );
+        return parent_plan_footer(footer, tui_state.parent_plan.as_ref());
     }
     let base = if tui_state.show_completion_actions && state.status == RunStatus::Completed {
         if is_worktree_run(state) {
@@ -16952,7 +17335,26 @@ fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTu
     } else {
         "Detach: q Esc Ctrl-D  |  Focus: Tab  |  Scroll: j/k Up/Down PgUp/PgDn mouse".to_string()
     };
-    format!("{base}{chain_suffix}")
+    parent_plan_footer(
+        format!("{base}{chain_suffix}"),
+        tui_state.parent_plan.as_ref(),
+    )
+}
+
+fn parent_plan_footer(footer: String, parent_plan: Option<&AttachParentPlan>) -> String {
+    let Some(parent_plan) = parent_plan else {
+        return footer;
+    };
+    let mut footer = footer
+        .replace("q/Esc/Ctrl-D detach", "q/Esc/Ctrl-D back to plan")
+        .replace("Detach: q Esc Ctrl-D", "Back to plan: q Esc Ctrl-D")
+        .replace("q detach", "q back to plan");
+    footer.push_str(&format!(
+        "  |  parent plan {} {}",
+        run_prefix(&parent_plan.plan_id),
+        parent_plan.task_id
+    ));
+    footer
 }
 
 fn deadreckoning_status_line(
@@ -17802,24 +18204,26 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
 mod tui_tests {
     use super::{
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
-        AttachPanelCounts, AttachPanelRows, AttachTuiState, ChainAttachTuiState, CompletionAction,
-        ProviderActivity, ProviderJsonlLogSpec, acceptance_activity_lines, attach_header_text,
-        chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-        chain_should_auto_attach, chain_timeline_lines, chain_wall_cap_hit,
-        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
-        completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
-        deadreckoning_status_text, doc_polish_preview_text, live_file_lines, markdown_to_tui_lines,
-        max_panel_scroll, per_step_wall_cap, provider_ingest_base_roots,
-        provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
-        provider_jsonl_session_matches_run, render_attach, render_plan_attach, threshold_color,
+        AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, ChainAttachTuiState,
+        CompletionAction, ProviderActivity, ProviderJsonlLogSpec, acceptance_activity_lines,
+        attach_header_text, chain_activity_lines, chain_attach_footer_text,
+        chain_attach_header_text, chain_should_auto_attach, chain_timeline_lines,
+        chain_wall_cap_hit, claude_project_name_for_workdir, cli_wait_status_line,
+        collect_jsonl_provider_activity, completion_action_from_input, completion_hints_enabled,
+        deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
+        live_file_lines, markdown_to_tui_lines, max_panel_scroll, per_step_wall_cap,
+        provider_ingest_base_roots, provider_jsonl_activity_lines,
+        provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run, render_attach,
+        render_plan_attach, threshold_color,
     };
     use chrono::Utc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use deadreckon_core::{
         ApplyMode, ApplyStrategy, BranchPolicy, CapabilityPreview, Chain, ChainEvent,
         ChainEventKind, ChainNewOptions, ChainStatus, ChainStepStatus, DeadreckonPaths,
-        NetworkCapability, OnFail, Plan, PlanMessage, PlanMessageKind, PlanMode, PlanProviders,
-        PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunOptions, SpendRecord, create_run,
+        NetworkCapability, OnFail, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
+        PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunOptions,
+        SpendRecord, create_run,
     };
     use deadreckon_providers::SpendEstimate;
     use deadreckon_providers::registry::{
@@ -17973,12 +18377,15 @@ mod tui_tests {
         paths: &DeadreckonPaths,
         plan: &Plan,
         messages: &[PlanMessage],
+        plan_events: &[PlanEvent],
         selected: usize,
     ) -> String {
         let backend = TestBackend::new(140, 34);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_plan_attach(frame, paths, plan, messages, selected, true))
+            .draw(|frame| {
+                render_plan_attach(frame, paths, plan, messages, plan_events, selected, true)
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let area = buffer.area;
@@ -17997,20 +18404,19 @@ mod tui_tests {
         spend: &[SpendRecord],
         live: &AttachLive,
     ) -> String {
+        render_attach_text_with_tui_state(state, spend, live, AttachTuiState::default())
+    }
+
+    fn render_attach_text_with_tui_state(
+        state: &deadreckon_core::PipelineState,
+        spend: &[SpendRecord],
+        live: &AttachLive,
+        tui_state: AttachTuiState,
+    ) -> String {
         let backend = TestBackend::new(140, 34);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| {
-                render_attach(
-                    frame,
-                    state,
-                    spend,
-                    &[],
-                    &[],
-                    live,
-                    &AttachTuiState::default(),
-                )
-            })
+            .draw(|frame| render_attach(frame, state, spend, &[], &[], live, &tui_state))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let area = buffer.area;
@@ -18028,7 +18434,7 @@ mod tui_tests {
     fn attach_plan_shows_n_panes() {
         let (_temp, paths, plan) = full_plan_fixture(4);
 
-        let text = render_plan_attach_text(&paths, &plan, &[], 0);
+        let text = render_plan_attach_text(&paths, &plan, &[], &[], 0);
 
         assert!(text.contains("task-0 pending"), "{text}");
         assert!(text.contains("task-1 pending"), "{text}");
@@ -18041,7 +18447,7 @@ mod tui_tests {
     fn attach_plan_shows_provider_and_role_per_pane() {
         let (_temp, paths, plan) = review_plan_fixture();
 
-        let text = render_plan_attach_text(&paths, &plan, &[], 1);
+        let text = render_plan_attach_text(&paths, &plan, &[], &[], 1);
 
         assert!(
             text.contains("coder smoke:coder  reviewer smoke:reviewer"),
@@ -18066,7 +18472,7 @@ mod tui_tests {
         )
         .expect("message");
 
-        let text = render_plan_attach_text(&paths, &plan, &[message], 1);
+        let text = render_plan_attach_text(&paths, &plan, &[message], &[], 1);
 
         assert!(text.contains("deps task-0"), "{text}");
         assert!(
@@ -18076,10 +18482,32 @@ mod tui_tests {
     }
 
     #[test]
+    fn attach_plan_prefers_plan_events_for_activity() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+        let event = PlanEvent {
+            timestamp: Utc::now(),
+            plan_id: plan.plan_id.clone(),
+            event: PlanEventKind::TaskBlocked {
+                task_id: "task-1".to_string(),
+                task_index: 1,
+                reason: "task-1 blocked by task-0".to_string(),
+            },
+        };
+
+        let text = render_plan_attach_text(&paths, &plan, &[], &[event], 1);
+
+        assert!(text.contains("plan events"), "{text}");
+        assert!(
+            text.contains("task-1 blocked: task-1 blocked by task-0"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn attach_plan_shows_capability_preview() {
         let (_temp, paths, plan) = full_plan_fixture(2);
 
-        let text = render_plan_attach_text(&paths, &plan, &[], 0);
+        let text = render_plan_attach_text(&paths, &plan, &[], &[], 0);
 
         assert!(
             text.contains("capabilities network=Allowlist deploy=true install=false"),
@@ -18095,10 +18523,29 @@ mod tui_tests {
     fn attach_plan_enter_drills_then_esc_returns() {
         let (_temp, paths, plan) = full_plan_fixture(2);
 
-        let text = render_plan_attach_text(&paths, &plan, &[], 0);
+        let text = render_plan_attach_text(&paths, &plan, &[], &[], 0);
 
         assert!(text.contains("Enter drill into child"), "{text}");
         assert!(text.contains("q/Esc/Ctrl-D detach"), "{text}");
+    }
+
+    #[test]
+    fn child_attach_from_plan_names_parent_and_back_action() {
+        let (_temp, state) = doc_preview_state();
+        let tui_state = AttachTuiState {
+            parent_plan: Some(AttachParentPlan {
+                plan_id: "99998888777766665555444433332222".to_string(),
+                task_id: "task-1".to_string(),
+            }),
+            ..AttachTuiState::default()
+        };
+
+        let text =
+            render_attach_text_with_tui_state(&state, &[], &AttachLive::default(), tui_state);
+
+        assert!(text.contains("plan 99998888 / task-1"), "{text}");
+        assert!(text.contains("Back to plan: q Esc Ctrl-D"), "{text}");
+        assert!(text.contains("parent plan 99998888 task-1"), "{text}");
     }
 
     #[test]

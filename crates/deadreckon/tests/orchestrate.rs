@@ -8,10 +8,10 @@ use std::process::Command;
 use chrono::Utc;
 use deadreckon_core::lock::lock_path;
 use deadreckon_core::{
-    CoordinatorState, DeadreckonPaths, Plan, PlanMessage, PlanMessageKind, PlanMode, PlanRole,
-    PlanStatus, PlanTaskStatus, RunOptions, RunStatus, TraceRecord, append_plan_message,
-    append_trace, create_run, list_runs, load_plan, pid_is_alive, read_plan_messages, save_plan,
-    save_state,
+    CoordinatorState, DeadreckonPaths, Plan, PlanEventKind, PlanMessage, PlanMessageKind, PlanMode,
+    PlanRole, PlanStatus, PlanTaskStatus, RunOptions, RunStatus, TraceRecord, append_plan_event,
+    append_plan_message, append_trace, create_run, list_runs, load_plan, pid_is_alive,
+    read_plan_events, read_plan_messages, save_plan, save_state,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -43,6 +43,43 @@ fn plan_writes_plan_json_with_n_tasks() {
     assert_eq!(plan.tasks.len(), 3);
     assert_eq!(plan.providers.planner.as_deref(), Some("smoke"));
     assert_eq!(plan.providers.default_child.as_deref(), Some("smoke"));
+}
+
+#[test]
+fn plan_writes_plan_created_event_when_saved() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            PlanEventKind::PlanCreated {
+                mode: PlanMode::FullPlan,
+                task_count: 2
+            }
+        )),
+        "{events:#?}"
+    );
 }
 
 #[test]
@@ -871,6 +908,52 @@ fn fork_writes_progress_messages_jsonl() {
 }
 
 #[test]
+fn fork_writes_plan_lifecycle_events() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(&event.event, PlanEventKind::PlanStarted)),
+        "{events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            PlanEventKind::TaskReady { task_id, .. } if task_id == "task-0"
+        )),
+        "{events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            PlanEventKind::TaskStarted { task_id, .. } if task_id == "task-0"
+        )),
+        "{events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            PlanEventKind::TaskRunDiscovered { task_id, run_id: Some(_), .. }
+                if task_id == "task-0"
+        )),
+        "{events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            PlanEventKind::TaskCompleted { task_id, status, .. }
+                if task_id == "task-0" && status == "completed"
+        )),
+        "{events:#?}"
+    );
+}
+
+#[test]
 fn fork_writes_coordinator_json_with_child_pids() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -1208,6 +1291,7 @@ fn merge_composes_disjoint_children() {
 
     let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
     let merged_run_id = merged.merged_run_id.as_deref().expect("merged run");
+    let expected_merged = merged_run_id.to_string();
     let merged_state = deadreckon_core::load_run(&paths, merged_run_id).expect("merged state");
     let library = paths.library_dir(&merged_state.scope, &merged_state.run_id);
     assert_eq!(
@@ -1217,6 +1301,26 @@ fn merge_composes_disjoint_children() {
     assert_eq!(
         fs::read_to_string(library.join("child-1.txt")).expect("child 1"),
         "from task-1"
+    );
+    let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(&event.event, PlanEventKind::MergeStarted)),
+        "{events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            PlanEventKind::MergeCompleted { merged_run_id } if merged_run_id == &expected_merged
+        )),
+        "{events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(&event.event, PlanEventKind::PlanCompleted)),
+        "{events:#?}"
     );
 }
 
@@ -1237,6 +1341,19 @@ fn merge_fails_on_conflict_default() {
     let err = stderr(&output);
     assert!(err.contains("conflict at README.md"), "{err}");
     assert!(err.contains("--strategy prefer-child"), "{err}");
+    let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(&event.event, PlanEventKind::MergeConflict { .. })),
+        "{events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(&event.event, PlanEventKind::PlanFailed { .. })),
+        "{events:#?}"
+    );
 }
 
 #[test]
@@ -1778,6 +1895,16 @@ fn show_why_failed_plan_includes_blocker_message() {
         .expect("message"),
     )
     .expect("append message");
+    append_plan_event(
+        &paths,
+        &plan.plan_id,
+        PlanEventKind::TaskBlocked {
+            task_id: "task-1".to_string(),
+            task_index: 1,
+            reason: "task-1 blocked by failed dependency".to_string(),
+        },
+    )
+    .expect("append plan event");
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
@@ -1789,6 +1916,10 @@ fn show_why_failed_plan_includes_blocker_message() {
     assert!(out.contains("child 1 task-1 status failed"), "{out}");
     assert!(
         out.contains("blocker coordinator -> task-1: task-1 blocked by failed dependency"),
+        "{out}"
+    );
+    assert!(
+        out.contains("latest plan event") && out.contains("task-1 blocked"),
         "{out}"
     );
 }
@@ -1868,6 +1999,57 @@ fn history_grep_plan_scope_excludes_others() {
     let out = stdout(&output);
     assert!(out.contains("11112222"), "{out}");
     assert!(!out.contains("99998888"), "{out}");
+}
+
+#[test]
+fn history_grep_plan_scope_includes_plan_events() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    append_plan_event(
+        &paths,
+        &plan.plan_id,
+        PlanEventKind::TaskBlocked {
+            task_id: "task-1".to_string(),
+            task_index: 1,
+            reason: "event-only-plan-needle".to_string(),
+        },
+    )
+    .expect("append plan event");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "history",
+            "grep",
+            "event-only-plan-needle",
+            "--plan",
+            &plan.plan_id[..8],
+        ])
+        .output()
+        .expect("history grep");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("plan-events"), "{out}");
+    assert!(out.contains("event-only-plan-needle"), "{out}");
 }
 
 #[test]
