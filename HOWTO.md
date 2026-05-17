@@ -295,8 +295,8 @@ you passed `--no-docs`.
 deadreckon doc latest
 deadreckon doc latest --kind as-built
 deadreckon doc latest --kind decisions
-deadreckon doc latest --polish --force
-deadreckon doc latest --polish --doc-provider cli:codex --budget-cap 0.25
+deadreckon doc latest --polish --overwrite
+deadreckon doc latest --polish --doc-provider cli:codex --max-spend 0.25
 ```
 
 The polish preview lists the provider, why it was selected, the four narrator
@@ -362,19 +362,19 @@ deadreckon finish latest --autostash --cleanup
 deadreckon apply <run-id>
 deadreckon apply <run-id> --autostash
 deadreckon apply <run-id> --cleanup --no-confirm
-deadreckon apply <run-id> --strategy merge
-deadreckon apply <run-id> --strategy cherry-pick --no-confirm
+deadreckon apply <run-id> --git-strategy merge
+deadreckon apply <run-id> --git-strategy cherry-pick --no-confirm
 deadreckon keep <run-id> --autostash --cleanup
 deadreckon abandon <run-id>
 deadreckon discard <run-id>
 deadreckon abandon <run-id> --keep-branch
 deadreckon cleanup --completed
-deadreckon cleanup --stale --force
-deadreckon cleanup --all --completed --no-confirm
+deadreckon cleanup --stale --escalate
+deadreckon cleanup --all-scopes --completed --no-confirm
 deadreckon prune --completed
 deadreckon kill <run-id>
 deadreckon stop <run-id>
-deadreckon kill <run-id> --force
+deadreckon kill <run-id> --escalate
 deadreckon resume <run-id>
 deadreckon continue <run-id>
 deadreckon resume <run-id> --from-turn 2
@@ -579,7 +579,7 @@ Common fixes:
 deadreckon init
 deadreckon config set defaults.provider cli:codex
 deadreckon config set defaults.sandbox auto
-deadreckon kill <run-id> --force
+deadreckon kill <run-id> --escalate
 deadreckon resume <run-id>
 ```
 
