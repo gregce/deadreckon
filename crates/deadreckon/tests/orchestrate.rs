@@ -4232,6 +4232,68 @@ fn history_grep_substring_finds_pattern_across_library() {
 }
 
 #[test]
+fn history_grep_scope_and_all_match_list_semantics() {
+    let temp = repo_tempdir();
+    let repo_a = clean_git_repo(&temp);
+    let repo_b = temp.path().join("repo-b");
+    fs::create_dir_all(&repo_b).expect("repo b");
+    git(&repo_b, &["init"]).expect("git init b");
+    fs::write(repo_b.join("README.md"), "hello b").expect("readme b");
+    git(&repo_b, &["add", "-A"]).expect("add b");
+    git(&repo_b, &["commit", "-m", "initial b"]).expect("commit b");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    seed_trace_run(
+        &paths,
+        &repo_a,
+        "aaaa1111ccccdddd1111222233334444",
+        "scope-history-needle repo a",
+    );
+    seed_trace_run(
+        &paths,
+        &repo_b,
+        "bbbb2222eeeeffff5555666677778888",
+        "scope-history-needle repo b",
+    );
+    let scope_b = deadreckon_core::paths::workspace_scope(&repo_b).expect("scope b");
+
+    let scoped_default = deadreckon(&paths)
+        .current_dir(&repo_a)
+        .args(["history", "grep", "scope-history-needle"])
+        .output()
+        .expect("history grep scoped");
+    assert_success(&scoped_default);
+    let out = stdout(&scoped_default);
+    assert!(out.contains("aaaa1111"), "{out}");
+    assert!(!out.contains("bbbb2222"), "{out}");
+
+    let explicit_scope = deadreckon(&paths)
+        .current_dir(&repo_a)
+        .args([
+            "history",
+            "grep",
+            "scope-history-needle",
+            "--scope",
+            &scope_b,
+        ])
+        .output()
+        .expect("history grep scope");
+    assert_success(&explicit_scope);
+    let out = stdout(&explicit_scope);
+    assert!(!out.contains("aaaa1111"), "{out}");
+    assert!(out.contains("bbbb2222"), "{out}");
+
+    let all_scopes = deadreckon(&paths)
+        .current_dir(&repo_a)
+        .args(["history", "grep", "scope-history-needle", "--all"])
+        .output()
+        .expect("history grep all");
+    assert_success(&all_scopes);
+    let out = stdout(&all_scopes);
+    assert!(out.contains("aaaa1111"), "{out}");
+    assert!(out.contains("bbbb2222"), "{out}");
+}
+
+#[test]
 fn history_grep_plan_scope_excludes_others() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
