@@ -5,7 +5,8 @@
 - Aligned top-level `attach` and `kill` id handling so run, chain, and plan ids all resolve through the normal lifecycle commands, with shared `attaching to <kind> <prefix>` and `killed <kind> <prefix>` banner wording.
 - Clarified help for `attach`, `kill`, and `show` to name run, chain, plan, and `plan-id:task-id` support where the commands already accept those ids.
 - Aligned provider setup wording so `doctor`, `detect`, and `providers list` use the same `kind=cli|http|local-http|scripted|custom` tokens and normal help says provider route instead of descriptor.
-- Added coherence coverage for the updated help, top-level chain attach/kill dispatch, provider kind vocabulary, and plan-child show help.
+- Added coherence coverage for the updated help, orchestration help vocabulary, top-level chain attach/kill dispatch, provider kind vocabulary, status key/value layout, shared stderr error rendering, raw ANSI ownership, visual identity helpers, and plan-child show help.
+- Refreshed README/HOWTO examples to use canonical `run`, `--branch-name`, `--overwrite`, `--max-spend`, `--git-strategy`, `--all-scopes`, and `--escalate` wording.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 
