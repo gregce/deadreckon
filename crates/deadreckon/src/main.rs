@@ -8748,6 +8748,19 @@ fn print_orchestrate_started(
     );
     println!(
         "{} {}",
+        ui_command("child:"),
+        ui_command(format!(
+            "deadreckon attach {}:task-0",
+            run_prefix(&plan.plan_id)
+        ))
+    );
+    println!(
+        "{} {}",
+        ui_command("when done:"),
+        ui_command(format!("deadreckon finish {}", run_prefix(&plan.plan_id)))
+    );
+    println!(
+        "{} {}",
         ui_command("history:"),
         ui_command(format!(
             "deadreckon history grep <pattern> --plan {}",
@@ -9134,6 +9147,164 @@ fn resolve_plan_id(paths: &DeadreckonPaths, id: &str) -> Result<String> {
             "use a longer plan id prefix",
         ))),
     }
+}
+
+#[derive(Debug, Clone)]
+struct PlanResultRun {
+    plan: Plan,
+    state: deadreckon_core::PipelineState,
+}
+
+fn resolve_plan_result_run(
+    paths: &DeadreckonPaths,
+    id: &str,
+    verb: &str,
+) -> Result<Option<PlanResultRun>> {
+    let plan_id = match resolve_plan_id(paths, id) {
+        Ok(plan_id) => plan_id,
+        Err(error) if error.to_string().contains("no plan") => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let plan = load_plan(paths, &plan_id)?;
+    let Some(run_id) = merged_run_id_for_completed_plan(&plan, verb)? else {
+        return Ok(None);
+    };
+    let state = load_run(paths, &run_id)?;
+    Ok(Some(PlanResultRun { plan, state }))
+}
+
+fn merged_run_id_for_completed_plan(plan: &Plan, verb: &str) -> Result<Option<String>> {
+    match plan.status {
+        PlanStatus::Merged => {}
+        PlanStatus::Pending => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("plan {} has not started yet", run_prefix(&plan.plan_id)),
+                &format!("deadreckon fork {}", run_prefix(&plan.plan_id)),
+            )));
+        }
+        PlanStatus::Forked => {
+            let ready_to_merge = plan
+                .tasks
+                .iter()
+                .all(|task| task.status == PlanTaskStatus::Completed);
+            let try_line = if ready_to_merge {
+                format!("deadreckon merge {}", run_prefix(&plan.plan_id))
+            } else {
+                format!("deadreckon attach {}", run_prefix(&plan.plan_id))
+            };
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "plan {} is still {}; cannot {verb} it yet",
+                    run_prefix(&plan.plan_id),
+                    plan_status_label(plan.status)
+                ),
+                &try_line,
+            )));
+        }
+        PlanStatus::Failed => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "plan {} failed; no completed result to {verb}",
+                    run_prefix(&plan.plan_id)
+                ),
+                &format!("deadreckon show {} --why-failed", run_prefix(&plan.plan_id)),
+            )));
+        }
+    }
+    let run_id = plan.merged_run_id.clone().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "plan {} is completed but has no result run id",
+                run_prefix(&plan.plan_id)
+            ),
+            &format!("deadreckon show {}", run_prefix(&plan.plan_id)),
+        ))
+    })?;
+    Ok(Some(run_id))
+}
+
+fn default_plan_materialize_dest(plan: &Plan) -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(
+            deadreckon_core::paths::task_key(&plan.root_goal)
+                .chars()
+                .take(24)
+                .collect::<String>(),
+        )
+}
+
+fn plan_apply_git_root(plan: &Plan) -> Result<Option<PathBuf>> {
+    let Some(parent_cwd) = plan.parent_cwd.as_ref() else {
+        return Ok(None);
+    };
+    deadreckon_core::find_git_root(parent_cwd).map_err(CliError::from)
+}
+
+fn print_plan_result_context(plan: &Plan, state: &deadreckon_core::PipelineState) {
+    println!(
+        "{} {} -> result run {}",
+        ui_heading("plan result:"),
+        ui_id(run_prefix(&plan.plan_id)),
+        ui_id(run_prefix(&state.run_id))
+    );
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PlanChildSelection {
+    plan_id: String,
+    task_id: String,
+    run_id: String,
+}
+
+fn resolve_plan_child_ref(paths: &DeadreckonPaths, id: &str) -> Result<Option<PlanChildSelection>> {
+    let Some((plan_ref, child_ref)) = id
+        .split_once(':')
+        .or_else(|| id.split_once('/'))
+        .map(|(plan_ref, child_ref)| (plan_ref.trim(), child_ref.trim()))
+    else {
+        return Ok(None);
+    };
+    if plan_ref.is_empty() || child_ref.is_empty() {
+        return Ok(None);
+    }
+    let plan_id = resolve_plan_id(paths, plan_ref)?;
+    let plan = load_plan(paths, &plan_id)?;
+    let task = resolve_plan_child_task(&plan, child_ref).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "plan {} has no child {child_ref}",
+                run_prefix(&plan.plan_id)
+            ),
+            &format!("deadreckon show {}", run_prefix(&plan.plan_id)),
+        ))
+    })?;
+    let run_id = task.child_run_id.clone().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "{} in plan {} has no run id yet",
+                task.task_id,
+                run_prefix(&plan.plan_id)
+            ),
+            &format!("deadreckon attach {}", run_prefix(&plan.plan_id)),
+        ))
+    })?;
+    Ok(Some(PlanChildSelection {
+        plan_id: plan.plan_id.clone(),
+        task_id: task.task_id.clone(),
+        run_id,
+    }))
+}
+
+fn resolve_plan_child_task<'a>(plan: &'a Plan, child_ref: &str) -> Option<&'a PlanTask> {
+    if let Some(task) = plan.task_by_id(child_ref) {
+        return Some(task);
+    }
+    let normalized = child_ref.strip_prefix("task-").unwrap_or(child_ref);
+    normalized
+        .parse::<u32>()
+        .ok()
+        .and_then(|index| plan.tasks.iter().find(|task| task.index == index))
 }
 
 fn apply_fork_provider_overrides(
@@ -9826,6 +9997,16 @@ fn print_fork_finished(plan: &Plan, no_hints: bool) {
             ui_command("attach:"),
             ui_command(format!("deadreckon attach {}", run_prefix(&plan.plan_id)))
         );
+        if plan.tasks.iter().any(|task| task.child_run_id.is_some()) {
+            println!(
+                "{} {}",
+                ui_command("child:"),
+                ui_command(format!(
+                    "deadreckon attach {}:task-0",
+                    run_prefix(&plan.plan_id)
+                ))
+            );
+        }
         println!(
             "{} {}",
             ui_command("merge:"),
@@ -10969,6 +11150,10 @@ fn copy_merge_file(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+fn skip_plan_apply_file(relative: &Path) -> bool {
+    skip_plan_merge_file(relative) || relative == Path::new("deadreckon-plan-manifest.json")
+}
+
 fn create_merged_plan_run(
     paths: &DeadreckonPaths,
     plan: &Plan,
@@ -11007,6 +11192,250 @@ fn create_merged_plan_run(
     save_state(&state)?;
     promote_completed_run(paths, &mut state)?;
     Ok(state)
+}
+
+fn prepare_plan_result_apply_state(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    merged_state: &deadreckon_core::PipelineState,
+) -> Result<deadreckon_core::PipelineState> {
+    let git_root = plan_apply_git_root(plan)?.ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "plan {} source is not a git repo",
+                run_prefix(&plan.plan_id)
+            ),
+            &format!(
+                "deadreckon materialize {} --dest <path>",
+                run_prefix(&plan.plan_id)
+            ),
+        ))
+    })?;
+    let merged_source = paths.library_dir(&merged_state.scope, &merged_state.run_id);
+    if !merged_source.is_dir() {
+        return Err(CliError::Core(DeadreckonError::NotFound(format!(
+            "library missing for plan result {}",
+            merged_state.run_id
+        ))));
+    }
+
+    let run_id = Uuid::new_v4().simple().to_string();
+    let record = plan_apply_worktree_record(paths, plan, &git_root, &run_id)?;
+    create_worktree(&record)?;
+    let worktree_path = record.worktree_path.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "missing plan apply worktree_path".to_string(),
+        ))
+    })?;
+    seed_plan_result_worktree(plan, merged_state, &merged_source, worktree_path)?;
+
+    let mut state = create_run(
+        paths,
+        RunOptions {
+            goal: format!(
+                "{} (deadreckon plan {})",
+                plan.root_goal,
+                run_prefix(&plan.plan_id)
+            ),
+            cwd: git_root,
+            sandbox: "none".to_string(),
+            provider: Some("deadreckon:orchestrate-apply".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: None,
+            max_wall_seconds: None,
+            run_id: Some(run_id),
+            codebase: Some(record),
+        },
+    )?;
+    write_acceptance_marker(
+        &state.run_root,
+        state.run_id.clone(),
+        state.working_dir.clone(),
+        1,
+    )?;
+    state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
+    append_trace(
+        &state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn: state.turn,
+            event: "plan_result_apply_prepared".to_string(),
+            latency_ms: None,
+            detail: json!({
+                "plan_id": plan.plan_id,
+                "merged_run_id": merged_state.run_id,
+                "source": merged_source.display().to_string(),
+                "working_dir": state.working_dir.display().to_string(),
+            }),
+        },
+    )?;
+    save_state(&state)?;
+    Ok(state)
+}
+
+fn plan_apply_worktree_record(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    git_root: &Path,
+    run_id: &str,
+) -> Result<CodebaseRecord> {
+    let scope = workspace_scope(git_root)?;
+    let branch_name = format!(
+        "dr/plan-{}-{}",
+        run_prefix(&plan.plan_id),
+        run_prefix(run_id)
+    );
+    if git_ref_exists(git_root, &branch_name) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("branch {branch_name} already exists"),
+            "retry the apply or pass --cleanup after a successful apply",
+        )));
+    }
+    let (base_ref, base_sha, parent_branch) = plan_apply_base(paths, plan, git_root)?;
+    let mut record = CodebaseRecord::fresh();
+    record.mode = CodebaseMode::Worktree;
+    record.source_path = Some(git_root.to_path_buf());
+    record.source_git_root = Some(git_root.to_path_buf());
+    record.branch_name = Some(branch_name);
+    record.base_ref = Some(base_ref);
+    record.base_sha = Some(base_sha);
+    record.parent_branch = parent_branch;
+    record.worktree_path = Some(plan_apply_worktree_path(paths, &scope, run_id));
+    Ok(record)
+}
+
+fn plan_apply_base(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    git_root: &Path,
+) -> Result<(String, String, Option<String>)> {
+    for task in &plan.tasks {
+        let Some(child_run_id) = task.child_run_id.as_deref() else {
+            continue;
+        };
+        let Ok(child) = load_run(paths, child_run_id) else {
+            continue;
+        };
+        let Ok(record) = read_run_codebase_record(paths, &child) else {
+            continue;
+        };
+        if record.source_git_root.as_deref() != Some(git_root) {
+            continue;
+        }
+        let Some(base_sha) = record.base_sha.as_deref() else {
+            continue;
+        };
+        if git_status(
+            git_root,
+            &["cat-file", "-e", &format!("{base_sha}^{{commit}}")],
+        )
+        .is_err()
+        {
+            continue;
+        }
+        return Ok((
+            base_sha.to_string(),
+            base_sha.to_string(),
+            record.base_ref.clone(),
+        ));
+    }
+
+    let base_ref = git_stdout(git_root, &["symbolic-ref", "--short", "HEAD"])
+        .unwrap_or_else(|_| "HEAD".into());
+    let base_sha = git_stdout(git_root, &["rev-parse", &base_ref])?;
+    Ok((base_ref.clone(), base_sha, Some(base_ref)))
+}
+
+fn plan_apply_worktree_path(paths: &DeadreckonPaths, scope: &str, run_id: &str) -> PathBuf {
+    let stem = format!(
+        "{}-{}",
+        deadreckon_core::paths::sanitize_slug(scope),
+        run_prefix(run_id)
+    );
+    let root = paths.home().join("worktrees");
+    let mut candidate = root.join(&stem);
+    let mut suffix = 2;
+    while candidate.exists()
+        && fs::read_dir(&candidate)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(true)
+    {
+        candidate = root.join(format!("{stem}-{suffix}"));
+        suffix += 1;
+    }
+    candidate
+}
+
+fn seed_plan_result_worktree(
+    plan: &Plan,
+    merged_state: &deadreckon_core::PipelineState,
+    merged_source: &Path,
+    worktree_path: &Path,
+) -> Result<()> {
+    for file in inventory_files(worktree_path)? {
+        let relative = file.strip_prefix(worktree_path).map_err(|err| {
+            DeadreckonError::InvalidInput(format!("plan apply worktree prefix error: {err}"))
+        })?;
+        if path_has_component(relative, ".git") {
+            continue;
+        }
+        remove_if_exists(&file)?;
+    }
+    for file in inventory_files(merged_source)? {
+        let relative = file.strip_prefix(merged_source).map_err(|err| {
+            DeadreckonError::InvalidInput(format!("plan apply source prefix error: {err}"))
+        })?;
+        if skip_plan_apply_file(relative) {
+            continue;
+        }
+        copy_merge_file(&file, &worktree_path.join(relative))?;
+    }
+
+    git_status(worktree_path, &["add", "-A"])?;
+    let staged = git_stdout(worktree_path, &["diff", "--cached", "--stat"])?;
+    if staged.trim().is_empty() {
+        return Ok(());
+    }
+    git_status(
+        worktree_path,
+        &[
+            "commit",
+            "-m",
+            &plan_apply_commit_subject(plan),
+            "-m",
+            &plan_apply_commit_body(plan, merged_state),
+        ],
+    )
+}
+
+fn plan_apply_commit_subject(plan: &Plan) -> String {
+    format!(
+        "{} (deadreckon plan {})",
+        one_line(&plan.root_goal, 72),
+        run_prefix(&plan.plan_id)
+    )
+}
+
+fn plan_apply_commit_body(plan: &Plan, merged_state: &deadreckon_core::PipelineState) -> String {
+    let mut lines = vec![
+        format!("Plan: {}", plan.plan_id),
+        format!("Result run: {}", merged_state.run_id),
+        String::new(),
+        "Children:".to_string(),
+    ];
+    for task in &plan.tasks {
+        lines.push(format!(
+            "- {}: {}{}",
+            task.task_id,
+            task.child_run_id.as_deref().unwrap_or("-"),
+            task.provider
+                .as_deref()
+                .map(|provider| format!(" ({provider})"))
+                .unwrap_or_default()
+        ));
+    }
+    lines.join("\n")
 }
 
 fn write_plan_merge_manifest(
@@ -11078,18 +11507,30 @@ fn print_merge_finished(
 ) {
     println!(
         "{} {}",
-        ui_ok("merged"),
-        ui_id(run_prefix(&merged_run.run_id))
+        ui_ok("completed orchestration"),
+        ui_id(run_prefix(&plan.plan_id))
     );
-    println!("plan {}", run_prefix(&plan.plan_id));
+    println!("result run {}", run_prefix(&merged_run.run_id));
     println!("library {}", library_dir.display());
     if !no_hints {
+        println!(
+            "{} {}",
+            ui_command("finish:"),
+            ui_command(format!("deadreckon finish {}", run_prefix(&plan.plan_id)))
+        );
+        if plan_apply_git_root(plan).ok().flatten().is_some() {
+            println!(
+                "{} {}",
+                ui_command("apply:"),
+                ui_command(format!("deadreckon apply {}", run_prefix(&plan.plan_id)))
+            );
+        }
         println!(
             "{} {}",
             ui_command("materialize:"),
             ui_command(format!(
                 "deadreckon materialize {} --dest ./{}",
-                run_prefix(&merged_run.run_id),
+                run_prefix(&plan.plan_id),
                 deadreckon_core::paths::task_key(&plan.root_goal)
                     .chars()
                     .take(24)
@@ -11164,16 +11605,18 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
             println!("    {detail}");
         }
         if show_hints && let Some(run_id) = task.child_run_id.as_deref() {
+            let child_ref = format!("{}:{}", run_prefix(&plan.plan_id), task.task_id);
             println!(
                 "    {} {}",
-                ui_command("attach:"),
-                ui_command(format!("deadreckon attach {}", run_prefix(run_id)))
+                ui_command("drill:"),
+                ui_command(format!("deadreckon attach {child_ref}"))
             );
             println!(
                 "    {} {}",
                 ui_command("show:"),
-                ui_command(format!("deadreckon show {}", run_prefix(run_id)))
+                ui_command(format!("deadreckon show {child_ref}"))
             );
+            println!("    run id {}", run_prefix(run_id));
         }
     }
     let messages = read_plan_messages(paths, &plan.plan_id).unwrap_or_default();
@@ -11184,7 +11627,7 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
         );
     }
     if let Some(merged_run_id) = plan.merged_run_id.as_deref() {
-        println!("merged run {}", run_prefix(merged_run_id));
+        println!("result run {}", run_prefix(merged_run_id));
     }
     if show_hints {
         println!(
@@ -11208,11 +11651,26 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
                 );
             }
             PlanStatus::Merged => {
-                if let Some(run_id) = plan.merged_run_id.as_deref() {
+                if plan.merged_run_id.is_some() {
+                    println!(
+                        "{} {}",
+                        ui_command("finish:"),
+                        ui_command(format!("deadreckon finish {}", run_prefix(&plan.plan_id)))
+                    );
+                    if plan_apply_git_root(plan).ok().flatten().is_some() {
+                        println!(
+                            "{} {}",
+                            ui_command("apply:"),
+                            ui_command(format!("deadreckon apply {}", run_prefix(&plan.plan_id)))
+                        );
+                    }
                     println!(
                         "{} {}",
                         ui_command("materialize:"),
-                        ui_command(format!("deadreckon materialize {}", run_prefix(run_id)))
+                        ui_command(format!(
+                            "deadreckon materialize {}",
+                            run_prefix(&plan.plan_id)
+                        ))
                     );
                 }
             }
@@ -11778,7 +12236,19 @@ fn materialize_command(
     include_manifest: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = load_cli_run(&paths, &run_id)?;
+    let (state, plan_context, dest) = match load_cli_run(&paths, &run_id) {
+        Ok(state) => (state, None, dest),
+        Err(run_error) => match resolve_plan_result_run(&paths, &run_id, "materialize")? {
+            Some(result) => {
+                let dest = dest.or_else(|| Some(default_plan_materialize_dest(&result.plan)));
+                (result.state, Some(result.plan), dest)
+            }
+            None => return Err(run_error),
+        },
+    };
+    if let Some(plan) = plan_context.as_ref() {
+        print_plan_result_context(plan, &state);
+    }
     let materialized = materialize_completed_run(&paths, &state, dest, force, include_manifest)?;
     print_materialized(&materialized);
     Ok(())
@@ -11799,7 +12269,38 @@ fn finish_command(
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let requested = run_id.unwrap_or_else(|| "latest".to_string());
-    let state = load_cli_run(&paths, &requested)?;
+    let (state, plan_context, dest) = match load_cli_run(&paths, &requested) {
+        Ok(state) => (state, None, dest),
+        Err(run_error) => match resolve_plan_result_run(&paths, &requested, "finish")? {
+            Some(result) => {
+                if dest.is_none() && plan_apply_git_root(&result.plan)?.is_some() {
+                    println!(
+                        "{} {}",
+                        ui_heading("finish:"),
+                        ui_command(format!(
+                            "deadreckon apply {}",
+                            run_prefix(&result.plan.plan_id)
+                        ))
+                    );
+                    return apply_command_inner(
+                        requested, strategy, branch, no_confirm, autostash, cleanup, message,
+                        false, false,
+                    );
+                }
+                let dest =
+                    Some(dest.unwrap_or_else(|| default_plan_materialize_dest(&result.plan)));
+                (result.state, Some(result.plan), dest)
+            }
+            None => return Err(run_error),
+        },
+    };
+    let finish_ref = plan_context
+        .as_ref()
+        .map(|plan| run_prefix(&plan.plan_id))
+        .unwrap_or_else(|| run_prefix(&state.run_id));
+    if let Some(plan) = plan_context.as_ref() {
+        print_plan_result_context(plan, &state);
+    }
     match state.status {
         RunStatus::Completed => {}
         RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => {
@@ -11841,7 +12342,7 @@ fn finish_command(
             println!(
                 "{} {}",
                 ui_heading("finish:"),
-                ui_command(format!("deadreckon export {}", run_prefix(&state.run_id)))
+                ui_command(format!("deadreckon export {finish_ref}"))
             );
             materialize_completed_run(&paths, &state, dest, force, include_manifest)
                 .map(|materialized| print_materialized(&materialized))
@@ -12007,7 +12508,18 @@ fn apply_command_inner(
     plain: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = load_cli_run(&paths, &run_id)?;
+    let state = match load_cli_run(&paths, &run_id) {
+        Ok(state) => state,
+        Err(run_error) => match resolve_plan_result_run(&paths, &run_id, "apply")? {
+            Some(result) => {
+                if !quiet {
+                    print_plan_result_context(&result.plan, &result.state);
+                }
+                prepare_plan_result_apply_state(&paths, &result.plan, &result.state)?
+            }
+            None => return Err(run_error),
+        },
+    };
     if state.status != RunStatus::Completed {
         return Err(CliError::Core(deadreckon_core::user_error(
             &format!("run {} is {}", state.run_id, state.status),
@@ -13335,6 +13847,7 @@ fn list_command(
                         "completed": plan.completed_children,
                         "total": plan.total_children,
                     },
+                    "result_run_id": &plan.merged_run_id,
                 })
             })
             .collect::<Vec<_>>();
@@ -13595,6 +14108,7 @@ impl ListEntry {
 #[derive(Debug)]
 struct PlanListEntry {
     plan_id: String,
+    merged_run_id: Option<String>,
     scope: String,
     goal: String,
     status: PlanStatus,
@@ -13642,6 +14156,7 @@ fn list_plan_entries(
         let total_children = plan.tasks.len();
         plans.push(PlanListEntry {
             plan_id: plan.plan_id,
+            merged_run_id: plan.merged_run_id,
             scope: plan.parent_scope.unwrap_or_else(|| "global".to_string()),
             goal: plan.root_goal,
             status: plan.status,
@@ -13663,7 +14178,8 @@ fn plan_action_label(plan: &PlanListEntry) -> String {
             format!("merge {}/{}", plan.completed_children, plan.total_children)
         }
         PlanStatus::Forked => format!("attach {}/{}", plan.completed_children, plan.total_children),
-        PlanStatus::Merged => "done".to_string(),
+        PlanStatus::Merged if plan.merged_run_id.is_some() => "finish".to_string(),
+        PlanStatus::Merged => "show".to_string(),
         PlanStatus::Failed => "show failure".to_string(),
     }
 }
@@ -14672,28 +15188,41 @@ fn print_doc_polish_summary(record: &deadreckon_runtime::PolishRecord) {
 
 async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = match load_cli_run(&paths, &run_id) {
-        Ok(state) => state,
-        Err(run_error) => {
-            if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
-                let plan = load_plan(&paths, &plan_id)?;
-                let show_hints = completion_hints_enabled(no_hints);
-                if io::stdout().is_terminal() && !plain {
-                    eprintln!("attaching to plan {}", run_prefix(&plan.plan_id));
-                    attach_plan_tui(&paths, &plan.plan_id, show_hints).await?;
-                } else {
-                    print_plan_summary(&paths, &plan, show_hints);
+    let mut parent_plan = None;
+    let state = if let Some(selection) = resolve_plan_child_ref(&paths, &run_id)? {
+        parent_plan = Some(AttachParentPlan {
+            plan_id: selection.plan_id,
+            task_id: selection.task_id,
+        });
+        load_run(&paths, &selection.run_id)?
+    } else {
+        match load_cli_run(&paths, &run_id) {
+            Ok(state) => state,
+            Err(run_error) => {
+                if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
+                    let plan = load_plan(&paths, &plan_id)?;
+                    let show_hints = completion_hints_enabled(no_hints);
+                    if io::stdout().is_terminal() && !plain {
+                        eprintln!("attaching to plan {}", run_prefix(&plan.plan_id));
+                        attach_plan_tui(&paths, &plan.plan_id, show_hints).await?;
+                    } else {
+                        print_plan_summary(&paths, &plan, show_hints);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                return Err(run_error);
             }
-            return Err(run_error);
         }
     };
     let run_id = state.run_id.clone();
     let show_hints = completion_hints_enabled(no_hints);
     if io::stdout().is_terminal() && !plain {
         eprintln!("attaching to run {}", run_prefix(&run_id));
-        attach_tui(&paths, &run_id, show_hints).await?;
+        if parent_plan.is_some() {
+            attach_tui_with_parent(&paths, &run_id, show_hints, parent_plan).await?;
+        } else {
+            attach_tui(&paths, &run_id, show_hints).await?;
+        }
         let state = load_run(&paths, &run_id)?;
         if state.status == RunStatus::Completed && show_hints {
             print_exit_summary_card(&state, &RunLoopOutcome::Done, plain);
@@ -14701,6 +15230,14 @@ async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<(
             print_lifecycle_hints(&state);
         }
         return Ok(());
+    }
+    if let Some(parent_plan) = parent_plan.as_ref() {
+        println!(
+            "plan {} / {} -> run {}",
+            run_prefix(&parent_plan.plan_id),
+            parent_plan.task_id,
+            run_prefix(&state.run_id)
+        );
     }
     if state.status == RunStatus::Completed && show_hints {
         print_exit_summary_card(&state, &RunLoopOutcome::Done, plain);
@@ -15277,30 +15814,37 @@ fn show_command(
     json_output: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = match load_cli_run(&paths, run_id) {
-        Ok(state) => state,
-        Err(run_error) => {
-            if let Ok(plan_id) = resolve_plan_id(&paths, run_id) {
-                let plan = load_plan(&paths, &plan_id)?;
-                if json_output {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "plan": plan,
-                            "try_lines": Vec::<String>::new(),
-                        }))?
-                    );
+    let mut child_context: Option<PlanChildSelection> = None;
+    let state = if let Some(selection) = resolve_plan_child_ref(&paths, run_id)? {
+        let state = load_run(&paths, &selection.run_id)?;
+        child_context = Some(selection);
+        state
+    } else {
+        match load_cli_run(&paths, run_id) {
+            Ok(state) => state,
+            Err(run_error) => {
+                if let Ok(plan_id) = resolve_plan_id(&paths, run_id) {
+                    let plan = load_plan(&paths, &plan_id)?;
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "plan": plan,
+                                "try_lines": Vec::<String>::new(),
+                            }))?
+                        );
+                        return Ok(());
+                    }
+                    if why_failed {
+                        show_plan_why_failed(&paths, &plan);
+                        return Ok(());
+                    }
+                    print_plan_summary(&paths, &plan, true);
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
                     return Ok(());
                 }
-                if why_failed {
-                    show_plan_why_failed(&paths, &plan);
-                    return Ok(());
-                }
-                print_plan_summary(&paths, &plan, true);
-                println!("{}", serde_json::to_string_pretty(&plan)?);
-                return Ok(());
+                return Err(run_error);
             }
-            return Err(run_error);
         }
     };
     if json_output {
@@ -15308,6 +15852,7 @@ fn show_command(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "run": state,
+                "plan_child": child_context,
                 "try_lines": Vec::<String>::new(),
             }))?
         );
@@ -15315,6 +15860,14 @@ fn show_command(
     }
     if why_failed {
         return show_run_why_failed(&state);
+    }
+    if let Some(selection) = child_context.as_ref() {
+        println!(
+            "plan {} / {} -> run {}",
+            run_prefix(&selection.plan_id),
+            selection.task_id,
+            run_prefix(&selection.run_id)
+        );
     }
     print_run_locations(&state);
     if let Some(line) = chain_context_line_for_working(&state.working_dir)? {
@@ -15373,7 +15926,13 @@ fn show_command(
 fn read_parent_marker(root: &Path) -> Result<Option<ParentMarker>> {
     let path = root.join(".deadreckon/parent.json");
     match fs::read(&path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Ok(bytes) => {
+            let value: Value = serde_json::from_slice(&bytes)?;
+            if value.get("parent_run_id").is_none() {
+                return Ok(None);
+            }
+            Ok(Some(serde_json::from_value(value)?))
+        }
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(CliError::Io(source)),
     }
@@ -16437,7 +16996,8 @@ fn plan_attach_footer(
     show_hints: bool,
 ) -> String {
     let mut footer =
-        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter drill into child".to_string();
+        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter drill into child, Esc returns"
+            .to_string();
     if let Some(task) = plan.tasks.get(selected) {
         match task.child_run_id.as_deref() {
             None => {

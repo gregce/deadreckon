@@ -279,12 +279,14 @@ Lifecycle:
 const FINISH_HELP: &str = "\
 Lifecycle:
   deadreckon finish latest
+  deadreckon finish <plan-id>
   deadreckon finish latest --autostash --cleanup
   deadreckon finish latest --dest ./finished-project
 
 Finish chooses the right completed-run action:
   worktree run -> apply
   fresh/copy run -> export
+  completed orchestrate plan -> apply to source git, or export with --dest / non-git source
   in-place run -> show review guidance
 
 It still respects confirmations unless you pass `--no-confirm`.";
@@ -292,18 +294,21 @@ It still respects confirmations unless you pass `--no-confirm`.";
 const MATERIALIZE_HELP: &str = "\
 Lifecycle:
   deadreckon export latest --dest ./finished-project
+  deadreckon export <plan-id> --dest ./finished-project
   deadreckon show latest
   deadreckon extend latest \"follow-up goal\"
 
-Use export/materialize for completed fresh or copy runs. Worktree runs use `deadreckon apply` instead.";
+Use export/materialize for completed fresh/copy runs and completed orchestration plans.
+Worktree runs use `deadreckon apply` instead.";
 
 const APPLY_HELP: &str = "\
 Lifecycle:
   deadreckon show latest
   deadreckon apply latest --autostash --cleanup
+  deadreckon apply <plan-id> --cleanup
   deadreckon discard latest
 
-Use apply for completed worktree runs. It merges the temporary `dr/...` branch back into your checkout.";
+Use apply for completed worktree runs and completed orchestration plans. It merges a temporary `dr/...` branch back into your checkout.";
 
 const ABANDON_HELP: &str = "\
 Lifecycle:
@@ -982,7 +987,7 @@ pub(crate) enum Commands {
         after_help = FINISH_HELP
     )]
     Finish {
-        #[arg(help = "Run id, unique prefix, or latest")]
+        #[arg(help = "Run id, plan id, unique prefix, or latest")]
         run_id: Option<String>,
         #[arg(long, help = "Destination directory for fresh/copy exports")]
         dest: Option<PathBuf>,
@@ -1031,7 +1036,7 @@ pub(crate) enum Commands {
         after_help = MATERIALIZE_HELP
     )]
     Materialize {
-        #[arg(help = "Run id, unique prefix, or latest")]
+        #[arg(help = "Run id, plan id, unique prefix, or latest")]
         run_id: String,
         #[arg(long, help = "Destination directory")]
         dest: Option<PathBuf>,
@@ -1052,7 +1057,7 @@ pub(crate) enum Commands {
         after_help = APPLY_HELP
     )]
     Apply {
-        #[arg(help = "Run id, unique prefix, or latest")]
+        #[arg(help = "Run id, plan id, unique prefix, or latest")]
         run_id: String,
         #[arg(
             long,

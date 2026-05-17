@@ -11,7 +11,7 @@ use deadreckon_core::{
     CHAIN_EVENTS_JSONL, CoordinatorState, DeadreckonPaths, PLAN_EVENTS_JSONL, Plan, PlanEvent,
     PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanRole, PlanStatus, PlanTaskStatus,
     RUN_EVENTS_JSONL, RunOptions, RunStatus, TraceRecord, append_plan_event, append_plan_message,
-    append_trace, create_run, list_runs, load_plan, pid_is_alive, read_codebase_record,
+    append_trace, create_run, list_runs, load_plan, load_run, pid_is_alive, read_codebase_record,
     read_plan_events, read_plan_messages, save_plan, save_state,
 };
 use serde_json::{Value, json};
@@ -2093,6 +2093,228 @@ fn merge_composes_disjoint_children() {
 }
 
 #[test]
+fn materialize_accepts_completed_plan_id() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    let dest = temp.path().join("materialized-plan");
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("materialize")
+        .arg(&plan.plan_id[..8])
+        .arg("--dest")
+        .arg(&dest)
+        .output()
+        .expect("materialize plan");
+    assert_success(&output);
+
+    let out = stdout(&output);
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    let merged_run_id = merged.merged_run_id.as_deref().expect("result run");
+    assert!(out.contains("plan result:"), "{out}");
+    assert!(out.contains(&plan.plan_id[..8]), "{out}");
+    assert!(out.contains(&merged_run_id[..8]), "{out}");
+    assert!(dest.join("README.md").is_file());
+    assert!(dest.join("deadreckon-plan-manifest.json").is_file());
+}
+
+#[test]
+fn apply_accepts_completed_plan_id_and_commits_to_source_branch() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+    write_plan_child_marker(
+        &paths,
+        &plan,
+        0,
+        "plan-apply-marker.txt",
+        "from plan apply\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["apply", &plan.plan_id[..8], "--no-confirm", "--cleanup"])
+        .output()
+        .expect("apply plan");
+    assert_success(&output);
+
+    let out = stdout(&output);
+    assert!(out.contains("plan result:"), "{out}");
+    assert!(out.contains(&plan.plan_id[..8]), "{out}");
+    assert!(repo.join("plan-apply-marker.txt").is_file());
+    assert!(!repo.join("deadreckon-plan-manifest.json").exists());
+    let subject = git_output(&repo, &["log", "-1", "--pretty=%s"]);
+    assert!(subject.contains("deadreckon plan"), "{subject}");
+    assert_eq!(git_output(&repo, &["status", "--short"]), "");
+}
+
+#[test]
+fn apply_plan_id_supports_autostash_in_dirty_source_repo() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+    write_plan_child_marker(
+        &paths,
+        &plan,
+        0,
+        "plan-autostash-marker.txt",
+        "from plan autostash\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    fs::write(repo.join("local-note.txt"), "keep my local note\n").expect("local note");
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "apply",
+            &plan.plan_id[..8],
+            "--autostash",
+            "--no-confirm",
+            "--cleanup",
+        ])
+        .output()
+        .expect("apply plan");
+    assert_success(&output);
+
+    assert!(repo.join("plan-autostash-marker.txt").is_file());
+    assert_eq!(
+        fs::read_to_string(repo.join("local-note.txt")).expect("local note"),
+        "keep my local note\n"
+    );
+    let status = git_output(&repo, &["status", "--short"]);
+    assert!(status.contains("?? local-note.txt"), "{status}");
+}
+
+#[test]
+fn finish_accepts_completed_plan_id_and_applies_in_git_repo() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+    write_plan_child_marker(
+        &paths,
+        &plan,
+        0,
+        "plan-finish-marker.txt",
+        "from plan finish\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["finish", &plan.plan_id[..8], "--no-confirm", "--cleanup"])
+        .output()
+        .expect("finish plan");
+    assert_success(&output);
+
+    let out = stdout(&output);
+    assert!(out.contains("plan result:"), "{out}");
+    assert!(
+        out.contains(&format!("deadreckon apply {}", &plan.plan_id[..8])),
+        "{out}"
+    );
+    assert!(repo.join("plan-finish-marker.txt").is_file());
+    let subject = git_output(&repo, &["log", "-1", "--pretty=%s"]);
+    assert!(subject.contains("deadreckon plan"), "{subject}");
+}
+
+#[test]
+fn completed_plan_list_action_points_to_finish() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+    assert_success(&output);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("list")
+        .output()
+        .expect("list");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains(&plan.plan_id[..8]), "{out}");
+    assert!(out.contains("orchestrate"), "{out}");
+    assert!(out.contains("finish"), "{out}");
+}
+
+#[test]
+fn plan_child_selector_drills_to_child_run() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+    let child_run_id = plan.tasks[0].child_run_id.as_deref().expect("child run");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "attach",
+            &format!("{}:task-0", &plan.plan_id[..8]),
+            "--plain",
+            "--no-hints",
+        ])
+        .output()
+        .expect("attach child");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(
+        out.contains(&format!("plan {} / task-0", &plan.plan_id[..8])),
+        "{out}"
+    );
+    assert!(out.contains(&child_run_id[..8]), "{out}");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["show", &format!("{}:0", &plan.plan_id[..8]), "--plain"])
+        .output()
+        .expect("show child");
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(
+        out.contains(&format!("plan {} / task-0", &plan.plan_id[..8])),
+        "{out}"
+    );
+    assert!(out.contains(&child_run_id[..8]), "{out}");
+}
+
+#[test]
 fn merge_emits_started_and_completed_events() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -3742,13 +3964,14 @@ fn plan_plain_summary_lists_child_attach_and_show_commands() {
         "{out}"
     );
     assert!(
-        out.contains(&format!("deadreckon attach {}", &child[..8])),
+        out.contains(&format!("deadreckon attach {}:task-0", &plan.plan_id[..8])),
         "{out}"
     );
     assert!(
-        out.contains(&format!("deadreckon show {}", &child[..8])),
+        out.contains(&format!("deadreckon show {}:task-0", &plan.plan_id[..8])),
         "{out}"
     );
+    assert!(out.contains(&format!("run id {}", &child[..8])), "{out}");
 }
 
 #[test]
@@ -4274,6 +4497,20 @@ fn plan_and_fork_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> Plan 
     load_plan(paths, &plan.plan_id).expect("forked plan")
 }
 
+fn write_plan_child_marker(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    child_index: usize,
+    name: &str,
+    body: &str,
+) {
+    let task = plan.tasks.get(child_index).expect("child task");
+    let run_id = task.child_run_id.as_deref().expect("child run id");
+    let child = load_run(paths, run_id).expect("child run");
+    let library = paths.library_dir(&child.scope, &child.run_id);
+    fs::write(library.join(name), body).expect("child marker");
+}
+
 fn review_gate_failure_plan(
     paths: &DeadreckonPaths,
     repo: &std::path::Path,
@@ -4668,6 +4905,23 @@ fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
+}
+
+fn git_output(cwd: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .expect("git output");
+    assert!(
+        output.status.success(),
+        "git {:?}\n{}{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 fn newest_plan(paths: &DeadreckonPaths) -> Plan {

@@ -133,13 +133,20 @@ fn attach_plan_plain_displays_running_for_inflight_child() {
     assert!(stdout.contains("status      : running"), "{stdout}");
     assert!(stdout.contains("task-0"), "{stdout}");
     assert!(
-        stdout.contains("attach: deadreckon attach aaaabbbb"),
+        stdout.contains(&format!(
+            "drill: deadreckon attach {}:task-0",
+            &plan.plan_id[..8]
+        )),
         "{stdout}"
     );
     assert!(
-        stdout.contains("show: deadreckon show aaaabbbb"),
+        stdout.contains(&format!(
+            "show: deadreckon show {}:task-0",
+            &plan.plan_id[..8]
+        )),
         "{stdout}"
     );
+    assert!(stdout.contains("run id aaaabbbb"), "{stdout}");
 }
 
 #[test]
