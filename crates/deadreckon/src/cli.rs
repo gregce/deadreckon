@@ -387,10 +387,13 @@ Undo restores a run snapshot. It is mainly for in-place runs or recovery inside 
 const SHOW_HELP: &str = "\
 Lifecycle:
   deadreckon show latest
+  deadreckon show <plan-id>
+  deadreckon show <plan-id>:task-0
+  deadreckon show <plan-id> --why-failed
   deadreckon doc latest
   deadreckon finish latest
 
-Show prints run or plan state, mode, lineage, traces, provenance, docs, and suggested next actions.";
+Show prints run, plan, or plan-child state, mode, lineage, traces, provenance, docs, and suggested next actions.";
 
 const STATUS_HELP: &str = "\
 Lifecycle:
@@ -1279,11 +1282,11 @@ pub(crate) enum Commands {
         next_help_heading = "Inspect And Import",
         hide = true,
         visible_alias = "inspect",
-        about = "Show full state, provenance, and trace details for a run",
+        about = "Show full state, provenance, and trace details for a run, plan, or plan child",
         after_help = SHOW_HELP
     )]
     Show {
-        #[arg(help = "Run id, unique prefix, or latest")]
+        #[arg(help = "Run id, plan id, plan-id:task-id, unique prefix, or latest")]
         run_id: String,
         #[arg(long, help = "Only show trace/provenance records for this turn")]
         turn: Option<u32>,

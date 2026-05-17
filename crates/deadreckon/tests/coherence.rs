@@ -143,6 +143,15 @@ fn command_help_prefers_status_finish_export_and_cleanup() {
         "status help should lead with canonical status command:\n{status}"
     );
 
+    let show = help(["show", "--help"]);
+    assert!(show.contains("deadreckon show <plan-id>"), "{show}");
+    assert!(show.contains("deadreckon show <plan-id>:task-0"), "{show}");
+    assert!(
+        show.contains("Show prints run, plan, or plan-child state"),
+        "{show}"
+    );
+    assert!(show.contains("Run id, plan id, plan-id:task-id"), "{show}");
+
     let merge = help(["merge", "--help"]);
     assert!(merge.contains("deadreckon finish <plan-id>"), "{merge}");
     assert!(merge.contains("deadreckon apply <plan-id>"), "{merge}");
