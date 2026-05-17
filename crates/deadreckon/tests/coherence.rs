@@ -42,6 +42,15 @@ fn raw_ansi_escapes_stay_in_ui_module() {
 }
 
 #[test]
+fn error_lines_use_shared_stderr_helper() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");
+    assert!(!main.contains("eprintln!(\"error:"), "raw error printer");
+    assert!(!main.contains("eprintln!(\"  hint:"), "raw hint printer");
+    assert!(main.contains("fn print_error("), "shared error helper");
+}
+
+#[test]
 fn help_uses_new_flag_names_with_alpha_aliases_hidden() {
     let run = help(["run", "--help"]);
     assert!(run.contains("--branch-name"), "{run}");

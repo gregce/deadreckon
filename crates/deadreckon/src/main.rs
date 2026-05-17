@@ -218,12 +218,20 @@ fn print_kv_block(items: &[(&str, &str)]) {
     let _ = ui::kv_block(ui::Stream::Stdout, items);
 }
 
+fn print_error(err: &CliError) {
+    eprintln!("{} {err}", ui_error("error:"));
+}
+
+fn print_error_hint(err: &CliError) {
+    let _ = ui::hint(ui::Stream::Stderr, error_hint(err));
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = main_inner().await {
         let exit_code = err.exit_code();
-        eprintln!("{} {err}", ui_error("error:"));
-        let _ = ui::hint(ui::Stream::Stderr, error_hint(&err));
+        print_error(&err);
+        print_error_hint(&err);
         std::process::exit(exit_code);
     }
 }
@@ -3740,7 +3748,7 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
                             false,
                         );
                         if let Err(err) = &action {
-                            eprintln!("error: {err}");
+                            print_error(err);
                         }
                         let _ = prompt::open("press Enter to return to chain attach...", None);
                         resume_tui(&mut terminal)?;
@@ -3751,7 +3759,7 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
                         if !goal.trim().is_empty() {
                             let action = chain_extend_command(paths, chain_id, goal, None, None);
                             if let Err(err) = &action {
-                                eprintln!("error: {err}");
+                                print_error(err);
                             }
                         }
                         let _ = prompt::open("press Enter to return to chain attach...", None);
@@ -3762,7 +3770,7 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
                         let action =
                             chain_pause_command(paths, chain_id, Some("user_paused".to_string()));
                         if let Err(err) = &action {
-                            eprintln!("error: {err}");
+                            print_error(err);
                         }
                         let _ = prompt::open("press Enter to return to chain attach...", None);
                         resume_tui(&mut terminal)?;
@@ -3772,7 +3780,7 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
                         if prompt::confirm("kill chain?", false)?
                             && let Err(err) = chain_kill_command(paths, chain_id, false)
                         {
-                            eprintln!("error: {err}");
+                            print_error(&err);
                         }
                         let _ = prompt::open("press Enter to return to chain attach...", None);
                         resume_tui(&mut terminal)?;
@@ -16882,7 +16890,7 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
                         let child_result =
                             attach_tui_with_parent(paths, run_id, show_hints, parent_plan).await;
                         if let Err(err) = &child_result {
-                            eprintln!("error: {err}");
+                            print_error(err);
                             let _ = prompt::open("press Enter to return to plan attach...", None);
                         }
                         resume_tui(&mut terminal)?;
@@ -17452,7 +17460,7 @@ async fn attach_tui_with_parent(
                         suspend_tui(&mut terminal)?;
                         let action = chain_attach_command(paths, &marker.chain_id, false);
                         if let Err(err) = &action {
-                            eprintln!("error: {err}");
+                            print_error(err);
                         }
                         resume_tui(&mut terminal)?;
                     }
@@ -17550,8 +17558,8 @@ async fn handle_tui_completion_key(
         CompletionAction::Quit => Ok(()),
     };
     if let Err(err) = &action_result {
-        eprintln!("error: {err}");
-        eprintln!("  hint: {}", error_hint(err));
+        print_error(err);
+        print_error_hint(err);
     }
     let _ = prompt::open("press Enter to return to attach...", None);
     resume_tui(terminal)?;
