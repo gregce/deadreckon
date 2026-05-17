@@ -325,6 +325,67 @@ fn top_level_attach_plain_accepts_chain_id() {
 }
 
 #[test]
+fn chain_show_and_attach_plain_share_header_precision() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let mut chain = Chain::new(ChainNewOptions {
+        root_goal: "chain header precision".to_string(),
+        goals: vec!["first step".to_string(), "second step".to_string()],
+        scope: workspace_scope(&cwd).expect("scope"),
+        base_branch: "main".to_string(),
+        base_sha: "0123456789abcdef".to_string(),
+        cwd: cwd.clone(),
+        provider: None,
+        model: None,
+        sandbox: "none".to_string(),
+        branch_policy: BranchPolicy::Stack,
+        apply_mode: ApplyMode::Manual,
+        apply_strategy: ApplyStrategy::Squash,
+        apply_allowlist: Vec::new(),
+        on_fail: OnFail::Stop,
+        circuit_breaker_threshold: 1,
+        max_spend_usd: Some(5.0),
+        max_wall_seconds: None,
+        deadreckon_version: "0.1.0".to_string(),
+    })
+    .expect("chain");
+    chain.status = ChainStatus::Running;
+    chain.total_spend_usd = 1.25;
+    save_chain(&paths, &chain).expect("save chain");
+
+    let show = deadreckon(&paths)
+        .current_dir(&cwd)
+        .env("NO_COLOR", "1")
+        .args(["chain", "show", &chain.chain_id[..8]])
+        .output()
+        .expect("chain show");
+    assert!(show.status.success(), "{}", stderr(&show));
+    let show_stdout = stdout(&show);
+
+    let attach = deadreckon(&paths)
+        .current_dir(&cwd)
+        .env("NO_COLOR", "1")
+        .args(["attach", &chain.chain_id[..8], "--plain"])
+        .output()
+        .expect("chain attach");
+    assert!(attach.status.success(), "{}", stderr(&attach));
+    let attach_stdout = stdout(&attach);
+
+    let show_header = show_stdout.lines().take(8).collect::<Vec<_>>();
+    let attach_header = attach_stdout.lines().take(8).collect::<Vec<_>>();
+    assert_eq!(
+        show_header, attach_header,
+        "{show_stdout}\n---\n{attach_stdout}"
+    );
+    assert!(
+        show_stdout.contains("spend : $1.250000 / $5.000000"),
+        "{show_stdout}"
+    );
+}
+
+#[test]
 fn top_level_kill_accepts_chain_id_and_uses_shared_banner() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
