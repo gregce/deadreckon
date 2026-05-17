@@ -123,21 +123,7 @@ pub fn pad_visible(text: &str, width: usize) -> String {
 }
 
 pub fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for code in chars.by_ref() {
-                if code.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(ch);
-    }
-    out
+    crate::ui::strip_ansi(text)
 }
 
 fn body_lines(card: &Card, plain: bool, color: bool) -> Vec<String> {
@@ -256,7 +242,7 @@ fn border(position: &str, width: usize, plain: bool, color: bool) -> String {
 
 fn style_border(text: &str, color: bool) -> String {
     if color {
-        format!("\u{1b}[2m{text}\u{1b}[0m")
+        crate::ui::ansi_wrap("2", text)
     } else {
         text.to_string()
     }
@@ -264,7 +250,7 @@ fn style_border(text: &str, color: bool) -> String {
 
 fn style_title(text: &str, color: bool) -> String {
     if color {
-        format!("\u{1b}[1m{text}\u{1b}[0m")
+        crate::ui::ansi_wrap("1", text)
     } else {
         text.to_string()
     }
@@ -281,7 +267,7 @@ fn style_tone(text: &str, tone: Tone, color: bool) -> String {
         Tone::Bad => "31",
         Tone::Dim => "2",
     };
-    format!("\u{1b}[{code}m{text}\u{1b}[0m")
+    crate::ui::ansi_wrap(code, text)
 }
 
 fn truncate_visible_for_mode(text: &str, width: usize, plain: bool) -> String {
@@ -310,18 +296,8 @@ fn truncate_visible_inner(text: &str, width: usize, ellipsis: &str) -> String {
     let mut active_style = false;
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
-            let mut sequence = String::from(ch);
-            if let Some(bracket) = chars.next() {
-                sequence.push(bracket);
-            }
-            for code in chars.by_ref() {
-                sequence.push(code);
-                if code.is_ascii_alphabetic() {
-                    active_style = sequence != "\u{1b}[0m";
-                    break;
-                }
-            }
+        if let Some((sequence, active)) = crate::ui::read_ansi_sequence(ch, &mut chars) {
+            active_style = active;
             out.push_str(&sequence);
             continue;
         }
@@ -333,7 +309,7 @@ fn truncate_visible_inner(text: &str, width: usize, ellipsis: &str) -> String {
     }
     out.push_str(ellipsis);
     if active_style {
-        out.push_str("\u{1b}[0m");
+        out.push_str(crate::ui::ansi_reset());
     }
     out
 }

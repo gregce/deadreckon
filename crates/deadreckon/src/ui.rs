@@ -1,9 +1,13 @@
 use std::io::{self, IsTerminal, Write as _};
+use std::iter::Peekable;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::style::Color;
 
 static PLAIN_OUTPUT: AtomicBool = AtomicBool::new(false);
+#[allow(dead_code)]
+const ANSI_ESC: char = '\u{1b}';
+const ANSI_RESET: &str = "\x1b[0m";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stream {
@@ -87,10 +91,54 @@ pub(crate) fn render(stream: Stream, tone: Tone, text: impl AsRef<str>) -> Strin
         return text.to_string();
     };
     if enabled(stream) {
-        format!("\x1b[{code}m{text}\x1b[0m")
+        ansi_wrap(code, text)
     } else {
         text.to_string()
     }
+}
+
+pub(crate) fn ansi_wrap(code: &str, text: &str) -> String {
+    format!("\x1b[{code}m{text}{ANSI_RESET}")
+}
+
+#[allow(dead_code)]
+pub(crate) fn ansi_reset() -> &'static str {
+    ANSI_RESET
+}
+
+#[allow(dead_code)]
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if read_ansi_sequence(ch, &mut chars).is_some() {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[allow(dead_code)]
+pub(crate) fn read_ansi_sequence<I>(first: char, chars: &mut Peekable<I>) -> Option<(String, bool)>
+where
+    I: Iterator<Item = char>,
+{
+    if first != ANSI_ESC || chars.peek() != Some(&'[') {
+        return None;
+    }
+    let mut sequence = String::from(first);
+    if let Some(bracket) = chars.next() {
+        sequence.push(bracket);
+    }
+    for code in chars.by_ref() {
+        sequence.push(code);
+        if code.is_ascii_alphabetic() {
+            let active = sequence != ANSI_RESET;
+            return Some((sequence, active));
+        }
+    }
+    Some((sequence, false))
 }
 
 pub(crate) fn status_tone(status: impl AsRef<str>) -> Tone {

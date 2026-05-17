@@ -22035,8 +22035,9 @@ mod tui_tests {
     #[test]
     fn chain_attach_plain_emits_periodic_snapshot_no_ansi() {
         let snapshot = chain_attach_header_text(&chain_fixture());
+        let ansi_start = format!("{}[", char::from(27));
 
-        assert!(!snapshot.contains("\u{1b}["), "{snapshot}");
+        assert!(!snapshot.contains(&ansi_start), "{snapshot}");
         assert!(snapshot.contains("policy branch=stack"), "{snapshot}");
     }
 

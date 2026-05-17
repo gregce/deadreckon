@@ -23,14 +23,22 @@ fn runstatus_executing_renders_running_through_glossary() {
 #[test]
 fn raw_ansi_escapes_stay_in_ui_module() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");
-    assert!(!main.contains("\\x1b["), "main.rs contains raw ANSI");
-    let ui = fs::read_to_string(manifest.join("src/ui.rs")).expect("ui");
-    let ui_card = fs::read_to_string(manifest.join("src/ui_card.rs")).expect("ui_card");
-    assert!(
-        ui.contains("\\x1b[") || ui_card.contains("\\u{1b}["),
-        "ui modules own ANSI rendering"
-    );
+    for entry in fs::read_dir(manifest.join("src")).expect("src dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).expect("source");
+        if path.file_name().and_then(|name| name.to_str()) == Some("ui.rs") {
+            assert!(text.contains("\\x1b["), "ui.rs owns raw ANSI rendering");
+            continue;
+        }
+        assert!(
+            !text.contains("\\x1b[") && !text.contains("\\u{1b}["),
+            "{} contains raw ANSI escape construction",
+            path.display()
+        );
+    }
 }
 
 #[test]
