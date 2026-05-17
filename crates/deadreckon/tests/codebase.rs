@@ -1079,7 +1079,7 @@ fn materialize_in_place_refuses_with_undo_hint() {
 
     assert!(!materialize.status.success());
     let stderr = stderr(&materialize);
-    assert!(stderr.contains("materialize is not needed; run edited the source in-place"));
+    assert!(stderr.contains("export is not needed; run edited the source in-place"));
     assert!(stderr.contains("try: deadreckon undo"));
 }
 
@@ -1747,7 +1747,7 @@ fn materialize_in_worktree_refuses_with_apply_hint() {
 
     assert!(!materialize.status.success());
     let stderr = stderr(&materialize);
-    assert!(stderr.contains("materialize is for copy/fresh runs; run was worktree"));
+    assert!(stderr.contains("export is for copy/fresh runs; run was worktree"));
     assert!(stderr.contains(&format!("try: deadreckon apply {run_id}")));
 }
 

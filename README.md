@@ -166,8 +166,8 @@ Each accepted run produces a review packet:
 - `manifest.json` records what was built and from what.
 
 Agentic CLIs usually leave you with a patch and a transcript. deadreckon turns
-the session into a local published artifact you can inspect, materialize, extend,
-or apply.
+the session into a local published artifact you can inspect, export, extend, or
+apply.
 
 ### Resume, Kill, Extend, Or Export Any Run
 
@@ -348,7 +348,7 @@ show          inspect state, lineage, spend, files
 doc           print or export run documentation
 apply         apply a completed worktree run to your branch
 abandon       remove a worktree run and temporary branch
-materialize   copy a completed artifact to a normal directory
+export        copy a completed artifact to a normal directory
 extend        continue from a completed run
 resume        continue an interrupted run
 kill          stop a live run and child processes
@@ -359,7 +359,7 @@ import        normalize histories from other coding tools
 doctor        check config, providers, sandboxes, disk, runtime
 ```
 
-Aliases: `keep` → `apply`, `discard` → `abandon`, `export` → `materialize`, `prune` → `cleanup`, `follow-up` → `extend`, `continue` → `resume`, `stop` → `kill`, `next` → `status`.
+Aliases: `keep` → `apply`, `materialize` → `export`, `discard` → `abandon`, `prune` → `cleanup`, `follow-up` → `extend`, `continue` → `resume`, `stop` → `kill`, `next` → `status`.
 
 ## Verification
 

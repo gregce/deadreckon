@@ -199,6 +199,30 @@ fn command_help_prefers_status_finish_export_and_cleanup() {
 }
 
 #[test]
+fn current_docs_do_not_teach_stale_primary_aliases() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo = manifest
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("repo");
+    for relative in ["README.md", "HOWTO.md", "docs/DEVELOPMENT-README.md"] {
+        let text = fs::read_to_string(repo.join(relative)).expect(relative);
+        for stale in [
+            "deadreckon materialize",
+            "deadreckon next",
+            "deadreckon discard",
+            "m materialize",
+            "materialize/export",
+        ] {
+            assert!(
+                !text.contains(stale),
+                "{relative} should not teach stale primary alias `{stale}`"
+            );
+        }
+    }
+}
+
+#[test]
 fn orchestration_help_uses_plan_child_provider_language() {
     for (args, label) in [
         (["orchestrate", "--help"], "orchestrate"),

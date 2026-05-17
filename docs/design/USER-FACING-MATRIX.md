@@ -1,6 +1,6 @@
 # User-Facing Surface Matrix
 
-**Status:** Refreshed against current code at local HEAD `35d64e3` on 2026-05-17.
+**Status:** Refreshed against the local working tree on 2026-05-17.
 **Scope:** The user-visible CLI, prompts, summaries, TUI labels, JSON/plain modes, help text, docs-facing terminology, and orchestration surfaces in `/Users/gdc/deadreckon`.
 **Method:** Source audit of `crates/deadreckon/src/{cli.rs,main.rs,ui.rs,prompt.rs}` and `crates/deadreckon-core/src/{glossary.rs,state.rs,chain.rs,plan.rs}`, plus the current AS-BUILT and goal docs.
 **Read this as:** the current coherence backlog. The prior matrix cited commit `455b91a` and listed 108 issues; many of those are now implemented. This refresh keeps the visual affordances that are working and focuses the remaining user-facing drift.
@@ -16,10 +16,12 @@
 | Prompt helper | `prompt::open` and `prompt::confirm` provide a shared confirmation shape. | `crates/deadreckon/src/prompt.rs:1` | The old doc polish default-marker bug is fixed. |
 | Error hints | `error_hint` returns actionable strings and uses discovered config paths. | `crates/deadreckon/src/main.rs:147` | Generic provider/core errors now get a fallback hint. |
 | `def-done` naming | Top help and command help use `deadreckon def-done`, not `deadreckon done`. | `crates/deadreckon/src/main.rs:845`, `crates/deadreckon/src/cli.rs:189` | The screenshot miss is fixed in the current source. |
+| Help discovery | Top help, help-all, and command help now prefer canonical words: `status`, `finish`, `export`, `cleanup`, `run/chain/plan`, and aliases inline. | `crates/deadreckon/src/main.rs:834`, `crates/deadreckon/src/main.rs:917`, `crates/deadreckon/tests/coherence.rs:77` | The remaining gap is structural: the rows are tested but not generated from one command table. |
+| Copy-out wording | User-facing prompts, docs, help, and refusal text now say `export`; `materialize` remains a hidden compatibility alias/internal marker word. | `crates/deadreckon/src/main.rs:12430`, `crates/deadreckon/src/main.rs:16679`, `crates/deadreckon/tests/coherence.rs:201` | TUI key `m` is preserved while the visible action is `export`. |
 | Plan/orchestrate start output | Orchestrate preflight and started output now print mode, children, providers, source, gate, repair, sandbox, spend, wall, plan, and events. | `crates/deadreckon/src/main.rs:8604`, `crates/deadreckon/src/main.rs:8694` | This is much closer to `run` parity. |
 | Plan attach drilldown | `attach <plan-id>` can drill into a child run and return. | `crates/deadreckon/src/main.rs:16757` | Footer copy still needs coherence work. |
 | Plan event stream | `plan-events.jsonl` exists and plan attach reads it. | `crates/deadreckon-core/src/plan.rs:13`, `crates/deadreckon/src/main.rs:16768` | It is file-backed polling, not a same-process broadcast bus. |
-| Orchestrate finish/apply | Completed plans can route through `finish`, `apply`, and `materialize` by plan id. | `crates/deadreckon/src/main.rs:12232`, `crates/deadreckon/src/main.rs:12499` | Help text still leaks result-run terminology in places. |
+| Orchestrate finish/apply/export | Completed plans can route through `finish`, `apply`, and `export` by plan id. | `crates/deadreckon/src/main.rs:12232`, `crates/deadreckon/src/main.rs:12499` | Plan id is primary in help; result-run ids are secondary implementation detail. |
 | Chain glyph collision | Chain step `Applied` now uses `◉`; `Running` remains `●`. | `crates/deadreckon/src/main.rs:4824` | Preserve glyph set: `○ ● ◐ ✗ ↷ ◉ ↶`. |
 | Machine output | JSON exists on key inspect/list surfaces: list, status, show, doctor, detect, providers list, library list, and chain list/show/status. | `crates/deadreckon/src/cli.rs:898`, `crates/deadreckon/src/cli.rs:970`, `crates/deadreckon/src/cli.rs:1287`, `crates/deadreckon/src/cli.rs:1317`, `crates/deadreckon/src/cli.rs:1666`, `crates/deadreckon/src/cli.rs:1723` | Shapes and `try_lines` are not yet uniform. |
 | Visual identity | The cyan `deadreckoning` progress label, `* ^ . -` course strip, magenta ids, TUI palette, spend gradient, and step glyphs are present. | `crates/deadreckon/src/main.rs:12044`, `crates/deadreckon/src/ui.rs:25`, `crates/deadreckon/src/main.rs:20384` | Keep these; standardize their construction. |
@@ -32,37 +34,37 @@ Source: `crates/deadreckon/src/cli.rs`.
 |---|---|---:|---|---|
 | `init` | `setup` | yes | Configure once. | Good. |
 | `config` | `settings` | yes | Read/change defaults. | Uses provider route/model language. |
-| `help-all` | `commands` | yes | Discover advanced commands. | Custom help presents alias as a separate item. |
+| `help-all` | `commands` | yes | Discover advanced commands. | Alias is shown inline. |
 | `completion` | `completions` | yes | Install/generate completions. | Good. |
 | `acceptance` | none | hidden | Compatibility surface for done criteria. | Should remain advanced and defer to `def-done`. |
 | `def-done` | none | yes | Write/check done criteria. | Canonical user word. |
-| `run` | none | yes | Start one coding run. | Good, but help examples still use `next` alias. |
+| `run` | none | yes | Start one coding run. | Good. |
 | `orchestrate` | none | yes | Plan/fork/merge in one command. | Needs final word/flag/style parity with `run`. |
 | `plan` | none | yes | Write orchestration plan only. | Good advanced verb. |
 | `fork` | none | yes | Start plan children. | Good advanced verb. |
-| `merge` | none | yes | Compose plan children. | Help still points users at merged run ids. |
+| `merge` | none | yes | Compose plan children. | Help teaches `finish <plan-id>` first, then direct `apply`/`export`. |
 | `chain` | none | yes | Serial multi-step goals. | Good, but flag names and footers differ. |
 | `doctor` | `check` | yes | Check local setup. | Good. |
-| `detect` | none | yes | Probe providers. | Missing from custom top help. |
-| `providers` | none | yes | List provider routes/models. | Missing from custom top help. |
-| `update` | none | yes | Self-update. | Missing from custom top help. |
-| `list` | `runs` | yes | List runs and plans. | "runs and orchestration jobs" should become "runs and plans". |
+| `detect` | none | yes | Probe providers. | Included in custom top help. |
+| `providers` | none | yes | List provider routes/models. | Included in custom top help. |
+| `update` | none | yes | Self-update. | Included in custom top help. |
+| `list` | `runs` | yes | List runs and plans. | Good. |
 | `library` | `artifacts` | hidden | Inspect promoted artifacts. | Advanced command appears in `help-all`. |
 | `finish` | none | yes | Route completed work. | Best primary verb for most users. |
-| `materialize` | `export`, `copy-out` | hidden | Copy a completed artifact to a directory. | User-facing examples should prefer one word, likely `export`. |
+| `export` | `materialize`, `copy-out` | hidden command alias | Copy a completed artifact to a directory. | `export` is canonical; `materialize` remains compatibility/internal vocabulary. |
 | `apply` | `keep` | hidden | Merge work back into source git. | Advanced but central after completion. |
-| `abandon` | `discard` | hidden | Remove temporary worktree/branch. | Help and next actions often say `discard`. |
+| `abandon` | `discard` | hidden | Remove temporary worktree/branch. | Advanced; common flow prefers `cleanup`. |
 | `cleanup` | `prune`, `clean` | yes | Remove stale/completed worktrees. | Good primary cleanup word. |
 | `extend` | `follow-up` | yes | Continue from completed output. | Good. |
 | `doc` | `docs` | hidden | Print/regenerate run docs. | User sees both "doc" command and "docs" noun. |
-| `attach` | `watch` | yes | Open live TUI for run/plan. | Top help says "run" only. |
-| `kill` | `stop` | yes | Cancel run/plan. | Good, cascade messaging should be uniform. |
+| `attach` | `watch` | yes | Open live TUI for run, chain, or plan. | Good. |
+| `kill` | `stop` | yes | Cancel run, chain, or plan. | Good. |
 | `resume` | `continue` | yes | Resume incomplete run. | Good. |
 | `undo` | `restore` | hidden | Restore in-place snapshot. | Advanced. |
 | `show` | `inspect` | hidden | Detailed state/provenance/plan failure. | Hidden but examples rely on it. |
-| `status` | `next` | yes | Latest run and next action. | Examples still prefer `next` in several help blocks. |
+| `status` | `next` | yes | Latest run and next action. | `next` is secondary alias only. |
 | `import` | none | hidden | Import other tool history. | Advanced. |
-| `history` | none | yes | Search traces/provenance. | Missing from custom top help. |
+| `history` | none | yes | Search traces/provenance. | Included in custom top help. |
 
 ## Current Vocabulary
 
@@ -75,7 +77,7 @@ Source: `crates/deadreckon/src/cli.rs`.
 | Plan unit | task / child / worker | mixed | Use `child` for the user, `task-*` for stable ids, `worker spec` for files only. |
 | Done contract | done criteria / acceptance / gate / final gate | mixed | Use `done criteria` for users; use `gate` only in technical status rows. |
 | Provider selection | provider / route / descriptor / model | mixed | Use `provider` and `model` in normal output; reserve `route`/`descriptor` for advanced provider docs. |
-| Copy output | export / materialize / copy-out | mixed | Prefer `finish` first; direct copy action should consistently be `export` in user examples. |
+| Copy output | materialize marker / export command | `export` | Prefer `finish` first; direct copy action says `export`; `materialize` stays hidden compatibility/internal marker text. |
 | Throw away temp work | abandon / discard / cleanup | mixed | Prefer `cleanup` for common flow, one direct verb for advanced flow. |
 | Latest id | run id only / run or plan id | mixed | Say "run and plan ids accept prefixes" wherever both are accepted. |
 
@@ -85,18 +87,8 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 | ID | Surface | Current evidence | Required change |
 |---|---|---|---|
-| H1 | Two top-level help sources differ. | `TOP_LEVEL_HELP` includes `detect`, `providers`, `update`, `history`; custom `print_top_help` omits them. | Generate both from one table or make one delegate to the other. |
-| H2 | `commands` alias looks like a separate command. | `print_top_help` prints both `help-all` and `commands`. | Show aliases inline: `help-all (alias: commands)`. |
-| H3 | `list` description says "orchestration jobs". | `print_top_help` and `print_help_all`. | Use "runs and plans". |
-| H4 | `attach` help says run only. | `ATTACH_HELP`, custom top help. | Say "watch a run or plan"; mention `plan-id:task-id` drilldown. |
-| H5 | `status` help examples use `next`. | `RUN_HELP`, `ATTACH_HELP`, `STATUS_HELP`. | Prefer canonical `status`; list `next` only as an alias. |
-| H6 | Export/materialize examples are split. | `FINISH_HELP`, `MATERIALIZE_HELP`, `print_lifecycle_hints`. | Decide the user-facing direct verb and use it everywhere. |
-| H7 | Abandon/discard examples are split. | `APPLY_HELP`, `ABANDON_HELP`, `print_lifecycle_hints`. | Prefer one direct verb, and prefer `cleanup` for common cleanup. |
-| H8 | `MERGE_HELP` still teaches `materialize <merged-run-id>`. | `crates/deadreckon/src/cli.rs:179`. | Teach `finish <plan-id>` first, then optional direct `apply/export <plan-id>`. |
 | H9 | Hidden commands are discoverable through examples. | `apply`, `materialize`, `abandon`, `doc`, `show` are hidden but heavily referenced. | Define "advanced but documented" vs "hidden compatibility alias"; do not leave ghost commands. |
-| H10 | `help-all` lists `export` and `materialize` separately. | `print_help_all`. | One row with aliases inline. |
-| H11 | `acceptance` and `def-done` duplicate concepts. | `ACCEPTANCE_HELP`, `DONE_HELP`. | `def-done` is the canonical path; `acceptance` says compatibility/advanced and links to exact equivalents. |
-| H12 | Help is not snapshot-tested as a product surface. | No central help snapshot found in the audit. | Add tests for top help, help-all, run, orchestrate, plan/fork/merge, chain, finish/apply/export, def-done. |
+| H12 | Help is tested but not generated from one command table. | `crates/deadreckon/tests/coherence.rs` covers top help, help-all, and key command help, but `TOP_LEVEL_HELP`, `print_top_help`, and `print_help_all` still duplicate rows. | Add a command metadata table or stronger snapshot tests so custom help and clap help cannot drift. |
 
 ### Flags And Option Semantics
 

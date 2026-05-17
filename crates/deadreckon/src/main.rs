@@ -12272,7 +12272,7 @@ fn materialize_command(
     let paths = DeadreckonPaths::discover();
     let (state, plan_context, dest) = match load_cli_run(&paths, &run_id) {
         Ok(state) => (state, None, dest),
-        Err(run_error) => match resolve_plan_result_run(&paths, &run_id, "materialize")? {
+        Err(run_error) => match resolve_plan_result_run(&paths, &run_id, "export")? {
             Some(result) => {
                 let dest = dest.or_else(|| Some(default_plan_materialize_dest(&result.plan)));
                 (result.state, Some(result.plan), dest)
@@ -12427,13 +12427,13 @@ fn materialize_completed_run(
         match record.mode {
             CodebaseMode::Worktree => {
                 return Err(CliError::Core(deadreckon_core::user_error(
-                    "materialize is for copy/fresh runs; run was worktree",
+                    "export is for copy/fresh runs; run was worktree",
                     &format!("deadreckon apply {}", state.run_id),
                 )));
             }
             CodebaseMode::InPlace => {
                 return Err(CliError::Core(deadreckon_core::user_error(
-                    "materialize is not needed; run edited the source in-place",
+                    "export is not needed; run edited the source in-place",
                     "deadreckon undo",
                 )));
             }
@@ -12453,7 +12453,7 @@ fn materialize_completed_run(
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(run_prefix(&state.run_id))
     }))?;
-    refuse_dest_inside_home(paths, &dest, "materialize")?;
+    refuse_dest_inside_home(paths, &dest, "export")?;
     prepare_empty_dest(&dest, force)?;
 
     copy_tree(&library_dir, &dest)?;
@@ -16450,7 +16450,7 @@ fn print_run_summary(state: &deadreckon_core::PipelineState) {
     if let Ok(Some(marker)) = read_parent_marker(&state.working_dir) {
         let label = match marker.kind.as_str() {
             "extended" => format!("extended from {}", run_prefix(&marker.parent_run_id)),
-            "materialized" => format!("materialized from {}", run_prefix(&marker.parent_run_id)),
+            "materialized" => format!("exported from {}", run_prefix(&marker.parent_run_id)),
             other => format!("{other} from {}", run_prefix(&marker.parent_run_id)),
         };
         items.push(("lineage".to_string(), label));
@@ -16676,7 +16676,7 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
         let prompt_text = if is_worktree_run(state) {
             "completed action [a apply, b abandon, d docs, s show, q quit]: "
         } else {
-            "completed action [m materialize, e extend, d docs, s show, q quit]: "
+            "completed action [m export, e extend, d docs, s show, q quit]: "
         };
         let answer = prompt::open(prompt_text, None)?;
         match completion_action_from_input(&answer) {
@@ -16728,7 +16728,7 @@ enum CompletionAction {
 impl CompletionAction {
     fn label(self) -> &'static str {
         match self {
-            Self::Materialize => "materialize",
+            Self::Materialize => "export",
             Self::Extend => "extend",
             Self::Apply => "apply",
             Self::Abandon => "abandon",
@@ -16759,7 +16759,7 @@ impl CompletionAction {
 
 fn completion_action_from_input(input: &str) -> Option<CompletionAction> {
     match input.trim().to_ascii_lowercase().as_str() {
-        "m" | "materialize" => Some(CompletionAction::Materialize),
+        "m" | "export" | "materialize" => Some(CompletionAction::Materialize),
         "e" | "extend" => Some(CompletionAction::Extend),
         "a" | "apply" => Some(CompletionAction::Apply),
         "b" | "abandon" => Some(CompletionAction::Abandon),
@@ -16775,10 +16775,7 @@ fn prompt_materialize_action(
     state: &deadreckon_core::PipelineState,
 ) -> Result<()> {
     let default_dest = default_materialize_dest(state);
-    let answer = prompt::open(
-        &format!("materialize dest [{}]: ", default_dest.display()),
-        None,
-    )?;
+    let answer = prompt::open(&format!("export dest [{}]: ", default_dest.display()), None)?;
     let dest = if answer.trim().is_empty() {
         default_dest
     } else {
@@ -22182,6 +22179,10 @@ mod tui_tests {
     fn completion_action_parser_accepts_short_and_long_forms() {
         assert_eq!(
             completion_action_from_input("m"),
+            Some(CompletionAction::Materialize)
+        );
+        assert_eq!(
+            completion_action_from_input("export"),
             Some(CompletionAction::Materialize)
         );
         assert_eq!(

@@ -49,7 +49,7 @@ DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke ./target/release/deadrec
 
 ```text
 git repo: init -> run -> attach -> apply | abandon
-copy/fresh:       run -> attach -> materialize -> extend
+copy/fresh:       run -> attach -> export -> extend
 ```
 
 Start an unattended run:
@@ -80,12 +80,11 @@ If your checkout has local edits, interactive `apply` can stash and restore
 them; scripts can pass `--autostash`. Use `--cleanup` after inspection or after
 a successful apply to remove the deadreckon worktree and temporary branch.
 
-Materialize a completed copy or fresh artifact into an editable project
-directory:
+Export a completed copy or fresh artifact into an editable project directory:
 
 ```bash
 deadreckon run "make a realtime chess app" --fresh
-deadreckon materialize <run-id> --dest ./realtime-chess
+deadreckon export <run-id> --dest ./realtime-chess
 cd ./realtime-chess
 ```
 
@@ -97,7 +96,7 @@ deadreckon show <new-run-id>
 ```
 
 Completed runs print a next-action menu by default. Worktree runs offer
-`a` apply, `b` abandon, `d` docs, and `s` show. Copy/fresh runs offer `m` materialize,
+`a` apply, `b` abandon, `d` docs, and `s` show. Copy/fresh runs offer `m` export,
 `e` extend, `d` docs, and `s` show. In the TUI, the same keys are available after
 completion. Use `--no-hints` on `run` or `attach` to suppress completion
 guidance.

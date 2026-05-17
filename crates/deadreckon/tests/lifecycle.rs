@@ -157,7 +157,7 @@ fn materialize_refuses_dest_inside_runstate() {
         .expect("materialize");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("refusing to materialize back into runstate"));
+    assert!(stderr(&output).contains("refusing to export back into runstate"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

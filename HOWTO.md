@@ -275,7 +275,7 @@ After a run completes, the TUI footer adds lifecycle actions:
 a        apply a completed worktree run
 b        abandon/discard a completed worktree run
 d        toggle formatted RUN-NARRATIVE.md docs in the main panel
-m        materialize/export a completed copy/fresh artifact
+m        export a completed copy/fresh artifact
 e        extend a completed copy/fresh run with a follow-up goal
 s        show run details
 ```
@@ -300,7 +300,7 @@ deadreckon doc latest --polish --doc-provider cli:codex --max-spend 0.25
 ```
 
 The polish preview lists the provider, why it was selected, the four narrator
-subskills, token budget, budget cap, and inputs hash. `--no-confirm` skips the
+subskills, token budget, max spend, and inputs hash. `--no-confirm` skips the
 prompt for scripts. Results are recorded in `polish.json` with one status line
 per subskill.
 
@@ -312,11 +312,11 @@ Completed `run` and `extend` commands show the same lifecycle actions in the CLI
 
 ```text
 completed action [a apply, b abandon, d docs, s show, q quit]:
-completed action [m materialize, e extend, d docs, s show, q quit]:
+completed action [m export, e extend, d docs, s show, q quit]:
 ```
 
 Worktree runs use `a` to squash-apply changes to the current branch or `b` to
-discard the worktree and temporary branch. Copy/fresh runs use `m` to copy the
+abandon the worktree and temporary branch. Copy/fresh runs use `m` to export the
 library artifact into a normal directory, `e` to start a child run from the
 completed artifact, `d` to read `RUN-NARRATIVE.md`, or `s` to inspect state and lineage. Pass `--no-hints` to
 `run` or `attach` when scripting.
@@ -326,10 +326,10 @@ The CLI aliases use friendlier lifecycle names:
 ```bash
 deadreckon finish latest                            # choose apply or export from run mode
 deadreckon def-done "builds and passes tests"           # write done criteria
-deadreckon export latest --dest ./finished-project   # alias for materialize
+deadreckon export latest --dest ./finished-project   # copy an artifact to a normal directory
 deadreckon keep latest --autostash --cleanup         # alias for apply
-deadreckon discard latest                            # alias for abandon
-deadreckon next                                      # alias for status
+deadreckon abandon latest                            # remove a temporary worktree/branch
+deadreckon status                                    # latest state and next action
 deadreckon watch latest                              # alias for attach
 deadreckon stop latest                               # alias for kill
 deadreckon continue latest                           # alias for resume
@@ -352,7 +352,6 @@ deadreckon extend <worktree-run-id> "continue with the next change"
 deadreckon list
 deadreckon list --all
 deadreckon status
-deadreckon next
 deadreckon show <run-id>
 deadreckon show latest
 deadreckon inspect latest
@@ -366,7 +365,6 @@ deadreckon apply <run-id> --git-strategy merge
 deadreckon apply <run-id> --git-strategy cherry-pick --no-confirm
 deadreckon keep <run-id> --autostash --cleanup
 deadreckon abandon <run-id>
-deadreckon discard <run-id>
 deadreckon abandon <run-id> --keep-branch
 deadreckon cleanup --completed
 deadreckon cleanup --stale --escalate

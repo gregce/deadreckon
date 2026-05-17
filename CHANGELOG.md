@@ -67,6 +67,7 @@
 - Preserved the cyan `deadreckoning` banner, course strip, magenta IDs, spend gauge colors, and chain glyphs, with applied steps now using `◉`.
 - Aligned attach and kill banners across runs, chains, and plans.
 - Aligned `show --why-failed` and `chain show --why-failed` through one failure-summary layout, and added JSON output for list/status/show/doctor/provider/library inspection surfaces.
+- Made `export` the visible copy-out word in help, completion prompts, docs, and refusal text while keeping `materialize` as an alpha compatibility alias/internal marker.
 
 ## Orchestration milestone (alpha) — 2026-05-13
 
