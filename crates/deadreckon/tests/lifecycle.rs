@@ -848,7 +848,9 @@ fn help_lists_lifecycle_verbs() {
     assert!(stdout.contains("completion"));
     assert!(stdout.contains("help-all"));
     assert!(!stdout.contains("acceptance"));
-    assert!(stdout.contains("Run and plan ids accept unique prefixes"));
+    assert!(stdout.contains(
+        "Run, chain, and plan ids accept unique prefixes where that command accepts the kind"
+    ));
 }
 
 #[test]
