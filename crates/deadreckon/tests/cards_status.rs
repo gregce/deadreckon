@@ -159,6 +159,59 @@ fn status_report_marks_subscription_spend_with_tilde() {
     assert!(out.contains("~$0.000000"), "{out}");
 }
 
+#[test]
+fn status_latest_uses_same_kv_layout_for_completed_failed_running() {
+    let cases = [
+        (RunStatus::Completed, "completed ->"),
+        (RunStatus::Failed, "failed ->"),
+        (RunStatus::Executing, "running ->"),
+    ];
+    let mut layouts = Vec::new();
+
+    for (status, expected_state) in cases {
+        let temp = repo_tempdir();
+        let (paths, mut state) = state(&temp, expected_state);
+        state.status = status;
+        state.failure_reason = (status == RunStatus::Failed).then(|| "acceptance failed".into());
+        save_state(&state).expect("save state");
+
+        let output = deadreckon(&paths)
+            .current_dir(&state.cwd)
+            .args(["status", "latest", "--plain"])
+            .output()
+            .expect("status latest");
+
+        assert_success(&output);
+        let out = stdout(&output);
+        assert!(out.contains("deadreckon status"), "{out}");
+        assert!(out.contains(expected_state), "{out}");
+        assert!(!out.contains("executing"), "{out}");
+        layouts.push(status_layout_keys(&out));
+    }
+
+    assert_eq!(layouts[0], layouts[1]);
+    assert_eq!(layouts[0], layouts[2]);
+    assert_eq!(
+        layouts[0],
+        [
+            "run",
+            "state",
+            "phase",
+            "scope",
+            "updated",
+            "provider",
+            "sandbox",
+            "spend",
+            "wall",
+            "goal",
+            "state",
+            "launch-dir",
+            "working",
+            "mode",
+        ]
+    );
+}
+
 fn state(temp: &TempDir, goal: &str) -> (DeadreckonPaths, deadreckon_core::PipelineState) {
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let cwd = temp.path().join("repo");
@@ -181,6 +234,15 @@ fn state(temp: &TempDir, goal: &str) -> (DeadreckonPaths, deadreckon_core::Pipel
     state.status = RunStatus::Completed;
     save_state(&state).expect("save");
     (paths, state)
+}
+
+fn status_layout_keys(out: &str) -> Vec<String> {
+    out.lines()
+        .skip_while(|line| *line != "deadreckon status")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_once(':').map(|(key, _)| key.trim().to_string()))
+        .collect()
 }
 
 fn repo_tempdir() -> TempDir {
