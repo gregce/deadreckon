@@ -857,7 +857,7 @@ fn print_top_help() {
             "run coder/reviewer or full-plan multi-agent work",
         ),
         ("chain", "run several coding steps in sequence"),
-        ("attach", "watch a run or plan in the TUI"),
+        ("attach", "watch a run, chain, or plan in the TUI"),
         ("status", "see the latest run and next action"),
         ("list", "show runs and plans"),
         ("finish", "apply or export completed work"),
@@ -892,7 +892,7 @@ fn print_top_help() {
     }
     println!();
     println!(
-        "{} Run and plan ids accept unique prefixes. {} means the newest item for the current project.",
+        "{} Run, chain, and plan ids accept unique prefixes where that command accepts the kind. {} means the newest item for the current project.",
         ui_heading("Note:"),
         ui_command("latest")
     );
@@ -930,7 +930,7 @@ fn print_help_all() {
             "run coder/reviewer or full-plan multi-agent work",
         ),
         ("chain", "run several coding steps in sequence"),
-        ("attach", "watch a run or plan in the TUI"),
+        ("attach", "watch a run, chain, or plan in the TUI"),
         ("status", "see the latest run and next action"),
         ("list", "show runs and plans"),
         ("finish", "route completed work to apply or export"),
@@ -3665,7 +3665,7 @@ fn chain_attach_command(paths: &DeadreckonPaths, id: &str, plain: bool) -> Resul
     let id = resolve_chain_id(paths, id, false)?;
     let chain = load_chain(paths, &id)?;
     if io::stdout().is_terminal() && !plain {
-        eprintln!("attaching to chain {}", chain_prefix(&id));
+        print_attach_banner("chain", &id);
         return chain_attach_tui(paths, &id);
     }
     print_chain_attach_snapshot(&chain);
@@ -4766,7 +4766,7 @@ fn compact_reason(reason: &str) -> String {
 }
 
 fn chain_prefix(chain_id: &str) -> String {
-    chain_id.chars().take(8).collect()
+    id_prefix(chain_id)
 }
 
 fn short_sha(sha: &str) -> String {
@@ -13762,7 +13762,11 @@ fn refuse_dest_inside_home(paths: &DeadreckonPaths, dest: &Path, verb: &str) -> 
 }
 
 fn run_prefix(run_id: &str) -> String {
-    run_id.chars().take(8).collect()
+    id_prefix(run_id)
+}
+
+fn id_prefix(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 fn normalize_permissions(root: &Path) -> Result<()> {
@@ -15200,12 +15204,15 @@ async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<(
                     let plan = load_plan(&paths, &plan_id)?;
                     let show_hints = completion_hints_enabled(no_hints);
                     if io::stdout().is_terminal() && !plain {
-                        eprintln!("attaching to plan {}", run_prefix(&plan.plan_id));
+                        print_attach_banner("plan", &plan.plan_id);
                         attach_plan_tui(&paths, &plan.plan_id, show_hints).await?;
                     } else {
                         print_plan_summary(&paths, &plan, show_hints);
                     }
                     return Ok(());
+                }
+                if resolve_chain_id(&paths, &run_id, false).is_ok() {
+                    return chain_attach_command(&paths, &run_id, plain);
                 }
                 return Err(run_error);
             }
@@ -15214,7 +15221,7 @@ async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<(
     let run_id = state.run_id.clone();
     let show_hints = completion_hints_enabled(no_hints);
     if io::stdout().is_terminal() && !plain {
-        eprintln!("attaching to run {}", run_prefix(&run_id));
+        print_attach_banner("run", &run_id);
         if parent_plan.is_some() {
             attach_tui_with_parent(&paths, &run_id, show_hints, parent_plan).await?;
         } else {
@@ -15391,6 +15398,14 @@ fn print_kill_banner(kind: &str, id: &str, force: bool, processes: Option<u32>) 
         Some(count) => println!("killed {kind} {id}{forcefully} ({count} processes signalled)"),
         None => println!("killed {kind} {id}{forcefully}"),
     }
+}
+
+fn attach_banner(kind: &str, id: &str) -> String {
+    format!("attaching to {kind} {}", id_prefix(id))
+}
+
+fn print_attach_banner(kind: &str, id: &str) {
+    eprintln!("{}", attach_banner(kind, id));
 }
 
 fn kill_loaded_run(
@@ -20465,7 +20480,7 @@ mod tui_tests {
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, ChainAttachTuiState,
         CompletionAction, ProviderActivity, ProviderJsonlLogSpec, acceptance_activity_lines,
-        attach_header_text, attach_should_return_to_plan, chain_activity_lines,
+        attach_banner, attach_header_text, attach_should_return_to_plan, chain_activity_lines,
         chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
         chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
         cli_wait_status_line, collect_jsonl_provider_activity, completion_action_from_input,
@@ -20530,6 +20545,14 @@ mod tui_tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[test]
+    fn attach_banner_names_kind_and_prefix() {
+        let id = "aaaabbbbccccdddd1111222233334444";
+        assert_eq!(attach_banner("run", id), "attaching to run aaaabbbb");
+        assert_eq!(attach_banner("chain", id), "attaching to chain aaaabbbb");
+        assert_eq!(attach_banner("plan", id), "attaching to plan aaaabbbb");
     }
 
     fn doc_preview_state() -> (tempfile::TempDir, deadreckon_core::PipelineState) {

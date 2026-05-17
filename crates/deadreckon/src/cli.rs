@@ -26,7 +26,7 @@ Core lifecycle:
   run         start unattended coding work
   orchestrate run coder/reviewer or full-plan multi-agent work
   chain       run several coding steps in sequence
-  attach      watch a run or plan in the TUI
+  attach      watch a run, chain, or plan in the TUI
   status      see the latest run and next action
   list        show runs and plans
   finish      apply or export completed work
@@ -46,7 +46,7 @@ More help:
   help-all    show every command, including advanced commands (alias: commands)
   <command> --help
 
-Run and plan ids accept unique prefixes. `latest` means the newest item for the current project.";
+Run, chain, and plan ids accept unique prefixes where that command accepts the kind. `latest` means the newest item for the current project.";
 
 const COMPLETION_HELP: &str = "\
 Lifecycle:
@@ -351,11 +351,13 @@ Docs can be regenerated with a provider-backed polish pass:
 const ATTACH_HELP: &str = "\
 Lifecycle:
   deadreckon attach latest
+  deadreckon attach <chain-id>
   deadreckon attach <plan-id>
+  deadreckon attach <plan-id>:task-0
   deadreckon status latest
   deadreckon finish latest
 
-Attach opens the live TUI for a run or plan. `q`, Esc, and Ctrl-D detach without killing the work.";
+Attach opens the live TUI for a run, chain, or plan. `q`, Esc, and Ctrl-D detach without killing the work.";
 
 const KILL_HELP: &str = "\
 Lifecycle:
@@ -1210,11 +1212,11 @@ pub(crate) enum Commands {
     #[command(
         next_help_heading = "Run Lifecycle",
         visible_alias = "watch",
-        about = "Attach the live terminal UI to a run",
+        about = "Attach the live terminal UI to a run, chain, or plan",
         after_help = ATTACH_HELP
     )]
     Attach {
-        #[arg(help = "Run id, unique prefix, or latest")]
+        #[arg(help = "Run id, chain id, plan id, plan-id:task-id, unique prefix, or latest")]
         run_id: String,
         #[arg(long, help = "Suppress post-completion action hints")]
         no_hints: bool,

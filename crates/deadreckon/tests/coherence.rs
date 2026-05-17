@@ -59,7 +59,10 @@ fn top_help_uses_canonical_discovery_words() {
             "top help should include {command} in More help:\n{top}"
         );
     }
-    assert!(top.contains("watch a run or plan in the TUI"), "{top}");
+    assert!(
+        top.contains("watch a run, chain, or plan in the TUI"),
+        "{top}"
+    );
     assert!(top.contains("show runs and plans"), "{top}");
     assert!(
         top.contains("show every command, including advanced commands (alias: commands)"),
@@ -74,7 +77,9 @@ fn top_help_uses_canonical_discovery_words() {
         "plan-facing help should not say jobs:\n{top}"
     );
     assert!(
-        top.contains("Run and plan ids accept unique prefixes."),
+        top.contains(
+            "Run, chain, and plan ids accept unique prefixes where that command accepts the kind."
+        ),
         "{top}"
     );
 }
@@ -108,9 +113,14 @@ fn command_help_prefers_status_finish_export_and_cleanup() {
 
     let attach = help(["attach", "--help"]);
     assert!(attach.contains("deadreckon status latest"), "{attach}");
+    assert!(attach.contains("deadreckon attach <chain-id>"), "{attach}");
     assert!(attach.contains("deadreckon attach <plan-id>"), "{attach}");
     assert!(
-        attach.contains("Attach opens the live TUI for a run or plan."),
+        attach.contains("deadreckon attach <plan-id>:task-0"),
+        "{attach}"
+    );
+    assert!(
+        attach.contains("Attach opens the live TUI for a run, chain, or plan."),
         "{attach}"
     );
     assert!(
@@ -241,6 +251,50 @@ fn attach_plan_plain_displays_running_for_inflight_child() {
         "{stdout}"
     );
     assert!(stdout.contains("run id aaaabbbb"), "{stdout}");
+}
+
+#[test]
+fn top_level_attach_plain_accepts_chain_id() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let mut chain = Chain::new(ChainNewOptions {
+        root_goal: "top-level chain attach".to_string(),
+        goals: vec!["first step".to_string(), "second step".to_string()],
+        scope: workspace_scope(&cwd).expect("scope"),
+        base_branch: "main".to_string(),
+        base_sha: "0123456789abcdef".to_string(),
+        cwd: cwd.clone(),
+        provider: None,
+        model: None,
+        sandbox: "none".to_string(),
+        branch_policy: BranchPolicy::Stack,
+        apply_mode: ApplyMode::Manual,
+        apply_strategy: ApplyStrategy::Squash,
+        apply_allowlist: Vec::new(),
+        on_fail: OnFail::Stop,
+        circuit_breaker_threshold: 1,
+        max_spend_usd: Some(1.0),
+        max_wall_seconds: None,
+        deadreckon_version: "0.1.0".to_string(),
+    })
+    .expect("chain");
+    chain.status = ChainStatus::Running;
+    chain.steps[0].status = ChainStepStatus::Running;
+    save_chain(&paths, &chain).expect("save chain");
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["attach", &chain.chain_id[..8], "--plain"])
+        .output()
+        .expect("attach chain");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = stdout(&output);
+    assert!(stdout.contains(&chain.chain_id[..8]), "{stdout}");
+    assert!(stdout.contains("step 1"), "{stdout}");
+    assert!(stdout.contains("[r] redo"), "{stdout}");
 }
 
 #[test]
