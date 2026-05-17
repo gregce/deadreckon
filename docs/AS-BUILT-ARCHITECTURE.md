@@ -1668,7 +1668,7 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 ## 26. Coherence Pass (alpha)
 
-> **Status (2026-05-17):** The May 2026 coherence pass — glossary, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, JSON parity — is **alpha-complete and described below**. A follow-on **closure pass** is queued but not yet applied: it targets the orchestration surfaces (`orchestrate`, `plan`, `fork`, `merge`, `finish`) and the plan-attach TUI that landed after this section was first written. The closure brief is at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md` (with rider) and `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`; the inconsistency catalog is `docs/design/USER-FACING-MATRIX.md`. The closure pass is intentionally schema-preserving (no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant renames; only display strings change via `glossary.rs`).
+> **Status (2026-05-17):** The May 2026 coherence pass — glossary, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, JSON parity — is **alpha-complete and described below**. The follow-on **closure pass** is now in progress for surfaces that landed later: orchestration commands, plan attach, provider-route wording, and polymorphic lifecycle ids. The closure brief is at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md` (with rider) and `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`; the inconsistency catalog is `docs/design/USER-FACING-MATRIX.md`. The closure pass is intentionally schema-preserving (no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant renames; only display strings change via `glossary.rs`).
 
 ### 26.1 Glossary
 
@@ -1692,7 +1692,7 @@ The alpha CLI names intent before force. Kill paths use `--escalate`; destinatio
 
 ### 26.6 Attach And Kill Parity
 
-`attach <id>` prints `attaching to run|chain|plan <prefix>` to stderr before opening a TUI. `kill <run-id>`, `chain kill`, and `kill <plan-id>` route through one banner shape; plan kill keeps the plan-only process count.
+`attach <id>` prints `attaching to run|chain|plan <prefix>` to stderr before opening a TUI. `kill <id>` accepts run, chain, and plan ids and routes through one banner shape; plan kill keeps the plan-only process count.
 
 ### 26.7 TUI Palette And Parity
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## Coherence closure (alpha) - 2026-05-17
+
+- Aligned top-level `attach` and `kill` id handling so run, chain, and plan ids all resolve through the normal lifecycle commands, with shared `attaching to <kind> <prefix>` and `killed <kind> <prefix>` banner wording.
+- Clarified help for `attach`, `kill`, and `show` to name run, chain, plan, and `plan-id:task-id` support where the commands already accept those ids.
+- Aligned provider setup wording so `doctor`, `detect`, and `providers list` use the same `kind=cli|http|local-http|scripted|custom` tokens and normal help says provider route instead of descriptor.
+- Added coherence coverage for the updated help, top-level chain attach/kill dispatch, provider kind vocabulary, and plan-child show help.
+
 ## Semantic merge repair (alpha) - 2026-05-16
 
 - Changed orchestration merge to default to DAG-aware composition, so descendant child artifacts can supersede ancestor file edits without a manual `prefer-child` retry.
