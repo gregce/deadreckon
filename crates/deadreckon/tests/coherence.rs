@@ -199,6 +199,40 @@ fn command_help_prefers_status_finish_export_and_cleanup() {
 }
 
 #[test]
+fn orchestration_help_uses_plan_child_provider_language() {
+    for (args, label) in [
+        (["orchestrate", "--help"], "orchestrate"),
+        (["plan", "--help"], "plan"),
+        (["fork", "--help"], "fork"),
+        (["merge", "--help"], "merge"),
+    ] {
+        let out = help(args);
+        assert!(
+            !out.contains("job"),
+            "{label} help should not say job:\n{out}"
+        );
+        assert!(
+            !out.contains("descriptor"),
+            "{label} help should reserve descriptor for technical docs:\n{out}"
+        );
+        assert!(
+            out.contains("plan"),
+            "{label} help should name plans:\n{out}"
+        );
+        assert!(
+            out.contains("child"),
+            "{label} help should name children:\n{out}"
+        );
+        if label != "merge" {
+            assert!(
+                out.contains("provider"),
+                "{label} help should surface provider selection:\n{out}"
+            );
+        }
+    }
+}
+
+#[test]
 fn attach_plain_displays_running_for_executing_run() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
