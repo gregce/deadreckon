@@ -15425,10 +15425,14 @@ fn kill_plan_command(paths: &DeadreckonPaths, plan_id: &str, force: bool) -> Res
 }
 
 fn print_kill_banner(kind: &str, id: &str, force: bool, processes: Option<u32>) {
+    println!("{}", kill_banner(kind, id, force, processes));
+}
+
+fn kill_banner(kind: &str, id: &str, force: bool, processes: Option<u32>) -> String {
     let forcefully = if force { " forcefully" } else { "" };
     match processes {
-        Some(count) => println!("killed {kind} {id}{forcefully} ({count} processes signalled)"),
-        None => println!("killed {kind} {id}{forcefully}"),
+        Some(count) => format!("killed {kind} {id}{forcefully} ({count} processes signalled)"),
+        None => format!("killed {kind} {id}{forcefully}"),
     }
 }
 
@@ -20517,7 +20521,7 @@ mod tui_tests {
         chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
         cli_wait_status_line, collect_jsonl_provider_activity, completion_action_from_input,
         completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
-        doc_polish_preview_text, implementation_plan_warnings, live_file_lines,
+        doc_polish_preview_text, implementation_plan_warnings, kill_banner, live_file_lines,
         markdown_to_tui_lines, max_panel_scroll, per_step_wall_cap, plan_attach_footer,
         provider_ingest_base_roots, provider_jsonl_activity_lines,
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
@@ -20585,6 +20589,22 @@ mod tui_tests {
         assert_eq!(attach_banner("run", id), "attaching to run aaaabbbb");
         assert_eq!(attach_banner("chain", id), "attaching to chain aaaabbbb");
         assert_eq!(attach_banner("plan", id), "attaching to plan aaaabbbb");
+    }
+
+    #[test]
+    fn kill_banner_names_kind_prefix_and_plan_process_count() {
+        assert_eq!(
+            kill_banner("run", "aaaabbbb", false, None),
+            "killed run aaaabbbb"
+        );
+        assert_eq!(
+            kill_banner("chain", "aaaabbbb", true, None),
+            "killed chain aaaabbbb forcefully"
+        );
+        assert_eq!(
+            kill_banner("plan", "aaaabbbb", true, Some(3)),
+            "killed plan aaaabbbb forcefully (3 processes signalled)"
+        );
     }
 
     fn doc_preview_state() -> (tempfile::TempDir, deadreckon_core::PipelineState) {
