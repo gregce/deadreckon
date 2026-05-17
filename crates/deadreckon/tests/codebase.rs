@@ -352,7 +352,7 @@ fn branch_collision_refused_with_branch_hint() {
         .arg("run")
         .arg("branch collision")
         .arg("--smoke")
-        .arg("--branch")
+        .arg("--branch-name")
         .arg("main")
         .arg("--yes")
         .output()
@@ -361,7 +361,7 @@ fn branch_collision_refused_with_branch_hint() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(stderr.contains("branch main already exists"));
-    assert!(stderr.contains("try: pass --branch <other-name>"));
+    assert!(stderr.contains("try: pass --branch-name <other-name>"));
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 

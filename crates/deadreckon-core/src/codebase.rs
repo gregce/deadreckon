@@ -227,7 +227,7 @@ pub fn prepare_worktree_record(
     if git_ref_exists(&git_root, &branch_name)? {
         return Err(user_error(
             &format!("branch {branch_name} already exists"),
-            "pass --branch <other-name>",
+            "pass --branch-name <other-name>",
         ));
     }
     let scope = workspace_scope(&git_root)?;
