@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-15 (plan observability alpha)
+**Last updated:** 2026-05-17 (orchestration apply/finish, gate continues after failure, full distribution pipeline)
 **Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -478,10 +478,11 @@ main.rs run_command()
 `Completed` is only reached if the turn loop emits `RunLoopOutcome::Done`, which itself requires:
 
 1. The loop saw `Action::Done` (or a CLI sub-agent finished with file changes), **and**
-2. `run_acceptance_gate(state)` succeeded (invoked the external `dr-gate` binary), **and**
-3. `validate_acceptance_marker(state)` succeeded (signature + run_id check), **and**
-4. `promote_if_ready(state)` swapped `working/` → `library/<scope>/<run_id>/`, **and**
-5. `set_phase_status(PhaseId(60), Completed)` ran (which is the only path to `RunStatus::Completed`).
+2. `acceptance_gate_passed_or_record_failure(state, ...)` returned `true` after invoking `dr-gate` and validating the signed marker (`turn_loop.rs:1298`). Gate failures are non-terminal: the helper logs them and returns `false`, letting the loop continue until the gate passes or the turn budget is exhausted (§13.6), **and**
+3. `promote_if_ready(state)` swapped `working/` → `library/<scope>/<run_id>/`, **and**
+4. `set_phase_status(PhaseId(60), Completed)` ran (which is the only path to `RunStatus::Completed`).
+
+If gate failures accumulate during a run, `state.failure_reason` accumulates a chained record (e.g. `"acceptance failed after turn 3: ...; acceptance failed after turn 5: ...; max turn budget exhausted"`).
 
 ---
 
@@ -736,13 +737,13 @@ pub trait Provider: Send + Sync {
 }
 ```
 
-`ProviderRequest` (`lib.rs:83-91`) carries: `prompt`, `max_output_tokens`, optional `cwd`, optional `output_path`, optional `sandbox_backend`, optional `pid_file`, optional `cancellation_token`.
+`ProviderRequest` (`types.rs:89`) carries: `prompt`, `max_output_tokens`, optional `cwd`, optional `output_path`, optional `sandbox_backend`, optional `pid_file`, optional `cancellation_token`.
 
-`ProviderResponse` (`lib.rs:94-102`) carries: `provider`, `model`, `content`, `usage`, `spend`, `trace` (JSON value).
+`ProviderResponse` (`types.rs:100`) carries: `provider`, `model`, `content`, `usage`, `spend`, `trace` (JSON value).
 
 ### 10.2 Kinds
 
-`lib.rs:52-61`:
+`types.rs:18`:
 
 ```rust
 pub enum ProviderKind {
@@ -1055,17 +1056,14 @@ The progress file is truncated at the start of each evaluation so resumed/extend
 
 ### 13.6 Where the gate is invoked
 
-The CLI sub-agent path and regular Done path in `crates/deadreckon-runtime/src/turn_loop.rs` both call:
+When the turn loop emits `Action::Done` — either through a CLI sub-agent finishing or a JSON-action provider returning `Done` — it routes through `acceptance_gate_passed_or_record_failure` (`crates/deadreckon-runtime/src/turn_loop.rs:1298`). Both call sites (`turn_loop.rs:359` for JSON Done, `turn_loop.rs:615` for CLI sub-agent Done) use this helper.
 
-```rust
-run_acceptance_gate(state)?;
-validate_acceptance_marker(state)?;
-promote_if_ready(state)?;
-```
+The helper composes `run_acceptance_gate` (invokes `dr-gate` as a subprocess) and `validate_acceptance_marker` (signature + run_id check):
 
-The first call invokes `dr-gate` as a subprocess. The second validates what `dr-gate` wrote. The third atomically swaps the working tree into the library.
+- **If the gate passes:** the helper returns `true` and the loop continues into `promote_if_ready`.
+- **If the gate fails:** the helper logs `acceptance.failed` to `traces.jsonl`, appends an explicit corrective hint to the run history (`"acceptance failed after turn N: <reason>. Continue by fixing the failing done criteria; do not declare done until dr-gate passes."`), emits a `RunEventKind::Error` event, records the reason in `state.failure_reason`, and **returns `false` — the run does not terminate**.
 
-Failure at any step prevents the run from reaching `Completed`.
+The agent sees the failure inside the next turn doc and can revise the working tree and re-declare `Done`. Only when the turn budget is exhausted does the run fail; at that point the accumulated reasons in `state.failure_reason` become the final `failure_reason` text (`turn_loop.rs:633`).
 
 ---
 
@@ -1183,6 +1181,8 @@ See `/Users/gdc/deadreckon/docs/RESUME-SEMANTICS.md` for the contract.
 
 The handler creates an `imported-<hash>` run, parses the source, appends entries to `traces.jsonl` + `provenance.jsonl`, marks the run `Completed` (skipping the gate), and never writes back to the source. Current coverage is **inventory-level**: it produces a listing/summary but doesn't deeply normalize all fields. Round-trip parity (import → `show <id>` → render comparable to source) is a hardening target — see `docs/goals/2026-05-11-1400-deadreckon-robust-rider.md` §7.
 
+`deadreckon import` is the *user-driven* ingest. The *TUI-driven* ingest path that lets `attach` read live provider transcripts (Codex, Claude Code, Gemini, OpenCode, Copilot, Pi) is descriptor-driven and lives in `crates/deadreckon-providers/descriptors/`; see `docs/design/PROVIDER-CLI-INGEST.md` for the schema, candidate discovery, cwd matching, and per-provider parsers.
+
 ---
 
 ## 17. CLI Surface
@@ -1191,24 +1191,38 @@ The `Commands` enum in `crates/deadreckon/src/main.rs` defines the CLI surface. 
 
 | Verb | Handler | Role |
 |---|---|---|
-| `init` | `main.rs:241` | Interactive setup of `~/.deadreckon/config.toml` |
-| `config get/set` | `main.rs:279` | Non-interactive TOML edits |
-| `run` | `main.rs:316` | Create + enter turn loop |
-| `doctor` | `main.rs:484` | 8-point actionable preflight |
-| `status` / `next` | `main.rs` | Current project's latest run, locations, and next action |
-| `list` | `main.rs` | Project-scoped run inventory by default; `--all` for global history, `--full` for exact values |
-| `apply` | `main.rs` | Apply a completed worktree run to the user's current branch |
-| `abandon` / `discard` | `main.rs` | Remove a run's worktree branch/path or mark no-op modes abandoned |
-| `materialize` / `export` | `main.rs` | Copy a completed fresh/copy artifact to a normal directory |
-| `cleanup` / `prune` | `main.rs` | Clean abandoned, stale, or selected completed worktree runs |
-| `attach` | `main.rs:874` | TUI on a live or completed run |
-| `kill` | `main.rs:885` | Lock release + child PID termination |
-| `resume` | `main.rs:940` | Re-enter the loop on a non-Completed run |
-| `undo` | `main.rs:1002` | Restore snapshot to a target turn |
-| `show` | `main.rs:1025` | Pretty-print full state + provenance + traces |
-| `import` | `main.rs:1056` | Read-only import from claude/codex/cursor |
-| `chain` | `main.rs:1246` | Create, plan, run, attach, pause/resume/kill, undo, extend, and redo serial autonomous chains |
-| `completion` / `completions` | `main.rs` | Generate or install shell tab-completion scripts (bash, zsh, fish, elvish, powershell) |
+| `init` | `cli.rs:440` | Interactive setup of `~/.deadreckon/config.toml` |
+| `config get/set` | `cli.rs:465` | Non-interactive TOML edits |
+| `run` | `cli.rs:537` | Create + enter turn loop |
+| `doctor` | `cli.rs:910` | 8-point actionable preflight |
+| `status` / `next` | `cli.rs:1308` | Current project's latest run, locations, and next action |
+| `list` | `cli.rs:964` | Project-scoped run inventory by default; `--all` for global history, `--full` for exact values |
+| `apply` | `cli.rs:1062` | Apply a completed worktree run (or merged plan result) to the user's current branch |
+| `finish` | `cli.rs:992` | Choose the right completion action (apply for git worktrees, export for non-git) for a run or merged plan |
+| `abandon` / `discard` | `cli.rs:1103` | Remove a run's worktree branch/path or mark no-op modes abandoned |
+| `materialize` / `export` | `cli.rs:1041` | Copy a completed fresh/copy artifact (or merged plan result) to a normal directory |
+| `cleanup` / `prune` | `cli.rs:1121` | Clean abandoned, stale, or selected completed worktree runs |
+| `attach` | `cli.rs:1216` | TUI on a live or completed run, chain, or plan |
+| `kill` | `cli.rs:1230` | Lock release + child PID termination (run, chain, or plan) |
+| `resume` | `cli.rs:1248` | Re-enter the loop on a non-Completed run |
+| `extend` | `cli.rs:1149` | Re-open a completed run with a follow-up goal that inherits history |
+| `undo` | `cli.rs:1265` | Restore snapshot to a target turn |
+| `show` | `cli.rs:1281` | Pretty-print full state + provenance + traces; `--why-failed` for runs and plans |
+| `import` | `cli.rs:1329` | Read-only import from claude/codex/cursor |
+| `chain` | `cli.rs:798` | Create, plan, run, attach, pause/resume/kill, undo, extend, and redo serial autonomous chains |
+| `orchestrate` | `cli.rs:630` | One-command wrappers for `review` and `full-plan` multi-agent runs |
+| `plan` | `cli.rs:679` | Write an orchestration plan (worker specs + `plan.json`) without starting child runs |
+| `fork` | `cli.rs:720` | Spawn ready child runs for a plan and supervise them through completion |
+| `merge` | `cli.rs:756` | Compose completed child library artifacts into a new promoted run (with semantic merge repair) |
+| `def-done` | `cli.rs:502` | Write, add, show, or check the project's English done criteria |
+| `acceptance` | `cli.rs:492` | Create, refine, explain, or check project acceptance criteria |
+| `doc` | `cli.rs:1182` | Print run narrative, as-built, decisions, or delta; with optional polish pass |
+| `history` | `cli.rs:1298` | Search durable run traces and provenance (regex/scope/plan filters) |
+| `library` | `cli.rs:983` | Query promoted run artifacts by goal/date/scope |
+| `detect` | `cli.rs:919` | Probe registered providers and return availability and credential status |
+| `providers` | `cli.rs:932` | List provider routes, models, kind tokens, and the active selection |
+| `update` | `cli.rs:941` | Check for or route self-updates via npm, Homebrew, shell, Cargo, or source channel |
+| `completion` / `completions` | `cli.rs:482` | Generate or install shell tab-completion scripts (bash, zsh, fish, elvish, powershell) |
 
 The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defaults to `$10` (with a confirmation gate above `$50`), `--provider` defaults to the highest-credentialed entry per the fallback chain, `--skill` defaults to `default-coding`.
 
@@ -1228,6 +1242,8 @@ The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defau
 
 - On a TTY: `attach_tui()` enables raw mode, alternate screen, and renders a `ratatui` UI.
 - Off-TTY: prints a plain-text summary + locations.
+
+`attach` dispatches by id kind: a run id opens the run TUI documented below, a chain id opens the chain attach view (`Chains`, §28), and a plan id opens the plan attach TUI (`Plans`, §30.3 / §32.3). All three TUIs draw from the same palette (`ui::TUI_PALETTE`, §26.7) and the same key conventions (`q`/`Esc`/`Ctrl-D` detach; `d` toggles docs view in the run TUI; `Enter` drills into a child run from plan attach).
 
 ### 18.2 Layout
 
@@ -1334,7 +1350,7 @@ Three credential paths:
 2. **CLI subscription.** Run with `--provider cli:claude-code` or `cli:codex`. The binary's presence in `$PATH` is the credential. No key required.
 3. **OpenAI-compatible.** Plug an OpenRouter or `llama.cpp` endpoint into `base_url` + `api_key`.
 
-`deadreckon init` (`main.rs:241-277`) walks the user through option (1) or (2): it detects `claude` and `codex` in `$PATH` and offers them as default providers before asking for keys.
+`deadreckon init` walks the user through option (1) or (2): it queries the provider registry for any subscription CLI provider whose binary is available (`auto_subscription_cli_provider`, `main.rs:1192`) and offers the first match — `cli:claude-code`, `cli:codex`, `cli:gemini`, `cli:opencode`, `cli:copilot`, or `cli:pi`, depending on what's installed — before asking for keys. The interactive fallback still defaults to `claude` or `codex` if both are present (`main.rs:11759`). When the chosen provider is a `cli:*` route, the generated config preserves it in the fallback chain rather than overwriting with the historic claude/codex default (commit `a38f516`).
 
 ---
 
@@ -1652,6 +1668,8 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 ## 26. Coherence Pass (alpha)
 
+> **Status (2026-05-17):** The May 2026 coherence pass — glossary, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, JSON parity — is **alpha-complete and described below**. A follow-on **closure pass** is queued but not yet applied: it targets the orchestration surfaces (`orchestrate`, `plan`, `fork`, `merge`, `finish`) and the plan-attach TUI that landed after this section was first written. The closure brief is at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md` (with rider) and `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`; the inconsistency catalog is `docs/design/USER-FACING-MATRIX.md`. The closure pass is intentionally schema-preserving (no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant renames; only display strings change via `glossary.rs`).
+
 ### 26.1 Glossary
 
 `crates/deadreckon-core/src/glossary.rs` is the display vocabulary source for statuses and primary nouns. Stored enum variants keep their alpha schema names, including `RunStatus::Executing`, but user-facing run and phase text now renders `running`. Chains, chain steps, plan status, and plan-child status use the same helper family, so `attach <plan-id> --plain`, `merge <plan-id>`, and `status <run-id>` agree on `running`.
@@ -1878,7 +1896,7 @@ At launch time the coordinator rewrites the spec for dependent tasks with comple
 
 ### 30.4 Merge Artifact
 
-Merge creates a normal promoted run so existing `materialize`, `library`, and run inspection paths keep working. The promoted library also gets `deadreckon-plan-manifest.json` with plan id, root goal, mode, provider roles, capability preview, task graph, child run ids, summary paths, coordinator message counts, and recorded conflicts.
+Merge creates a normal promoted run so existing `materialize`, `library`, and run inspection paths keep working. Plan ids resolve through the same prefix-matching path as run ids, so `apply <plan-id>`, `finish <plan-id>`, `export <plan-id>`, and `materialize <plan-id>` all accept either a full plan id or an unambiguous prefix and route through `resolve_plan_result_run` (`main.rs:12508`) onto the merged promoted run. `apply <plan-id>` lands the merged tree on the source branch (with `--autostash` / `--cleanup` honored exactly as for normal runs); `finish <plan-id>` picks `apply` for git worktrees and `export` for non-git sources; `export <plan-id> --dest <path>` writes the merged library to disk. The promoted library also gets `deadreckon-plan-manifest.json` with plan id, root goal, mode, provider roles, capability preview, task graph, child run ids, summary paths, coordinator message counts, and recorded conflicts.
 
 Conflict bundles are versioned JSON objects. `conflicts.json` records the strategy, conflict path, child indexes, task ids, run ids, artifact roots, artifact file paths, content hashes, and dependency edges. `repair-request.json` adds root goal, task graph, worker-spec paths, child summary paths, recent plan events, and `merge-working` so the planner can decide without reading sibling transcripts. `repair-plan.json` stores the validated provider decision and rationale. If the planner chooses a repair child, `repair-run.json` stores the normal run id/scope/status, and the repaired promoted library is copied back into `merge-working` before the final plan merge run is created.
 
@@ -1894,7 +1912,7 @@ The plan TUI still reads child state/traces from disk on refresh and the plan ev
 
 ### 31.1 Install Receipts And Update Cache
 
-The install channel is durable, not guessed on every command. `crates/deadreckon-core/src/install_receipt.rs` defines `Receipt` with `channel`, `channel_version`, `binary_path`, optional install source/platform package, and `receipt_version`. The receipt is stored at `~/.deadreckon/install-receipt.json`.
+The install channel is durable, not guessed on every command. `crates/deadreckon-core/src/install_receipt.rs` defines `Receipt` with `channel` (a lowercase enum: `npm`, `brew`, `shell`, `cargo`, or `source`), `channel_version`, `binary_path`, `installed_at` (ISO-8601 UTC), optional `install_source` and `platform_package`, and `receipt_version`. The receipt is stored at `~/.deadreckon/install-receipt.json`.
 
 When a receipt is missing, normal `deadreckon update` detects the current binary path and persists the inferred receipt before routing the update. `deadreckon update --check` deliberately remains read-only and does not write that receipt. Detection recognizes npm package layouts, Homebrew Cellar paths, `~/.cargo/bin`, shell installer paths under `~/.local/share/deadreckon` or `%LOCALAPPDATA%/deadreckon`, and falls back to `source`.
 
@@ -1925,9 +1943,9 @@ Shell-channel installs are updated in place through `axoupdater`. Before mutatin
 
 ### 31.4 npm And Homebrew
 
-The npm distribution uses a small `deadreckon` wrapper package with optional dependencies on five platform packages: darwin-arm64, darwin-x64, linux-arm64, linux-x64, and win32-x64. `npm/scripts/prepare-release.mjs` repacks cargo-dist artifacts into those platform package directories and updates versions from the tag. The wrapper `postinstall` writes an npm receipt without network access, so future `deadreckon update` calls know they should route back to npm.
+The npm distribution uses a small `deadreckon` wrapper package with optional dependencies on five platform packages: darwin-arm64, darwin-x64, linux-arm64, linux-x64, and win32-x64. `npm/scripts/prepare-release.mjs` repacks cargo-dist artifacts into those platform package directories and updates versions from the tag. The wrapper `postinstall` (`npm/deadreckon/scripts/postinstall.js`) runs at install time, detects which platform package was selected, and writes an `install-receipt.json` with `channel: "npm"`, `install_source: "npm:deadreckon@<version>"`, and `platform_package: "<detected>"` — no network needed at update time. `.github/workflows/publish-npm.yml` (invoked from the release workflow) publishes the wrapper plus all five platform packages with `NPM_TOKEN`.
 
-Homebrew publishing uses cargo-dist formula output, then `release/homebrew/patch-formula.mjs` pins release archive SHA-256 values and injects receipt writing into the formula. The release workflow publishes the patched formula into `gdc/homebrew-tap` with `HOMEBREW_TAP_TOKEN`.
+Homebrew publishing uses cargo-dist's generated formula as the starting point. `release/homebrew/patch-formula.mjs` then injects a `write_deadreckon_receipt!` method into the formula and calls it from the `install` block; the injected code writes `install-receipt.json` with `channel: "brew"` and `install_source: "brew:gdc/tap/deadreckon"` at install time. cargo-dist itself still owns release-archive SHA-256 pinning. The release workflow publishes the patched formula into `gdc/homebrew-tap` with `HOMEBREW_TAP_TOKEN`.
 
 ### 31.5 Current Limits
 
@@ -1945,7 +1963,7 @@ The stream is orchestration-level only. It records plan and task lifecycle edges
 
 ### 32.2 Emission Points
 
-`plan` appends `plan_created` after `plan.json` is saved. `fork` appends `plan_started`, task ready/start events, child run discovery when a PID or run id becomes known, terminal task events, and dependency blocker events. `merge` appends merge start/conflict, optional repair planned/started/run-discovered/repaired/failed events, merge completed, and plan completion. `kill <plan-id>` appends task killed, plan killed, and plan failed events while preserving discovered child run ids even if a child already reached a terminal state before the kill sweep loaded it.
+`plan` appends `plan_created` after `plan.json` is saved. `fork` appends `plan_started` exactly once per invocation, then `task_ready` for each task in the ready batch, `task_started` before each child spawn, `task_run_discovered` when a PID or run id becomes known, and one of `task_completed` / `task_failed` / `task_blocked` / `task_killed` on each terminal transition (including dependency-blocker events). `merge` appends `merge_started`, optional `merge_conflict`, then the optional repair sequence (`merge_repair_planned` / `merge_repair_started` / `merge_repair_run_discovered` / `merge_repaired` or `merge_repair_failed`), then `merge_completed` and `plan_completed`. Idempotency and ordering are covered by depth tests added in commit `4fcb7f9`. `kill <plan-id>` appends `task_killed` per child, then `plan_killed` and `plan_failed`, preserving discovered run ids and PIDs even if a child already reached a terminal state before the kill sweep loaded it so recovery commands can still map live processes back to durable state.
 
 ### 32.3 User Surfaces
 
