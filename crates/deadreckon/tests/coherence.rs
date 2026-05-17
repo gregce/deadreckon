@@ -152,6 +152,17 @@ fn command_help_prefers_status_finish_export_and_cleanup() {
     );
     assert!(show.contains("Run id, plan id, plan-id:task-id"), "{show}");
 
+    let detect = help(["detect", "--help"]);
+    assert!(detect.contains("registered provider routes"), "{detect}");
+    assert!(!detect.contains("descriptor data"), "{detect}");
+
+    let providers = help(["providers", "list", "--help"]);
+    assert!(
+        providers.contains("List registered provider routes"),
+        "{providers}"
+    );
+    assert!(!providers.contains("descriptor registry"), "{providers}");
+
     let merge = help(["merge", "--help"]);
     assert!(merge.contains("deadreckon finish <plan-id>"), "{merge}");
     assert!(merge.contains("deadreckon apply <plan-id>"), "{merge}");

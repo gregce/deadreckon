@@ -91,8 +91,8 @@ Lifecycle:
   deadreckon detect --json
   deadreckon detect ollama --ping
 
-Detect probes registered providers from descriptor data. CLI providers check PATH
-and version output; API providers check credentials by default and only touch
+Detect probes registered provider routes. CLI providers check PATH and version
+output; API providers check credentials by default and only touch
 endpoints when `--ping` is supplied.";
 
 const PROVIDERS_HELP: &str = "\
@@ -103,7 +103,7 @@ Lifecycle:
   deadreckon run \"goal\" --provider cli:codex --model gpt-5.1-codex
 
 `providers list` is registry-backed. By default it shows the configured
-provider route; `--all` shows every built-in and override descriptor.";
+provider route; `--all` shows every built-in and override provider route.";
 
 const UPDATE_HELP: &str = "\
 Lifecycle:
@@ -920,7 +920,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Setup",
-        about = "Probe registered providers from descriptor data",
+        about = "Probe registered provider routes",
         after_help = DETECT_HELP
     )]
     Detect {
@@ -933,7 +933,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Setup",
-        about = "List registered provider descriptors",
+        about = "List registered provider routes",
         after_help = PROVIDERS_HELP
     )]
     Providers {
@@ -1662,7 +1662,7 @@ pub(crate) enum ConfigCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum ProvidersCommand {
-    #[command(about = "List providers registered in the descriptor registry")]
+    #[command(about = "List registered provider routes")]
     List {
         #[arg(long, help = "Also list model catalog entries")]
         models: bool,
