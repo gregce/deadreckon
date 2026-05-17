@@ -20526,12 +20526,12 @@ mod tui_tests {
         CompletionAction, ProviderActivity, ProviderJsonlLogSpec, acceptance_activity_lines,
         attach_banner, attach_header_text, attach_should_return_to_plan, chain_activity_lines,
         chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
-        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
+        chain_step_dot, chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
         cli_wait_status_line, collect_jsonl_provider_activity, completion_action_from_input,
         completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
         doc_polish_preview_text, implementation_plan_warnings, kill_banner, live_file_lines,
-        markdown_to_tui_lines, max_panel_scroll, per_step_wall_cap, plan_attach_footer,
-        provider_ingest_base_roots, provider_jsonl_activity_lines,
+        markdown_to_tui_lines, max_panel_scroll, meter_color, per_step_wall_cap,
+        plan_attach_footer, provider_ingest_base_roots, provider_jsonl_activity_lines,
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
         render_attach, render_plan_attach, threshold_color,
@@ -21325,6 +21325,18 @@ mod tui_tests {
     }
 
     #[test]
+    fn spend_gauge_uses_gradient_and_pause_cap_palette() {
+        let (_temp, mut state) = doc_preview_state();
+
+        assert_eq!(meter_color(0.30, &state), Color::Green);
+        assert_eq!(meter_color(0.70, &state), Color::Yellow);
+        assert_eq!(meter_color(0.90, &state), Color::Red);
+
+        state.pause_reason = Some("spend cap reached".to_string());
+        assert_eq!(meter_color(0.90, &state), Color::Magenta);
+    }
+
+    #[test]
     fn deadreckoning_course_animation_moves() {
         let first = deadreckoning_course_ascii(16, 0);
         let second = deadreckoning_course_ascii(16, 1);
@@ -21332,6 +21344,22 @@ mod tui_tests {
         assert_ne!(first, second);
         assert!(first.contains('*'));
         assert_eq!(first.chars().count(), 16);
+    }
+
+    #[test]
+    fn deadreckoning_course_strip_matches_identity_golden() {
+        assert_eq!(deadreckoning_course_ascii(18, 0), "*--.--.^-.--.-^.--");
+    }
+
+    #[test]
+    fn chain_step_glyphs_match_identity_set() {
+        assert_eq!(chain_step_dot(ChainStepStatus::Pending), "○");
+        assert_eq!(chain_step_dot(ChainStepStatus::Running), "●");
+        assert_eq!(chain_step_dot(ChainStepStatus::Completed), "◐");
+        assert_eq!(chain_step_dot(ChainStepStatus::Failed), "✗");
+        assert_eq!(chain_step_dot(ChainStepStatus::Skipped), "↷");
+        assert_eq!(chain_step_dot(ChainStepStatus::Applied), "◉");
+        assert_eq!(chain_step_dot(ChainStepStatus::Undone), "↶");
     }
 
     #[test]
