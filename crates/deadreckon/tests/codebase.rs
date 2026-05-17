@@ -1386,7 +1386,7 @@ fn apply_conflict_leaves_markers_and_prints_resolve_hint() {
     let stderr = stderr(&apply);
     assert!(stderr.contains("merge produced conflicts"));
     assert!(stderr.contains(&format!(
-        "try: resolve, then git commit && deadreckon abandon {run_id}"
+        "try: resolve, then git commit && deadreckon cleanup {run_id}"
     )));
     assert!(
         fs::read_to_string(repo.join("conflict.txt"))
@@ -1431,7 +1431,7 @@ fn apply_refuses_non_worktree_with_mode_specific_hint() {
     let stderr = stderr(&apply);
     assert!(stderr.contains("apply requires worktree mode; run was fresh"));
     assert!(stderr.contains(&format!(
-        "try: deadreckon materialize {} --dest <path>",
+        "try: deadreckon export {} --dest <path>",
         run.run_id
     )));
 }
@@ -1490,7 +1490,7 @@ fn post_apply_hint_includes_git_log_one_stat() {
     assert!(stdout.contains(&format!("applied {run_id} onto")));
     assert!(stdout.contains("commit "));
     assert!(stdout.contains("Cargo.toml"));
-    assert!(stdout.contains(&format!("next: deadreckon discard {}", &run_id[..8])));
+    assert!(stdout.contains(&format!("next: deadreckon cleanup {}", &run_id[..8])));
     assert!(stdout.contains("completed run"), "{stdout}");
     assert!(!stdout.contains('\u{1b}'), "{stdout}");
 }
@@ -1823,7 +1823,7 @@ fn list_default_is_compact_and_points_to_show_for_details() {
     assert_success(&help);
     let help_stdout = stdout(&help);
     assert!(help_stdout.contains("deadreckon show <short-id>"));
-    assert!(help_stdout.contains("orchestration plans"));
+    assert!(help_stdout.contains("runs and plans"));
     assert!(help_stdout.contains("--full"));
     assert!(compact_stdout.contains("deadreckon show <id>"));
     assert!(!compact_stdout.contains("deadreckon list --full"));
@@ -2012,7 +2012,7 @@ fn post_run_hint_lists_apply_and_abandon_lines() {
     assert!(stdout.contains(&format!(
         "cleanup: deadreckon apply {short} --autostash --cleanup"
     )));
-    assert!(stdout.contains(&format!("discard: deadreckon discard {short}")));
+    assert!(stdout.contains(&format!("cleanup: deadreckon cleanup {short}")));
 }
 
 fn repo_tempdir() -> TempDir {

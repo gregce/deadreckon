@@ -51,6 +51,100 @@ fn help_uses_new_flag_names_with_alpha_aliases_hidden() {
 }
 
 #[test]
+fn top_help_uses_canonical_discovery_words() {
+    let top = help(["--help"]);
+    for command in ["detect", "providers", "update", "history"] {
+        assert!(
+            top.contains(command),
+            "top help should include {command} in More help:\n{top}"
+        );
+    }
+    assert!(top.contains("watch a run or plan in the TUI"), "{top}");
+    assert!(top.contains("show runs and plans"), "{top}");
+    assert!(
+        top.contains("show every command, including advanced commands (alias: commands)"),
+        "{top}"
+    );
+    assert!(
+        !top.contains("commands    alias for help-all"),
+        "aliases should be inline, not separate commands:\n{top}"
+    );
+    assert!(
+        !top.contains("orchestration jobs"),
+        "plan-facing help should not say jobs:\n{top}"
+    );
+    assert!(
+        top.contains("Run and plan ids accept unique prefixes."),
+        "{top}"
+    );
+}
+
+#[test]
+fn help_all_keeps_aliases_inline() {
+    let all = help(["help-all"]);
+    assert!(all.contains("show runs and plans"), "{all}");
+    assert!(
+        all.contains("copy a completed fresh/copy run (alias: materialize)"),
+        "{all}"
+    );
+    assert!(
+        !all.contains("materialize alias for export"),
+        "materialize should not get a separate row:\n{all}"
+    );
+    assert!(
+        !all.contains("orchestration jobs"),
+        "plan-facing help should not say jobs:\n{all}"
+    );
+}
+
+#[test]
+fn command_help_prefers_status_finish_export_and_cleanup() {
+    let run = help(["run", "--help"]);
+    assert!(run.contains("deadreckon status latest"), "{run}");
+    assert!(
+        !run.contains("deadreckon next"),
+        "run help should reserve next for alias notes:\n{run}"
+    );
+
+    let attach = help(["attach", "--help"]);
+    assert!(attach.contains("deadreckon status latest"), "{attach}");
+    assert!(attach.contains("deadreckon attach <plan-id>"), "{attach}");
+    assert!(
+        attach.contains("Attach opens the live TUI for a run or plan."),
+        "{attach}"
+    );
+    assert!(
+        !attach.contains("deadreckon next"),
+        "attach help should reserve next for alias notes:\n{attach}"
+    );
+
+    let status = help(["status", "--help"]);
+    assert!(status.contains("deadreckon status"), "{status}");
+    assert!(status.contains("`next` is an alias."), "{status}");
+    assert!(
+        !status.contains("deadreckon next"),
+        "status help should lead with canonical status command:\n{status}"
+    );
+
+    let merge = help(["merge", "--help"]);
+    assert!(merge.contains("deadreckon finish <plan-id>"), "{merge}");
+    assert!(merge.contains("deadreckon apply <plan-id>"), "{merge}");
+    assert!(
+        merge.contains("deadreckon export <plan-id> --dest ./result"),
+        "{merge}"
+    );
+    assert!(!merge.contains("merged-run-id"), "{merge}");
+    assert!(!merge.contains("deadreckon materialize"), "{merge}");
+
+    let apply = help(["apply", "--help"]);
+    assert!(apply.contains("deadreckon cleanup latest"), "{apply}");
+    assert!(
+        !apply.contains("deadreckon discard latest"),
+        "apply help should prefer cleanup:\n{apply}"
+    );
+}
+
+#[test]
 fn attach_plain_displays_running_for_executing_run() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));

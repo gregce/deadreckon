@@ -862,9 +862,9 @@ fn print_top_help() {
             "run coder/reviewer or full-plan multi-agent work",
         ),
         ("chain", "run several coding steps in sequence"),
-        ("attach", "watch a run in the TUI"),
+        ("attach", "watch a run or plan in the TUI"),
         ("status", "see the latest run and next action"),
-        ("list", "show runs and orchestration jobs"),
+        ("list", "show runs and plans"),
         ("finish", "apply or export completed work"),
     ] {
         println!("  {:<12} {}", ui_command(name), purpose);
@@ -883,18 +883,21 @@ fn print_top_help() {
     println!("{}", ui_heading("More help:"));
     for (name, purpose) in [
         ("completion", "generate shell tab-completion scripts"),
+        ("detect", "probe registered providers"),
+        ("providers", "list provider routes and models"),
+        ("update", "check for or route self-updates"),
+        ("history", "search run traces and provenance"),
         (
             "help-all",
-            "show every command, including advanced commands",
+            "show every command, including advanced commands (alias: commands)",
         ),
-        ("commands", "alias for help-all"),
         ("<command> --help", "detailed help for one command"),
     ] {
         println!("  {:<18} {}", ui_command(name), purpose);
     }
     println!();
     println!(
-        "{} Run ids accept unique prefixes. {} means the newest run for the current project.",
+        "{} Run and plan ids accept unique prefixes. {} means the newest item for the current project.",
         ui_heading("Note:"),
         ui_command("latest")
     );
@@ -932,9 +935,9 @@ fn print_help_all() {
             "run coder/reviewer or full-plan multi-agent work",
         ),
         ("chain", "run several coding steps in sequence"),
-        ("attach", "watch a run in the TUI"),
+        ("attach", "watch a run or plan in the TUI"),
         ("status", "see the latest run and next action"),
-        ("list", "show runs and orchestration jobs"),
+        ("list", "show runs and plans"),
         ("finish", "route completed work to apply or export"),
     ] {
         println!("  {:<12} {}", ui_command(name), purpose);
@@ -965,8 +968,10 @@ fn print_help_all() {
     println!("{}", ui_heading("inspect and advanced"));
     for (name, purpose) in [
         ("apply", "merge a completed worktree run"),
-        ("export", "copy a completed fresh/copy run"),
-        ("materialize", "alias for export"),
+        (
+            "export",
+            "copy a completed fresh/copy run (alias: materialize)",
+        ),
         ("doc", "read or regenerate run docs"),
         ("library", "inspect promoted artifacts"),
         ("show", "show raw state, traces, and provenance"),
@@ -7481,14 +7486,14 @@ fn run_preview(input: &RunPreview<'_>) -> String {
             });
             sections.push(Section::Command {
                 label: "on fail".to_string(),
-                command: format!("deadreckon abandon {run_id}"),
+                command: format!("deadreckon cleanup {run_id}"),
             });
         }
         CodebaseMode::Copy | CodebaseMode::Fresh => {
             sections.push(Section::Blank);
             sections.push(Section::Command {
                 label: "on success".to_string(),
-                command: format!("deadreckon materialize {run_id} --dest <path>"),
+                command: format!("deadreckon export {run_id} --dest <path>"),
             });
             sections.push(Section::Command {
                 label: "inspect".to_string(),
@@ -8886,7 +8891,7 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
             ),
             match plan.status {
                 PlanStatus::Forked => "deadreckon merge <plan-id>",
-                PlanStatus::Merged => "deadreckon show <merged-run-id>",
+                PlanStatus::Merged => "deadreckon finish <plan-id>",
                 PlanStatus::Failed => "deadreckon show <plan-id> --why-failed",
                 PlanStatus::Pending => "deadreckon fork <plan-id>",
             },
@@ -11206,7 +11211,7 @@ fn prepare_plan_result_apply_state(
                 run_prefix(&plan.plan_id)
             ),
             &format!(
-                "deadreckon materialize {} --dest <path>",
+                "deadreckon export {} --dest <path>",
                 run_prefix(&plan.plan_id)
             ),
         ))
@@ -11527,9 +11532,9 @@ fn print_merge_finished(
         }
         println!(
             "{} {}",
-            ui_command("materialize:"),
+            ui_command("export:"),
             ui_command(format!(
-                "deadreckon materialize {} --dest ./{}",
+                "deadreckon export {} --dest ./{}",
                 run_prefix(&plan.plan_id),
                 deadreckon_core::paths::task_key(&plan.root_goal)
                     .chars()
@@ -11666,11 +11671,8 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
                     }
                     println!(
                         "{} {}",
-                        ui_command("materialize:"),
-                        ui_command(format!(
-                            "deadreckon materialize {}",
-                            run_prefix(&plan.plan_id)
-                        ))
+                        ui_command("export:"),
+                        ui_command(format!("deadreckon export {}", run_prefix(&plan.plan_id)))
                     );
                 }
             }
@@ -12683,7 +12685,7 @@ fn finish_apply_cleanup(
         println!(
             "{} {}",
             ui_command("next:"),
-            ui_command(format!("deadreckon discard {}", run_prefix(&state.run_id)))
+            ui_command(format!("deadreckon cleanup {}", run_prefix(&state.run_id)))
         );
     }
     Ok(())
@@ -12788,7 +12790,7 @@ fn apply_merge_error(run_id: &str, autostash: &Option<ApplyAutoStash>, err: &Cli
 }
 
 fn apply_conflict_hint(run_id: &str, autostash: &Option<ApplyAutoStash>) -> String {
-    let mut hint = format!("resolve, then git commit && deadreckon abandon {run_id}");
+    let mut hint = format!("resolve, then git commit && deadreckon cleanup {run_id}");
     if let Some(stash) = autostash {
         hint.push_str(&format!(
             "; restore local changes with git stash pop {}",
@@ -13047,7 +13049,7 @@ fn cleanup_worktree_run(
 fn apply_mode_error(run_id: &str, mode: CodebaseMode) -> DeadreckonError {
     let hint = match mode {
         CodebaseMode::Copy | CodebaseMode::Fresh => {
-            format!("deadreckon materialize {run_id} --dest <path>")
+            format!("deadreckon export {run_id} --dest <path>")
         }
         CodebaseMode::InPlace => "deadreckon undo to revert if needed".to_string(),
         CodebaseMode::Worktree => format!("deadreckon apply {run_id}"),
@@ -14762,7 +14764,7 @@ fn print_library_table(entries: &[LibraryEntry], full: bool) {
         "{} use `{}` or `{}`",
         ui_muted("hint:"),
         ui_command("deadreckon library show <run-id>"),
-        ui_command("deadreckon materialize <run-id> --dest <path>")
+        ui_command("deadreckon export <run-id> --dest <path>")
     );
 }
 
@@ -14792,7 +14794,7 @@ fn print_library_entry(entry: &LibraryEntry) {
     println!(
         "next:       {}",
         ui_command(format!(
-            "deadreckon materialize {}",
+            "deadreckon export {}",
             run_prefix(&manifest.run_id)
         ))
     );
@@ -16547,8 +16549,8 @@ fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
             ))
         );
         println!(
-            "  discard: {}",
-            ui_command(format!("deadreckon discard {}", run_prefix(&state.run_id)))
+            "  cleanup: {}",
+            ui_command(format!("deadreckon cleanup {}", run_prefix(&state.run_id)))
         );
         println!(
             "  docs:    {}",

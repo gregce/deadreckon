@@ -26,9 +26,9 @@ Core lifecycle:
   run         start unattended coding work
   orchestrate run coder/reviewer or full-plan multi-agent work
   chain       run several coding steps in sequence
-  attach      watch a run in the TUI
+  attach      watch a run or plan in the TUI
   status      see the latest run and next action
-  list        show runs and orchestration jobs
+  list        show runs and plans
   finish      apply or export completed work
 
 Continue or recover:
@@ -43,11 +43,10 @@ More help:
   providers   list provider routes and models
   update      check for or route self-updates
   history     search run traces and provenance
-  help-all    show every command, including advanced commands
-  commands    alias for help-all
+  help-all    show every command, including advanced commands (alias: commands)
   <command> --help
 
-Run ids accept unique prefixes. `latest` means the newest run for the current project.";
+Run and plan ids accept unique prefixes. `latest` means the newest item for the current project.";
 
 const COMPLETION_HELP: &str = "\
 Lifecycle:
@@ -120,7 +119,7 @@ const RUN_HELP: &str = "\
 Lifecycle:
   deadreckon run \"build the thing\"
   deadreckon attach latest
-  deadreckon next
+  deadreckon status latest
   deadreckon finish latest
 
 Common provider/model changes:
@@ -150,6 +149,7 @@ Lifecycle:
   deadreckon orchestrate \"build the thing\"
   deadreckon attach <plan-id>
   deadreckon merge <plan-id>
+  deadreckon finish <plan-id>
 
 Orchestrate is the one-command multi-agent wrapper. Review mode is a coder
 provider followed by a fresh reviewer/fixer. Full-plan mode asks a planner
@@ -179,7 +179,9 @@ using the provider recorded in plan.json unless you override it here.";
 const MERGE_HELP: &str = "\
 Lifecycle:
   deadreckon merge <plan-id>
-  deadreckon materialize <merged-run-id> --dest ./result
+  deadreckon finish <plan-id>
+  deadreckon apply <plan-id>
+  deadreckon export <plan-id> --dest ./result
 
 Merge composes completed child artifacts into one promoted deadreckon library
 entry. The default merge is DAG-aware and automatically attempts bounded repair
@@ -263,8 +265,8 @@ Lifecycle:
   deadreckon attach <short-id>
   deadreckon finish <short-id>
 
-The default view is compact and scoped to the current project. It includes both
-normal runs and orchestration plans. Use `show` for full run details or
+The default view is compact and scoped to the current project. It includes
+normal runs and plans. Use `show` for full run details or
 `attach <plan-id>` for orchestration progress.";
 
 const LIBRARY_HELP: &str = "\
@@ -286,7 +288,7 @@ Lifecycle:
 Finish chooses the right completed-run action:
   worktree run -> apply
   fresh/copy run -> export
-  completed orchestrate plan -> apply to source git, or export with --dest / non-git source
+  completed plan -> apply to source git, or export with --dest / non-git source
   in-place run -> show review guidance
 
 It still respects confirmations unless you pass `--no-confirm`.";
@@ -298,7 +300,7 @@ Lifecycle:
   deadreckon show latest
   deadreckon extend latest \"follow-up goal\"
 
-Use export/materialize for completed fresh/copy runs and completed orchestration plans.
+Use export for completed fresh/copy runs and completed plans. `materialize` is an alias.
 Worktree runs use `deadreckon apply` instead.";
 
 const APPLY_HELP: &str = "\
@@ -306,16 +308,16 @@ Lifecycle:
   deadreckon show latest
   deadreckon apply latest --autostash --cleanup
   deadreckon apply <plan-id> --cleanup
-  deadreckon discard latest
+  deadreckon cleanup latest
 
 Use apply for completed worktree runs and completed orchestration plans. It merges a temporary `dr/...` branch back into your checkout.";
 
 const ABANDON_HELP: &str = "\
 Lifecycle:
-  deadreckon discard latest
+  deadreckon cleanup latest
   deadreckon cleanup --completed
 
-Discard removes a run's temporary worktree and branch after you decide not to keep it.";
+Abandon removes a run's temporary worktree and branch after you decide not to keep it. Most users should use cleanup.";
 
 const CLEANUP_HELP: &str = "\
 Lifecycle:
@@ -349,10 +351,11 @@ Docs can be regenerated with a provider-backed polish pass:
 const ATTACH_HELP: &str = "\
 Lifecycle:
   deadreckon attach latest
-  deadreckon next
+  deadreckon attach <plan-id>
+  deadreckon status latest
   deadreckon finish latest
 
-Attach opens the live TUI. `q`, Esc, and Ctrl-D detach without killing the run.";
+Attach opens the live TUI for a run or plan. `q`, Esc, and Ctrl-D detach without killing the work.";
 
 const KILL_HELP: &str = "\
 Lifecycle:
@@ -360,7 +363,7 @@ Lifecycle:
   deadreckon resume latest
   deadreckon cleanup --stale
 
-Kill cancels the run, writes durable state, and terminates supervised child processes.";
+Kill cancels a run or plan, writes durable state, and terminates supervised child processes.";
 
 const RESUME_HELP: &str = "\
 Lifecycle:
@@ -383,15 +386,15 @@ Lifecycle:
   deadreckon doc latest
   deadreckon finish latest
 
-Show prints state, mode, lineage, traces, provenance, docs, and suggested next actions.";
+Show prints run or plan state, mode, lineage, traces, provenance, docs, and suggested next actions.";
 
 const STATUS_HELP: &str = "\
 Lifecycle:
-  deadreckon next
+  deadreckon status
   deadreckon attach latest
   deadreckon finish latest
 
-Status explains the latest run and what to do next. `next` is the same command.";
+Status explains the latest run or plan and what to do next. `next` is an alias.";
 
 const IMPORT_HELP: &str = "\
 Lifecycle:
