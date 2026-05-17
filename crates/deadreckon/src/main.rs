@@ -7013,11 +7013,16 @@ async fn doctor_providers(paths: &DeadreckonPaths, root: &toml::Value) -> Result
         println!("    {} deadreckon init", ui_command("fix:"));
         return Ok(());
     };
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
     for (name, entry) in providers {
         let kind = entry
             .get("kind")
             .and_then(toml::Value::as_str)
             .unwrap_or(name);
+        let kind_label = registry
+            .get(name)
+            .map(|descriptor| descriptor_kind_label(&descriptor.kind).to_string())
+            .unwrap_or_else(|| config_provider_kind_label(kind).to_string());
         if kind.contains("cli") || name.starts_with("cli:") {
             let binary = entry
                 .get("binary")
@@ -7031,13 +7036,13 @@ async fn doctor_providers(paths: &DeadreckonPaths, root: &toml::Value) -> Result
                 });
             if command_exists(binary) || PathBuf::from(binary).exists() {
                 println!(
-                    "{} provider {name} CLI binary {binary} found | {} deadreckon run \"goal\" --provider {name} --preview",
+                    "{} provider {name} kind={kind_label} CLI binary {binary} found | {} deadreckon run \"goal\" --provider {name} --preview",
                     ui_ok("✓"),
                     ui_command("try:")
                 );
             } else {
                 println!(
-                    "{} provider {name} CLI binary {binary} missing",
+                    "{} provider {name} kind={kind_label} CLI binary {binary} missing",
                     ui_warn("✗")
                 );
                 println!(
@@ -7047,16 +7052,19 @@ async fn doctor_providers(paths: &DeadreckonPaths, root: &toml::Value) -> Result
             }
         } else if provider_has_key(entry) {
             if std::env::var_os("DEADRECKON_DOCTOR_PING").is_some() {
-                doctor_provider_ping(paths, name).await?;
+                doctor_provider_ping(paths, name, &kind_label).await?;
             } else {
                 println!(
-                    "{} provider {name} credential present; ping skipped | {} DEADRECKON_DOCTOR_PING=1 deadreckon doctor",
+                    "{} provider {name} kind={kind_label} credential present; ping skipped | {} DEADRECKON_DOCTOR_PING=1 deadreckon doctor",
                     ui_ok("✓"),
                     ui_command("try:")
                 );
             }
         } else {
-            println!("{} provider {name} credential missing", ui_warn("✗"));
+            println!(
+                "{} provider {name} kind={kind_label} credential missing",
+                ui_warn("✗")
+            );
             println!(
                 "    {} deadreckon config set providers.{name}.api_key <KEY>",
                 ui_command("fix:")
@@ -7066,7 +7074,22 @@ async fn doctor_providers(paths: &DeadreckonPaths, root: &toml::Value) -> Result
     Ok(())
 }
 
-async fn doctor_provider_ping(paths: &DeadreckonPaths, name: &str) -> Result<()> {
+fn config_provider_kind_label(kind: &str) -> &'static str {
+    let kind = kind.to_ascii_lowercase();
+    if kind.contains("cli") {
+        "cli"
+    } else if kind.contains("compatible") || kind.contains("local") {
+        "local-http"
+    } else if kind.contains("smoke") || kind.contains("script") {
+        "scripted"
+    } else if kind.contains("anthropic") || kind.contains("open-ai") || kind.contains("openai") {
+        "http"
+    } else {
+        "custom"
+    }
+}
+
+async fn doctor_provider_ping(paths: &DeadreckonPaths, name: &str, kind_label: &str) -> Result<()> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), Some(name))?;
     let request = ProviderRequest {
         prompt: "Reply with OK only.".to_string(),
@@ -7084,20 +7107,26 @@ async fn doctor_provider_ping(paths: &DeadreckonPaths, name: &str) -> Result<()>
     .await
     {
         Ok(Ok(response)) => println!(
-            "{} provider {name} ping ok model {} | {} deadreckon run \"goal\" --provider {name} --preview",
+            "{} provider {name} kind={kind_label} ping ok model {} | {} deadreckon run \"goal\" --provider {name} --preview",
             ui_ok("✓"),
             response.model,
             ui_command("try:")
         ),
         Ok(Err(err)) => {
-            println!("{} provider {name} ping failed", ui_warn("✗"));
+            println!(
+                "{} provider {name} kind={kind_label} ping failed",
+                ui_warn("✗")
+            );
             println!(
                 "    {} check credentials or set a fallback provider ({err})",
                 ui_command("fix:")
             );
         }
         Err(_) => {
-            println!("{} provider {name} ping timed out", ui_warn("✗"));
+            println!(
+                "{} provider {name} kind={kind_label} ping timed out",
+                ui_warn("✗")
+            );
             println!(
                 "    {} check network/provider status or unset DEADRECKON_DOCTOR_PING",
                 ui_command("fix:")

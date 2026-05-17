@@ -350,6 +350,48 @@ fn top_level_kill_accepts_chain_id_and_uses_shared_banner() {
 }
 
 #[test]
+fn doctor_detect_and_providers_share_kind_token() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(paths.home()).expect("home");
+    let empty_bin = temp.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin");
+    fs::write(
+        paths.config_path(),
+        r#"
+default_provider = "cli:codex"
+
+[providers."cli:codex"]
+kind = "cli-codex"
+extra_args = []
+"#,
+    )
+    .expect("config");
+
+    for (args, label) in [
+        (vec!["doctor"], "doctor"),
+        (vec!["detect"], "detect"),
+        (vec!["providers", "list"], "providers list"),
+    ] {
+        let output = deadreckon(&paths)
+            .env("PATH", &empty_bin)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("{label}: {err}"));
+        assert!(output.status.success(), "{}: {}", label, stderr(&output));
+        let stdout = stdout(&output);
+        assert!(
+            stdout.contains("kind=cli"),
+            "{label} should print provider kind tokens:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("descriptor="),
+            "{label} should not expose descriptor as a normal output noun:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn why_failed_run_and_chain_share_failure_layout() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
