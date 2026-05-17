@@ -93,6 +93,22 @@ pub(crate) fn render(stream: Stream, tone: Tone, text: impl AsRef<str>) -> Strin
     }
 }
 
+pub(crate) fn status_tone(status: impl AsRef<str>) -> Tone {
+    match status.as_ref().trim().to_ascii_lowercase().as_str() {
+        "ok" | "ready" | "set" | "wrote" | "updated" | "installed" | "completed" | "passed"
+        | "polished" | "applied" | "cleaned" | "exported" => Tone::Ok,
+        "running" => Tone::Heading,
+        "failed" | "killed" | "error" | "missing" | "refused" => Tone::Negative,
+        "pending" | "planned" | "paused" | "skipped" | "undone" | "warning" | "warn" => Tone::Warn,
+        _ => Tone::Warn,
+    }
+}
+
+pub(crate) fn render_status(stream: Stream, status: impl AsRef<str>) -> String {
+    let status = status.as_ref();
+    render(stream, status_tone(status), status)
+}
+
 #[allow(dead_code)]
 pub(crate) fn write(stream: Stream, tone: Tone, text: impl AsRef<str>) -> io::Result<()> {
     let rendered = render(stream, tone, text);
@@ -189,5 +205,21 @@ fn tone_code(tone: Tone) -> Option<&'static str> {
         Tone::Negative => Some("1;31"),
         Tone::Prompt => Some("1;36"),
         Tone::Hint => Some("1;34"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Tone, status_tone};
+
+    #[test]
+    fn status_tone_maps_known_lifecycle_words() {
+        assert_eq!(status_tone("completed"), Tone::Ok);
+        assert_eq!(status_tone("polished"), Tone::Ok);
+        assert_eq!(status_tone("running"), Tone::Heading);
+        assert_eq!(status_tone("paused"), Tone::Warn);
+        assert_eq!(status_tone("failed"), Tone::Negative);
+        assert_eq!(status_tone("killed"), Tone::Negative);
+        assert_eq!(status_tone("unknown"), Tone::Warn);
     }
 }

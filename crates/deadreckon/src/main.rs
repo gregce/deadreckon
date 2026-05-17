@@ -207,12 +207,7 @@ fn ui_warn(text: impl AsRef<str>) -> String {
 }
 
 fn ui_status(text: impl AsRef<str>) -> String {
-    let text = text.as_ref();
-    if text == "ok" || text == "polished" {
-        ui_ok(text)
-    } else {
-        ui_warn(text)
-    }
+    ui::render_status(ui::Stream::Stdout, text)
 }
 
 fn ui_error(text: impl AsRef<str>) -> String {
