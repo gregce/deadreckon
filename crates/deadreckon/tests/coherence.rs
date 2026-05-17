@@ -41,6 +41,12 @@ fn help_uses_new_flag_names_with_alpha_aliases_hidden() {
 
     let kill = help(["kill", "--help"]);
     assert!(kill.contains("--escalate"), "{kill}");
+    assert!(kill.contains("deadreckon kill <chain-id>"), "{kill}");
+    assert!(kill.contains("deadreckon kill <plan-id>"), "{kill}");
+    assert!(
+        kill.contains("Kill cancels a run, chain, or plan,"),
+        "{kill}"
+    );
 
     let doc = help(["doc", "--help"]);
     assert!(doc.contains("--max-spend"), "{doc}");
@@ -63,6 +69,7 @@ fn top_help_uses_canonical_discovery_words() {
         top.contains("watch a run, chain, or plan in the TUI"),
         "{top}"
     );
+    assert!(top.contains("cancel a run, chain, or plan"), "{top}");
     assert!(top.contains("show runs and plans"), "{top}");
     assert!(
         top.contains("show every command, including advanced commands (alias: commands)"),
@@ -295,6 +302,51 @@ fn top_level_attach_plain_accepts_chain_id() {
     assert!(stdout.contains(&chain.chain_id[..8]), "{stdout}");
     assert!(stdout.contains("step 1"), "{stdout}");
     assert!(stdout.contains("[r] redo"), "{stdout}");
+}
+
+#[test]
+fn top_level_kill_accepts_chain_id_and_uses_shared_banner() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let mut chain = Chain::new(ChainNewOptions {
+        root_goal: "top-level chain kill".to_string(),
+        goals: vec!["first step".to_string(), "second step".to_string()],
+        scope: workspace_scope(&cwd).expect("scope"),
+        base_branch: "main".to_string(),
+        base_sha: "0123456789abcdef".to_string(),
+        cwd: cwd.clone(),
+        provider: None,
+        model: None,
+        sandbox: "none".to_string(),
+        branch_policy: BranchPolicy::Stack,
+        apply_mode: ApplyMode::Manual,
+        apply_strategy: ApplyStrategy::Squash,
+        apply_allowlist: Vec::new(),
+        on_fail: OnFail::Stop,
+        circuit_breaker_threshold: 1,
+        max_spend_usd: Some(1.0),
+        max_wall_seconds: None,
+        deadreckon_version: "0.1.0".to_string(),
+    })
+    .expect("chain");
+    chain.status = ChainStatus::Running;
+    chain.steps[0].status = ChainStepStatus::Running;
+    save_chain(&paths, &chain).expect("save chain");
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["kill", &chain.chain_id[..8], "--escalate", "--plain"])
+        .output()
+        .expect("kill chain");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains(&format!("killed chain {} forcefully", &chain.chain_id[..8])),
+        "{stdout}"
+    );
 }
 
 #[test]

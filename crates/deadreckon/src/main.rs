@@ -869,7 +869,7 @@ fn print_top_help() {
     for (name, purpose) in [
         ("extend", "continue from a completed run"),
         ("resume", "resume an incomplete run"),
-        ("kill", "cancel a run"),
+        ("kill", "cancel a run, chain, or plan"),
         ("cleanup", "remove stale or completed worktrees"),
     ] {
         println!("  {:<12} {}", ui_command(name), purpose);
@@ -952,7 +952,7 @@ fn print_help_all() {
     for (name, purpose) in [
         ("extend", "continue from a completed run"),
         ("resume", "resume an incomplete run"),
-        ("kill", "cancel a run"),
+        ("kill", "cancel a run, chain, or plan"),
         ("cleanup", "remove stale or completed worktrees"),
         ("undo", "restore an in-place snapshot"),
         ("abandon", "discard a temporary worktree run"),
@@ -15262,6 +15262,9 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
         Err(run_error) => {
             if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
                 return kill_plan_command(&paths, &plan_id, force);
+            }
+            if let Ok(chain_id) = resolve_chain_id(&paths, &run_id, false) {
+                return chain_kill_command(&paths, &chain_id, force);
             }
             return Err(run_error);
         }

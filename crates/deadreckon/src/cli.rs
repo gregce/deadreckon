@@ -34,7 +34,7 @@ Core lifecycle:
 Continue or recover:
   extend      continue from a completed run
   resume      resume an incomplete run
-  kill        cancel a run
+  kill        cancel a run, chain, or plan
   cleanup     remove stale or completed worktrees
 
 More help:
@@ -362,10 +362,12 @@ Attach opens the live TUI for a run, chain, or plan. `q`, Esc, and Ctrl-D detach
 const KILL_HELP: &str = "\
 Lifecycle:
   deadreckon kill latest
+  deadreckon kill <chain-id>
+  deadreckon kill <plan-id>
   deadreckon resume latest
   deadreckon cleanup --stale
 
-Kill cancels a run or plan, writes durable state, and terminates supervised child processes.";
+Kill cancels a run, chain, or plan, writes durable state, and terminates supervised child processes.";
 
 const RESUME_HELP: &str = "\
 Lifecycle:
@@ -1226,11 +1228,11 @@ pub(crate) enum Commands {
     #[command(
         next_help_heading = "Run Lifecycle",
         visible_alias = "stop",
-        about = "Cancel a run",
+        about = "Cancel a run, chain, or plan",
         after_help = KILL_HELP
     )]
     Kill {
-        #[arg(help = "Run id, unique prefix, or latest")]
+        #[arg(help = "Run id, chain id, plan id, unique prefix, or latest")]
         run_id: String,
         #[arg(
             long = "escalate",
