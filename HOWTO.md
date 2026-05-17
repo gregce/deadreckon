@@ -186,7 +186,7 @@ Mode overrides:
 deadreckon run "goal" --fresh                         # old empty working dir
 deadreckon run "goal" --from .                        # gitignore-aware copy
 deadreckon run "goal" --worktree                      # force git worktree
-deadreckon run "goal" --base main --branch dr/my-task # customize worktree branch
+deadreckon run "goal" --base main --branch-name dr/my-task # customize worktree branch
 deadreckon run "goal" --allow-dirty                   # seed dirty files into worktree
 deadreckon run "goal" --in-place --i-know-its-a-lot   # edit current dir directly
 ```

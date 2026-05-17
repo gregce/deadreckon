@@ -8,7 +8,7 @@
 
 Claude Code, Codex, Cursor CLI, and the rest are good at writing code. They are not built to run unattended for hours and tell you, honestly, whether the work got done. deadreckon is.
 
-You bring the agent CLI you already trust. You tell deadreckon what "done" looks like in plain English. It runs the work in an isolated sandbox, saves every turn, and uses a separate watchdog process to decide when the job is actually finished: a watchdog the agent cannot fool.
+You bring the agent CLI you already trust. You tell deadreckon what "done" looks like in plain English. It runs the work in an isolated sandbox, saves every turn, and uses a separate watchdog process to decide when the run is actually finished: a watchdog the agent cannot fool.
 
 ```bash
 deadreckon def-done "users can sign up, log in, and save a drawing"
