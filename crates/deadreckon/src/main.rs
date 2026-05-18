@@ -1150,6 +1150,37 @@ const FLAG_POLICY_ROWS: &[(&str, &str)] = &[
     ),
 ];
 
+const PROVIDER_ROLE_ROWS: &[(&str, &str)] = &[
+    (
+        "--provider",
+        "primary run provider route; in full-plan orchestration, the default child route",
+    ),
+    (
+        "--planner-provider",
+        "full-plan route that writes the child graph before fork",
+    ),
+    (
+        "--child-provider IDX=PROVIDER",
+        "per-child route override for full-plan work",
+    ),
+    (
+        "--coder-provider",
+        "review-mode route that performs the implementation pass",
+    ),
+    (
+        "--reviewer-provider",
+        "review-mode route that independently reviews or fixes the coder result",
+    ),
+    (
+        "--doc-provider",
+        "documentation polish route; defaults through config, then run provider",
+    ),
+    (
+        "--repair-provider",
+        "merge repair planning and repair-child route",
+    ),
+];
+
 fn command_discovery(entry: &CommandHelpEntry) -> CommandDiscovery {
     match entry.display {
         "apply" | "export" | "doc" | "library" | "show" | "import" | "undo" | "abandon" => {
@@ -1247,6 +1278,17 @@ fn print_help_all() {
     println!("{}", ui_heading("output and scripting policy"));
     for (flag, purpose) in FLAG_POLICY_ROWS {
         println!("  {:<16} {}", ui_command(flag), purpose);
+    }
+    println!();
+    println!("{}", ui_heading("provider roles"));
+    println!(
+        "{}",
+        ui_muted(
+            "Normal output says provider route/model/kind; descriptor is reserved for registry docs."
+        )
+    );
+    for (flag, purpose) in PROVIDER_ROLE_ROWS {
+        println!("  {:<32} {}", ui_command(flag), purpose);
     }
     println!();
     println!(

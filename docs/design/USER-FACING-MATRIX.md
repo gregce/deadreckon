@@ -25,6 +25,7 @@
 | Strategy flag family | `merge --strategy` is plan composition, `apply`/`finish --git-strategy` is git apply behavior, and chain help separates `--apply-mode` from per-step `--apply-strategy`. | `crates/deadreckon/src/cli.rs:735`, `crates/deadreckon/tests/coherence.rs:122` | Hidden `--strategy` aliases for apply/finish remain for one alpha; user-facing help scopes the terms. |
 | Prompt-skip flags | `help-all` documents `--yes` as preflight preview acceptance and `--no-confirm` as destructive/follow-up confirmation skipping; command help follows that split. | `crates/deadreckon/src/main.rs:1118`, `crates/deadreckon/src/cli.rs:548`, `crates/deadreckon/tests/coherence.rs:161` | `run` keeps both because it has a preflight plus separate safety confirmations. |
 | Output mode flags | `help-all` documents `--quiet`, `--plain`, `--json`, and `--no-hints` precedence; quiet text is shared and JSON remains inspection/list-only in alpha. | `crates/deadreckon/src/main.rs:1118`, `crates/deadreckon/tests/coherence.rs:161` | `--json` wins over styling/hints where present; `DEADRECKON_HINTS=0` is the process-level hint override. |
+| Provider role flags | `help-all` documents provider roles for primary run, planner, child, coder, reviewer, documentation, and repair routes; orchestration/doc help uses provider-route wording. | `crates/deadreckon/src/main.rs:1148`, `crates/deadreckon/src/cli.rs:665`, `crates/deadreckon/tests/coherence.rs:241` | Normal user surfaces say provider route/model/kind; descriptor remains registry vocabulary. |
 | Copy-out wording | User-facing prompts, docs, help, and refusal text now say `export`; `materialize` remains a hidden compatibility alias/internal marker word. | `crates/deadreckon/src/main.rs:12430`, `crates/deadreckon/src/main.rs:16679`, `crates/deadreckon/tests/coherence.rs:201` | TUI key `m` is preserved while the visible action is `export`. |
 | Plan/orchestrate start output | Orchestrate preflight and started output now print mode, children, providers, source, gate, repair, sandbox, spend, wall, plan, and events. | `crates/deadreckon/src/main.rs:8604`, `crates/deadreckon/src/main.rs:8694` | This is much closer to `run` parity. |
 | Plan attach drilldown | `attach <plan-id>` can drill into a child run and return. | `crates/deadreckon/src/main.rs:16757` | Footer copy still needs coherence work. |
@@ -95,7 +96,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 | ID | Surface | Current evidence | Required change |
 |---|---|---|---|
-| F10 | Provider flags are role-specific but not presented as a system. | `--provider`, `--planner-provider`, `--coder-provider`, `--reviewer-provider`, `--child-provider`, `--doc-provider`. | Add a provider-role glossary and shared provider prompt/preflight builder. |
 
 ### Style, Streams, And Text Blocks
 
@@ -145,10 +145,8 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 | ID | Surface | Current evidence | Required change |
 |---|---|---|---|
-| P1 | Provider nouns drift. | `providers`, `detect`, `config`, and run/orchestrate help mix provider/route/descriptor. | One provider glossary with progressive disclosure. |
 | P2 | Provider setup is not one reusable flow. | `init`, `config provider`, run flags, orchestrate flags, doc polish flags. | Shared provider selection/prompt builder. |
 | P3 | Spend cap wording differs by object. | Per-run, per-child, aggregate chain, doc polish. | One cap glossary: run cap, per-child cap, aggregate chain cap, doc polish cap. |
-| P4 | Doc polish has its own provider/cap/prompt vocabulary. | `DOC_HELP`, `doc_command`. | Fold into provider/cap/prompt policy. |
 | P5 | Done criteria and acceptance docs can still diverge. | `def-done`, hidden `acceptance`, status/gate labels. | One docs section and help text source for done criteria. |
 | P6 | Existing docs likely contain stale alias examples. | README/HOWTO/AS-BUILT/goals predate parts of the coherence pass. | Sweep docs after code changes and update examples to canonical words. |
 

@@ -1638,7 +1638,7 @@ When `deadreckon apply` builds the default squash or merge message, it reads `RU
 
 ### 25.9 `deadreckon doc`
 
-`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another artifact, `--export <path>` writes it to disk, and `--overwrite` overwrites exports or a prior polish result. `--polish` prints a preview listing provider, provider source, subskills, token budget, max spend, and inputs hash before it calls the doc provider; `--no-confirm` skips the prompt for scripts. `--doc-provider <route>` overrides the automatic doc provider and `--max-spend <usd>` limits the polish pass. The older `--force` and `--budget-cap` spellings remain hidden alpha aliases.
+`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another artifact, `--export <path>` writes it to disk, and `--overwrite` overwrites exports or a prior polish result. `--polish` prints a preview listing provider route, provider source, subskills, token budget, max spend, and inputs hash before it calls the documentation provider route; `--no-confirm` skips the prompt for scripts. `--doc-provider <route>` overrides the automatic documentation provider route and `--max-spend <usd>` limits the polish pass. The older `--force` and `--budget-cap` spellings remain hidden alpha aliases.
 
 ### 25.10 Cost And Idempotency
 
@@ -1709,6 +1709,8 @@ The user-facing skip model is split by timing. `--yes` belongs to preflight prev
 ### 26.8 Provider And Failure Vocabulary
 
 Provider displays use the provider/route/model/kind vocabulary consistently. Human provider lists and detection rows use the same `kind=cli|http|local-http|scripted` tokens, and the configured route is marked with `*` in the selection and registry views. `show --why-failed` and `chain show --why-failed` now route through one failure-summary renderer with shared `status:`, `reason:`, `evidence:`, and `try:` sections.
+
+`deadreckon help-all` includes the provider-role glossary. `--provider` is the primary run provider route and the default child route in full-plan orchestration. `--planner-provider` writes the full-plan child graph. `--child-provider IDX=PROVIDER` overrides a specific child. `--coder-provider` performs the review-mode implementation pass. `--reviewer-provider` independently reviews or fixes the coder result. `--doc-provider` handles documentation polish, resolving through explicit flag, config, then run provider. `--repair-provider` handles merge repair planning and repair-child runs. Normal user surfaces say provider route/model/kind; descriptor remains registry documentation vocabulary.
 
 ### 26.9 JSON Parity
 

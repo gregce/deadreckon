@@ -118,9 +118,10 @@ Lifecycle:
   deadreckon finish <plan-id>
 
 Orchestrate is the one-command multi-agent wrapper. Review mode is a coder
-provider followed by a fresh reviewer/fixer. Full-plan mode asks a planner
-provider for child work before fork and merge. Merge repair is automatic by
-default; --no-repair is only for debugging raw conflict bundles.";
+provider route followed by a fresh reviewer/fixer provider route. Full-plan
+mode asks a planner provider route for child work before fork and merge. Merge
+repair is automatic by default; --no-repair is only for debugging raw conflict
+bundles.";
 
 const PLAN_HELP: &str = "\
 Lifecycle:
@@ -130,8 +131,8 @@ Lifecycle:
   deadreckon merge <plan-id>
 
 Plan writes ~/.deadreckon/plans/<plan-id>/plan.json plus worker specs. Full-plan
-mode asks the planner route for a child graph. Review mode writes a coder child
-followed by a fresh reviewer child.";
+mode asks the planner provider route for a child graph. Review mode writes a
+coder child followed by a fresh reviewer child.";
 
 const FORK_HELP: &str = "\
 Lifecycle:
@@ -140,7 +141,7 @@ Lifecycle:
   deadreckon merge <plan-id>
 
 Fork starts the plan coordinator. Each child is still a normal deadreckon run,
-using the provider recorded in plan.json unless you override it here.";
+using the provider route recorded in plan.json unless you override it here.";
 
 const MERGE_HELP: &str = "\
 Lifecycle:
@@ -574,7 +575,7 @@ pub(crate) enum Commands {
         provider: Option<String>,
         #[arg(long, help = "Model override for this run")]
         model: Option<String>,
-        #[arg(long, help = "Provider route for generated documentation polish")]
+        #[arg(long, help = "Documentation provider route for generated docs")]
         doc_provider: Option<String>,
         #[arg(
             long,
@@ -662,19 +663,19 @@ pub(crate) enum Commands {
         n: u8,
         #[arg(long, value_enum, default_value_t = CliPlanMode::FullPlan, help = "Plan mode")]
         mode: CliPlanMode,
-        #[arg(long, help = "Full-plan planner provider")]
+        #[arg(long, help = "Planner provider route for full-plan decomposition")]
         planner_provider: Option<String>,
-        #[arg(long, help = "Default full-plan child provider")]
+        #[arg(long, help = "Default child provider route for full-plan work")]
         provider: Option<String>,
         #[arg(
             long,
             value_name = "IDX=PROVIDER",
-            help = "Per-child provider override"
+            help = "Per-child provider route override"
         )]
         child_provider: Vec<String>,
-        #[arg(long, help = "Review-mode coding provider")]
+        #[arg(long, help = "Coder provider route for review mode")]
         coder_provider: Option<String>,
-        #[arg(long, help = "Review-mode reviewer provider")]
+        #[arg(long, help = "Reviewer provider route for review mode")]
         reviewer_provider: Option<String>,
         #[arg(long, help = "Initialize git in a plain directory before planning")]
         init_git: bool,
@@ -708,17 +709,17 @@ pub(crate) enum Commands {
             help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
         )]
         sandbox: Option<String>,
-        #[arg(long, help = "Override the full-plan default child provider")]
+        #[arg(long, help = "Override the plan default child provider route")]
         provider: Option<String>,
         #[arg(
             long,
             value_name = "IDX=PROVIDER",
-            help = "Per-child provider override"
+            help = "Per-child provider route override"
         )]
         child_provider: Vec<String>,
-        #[arg(long, help = "Review-mode coding provider override")]
+        #[arg(long, help = "Coder provider route override for review mode")]
         coder_provider: Option<String>,
-        #[arg(long, help = "Review-mode reviewer provider override")]
+        #[arg(long, help = "Reviewer provider route override for review mode")]
         reviewer_provider: Option<String>,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
@@ -747,7 +748,7 @@ pub(crate) enum Commands {
         no_repair: bool,
         #[arg(
             long,
-            help = "Provider to use for merge repair planning and repair child runs"
+            help = "Repair provider route for merge repair planning and child runs"
         )]
         repair_provider: Option<String>,
         #[arg(
@@ -1166,7 +1167,10 @@ pub(crate) enum Commands {
         kind: CliDocKind,
         #[arg(long, help = "Write the document to this path instead of stdout")]
         export: Option<PathBuf>,
-        #[arg(long, help = "Use the doc provider to polish generated docs")]
+        #[arg(
+            long,
+            help = "Use the documentation provider route to polish generated docs"
+        )]
         polish: bool,
         #[arg(long, help = "Skip destructive or follow-up confirmations")]
         no_confirm: bool,
@@ -1178,7 +1182,7 @@ pub(crate) enum Commands {
         force: bool,
         #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
-        #[arg(long, help = "Provider route for documentation polish")]
+        #[arg(long, help = "Documentation provider route for polish")]
         doc_provider: Option<String>,
         #[arg(
             long = "max-spend",
@@ -1329,13 +1333,13 @@ pub(crate) enum CliPlanMode {
 #[derive(Subcommand)]
 pub(crate) enum OrchestrateCommand {
     #[command(
-        about = "Run one coder provider, then a fresh reviewer/fixer provider",
+        about = "Run one coder provider route, then a fresh reviewer/fixer provider route",
         after_help = "Example:\n  deadreckon orchestrate review \"build the thing\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes"
     )]
     Review(OrchestrateReviewArgs),
     #[command(
         name = "full-plan",
-        about = "Ask a planner provider for child work, then fork and merge",
+        about = "Ask a planner provider route for child work, then fork and merge",
         after_help = "Example:\n  deadreckon orchestrate full-plan \"build the thing\" --planner-provider cli:codex --provider cli:claude-code --n 4 --yes"
     )]
     FullPlan(OrchestrateFullPlanArgs),
@@ -1354,9 +1358,9 @@ pub(crate) struct OrchestrateReviewArgs {
         help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
     )]
     pub(crate) sandbox: Option<String>,
-    #[arg(long, help = "Review-mode coding provider")]
+    #[arg(long, help = "Coder provider route for review mode")]
     pub(crate) coder_provider: Option<String>,
-    #[arg(long, help = "Review-mode reviewer provider")]
+    #[arg(long, help = "Reviewer provider route for review mode")]
     pub(crate) reviewer_provider: Option<String>,
     #[arg(
         long,
@@ -1401,14 +1405,14 @@ pub(crate) struct OrchestrateFullPlanArgs {
         help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
     )]
     pub(crate) sandbox: Option<String>,
-    #[arg(long, help = "Full-plan planner provider")]
+    #[arg(long, help = "Planner provider route for full-plan decomposition")]
     pub(crate) planner_provider: Option<String>,
-    #[arg(long, help = "Default full-plan child provider")]
+    #[arg(long, help = "Default child provider route for full-plan work")]
     pub(crate) provider: Option<String>,
     #[arg(
         long,
         value_name = "IDX=PROVIDER",
-        help = "Per-child provider override"
+        help = "Per-child provider route override"
     )]
     pub(crate) child_provider: Vec<String>,
     #[arg(

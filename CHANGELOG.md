@@ -16,6 +16,7 @@
 - Aligned branch target wording so `run` names worktree branches with `--branch-name`, `apply`/`finish` target branches with `--into`, and apply output says changes landed `into` the target branch.
 - Scoped strategy vocabulary so `merge --strategy` means plan composition, `apply`/`finish --git-strategy` means git apply behavior, and chain help separates `--apply-mode` from per-step `--apply-strategy`.
 - Added a `help-all` output/scripting policy and aligned help for `--yes`, `--no-confirm`, `--quiet`, `--plain`, `--json`, and `--no-hints`.
+- Added a provider-role glossary to `help-all` and aligned orchestration/doc help around provider routes for planner, child, coder, reviewer, repair, and documentation roles.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 

@@ -241,6 +241,72 @@ fn prompt_output_and_machine_flags_have_one_policy() {
 }
 
 #[test]
+fn provider_role_help_uses_one_glossary() {
+    let all = help(["help-all"]);
+    assert!(all.contains("provider roles"), "{all}");
+    for phrase in [
+        "provider route/model/kind",
+        "--provider",
+        "primary run provider route",
+        "--planner-provider",
+        "writes the child graph before fork",
+        "--child-provider IDX=PROVIDER",
+        "per-child route override",
+        "--coder-provider",
+        "implementation pass",
+        "--reviewer-provider",
+        "independently reviews or fixes",
+        "--doc-provider",
+        "documentation polish route",
+        "--repair-provider",
+        "merge repair planning",
+    ] {
+        assert!(all.contains(phrase), "missing `{phrase}`:\n{all}");
+    }
+
+    for args in [
+        &["orchestrate", "--help"][..],
+        &["orchestrate", "review", "--help"][..],
+        &["orchestrate", "full-plan", "--help"][..],
+        &["plan", "--help"][..],
+        &["fork", "--help"][..],
+        &["merge", "--help"][..],
+        &["doc", "--help"][..],
+    ] {
+        let out = help_slice(args);
+        assert!(
+            !out.contains("descriptor"),
+            "{args:?} should reserve descriptor for registry docs:\n{out}"
+        );
+    }
+
+    let plan = help(["plan", "--help"]);
+    assert!(
+        plan.contains("Planner provider route for full-plan decomposition"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("Default child provider route for full-plan work"),
+        "{plan}"
+    );
+    assert!(plan.contains("Per-child provider route override"), "{plan}");
+    assert!(
+        plan.contains("Coder provider route for review mode"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("Reviewer provider route for review mode"),
+        "{plan}"
+    );
+
+    let doc = help(["doc", "--help"]);
+    assert!(
+        doc.contains("Documentation provider route for polish"),
+        "{doc}"
+    );
+}
+
+#[test]
 fn all_scope_flag_help_uses_scope_vocabulary() {
     for args in [
         &["chain", "--help"][..],
