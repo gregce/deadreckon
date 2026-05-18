@@ -1668,7 +1668,7 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 ## 26. Coherence Pass (alpha)
 
-> **Status (2026-05-17):** The May 2026 coherence pass — glossary, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, JSON parity — is **alpha-complete and described below**. The follow-on **closure pass** is now in progress for surfaces that landed later: orchestration commands, plan attach, provider-route wording, and polymorphic lifecycle ids. The closure brief is at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md` (with rider) and `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`; the inconsistency catalog is `docs/design/USER-FACING-MATRIX.md`. The closure pass is intentionally schema-preserving (no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant renames; only display strings change via `glossary.rs`).
+> **Status (2026-05-18):** The May 2026 coherence pass and closure pass are alpha-complete. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, JSON parity, orchestration commands, plan attach, and polymorphic lifecycle ids now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md` and `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`; the current drift backlog is `docs/design/USER-FACING-MATRIX.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs`.
 
 ### 26.1 Glossary
 
@@ -1867,6 +1867,7 @@ Two modes are built:
   coordinator.json          # present only while fork is supervising
   messages.jsonl
   plan-events.jsonl
+  docs/PLAN-NARRATIVE.md
   worker-specs/task-0.md
   summaries/task-0.md
   merge-working/
@@ -1876,7 +1877,7 @@ Two modes are built:
   merge-proofs/repair-run.json
 ```
 
-`messages.jsonl` remains the typed coordinator mailbox. `plan-events.jsonl` is the append-only orchestration timeline: plan created/started, task ready/started/run-discovered/completed/blocked/failed/killed, merge started/conflicted/repair-planned/repair-started/repair-run-discovered/repaired/repair-failed/completed, and plan completed/failed/killed. It is file-backed like `chain-events.jsonl`; child turn/tool traces stay in each child run's normal `events.jsonl`, `traces.jsonl`, and `spend.jsonl`.
+`messages.jsonl` remains the typed coordinator mailbox. `plan-events.jsonl` is the append-only orchestration timeline: plan created/started, task ready/started/run-discovered/completed/blocked/failed/killed, merge started/conflicted/repair-planned/repair-started/repair-run-discovered/repaired/repair-failed/completed, and plan completed/failed/killed. `docs/PLAN-NARRATIVE.md` is written after a successful merge and aggregates the durable child summaries into one plan-level reading path. The event stream is file-backed like `chain-events.jsonl`; child turn/tool traces stay in each child run's normal `events.jsonl`, `traces.jsonl`, and `spend.jsonl`.
 
 Every child run receives an inline copy of its worker spec in the prompt. The spec includes root goal, exact task scope, provider, role, dependency context, capability preview, and hygiene rules such as staying within scope and not spawning subagents. The current worker-spec posture borrows Claude Code's coordinator rules: the spec is the complete brief, children should not inspect sibling transcripts, corrections stay with the worker that has the failure context, and reviewer lanes verify independently rather than inheriting coder assumptions.
 

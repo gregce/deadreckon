@@ -7,6 +7,7 @@
 - Aligned provider setup wording so `doctor`, `detect`, and `providers list` use the same `kind=cli|http|local-http|scripted|custom` tokens and normal help says provider route instead of descriptor.
 - Added coherence coverage for the updated help, orchestration help vocabulary, top-level chain attach/kill dispatch, provider kind vocabulary, status key/value layout, shared stderr error rendering, raw ANSI ownership, visual identity helpers, and plan-child show help.
 - Refreshed README/HOWTO examples to use canonical `run`, `--branch-name`, `--overwrite`, `--max-spend`, `--git-strategy`, `--all-scopes`, and `--escalate` wording.
+- Added `docs/PLAN-NARRATIVE.md` for merged plans so orchestration has one plan-level reading path built from child summaries.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 

@@ -8,6 +8,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
+use crate::glossary::{plan_status_label, plan_task_status_label};
 use crate::paths::{DeadreckonPaths, sanitize_slug};
 use crate::state::{append_json_line, atomic_write_json};
 
@@ -15,6 +16,8 @@ pub const PLAN_JSON: &str = "plan.json";
 pub const COORDINATOR_JSON: &str = "coordinator.json";
 pub const PLAN_MESSAGES_JSONL: &str = "messages.jsonl";
 pub const PLAN_EVENTS_JSONL: &str = "plan-events.jsonl";
+pub const PLAN_DOCS_DIR: &str = "docs";
+pub const PLAN_NARRATIVE: &str = "PLAN-NARRATIVE.md";
 pub const WORKER_SPECS_DIR: &str = "worker-specs";
 pub const SUMMARIES_DIR: &str = "summaries";
 pub const PLAN_CHILD_PARENT_JSON: &str = ".deadreckon/parent.json";
@@ -24,6 +27,15 @@ pub const PLAN_CHILD_PARENT_JSON: &str = ".deadreckon/parent.json";
 pub enum PlanMode {
     FullPlan,
     Review,
+}
+
+impl PlanMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FullPlan => "full-plan",
+            Self::Review => "review",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -554,6 +566,75 @@ pub fn write_child_summary(
     }
     fs::write(&path, summary).with_path(&path)?;
     Ok(path)
+}
+
+pub fn plan_narrative_path(paths: &DeadreckonPaths, plan_id: &str) -> PathBuf {
+    paths
+        .plan_dir(plan_id)
+        .join(PLAN_DOCS_DIR)
+        .join(PLAN_NARRATIVE)
+}
+
+pub fn write_plan_narrative(paths: &DeadreckonPaths, plan: &Plan) -> Result<PathBuf> {
+    let path = plan_narrative_path(paths, &plan.plan_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_path(parent)?;
+    }
+
+    let mut out = String::new();
+    out.push_str("# Plan Narrative\n\n");
+    out.push_str(&format!("**Plan ID:** `{}`\n", plan.plan_id));
+    out.push_str(&format!("**Status:** {}\n", plan_status_label(plan.status)));
+    out.push_str(&format!("**Goal:** {}\n", plan.root_goal));
+    out.push_str(&format!("**Mode:** {}\n", plan.mode.as_str()));
+    if let Some(run_id) = plan.merged_run_id.as_deref() {
+        out.push_str(&format!("**Result run:** `{run_id}`\n"));
+    }
+    out.push_str("\n## Reading Order\n\n");
+    out.push_str(
+        "Start with this plan narrative, then read the child summaries below for the work each child completed.\n\n",
+    );
+    out.push_str("## Child Summaries\n\n");
+
+    for task in &plan.tasks {
+        out.push_str(&format!("### Child {}: {}\n\n", task.index, task.subject));
+        out.push_str(&format!("- Child id: `{}`\n", task.task_id));
+        out.push_str(&format!("- Role: {}\n", plan_role_label(task.role)));
+        out.push_str(&format!(
+            "- Status: {}\n",
+            plan_task_status_label(task.status)
+        ));
+        if let Some(run_id) = task.child_run_id.as_deref() {
+            out.push_str(&format!("- Run: `{run_id}`\n"));
+        }
+        if task.depends_on.is_empty() {
+            out.push_str("- Dependencies: none\n");
+        } else {
+            out.push_str(&format!("- Dependencies: {}\n", task.depends_on.join(", ")));
+        }
+        out.push('\n');
+
+        let summary_path = task
+            .summary_path
+            .as_ref()
+            .map(|relative| paths.plan_dir(&plan.plan_id).join(relative))
+            .unwrap_or_else(|| paths.child_summary(&plan.plan_id, &task.task_id));
+        let summary = fs::read_to_string(&summary_path)
+            .unwrap_or_else(|_| "No child summary was recorded for this child.".to_string());
+        out.push_str(summary.trim());
+        out.push_str("\n\n");
+    }
+
+    fs::write(&path, out).with_path(&path)?;
+    Ok(path)
+}
+
+fn plan_role_label(role: PlanRole) -> &'static str {
+    match role {
+        PlanRole::Child => "child",
+        PlanRole::Coder => "coder",
+        PlanRole::Reviewer => "reviewer",
+    }
 }
 
 pub fn write_plan_child_marker(working_dir: &Path, marker: &PlanChildMarker) -> Result<PathBuf> {

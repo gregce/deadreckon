@@ -36,6 +36,7 @@ use deadreckon::ui_card::{
 };
 use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt, write_receipt};
 use deadreckon_core::paths::workspace_scope;
+use deadreckon_core::plan::write_plan_narrative;
 use deadreckon_core::update_cache::{read_cache, write_cache};
 use deadreckon_core::{
     AcceptanceMarker, AcceptanceProgressEntry, ApplyMode, ApplyStrategy, BranchPolicy, Chain,
@@ -10220,6 +10221,7 @@ async fn merge_command(args: MergeCommandArgs) -> Result<()> {
         },
     )?;
     append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanCompleted)?;
+    let _plan_narrative = write_plan_narrative(&paths, &plan)?;
     let library_dir = paths.library_dir(&merged_run.scope, &merged_run.run_id);
     write_plan_merge_manifest(&paths, &library_dir, &plan, &merge.conflicts)?;
     if !quiet {
@@ -12921,12 +12923,16 @@ fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
     if candidates.is_empty() {
         println!("no cleanup candidates");
         if !completed {
-            println!(
-                "hint: use `deadreckon cleanup --completed` to discard completed worktree runs"
+            let _ = ui::hint(
+                ui::Stream::Stderr,
+                "use `deadreckon cleanup --completed` to discard completed worktree runs",
             );
         }
         if !all {
-            println!("hint: use `deadreckon cleanup --all-scopes` to search every project");
+            let _ = ui::hint(
+                ui::Stream::Stderr,
+                "use `deadreckon cleanup --all-scopes` to search every project",
+            );
         }
         return Ok(());
     }
@@ -13909,7 +13915,10 @@ fn list_command(
         match effective_scope.as_deref() {
             Some(scope) => {
                 println!("no runs for current project ({scope})");
-                println!("hint: use `deadreckon list --all` to see every project");
+                let _ = ui::hint(
+                    ui::Stream::Stderr,
+                    "use `deadreckon list --all` to see every project",
+                );
             }
             None => println!("no runs"),
         }

@@ -17,13 +17,16 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
+use deadreckon_core::plan::write_plan_narrative;
 use deadreckon_core::{
-    CodebaseMode, CodebaseRecord, DeadreckonPaths, FileChange, FrontmatterFields, RunOptions,
-    RunStatus, TurnDocInput, TurnRecord, append_parent_narrative_update, append_turn_doc,
-    apply_commit_body, as_built_path, auto_title, coalesce_into_phases, decisions_path,
+    CodebaseMode, CodebaseRecord, DeadreckonPaths, FileChange, FrontmatterFields, Plan, PlanMode,
+    PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunOptions, RunStatus,
+    TurnDocInput, TurnRecord, append_parent_narrative_update, append_turn_doc, apply_commit_body,
+    as_built_path, auto_title, child_summary_relative_path, coalesce_into_phases, decisions_path,
     diff_samples_markdown, docs_dir, frontmatter, is_decision_candidate,
     missing_files_in_narrative, narrative_path, polish_path, publish_docs_for_promotion,
     rewrite_templated_docs, save_state, should_emit_delta, source_layout, tool_stdio_markdown,
+    write_child_summary,
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_runtime::{
@@ -1345,13 +1348,59 @@ fn extend_updates_parent_narrative_with_updates_since() {
 
 #[test]
 fn plan_narrative_aggregates_child_summaries() {
-    let help = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
-        .arg("--help")
-        .output()
-        .expect("help");
+    let temp = TempDir::new().expect("tempdir");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut task = PlanTask::new(0, "parser", "parse provider logs", PlanRole::Child, None);
+    task.status = PlanTaskStatus::Completed;
+    task.child_run_id = Some("run123456789".to_string());
+    task.summary_path = Some(child_summary_relative_path(&task.task_id));
+    let mut reviewer = PlanTask::new(
+        1,
+        "reviewer",
+        "review provider logs",
+        PlanRole::Reviewer,
+        None,
+    );
+    reviewer.status = PlanTaskStatus::Completed;
+    reviewer.child_run_id = Some("run987654321".to_string());
+    reviewer.summary_path = Some(child_summary_relative_path(&reviewer.task_id));
+    let mut plan = Plan::new(
+        "coherent plan docs",
+        PlanMode::FullPlan,
+        vec![task.clone(), reviewer.clone()],
+        PlanProviders::default(),
+        Some("scope".to_string()),
+        "test",
+    )
+    .expect("plan");
+    plan.status = PlanStatus::Merged;
+    plan.merged_run_id = Some("result123456".to_string());
+    write_child_summary(
+        &paths,
+        &plan.plan_id,
+        &task.task_id,
+        "Child summary says the parser now reports running.",
+    )
+    .expect("child summary");
+    write_child_summary(
+        &paths,
+        &plan.plan_id,
+        &reviewer.task_id,
+        "Reviewer summary says the labels match the run.",
+    )
+    .expect("reviewer summary");
+
+    let path = write_plan_narrative(&paths, &plan).expect("plan narrative");
+    let text = fs::read_to_string(path).expect("read plan narrative");
+
+    assert!(text.contains("**Status:** completed"), "{text}");
+    assert!(text.contains("**Mode:** full-plan"), "{text}");
+    assert!(text.contains("### Child 0: parser"), "{text}");
+    assert!(text.contains("- Status: completed"), "{text}");
+    assert!(text.contains("- Run: `run123456789`"), "{text}");
     assert!(
-        !stdout(&help).contains(" plan "),
-        "orchestrate not landed; plan narrative gated"
+        text.contains("Child summary says the parser now reports running."),
+        "{text}"
     );
 }
 

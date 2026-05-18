@@ -47,6 +47,10 @@ fn error_lines_use_shared_stderr_helper() {
     let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");
     assert!(!main.contains("eprintln!(\"error:"), "raw error printer");
     assert!(!main.contains("eprintln!(\"  hint:"), "raw hint printer");
+    assert!(
+        !main.contains("println!(\"hint:"),
+        "raw stdout hint printer"
+    );
     assert!(main.contains("fn print_error("), "shared error helper");
 }
 
