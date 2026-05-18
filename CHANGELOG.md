@@ -10,6 +10,7 @@
 - Added `docs/PLAN-NARRATIVE.md` for merged plans so orchestration has one plan-level reading path built from child summaries.
 - Rendered top help and `help-all` from one command catalog, with tests that catch duplicate rows and catalog entries that drift away from clap commands.
 - Clarified the `help-all` discovery policy so documented advanced commands are distinct from compatibility aliases kept inline on canonical rows.
+- Standardized `--plain` help across run, orchestration, lifecycle, and inspection commands as "without TUI, spinner, or ANSI affordances."
 
 ## Semantic merge repair (alpha) - 2026-05-16
 

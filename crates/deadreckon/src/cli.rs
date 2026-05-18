@@ -641,7 +641,7 @@ pub(crate) enum Commands {
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
         quiet: bool,
-        #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },
     #[command(
@@ -682,7 +682,7 @@ pub(crate) enum Commands {
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
         quiet: bool,
-        #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },
     #[command(
@@ -718,7 +718,7 @@ pub(crate) enum Commands {
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
         quiet: bool,
-        #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },
     #[command(
@@ -760,7 +760,7 @@ pub(crate) enum Commands {
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
         quiet: bool,
-        #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },
     #[command(
@@ -835,7 +835,7 @@ pub(crate) enum Commands {
         no_hints: bool,
         #[arg(long, help = "Suppress success stdout")]
         quiet: bool,
-        #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
         #[arg(long, help = "Reason for pause")]
         reason: Option<String>,
@@ -925,7 +925,7 @@ pub(crate) enum Commands {
         yes: bool,
         #[arg(long, help = "Suppress lifecycle hints")]
         quiet: bool,
-        #[arg(long, help = "Plain output without ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },
     #[command(
@@ -941,7 +941,7 @@ pub(crate) enum Commands {
         all: bool,
         #[arg(long, help = "Use the table layout (default; kept for compatibility)")]
         full: bool,
-        #[arg(long, help = "Plain output without ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
@@ -1063,7 +1063,7 @@ pub(crate) enum Commands {
         cleanup: bool,
         #[arg(long, help = "Commit message override")]
         message: Option<String>,
-        #[arg(long, help = "Plain output without ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },
     #[command(
@@ -1191,7 +1191,7 @@ pub(crate) enum Commands {
         run_id: String,
         #[arg(long, help = "Suppress post-completion action hints")]
         no_hints: bool,
-        #[arg(long, help = "Plain output without opening the TUI")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },
     #[command(
@@ -1209,7 +1209,7 @@ pub(crate) enum Commands {
             help = "Escalate subprocess termination"
         )]
         force: bool,
-        #[arg(long, help = "Plain output without ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },
     #[command(
@@ -1225,7 +1225,7 @@ pub(crate) enum Commands {
         from_turn: Option<u32>,
         #[arg(long, help = "Override wall-clock cap")]
         max_wall_seconds: Option<f64>,
-        #[arg(long, help = "Plain output without ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },
     #[command(
@@ -1258,7 +1258,7 @@ pub(crate) enum Commands {
         turn: Option<u32>,
         #[arg(long, help = "Explain the most likely failure cause")]
         why_failed: bool,
-        #[arg(long, help = "Plain output without ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
@@ -1288,7 +1288,7 @@ pub(crate) enum Commands {
             help = "Use the global latest run instead of the current project"
         )]
         all: bool,
-        #[arg(long, help = "Plain output without ANSI affordances")]
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
@@ -1375,7 +1375,7 @@ pub(crate) struct OrchestrateReviewArgs {
     pub(crate) no_hints: bool,
     #[arg(long, help = "Suppress success stdout")]
     pub(crate) quiet: bool,
-    #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+    #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
     pub(crate) plain: bool,
 }
 
@@ -1428,7 +1428,7 @@ pub(crate) struct OrchestrateFullPlanArgs {
     pub(crate) no_hints: bool,
     #[arg(long, help = "Suppress success stdout")]
     pub(crate) quiet: bool,
-    #[arg(long, help = "Plain output without TUI or ANSI affordances")]
+    #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
     pub(crate) plain: bool,
 }
 

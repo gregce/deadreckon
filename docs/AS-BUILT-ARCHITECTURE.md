@@ -1688,6 +1688,8 @@ Custom top-level help and `help-all` command discovery now render from `COMMAND_
 
 The alpha CLI names intent before force. Kill paths use `--escalate`; destination overwrites use `--overwrite`; abandon uses `--anyway`; chain and cleanup cross-scope commands use `--all-scopes`; status uses `--global`; run branch naming uses `--branch-name`; apply/finish targets use `--into`; doc polish uses `--max-spend`; apply and finish git behavior use `--git-strategy`. The old spellings stay as hidden aliases for one alpha. Chain branch policy displays `linear-merge` while accepting the old `merge` value.
 
+Every visible `--plain` flag uses the same help definition: "Plain output without TUI, spinner, or ANSI affordances." Individual commands still implement their own plain-mode effect, such as `attach --plain` choosing the text summary instead of ratatui.
+
 ### 26.5 Prompts
 
 `crates/deadreckon/src/prompt.rs` owns `prompt::open` and `prompt::confirm`. Every `Y/n` and `y/N` confirmation now renders with the same `? question [Y/n]: ` shape. The high-spend prompt says `continue with --max-spend $N? [y/N]:`, and doc polish now treats Enter as the displayed yes default.

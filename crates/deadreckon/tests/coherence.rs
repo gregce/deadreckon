@@ -203,6 +203,50 @@ fn command_help_prefers_status_finish_export_and_cleanup() {
 }
 
 #[test]
+fn plain_flag_help_uses_one_definition() {
+    const PLAIN_HELP: &str = "Plain output without TUI, spinner, or ANSI affordances";
+    const STALE_PLAIN_HELP: &[&str] = &[
+        "Plain output without TUI or ANSI affordances",
+        "Plain output without ANSI affordances",
+        "Plain output without opening the TUI",
+    ];
+
+    for args in [
+        ["run", "--help"],
+        ["orchestrate", "--help"],
+        ["plan", "--help"],
+        ["fork", "--help"],
+        ["merge", "--help"],
+        ["chain", "--help"],
+        ["list", "--help"],
+        ["update", "--help"],
+        ["apply", "--help"],
+        ["attach", "--help"],
+        ["kill", "--help"],
+        ["resume", "--help"],
+        ["show", "--help"],
+        ["status", "--help"],
+    ] {
+        let out = help(args);
+        assert!(out.contains(PLAIN_HELP), "{args:?}\n{out}");
+        for stale in STALE_PLAIN_HELP {
+            assert!(!out.contains(stale), "{args:?}\n{out}");
+        }
+    }
+
+    for args in [
+        ["orchestrate", "review", "--help"],
+        ["orchestrate", "full-plan", "--help"],
+    ] {
+        let out = help(args);
+        assert!(out.contains(PLAIN_HELP), "{args:?}\n{out}");
+        for stale in STALE_PLAIN_HELP {
+            assert!(!out.contains(stale), "{args:?}\n{out}");
+        }
+    }
+}
+
+#[test]
 fn current_docs_do_not_teach_stale_primary_aliases() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let repo = manifest
