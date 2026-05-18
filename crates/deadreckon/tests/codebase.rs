@@ -1487,7 +1487,7 @@ fn post_apply_hint_includes_git_log_one_stat() {
 
     assert_success(&apply);
     let stdout = stdout(&apply);
-    assert!(stdout.contains(&format!("applied {run_id} onto")));
+    assert!(stdout.contains(&format!("applied {run_id} into")));
     assert!(stdout.contains("commit "));
     assert!(stdout.contains("Cargo.toml"));
     assert!(stdout.contains(&format!("next: deadreckon cleanup {}", &run_id[..8])));

@@ -987,7 +987,7 @@ pub(crate) enum Commands {
         #[arg(
             long = "into",
             alias = "branch",
-            help = "Apply target branch; defaults to the current branch"
+            help = "Target branch for apply; defaults to the current branch"
         )]
         branch: Option<String>,
         #[arg(
@@ -1047,7 +1047,7 @@ pub(crate) enum Commands {
         #[arg(
             long = "into",
             alias = "branch",
-            help = "Target branch; defaults to the current branch"
+            help = "Target branch for apply; defaults to the current branch"
         )]
         branch: Option<String>,
         #[arg(long, help = "Skip interactive confirmation")]

@@ -13,6 +13,7 @@
 - Standardized `--plain` help across run, orchestration, lifecycle, and inspection commands as "without TUI, spinner, or ANSI affordances."
 - Standardized cross-project flag help on "all project scopes" while keeping provider `--all` scoped to provider inventory.
 - Renamed visible update override help from `--force` to `--anyway`, keeping `--force` as a hidden alpha alias.
+- Aligned branch target wording so `run` names worktree branches with `--branch-name`, `apply`/`finish` target branches with `--into`, and apply output says changes landed `into` the target branch.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 

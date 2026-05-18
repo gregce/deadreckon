@@ -60,6 +60,14 @@ fn help_uses_new_flag_names_with_alpha_aliases_hidden() {
     assert!(run.contains("--branch-name"), "{run}");
     assert!(!run.contains("--branch <"), "{run}");
 
+    let finish = help(["finish", "--help"]);
+    assert!(finish.contains("--into"), "{finish}");
+    assert!(
+        finish.contains("Target branch for apply; defaults to the current branch"),
+        "{finish}"
+    );
+    assert!(!finish.contains("--branch <"), "{finish}");
+
     let kill = help(["kill", "--help"]);
     assert!(kill.contains("--escalate"), "{kill}");
     assert!(kill.contains("deadreckon kill <chain-id>"), "{kill}");
@@ -75,6 +83,12 @@ fn help_uses_new_flag_names_with_alpha_aliases_hidden() {
 
     let apply = help(["apply", "--help"]);
     assert!(apply.contains("--git-strategy"), "{apply}");
+    assert!(apply.contains("--into"), "{apply}");
+    assert!(
+        apply.contains("Target branch for apply; defaults to the current branch"),
+        "{apply}"
+    );
+    assert!(!apply.contains("--branch <"), "{apply}");
 }
 
 #[test]

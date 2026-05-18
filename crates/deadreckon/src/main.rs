@@ -12907,7 +12907,7 @@ fn apply_command_inner(
     }
     if !quiet {
         println!(
-            "{} {} onto {}",
+            "{} {} into {}",
             ui_ok("applied"),
             ui_id(&state.run_id),
             target
@@ -12924,13 +12924,14 @@ fn apply_command_inner(
 
 fn print_already_applied(state: &deadreckon_core::PipelineState, branch: &str, target: &str) {
     println!(
-        "{} {} onto {}",
+        "{} {} into {}",
         ui_ok("already applied"),
         ui_id(&state.run_id),
         target
     );
-    println!("  branch: {branch}");
-    println!("  reason: no file changes remain between the branch and target");
+    println!("  run branch:    {branch}");
+    println!("  target branch: {target}");
+    println!("  reason: no file changes remain between the run branch and target branch");
 }
 
 fn finish_apply_cleanup(
