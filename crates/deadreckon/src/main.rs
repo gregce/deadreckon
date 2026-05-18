@@ -1154,6 +1154,25 @@ const PROVIDER_ROLE_ROWS: &[(&str, &str)] = &[
     ),
 ];
 
+const CAP_POLICY_ROWS: &[(&str, &str)] = &[
+    (
+        "run cap",
+        "`run --max-spend` limits one run's provider spend",
+    ),
+    (
+        "per-child cap",
+        "`orchestrate`/`fork --max-spend` limits each child run",
+    ),
+    (
+        "aggregate chain cap",
+        "`chain --max-spend` limits cumulative chain spend",
+    ),
+    (
+        "doc polish cap",
+        "`doc --max-spend` limits documentation polish spend",
+    ),
+];
+
 fn command_discovery(entry: &CommandHelpEntry) -> CommandDiscovery {
     match entry.display {
         "apply" | "export" | "doc" | "library" | "show" | "import" | "undo" | "abandon" => {
@@ -1262,6 +1281,11 @@ fn print_help_all() {
     );
     for (flag, purpose) in PROVIDER_ROLE_ROWS {
         println!("  {:<32} {}", ui_command(flag), purpose);
+    }
+    println!();
+    println!("{}", ui_heading("spend cap glossary"));
+    for (label, purpose) in CAP_POLICY_ROWS {
+        println!("  {:<22} {}", ui_command(label), purpose);
     }
     println!();
     println!(

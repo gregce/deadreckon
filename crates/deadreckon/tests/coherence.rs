@@ -375,6 +375,24 @@ fn provider_role_help_uses_one_glossary() {
 }
 
 #[test]
+fn spend_cap_help_uses_one_glossary() {
+    let all = help(["help-all"]);
+    assert!(all.contains("spend cap glossary"), "{all}");
+    for phrase in [
+        "run cap",
+        "`run --max-spend` limits one run's provider spend",
+        "per-child cap",
+        "`orchestrate`/`fork --max-spend` limits each child run",
+        "aggregate chain cap",
+        "`chain --max-spend` limits cumulative chain spend",
+        "doc polish cap",
+        "`doc --max-spend` limits documentation polish spend",
+    ] {
+        assert!(all.contains(phrase), "missing `{phrase}`:\n{all}");
+    }
+}
+
+#[test]
 fn all_scope_flag_help_uses_scope_vocabulary() {
     for args in [
         &["chain", "--help"][..],

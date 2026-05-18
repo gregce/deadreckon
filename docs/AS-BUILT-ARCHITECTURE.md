@@ -1693,6 +1693,8 @@ Every visible `--plain` flag uses the same help definition: "Plain output withou
 
 Output and scripting flags have a visible policy in `deadreckon help-all`. `--yes` confirms preflight previews for start/update-style commands. `--no-confirm` skips destructive or follow-up confirmations after the target is known. `--quiet` suppresses success chatter and post-action hints, never requested data or errors. `--plain` disables TUI, spinner, and ANSI affordances without implying quiet. `--json` is reserved for inspection/list surfaces and wins over styling and hints. `--no-hints` suppresses optional next-step hints; `DEADRECKON_HINTS=0|false|off|no` disables them globally for the process.
 
+`deadreckon help-all` also carries the spend-cap glossary. A run cap is `run --max-spend` for one run, a per-child cap is `orchestrate`/`fork --max-spend` for each child run, an aggregate chain cap is `chain --max-spend`, and a doc polish cap is `doc --max-spend`.
+
 ### 26.5 Prompts
 
 `crates/deadreckon/src/prompt.rs` owns `prompt::open` and `prompt::confirm`. Every `Y/n` and `y/N` confirmation now renders with the same `? question [Y/n]: ` shape. The high-spend prompt says `continue with --max-spend $N? [y/N]:`, and doc polish now treats Enter as the displayed yes default.
