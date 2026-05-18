@@ -12,41 +12,7 @@ const TOP_LEVEL_TEMPLATE: &str = "\
 Options:
 {options}";
 
-const TOP_LEVEL_HELP: &str = "\
-Typical flow:
-  deadreckon def-done \"builds, tests pass, and opens in a browser\"
-  deadreckon run \"build the thing\"
-  deadreckon attach latest
-  deadreckon finish latest
-
-Core lifecycle:
-  init        configure deadreckon
-  doctor      check provider, sandbox, and local setup
-  def-done    write/check done criteria in English
-  run         start unattended coding work
-  orchestrate run coder/reviewer or full-plan multi-agent work
-  chain       run several coding steps in sequence
-  attach      watch a run, chain, or plan in the TUI
-  status      see the latest run and next action
-  list        show runs and plans
-  finish      apply or export completed work
-
-Continue or recover:
-  extend      continue from a completed run
-  resume      resume an incomplete run
-  kill        cancel a run, chain, or plan
-  cleanup     remove stale or completed worktrees
-
-More help:
-  completion  generate shell tab-completion scripts
-  detect      probe registered providers
-  providers   list provider routes and models
-  update      check for or route self-updates
-  history     search run traces and provenance
-  help-all    show every command, including advanced commands (alias: commands)
-  <command> --help
-
-Run, chain, and plan ids accept unique prefixes where that command accepts the kind. `latest` means the newest item for the current project.";
+const TOP_LEVEL_AFTER_HELP: &str = "\n\nRun `deadreckon help-all` for the full command catalog.";
 
 const COMPLETION_HELP: &str = "\
 Lifecycle:
@@ -429,7 +395,7 @@ searches the current project's run traces. Use --all to search every project.";
     about = "Unattended agentic coding harness",
     long_about = "deadreckon runs long coding goals in an isolated worktree or sandbox, tracks durable state, and gives you explicit apply/export/cleanup steps.",
     help_template = TOP_LEVEL_TEMPLATE,
-    after_help = TOP_LEVEL_HELP
+    after_help = TOP_LEVEL_AFTER_HELP
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]

@@ -832,6 +832,313 @@ fn wants_top_level_help() -> bool {
     matches!(arg.to_string_lossy().as_ref(), "-h" | "--help" | "help")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopHelpGroup {
+    CoreLifecycle,
+    ContinueRecover,
+    MoreHelp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelpAllGroup {
+    SetupProviders,
+    CoreLifecycle,
+    Orchestration,
+    ContinueRecover,
+    InspectAdvanced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommandHelpEntry {
+    display: &'static str,
+    clap_name: Option<&'static str>,
+    purpose: &'static str,
+    top_group: Option<TopHelpGroup>,
+    all_group: Option<HelpAllGroup>,
+}
+
+const TYPICAL_FLOW_COMMANDS: &[&str] = &[
+    "deadreckon def-done \"builds, tests pass, and opens in a browser\"",
+    "deadreckon run \"build the thing\"",
+    "deadreckon attach latest",
+    "deadreckon finish latest",
+];
+
+const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
+    CommandHelpEntry {
+        display: "init",
+        clap_name: Some("init"),
+        purpose: "configure deadreckon",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::SetupProviders),
+    },
+    CommandHelpEntry {
+        display: "doctor",
+        clap_name: Some("doctor"),
+        purpose: "check provider, sandbox, and local setup",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::SetupProviders),
+    },
+    CommandHelpEntry {
+        display: "detect",
+        clap_name: Some("detect"),
+        purpose: "probe registered providers",
+        top_group: Some(TopHelpGroup::MoreHelp),
+        all_group: Some(HelpAllGroup::SetupProviders),
+    },
+    CommandHelpEntry {
+        display: "providers",
+        clap_name: Some("providers"),
+        purpose: "list provider routes and models",
+        top_group: Some(TopHelpGroup::MoreHelp),
+        all_group: Some(HelpAllGroup::SetupProviders),
+    },
+    CommandHelpEntry {
+        display: "config",
+        clap_name: Some("config"),
+        purpose: "read or update configuration",
+        top_group: None,
+        all_group: Some(HelpAllGroup::SetupProviders),
+    },
+    CommandHelpEntry {
+        display: "completion",
+        clap_name: Some("completion"),
+        purpose: "install or generate shell completions",
+        top_group: Some(TopHelpGroup::MoreHelp),
+        all_group: Some(HelpAllGroup::SetupProviders),
+    },
+    CommandHelpEntry {
+        display: "def-done",
+        clap_name: Some("def-done"),
+        purpose: "write/check done criteria in English",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::CoreLifecycle),
+    },
+    CommandHelpEntry {
+        display: "run",
+        clap_name: Some("run"),
+        purpose: "start unattended coding work",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::CoreLifecycle),
+    },
+    CommandHelpEntry {
+        display: "orchestrate",
+        clap_name: Some("orchestrate"),
+        purpose: "run coder/reviewer or full-plan multi-agent work",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::Orchestration),
+    },
+    CommandHelpEntry {
+        display: "chain",
+        clap_name: Some("chain"),
+        purpose: "run several coding steps in sequence",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::CoreLifecycle),
+    },
+    CommandHelpEntry {
+        display: "attach",
+        clap_name: Some("attach"),
+        purpose: "watch a run, chain, or plan in the TUI",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::CoreLifecycle),
+    },
+    CommandHelpEntry {
+        display: "status",
+        clap_name: Some("status"),
+        purpose: "see the latest run and next action",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::CoreLifecycle),
+    },
+    CommandHelpEntry {
+        display: "list",
+        clap_name: Some("list"),
+        purpose: "show runs and plans",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::CoreLifecycle),
+    },
+    CommandHelpEntry {
+        display: "finish",
+        clap_name: Some("finish"),
+        purpose: "apply or export completed work",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::CoreLifecycle),
+    },
+    CommandHelpEntry {
+        display: "plan",
+        clap_name: Some("plan"),
+        purpose: "write a multi-agent plan without starting it",
+        top_group: None,
+        all_group: Some(HelpAllGroup::Orchestration),
+    },
+    CommandHelpEntry {
+        display: "fork",
+        clap_name: Some("fork"),
+        purpose: "start child runs for a plan",
+        top_group: None,
+        all_group: Some(HelpAllGroup::Orchestration),
+    },
+    CommandHelpEntry {
+        display: "merge",
+        clap_name: Some("merge"),
+        purpose: "compose completed plan children",
+        top_group: None,
+        all_group: Some(HelpAllGroup::Orchestration),
+    },
+    CommandHelpEntry {
+        display: "extend",
+        clap_name: Some("extend"),
+        purpose: "continue from a completed run",
+        top_group: Some(TopHelpGroup::ContinueRecover),
+        all_group: Some(HelpAllGroup::ContinueRecover),
+    },
+    CommandHelpEntry {
+        display: "resume",
+        clap_name: Some("resume"),
+        purpose: "resume an incomplete run",
+        top_group: Some(TopHelpGroup::ContinueRecover),
+        all_group: Some(HelpAllGroup::ContinueRecover),
+    },
+    CommandHelpEntry {
+        display: "kill",
+        clap_name: Some("kill"),
+        purpose: "cancel a run, chain, or plan",
+        top_group: Some(TopHelpGroup::ContinueRecover),
+        all_group: Some(HelpAllGroup::ContinueRecover),
+    },
+    CommandHelpEntry {
+        display: "cleanup",
+        clap_name: Some("cleanup"),
+        purpose: "remove stale or completed worktrees",
+        top_group: Some(TopHelpGroup::ContinueRecover),
+        all_group: Some(HelpAllGroup::ContinueRecover),
+    },
+    CommandHelpEntry {
+        display: "undo",
+        clap_name: Some("undo"),
+        purpose: "restore an in-place snapshot",
+        top_group: None,
+        all_group: Some(HelpAllGroup::ContinueRecover),
+    },
+    CommandHelpEntry {
+        display: "abandon",
+        clap_name: Some("abandon"),
+        purpose: "discard a temporary worktree run",
+        top_group: None,
+        all_group: Some(HelpAllGroup::ContinueRecover),
+    },
+    CommandHelpEntry {
+        display: "update",
+        clap_name: Some("update"),
+        purpose: "check for or route self-updates",
+        top_group: Some(TopHelpGroup::MoreHelp),
+        all_group: Some(HelpAllGroup::InspectAdvanced),
+    },
+    CommandHelpEntry {
+        display: "history",
+        clap_name: Some("history"),
+        purpose: "search run traces and provenance",
+        top_group: Some(TopHelpGroup::MoreHelp),
+        all_group: Some(HelpAllGroup::InspectAdvanced),
+    },
+    CommandHelpEntry {
+        display: "apply",
+        clap_name: Some("apply"),
+        purpose: "merge a completed worktree run",
+        top_group: None,
+        all_group: Some(HelpAllGroup::InspectAdvanced),
+    },
+    CommandHelpEntry {
+        display: "export",
+        clap_name: Some("materialize"),
+        purpose: "copy a completed fresh/copy run (alias: materialize)",
+        top_group: None,
+        all_group: Some(HelpAllGroup::InspectAdvanced),
+    },
+    CommandHelpEntry {
+        display: "doc",
+        clap_name: Some("doc"),
+        purpose: "read or regenerate run docs",
+        top_group: None,
+        all_group: Some(HelpAllGroup::InspectAdvanced),
+    },
+    CommandHelpEntry {
+        display: "library",
+        clap_name: Some("library"),
+        purpose: "inspect promoted artifacts",
+        top_group: None,
+        all_group: Some(HelpAllGroup::InspectAdvanced),
+    },
+    CommandHelpEntry {
+        display: "show",
+        clap_name: Some("show"),
+        purpose: "show raw state, traces, and provenance",
+        top_group: None,
+        all_group: Some(HelpAllGroup::InspectAdvanced),
+    },
+    CommandHelpEntry {
+        display: "import",
+        clap_name: Some("import"),
+        purpose: "import other tool history",
+        top_group: None,
+        all_group: Some(HelpAllGroup::InspectAdvanced),
+    },
+    CommandHelpEntry {
+        display: "acceptance",
+        clap_name: Some("acceptance"),
+        purpose: "advanced compatibility command for done criteria",
+        top_group: None,
+        all_group: Some(HelpAllGroup::InspectAdvanced),
+    },
+    CommandHelpEntry {
+        display: "help-all",
+        clap_name: Some("help-all"),
+        purpose: "show every command, including advanced commands (alias: commands)",
+        top_group: Some(TopHelpGroup::MoreHelp),
+        all_group: None,
+    },
+    CommandHelpEntry {
+        display: "<command> --help",
+        clap_name: None,
+        purpose: "detailed help for one command",
+        top_group: Some(TopHelpGroup::MoreHelp),
+        all_group: None,
+    },
+];
+
+const HELP_ALL_GROUPS: &[(HelpAllGroup, &str)] = &[
+    (HelpAllGroup::SetupProviders, "setup and providers"),
+    (HelpAllGroup::CoreLifecycle, "core lifecycle"),
+    (HelpAllGroup::Orchestration, "orchestration"),
+    (HelpAllGroup::ContinueRecover, "continue and recover"),
+    (HelpAllGroup::InspectAdvanced, "inspect and advanced"),
+];
+
+fn print_catalog_rows<'a>(rows: impl IntoIterator<Item = &'a CommandHelpEntry>) {
+    let rows = rows.into_iter().collect::<Vec<_>>();
+    let width = rows
+        .iter()
+        .map(|entry| entry.display.chars().count())
+        .max()
+        .unwrap_or(0);
+    for entry in rows {
+        println!(
+            "  {:<width$} {}",
+            ui_command(entry.display),
+            entry.purpose,
+            width = width
+        );
+    }
+}
+
+fn print_top_help_group(title: &str, group: TopHelpGroup) {
+    println!("{}", ui_heading(title));
+    print_catalog_rows(
+        COMMAND_HELP_CATALOG
+            .iter()
+            .filter(|entry| entry.top_group == Some(group)),
+    );
+}
+
 fn print_top_help() {
     println!(
         "{} {}",
@@ -846,59 +1153,15 @@ fn print_top_help() {
     println!("  {}", ui_command("deadreckon [command]"));
     println!();
     println!("{}", ui_heading("Typical flow:"));
-    for command in [
-        "deadreckon def-done \"builds, tests pass, and opens in a browser\"",
-        "deadreckon run \"build the thing\"",
-        "deadreckon attach latest",
-        "deadreckon finish latest",
-    ] {
+    for command in TYPICAL_FLOW_COMMANDS {
         println!("  {}", ui_command(command));
     }
     println!();
-    println!("{}", ui_heading("Core lifecycle:"));
-    for (name, purpose) in [
-        ("init", "configure deadreckon"),
-        ("doctor", "check provider, sandbox, and local setup"),
-        ("def-done", "write/check done criteria in English"),
-        ("run", "start unattended coding work"),
-        (
-            "orchestrate",
-            "run coder/reviewer or full-plan multi-agent work",
-        ),
-        ("chain", "run several coding steps in sequence"),
-        ("attach", "watch a run, chain, or plan in the TUI"),
-        ("status", "see the latest run and next action"),
-        ("list", "show runs and plans"),
-        ("finish", "apply or export completed work"),
-    ] {
-        println!("  {:<12} {}", ui_command(name), purpose);
-    }
+    print_top_help_group("Core lifecycle:", TopHelpGroup::CoreLifecycle);
     println!();
-    println!("{}", ui_heading("Continue or recover:"));
-    for (name, purpose) in [
-        ("extend", "continue from a completed run"),
-        ("resume", "resume an incomplete run"),
-        ("kill", "cancel a run, chain, or plan"),
-        ("cleanup", "remove stale or completed worktrees"),
-    ] {
-        println!("  {:<12} {}", ui_command(name), purpose);
-    }
+    print_top_help_group("Continue or recover:", TopHelpGroup::ContinueRecover);
     println!();
-    println!("{}", ui_heading("More help:"));
-    for (name, purpose) in [
-        ("completion", "generate shell tab-completion scripts"),
-        ("detect", "probe registered providers"),
-        ("providers", "list provider routes and models"),
-        ("update", "check for or route self-updates"),
-        ("history", "search run traces and provenance"),
-        (
-            "help-all",
-            "show every command, including advanced commands (alias: commands)",
-        ),
-        ("<command> --help", "detailed help for one command"),
-    ] {
-        println!("  {:<18} {}", ui_command(name), purpose);
-    }
+    print_top_help_group("More help:", TopHelpGroup::MoreHelp);
     println!();
     println!(
         "{} Run, chain, and plan ids accept unique prefixes where that command accepts the kind. {} means the newest item for the current project.",
@@ -917,76 +1180,14 @@ fn print_top_help() {
 
 fn print_help_all() {
     println!("{}", ui_heading("deadreckon commands"));
-    println!();
-    println!("{}", ui_heading("setup and providers"));
-    for (name, purpose) in [
-        ("init", "configure deadreckon"),
-        ("doctor", "check provider, sandbox, and local setup"),
-        ("detect", "probe registered providers"),
-        ("providers", "list provider routes and models"),
-        ("config", "read or update configuration"),
-        ("completion", "install or generate shell completions"),
-    ] {
-        println!("  {:<12} {}", ui_command(name), purpose);
-    }
-    println!();
-    println!("{}", ui_heading("core lifecycle"));
-    for (name, purpose) in [
-        ("def-done", "write/check done criteria in English"),
-        ("run", "start unattended coding work"),
-        (
-            "orchestrate",
-            "run coder/reviewer or full-plan multi-agent work",
-        ),
-        ("chain", "run several coding steps in sequence"),
-        ("attach", "watch a run, chain, or plan in the TUI"),
-        ("status", "see the latest run and next action"),
-        ("list", "show runs and plans"),
-        ("finish", "route completed work to apply or export"),
-    ] {
-        println!("  {:<12} {}", ui_command(name), purpose);
-    }
-    println!();
-    println!("{}", ui_heading("orchestration"));
-    for (name, purpose) in [
-        ("orchestrate", "plan, fork, and merge in one command"),
-        ("plan", "write a multi-agent plan without starting it"),
-        ("fork", "start child runs for a plan"),
-        ("merge", "compose completed plan children"),
-    ] {
-        println!("  {:<12} {}", ui_command(name), purpose);
-    }
-    println!();
-    println!("{}", ui_heading("continue and recover"));
-    for (name, purpose) in [
-        ("extend", "continue from a completed run"),
-        ("resume", "resume an incomplete run"),
-        ("kill", "cancel a run, chain, or plan"),
-        ("cleanup", "remove stale or completed worktrees"),
-        ("undo", "restore an in-place snapshot"),
-        ("abandon", "discard a temporary worktree run"),
-    ] {
-        println!("  {:<12} {}", ui_command(name), purpose);
-    }
-    println!();
-    println!("{}", ui_heading("inspect and advanced"));
-    for (name, purpose) in [
-        ("apply", "merge a completed worktree run"),
-        (
-            "export",
-            "copy a completed fresh/copy run (alias: materialize)",
-        ),
-        ("doc", "read or regenerate run docs"),
-        ("library", "inspect promoted artifacts"),
-        ("show", "show raw state, traces, and provenance"),
-        ("history", "search trace and provenance evidence"),
-        ("import", "import other tool history"),
-        (
-            "acceptance",
-            "advanced compatibility command for done criteria",
-        ),
-    ] {
-        println!("  {:<12} {}", ui_command(name), purpose);
+    for (group, title) in HELP_ALL_GROUPS {
+        println!();
+        println!("{}", ui_heading(title));
+        print_catalog_rows(
+            COMMAND_HELP_CATALOG
+                .iter()
+                .filter(|entry| entry.all_group == Some(*group)),
+        );
     }
     println!();
     println!(
@@ -20528,9 +20729,10 @@ mod tui_tests {
 
     use super::{
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
-        AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, ChainAttachTuiState,
-        CompletionAction, ProviderActivity, ProviderJsonlLogSpec, acceptance_activity_lines,
-        attach_banner, attach_header_text, attach_should_return_to_plan, chain_activity_lines,
+        AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, COMMAND_HELP_CATALOG,
+        ChainAttachTuiState, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS, ProviderActivity,
+        ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines, attach_banner,
+        attach_header_text, attach_should_return_to_plan, chain_activity_lines,
         chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
         chain_step_dot, chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
         cli_wait_status_line, collect_jsonl_provider_activity, completion_action_from_input,
@@ -20542,8 +20744,9 @@ mod tui_tests {
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
         render_attach, render_plan_attach, threshold_color,
     };
-    use crate::cli::CliPlanMode;
+    use crate::cli::{Cli, CliPlanMode};
     use chrono::Utc;
+    use clap::CommandFactory;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use deadreckon_core::{
         ApplyMode, ApplyStrategy, BranchPolicy, CapabilityPreview, Chain, ChainEvent,
@@ -20595,6 +20798,80 @@ mod tui_tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    #[test]
+    fn command_help_catalog_rows_are_unique() {
+        let mut top_rows = std::collections::BTreeSet::new();
+        let mut help_all_rows = std::collections::BTreeSet::new();
+
+        for entry in COMMAND_HELP_CATALOG {
+            if entry.top_group.is_some() {
+                assert!(
+                    top_rows.insert(entry.display),
+                    "duplicate top-help row for {}",
+                    entry.display
+                );
+            }
+            if entry.all_group.is_some() {
+                assert!(
+                    help_all_rows.insert(entry.display),
+                    "duplicate help-all row for {}",
+                    entry.display
+                );
+            }
+        }
+
+        assert!(top_rows.contains("help-all"));
+        assert!(top_rows.contains("<command> --help"));
+        assert!(help_all_rows.contains("export"));
+        assert!(!help_all_rows.contains("materialize"));
+    }
+
+    #[test]
+    fn command_help_catalog_points_at_real_clap_commands() {
+        let clap_names = Cli::command()
+            .get_subcommands()
+            .map(|command| command.get_name().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for CommandHelpEntry {
+            display, clap_name, ..
+        } in COMMAND_HELP_CATALOG
+        {
+            let Some(clap_name) = clap_name else {
+                continue;
+            };
+            assert!(
+                clap_names.contains(*clap_name),
+                "catalog row {display} points at missing clap command {clap_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_help_catalog_covers_expected_sections() {
+        let mut top_groups = std::collections::BTreeSet::new();
+        let mut all_groups = std::collections::BTreeSet::new();
+        for entry in COMMAND_HELP_CATALOG {
+            if let Some(group) = entry.top_group {
+                top_groups.insert(format!("{group:?}"));
+            }
+            if let Some(group) = entry.all_group {
+                all_groups.insert(format!("{group:?}"));
+            }
+        }
+
+        for group in [
+            TopHelpGroup::CoreLifecycle,
+            TopHelpGroup::ContinueRecover,
+            TopHelpGroup::MoreHelp,
+        ] {
+            assert!(top_groups.contains(&format!("{group:?}")));
+        }
+        for (group, _) in HELP_ALL_GROUPS {
+            assert!(all_groups.contains(&format!("{group:?}")));
+        }
     }
 
     #[test]

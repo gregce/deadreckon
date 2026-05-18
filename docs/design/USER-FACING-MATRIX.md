@@ -1,6 +1,6 @@
 # User-Facing Surface Matrix
 
-**Status:** Refreshed against the local working tree on 2026-05-17.
+**Status:** Refreshed against the local working tree on 2026-05-18.
 **Scope:** The user-visible CLI, prompts, summaries, TUI labels, JSON/plain modes, help text, docs-facing terminology, and orchestration surfaces in `/Users/gdc/deadreckon`.
 **Method:** Source audit of `crates/deadreckon/src/{cli.rs,main.rs,ui.rs,prompt.rs}` and `crates/deadreckon-core/src/{glossary.rs,state.rs,chain.rs,plan.rs}`, plus the current AS-BUILT and goal docs.
 **Read this as:** the current coherence backlog. The prior matrix cited commit `455b91a` and listed 108 issues; many of those are now implemented. This refresh keeps the visual affordances that are working and focuses the remaining user-facing drift.
@@ -16,7 +16,7 @@
 | Prompt helper | `prompt::open` and `prompt::confirm` provide a shared confirmation shape. | `crates/deadreckon/src/prompt.rs:1` | The old doc polish default-marker bug is fixed. |
 | Error hints | `error_hint` returns actionable strings and uses discovered config paths. | `crates/deadreckon/src/main.rs:147` | Generic provider/core errors now get a fallback hint. |
 | `def-done` naming | Top help and command help use `deadreckon def-done`, not `deadreckon done`. | `crates/deadreckon/src/main.rs:845`, `crates/deadreckon/src/cli.rs:189` | The screenshot miss is fixed in the current source. |
-| Help discovery | Top help, help-all, and command help now prefer canonical words: `status`, `finish`, `export`, `cleanup`, `run/chain/plan`, and aliases inline. | `crates/deadreckon/src/main.rs:834`, `crates/deadreckon/src/main.rs:917`, `crates/deadreckon/tests/coherence.rs:77` | The remaining gap is structural: the rows are tested but not generated from one command table. |
+| Help discovery | Top help and `help-all` render command rows from one catalog, while command help uses canonical words: `status`, `finish`, `export`, `cleanup`, `run/chain/plan`, and aliases inline. | `crates/deadreckon/src/main.rs:846`, `crates/deadreckon/src/main.rs:1181`, `crates/deadreckon/tests/coherence.rs:77` | Catalog tests verify row uniqueness and that rows point at real clap commands. |
 | Copy-out wording | User-facing prompts, docs, help, and refusal text now say `export`; `materialize` remains a hidden compatibility alias/internal marker word. | `crates/deadreckon/src/main.rs:12430`, `crates/deadreckon/src/main.rs:16679`, `crates/deadreckon/tests/coherence.rs:201` | TUI key `m` is preserved while the visible action is `export`. |
 | Plan/orchestrate start output | Orchestrate preflight and started output now print mode, children, providers, source, gate, repair, sandbox, spend, wall, plan, and events. | `crates/deadreckon/src/main.rs:8604`, `crates/deadreckon/src/main.rs:8694` | This is much closer to `run` parity. |
 | Plan attach drilldown | `attach <plan-id>` can drill into a child run and return. | `crates/deadreckon/src/main.rs:16757` | Footer copy still needs coherence work. |
@@ -88,7 +88,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 | ID | Surface | Current evidence | Required change |
 |---|---|---|---|
 | H9 | Hidden commands are discoverable through examples. | `apply`, `materialize`, `abandon`, `doc`, `show` are hidden but heavily referenced. | Define "advanced but documented" vs "hidden compatibility alias"; do not leave ghost commands. |
-| H12 | Help is tested but not generated from one command table. | `crates/deadreckon/tests/coherence.rs` covers top help, help-all, and key command help, but `TOP_LEVEL_HELP`, `print_top_help`, and `print_help_all` still duplicate rows. | Add a command metadata table or stronger snapshot tests so custom help and clap help cannot drift. |
 
 ### Flags And Option Semantics
 
@@ -175,7 +174,7 @@ Source: `crates/deadreckon/src/cli.rs`.
 The next coherence goal should land these decisions:
 
 1. One glossary for nouns, verbs, statuses, object kinds, provider roles, and done criteria.
-2. One command/help table that feeds custom top help, help-all, and clap after-help examples.
+2. Keep custom top help and help-all on the shared command catalog, with clap coverage tests for row drift.
 3. One flag policy for `--yes`, `--no-confirm`, `--all`, `--all-scopes`, `--plain`, `--quiet`, `--json`, `--no-hints`, provider roles, caps, and strategies.
 4. One style/palette helper for headings, ids, commands, statuses, hints, try-lines, warnings, errors, progress, and TUI colors.
 5. One lifecycle summary builder for run, plan, chain, finish, apply, export, extend, resume, kill, and cleanup results.
