@@ -691,6 +691,8 @@ pub(crate) enum Commands {
         no_hints: bool,
         #[arg(long, help = "Suppress success chatter and post-action hints")]
         quiet: bool,
+        #[arg(long, help = "Emit a machine-readable plan summary as JSON")]
+        json: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },
@@ -1789,6 +1791,7 @@ pub(crate) struct PlanCommandArgs {
     pub(crate) skip_acceptance_prompt: bool,
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
+    pub(crate) json: bool,
     pub(crate) plain: bool,
 }
 

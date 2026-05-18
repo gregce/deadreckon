@@ -376,9 +376,10 @@ async fn main_inner() -> Result<()> {
             acceptance,
             no_hints,
             quiet,
+            json,
             plain,
         } => {
-            ui::set_plain_output(plain);
+            ui::set_plain_output(plain || json);
             plan_command(PlanCommandArgs {
                 goal,
                 n,
@@ -393,9 +394,10 @@ async fn main_inner() -> Result<()> {
                 reviewer_provider,
                 init_git,
                 acceptance,
-                skip_acceptance_prompt: quiet,
+                skip_acceptance_prompt: quiet || json,
                 no_hints,
                 quiet,
+                json,
                 plain,
             })
             .await
@@ -1646,6 +1648,7 @@ async fn detect_command(id: Option<String>, json_output: bool, ping: bool) -> Re
     let paths = DeadreckonPaths::discover();
     let registry = ProviderRegistry::with_overrides(paths.home())?;
     let options = ProviderProbeOptions { ping };
+    let requested_id = id.clone();
     let results = if let Some(id) = id {
         let Some(descriptor) = registry.get(&id) else {
             let message = format!("no provider '{id}' in registry");
@@ -1661,7 +1664,18 @@ async fn detect_command(id: Option<String>, json_output: bool, ping: bool) -> Re
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "providers": results }))?
+            serde_json::to_string_pretty(&json!({
+                "kind": "provider_detect",
+                "id": requested_id.as_deref().unwrap_or("all"),
+                "status": "ok",
+                "next_actions": ["deadreckon providers list"],
+                "try_lines": Vec::<String>::new(),
+                "paths": {
+                    "home": paths.home(),
+                    "config": paths.config_path(),
+                },
+                "providers": results,
+            }))?
         );
     } else {
         print_detect_results(&results);
@@ -2155,10 +2169,18 @@ async fn providers_list_command(
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "kind": "providers",
+                "id": if all { "all" } else { "configured" },
+                "status": "ok",
+                "next_actions": ["deadreckon detect"],
+                "try_lines": Vec::<String>::new(),
+                "paths": {
+                    "home": paths.home(),
+                    "config": paths.config_path(),
+                },
                 "providers": results,
                 "missing_providers": missing,
                 "active": active,
-                "try_lines": Vec::<String>::new(),
             }))?
         );
         return Ok(());
@@ -3844,8 +3866,15 @@ fn chain_show_command(
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "chain": chain,
+                "kind": "chain",
+                "id": &chain.chain_id,
+                "status": chain_status_label(&chain),
+                "next_actions": [format!("deadreckon chain attach {}", chain_prefix(&chain.chain_id))],
                 "try_lines": Vec::<String>::new(),
+                "paths": {
+                    "chain": paths.chain_json(&chain.chain_id),
+                },
+                "chain": chain,
             }))?
         );
         return Ok(());
@@ -3872,11 +3901,19 @@ fn chain_show_command(
 }
 
 fn print_chains_json(chains: &[Chain]) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "chains": chains,
+            "kind": "chain_list",
+            "id": "chains",
+            "status": "ok",
+            "next_actions": ["deadreckon chain status latest"],
             "try_lines": Vec::<String>::new(),
+            "paths": {
+                "home": paths.home(),
+            },
+            "chains": chains,
         }))?
     );
     Ok(())
@@ -7148,12 +7185,20 @@ async fn doctor_command(json_output: bool) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "source": source,
+                "kind": "doctor",
+                "id": &source,
+                "status": "ok",
+                "next_actions": ["deadreckon detect", "deadreckon providers list"],
+                "try_lines": Vec::<String>::new(),
+                "paths": {
+                    "home": paths.home(),
+                    "config": paths.config_path(),
+                },
+                "source": &source,
                 "home": paths.home(),
                 "config_path": paths.config_path(),
                 "config_present": paths.config_path().exists(),
                 "sandboxes": sandbox_checks,
-                "try_lines": Vec::<String>::new(),
             }))?
         );
         return Ok(());
@@ -7922,6 +7967,7 @@ fn orchestrate_request_from_cli(
                     || bare.quiet,
                 no_hints: args.no_hints || bare.no_hints,
                 quiet: args.quiet || bare.quiet,
+                json: false,
                 plain: args.plain || bare.plain,
             },
             preview: args.preview || bare.preview,
@@ -7951,6 +7997,7 @@ fn orchestrate_request_from_cli(
                     || bare.quiet,
                 no_hints: args.no_hints || bare.no_hints,
                 quiet: args.quiet || bare.quiet,
+                json: false,
                 plain: args.plain || bare.plain,
             },
             preview: args.preview || bare.preview,
@@ -8028,6 +8075,7 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         skip_acceptance_prompt: yes || preview || quiet,
         no_hints,
         quiet,
+        json: false,
         plain,
     };
     match mode {
@@ -8280,10 +8328,15 @@ async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
 async fn plan_command(args: PlanCommandArgs) -> Result<()> {
     let quiet = args.quiet;
     let no_hints = args.no_hints;
+    let json_output = args.json;
     if !prepare_orchestration_source(args.init_git, quiet)? {
         return Ok(());
     }
     let plan = create_orchestration_plan(args).await?;
+    if json_output {
+        print_plan_json(&plan)?;
+        return Ok(());
+    }
     if !quiet {
         print_plan_created(&plan, no_hints);
     }
@@ -8330,6 +8383,7 @@ async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
         skip_acceptance_prompt,
         no_hints: _,
         quiet,
+        json: _,
         plain,
     } = args;
     let goal = goal.trim().to_string();
@@ -8832,6 +8886,51 @@ fn plan_acceptance_label(plan: &Plan) -> String {
         Some(checks) => format!("configured ({checks} checks) from {}", path.display()),
         None => format!("configured from {}", path.display()),
     }
+}
+
+fn plan_next_actions(plan: &Plan) -> Vec<String> {
+    let id = run_prefix(&plan.plan_id);
+    match plan.status {
+        PlanStatus::Pending => vec![format!("deadreckon fork {id}")],
+        PlanStatus::Forked => {
+            if plan
+                .tasks
+                .iter()
+                .all(|task| task.status == PlanTaskStatus::Completed)
+            {
+                vec![format!("deadreckon merge {id}")]
+            } else {
+                vec![format!("deadreckon attach {id}")]
+            }
+        }
+        PlanStatus::Merged => vec![format!("deadreckon finish {id}")],
+        PlanStatus::Failed => vec![format!("deadreckon show {id} --why-failed")],
+    }
+}
+
+fn plan_paths_json(plan: &Plan) -> Value {
+    let paths = DeadreckonPaths::discover();
+    json!({
+        "plan": paths.plan_json(&plan.plan_id),
+        "events": paths.plan_events(&plan.plan_id),
+        "directory": paths.plan_dir(&plan.plan_id),
+    })
+}
+
+fn print_plan_json(plan: &Plan) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "kind": "plan",
+            "id": &plan.plan_id,
+            "status": plan_status_label(plan.status),
+            "next_actions": plan_next_actions(plan),
+            "try_lines": Vec::<String>::new(),
+            "paths": plan_paths_json(plan),
+            "plan": plan,
+        }))?
+    );
+    Ok(())
 }
 
 fn print_plan_created(plan: &Plan, no_hints: bool) {
@@ -14170,9 +14269,20 @@ fn list_command(
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "kind": "list",
+                "id": effective_scope.as_deref().unwrap_or("all-scopes"),
+                "status": "ok",
+                "next_actions": [
+                    "deadreckon status latest",
+                    "deadreckon attach <id>",
+                    "deadreckon show <id>",
+                ],
+                "try_lines": Vec::<String>::new(),
+                "paths": {
+                    "home": paths.home(),
+                },
                 "runs": runs,
                 "plans": plans,
-                "try_lines": Vec::<String>::new(),
             }))?
         );
         return Ok(());
@@ -14795,8 +14905,15 @@ fn library_command(command: LibraryCommand) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
-                        "artifacts": artifacts,
+                        "kind": "library_list",
+                        "id": scope.as_deref().unwrap_or(if all { "all-scopes" } else { "current-scope" }),
+                        "status": "ok",
+                        "next_actions": ["deadreckon finish <id>", "deadreckon export <id>"],
                         "try_lines": Vec::<String>::new(),
+                        "paths": {
+                            "home": paths.home(),
+                        },
+                        "artifacts": artifacts,
                     }))?
                 );
                 return Ok(());
@@ -16166,8 +16283,13 @@ fn show_command(
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&json!({
-                                "plan": plan,
+                                "kind": "plan",
+                                "id": &plan.plan_id,
+                                "status": plan_status_label(plan.status),
+                                "next_actions": plan_next_actions(&plan),
                                 "try_lines": Vec::<String>::new(),
+                                "paths": plan_paths_json(&plan),
+                                "plan": plan,
                             }))?
                         );
                         return Ok(());
@@ -16185,12 +16307,23 @@ fn show_command(
         }
     };
     if json_output {
+        let status = run_status_label(state.status);
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "kind": "run",
+                "id": &state.run_id,
+                "status": status,
+                "next_actions": [next_action_label(&paths, &state)],
+                "try_lines": Vec::<String>::new(),
+                "paths": {
+                    "state": state.state_path(),
+                    "run_root": &state.run_root,
+                    "working": &state.working_dir,
+                    "artifact": &state.promoted_library_dir,
+                },
                 "run": state,
                 "plan_child": child_context,
-                "try_lines": Vec::<String>::new(),
             }))?
         );
         return Ok(());
@@ -16529,13 +16662,24 @@ fn status_command(run_id: Option<String>, all: bool, plain: bool, json_output: b
     };
     if json_output {
         let next_action = next_action_label(&paths, &state);
+        let status = run_status_label(state.status);
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "run": &state,
-                "status_label": run_status_label(state.status),
-                "next_action": next_action,
+                "kind": "run_status",
+                "id": &state.run_id,
+                "status": status,
+                "next_actions": [next_action.clone()],
                 "try_lines": Vec::<String>::new(),
+                "paths": {
+                    "state": state.state_path(),
+                    "run_root": &state.run_root,
+                    "working": &state.working_dir,
+                    "artifact": &state.promoted_library_dir,
+                },
+                "run": &state,
+                "status_label": status,
+                "next_action": next_action,
             }))?
         );
         return Ok(());

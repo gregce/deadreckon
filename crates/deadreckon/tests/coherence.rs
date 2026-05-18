@@ -1039,7 +1039,7 @@ fn json_inspection_surfaces_emit_named_payloads() {
         &paths,
         RunOptions {
             goal: "json run".to_string(),
-            cwd,
+            cwd: cwd.clone(),
             sandbox: "none".to_string(),
             provider: None,
             skill_name: "default-coding".to_string(),
@@ -1055,6 +1055,7 @@ fn json_inspection_surfaces_emit_named_payloads() {
         (vec!["list", "--json"], "runs"),
         (vec!["status", &state.run_id[..8], "--json"], "run"),
         (vec!["show", &state.run_id[..8], "--json"], "run"),
+        (vec!["detect", "--json"], "providers"),
         (vec!["doctor", "--json"], "sandboxes"),
         (vec!["providers", "list", "--json"], "providers"),
         (vec!["chain", "--json", "list"], "chains"),
@@ -1064,12 +1065,46 @@ fn json_inspection_surfaces_emit_named_payloads() {
             .output()
             .expect("json command");
         assert!(output.status.success(), "{}", stderr(&output));
-        let value: Value = serde_json::from_str(&stdout(&output)).expect("valid json");
+        let stdout = stdout(&output);
+        assert!(!stdout.contains("\u{1b}["), "{stdout}");
+        assert!(!stdout.contains("hint:"), "{stdout}");
+        let value: Value = serde_json::from_str(&stdout).expect("valid json");
         assert!(value.get(key).is_some(), "missing {key}: {value}");
+        for field in ["kind", "id", "status", "next_actions", "try_lines", "paths"] {
+            assert!(value.get(field).is_some(), "missing {field}: {value}");
+        }
         assert!(
-            value.get("try_lines").is_some(),
-            "missing try_lines: {value}"
+            value.get("next_actions").is_some_and(Value::is_array),
+            "next_actions should be an array: {value}"
         );
+        assert!(
+            value.get("try_lines").is_some_and(Value::is_array),
+            "try_lines should be an array: {value}"
+        );
+    }
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args([
+            "plan",
+            "json plan",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--quiet",
+            "--json",
+        ])
+        .output()
+        .expect("plan json command");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = stdout(&output);
+    assert!(!stdout.contains("\u{1b}["), "{stdout}");
+    assert!(!stdout.contains("hint:"), "{stdout}");
+    let value: Value = serde_json::from_str(&stdout).expect("valid plan json");
+    assert!(value.get("plan").is_some(), "{value}");
+    for field in ["kind", "id", "status", "next_actions", "try_lines", "paths"] {
+        assert!(value.get(field).is_some(), "missing {field}: {value}");
     }
 }
 

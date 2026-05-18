@@ -36,7 +36,7 @@
 | Plan event stream | `plan-events.jsonl` exists and plan attach reads it. | `crates/deadreckon-core/src/plan.rs:13`, `crates/deadreckon/src/main.rs:16768` | It is file-backed polling, not a same-process broadcast bus. |
 | Orchestrate finish/apply/export | Completed plans can route through `finish`, `apply`, and `export` by plan id. | `crates/deadreckon/src/main.rs:12232`, `crates/deadreckon/src/main.rs:12499` | Plan id is primary in help; result-run ids are secondary implementation detail. |
 | Chain glyph collision | Chain step `Applied` now uses `◉`; `Running` remains `●`. | `crates/deadreckon/src/main.rs:4824` | Preserve glyph set: `○ ● ◐ ✗ ↷ ◉ ↶`. |
-| Machine output | JSON exists on key inspect/list surfaces: list, status, show, doctor, detect, providers list, library list, and chain list/show/status. | `crates/deadreckon/src/cli.rs:898`, `crates/deadreckon/src/cli.rs:970`, `crates/deadreckon/src/cli.rs:1287`, `crates/deadreckon/src/cli.rs:1317`, `crates/deadreckon/src/cli.rs:1666`, `crates/deadreckon/src/cli.rs:1723` | Shapes and `try_lines` are not yet uniform. |
+| Machine output | JSON exists on key inspect/list surfaces plus `plan --json`; representative JSON responses include `kind`, `id`, `status`, `next_actions`, `try_lines`, and `paths` without ANSI or hints. | `crates/deadreckon/src/cli.rs:695`, `crates/deadreckon/src/main.rs:1664`, `crates/deadreckon/src/main.rs:8954`, `crates/deadreckon/tests/coherence.rs:1050` | Existing payload keys such as `runs`, `run`, `plan`, `providers`, and `chains` remain for compatibility. |
 | Visual identity | The cyan `deadreckoning` progress label, `* ^ . -` course strip, magenta ids, TUI palette, spend gradient, and step glyphs are present. | `crates/deadreckon/src/main.rs:12044`, `crates/deadreckon/src/ui.rs:25`, `crates/deadreckon/src/main.rs:20384` | Keep these; standardize their construction. |
 
 ## Current Command Catalog
@@ -141,8 +141,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 | ID | Surface | Current evidence | Required change |
 |---|---|---|---|
-| J1 | JSON shapes use different next-action conventions. | Status JSON has `try_lines`; other JSON surfaces vary. | Standard optional fields: `kind`, `id`, `status`, `next_actions`, `try_lines`, `paths`. |
-| J2 | Plan JSON/plain coverage is incomplete. | Plan summaries are text-heavy; plan command JSON is absent. | Add JSON where the command is inspection-like or preview-like. |
 | J4 | Snapshot tests are missing for many user surfaces. | Existing unit tests cover footers and helpers, not the whole command matrix. | Add golden tests for help, summaries, prompts, and JSON no-ANSI/no-hints behavior. |
 | J5 | Docs do not describe the user-facing style contract. | AS-BUILT has coherence section but not the full matrix contract. | Update AS-BUILT §17/§18/§26/§30/§32 after implementation. |
 

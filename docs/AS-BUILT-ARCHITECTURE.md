@@ -1717,7 +1717,7 @@ Plan merge/result output keeps the plan id as the primary object. The synthesize
 
 ### 26.9 JSON Parity
 
-Inspection surfaces that already read durable state now expose `--json`: `list`, `chain list`, `providers list`, `library list`, `status`, `show`, and `doctor`. Each JSON response is a top-level object with a named payload and `try_lines`, matching the existing `detect --json` shape. State-changing start/merge/fork/update actions remain text-first in alpha; their previews are not JSON surfaces.
+Inspection surfaces that already read durable state now expose `--json`: `list`, `chain list`, `providers list`, `library list`, `status`, `show`, `detect`, and `doctor`. `plan --json` is also available for the write-plan-only preview surface, returning the saved plan id, status, paths, and next action without human hints. Representative JSON responses are top-level objects with `kind`, `id`, `status`, `next_actions`, `try_lines`, `paths`, and the existing named payload (`run`, `plan`, `runs`, `providers`, `chains`, and so on) for compatibility. JSON mode disables ANSI and optional hints. State-changing start/merge/fork/update actions remain text-first in alpha.
 
 ### 26.10 Deferred V1 Work
 
