@@ -22,6 +22,7 @@
 - Moved the CLI style facade into `ui.rs` and added coherence coverage so status tone mapping and public style helpers have one source of truth.
 - Added standard JSON envelope fields across representative machine-readable surfaces and exposed `plan --json` for scriptable plan creation.
 - Split note, warning, paused, and failed/killed style intents, and routed extended-run terminal outcomes through status tones.
+- Rendered run, extend, and resume start summaries through the shared key/value block instead of bespoke provider/docs/state lines.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 

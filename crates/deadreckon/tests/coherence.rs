@@ -95,6 +95,21 @@ fn terminal_status_lines_do_not_use_warning_tone_for_failures() {
 }
 
 #[test]
+fn run_start_summaries_use_shared_key_value_layout() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");
+    let start = main
+        .split("fn print_run_started_with_label(")
+        .nth(1)
+        .and_then(|rest| rest.split("fn print_lifecycle_hints(").next())
+        .expect("print_run_started_with_label body");
+
+    assert!(start.contains("print_kv_block(&item_refs)"), "{start}");
+    assert!(!start.contains("println!(\"provider {}\""), "{start}");
+    assert!(!start.contains("println!(\"state {}\""), "{start}");
+}
+
+#[test]
 fn error_lines_use_shared_stderr_helper() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");

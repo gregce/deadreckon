@@ -1683,7 +1683,7 @@ Custom top-level help and `help-all` command discovery now render from `COMMAND_
 
 ### 26.3 Key/Value Layout
 
-`print_kv_block` wraps `ui::kv_block` for CLI cards. Run summaries, run locations, status cards, plan creation, and plan summaries now use lowercase keys, padded colons, and six-decimal spend where applicable.
+`print_kv_block` wraps `ui::kv_block` for CLI cards. Run start banners, run summaries, run locations, status cards, plan creation, and plan summaries now use lowercase keys, padded colons, and six-decimal spend where applicable.
 
 ### 26.4 Flag Truth
 

@@ -35,6 +35,7 @@
 | Plan result primacy | Merge/result output names the plan first and labels the synthesized result run and artifact library as secondary implementation details. | `crates/deadreckon/src/main.rs:9586`, `crates/deadreckon/src/main.rs:11849`, `crates/deadreckon/tests/coherence.rs:357` | Plan ids remain the user-facing lifecycle id for `finish`, `apply`, and `export`. |
 | Public docs alias sweep | README, HOWTO, and DEVELOPMENT-README no longer teach stale primary aliases or old flag spellings for the current CLI. | `crates/deadreckon/tests/coherence.rs:336` | Historical goal/rider docs may still mention old spellings as history; AS-BUILT calls them hidden alpha aliases where relevant. |
 | Plan/orchestrate start output | Orchestrate preflight and started output now print mode, children, providers, source, gate, repair, sandbox, spend, wall, plan, and events. | `crates/deadreckon/src/main.rs:8604`, `crates/deadreckon/src/main.rs:8694` | This is much closer to `run` parity. |
+| Run start key/value layout | Fresh, extended, and resumed run start banners share one padded key/value block for provider, model, docs, state, and attach. | `crates/deadreckon/src/main.rs:16988`, `crates/deadreckon/tests/coherence.rs:93` | This closes the most visible run/extend/resume start-summary mismatch without changing durable state. |
 | Plan attach drilldown | `attach <plan-id>` can drill into a child run and return. | `crates/deadreckon/src/main.rs:16757` | Footer copy still needs coherence work. |
 | Plan event stream | `plan-events.jsonl` exists and plan attach reads it. | `crates/deadreckon-core/src/plan.rs:13`, `crates/deadreckon/src/main.rs:16768` | It is file-backed polling, not a same-process broadcast bus. |
 | Orchestrate finish/apply/export | Completed plans can route through `finish`, `apply`, and `export` by plan id. | `crates/deadreckon/src/main.rs:12232`, `crates/deadreckon/src/main.rs:12499` | Plan id is primary in help; result-run ids are secondary implementation detail. |
@@ -103,7 +104,7 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 | ID | Surface | Current evidence | Required change |
 |---|---|---|---|
-| S4 | Key-value blocks are not universal. | `print_kv_block` exists, but `print_run_started`, status locations, and many summaries hand-format rows. | One kv-block helper with optional labels/try-lines. |
+| S4 | Key-value blocks are not universal. | `print_kv_block` exists, but some status detail rows and summaries still hand-format rows. | One kv-block helper with optional labels/try-lines. |
 | S5 | Hint and try-line formatting is mixed. | `ui::hint`, raw `hint:`, raw `try:`, and styled `ui_command("try:")`. | Centralize `hint`, `try_line`, and `next_action` helpers. |
 | S6 | Stream policy is implicit. | Prompts on stdout, progress on stderr, previews on stderr, success on stdout, cancellations mixed. | Document and enforce stdout/stderr rules per output type. |
 | S8 | Table headers vary. | Uppercase run/chain list headers vs lowercase kv labels. | Define table style for list-like output and kv style for detail output. |

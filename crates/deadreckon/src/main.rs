@@ -16990,22 +16990,33 @@ fn print_run_started_with_label(
         ui_ok(label),
         ui_id(format!("{} ({})", run_prefix(&state.run_id), state.run_id))
     );
+    let mut rows = Vec::new();
     if let Some(route) = route {
-        println!("provider {}", route.name);
-        println!("model {}", route.model);
+        rows.push(("provider".to_string(), route.name.clone()));
+        rows.push(("model".to_string(), route.model.clone()));
     } else if let Some(provider) = state.provider.as_deref() {
-        println!("provider {provider}");
+        rows.push(("provider".to_string(), provider.to_string()));
     }
-    println!(
-        "docs {} ({doc_provider_source})",
-        doc_provider.unwrap_or("templated only")
-    );
-    println!(
-        "{} {}",
-        ui_command("attach:"),
-        ui_command(format!("deadreckon attach {}", run_prefix(&state.run_id)))
-    );
-    println!("state {}", state.state_path().display());
+    rows.push((
+        "docs".to_string(),
+        format!(
+            "{} ({doc_provider_source})",
+            doc_provider.unwrap_or("templated only")
+        ),
+    ));
+    rows.push((
+        "state".to_string(),
+        state.state_path().display().to_string(),
+    ));
+    rows.push((
+        "attach".to_string(),
+        format!("deadreckon attach {}", run_prefix(&state.run_id)),
+    ));
+    let item_refs = rows
+        .iter()
+        .map(|(label, value)| (label.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    print_kv_block(&item_refs);
     let _ = io::stdout().flush();
 }
 
