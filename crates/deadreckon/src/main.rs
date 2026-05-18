@@ -1123,6 +1123,33 @@ const HELP_ALL_GROUPS: &[(HelpAllGroup, &str)] = &[
 
 const HELP_ALL_DISCOVERY_NOTE: &str = "Advanced commands are documented here but hidden from short help; compatibility aliases stay inline on their canonical command row.";
 
+const FLAG_POLICY_ROWS: &[(&str, &str)] = &[
+    (
+        "--yes",
+        "confirms preflight previews for start/update-style commands",
+    ),
+    (
+        "--no-confirm",
+        "skips destructive or follow-up confirmations after a target is known",
+    ),
+    (
+        "--quiet",
+        "suppresses success chatter and post-action hints, never requested data or errors",
+    ),
+    (
+        "--plain",
+        "disables TUI, spinner, and ANSI affordances; it does not imply quiet",
+    ),
+    (
+        "--json",
+        "is for inspection/list surfaces; JSON wins over styling and hints",
+    ),
+    (
+        "--no-hints",
+        "suppresses optional next-step hints; DEADRECKON_HINTS=0 also disables them",
+    ),
+];
+
 fn command_discovery(entry: &CommandHelpEntry) -> CommandDiscovery {
     match entry.display {
         "apply" | "export" | "doc" | "library" | "show" | "import" | "undo" | "abandon" => {
@@ -1215,6 +1242,11 @@ fn print_help_all() {
                 .iter()
                 .filter(|entry| entry.all_group == Some(*group)),
         );
+    }
+    println!();
+    println!("{}", ui_heading("output and scripting policy"));
+    for (flag, purpose) in FLAG_POLICY_ROWS {
+        println!("  {:<16} {}", ui_command(flag), purpose);
     }
     println!();
     println!(

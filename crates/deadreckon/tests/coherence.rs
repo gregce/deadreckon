@@ -161,6 +161,86 @@ fn strategy_flags_use_scoped_vocabulary() {
 }
 
 #[test]
+fn prompt_output_and_machine_flags_have_one_policy() {
+    let all = help(["help-all"]);
+    assert!(all.contains("output and scripting policy"), "{all}");
+    for phrase in [
+        "--yes",
+        "confirms preflight previews for start/update-style commands",
+        "--no-confirm",
+        "skips destructive or follow-up confirmations after a target is known",
+        "--quiet",
+        "suppresses success chatter and post-action hints, never requested data or errors",
+        "--plain",
+        "disables TUI, spinner, and ANSI affordances; it does not imply quiet",
+        "--json",
+        "JSON wins over styling and hints",
+        "--no-hints",
+        "DEADRECKON_HINTS=0 also disables them",
+    ] {
+        assert!(all.contains(phrase), "missing `{phrase}`:\n{all}");
+    }
+
+    for args in [
+        &["run", "--help"][..],
+        &["orchestrate", "--help"][..],
+        &["orchestrate", "review", "--help"][..],
+        &["orchestrate", "full-plan", "--help"][..],
+        &["chain", "--help"][..],
+    ] {
+        let out = help_slice(args);
+        assert!(
+            out.contains("preflight") && out.contains("without prompting"),
+            "{args:?}\n{out}"
+        );
+    }
+
+    let update = help(["update", "--help"]);
+    assert!(
+        update.contains("Confirm shell-channel update preview without prompting"),
+        "{update}"
+    );
+
+    for args in [
+        &["run", "--help"][..],
+        &["orchestrate", "--help"][..],
+        &["plan", "--help"][..],
+        &["fork", "--help"][..],
+        &["merge", "--help"][..],
+        &["chain", "--help"][..],
+        &["update", "--help"][..],
+    ] {
+        let out = help_slice(args);
+        assert!(
+            out.contains("Suppress success chatter and post-action hints"),
+            "{args:?}\n{out}"
+        );
+        assert!(
+            !out.contains("Suppress success stdout"),
+            "{args:?} should not use stale quiet wording:\n{out}"
+        );
+    }
+
+    for args in [
+        &["finish", "--help"][..],
+        &["apply", "--help"][..],
+        &["cleanup", "--help"][..],
+        &["doc", "--help"][..],
+        &["chain", "--help"][..],
+    ] {
+        let out = help_slice(args);
+        assert!(
+            out.contains("Skip destructive or follow-up confirmations"),
+            "{args:?}\n{out}"
+        );
+        assert!(
+            !out.contains("Skip interactive confirmation"),
+            "{args:?} should not use stale confirmation wording:\n{out}"
+        );
+    }
+}
+
+#[test]
 fn all_scope_flag_help_uses_scope_vocabulary() {
     for args in [
         &["chain", "--help"][..],

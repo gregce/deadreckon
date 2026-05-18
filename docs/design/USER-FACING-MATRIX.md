@@ -23,6 +23,8 @@
 | Force aliases | Visible help uses intent-specific flags: `--escalate`, `--overwrite`, and `--anyway`; old `--force` spellings stay hidden alpha aliases. | `crates/deadreckon/src/cli.rs:917`, `crates/deadreckon/tests/coherence.rs:70` | `update --anyway` replaces the last visible primary-command `--force`. |
 | Branch target flags | Worktree runs expose `--branch-name`; apply and finish expose `--into`; apply output says work landed `into` the target branch. | `crates/deadreckon/src/cli.rs:532`, `crates/deadreckon/src/main.rs:12911`, `crates/deadreckon/tests/coherence.rs:60` | Hidden `--branch` aliases remain for one alpha, but help and output use the canonical words. |
 | Strategy flag family | `merge --strategy` is plan composition, `apply`/`finish --git-strategy` is git apply behavior, and chain help separates `--apply-mode` from per-step `--apply-strategy`. | `crates/deadreckon/src/cli.rs:735`, `crates/deadreckon/tests/coherence.rs:122` | Hidden `--strategy` aliases for apply/finish remain for one alpha; user-facing help scopes the terms. |
+| Prompt-skip flags | `help-all` documents `--yes` as preflight preview acceptance and `--no-confirm` as destructive/follow-up confirmation skipping; command help follows that split. | `crates/deadreckon/src/main.rs:1118`, `crates/deadreckon/src/cli.rs:548`, `crates/deadreckon/tests/coherence.rs:161` | `run` keeps both because it has a preflight plus separate safety confirmations. |
+| Output mode flags | `help-all` documents `--quiet`, `--plain`, `--json`, and `--no-hints` precedence; quiet text is shared and JSON remains inspection/list-only in alpha. | `crates/deadreckon/src/main.rs:1118`, `crates/deadreckon/tests/coherence.rs:161` | `--json` wins over styling/hints where present; `DEADRECKON_HINTS=0` is the process-level hint override. |
 | Copy-out wording | User-facing prompts, docs, help, and refusal text now say `export`; `materialize` remains a hidden compatibility alias/internal marker word. | `crates/deadreckon/src/main.rs:12430`, `crates/deadreckon/src/main.rs:16679`, `crates/deadreckon/tests/coherence.rs:201` | TUI key `m` is preserved while the visible action is `export`. |
 | Plan/orchestrate start output | Orchestrate preflight and started output now print mode, children, providers, source, gate, repair, sandbox, spend, wall, plan, and events. | `crates/deadreckon/src/main.rs:8604`, `crates/deadreckon/src/main.rs:8694` | This is much closer to `run` parity. |
 | Plan attach drilldown | `attach <plan-id>` can drill into a child run and return. | `crates/deadreckon/src/main.rs:16757` | Footer copy still needs coherence work. |
@@ -93,10 +95,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 | ID | Surface | Current evidence | Required change |
 |---|---|---|---|
-| F1 | Prompt-skipping flags differ. | `--yes` on run/orchestrate/chain/update; `--no-confirm` on finish/apply/doc. | Define one semantic model: preflight confirmation vs destructive confirmation vs all prompts. |
-| F7 | Quiet behavior is not global. | `--quiet` exists on run/orchestrate/plan/fork/merge/chain, not most completed-run actions. | Define which commands can suppress success stdout and why. |
-| F8 | JSON availability is partial. | JSON exists on many inspect commands, but not plan/fork/merge/orchestrate preflight. | Decide which stateful commands emit JSON and ensure no hints/ANSI leak into JSON. |
-| F9 | Hints use `--no-hints` unevenly. | Run/plan/orchestrate/update/attach surfaces vary. | One hint policy helper and one env/flag precedence rule. |
 | F10 | Provider flags are role-specific but not presented as a system. | `--provider`, `--planner-provider`, `--coder-provider`, `--reviewer-provider`, `--child-provider`, `--doc-provider`. | Add a provider-role glossary and shared provider prompt/preflight builder. |
 
 ### Style, Streams, And Text Blocks
@@ -160,7 +158,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 |---|---|---|---|
 | J1 | JSON shapes use different next-action conventions. | Status JSON has `try_lines`; other JSON surfaces vary. | Standard optional fields: `kind`, `id`, `status`, `next_actions`, `try_lines`, `paths`. |
 | J2 | Plan JSON/plain coverage is incomplete. | Plan summaries are text-heavy; plan command JSON is absent. | Add JSON where the command is inspection-like or preview-like. |
-| J3 | `--plain`, `--quiet`, and `--json` precedence is undocumented. | Flags are distributed by command. | Define precedence: JSON wins over styling/hints; quiet suppresses success chatter but not requested data/errors. |
 | J4 | Snapshot tests are missing for many user surfaces. | Existing unit tests cover footers and helpers, not the whole command matrix. | Add golden tests for help, summaries, prompts, and JSON no-ANSI/no-hints behavior. |
 | J5 | Docs do not describe the user-facing style contract. | AS-BUILT has coherence section but not the full matrix contract. | Update AS-BUILT §17/§18/§26/§30/§32 after implementation. |
 

@@ -1690,9 +1690,13 @@ The alpha CLI names intent before force. Kill paths use `--escalate`; destinatio
 
 Every visible `--plain` flag uses the same help definition: "Plain output without TUI, spinner, or ANSI affordances." Individual commands still implement their own plain-mode effect, such as `attach --plain` choosing the text summary instead of ratatui.
 
+Output and scripting flags have a visible policy in `deadreckon help-all`. `--yes` confirms preflight previews for start/update-style commands. `--no-confirm` skips destructive or follow-up confirmations after the target is known. `--quiet` suppresses success chatter and post-action hints, never requested data or errors. `--plain` disables TUI, spinner, and ANSI affordances without implying quiet. `--json` is reserved for inspection/list surfaces and wins over styling and hints. `--no-hints` suppresses optional next-step hints; `DEADRECKON_HINTS=0|false|off|no` disables them globally for the process.
+
 ### 26.5 Prompts
 
 `crates/deadreckon/src/prompt.rs` owns `prompt::open` and `prompt::confirm`. Every `Y/n` and `y/N` confirmation now renders with the same `? question [Y/n]: ` shape. The high-spend prompt says `continue with --max-spend $N? [y/N]:`, and doc polish now treats Enter as the displayed yes default.
+
+The user-facing skip model is split by timing. `--yes` belongs to preflight preview acceptance on commands such as `run`, `orchestrate`, `chain`, and shell-channel `update`; `--no-confirm` belongs to direct destructive or follow-up actions such as `finish`, `apply`, `cleanup`, chain recovery commands, and doc polish.
 
 ### 26.6 Attach And Kill Parity
 
@@ -1708,7 +1712,7 @@ Provider displays use the provider/route/model/kind vocabulary consistently. Hum
 
 ### 26.9 JSON Parity
 
-Inspection surfaces that already read durable state now expose `--json`: `list`, `chain list`, `providers list`, `library list`, `status`, `show`, and `doctor`. Each JSON response is a top-level object with a named payload and `try_lines`, matching the existing `detect --json` shape.
+Inspection surfaces that already read durable state now expose `--json`: `list`, `chain list`, `providers list`, `library list`, `status`, `show`, and `doctor`. Each JSON response is a top-level object with a named payload and `try_lines`, matching the existing `detect --json` shape. State-changing start/merge/fork/update actions remain text-first in alpha; their previews are not JSON surfaces.
 
 ### 26.10 Deferred V1 Work
 

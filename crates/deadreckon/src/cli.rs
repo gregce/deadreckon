@@ -545,7 +545,7 @@ pub(crate) enum Commands {
         allow_dirty: bool,
         #[arg(long, help = "Initialize git in a plain directory before running")]
         init_git: bool,
-        #[arg(long, help = "Skip the run preview confirmation")]
+        #[arg(long, help = "Confirm the run preflight preview without prompting")]
         yes: bool,
         #[arg(long, help = "Show the planned run without creating state")]
         preview: bool,
@@ -559,10 +559,7 @@ pub(crate) enum Commands {
             help = "Prevent system sleep during the run: auto, on, or off"
         )]
         prevent_sleep: Option<String>,
-        #[arg(
-            long,
-            help = "Suppress completion chatter and interactive follow-up prompts"
-        )]
+        #[arg(long, help = "Suppress success chatter and post-action hints")]
         quiet: bool,
         #[arg(long, help = "Spend cap in USD")]
         max_spend: Option<f64>,
@@ -595,9 +592,9 @@ pub(crate) enum Commands {
         smoke: bool,
         #[arg(long, help = "Allow high spend or in-place edits")]
         i_know_its_a_lot: bool,
-        #[arg(long, help = "Skip safety prompts in scripts")]
+        #[arg(long, help = "Skip safety confirmations after preflight in scripts")]
         no_confirm: bool,
-        #[arg(long, help = "Suppress post-completion action prompts")]
+        #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
         #[arg(long, help = "Skip generated run documentation")]
         no_docs: bool,
@@ -642,13 +639,13 @@ pub(crate) enum Commands {
             help = "Acceptance spec for child runs; defaults to .deadreckon/acceptance.yaml when present"
         )]
         acceptance: Option<PathBuf>,
-        #[arg(long, help = "Skip the orchestration preflight confirmation")]
+        #[arg(long, help = "Confirm the orchestration preflight without prompting")]
         yes: bool,
         #[arg(long, help = "Debug only: disable automatic semantic merge repair")]
         no_repair: bool,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
-        #[arg(long, help = "Suppress success stdout")]
+        #[arg(long, help = "Suppress success chatter and post-action hints")]
         quiet: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
@@ -689,7 +686,7 @@ pub(crate) enum Commands {
         acceptance: Option<PathBuf>,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
-        #[arg(long, help = "Suppress success stdout")]
+        #[arg(long, help = "Suppress success chatter and post-action hints")]
         quiet: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
@@ -725,7 +722,7 @@ pub(crate) enum Commands {
         reviewer_provider: Option<String>,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
-        #[arg(long, help = "Suppress success stdout")]
+        #[arg(long, help = "Suppress success chatter and post-action hints")]
         quiet: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
@@ -761,13 +758,13 @@ pub(crate) enum Commands {
         repair_mode: String,
         #[arg(long, default_value_t = 1, help = "Maximum automatic repair attempts")]
         repair_attempts: u32,
-        #[arg(long, help = "Confirm automatic repair actions for this merge")]
+        #[arg(long, help = "Confirm automatic repair actions without prompting")]
         yes: bool,
         #[arg(long, help = "Skip the merge gate marker warning path")]
         no_gate: bool,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
-        #[arg(long, help = "Suppress success stdout")]
+        #[arg(long, help = "Suppress success chatter and post-action hints")]
         quiet: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
@@ -786,7 +783,7 @@ pub(crate) enum Commands {
         from_stdin: bool,
         #[arg(long, help = "Write chain.json only; do not start the conductor")]
         draft: bool,
-        #[arg(long, help = "Skip the interactive chain preview confirmation")]
+        #[arg(long, help = "Confirm the chain preflight preview without prompting")]
         yes: bool,
         #[arg(long, help = "Start the conductor in the background")]
         detach: bool,
@@ -842,7 +839,7 @@ pub(crate) enum Commands {
         n: u8,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
-        #[arg(long, help = "Suppress success stdout")]
+        #[arg(long, help = "Suppress success chatter and post-action hints")]
         quiet: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
@@ -868,7 +865,7 @@ pub(crate) enum Commands {
         reapply: bool,
         #[arg(long, help = "Insert extension at this step index")]
         insert_at: Option<u32>,
-        #[arg(long, help = "Skip confirmation for destructive chain actions")]
+        #[arg(long, help = "Skip destructive or follow-up confirmations")]
         no_confirm: bool,
         #[arg(long, help = "Print exact IDs and paths")]
         full: bool,
@@ -880,7 +877,7 @@ pub(crate) enum Commands {
         all: bool,
         #[arg(long, help = "Explain the failure reason in chain show")]
         why_failed: bool,
-        #[arg(long, help = "Emit machine-readable JSON for list/show/status")]
+        #[arg(long, help = "Emit machine-readable JSON for chain list/show/status")]
         json: bool,
     },
     #[command(
@@ -931,9 +928,9 @@ pub(crate) enum Commands {
         force: bool,
         #[arg(long, help = "Include prereleases when checking the latest release")]
         allow_prerelease: bool,
-        #[arg(long, help = "Confirm shell-channel updates without prompting")]
+        #[arg(long, help = "Confirm shell-channel update preview without prompting")]
         yes: bool,
-        #[arg(long, help = "Suppress lifecycle hints")]
+        #[arg(long, help = "Suppress success chatter and post-action hints")]
         quiet: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
@@ -1009,7 +1006,7 @@ pub(crate) enum Commands {
             help = "Remove the temporary worktree/branch after a successful worktree apply"
         )]
         cleanup: bool,
-        #[arg(long, help = "Skip interactive confirmations")]
+        #[arg(long, help = "Skip destructive or follow-up confirmations")]
         no_confirm: bool,
         #[arg(long, help = "Commit message override for worktree apply")]
         message: Option<String>,
@@ -1059,7 +1056,7 @@ pub(crate) enum Commands {
             help = "Target branch for apply; defaults to the current branch"
         )]
         branch: Option<String>,
-        #[arg(long, help = "Skip interactive confirmation")]
+        #[arg(long, help = "Skip destructive or follow-up confirmations")]
         no_confirm: bool,
         #[arg(
             long,
@@ -1110,7 +1107,7 @@ pub(crate) enum Commands {
         completed: bool,
         #[arg(long, help = "Include stale running runs")]
         stale: bool,
-        #[arg(long, help = "Skip interactive confirmation")]
+        #[arg(long, help = "Skip destructive or follow-up confirmations")]
         no_confirm: bool,
         #[arg(
             long = "escalate",
@@ -1171,7 +1168,7 @@ pub(crate) enum Commands {
         export: Option<PathBuf>,
         #[arg(long, help = "Use the doc provider to polish generated docs")]
         polish: bool,
-        #[arg(long, help = "Skip polish confirmation")]
+        #[arg(long, help = "Skip destructive or follow-up confirmations")]
         no_confirm: bool,
         #[arg(
             long = "overwrite",
@@ -1199,7 +1196,7 @@ pub(crate) enum Commands {
     Attach {
         #[arg(help = "Run id, chain id, plan id, plan-id:task-id, unique prefix, or latest")]
         run_id: String,
-        #[arg(long, help = "Suppress post-completion action hints")]
+        #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
@@ -1377,13 +1374,13 @@ pub(crate) struct OrchestrateReviewArgs {
         help = "Show the resolved orchestration preflight without starting work"
     )]
     pub(crate) preview: bool,
-    #[arg(long, help = "Skip the orchestration preflight confirmation")]
+    #[arg(long, help = "Confirm the orchestration preflight without prompting")]
     pub(crate) yes: bool,
     #[arg(long, help = "Debug only: disable automatic semantic merge repair")]
     pub(crate) no_repair: bool,
     #[arg(long, help = "Suppress post-action hints")]
     pub(crate) no_hints: bool,
-    #[arg(long, help = "Suppress success stdout")]
+    #[arg(long, help = "Suppress success chatter and post-action hints")]
     pub(crate) quiet: bool,
     #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
     pub(crate) plain: bool,
@@ -1430,13 +1427,13 @@ pub(crate) struct OrchestrateFullPlanArgs {
         help = "Show the resolved orchestration preflight without starting work"
     )]
     pub(crate) preview: bool,
-    #[arg(long, help = "Skip the orchestration preflight confirmation")]
+    #[arg(long, help = "Confirm the orchestration preflight without prompting")]
     pub(crate) yes: bool,
     #[arg(long, help = "Debug only: disable automatic semantic merge repair")]
     pub(crate) no_repair: bool,
     #[arg(long, help = "Suppress post-action hints")]
     pub(crate) no_hints: bool,
-    #[arg(long, help = "Suppress success stdout")]
+    #[arg(long, help = "Suppress success chatter and post-action hints")]
     pub(crate) quiet: bool,
     #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
     pub(crate) plain: bool,
