@@ -103,7 +103,9 @@ use crate::cli::{
     HistoryKind, LibraryCommand, MergeCommandArgs, OrchestrateCommand, PlanCommandArgs,
     ProvidersCommand, RunCommandArgs,
 };
-use crate::ui::{ui_command, ui_error, ui_heading, ui_id, ui_muted, ui_ok, ui_status, ui_warn};
+use crate::ui::{
+    ui_command, ui_error, ui_heading, ui_id, ui_muted, ui_note, ui_ok, ui_status, ui_warn,
+};
 
 #[derive(Debug, thiserror::Error)]
 enum CliError {
@@ -1338,7 +1340,7 @@ fn try_install_completion_after_init() {
     match install_completion(None, None, true) {
         Ok(_) => {}
         Err(err) => {
-            eprintln!("{} shell completion not installed: {err}", ui_warn("note"));
+            eprintln!("{} shell completion not installed: {err}", ui_note("note"));
             eprintln!(
                 "{} {}",
                 ui_command("try:"),
@@ -5957,7 +5959,7 @@ fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> 
                 .iter()
                 .any(|result| result.must_pass && !result.passed);
             if failed_required {
-                println!("{}", ui_warn("done criteria failed"));
+                println!("{}", ui_status("done criteria failed"));
             } else {
                 println!("{}", ui_ok("done criteria passed"));
             }
@@ -6326,7 +6328,7 @@ async fn ensure_acceptance_before_start(
     {
         Ok(()) => resolve_acceptance_source(cwd, None),
         Err(err) => {
-            println!("{}", ui_warn("done criteria draft failed"));
+            println!("{}", ui_status("done criteria draft failed"));
             println!("  {err}");
             if !prompt::confirm("use a detected local check template instead?", true)? {
                 return Ok(existing);
@@ -13700,14 +13702,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     lock.release()?;
 
     let completed = outcome == RunLoopOutcome::Done;
-    match outcome {
-        RunLoopOutcome::Done => println!("{} {}", ui_ok("completed extended run"), state.run_id),
-        RunLoopOutcome::PausedAtCap => {
-            println!("{} {}", ui_warn("paused extended run"), state.run_id)
-        }
-        RunLoopOutcome::Killed => println!("{} {}", ui_warn("killed extended run"), state.run_id),
-        RunLoopOutcome::Failed => println!("{} {}", ui_warn("failed extended run"), state.run_id),
-    }
+    print_extended_run_outcome(&state, outcome);
     print_run_locations(&state);
     if completed {
         append_parent_narrative_update(&parent, &state)?;
@@ -13889,12 +13884,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     lock.release()?;
 
     let completed = outcome == RunLoopOutcome::Done;
-    match outcome {
-        RunLoopOutcome::Done => println!("completed extended run {}", state.run_id),
-        RunLoopOutcome::PausedAtCap => println!("paused extended run {}", state.run_id),
-        RunLoopOutcome::Killed => println!("killed extended run {}", state.run_id),
-        RunLoopOutcome::Failed => println!("failed extended run {}", state.run_id),
-    }
+    print_extended_run_outcome(&state, outcome);
     print_run_locations(&state);
     if completed {
         append_parent_narrative_update(&parent, &state)?;
@@ -13903,6 +13893,24 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         Box::pin(complete_run_actions(&state, true)).await?;
     }
     Ok(())
+}
+
+fn run_loop_outcome_status(outcome: RunLoopOutcome) -> &'static str {
+    match outcome {
+        RunLoopOutcome::Done => "completed",
+        RunLoopOutcome::PausedAtCap => "paused",
+        RunLoopOutcome::Killed => "killed",
+        RunLoopOutcome::Failed => "failed",
+    }
+}
+
+fn print_extended_run_outcome(state: &deadreckon_core::PipelineState, outcome: RunLoopOutcome) {
+    let status = run_loop_outcome_status(outcome);
+    println!(
+        "{} extended run {}",
+        ui_status(status),
+        ui_id(&state.run_id)
+    );
 }
 
 fn align_extended_run_with_parent(

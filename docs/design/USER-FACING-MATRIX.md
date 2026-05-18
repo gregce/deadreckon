@@ -13,6 +13,9 @@
 | Run/phase display | `RunStatus` and `PhaseStatus` `Display` use the glossary. | `crates/deadreckon-core/src/state.rs:22` | Old `executing`/`running` UI split is mostly closed. |
 | Plan status display | `Forked` renders as `running`; `Merged` renders as `completed`. | `crates/deadreckon-core/src/glossary.rs:62` | Good user word, historical stored enum retained. |
 | Shared style helper | `ui.rs` owns `Tone`, `Stream`, ANSI rendering, the `ui_*` facade, status tone mapping, TUI palette, hints, and key-value blocks. | `crates/deadreckon/src/ui.rs:1`, `crates/deadreckon/tests/coherence.rs:41` | Raw styling and public CLI style wrappers now have one owner. |
+| Status tone semantics | Status labels route through `ui::status_tone`; `failed`/`killed`, `paused`, `warning`, and `note` are separate style intents. | `crates/deadreckon/src/ui.rs:132`, `crates/deadreckon/tests/coherence.rs:73` | Extended-run and done-criteria failure lines no longer use the warning facade. |
+| Card policy | Cards are scoped to run preflights, run exit summaries, and completed attach footers; list/status/history/show stay table or report shaped. | `docs/AS-BUILT-ARCHITECTURE.md:1732`, `crates/deadreckon/src/ui_card.rs:1` | This preserves richer transition summaries without making inspection surfaces noisy. |
+| Wait banner builder | CLI wait output and TUI footer progress share the named `deadreckoning` course strip helpers with golden coverage for `* ^ . -`. | `crates/deadreckon/src/main.rs:12347`, `crates/deadreckon/src/main.rs:21729`, `crates/deadreckon/src/main.rs:22386` | Keep the visual identity, but construction is named and tested. |
 | Prompt helper | `prompt::open` and `prompt::confirm` provide a shared confirmation shape. | `crates/deadreckon/src/prompt.rs:1` | The old doc polish default-marker bug is fixed. |
 | Error hints | `error_hint` returns actionable strings and uses discovered config paths. | `crates/deadreckon/src/main.rs:147` | Generic provider/core errors now get a fallback hint. |
 | `def-done` naming | Top help and command help use `deadreckon def-done`, not `deadreckon done`. | `crates/deadreckon/src/main.rs:845`, `crates/deadreckon/src/cli.rs:189` | The screenshot miss is fixed in the current source. |
@@ -100,13 +103,10 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 | ID | Surface | Current evidence | Required change |
 |---|---|---|---|
-| S3 | Warning tone is used for non-warning states. | Paused/killed/failed extended run output and provider rows. | Separate `paused`, `failed`, `warning`, and `note` tones. |
 | S4 | Key-value blocks are not universal. | `print_kv_block` exists, but `print_run_started`, status locations, and many summaries hand-format rows. | One kv-block helper with optional labels/try-lines. |
 | S5 | Hint and try-line formatting is mixed. | `ui::hint`, raw `hint:`, raw `try:`, and styled `ui_command("try:")`. | Centralize `hint`, `try_line`, and `next_action` helpers. |
 | S6 | Stream policy is implicit. | Prompts on stdout, progress on stderr, previews on stderr, success on stdout, cancellations mixed. | Document and enforce stdout/stderr rules per output type. |
-| S7 | Cards are not scoped by policy. | Run exit/preflight cards exist; list/status use text tables. | Preserve cards only where useful: run/orchestrate preview and completion summaries; do not add cards to list/status/history. |
 | S8 | Table headers vary. | Uppercase run/chain list headers vs lowercase kv labels. | Define table style for list-like output and kv style for detail output. |
-| S9 | Wait banner has no builder. | `deadreckoning` and course strip built in `cli_wait_status_line`. | Keep the visual, but route through a named helper/test. |
 | S10 | ANSI color palette is split between CLI and TUI. | `Tone` plus direct `ratatui::Color` usage. | One palette module that exposes CLI tone and TUI color roles. |
 
 ### Lifecycle Flow Consistency

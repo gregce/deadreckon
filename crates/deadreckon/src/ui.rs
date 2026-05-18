@@ -25,6 +25,8 @@ pub(crate) enum Tone {
     Command,
     Ok,
     Warn,
+    Paused,
+    Note,
     Negative,
     Prompt,
     Hint,
@@ -142,13 +144,27 @@ where
 }
 
 pub(crate) fn status_tone(status: impl AsRef<str>) -> Tone {
-    match status.as_ref().trim().to_ascii_lowercase().as_str() {
+    let status = status.as_ref().trim().to_ascii_lowercase();
+    if status.contains("failed")
+        || status.contains("killed")
+        || status.contains("error")
+        || status.contains("missing")
+        || status.contains("refused")
+    {
+        return Tone::Negative;
+    }
+    if status.contains("paused") {
+        return Tone::Paused;
+    }
+    if status.contains("warning") || status.contains("warn") {
+        return Tone::Warn;
+    }
+    match status.as_str() {
         "ok" | "ready" | "set" | "wrote" | "updated" | "installed" | "completed" | "passed"
         | "polished" | "applied" | "cleaned" | "exported" => Tone::Ok,
         "running" => Tone::Heading,
-        "failed" | "killed" | "error" | "missing" | "refused" => Tone::Negative,
-        "pending" | "planned" | "paused" | "skipped" | "undone" | "warning" | "warn" => Tone::Warn,
-        _ => Tone::Warn,
+        "pending" | "planned" | "skipped" | "undone" | "recorded" | "note" => Tone::Note,
+        _ => Tone::Note,
     }
 }
 
@@ -179,6 +195,10 @@ pub(crate) fn ui_ok(text: impl AsRef<str>) -> String {
 
 pub(crate) fn ui_warn(text: impl AsRef<str>) -> String {
     render(Stream::Stdout, Tone::Warn, text)
+}
+
+pub(crate) fn ui_note(text: impl AsRef<str>) -> String {
+    render(Stream::Stdout, Tone::Note, text)
 }
 
 pub(crate) fn ui_status(text: impl AsRef<str>) -> String {
@@ -282,6 +302,8 @@ fn tone_code(tone: Tone) -> Option<&'static str> {
         Tone::Command => Some("1;34"),
         Tone::Ok => Some("1;32"),
         Tone::Warn => Some("1;33"),
+        Tone::Paused => Some("1;33"),
+        Tone::Note => Some("2"),
         Tone::Negative => Some("1;31"),
         Tone::Prompt => Some("1;36"),
         Tone::Hint => Some("1;34"),
@@ -297,9 +319,13 @@ mod tests {
         assert_eq!(status_tone("completed"), Tone::Ok);
         assert_eq!(status_tone("polished"), Tone::Ok);
         assert_eq!(status_tone("running"), Tone::Heading);
-        assert_eq!(status_tone("paused"), Tone::Warn);
+        assert_eq!(status_tone("paused"), Tone::Paused);
         assert_eq!(status_tone("failed"), Tone::Negative);
         assert_eq!(status_tone("killed"), Tone::Negative);
-        assert_eq!(status_tone("unknown"), Tone::Warn);
+        assert_eq!(status_tone("done criteria failed"), Tone::Negative);
+        assert_eq!(status_tone("pending"), Tone::Note);
+        assert_eq!(status_tone("note"), Tone::Note);
+        assert_eq!(status_tone("warning"), Tone::Warn);
+        assert_eq!(status_tone("unknown"), Tone::Note);
     }
 }

@@ -54,6 +54,7 @@ fn style_facade_and_status_tones_live_in_ui_module() {
         "ui_command",
         "ui_ok",
         "ui_warn",
+        "ui_note",
         "ui_status",
         "ui_error",
     ] {
@@ -71,6 +72,26 @@ fn style_facade_and_status_tones_live_in_ui_module() {
         ui.contains("fn status_tone(") && ui.contains("render_status("),
         "ui.rs should own status tone mapping"
     );
+}
+
+#[test]
+fn terminal_status_lines_do_not_use_warning_tone_for_failures() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");
+    let ui = fs::read_to_string(manifest.join("src/ui.rs")).expect("ui");
+
+    for stale in [
+        "ui_warn(\"paused extended run\")",
+        "ui_warn(\"killed extended run\")",
+        "ui_warn(\"failed extended run\")",
+        "ui_warn(\"done criteria failed\")",
+    ] {
+        assert!(!main.contains(stale), "stale warning tone: {stale}");
+    }
+    assert!(main.contains("fn print_extended_run_outcome("));
+    assert!(main.contains("ui_status(status)"));
+    assert!(ui.contains("Paused"));
+    assert!(ui.contains("Note"));
 }
 
 #[test]
