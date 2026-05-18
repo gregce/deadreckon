@@ -24,6 +24,7 @@
 - Split note, warning, paused, and failed/killed style intents, and routed extended-run terminal outcomes through status tones.
 - Rendered run, extend, and resume start summaries through the shared key/value block instead of bespoke provider/docs/state lines.
 - Added a `help-all` spend-cap glossary for run, per-child, aggregate chain, and doc polish caps.
+- Closed the user-facing matrix as an alpha record and moved larger output-layout, orchestration, provider/done-criteria, and snapshot work to V1 candidates.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 

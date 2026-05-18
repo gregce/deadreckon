@@ -3,7 +3,7 @@
 **Status:** Refreshed against the local working tree on 2026-05-18.
 **Scope:** The user-visible CLI, prompts, summaries, TUI labels, JSON/plain modes, help text, docs-facing terminology, and orchestration surfaces in `/Users/gdc/deadreckon`.
 **Method:** Source audit of `crates/deadreckon/src/{cli.rs,main.rs,ui.rs,prompt.rs}` and `crates/deadreckon-core/src/{glossary.rs,state.rs,chain.rs,plan.rs}`, plus the current AS-BUILT and goal docs.
-**Read this as:** the current coherence backlog. The prior matrix cited commit `455b91a` and listed 108 issues; many of those are now implemented. This refresh keeps the visual affordances that are working and focuses the remaining user-facing drift.
+**Read this as:** the alpha coherence closure record. The prior matrix cited commit `455b91a` and listed 108 issues; the closure fixes the accidental user-facing drift and leaves larger template/palette/orchestration redesigns as explicit V1 deferrals.
 
 ## Fixed Since The Prior Audit
 
@@ -42,6 +42,7 @@
 | Orchestrate finish/apply/export | Completed plans can route through `finish`, `apply`, and `export` by plan id. | `crates/deadreckon/src/main.rs:12232`, `crates/deadreckon/src/main.rs:12499` | Plan id is primary in help; result-run ids are secondary implementation detail. |
 | Chain glyph collision | Chain step `Applied` now uses `◉`; `Running` remains `●`. | `crates/deadreckon/src/main.rs:4824` | Preserve glyph set: `○ ● ◐ ✗ ↷ ◉ ↶`. |
 | Machine output | JSON exists on key inspect/list surfaces plus `plan --json`; representative JSON responses include `kind`, `id`, `status`, `next_actions`, `try_lines`, and `paths` without ANSI or hints. | `crates/deadreckon/src/cli.rs:695`, `crates/deadreckon/src/main.rs:1664`, `crates/deadreckon/src/main.rs:8954`, `crates/deadreckon/tests/coherence.rs:1050` | Existing payload keys such as `runs`, `run`, `plan`, `providers`, and `chains` remain for compatibility. |
+| Style contract docs | AS-BUILT §26 documents glossary, style facade, key/value layout, flag/output policy, provider roles, JSON parity, card policy, and V1 limits. | `docs/AS-BUILT-ARCHITECTURE.md:1670`, `docs/V1-CANDIDATES.md:1` | The docs now distinguish alpha closure from broader V1 refinements. |
 | Visual identity | The cyan `deadreckoning` progress label, `* ^ . -` course strip, magenta ids, TUI palette, spend gradient, and step glyphs are present. | `crates/deadreckon/src/main.rs:12044`, `crates/deadreckon/src/ui.rs:25`, `crates/deadreckon/src/main.rs:20384` | Keep these; standardize their construction. |
 
 ## Current Command Catalog
@@ -57,11 +58,11 @@ Source: `crates/deadreckon/src/cli.rs`.
 | `acceptance` | none | hidden | Compatibility surface for done criteria. | Should remain advanced and defer to `def-done`. |
 | `def-done` | none | yes | Write/check done criteria. | Canonical user word. |
 | `run` | none | yes | Start one coding run. | Good. |
-| `orchestrate` | none | yes | Plan/fork/merge in one command. | Needs final word/flag/style parity with `run`. |
+| `orchestrate` | none | yes | Plan/fork/merge in one command. | Alpha parity is in place; a fuller shared renderer is deferred. |
 | `plan` | none | yes | Write orchestration plan only. | Good advanced verb. |
 | `fork` | none | yes | Start plan children. | Good advanced verb. |
 | `merge` | none | yes | Compose plan children. | Help teaches `finish <plan-id>` first, then direct `apply`/`export`. |
-| `chain` | none | yes | Serial multi-step goals. | Good, but flag names and footers differ. |
+| `chain` | none | yes | Serial multi-step goals. | Good; full footer/table templating is deferred. |
 | `doctor` | `check` | yes | Check local setup. | Good. |
 | `detect` | none | yes | Probe providers. | Included in custom top help. |
 | `providers` | none | yes | List provider routes/models. | Included in custom top help. |
@@ -99,11 +100,13 @@ Source: `crates/deadreckon/src/cli.rs`.
 | Throw away temp work | abandon / discard / cleanup | mixed | Prefer `cleanup` for common flow, one direct verb for advanced flow. |
 | Latest id | run id only / run or plan id | mixed | Say "run and plan ids accept prefixes" wherever both are accepted. |
 
-## Remaining Findings
+## Explicit Alpha Deferrals
+
+These are intentionally not alpha-closure blockers. They are captured in `docs/V1-CANDIDATES.md` and should be tackled as follow-up design/implementation work, not as hidden drift in the current CLI.
 
 ### Style, Streams, And Text Blocks
 
-| ID | Surface | Current evidence | Required change |
+| ID | Surface | Current evidence | Deferred change |
 |---|---|---|---|
 | S4 | Key-value blocks are not universal. | `print_kv_block` exists, but some status detail rows and summaries still hand-format rows. | One kv-block helper with optional labels/try-lines. |
 | S5 | Hint and try-line formatting is mixed. | `ui::hint`, raw `hint:`, raw `try:`, and styled `ui_command("try:")`. | Centralize `hint`, `try_line`, and `next_action` helpers. |
@@ -113,7 +116,7 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 ### Lifecycle Flow Consistency
 
-| ID | Surface | Current evidence | Required change |
+| ID | Surface | Current evidence | Deferred change |
 |---|---|---|---|
 | L1 | `run`, `extend`, `resume`, and `orchestrate` start/finish banners differ. | `print_run_started`, `print_orchestrate_started`, extended-run completion lines. | Use one lifecycle summary renderer with object kind = run/plan/chain. |
 | L9 | Non-git setup wording differs between run and orchestrate. | Run interactive mode chooser; orchestrate `--init-git` preflight. | Shared source-mode preflight: git, init-git, copy/fresh fallback, done criteria. |
@@ -121,7 +124,7 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 ### Orchestration-Specific Surfaces
 
-| ID | Surface | Current evidence | Required change |
+| ID | Surface | Current evidence | Deferred change |
 |---|---|---|---|
 | O1 | Plan/fork/merge/orchestrate are not visually a single family. | Separate help constants and summaries. | A shared orchestration prompt/preflight/result builder. |
 | O2 | Mode selection needs a clearer interactive model. | Orchestrate has review/full-plan args and provider roles. | Before execution, users should choose mode, child count, planner/coder/reviewer/child providers, repair, caps, source mode. |
@@ -133,21 +136,20 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 ### Provider, Done Criteria, And Docs
 
-| ID | Surface | Current evidence | Required change |
+| ID | Surface | Current evidence | Deferred change |
 |---|---|---|---|
 | P2 | Provider setup is not one reusable flow. | `init`, `config provider`, run flags, orchestrate flags, doc polish flags. | Shared provider selection/prompt builder. |
 | P5 | Done criteria and acceptance docs can still diverge. | `def-done`, hidden `acceptance`, status/gate labels. | One docs section and help text source for done criteria. |
 
 ### Machine-Readable And Test Coverage
 
-| ID | Surface | Current evidence | Required change |
+| ID | Surface | Current evidence | Deferred change |
 |---|---|---|---|
 | J4 | Snapshot tests are missing for many user surfaces. | Existing unit tests cover footers and helpers, not the whole command matrix. | Add golden tests for help, summaries, prompts, and JSON no-ANSI/no-hints behavior. |
-| J5 | Docs do not describe the user-facing style contract. | AS-BUILT has coherence section but not the full matrix contract. | Update AS-BUILT §17/§18/§26/§30/§32 after implementation. |
 
-## Target Model
+## V1 Target Model
 
-The next coherence goal should land these decisions:
+The alpha closure landed the immediate user-facing vocabulary, help, flag, provider-role, JSON, and docs coherence work. A V1 coherence/design pass can still deepen these decisions:
 
 1. One glossary for nouns, verbs, statuses, object kinds, provider roles, and done criteria.
 2. Keep custom top help and help-all on the shared command catalog, with clap coverage tests for row drift.

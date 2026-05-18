@@ -1669,7 +1669,7 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 ## 26. Coherence Pass (alpha)
 
-> **Status (2026-05-18):** The May 2026 coherence pass and closure pass are alpha-complete. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, JSON parity, orchestration commands, plan attach, and polymorphic lifecycle ids now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md` and `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`; the current drift backlog is `docs/design/USER-FACING-MATRIX.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs`.
+> **Status (2026-05-18):** The May 2026 coherence pass and closure pass are alpha-complete. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, JSON parity, orchestration commands, plan attach, and polymorphic lifecycle ids now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md` and `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`; the closure matrix is `docs/design/USER-FACING-MATRIX.md`, with larger follow-ups explicitly deferred to `docs/V1-CANDIDATES.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs`.
 
 ### 26.1 Glossary
 
@@ -1723,7 +1723,7 @@ Inspection surfaces that already read durable state now expose `--json`: `list`,
 
 ### 26.10 Deferred V1 Work
 
-Mass renaming stored enum variants, themable palettes, localization hooks, and a template engine for status cards stay in `docs/V1-CANDIDATES.md`.
+Mass renaming stored enum variants, themable palettes, localization hooks, a full output-layout facade, generic lifecycle renderer, richer orchestration UI, provider/done-criteria setup unification, command-matrix golden snapshots, and a template engine for status cards stay in `docs/V1-CANDIDATES.md`.
 
 ---
 

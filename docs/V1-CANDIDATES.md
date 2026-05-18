@@ -10,6 +10,10 @@
 - Broadcast-backed plan event bus: alpha plan events are durable JSONL. A V1 multiplexer could stream plan, child, and repair events to attach sessions without polling plan/run files.
 - Mass rename of stored status variants, especially `RunStatus::Executing` to `RunStatus::Running`. The coherence pass changed display text only.
 - Themable palettes via config. Alpha keeps one hard-coded palette in `ui.rs`.
+- Full output-layout facade: universal key/value rows, `try_line`/`next_action` helpers, table header helpers, stream-policy enforcement, and a generic lifecycle summary renderer for run/plan/chain/finish/apply/export/extend/resume/kill/cleanup.
+- Orchestration UI polish beyond alpha parity: shared plan/fork/merge/orchestrate preflight/result builders, richer provider role tables with route/model/source, explicit parallelism/dependency summaries, standardized plan attach footers, and richer merge-repair status panels.
+- Provider and done-criteria setup unification: one reusable provider selection/prompt flow across `init`, `config provider`, run/orchestrate flags, doc polish, and one docs/help source for `def-done` plus the hidden `acceptance` compatibility surface.
+- Command-matrix golden snapshots for help, summaries, prompts, table output, and JSON/plain/no-hints behavior once the CLI layout settles enough that snapshots catch regressions without making normal copy edits brittle.
 - Localization hooks for status words, nouns, prompts, and command hints.
 - Migration from hand-built status cards to a small template engine once the alpha CLI layout settles.
 - Full command-family renames beyond hidden alpha aliases, including removing `--force`, `--all`, `--branch`, and `--budget-cap` after the alias window closes.
