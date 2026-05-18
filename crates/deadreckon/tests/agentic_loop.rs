@@ -1050,8 +1050,8 @@ printf 'done\n'
 }
 
 fn repo_tempdir() -> TempDir {
-    let root = std::path::Path::new("/Users/gdc/deadreckon/.test-tmp");
-    fs::create_dir_all(root).expect("test tmp root");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
+    fs::create_dir_all(&root).expect("test tmp root");
     TempDir::new_in(root).expect("tempdir")
 }
 

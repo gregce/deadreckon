@@ -21058,6 +21058,12 @@ mod tui_tests {
             .join("")
     }
 
+    fn test_tempdir() -> tempfile::TempDir {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
+        std::fs::create_dir_all(&root).expect("test tmp");
+        tempfile::TempDir::new_in(root).expect("temp")
+    }
+
     #[test]
     fn command_help_catalog_rows_are_unique() {
         let mut top_rows = std::collections::BTreeSet::new();
@@ -21182,8 +21188,7 @@ mod tui_tests {
     }
 
     fn doc_preview_state() -> (tempfile::TempDir, deadreckon_core::PipelineState) {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let state = create_run(
             &paths,
@@ -21204,8 +21209,7 @@ mod tui_tests {
     }
 
     fn full_plan_fixture(task_count: usize) -> (tempfile::TempDir, DeadreckonPaths, Plan) {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let tasks = (0..task_count)
             .map(|index| {
@@ -21248,8 +21252,7 @@ mod tui_tests {
     }
 
     fn review_plan_fixture() -> (tempfile::TempDir, DeadreckonPaths, Plan) {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let coder = PlanTask::new(
             0,
@@ -22054,8 +22057,7 @@ mod tui_tests {
 
     #[test]
     fn provider_jsonl_matchers_cover_session_meta_and_top_level_cwd() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let working_dir = temp.path().join("work");
         let working_dirs = vec![working_dir.to_string_lossy().to_string()];
 
@@ -22094,8 +22096,7 @@ mod tui_tests {
 
     #[test]
     fn cwd_match_directory_field_matches_opencode_json() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let working_dir = temp.path().join("work");
         let working_dirs = vec![working_dir.to_string_lossy().to_string()];
         let path = temp.path().join("opencode.json");
@@ -22263,8 +22264,7 @@ mod tui_tests {
 
     #[test]
     fn provider_jsonl_copilot_ingest_discovers_bare_session_state_jsonl() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let (_state_temp, mut state) = doc_preview_state();
         state.provider = Some("cli:copilot".to_string());
         let home = temp.path().join("home");
@@ -22293,8 +22293,7 @@ mod tui_tests {
 
     #[test]
     fn provider_jsonl_copilot_ingest_discovers_nested_events_jsonl() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let (_state_temp, mut state) = doc_preview_state();
         state.provider = Some("cli:copilot".to_string());
         let home = temp.path().join("home");
@@ -22321,8 +22320,7 @@ mod tui_tests {
 
     #[test]
     fn provider_jsonl_copilot_ingest_json_pointer_cwd_matches_session_start() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let working_dir = temp.path().join("work");
         let path = temp.path().join("copilot.jsonl");
         std::fs::write(
@@ -22345,8 +22343,7 @@ mod tui_tests {
 
     #[test]
     fn provider_jsonl_pi_ingest_discovers_session_jsonl_under_encoded_cwd_dir() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let (_state_temp, mut state) = doc_preview_state();
         state.provider = Some("cli:pi".to_string());
         let home = temp.path().join("home");
@@ -22375,8 +22372,7 @@ mod tui_tests {
 
     #[test]
     fn provider_jsonl_pi_ingest_rejects_jsonl_without_session_header() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let (_state_temp, mut state) = doc_preview_state();
         state.provider = Some("cli:pi".to_string());
         let home = temp.path().join("home");
@@ -22403,8 +22399,7 @@ mod tui_tests {
 
     #[test]
     fn provider_jsonl_pi_ingest_top_level_cwd_matches_session_header() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let working_dir = temp.path().join("work");
         let path = temp.path().join("pi.jsonl");
         std::fs::write(
@@ -22426,8 +22421,7 @@ mod tui_tests {
 
     #[test]
     fn gemini_json_object_fixture_emits_agent_tool_result_and_tokens() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let (_state_temp, state) = doc_preview_state();
         let root = temp.path().join("gemini");
         std::fs::create_dir_all(&root).expect("gemini root");
@@ -22473,8 +22467,7 @@ mod tui_tests {
 
     #[test]
     fn gemini_jsonl_fixture_emits_activity_and_tokens() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let (_state_temp, state) = doc_preview_state();
         let root = temp.path().join("gemini");
         std::fs::create_dir_all(&root).expect("gemini root");
@@ -22506,8 +22499,7 @@ mod tui_tests {
 
     #[test]
     fn opencode_storage_fixture_emits_agent_thinking_tool_and_tokens() {
-        std::fs::create_dir_all("/Users/gdc/deadreckon/.test-tmp").expect("test tmp");
-        let temp = tempfile::TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("temp");
+        let temp = test_tempdir();
         let (_state_temp, state) = doc_preview_state();
         let root = temp.path().join("opencode");
         let session_dir = root.join("storage/session/project");

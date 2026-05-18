@@ -1466,8 +1466,14 @@ fn status_explains_failed_polish_when_fallback_docs_exist() {
     );
 }
 
+fn repo_tempdir() -> TempDir {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
+    fs::create_dir_all(&root).expect("test tmp root");
+    TempDir::new_in(root).expect("tempdir")
+}
+
 fn fresh_state(goal: &str) -> (TempDir, DeadreckonPaths, deadreckon_core::PipelineState) {
-    let temp = TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("tempdir");
+    let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let state = deadreckon_core::create_run(
         &paths,
@@ -1500,7 +1506,7 @@ fn completed_state_with_docs(
 fn copy_state_with_source(
     goal: &str,
 ) -> (TempDir, DeadreckonPaths, deadreckon_core::PipelineState) {
-    let temp = TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("tempdir");
+    let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     fs::create_dir_all(temp.path().join("source")).expect("source");
     let mut record = CodebaseRecord::fresh();
@@ -1528,7 +1534,7 @@ fn worktree_state(
     goal: &str,
     file_count: usize,
 ) -> (TempDir, DeadreckonPaths, deadreckon_core::PipelineState) {
-    let temp = TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("tempdir");
+    let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");

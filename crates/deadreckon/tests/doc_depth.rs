@@ -687,8 +687,14 @@ fn repo_skill(skill: &str) -> String {
     fs::read_to_string(repo_skill_path(skill)).expect("skill")
 }
 
+fn repo_tempdir() -> TempDir {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
+    fs::create_dir_all(&root).expect("test tmp root");
+    TempDir::new_in(root).expect("tempdir")
+}
+
 fn fresh_state(goal: &str) -> (TempDir, deadreckon_core::PipelineState) {
-    let temp = TempDir::new_in("/Users/gdc/deadreckon/.test-tmp").expect("tempdir");
+    let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let state = deadreckon_core::create_run(
         &paths,

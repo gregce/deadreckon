@@ -356,9 +356,9 @@ try_lines = ["start the local test server"]
 }
 
 fn repo_tempdir() -> TempDir {
-    let root = Path::new("/Users/gdc/deadreckon/.test-tmp");
-    fs::create_dir_all(root).expect("test tmp root");
-    let temp = TempDir::new_in(root).expect("tempdir");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
+    fs::create_dir_all(&root).expect("test tmp root");
+    let temp = TempDir::new_in(&root).expect("tempdir");
     fs::create_dir_all(temp.path().join("empty-bin")).expect("empty bin");
     temp
 }

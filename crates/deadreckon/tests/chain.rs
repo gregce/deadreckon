@@ -2996,7 +2996,7 @@ fn read_run_events(state: &deadreckon_core::PipelineState) -> Vec<RunEvent> {
 }
 
 fn repo_tempdir() -> TempDir {
-    let root = PathBuf::from("/Users/gdc/deadreckon/.test-tmp");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
     fs::create_dir_all(&root).expect("test tmp root");
     TempDir::new_in(root).expect("tempdir")
 }
