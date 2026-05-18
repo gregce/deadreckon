@@ -301,7 +301,9 @@ Lifecycle:
   deadreckon cleanup --stale --escalate
   deadreckon cleanup <run-id>
 
-Cleanup handles abandoned, stale, or completed temporary worktrees. It does not delete promoted library artifacts.";
+Cleanup removes temporary run worktrees and branches for abandoned, stale, or
+completed worktree runs. It does not delete plan state, promoted library
+artifacts, or directories exported with `deadreckon export`.";
 
 const EXTEND_HELP: &str = "\
 Lifecycle:

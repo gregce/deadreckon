@@ -1565,11 +1565,12 @@ prints exact IDs, locations, docs, traces, and the next recommended action.
 artifact/worktree locations, and the next recommended action. Running
 `deadreckon` with no subcommand dispatches to `status`.
 
-`cleanup` (alias `prune`) removes worktrees and temporary branches for already
-abandoned runs by default, with opt-in `--completed`, `--stale`,
-`--all-scopes`, `--escalate`, and `--overwrite` selectors. It leaves promoted
-library artifacts intact. The older `--all` and `--force` spellings remain
-hidden alpha aliases.
+`cleanup` (alias `prune`) removes temporary run worktrees and branches for
+abandoned, stale, or completed worktree runs, with opt-in `--completed`,
+`--stale`, `--all-scopes`, `--escalate`, and `--overwrite` selectors. It does
+not delete plan state, promoted library artifacts, or directories exported with
+`deadreckon export`. The older `--all` and `--force` spellings remain hidden
+alpha aliases.
 
 ### 24.11 Integration With Existing Verbs
 

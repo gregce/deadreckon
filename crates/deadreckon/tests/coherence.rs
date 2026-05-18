@@ -458,6 +458,20 @@ fn command_help_prefers_status_finish_export_and_cleanup() {
         !apply.contains("deadreckon discard latest"),
         "apply help should prefer cleanup:\n{apply}"
     );
+
+    let cleanup = help(["cleanup", "--help"]);
+    assert!(
+        cleanup.contains("temporary run worktrees and branches"),
+        "{cleanup}"
+    );
+    assert!(
+        cleanup.contains("does not delete plan state, promoted library"),
+        "{cleanup}"
+    );
+    assert!(
+        cleanup.contains("directories exported with `deadreckon export`"),
+        "{cleanup}"
+    );
 }
 
 #[test]
@@ -517,8 +531,15 @@ fn current_docs_do_not_teach_stale_primary_aliases() {
             "deadreckon materialize",
             "deadreckon next",
             "deadreckon discard",
+            "deadreckon done",
             "m materialize",
             "materialize/export",
+            "--force",
+            "--budget-cap",
+            "cleanup --all ",
+            "apply <run-id> --strategy",
+            "apply latest --strategy",
+            "run \"goal\" --branch ",
         ] {
             assert!(
                 !text.contains(stale),

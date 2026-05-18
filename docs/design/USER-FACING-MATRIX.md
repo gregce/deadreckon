@@ -27,6 +27,9 @@
 | Output mode flags | `help-all` documents `--quiet`, `--plain`, `--json`, and `--no-hints` precedence; quiet text is shared and JSON remains inspection/list-only in alpha. | `crates/deadreckon/src/main.rs:1118`, `crates/deadreckon/tests/coherence.rs:161` | `--json` wins over styling/hints where present; `DEADRECKON_HINTS=0` is the process-level hint override. |
 | Provider role flags | `help-all` documents provider roles for primary run, planner, child, coder, reviewer, documentation, and repair routes; orchestration/doc help uses provider-route wording. | `crates/deadreckon/src/main.rs:1148`, `crates/deadreckon/src/cli.rs:665`, `crates/deadreckon/tests/coherence.rs:241` | Normal user surfaces say provider route/model/kind; descriptor remains registry vocabulary. |
 | Copy-out wording | User-facing prompts, docs, help, and refusal text now say `export`; `materialize` remains a hidden compatibility alias/internal marker word. | `crates/deadreckon/src/main.rs:12430`, `crates/deadreckon/src/main.rs:16679`, `crates/deadreckon/tests/coherence.rs:201` | TUI key `m` is preserved while the visible action is `export`. |
+| Lifecycle help parity | Top help, attach, show, kill, merge, apply, and cleanup help use run/chain/plan id language, show `finish` first for completed plans, and document plan-child refs. | `crates/deadreckon/src/main.rs:1246`, `crates/deadreckon/src/cli.rs:330`, `crates/deadreckon/tests/coherence.rs:392` | Direct `apply`/`export` remain visible after `finish` for advanced post-completion flows. |
+| Cleanup boundary wording | Cleanup help names temporary run worktrees and branches as the target and excludes plan state, promoted library artifacts, and exported directories. | `crates/deadreckon/src/cli.rs:304`, `crates/deadreckon/tests/coherence.rs:456` | This keeps cleanup from sounding like it deletes everything deadreckon knows about. |
+| Public docs alias sweep | README, HOWTO, and DEVELOPMENT-README no longer teach stale primary aliases or old flag spellings for the current CLI. | `crates/deadreckon/tests/coherence.rs:336` | Historical goal/rider docs may still mention old spellings as history; AS-BUILT calls them hidden alpha aliases where relevant. |
 | Plan/orchestrate start output | Orchestrate preflight and started output now print mode, children, providers, source, gate, repair, sandbox, spend, wall, plan, and events. | `crates/deadreckon/src/main.rs:8604`, `crates/deadreckon/src/main.rs:8694` | This is much closer to `run` parity. |
 | Plan attach drilldown | `attach <plan-id>` can drill into a child run and return. | `crates/deadreckon/src/main.rs:16757` | Footer copy still needs coherence work. |
 | Plan event stream | `plan-events.jsonl` exists and plan attach reads it. | `crates/deadreckon-core/src/plan.rs:13`, `crates/deadreckon/src/main.rs:16768` | It is file-backed polling, not a same-process broadcast bus. |
@@ -92,11 +95,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 ## Remaining Findings
 
-### Flags And Option Semantics
-
-| ID | Surface | Current evidence | Required change |
-|---|---|---|---|
-
 ### Style, Streams, And Text Blocks
 
 | ID | Surface | Current evidence | Required change |
@@ -118,12 +116,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 |---|---|---|---|
 | L1 | `run`, `extend`, `resume`, and `orchestrate` start/finish banners differ. | `print_run_started`, `print_orchestrate_started`, extended-run completion lines. | Use one lifecycle summary renderer with object kind = run/plan/chain. |
 | L2 | Plan completion still exposes result run mapping. | `print_merge_finished`, `print_plan_summary`. | Show plan id as primary; result run id as secondary detail. |
-| L3 | `finish` is the primary post-completion action but output still points to direct actions first in places. | `print_lifecycle_hints`, merge help. | Always show `finish <id>` first unless the command is already a direct action. |
-| L4 | Latest-id language is run-only in top help. | `print_top_help` note. | Say "run and plan ids accept unique prefixes" where both are accepted; clarify `latest` scope. |
-| L5 | Plan child refs exist but are under-explained. | `deadreckon attach <plan-id>:task-0` output. | Add help and status rows for child refs, child run ids, and back-to-plan navigation. |
-| L6 | `show` handles plans but its help is run-centric. | `SHOW_HELP`, `print_plan_summary`. | Say `show <run-id|plan-id>` and document plan failure/repair detail. |
-| L7 | `kill` can target plans, but help says run. | `KILL_HELP`, kill output. | Say run or plan; output child cascade count consistently. |
-| L8 | Cleanup language is worktree-centric. | `CLEANUP_HELP`, cleanup output. | Clarify what cleans run worktrees, plan state, libraries, and materialized exports. |
 | L9 | Non-git setup wording differs between run and orchestrate. | Run interactive mode chooser; orchestrate `--init-git` preflight. | Shared source-mode preflight: git, init-git, copy/fresh fallback, done criteria. |
 | L10 | Done criteria/gate labels differ by flow. | Run missing criteria prompt; plan preflight `gate`; status `gate`. | User-facing setup says done criteria; detail rows may say gate with explanation. |
 
@@ -139,7 +131,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 | O6 | Plan attach footer differs from run/chain. | `plan_attach_footer`. | Standard footer grammar and back-navigation hints. |
 | O7 | Plan TUI reads disk by polling. | `read_plan_events_lossy` in attach loop. | Acceptable for alpha, but call out V1 broadcast bus in docs. |
 | O8 | Plan artifacts and apply/export outputs mix "library", "result run", and "plan". | `print_merge_finished`, `print_plan_summary`. | Treat plan as primary object and artifact/run as implementation details. |
-| O9 | Child run detail is available, but returning context is not described in help. | Attach drilldown code. | Add discoverable help and tests for plan -> child -> back. |
 
 ### Provider, Done Criteria, And Docs
 
@@ -148,7 +139,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 | P2 | Provider setup is not one reusable flow. | `init`, `config provider`, run flags, orchestrate flags, doc polish flags. | Shared provider selection/prompt builder. |
 | P3 | Spend cap wording differs by object. | Per-run, per-child, aggregate chain, doc polish. | One cap glossary: run cap, per-child cap, aggregate chain cap, doc polish cap. |
 | P5 | Done criteria and acceptance docs can still diverge. | `def-done`, hidden `acceptance`, status/gate labels. | One docs section and help text source for done criteria. |
-| P6 | Existing docs likely contain stale alias examples. | README/HOWTO/AS-BUILT/goals predate parts of the coherence pass. | Sweep docs after code changes and update examples to canonical words. |
 
 ### Machine-Readable And Test Coverage
 
