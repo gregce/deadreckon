@@ -1686,7 +1686,7 @@ Custom top-level help and `help-all` command discovery now render from `COMMAND_
 
 ### 26.4 Flag Truth
 
-The alpha CLI names intent before force. Kill paths use `--escalate`; destination overwrites use `--overwrite`; abandon uses `--anyway`; chain and cleanup cross-scope commands use `--all-scopes`; status uses `--global`; run branch naming uses `--branch-name`; apply/finish targets use `--into`; doc polish uses `--max-spend`; apply and finish git behavior use `--git-strategy`. The old spellings stay as hidden aliases for one alpha. Chain branch policy displays `linear-merge` while accepting the old `merge` value.
+The alpha CLI names intent before force. Kill paths use `--escalate`; destination overwrites use `--overwrite`; abandon uses `--anyway`; chain and cleanup cross-scope commands use `--all-scopes`; status uses `--global`; run branch naming uses `--branch-name`; apply/finish targets use `--into`; doc polish uses `--max-spend`; apply and finish git behavior use `--git-strategy`. The old spellings stay as hidden aliases for one alpha. Chain branch policy displays `linear-merge` while accepting the old `merge` value. Cross-project help says "all project scopes" on run, chain, history, cleanup, and library surfaces; provider `--all` remains provider inventory rather than project scope.
 
 Every visible `--plain` flag uses the same help definition: "Plain output without TUI, spinner, or ANSI affordances." Individual commands still implement their own plain-mode effect, such as `attach --plain` choosing the text summary instead of ratatui.
 

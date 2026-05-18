@@ -78,6 +78,35 @@ fn help_uses_new_flag_names_with_alpha_aliases_hidden() {
 }
 
 #[test]
+fn all_scope_flag_help_uses_scope_vocabulary() {
+    for args in [
+        &["chain", "--help"][..],
+        &["list", "--help"][..],
+        &["cleanup", "--help"][..],
+        &["history", "grep", "--help"][..],
+        &["library", "list", "--help"][..],
+        &["library", "search", "--help"][..],
+    ] {
+        let out = help_slice(args);
+        assert!(
+            out.contains("all project scopes"),
+            "{args:?} should describe cross-project scope:\n{out}"
+        );
+        assert!(
+            !out.contains("all projects") && !out.contains("all scopes"),
+            "{args:?} should not use stale cross-scope wording:\n{out}"
+        );
+    }
+
+    let providers = help(["providers", "list", "--help"]);
+    assert!(providers.contains("--all"), "{providers}");
+    assert!(
+        providers.contains("built-in") || providers.contains("override"),
+        "provider --all is provider inventory, not project scope:\n{providers}"
+    );
+}
+
+#[test]
 fn top_help_uses_canonical_discovery_words() {
     let top = help(["--help"]);
     for command in ["detect", "providers", "update", "history"] {
@@ -741,6 +770,10 @@ fn json_inspection_surfaces_emit_named_payloads() {
 }
 
 fn help<const N: usize>(args: [&str; N]) -> String {
+    help_slice(&args)
+}
+
+fn help_slice(args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .args(args)
         .output()

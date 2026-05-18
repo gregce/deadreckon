@@ -866,7 +866,7 @@ pub(crate) enum Commands {
         #[arg(
             long = "all-scopes",
             alias = "all",
-            help = "Show chains from all scopes"
+            help = "Show chains from all project scopes"
         )]
         all: bool,
         #[arg(long, help = "Explain the failure reason in chain show")]
@@ -937,7 +937,7 @@ pub(crate) enum Commands {
     List {
         #[arg(long, help = "Filter to a specific scope key")]
         scope: Option<String>,
-        #[arg(long, help = "Show runs from all projects")]
+        #[arg(long, help = "Show runs from all project scopes")]
         all: bool,
         #[arg(long, help = "Use the table layout (default; kept for compatibility)")]
         full: bool,
@@ -1634,7 +1634,7 @@ pub(crate) enum ProvidersCommand {
         models: bool,
         #[arg(
             long,
-            help = "Show every registered provider, not only configured routes"
+            help = "Show every built-in and override provider route, not only configured routes"
         )]
         all: bool,
         #[arg(long, help = "Print exact IDs and paths for scripts")]
@@ -1680,7 +1680,7 @@ pub(crate) enum LibraryCommand {
     List {
         #[arg(long, help = "Filter to a specific scope key")]
         scope: Option<String>,
-        #[arg(long, help = "Show artifacts from all projects")]
+        #[arg(long, help = "Show artifacts from all project scopes")]
         all: bool,
         #[arg(long, help = "Filter promoted goals by case-insensitive text")]
         goal: Option<String>,
@@ -1705,7 +1705,7 @@ pub(crate) enum LibraryCommand {
         query: String,
         #[arg(long, help = "Filter to a specific scope key")]
         scope: Option<String>,
-        #[arg(long, help = "Search artifacts from all projects")]
+        #[arg(long, help = "Search artifacts from all project scopes")]
         all: bool,
         #[arg(
             long,

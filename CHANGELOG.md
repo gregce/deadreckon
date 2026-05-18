@@ -11,6 +11,7 @@
 - Rendered top help and `help-all` from one command catalog, with tests that catch duplicate rows and catalog entries that drift away from clap commands.
 - Clarified the `help-all` discovery policy so documented advanced commands are distinct from compatibility aliases kept inline on canonical rows.
 - Standardized `--plain` help across run, orchestration, lifecycle, and inspection commands as "without TUI, spinner, or ANSI affordances."
+- Standardized cross-project flag help on "all project scopes" while keeping provider `--all` scoped to provider inventory.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 
