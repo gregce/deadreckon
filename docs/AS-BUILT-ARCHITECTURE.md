@@ -1677,7 +1677,7 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 ### 26.2 Style Helpers
 
-`crates/deadreckon/src/ui.rs` owns ANSI rendering through `Tone`, `Stream`, `write`, `writeln`, `hint`, and `kv_block`. Raw ANSI escapes are confined to that file. The cyan `deadreckoning` banner, blue `* ^ . -` course strip, magenta IDs, spend gauge gradient, and chain glyph family remain product affordances.
+`crates/deadreckon/src/ui.rs` owns ANSI rendering through `Tone`, `Stream`, `write`, `writeln`, `hint`, and `kv_block`. The small CLI facade (`ui_heading`, `ui_muted`, `ui_id`, `ui_command`, `ui_ok`, `ui_warn`, `ui_status`, and `ui_error`) also lives there, so `main.rs` imports style intent instead of defining its own wrappers. Raw ANSI escapes are confined to `ui.rs`, and status labels route through `ui::status_tone` before choosing a tone. The cyan `deadreckoning` banner, blue `* ^ . -` course strip, magenta IDs, spend gauge gradient, and chain glyph family remain product affordances.
 
 Custom top-level help and `help-all` command discovery now render from `COMMAND_HELP_CATALOG` in `crates/deadreckon/src/main.rs`. The top-level clap after-help no longer carries a duplicate command table; unit tests verify catalog row uniqueness and that every catalog entry points at a real clap subcommand or explicit pseudo-row such as `<command> --help`. `help-all` also states the discovery policy: advanced commands are documented there but hidden from short help, and compatibility aliases stay inline on their canonical row.
 

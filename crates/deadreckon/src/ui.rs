@@ -157,6 +157,38 @@ pub(crate) fn render_status(stream: Stream, status: impl AsRef<str>) -> String {
     render(stream, status_tone(status), status)
 }
 
+pub(crate) fn ui_heading(text: impl AsRef<str>) -> String {
+    render(Stream::Stdout, Tone::Heading, text)
+}
+
+pub(crate) fn ui_muted(text: impl AsRef<str>) -> String {
+    render(Stream::Stdout, Tone::Muted, text)
+}
+
+pub(crate) fn ui_id(text: impl AsRef<str>) -> String {
+    render(Stream::Stdout, Tone::Id, text)
+}
+
+pub(crate) fn ui_command(text: impl AsRef<str>) -> String {
+    render(Stream::Stdout, Tone::Command, text)
+}
+
+pub(crate) fn ui_ok(text: impl AsRef<str>) -> String {
+    render(Stream::Stdout, Tone::Ok, text)
+}
+
+pub(crate) fn ui_warn(text: impl AsRef<str>) -> String {
+    render(Stream::Stdout, Tone::Warn, text)
+}
+
+pub(crate) fn ui_status(text: impl AsRef<str>) -> String {
+    render_status(Stream::Stdout, text)
+}
+
+pub(crate) fn ui_error(text: impl AsRef<str>) -> String {
+    render(Stream::Stderr, Tone::Negative, text)
+}
+
 #[allow(dead_code)]
 pub(crate) fn write(stream: Stream, tone: Tone, text: impl AsRef<str>) -> io::Result<()> {
     let rendered = render(stream, tone, text);

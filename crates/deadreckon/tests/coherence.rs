@@ -42,6 +42,38 @@ fn raw_ansi_escapes_stay_in_ui_module() {
 }
 
 #[test]
+fn style_facade_and_status_tones_live_in_ui_module() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");
+    let ui = fs::read_to_string(manifest.join("src/ui.rs")).expect("ui");
+
+    for helper in [
+        "ui_heading",
+        "ui_muted",
+        "ui_id",
+        "ui_command",
+        "ui_ok",
+        "ui_warn",
+        "ui_status",
+        "ui_error",
+    ] {
+        assert!(
+            !main.contains(&format!("fn {helper}(")),
+            "main.rs should not own {helper}"
+        );
+        assert!(
+            ui.contains(&format!("fn {helper}(")),
+            "ui.rs should own {helper}"
+        );
+    }
+
+    assert!(
+        ui.contains("fn status_tone(") && ui.contains("render_status("),
+        "ui.rs should own status tone mapping"
+    );
+}
+
+#[test]
 fn error_lines_use_shared_stderr_helper() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");

@@ -12,7 +12,7 @@
 | Status glossary | A central user-facing glossary exists. Stored `Executing` still serializes as `executing`, but user labels render as `running`. | `crates/deadreckon-core/src/glossary.rs:1` | Applies to run, phase, chain, chain step, plan, and plan task labels. |
 | Run/phase display | `RunStatus` and `PhaseStatus` `Display` use the glossary. | `crates/deadreckon-core/src/state.rs:22` | Old `executing`/`running` UI split is mostly closed. |
 | Plan status display | `Forked` renders as `running`; `Merged` renders as `completed`. | `crates/deadreckon-core/src/glossary.rs:62` | Good user word, historical stored enum retained. |
-| Shared style helper | `ui.rs` owns `Tone`, `Stream`, ANSI rendering, TUI palette, hints, and key-value blocks. | `crates/deadreckon/src/ui.rs:1` | Raw styling is no longer entirely ad hoc. |
+| Shared style helper | `ui.rs` owns `Tone`, `Stream`, ANSI rendering, the `ui_*` facade, status tone mapping, TUI palette, hints, and key-value blocks. | `crates/deadreckon/src/ui.rs:1`, `crates/deadreckon/tests/coherence.rs:41` | Raw styling and public CLI style wrappers now have one owner. |
 | Prompt helper | `prompt::open` and `prompt::confirm` provide a shared confirmation shape. | `crates/deadreckon/src/prompt.rs:1` | The old doc polish default-marker bug is fixed. |
 | Error hints | `error_hint` returns actionable strings and uses discovered config paths. | `crates/deadreckon/src/main.rs:147` | Generic provider/core errors now get a fallback hint. |
 | `def-done` naming | Top help and command help use `deadreckon def-done`, not `deadreckon done`. | `crates/deadreckon/src/main.rs:845`, `crates/deadreckon/src/cli.rs:189` | The screenshot miss is fixed in the current source. |
@@ -100,8 +100,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 | ID | Surface | Current evidence | Required change |
 |---|---|---|---|
-| S1 | Style helper exists but wrappers remain scattered. | `ui_heading`, `ui_muted`, `ui_id`, `ui_command`, `ui_ok`, `ui_warn`, `ui_error` in `main.rs`. | Move all public style functions into `ui.rs` or one facade. |
-| S2 | Status color mapping is too narrow. | `ui_status` only treats `ok`/`polished` as green and otherwise warns. | Map known status labels through one status tone function. |
 | S3 | Warning tone is used for non-warning states. | Paused/killed/failed extended run output and provider rows. | Separate `paused`, `failed`, `warning`, and `note` tones. |
 | S4 | Key-value blocks are not universal. | `print_kv_block` exists, but `print_run_started`, status locations, and many summaries hand-format rows. | One kv-block helper with optional labels/try-lines. |
 | S5 | Hint and try-line formatting is mixed. | `ui::hint`, raw `hint:`, raw `try:`, and styled `ui_command("try:")`. | Centralize `hint`, `try_line`, and `next_action` helpers. |

@@ -103,6 +103,7 @@ use crate::cli::{
     HistoryKind, LibraryCommand, MergeCommandArgs, OrchestrateCommand, PlanCommandArgs,
     ProvidersCommand, RunCommandArgs,
 };
+use crate::ui::{ui_command, ui_error, ui_heading, ui_id, ui_muted, ui_ok, ui_status, ui_warn};
 
 #[derive(Debug, thiserror::Error)]
 enum CliError {
@@ -181,38 +182,6 @@ fn error_hint(err: &CliError) -> String {
         CliError::Json(_) => "inspect the referenced JSON file for invalid syntax".to_string(),
         CliError::Core(_) | CliError::Provider(_) => "run `deadreckon doctor`".to_string(),
     }
-}
-
-fn ui_heading(text: impl AsRef<str>) -> String {
-    ui::render(ui::Stream::Stdout, ui::Tone::Heading, text)
-}
-
-fn ui_muted(text: impl AsRef<str>) -> String {
-    ui::render(ui::Stream::Stdout, ui::Tone::Muted, text)
-}
-
-fn ui_id(text: impl AsRef<str>) -> String {
-    ui::render(ui::Stream::Stdout, ui::Tone::Id, text)
-}
-
-fn ui_command(text: impl AsRef<str>) -> String {
-    ui::render(ui::Stream::Stdout, ui::Tone::Command, text)
-}
-
-fn ui_ok(text: impl AsRef<str>) -> String {
-    ui::render(ui::Stream::Stdout, ui::Tone::Ok, text)
-}
-
-fn ui_warn(text: impl AsRef<str>) -> String {
-    ui::render(ui::Stream::Stdout, ui::Tone::Warn, text)
-}
-
-fn ui_status(text: impl AsRef<str>) -> String {
-    ui::render_status(ui::Stream::Stdout, text)
-}
-
-fn ui_error(text: impl AsRef<str>) -> String {
-    ui::render(ui::Stream::Stderr, ui::Tone::Negative, text)
 }
 
 fn print_kv_block(items: &[(&str, &str)]) {
