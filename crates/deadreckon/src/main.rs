@@ -4854,7 +4854,7 @@ fn parse_apply_strategy(value: &str) -> Result<ApplyStrategy> {
         "merge" => Ok(ApplyStrategy::Merge),
         "cherry-pick" => Ok(ApplyStrategy::CherryPick),
         other => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("unknown apply strategy {other}"),
+            &format!("unknown chain git apply strategy {other}"),
             "use --apply-strategy squash|merge|cherry-pick",
         ))),
     }
@@ -10565,12 +10565,12 @@ fn parse_merge_strategy(strategy: &str, prefer_child: Option<u32>) -> Result<Pla
             .map(PlanMergeStrategy::PreferChild)
             .ok_or_else(|| {
                 CliError::Core(deadreckon_core::user_error(
-                    "--strategy prefer-child needs --prefer-child <idx>",
+                    "plan merge strategy prefer-child needs --prefer-child <idx>",
                     "deadreckon merge <plan-id> --strategy prefer-child --prefer-child 1",
                 ))
             }),
         other => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("unknown merge strategy {other}"),
+            &format!("unknown plan merge strategy {other}"),
             "use --strategy dag-aware, fail-on-conflict, or prefer-child --prefer-child <idx>",
         ))),
     }
@@ -12898,7 +12898,7 @@ fn apply_command_inner(
         }
         other => {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                "unknown apply strategy {other}"
+                "unknown git apply strategy {other}"
             ))));
         }
     }

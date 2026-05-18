@@ -152,7 +152,11 @@ Lifecycle:
 Merge composes completed child artifacts into one promoted deadreckon library
 entry. The default merge is DAG-aware and automatically attempts bounded repair
 for true parallel conflicts; use --no-repair for raw conflict refusal or
---strategy prefer-child --prefer-child <idx> to pick one child deliberately.";
+--strategy prefer-child --prefer-child <idx> to pick one child deliberately.
+
+Strategy flags are scoped: merge --strategy is the plan merge strategy;
+apply/finish use --git-strategy for git operations; chain uses --apply-mode
+plus --apply-strategy for per-step git operations.";
 
 const DONE_HELP: &str = "\
 Lifecycle:
@@ -213,7 +217,11 @@ Lifecycle:
   run/resume executes the conductor.
   attach watches the chain TUI.
   pause/kill/undo/redo recover specific steps.
-  extend adds a new step to an existing chain.";
+  extend adds a new step to an existing chain.
+
+Apply flags:
+  --apply-mode controls the chain policy: auto, preview, or manual.
+  --apply-strategy controls the git strategy for applied steps: squash, merge, or cherry-pick.";
 
 const DOCTOR_HELP: &str = "\
 Lifecycle:
@@ -257,7 +265,8 @@ Finish chooses the right completed-run action:
   completed plan -> apply to source git, or export with --dest / non-git source
   in-place run -> show review guidance
 
-It still respects confirmations unless you pass `--no-confirm`.";
+It still respects confirmations unless you pass `--no-confirm`. When finish routes
+to apply, --git-strategy selects squash, merge, or cherry-pick.";
 
 const MATERIALIZE_HELP: &str = "\
 Lifecycle:
@@ -276,7 +285,7 @@ Lifecycle:
   deadreckon apply <plan-id> --cleanup
   deadreckon cleanup latest
 
-Use apply for completed worktree runs and completed orchestration plans. It merges a temporary `dr/...` branch back into your checkout.";
+Use apply for completed worktree runs and completed orchestration plans. It merges a temporary `dr/...` branch back into your checkout. Use --git-strategy for squash, merge, or cherry-pick.";
 
 const ABANDON_HELP: &str = "\
 Lifecycle:
@@ -732,7 +741,7 @@ pub(crate) enum Commands {
         #[arg(
             long,
             default_value = "dag-aware",
-            help = "Merge strategy: dag-aware, fail-on-conflict, or prefer-child"
+            help = "Plan merge strategy: dag-aware, fail-on-conflict, or prefer-child"
         )]
         strategy: String,
         #[arg(long, help = "Child index to prefer when --strategy prefer-child")]
@@ -790,13 +799,13 @@ pub(crate) enum Commands {
         #[arg(
             long,
             default_value = "auto",
-            help = "Apply mode: auto, preview, or manual"
+            help = "Chain apply mode: auto, preview, or manual"
         )]
         apply_mode: String,
         #[arg(
             long,
             default_value = "squash",
-            help = "Apply strategy: squash, merge, or cherry-pick"
+            help = "Git apply strategy for chain steps: squash, merge, or cherry-pick"
         )]
         apply_strategy: String,
         #[arg(long, help = "Glob allowlist for auto-apply")]

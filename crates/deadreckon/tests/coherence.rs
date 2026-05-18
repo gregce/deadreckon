@@ -120,6 +120,47 @@ fn force_is_hidden_behind_intent_specific_flags() {
 }
 
 #[test]
+fn strategy_flags_use_scoped_vocabulary() {
+    let merge = help(["merge", "--help"]);
+    assert!(merge.contains("--strategy"), "{merge}");
+    assert!(
+        merge.contains("Plan merge strategy: dag-aware, fail-on-conflict, or prefer-child"),
+        "{merge}"
+    );
+    assert!(
+        merge.contains("merge --strategy is the plan merge strategy"),
+        "{merge}"
+    );
+    assert!(
+        merge.contains("apply/finish use --git-strategy for git operations"),
+        "{merge}"
+    );
+
+    for args in [["apply", "--help"], ["finish", "--help"]] {
+        let out = help(args);
+        assert!(out.contains("--git-strategy"), "{args:?}\n{out}");
+        assert!(
+            out.contains("Git apply strategy: squash, merge, or cherry-pick"),
+            "{args:?}\n{out}"
+        );
+    }
+
+    let chain = help(["chain", "--help"]);
+    assert!(
+        chain.contains("Chain apply mode: auto, preview, or manual"),
+        "{chain}"
+    );
+    assert!(
+        chain.contains("Git apply strategy for chain steps: squash, merge, or cherry-pick"),
+        "{chain}"
+    );
+    assert!(
+        !chain.contains("Apply strategy: squash, merge, or cherry-pick"),
+        "chain help should not use the unscoped strategy phrase:\n{chain}"
+    );
+}
+
+#[test]
 fn all_scope_flag_help_uses_scope_vocabulary() {
     for args in [
         &["chain", "--help"][..],

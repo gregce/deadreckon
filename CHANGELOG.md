@@ -14,6 +14,7 @@
 - Standardized cross-project flag help on "all project scopes" while keeping provider `--all` scoped to provider inventory.
 - Renamed visible update override help from `--force` to `--anyway`, keeping `--force` as a hidden alpha alias.
 - Aligned branch target wording so `run` names worktree branches with `--branch-name`, `apply`/`finish` target branches with `--into`, and apply output says changes landed `into` the target branch.
+- Scoped strategy vocabulary so `merge --strategy` means plan composition, `apply`/`finish --git-strategy` means git apply behavior, and chain help separates `--apply-mode` from per-step `--apply-strategy`.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 
