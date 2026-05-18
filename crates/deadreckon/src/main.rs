@@ -9583,7 +9583,7 @@ fn plan_apply_git_root(plan: &Plan) -> Result<Option<PathBuf>> {
 
 fn print_plan_result_context(plan: &Plan, state: &deadreckon_core::PipelineState) {
     println!(
-        "{} {} -> result run {}",
+        "{} {} -> secondary run {}",
         ui_heading("plan result:"),
         ui_id(run_prefix(&plan.plan_id)),
         ui_id(run_prefix(&state.run_id))
@@ -11848,11 +11848,11 @@ fn print_merge_finished(
 ) {
     println!(
         "{} {}",
-        ui_ok("completed orchestration"),
+        ui_ok("completed plan"),
         ui_id(run_prefix(&plan.plan_id))
     );
-    println!("result run {}", run_prefix(&merged_run.run_id));
-    println!("library {}", library_dir.display());
+    println!("result run (secondary) {}", run_prefix(&merged_run.run_id));
+    println!("artifact library {}", library_dir.display());
     if !no_hints {
         println!(
             "{} {}",
@@ -11968,7 +11968,7 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
         );
     }
     if let Some(merged_run_id) = plan.merged_run_id.as_deref() {
-        println!("result run {}", run_prefix(merged_run_id));
+        println!("result run (secondary) {}", run_prefix(merged_run_id));
     }
     if show_hints {
         println!(

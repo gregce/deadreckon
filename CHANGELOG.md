@@ -18,6 +18,7 @@
 - Added a `help-all` output/scripting policy and aligned help for `--yes`, `--no-confirm`, `--quiet`, `--plain`, `--json`, and `--no-hints`.
 - Added a provider-role glossary to `help-all` and aligned orchestration/doc help around provider routes for planner, child, coder, reviewer, repair, and documentation roles.
 - Clarified cleanup help so it names temporary run worktrees/branches as its target and explicitly excludes plan state, promoted library artifacts, and exported directories.
+- Made plan merge/result output keep the plan primary, with result run and artifact library labeled as secondary implementation details.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 

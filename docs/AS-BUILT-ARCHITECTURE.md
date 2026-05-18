@@ -1713,6 +1713,8 @@ Provider displays use the provider/route/model/kind vocabulary consistently. Hum
 
 `deadreckon help-all` includes the provider-role glossary. `--provider` is the primary run provider route and the default child route in full-plan orchestration. `--planner-provider` writes the full-plan child graph. `--child-provider IDX=PROVIDER` overrides a specific child. `--coder-provider` performs the review-mode implementation pass. `--reviewer-provider` independently reviews or fixes the coder result. `--doc-provider` handles documentation polish, resolving through explicit flag, config, then run provider. `--repair-provider` handles merge repair planning and repair-child runs. Normal user surfaces say provider route/model/kind; descriptor remains registry documentation vocabulary.
 
+Plan merge/result output keeps the plan id as the primary object. The synthesized run id is labeled as a secondary result run, and the promoted path is labeled as the artifact library so users can still inspect implementation details without mistaking them for the main lifecycle id.
+
 ### 26.9 JSON Parity
 
 Inspection surfaces that already read durable state now expose `--json`: `list`, `chain list`, `providers list`, `library list`, `status`, `show`, and `doctor`. Each JSON response is a top-level object with a named payload and `try_lines`, matching the existing `detect --json` shape. State-changing start/merge/fork/update actions remain text-first in alpha; their previews are not JSON surfaces.

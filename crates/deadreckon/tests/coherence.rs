@@ -550,6 +550,28 @@ fn current_docs_do_not_teach_stale_primary_aliases() {
 }
 
 #[test]
+fn plan_result_wording_keeps_plan_primary() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");
+    assert!(
+        main.contains("completed plan"),
+        "merge completion should name the plan"
+    );
+    assert!(
+        main.contains("secondary run"),
+        "result run should be presented as a secondary detail"
+    );
+    assert!(
+        main.contains("artifact library"),
+        "library path should be labeled as the plan artifact detail"
+    );
+    assert!(
+        !main.contains("completed orchestration"),
+        "merge completion should not hide the primary plan behind orchestration wording"
+    );
+}
+
+#[test]
 fn orchestration_help_uses_plan_child_provider_language() {
     for (args, label) in [
         (["orchestrate", "--help"], "orchestrate"),

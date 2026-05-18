@@ -29,6 +29,7 @@
 | Copy-out wording | User-facing prompts, docs, help, and refusal text now say `export`; `materialize` remains a hidden compatibility alias/internal marker word. | `crates/deadreckon/src/main.rs:12430`, `crates/deadreckon/src/main.rs:16679`, `crates/deadreckon/tests/coherence.rs:201` | TUI key `m` is preserved while the visible action is `export`. |
 | Lifecycle help parity | Top help, attach, show, kill, merge, apply, and cleanup help use run/chain/plan id language, show `finish` first for completed plans, and document plan-child refs. | `crates/deadreckon/src/main.rs:1246`, `crates/deadreckon/src/cli.rs:330`, `crates/deadreckon/tests/coherence.rs:392` | Direct `apply`/`export` remain visible after `finish` for advanced post-completion flows. |
 | Cleanup boundary wording | Cleanup help names temporary run worktrees and branches as the target and excludes plan state, promoted library artifacts, and exported directories. | `crates/deadreckon/src/cli.rs:304`, `crates/deadreckon/tests/coherence.rs:456` | This keeps cleanup from sounding like it deletes everything deadreckon knows about. |
+| Plan result primacy | Merge/result output names the plan first and labels the synthesized result run and artifact library as secondary implementation details. | `crates/deadreckon/src/main.rs:9586`, `crates/deadreckon/src/main.rs:11849`, `crates/deadreckon/tests/coherence.rs:357` | Plan ids remain the user-facing lifecycle id for `finish`, `apply`, and `export`. |
 | Public docs alias sweep | README, HOWTO, and DEVELOPMENT-README no longer teach stale primary aliases or old flag spellings for the current CLI. | `crates/deadreckon/tests/coherence.rs:336` | Historical goal/rider docs may still mention old spellings as history; AS-BUILT calls them hidden alpha aliases where relevant. |
 | Plan/orchestrate start output | Orchestrate preflight and started output now print mode, children, providers, source, gate, repair, sandbox, spend, wall, plan, and events. | `crates/deadreckon/src/main.rs:8604`, `crates/deadreckon/src/main.rs:8694` | This is much closer to `run` parity. |
 | Plan attach drilldown | `attach <plan-id>` can drill into a child run and return. | `crates/deadreckon/src/main.rs:16757` | Footer copy still needs coherence work. |
@@ -115,7 +116,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 | ID | Surface | Current evidence | Required change |
 |---|---|---|---|
 | L1 | `run`, `extend`, `resume`, and `orchestrate` start/finish banners differ. | `print_run_started`, `print_orchestrate_started`, extended-run completion lines. | Use one lifecycle summary renderer with object kind = run/plan/chain. |
-| L2 | Plan completion still exposes result run mapping. | `print_merge_finished`, `print_plan_summary`. | Show plan id as primary; result run id as secondary detail. |
 | L9 | Non-git setup wording differs between run and orchestrate. | Run interactive mode chooser; orchestrate `--init-git` preflight. | Shared source-mode preflight: git, init-git, copy/fresh fallback, done criteria. |
 | L10 | Done criteria/gate labels differ by flow. | Run missing criteria prompt; plan preflight `gate`; status `gate`. | User-facing setup says done criteria; detail rows may say gate with explanation. |
 
@@ -130,7 +130,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 | O5 | Merge repair status is terse. | `merge repair {line}`. | Show repair mode, attempts, planner/provider, conflict paths, repair run id, and next action. |
 | O6 | Plan attach footer differs from run/chain. | `plan_attach_footer`. | Standard footer grammar and back-navigation hints. |
 | O7 | Plan TUI reads disk by polling. | `read_plan_events_lossy` in attach loop. | Acceptable for alpha, but call out V1 broadcast bus in docs. |
-| O8 | Plan artifacts and apply/export outputs mix "library", "result run", and "plan". | `print_merge_finished`, `print_plan_summary`. | Treat plan as primary object and artifact/run as implementation details. |
 
 ### Provider, Done Criteria, And Docs
 
