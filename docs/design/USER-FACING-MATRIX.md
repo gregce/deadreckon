@@ -17,6 +17,7 @@
 | Error hints | `error_hint` returns actionable strings and uses discovered config paths. | `crates/deadreckon/src/main.rs:147` | Generic provider/core errors now get a fallback hint. |
 | `def-done` naming | Top help and command help use `deadreckon def-done`, not `deadreckon done`. | `crates/deadreckon/src/main.rs:845`, `crates/deadreckon/src/cli.rs:189` | The screenshot miss is fixed in the current source. |
 | Help discovery | Top help and `help-all` render command rows from one catalog, while command help uses canonical words: `status`, `finish`, `export`, `cleanup`, `run/chain/plan`, and aliases inline. | `crates/deadreckon/src/main.rs:846`, `crates/deadreckon/src/main.rs:1181`, `crates/deadreckon/tests/coherence.rs:77` | Catalog tests verify row uniqueness and that rows point at real clap commands. |
+| Advanced command discovery | `help-all` explicitly explains that advanced commands are documented there but hidden from short help, while compatibility aliases stay inline on canonical rows. | `crates/deadreckon/src/main.rs:1116`, `crates/deadreckon/src/main.rs:20873` | `materialize` is not a ghost row; it stays an alias on `export`. |
 | Copy-out wording | User-facing prompts, docs, help, and refusal text now say `export`; `materialize` remains a hidden compatibility alias/internal marker word. | `crates/deadreckon/src/main.rs:12430`, `crates/deadreckon/src/main.rs:16679`, `crates/deadreckon/tests/coherence.rs:201` | TUI key `m` is preserved while the visible action is `export`. |
 | Plan/orchestrate start output | Orchestrate preflight and started output now print mode, children, providers, source, gate, repair, sandbox, spend, wall, plan, and events. | `crates/deadreckon/src/main.rs:8604`, `crates/deadreckon/src/main.rs:8694` | This is much closer to `run` parity. |
 | Plan attach drilldown | `attach <plan-id>` can drill into a child run and return. | `crates/deadreckon/src/main.rs:16757` | Footer copy still needs coherence work. |
@@ -82,12 +83,6 @@ Source: `crates/deadreckon/src/cli.rs`.
 | Latest id | run id only / run or plan id | mixed | Say "run and plan ids accept prefixes" wherever both are accepted. |
 
 ## Remaining Findings
-
-### Help And Command Discovery
-
-| ID | Surface | Current evidence | Required change |
-|---|---|---|---|
-| H9 | Hidden commands are discoverable through examples. | `apply`, `materialize`, `abandon`, `doc`, `show` are hidden but heavily referenced. | Define "advanced but documented" vs "hidden compatibility alias"; do not leave ghost commands. |
 
 ### Flags And Option Semantics
 

@@ -9,6 +9,7 @@
 - Refreshed README/HOWTO examples to use canonical `run`, `--branch-name`, `--overwrite`, `--max-spend`, `--git-strategy`, `--all-scopes`, and `--escalate` wording.
 - Added `docs/PLAN-NARRATIVE.md` for merged plans so orchestration has one plan-level reading path built from child summaries.
 - Rendered top help and `help-all` from one command catalog, with tests that catch duplicate rows and catalog entries that drift away from clap commands.
+- Clarified the `help-all` discovery policy so documented advanced commands are distinct from compatibility aliases kept inline on canonical rows.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 

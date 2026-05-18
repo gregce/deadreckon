@@ -849,6 +849,14 @@ enum HelpAllGroup {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandDiscovery {
+    Public,
+    Advanced,
+    Compatibility,
+    Pseudo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CommandHelpEntry {
     display: &'static str,
     clap_name: Option<&'static str>,
@@ -1113,6 +1121,19 @@ const HELP_ALL_GROUPS: &[(HelpAllGroup, &str)] = &[
     (HelpAllGroup::InspectAdvanced, "inspect and advanced"),
 ];
 
+const HELP_ALL_DISCOVERY_NOTE: &str = "Advanced commands are documented here but hidden from short help; compatibility aliases stay inline on their canonical command row.";
+
+fn command_discovery(entry: &CommandHelpEntry) -> CommandDiscovery {
+    match entry.display {
+        "apply" | "export" | "doc" | "library" | "show" | "import" | "undo" | "abandon" => {
+            CommandDiscovery::Advanced
+        }
+        "acceptance" => CommandDiscovery::Compatibility,
+        "<command> --help" => CommandDiscovery::Pseudo,
+        _ => CommandDiscovery::Public,
+    }
+}
+
 fn print_catalog_rows<'a>(rows: impl IntoIterator<Item = &'a CommandHelpEntry>) {
     let rows = rows.into_iter().collect::<Vec<_>>();
     let width = rows
@@ -1180,6 +1201,12 @@ fn print_top_help() {
 
 fn print_help_all() {
     println!("{}", ui_heading("deadreckon commands"));
+    if COMMAND_HELP_CATALOG
+        .iter()
+        .any(|entry| command_discovery(entry) == CommandDiscovery::Advanced)
+    {
+        println!("{}", ui_muted(HELP_ALL_DISCOVERY_NOTE));
+    }
     for (group, title) in HELP_ALL_GROUPS {
         println!();
         println!("{}", ui_heading(title));
@@ -20730,19 +20757,19 @@ mod tui_tests {
     use super::{
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, COMMAND_HELP_CATALOG,
-        ChainAttachTuiState, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS, ProviderActivity,
-        ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines, attach_banner,
-        attach_header_text, attach_should_return_to_plan, chain_activity_lines,
+        ChainAttachTuiState, CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS,
+        ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines,
+        attach_banner, attach_header_text, attach_should_return_to_plan, chain_activity_lines,
         chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
         chain_step_dot, chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
-        cli_wait_status_line, collect_jsonl_provider_activity, completion_action_from_input,
-        completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
-        doc_polish_preview_text, implementation_plan_warnings, kill_banner, live_file_lines,
-        markdown_to_tui_lines, max_panel_scroll, meter_color, per_step_wall_cap,
-        plan_attach_footer, provider_ingest_base_roots, provider_jsonl_activity_lines,
-        provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
-        read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
-        render_attach, render_plan_attach, threshold_color,
+        cli_wait_status_line, collect_jsonl_provider_activity, command_discovery,
+        completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
+        deadreckoning_status_text, doc_polish_preview_text, implementation_plan_warnings,
+        kill_banner, live_file_lines, markdown_to_tui_lines, max_panel_scroll, meter_color,
+        per_step_wall_cap, plan_attach_footer, provider_ingest_base_roots,
+        provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
+        provider_jsonl_session_matches_run, read_plan_events_lossy, recommend_child_count_for_goal,
+        recommend_orchestration_mode, render_attach, render_plan_attach, threshold_color,
     };
     use crate::cli::{Cli, CliPlanMode};
     use chrono::Utc;
@@ -20872,6 +20899,31 @@ mod tui_tests {
         for (group, _) in HELP_ALL_GROUPS {
             assert!(all_groups.contains(&format!("{group:?}")));
         }
+    }
+
+    #[test]
+    fn command_help_catalog_classifies_advanced_and_compatibility_surfaces() {
+        let entry = |name: &str| {
+            COMMAND_HELP_CATALOG
+                .iter()
+                .find(|entry| entry.display == name)
+                .unwrap_or_else(|| panic!("missing catalog row {name}"))
+        };
+
+        for name in ["apply", "export", "abandon", "doc", "show"] {
+            assert_eq!(command_discovery(entry(name)), CommandDiscovery::Advanced);
+        }
+        assert_eq!(
+            command_discovery(entry("acceptance")),
+            CommandDiscovery::Compatibility
+        );
+        assert_eq!(command_discovery(entry("run")), CommandDiscovery::Public);
+        assert!(
+            COMMAND_HELP_CATALOG
+                .iter()
+                .all(|entry| entry.display != "materialize"),
+            "materialize must stay an inline compatibility alias, not a catalog row"
+        );
     }
 
     #[test]

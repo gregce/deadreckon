@@ -1678,7 +1678,7 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 `crates/deadreckon/src/ui.rs` owns ANSI rendering through `Tone`, `Stream`, `write`, `writeln`, `hint`, and `kv_block`. Raw ANSI escapes are confined to that file. The cyan `deadreckoning` banner, blue `* ^ . -` course strip, magenta IDs, spend gauge gradient, and chain glyph family remain product affordances.
 
-Custom top-level help and `help-all` command discovery now render from `COMMAND_HELP_CATALOG` in `crates/deadreckon/src/main.rs`. The top-level clap after-help no longer carries a duplicate command table; unit tests verify catalog row uniqueness and that every catalog entry points at a real clap subcommand or explicit pseudo-row such as `<command> --help`.
+Custom top-level help and `help-all` command discovery now render from `COMMAND_HELP_CATALOG` in `crates/deadreckon/src/main.rs`. The top-level clap after-help no longer carries a duplicate command table; unit tests verify catalog row uniqueness and that every catalog entry points at a real clap subcommand or explicit pseudo-row such as `<command> --help`. `help-all` also states the discovery policy: advanced commands are documented there but hidden from short help, and compatibility aliases stay inline on their canonical row.
 
 ### 26.3 Key/Value Layout
 
