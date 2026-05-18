@@ -915,7 +915,8 @@ pub(crate) enum Commands {
         #[arg(long, help = "Only check and print current/latest version")]
         check: bool,
         #[arg(
-            long,
+            long = "anyway",
+            alias = "force",
             help = "Re-run the selected update path even at the same version"
         )]
         force: bool,

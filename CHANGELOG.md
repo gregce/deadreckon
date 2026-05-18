@@ -12,6 +12,7 @@
 - Clarified the `help-all` discovery policy so documented advanced commands are distinct from compatibility aliases kept inline on canonical rows.
 - Standardized `--plain` help across run, orchestration, lifecycle, and inspection commands as "without TUI, spinner, or ANSI affordances."
 - Standardized cross-project flag help on "all project scopes" while keeping provider `--all` scoped to provider inventory.
+- Renamed visible update override help from `--force` to `--anyway`, keeping `--force` as a hidden alpha alias.
 
 ## Semantic merge repair (alpha) - 2026-05-16
 

@@ -78,6 +78,34 @@ fn help_uses_new_flag_names_with_alpha_aliases_hidden() {
 }
 
 #[test]
+fn force_is_hidden_behind_intent_specific_flags() {
+    for (args, visible) in [
+        (&["kill", "--help"][..], "--escalate"),
+        (&["chain", "--help"][..], "--escalate"),
+        (&["cleanup", "--help"][..], "--escalate"),
+        (&["finish", "--help"][..], "--overwrite"),
+        (&["apply", "--help"][..], "--git-strategy"),
+        (&["export", "--help"][..], "--overwrite"),
+        (&["abandon", "--help"][..], "--anyway"),
+        (&["doc", "--help"][..], "--overwrite"),
+        (&["def-done", "--help"][..], "--overwrite"),
+        (&["acceptance", "setup", "--help"][..], "--overwrite"),
+        (&["acceptance", "add", "--help"][..], "--overwrite"),
+        (&["acceptance", "init", "--help"][..], "--overwrite"),
+        (&["acceptance", "draft", "--help"][..], "--overwrite"),
+        (&["acceptance", "refine", "--help"][..], "--overwrite"),
+        (&["update", "--help"][..], "--anyway"),
+    ] {
+        let out = help_slice(args);
+        assert!(out.contains(visible), "{args:?}\n{out}");
+        assert!(
+            !out.contains("--force"),
+            "{args:?} should keep --force as a hidden alpha alias:\n{out}"
+        );
+    }
+}
+
+#[test]
 fn all_scope_flag_help_uses_scope_vocabulary() {
     for args in [
         &["chain", "--help"][..],
