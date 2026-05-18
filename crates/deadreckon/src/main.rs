@@ -13726,7 +13726,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     lock.release()?;
 
     let completed = outcome == RunLoopOutcome::Done;
-    print_extended_run_outcome(&state, outcome);
+    print_extended_run_outcome(&state, &outcome);
     print_run_locations(&state);
     if completed {
         append_parent_narrative_update(&parent, &state)?;
@@ -13908,7 +13908,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     lock.release()?;
 
     let completed = outcome == RunLoopOutcome::Done;
-    print_extended_run_outcome(&state, outcome);
+    print_extended_run_outcome(&state, &outcome);
     print_run_locations(&state);
     if completed {
         append_parent_narrative_update(&parent, &state)?;
@@ -13919,7 +13919,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_loop_outcome_status(outcome: RunLoopOutcome) -> &'static str {
+fn run_loop_outcome_status(outcome: &RunLoopOutcome) -> &'static str {
     match outcome {
         RunLoopOutcome::Done => "completed",
         RunLoopOutcome::PausedAtCap => "paused",
@@ -13928,7 +13928,7 @@ fn run_loop_outcome_status(outcome: RunLoopOutcome) -> &'static str {
     }
 }
 
-fn print_extended_run_outcome(state: &deadreckon_core::PipelineState, outcome: RunLoopOutcome) {
+fn print_extended_run_outcome(state: &deadreckon_core::PipelineState, outcome: &RunLoopOutcome) {
     let status = run_loop_outcome_status(outcome);
     println!(
         "{} extended run {}",
@@ -16701,7 +16701,7 @@ fn status_command(run_id: Option<String>, all: bool, plain: bool, json_output: b
                 "kind": "run_status",
                 "id": &state.run_id,
                 "status": status,
-                "next_actions": [next_action.clone()],
+                "next_actions": [&next_action],
                 "try_lines": Vec::<String>::new(),
                 "paths": {
                     "state": state.state_path(),
