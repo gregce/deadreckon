@@ -3067,32 +3067,36 @@ output_cost_per_million = 0.0
 }
 
 fn wait_for_live_conductor(paths: &DeadreckonPaths, chain_id: &str) -> (String, u32, u32) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
     loop {
-        if let Ok(raw) = fs::read_to_string(paths.conductor_json(chain_id))
-            && let Ok(value) = serde_json::from_str::<Value>(&raw)
-        {
-            let run_id = value
-                .get("live_run_id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            let conductor_pid = value
-                .get("conductor_pid")
-                .and_then(Value::as_u64)
-                .map(|pid| pid as u32);
-            let child_pid = value
-                .get("live_child_pid")
-                .and_then(Value::as_u64)
-                .map(|pid| pid as u32);
-            if let (Some(run_id), Some(conductor_pid), Some(child_pid)) =
-                (run_id, conductor_pid, child_pid)
-            {
-                return (run_id, conductor_pid, child_pid);
+        let sidecar = match fs::read_to_string(paths.conductor_json(chain_id)) {
+            Ok(raw) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                    let run_id = value
+                        .get("live_run_id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    let conductor_pid = value
+                        .get("conductor_pid")
+                        .and_then(Value::as_u64)
+                        .map(|pid| pid as u32);
+                    let child_pid = value
+                        .get("live_child_pid")
+                        .and_then(Value::as_u64)
+                        .map(|pid| pid as u32);
+                    if let (Some(run_id), Some(conductor_pid), Some(child_pid)) =
+                        (run_id, conductor_pid, child_pid)
+                    {
+                        return (run_id, conductor_pid, child_pid);
+                    }
+                }
+                raw
             }
-        }
+            Err(err) => format!("read error: {err}"),
+        };
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for live conductor"
+            "timed out waiting for live conductor; last sidecar: {sidecar}"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

@@ -17,7 +17,9 @@ fn smoke_baseline_holds_after_print_refactor() {
 }
 
 fn assert_smoke_baseline_matches() {
-    let _guard = SMOKE_LOCK.lock().expect("smoke invariant lock");
+    let _guard = SMOKE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = workspace_root();
     let output = Command::new("make")
         .arg("smoke")

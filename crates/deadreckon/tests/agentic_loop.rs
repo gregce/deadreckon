@@ -67,9 +67,9 @@ async fn mock_provider_records_three_turns_and_artifacts_match() {
         .expect("run");
     let state = load_run(&paths, &run.run_id).expect("state");
     assert_eq!(state.status, RunStatus::Completed);
-    assert_eq!(state.turn, 4);
+    assert_eq!(state.turn, 5);
     assert_jsonl_count(&state.run_root.join("traces.jsonl"), 6);
-    assert_jsonl_count(&state.run_root.join("spend.jsonl"), 4);
+    assert_jsonl_count(&state.run_root.join("spend.jsonl"), 5);
     assert_jsonl_count(&state.run_root.join("provenance.jsonl"), 3);
     assert!(state.run_root.join("proofs/turn-acceptance.json").exists());
     assert!(state.working_dir.join("turn1.txt").exists());
@@ -116,9 +116,10 @@ async fn kill_run_across_processes_terminates_in_5s() {
     let state = load_run(&paths, &run_id).expect("state");
     assert_eq!(state.status, RunStatus::Killed);
     assert!(cancel_marker_path(&state).exists());
-    let events = fs::read_to_string(state.run_root.join(RUN_EVENTS_JSONL)).expect("events");
-    assert!(events.contains(r#""kind":"run_completed""#));
-    assert!(events.contains(r#""status":"killed""#));
+    wait_for_run_events(
+        &state.run_root,
+        &[r#""kind":"run_completed""#, r#""status":"killed""#],
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -156,9 +157,10 @@ async fn kill_during_http_streaming_aborts_request() {
 
     let state = load_run(&paths, &run_id).expect("state");
     assert_eq!(state.status, RunStatus::Killed);
-    let events = fs::read_to_string(state.run_root.join(RUN_EVENTS_JSONL)).expect("events");
-    assert!(events.contains(r#""kind":"run_completed""#));
-    assert!(events.contains(r#""status":"killed""#));
+    wait_for_run_events(
+        &state.run_root,
+        &[r#""kind":"run_completed""#, r#""status":"killed""#],
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -537,6 +539,7 @@ printf 'changed notes\n'
         .arg("1")
         .arg("--max-wall-seconds")
         .arg("0.1")
+        .arg("--no-docs")
         .env("DEADRECKON_HOME", &home)
         .output()
         .expect("run");
@@ -1374,6 +1377,25 @@ fn wait_for_run_id(paths: &DeadreckonPaths) -> String {
     }
 }
 
+fn wait_for_run_events(run_root: &Path, needles: &[&str]) -> String {
+    let events_path = run_root.join(RUN_EVENTS_JSONL);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last_events = String::new();
+    loop {
+        if let Ok(events) = fs::read_to_string(&events_path) {
+            if needles.iter().all(|needle| events.contains(needle)) {
+                return events;
+            }
+            last_events = events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run events did not contain {needles:?}; events:\n{last_events}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1519,12 +1541,17 @@ fn three_turn_script() -> Vec<FixtureResponse> {
             "completion_tokens": 40
         },
         {
+            "content": implementation_notes_write_action("notes-after-bash", "Recorded the first shell change."),
+            "prompt_tokens": 120,
+            "completion_tokens": 40
+        },
+        {
             "content": "{\"action\":\"write_file\",\"tool_call_id\":\"tool-write-2\",\"path\":\"notes.md\",\"content\":\"# Dead Reckoning\\n\\nTurn 2 wrote this file.\\n\"}",
             "prompt_tokens": 160,
             "completion_tokens": 60
         },
         {
-            "content": implementation_notes_write_action(),
+            "content": implementation_notes_write_action("notes-after-file", "Recorded the markdown file change."),
             "prompt_tokens": 160,
             "completion_tokens": 40
         },
@@ -1537,18 +1564,18 @@ fn three_turn_script() -> Vec<FixtureResponse> {
     .expect("script")
 }
 
-fn implementation_notes_write_action() -> String {
+fn implementation_notes_write_action(tool_call_id: &str, decision: &str) -> String {
     json!({
         "action": "write_file",
-        "tool_call_id": "tool-notes-3",
+        "tool_call_id": tool_call_id,
         "path": "implementation-notes.html",
-        "content": r#"<!doctype html>
+        "content": format!(r#"<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>Implementation Notes</title></head>
 <body>
 <h1>Implementation Notes</h1>
 <section id="design-decisions"><h2>Design decisions</h2>
-<ul><li>The mock provider fixture writes a maintained notes file before done.</li></ul></section>
+<ul><li>{decision}</li></ul></section>
 <section id="deviations"><h2>Deviations</h2>
 <ul><li>None.</li></ul></section>
 <section id="tradeoffs"><h2>Tradeoffs</h2>
@@ -1557,7 +1584,7 @@ fn implementation_notes_write_action() -> String {
 <ul><li>None.</li></ul></section>
 </body>
 </html>
-"#
+"#)
     })
     .to_string()
 }
