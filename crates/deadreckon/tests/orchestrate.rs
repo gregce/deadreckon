@@ -1776,8 +1776,12 @@ printf 'done\n'
 
     let codebase = read_codebase_record(&second_state.working_dir).expect("codebase");
     let source_path = codebase.source_path.as_ref().expect("source path");
+    let expected_plan_dir = paths
+        .plan_dir(&plan.plan_id)
+        .canonicalize()
+        .unwrap_or_else(|_| paths.plan_dir(&plan.plan_id));
     assert!(
-        source_path.starts_with(paths.plan_dir(&plan.plan_id)),
+        source_path.starts_with(&expected_plan_dir),
         "{}",
         source_path.display()
     );

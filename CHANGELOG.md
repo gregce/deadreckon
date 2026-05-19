@@ -1,5 +1,14 @@
 # Changelog
 
+## Orchestration live UX (alpha) - 2026-05-18
+
+- Added shared orchestration role and dependency summaries across plan creation, orchestrate preflight/start, fork completion, plan attach summaries, and merge completion.
+- Added provider role tables with route/model/source/notes rows for planner, default child, child overrides, coder, reviewer, and merge repair roles.
+- Added explicit parallelism/dependency summaries that show which children start now, which wait, and which tasks unblock downstream work.
+- Replaced terse merge repair plan summaries with structured repair detail covering mode, attempts, provider, conflict paths, sidecar paths, repair run status, latest repair event, and next action.
+- Moved plan attach onto a `PlanEventBus` feed that replays `plan-events.jsonl`, tolerates partial/malformed event rows, emits plan snapshots, and multiplexes child and repair run events into the plan activity stream.
+- Standardized plan attach footer grammar around detach, focus, child-run entry, back navigation, and `try:` lines.
+
 ## Coherence closure (alpha) - 2026-05-17
 
 - Aligned top-level `attach` and `kill` id handling so run, chain, and plan ids all resolve through the normal lifecycle commands, with shared `attaching to <kind> <prefix>` and `killed <kind> <prefix>` banner wording.

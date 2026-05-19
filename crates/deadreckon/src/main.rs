@@ -93,6 +93,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 mod cli;
+mod plan_event_bus;
 mod prompt;
 mod tui_events;
 mod ui;
@@ -103,6 +104,7 @@ use crate::cli::{
     HistoryKind, LibraryCommand, MergeCommandArgs, OrchestrateCommand, PlanCommandArgs,
     ProvidersCommand, RunCommandArgs,
 };
+use crate::plan_event_bus::{PlanEventBus, PlanFeedEvent};
 use crate::ui::{
     ui_command, ui_error, ui_heading, ui_id, ui_muted, ui_note, ui_ok, ui_status, ui_warn,
 };
@@ -8959,6 +8961,259 @@ fn print_plan_json(plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrchestrationRoleRow {
+    role: String,
+    route: String,
+    model: String,
+    source: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrchestrationDependencyRow {
+    child: String,
+    status: String,
+    starts: String,
+    waits_for: String,
+    unblocks: String,
+}
+
+fn orchestration_provider_role_rows(
+    plan: &Plan,
+    repair_enabled: bool,
+    repair_provider: Option<&str>,
+) -> Vec<OrchestrationRoleRow> {
+    let mut rows = Vec::new();
+    match plan.mode {
+        PlanMode::FullPlan => {
+            rows.push(orchestration_role_row(
+                "planner",
+                plan.providers.planner.as_deref(),
+                "plan",
+                "writes child graph",
+            ));
+            rows.push(orchestration_role_row(
+                "default child",
+                plan.providers.default_child.as_deref(),
+                "plan",
+                "runs ready children",
+            ));
+            let mut seen_overrides = BTreeSet::new();
+            for (index, route) in &plan.providers.children {
+                seen_overrides.insert(*index);
+                rows.push(orchestration_role_row(
+                    format!("child task-{index}"),
+                    Some(route.as_str()),
+                    "override",
+                    "per-child route",
+                ));
+            }
+            for task in &plan.tasks {
+                let default_route = plan.providers.default_child.as_deref();
+                if task.provider.as_deref().is_some()
+                    && task.provider.as_deref() != default_route
+                    && !seen_overrides.contains(&task.index)
+                {
+                    rows.push(orchestration_role_row(
+                        format!("child {}", task.task_id),
+                        task.provider.as_deref(),
+                        "task",
+                        one_line(&task.subject, 30),
+                    ));
+                }
+            }
+        }
+        PlanMode::Review => {
+            rows.push(orchestration_role_row(
+                "coder",
+                plan.providers.coder.as_deref(),
+                "plan",
+                "implementation pass",
+            ));
+            rows.push(orchestration_role_row(
+                "reviewer",
+                plan.providers.reviewer.as_deref(),
+                "plan",
+                "independent review",
+            ));
+        }
+    }
+    if repair_enabled {
+        let derived = repair_provider
+            .or(plan.providers.planner.as_deref())
+            .or(plan.providers.default_child.as_deref())
+            .or(plan.providers.reviewer.as_deref())
+            .or(plan.providers.coder.as_deref());
+        rows.push(orchestration_role_row(
+            "repair",
+            derived,
+            if repair_provider.is_some() {
+                "flag"
+            } else {
+                "derived"
+            },
+            "merge repair planning",
+        ));
+    } else {
+        rows.push(OrchestrationRoleRow {
+            role: "repair".to_string(),
+            route: "disabled".to_string(),
+            model: "-".to_string(),
+            source: "--no-repair".to_string(),
+            notes: "raw conflict refusal".to_string(),
+        });
+    }
+    rows
+}
+
+fn orchestration_role_row(
+    role: impl Into<String>,
+    route: Option<&str>,
+    source: impl Into<String>,
+    notes: impl Into<String>,
+) -> OrchestrationRoleRow {
+    OrchestrationRoleRow {
+        role: role.into(),
+        route: route.unwrap_or("config default").to_string(),
+        model: "-".to_string(),
+        source: if route.is_some() {
+            source.into()
+        } else {
+            "config".to_string()
+        },
+        notes: notes.into(),
+    }
+}
+
+fn orchestration_role_table_lines(rows: &[OrchestrationRoleRow]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{:<14} {:<22} {:<8} {:<12} {}",
+        "role", "route", "model", "source", "notes"
+    )];
+    lines.extend(rows.iter().map(|row| {
+        format!(
+            "{:<14} {:<22} {:<8} {:<12} {}",
+            row.role, row.route, row.model, row.source, row.notes
+        )
+    }));
+    lines
+}
+
+fn print_orchestration_role_table(
+    plan: &Plan,
+    repair_enabled: bool,
+    repair_provider: Option<&str>,
+) {
+    println!("provider roles");
+    for line in orchestration_role_table_lines(&orchestration_provider_role_rows(
+        plan,
+        repair_enabled,
+        repair_provider,
+    )) {
+        println!("  {line}");
+    }
+}
+
+fn orchestration_dependency_rows(plan: &Plan) -> Vec<OrchestrationDependencyRow> {
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .map(|task| task.task_id.as_str())
+        .collect::<BTreeSet<_>>();
+    plan.tasks
+        .iter()
+        .map(|task| {
+            let blockers = task
+                .depends_on
+                .iter()
+                .filter(|dependency| !completed.contains(dependency.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let starts = match task.status {
+                PlanTaskStatus::Pending if blockers.is_empty() => "now".to_string(),
+                PlanTaskStatus::Pending => format!("after {}", blockers.join(",")),
+                PlanTaskStatus::Running => "already running".to_string(),
+                PlanTaskStatus::Completed => "done".to_string(),
+                PlanTaskStatus::Failed => "failed".to_string(),
+                PlanTaskStatus::Killed => "killed".to_string(),
+            };
+            let unblocks = plan
+                .tasks
+                .iter()
+                .filter(|candidate| candidate.depends_on.iter().any(|dep| dep == &task.task_id))
+                .map(|candidate| candidate.task_id.clone())
+                .collect::<Vec<_>>();
+            OrchestrationDependencyRow {
+                child: task.task_id.clone(),
+                status: task_status_label(task.status).to_string(),
+                starts,
+                waits_for: if blockers.is_empty() {
+                    "-".to_string()
+                } else {
+                    blockers.join(",")
+                },
+                unblocks: if unblocks.is_empty() {
+                    "-".to_string()
+                } else {
+                    unblocks.join(",")
+                },
+            }
+        })
+        .collect()
+}
+
+fn orchestration_parallelism_lines(plan: &Plan) -> Vec<String> {
+    let rows = orchestration_dependency_rows(plan);
+    let starts_now = rows
+        .iter()
+        .filter(|row| row.starts == "now")
+        .map(|row| row.child.clone())
+        .collect::<Vec<_>>();
+    let waits = rows
+        .iter()
+        .filter(|row| row.waits_for != "-")
+        .map(|row| format!("{} after {}", row.child, row.waits_for))
+        .collect::<Vec<_>>();
+    vec![
+        format!(
+            "starts now: {}",
+            if starts_now.is_empty() {
+                "-".to_string()
+            } else {
+                starts_now.join(", ")
+            }
+        ),
+        format!(
+            "waits: {}",
+            if waits.is_empty() {
+                "-".to_string()
+            } else {
+                waits.join("; ")
+            }
+        ),
+    ]
+}
+
+fn print_orchestration_dependency_summary(plan: &Plan) {
+    println!("parallelism");
+    for line in orchestration_parallelism_lines(plan) {
+        println!("  {line}");
+    }
+    println!("dependencies");
+    println!(
+        "  {:<10} {:<10} {:<18} {:<18} unblocks",
+        "child", "status", "starts", "waits_for"
+    );
+    for row in orchestration_dependency_rows(plan) {
+        println!(
+            "  {:<10} {:<10} {:<18} {:<18} {}",
+            row.child, row.status, row.starts, row.waits_for, row.unblocks
+        );
+    }
+}
+
 fn print_plan_created(plan: &Plan, no_hints: bool) {
     println!(
         "{} {} ({})",
@@ -9009,6 +9264,8 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
         ("capabilities", capabilities.as_str()),
     ];
     print_kv_block(&items);
+    print_orchestration_role_table(plan, true, None);
+    print_orchestration_dependency_summary(plan);
     for task in &plan.tasks {
         let deps = if task.depends_on.is_empty() {
             "-".to_string()
@@ -9087,6 +9344,8 @@ fn print_orchestrate_preflight(
         ("capabilities", capabilities.as_str()),
     ];
     print_kv_block(&items);
+    print_orchestration_role_table(plan, !no_repair, None);
+    print_orchestration_dependency_summary(plan);
     for task in &plan.tasks {
         let deps = if task.depends_on.is_empty() {
             "-".to_string()
@@ -9170,6 +9429,8 @@ fn print_orchestrate_started(
         ("events", events_path_display.as_str()),
     ];
     print_kv_block(&items);
+    print_orchestration_role_table(plan, !no_repair, None);
+    print_orchestration_dependency_summary(plan);
     println!(
         "{} {}",
         ui_command("attach:"),
@@ -10425,6 +10686,8 @@ fn print_fork_finished(plan: &Plan, no_hints: bool) {
         completed,
         plan.tasks.len()
     );
+    print_orchestration_role_table(plan, true, None);
+    print_orchestration_dependency_summary(plan);
     if !no_hints {
         println!(
             "{} {}",
@@ -10621,7 +10884,7 @@ async fn merge_command(args: MergeCommandArgs) -> Result<()> {
     let library_dir = paths.library_dir(&merged_run.scope, &merged_run.run_id);
     write_plan_merge_manifest(&paths, &library_dir, &plan, &merge.conflicts)?;
     if !quiet {
-        print_merge_finished(&plan, &merged_run, &library_dir, no_hints);
+        print_merge_finished(&paths, &plan, &merged_run, &library_dir, no_hints);
     }
     Ok(())
 }
@@ -11935,6 +12198,7 @@ fn write_plan_merge_manifest(
 }
 
 fn print_merge_finished(
+    paths: &DeadreckonPaths,
     plan: &Plan,
     merged_run: &deadreckon_core::PipelineState,
     library_dir: &Path,
@@ -11947,6 +12211,17 @@ fn print_merge_finished(
     );
     println!("result run (secondary) {}", run_prefix(&merged_run.run_id));
     println!("artifact library {}", library_dir.display());
+    print_orchestration_role_table(plan, true, None);
+    print_orchestration_dependency_summary(plan);
+    let repair_summary = plan_merge_repair_summary_items(paths, plan);
+    if !repair_summary.is_empty() {
+        println!("merge repair");
+        let repair_items = repair_summary
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        print_kv_block(&repair_items);
+    }
     if !no_hints {
         println!(
             "{} {}",
@@ -12009,6 +12284,8 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
         ("capabilities", capabilities.as_str()),
     ];
     print_kv_block(&items);
+    print_orchestration_role_table(plan, true, None);
+    print_orchestration_dependency_summary(plan);
     if let Some(line) = plan_final_gate_line(paths, plan) {
         println!("final gate {line}");
     }
@@ -12016,8 +12293,14 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
     if let Some(event) = plan_events.last() {
         println!("latest plan event {}", plan_event_line(event));
     }
-    if let Some(line) = plan_merge_repair_status_line(paths, plan) {
-        println!("merge repair {line}");
+    let repair_summary = plan_merge_repair_summary_items(paths, plan);
+    if !repair_summary.is_empty() {
+        println!("merge repair");
+        let repair_items = repair_summary
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        print_kv_block(&repair_items);
     }
     println!("children");
     for task in &plan.tasks {
@@ -12155,6 +12438,179 @@ fn plan_merge_repair_status_line(paths: &DeadreckonPaths, plan: &Plan) -> Option
     conflicts
         .is_file()
         .then(|| format!("conflicts recorded ({})", conflicts.display()))
+}
+
+fn plan_merge_repair_summary_items(paths: &DeadreckonPaths, plan: &Plan) -> Vec<(String, String)> {
+    let proofs = paths.merge_proofs(&plan.plan_id);
+    let repair_request = proofs.join("repair-request.json");
+    let repair_plan = proofs.join("repair-plan.json");
+    let repair_run = proofs.join("repair-run.json");
+    let conflicts = proofs.join("conflicts.json");
+    if !repair_request.is_file()
+        && !repair_plan.is_file()
+        && !repair_run.is_file()
+        && !conflicts.is_file()
+    {
+        return Vec::new();
+    }
+
+    let events = read_plan_events_lossy(paths, &plan.plan_id);
+    let mut mode = None::<String>;
+    let mut provider = None::<String>;
+    let mut event_conflicts = None::<usize>;
+    let mut repair_run_id = None::<String>;
+    let mut latest_repair_event = None::<String>;
+    for event in &events {
+        match &event.event {
+            PlanEventKind::MergeConflict { conflict_count } => {
+                event_conflicts = Some(*conflict_count);
+                latest_repair_event = Some(plan_event_summary(&event.event));
+            }
+            PlanEventKind::MergeRepairPlanned {
+                conflict_count,
+                provider: planned_provider,
+            } => {
+                event_conflicts = Some(*conflict_count);
+                provider = planned_provider.clone();
+                latest_repair_event = Some(plan_event_summary(&event.event));
+            }
+            PlanEventKind::MergeRepairStarted { mode: repair_mode } => {
+                mode = Some(repair_mode.clone());
+                latest_repair_event = Some(plan_event_summary(&event.event));
+            }
+            PlanEventKind::MergeRepairRunDiscovered { run_id, .. } => {
+                repair_run_id = Some(run_id.clone());
+                latest_repair_event = Some(plan_event_summary(&event.event));
+            }
+            PlanEventKind::MergeRepaired {
+                repair_run_id: run, ..
+            } => {
+                if let Some(run) = run {
+                    repair_run_id = Some(run.clone());
+                }
+                latest_repair_event = Some(plan_event_summary(&event.event));
+            }
+            PlanEventKind::MergeRepairFailed { .. } => {
+                latest_repair_event = Some(plan_event_summary(&event.event));
+            }
+            _ => {}
+        }
+    }
+
+    let (conflict_count, conflict_paths) = merge_conflict_summary(&conflicts);
+    let repair_plan_value = read_json_value(&repair_plan);
+    let repair_run_value = read_json_value(&repair_run);
+    if provider.is_none()
+        && let Some(value) = read_json_value(&repair_request)
+    {
+        provider = value
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+    }
+    if repair_run_id.is_none()
+        && let Some(value) = repair_run_value.as_ref()
+    {
+        repair_run_id = value
+            .get("run_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+    }
+
+    let mut items = Vec::new();
+    items.push(("enabled".to_string(), "automatic".to_string()));
+    items.push((
+        "mode".to_string(),
+        mode.or_else(|| {
+            repair_plan_value
+                .as_ref()
+                .and_then(|value| value.get("decision"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "auto".to_string()),
+    ));
+    items.push((
+        "attempts".to_string(),
+        "1 default unless command flag changed this merge".to_string(),
+    ));
+    items.push((
+        "provider".to_string(),
+        provider.unwrap_or_else(|| "config default".to_string()),
+    ));
+    items.push((
+        "conflicts".to_string(),
+        match conflict_count.or(event_conflicts) {
+            Some(count) if conflict_paths.is_empty() => count.to_string(),
+            Some(count) => format!("{count}: {}", conflict_paths.join(", ")),
+            None if !conflict_paths.is_empty() => conflict_paths.join(", "),
+            None => "-".to_string(),
+        },
+    ));
+    if repair_request.is_file() {
+        items.push(("request".to_string(), repair_request.display().to_string()));
+    }
+    if repair_plan.is_file() {
+        let decision = repair_plan_value
+            .as_ref()
+            .and_then(|value| value.get("decision"))
+            .and_then(Value::as_str)
+            .unwrap_or("recorded");
+        items.push((
+            "repair plan".to_string(),
+            format!("{decision} ({})", repair_plan.display()),
+        ));
+    }
+    if repair_run.is_file() || repair_run_id.is_some() {
+        let status = repair_run_value
+            .as_ref()
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("recorded");
+        let run = repair_run_id
+            .as_deref()
+            .map(run_prefix)
+            .unwrap_or_else(|| "-".to_string());
+        items.push(("repair run".to_string(), format!("{run} {status}")));
+    }
+    if let Some(event) = latest_repair_event {
+        items.push(("latest event".to_string(), event));
+    }
+    items.push((
+        "next action".to_string(),
+        match plan.status {
+            PlanStatus::Pending => format!("deadreckon fork {}", run_prefix(&plan.plan_id)),
+            PlanStatus::Forked => format!("deadreckon merge {}", run_prefix(&plan.plan_id)),
+            PlanStatus::Merged => format!("deadreckon finish {}", run_prefix(&plan.plan_id)),
+            PlanStatus::Failed => {
+                format!("deadreckon show {} --why-failed", run_prefix(&plan.plan_id))
+            }
+        },
+    ));
+    items
+}
+
+fn merge_conflict_summary(path: &Path) -> (Option<usize>, Vec<String>) {
+    let Some(value) = read_json_value(path) else {
+        return (None, Vec::new());
+    };
+    let conflicts = value
+        .get("conflicts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let paths = conflicts
+        .iter()
+        .filter_map(|conflict| conflict.get("path").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (Some(conflicts.len()), paths)
+}
+
+fn read_json_value(path: &Path) -> Option<Value> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
 }
 
 fn format_wall_cap(max_wall_seconds: Option<f64>) -> String {
@@ -17303,11 +17759,35 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut selected = 0_usize;
+    let mut plan = load_plan(paths, plan_id)?;
+    let mut messages: Vec<PlanMessage>;
+    let mut plan_events = Vec::<PlanEvent>::new();
+    let mut feed_events = Vec::<PlanFeedEvent>::new();
+    let mut feed = PlanEventBus::file_tail(paths.clone(), plan_id.to_string());
 
     let result = loop {
-        let plan = load_plan(paths, plan_id)?;
-        let messages = read_plan_messages(paths, plan_id).unwrap_or_default();
-        let plan_events = read_plan_events_lossy(paths, plan_id);
+        for event in feed.refresh(Duration::ZERO).await {
+            match event {
+                PlanFeedEvent::Plan { event } => {
+                    plan_events.push(event.clone());
+                    feed_events.push(PlanFeedEvent::Plan { event });
+                }
+                PlanFeedEvent::Snapshot { plan: snapshot } => {
+                    plan = (*snapshot).clone();
+                    feed_events.push(PlanFeedEvent::Snapshot { plan: snapshot });
+                }
+                other => feed_events.push(other),
+            }
+        }
+        if plan_events.len() > 1_000 {
+            let drain = plan_events.len().saturating_sub(1_000);
+            plan_events.drain(0..drain);
+        }
+        if feed_events.len() > 1_000 {
+            let drain = feed_events.len().saturating_sub(1_000);
+            feed_events.drain(0..drain);
+        }
+        messages = read_plan_messages(paths, plan_id).unwrap_or_default();
         if selected >= plan.tasks.len() {
             selected = plan.tasks.len().saturating_sub(1);
         }
@@ -17316,10 +17796,13 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
                 frame,
                 paths,
                 &plan,
-                &messages,
-                &plan_events,
-                selected,
-                show_hints,
+                &PlanAttachRenderState {
+                    messages: &messages,
+                    plan_events: &plan_events,
+                    feed_events: &feed_events,
+                    selected,
+                    show_hints,
+                },
             )
         })?;
         if event::poll(std::time::Duration::from_millis(250))? {
@@ -17376,20 +17859,25 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
     result
 }
 
+struct PlanAttachRenderState<'a> {
+    messages: &'a [PlanMessage],
+    plan_events: &'a [PlanEvent],
+    feed_events: &'a [PlanFeedEvent],
+    selected: usize,
+    show_hints: bool,
+}
+
 fn render_plan_attach(
     frame: &mut ratatui::Frame<'_>,
     paths: &DeadreckonPaths,
     plan: &Plan,
-    messages: &[PlanMessage],
-    plan_events: &[PlanEvent],
-    selected: usize,
-    show_hints: bool,
+    state: &PlanAttachRenderState<'_>,
 ) {
     let area = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Min(10),
             Constraint::Length(7),
             Constraint::Length(2),
@@ -17417,6 +17905,7 @@ fn render_plan_attach(
             area.width.saturating_sub(4) as usize,
         )),
         Line::from(plan_provider_summary(plan)),
+        Line::from(orchestration_parallelism_lines(plan).join("  ")),
         Line::from(format!(
             "capabilities network={:?} deploy={} install={}{}",
             plan.capability_preview.network,
@@ -17444,7 +17933,7 @@ fn render_plan_attach(
         let Some(rect) = panes.get(index).copied() else {
             continue;
         };
-        let is_selected = index == selected;
+        let is_selected = index == state.selected;
         let title = format!(
             "{} {} {}",
             if is_selected { "*" } else { " " },
@@ -17493,11 +17982,14 @@ fn render_plan_attach(
     }
 
     let activity = plan_activity_lines(
-        plan_events,
-        messages,
+        state.plan_events,
+        state.messages,
+        state.feed_events,
         vertical[2].height.saturating_sub(2) as usize,
     );
-    let activity_title = if plan_events.is_empty() {
+    let activity_title = if !state.feed_events.is_empty() {
+        "plan feed"
+    } else if state.plan_events.is_empty() {
         "coordinator messages"
     } else {
         "plan events"
@@ -17506,7 +17998,7 @@ fn render_plan_attach(
         List::new(activity).block(Block::default().title(activity_title).borders(Borders::ALL)),
         vertical[2],
     );
-    let footer = plan_attach_footer(paths, plan, selected, show_hints);
+    let footer = plan_attach_footer(paths, plan, state.selected, state.show_hints);
     frame.render_widget(Paragraph::new(footer), vertical[3]);
 }
 
@@ -17517,7 +18009,7 @@ fn plan_attach_footer(
     show_hints: bool,
 ) -> String {
     let mut footer =
-        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter drill into child, Esc returns"
+        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter child run  |  b/Backspace back from child"
             .to_string();
     if let Some(task) = plan.tasks.get(selected) {
         match task.child_run_id.as_deref() {
@@ -17620,9 +18112,17 @@ fn plan_task_pane_layout(
 fn plan_activity_lines(
     plan_events: &[PlanEvent],
     messages: &[PlanMessage],
+    feed_events: &[PlanFeedEvent],
     max: usize,
 ) -> Vec<ListItem<'static>> {
-    let mut lines = if plan_events.is_empty() {
+    let mut lines = if !feed_events.is_empty() {
+        feed_events
+            .iter()
+            .rev()
+            .take(max.max(1))
+            .map(|event| ListItem::new(Line::from(plan_feed_event_line(event))))
+            .collect::<Vec<_>>()
+    } else if plan_events.is_empty() {
         messages
             .iter()
             .rev()
@@ -17646,6 +18146,38 @@ fn plan_activity_lines(
         lines.push(ListItem::new(Line::from("no plan activity yet")));
     }
     lines
+}
+
+fn plan_feed_event_line(event: &PlanFeedEvent) -> String {
+    match event {
+        PlanFeedEvent::Plan { event } => plan_event_line(event),
+        PlanFeedEvent::ChildRun {
+            task_id,
+            run_id,
+            event,
+        } => format!(
+            "{} child {} run {} {}",
+            event.timestamp.format("%H:%M:%S"),
+            task_id,
+            run_prefix(run_id),
+            event_line(event, false)
+        ),
+        PlanFeedEvent::RepairRun { run_id, event } => format!(
+            "{} repair run {} {}",
+            event.timestamp.format("%H:%M:%S"),
+            run_prefix(run_id),
+            event_line(event, false)
+        ),
+        PlanFeedEvent::Snapshot { plan } => format!(
+            "{} snapshot status {} children {}",
+            Utc::now().format("%H:%M:%S"),
+            plan_status_label(plan.status),
+            plan.tasks.len()
+        ),
+        PlanFeedEvent::Warning { message } => {
+            format!("{} warning {message}", Utc::now().format("%H:%M:%S"))
+        }
+    }
 }
 
 fn plan_event_line(event: &PlanEvent) -> String {
@@ -20989,18 +21521,21 @@ mod tui_tests {
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, COMMAND_HELP_CATALOG,
         ChainAttachTuiState, CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS,
-        ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines,
-        attach_banner, attach_header_text, attach_should_return_to_plan, chain_activity_lines,
-        chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
-        chain_step_dot, chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
-        cli_wait_status_line, collect_jsonl_provider_activity, command_discovery,
-        completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
-        deadreckoning_status_text, doc_polish_preview_text, implementation_plan_warnings,
-        kill_banner, live_file_lines, markdown_to_tui_lines, max_panel_scroll, meter_color,
-        per_step_wall_cap, plan_attach_footer, provider_ingest_base_roots,
-        provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
-        provider_jsonl_session_matches_run, read_plan_events_lossy, recommend_child_count_for_goal,
-        recommend_orchestration_mode, render_attach, render_plan_attach, threshold_color,
+        PlanAttachRenderState, PlanFeedEvent, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
+        acceptance_activity_lines, attach_banner, attach_header_text, attach_should_return_to_plan,
+        chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
+        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
+        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
+        command_discovery, completion_action_from_input, completion_hints_enabled,
+        deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
+        implementation_plan_warnings, kill_banner, live_file_lines, markdown_to_tui_lines,
+        max_panel_scroll, meter_color, orchestration_dependency_rows,
+        orchestration_parallelism_lines, orchestration_provider_role_rows,
+        orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
+        plan_merge_repair_summary_items, provider_ingest_base_roots, provider_jsonl_activity_lines,
+        provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
+        read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
+        render_attach, render_plan_attach, threshold_color,
     };
     use crate::cli::{Cli, CliPlanMode};
     use chrono::Utc;
@@ -21010,8 +21545,8 @@ mod tui_tests {
         ApplyMode, ApplyStrategy, BranchPolicy, CapabilityPreview, Chain, ChainEvent,
         ChainEventKind, ChainNewOptions, ChainStatus, ChainStepStatus, DeadreckonPaths,
         NetworkCapability, OnFail, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
-        PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunOptions,
-        SpendRecord, append_plan_event, create_run, save_plan,
+        PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunEvent,
+        RunEventKind, RunOptions, SpendRecord, append_plan_event, create_run, save_plan,
     };
     use deadreckon_providers::SpendEstimate;
     use deadreckon_providers::registry::{
@@ -21294,11 +21829,33 @@ mod tui_tests {
         plan_events: &[PlanEvent],
         selected: usize,
     ) -> String {
+        render_plan_attach_text_with_feed(paths, plan, messages, plan_events, &[], selected)
+    }
+
+    fn render_plan_attach_text_with_feed(
+        paths: &DeadreckonPaths,
+        plan: &Plan,
+        messages: &[PlanMessage],
+        plan_events: &[PlanEvent],
+        feed_events: &[PlanFeedEvent],
+        selected: usize,
+    ) -> String {
         let backend = TestBackend::new(140, 34);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
-                render_plan_attach(frame, paths, plan, messages, plan_events, selected, true)
+                render_plan_attach(
+                    frame,
+                    paths,
+                    plan,
+                    &PlanAttachRenderState {
+                        messages,
+                        plan_events,
+                        feed_events,
+                        selected,
+                        show_hints: true,
+                    },
+                )
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
@@ -21368,6 +21925,178 @@ mod tui_tests {
                 CliPlanMode::FullPlan
             ),
             5
+        );
+    }
+
+    #[test]
+    fn orchestration_preflight_snapshot_captures_provider_roles_and_parallelism() {
+        let (_temp, _paths, mut plan) = full_plan_fixture(3);
+        plan.tasks[2].depends_on = vec!["task-0".to_string()];
+
+        let role_lines =
+            orchestration_role_table_lines(&orchestration_provider_role_rows(&plan, true, None));
+        let parallelism = orchestration_parallelism_lines(&plan);
+
+        assert!(
+            role_lines
+                .iter()
+                .any(|line| line.contains("planner") && line.contains("smoke:planner")),
+            "{role_lines:#?}"
+        );
+        assert!(
+            role_lines
+                .iter()
+                .any(|line| line.contains("child task-1") && line.contains("smoke:reviewer")),
+            "{role_lines:#?}"
+        );
+        assert!(
+            role_lines
+                .iter()
+                .any(|line| line.contains("repair") && line.contains("smoke:planner")),
+            "{role_lines:#?}"
+        );
+        assert!(
+            parallelism
+                .iter()
+                .any(|line| line.contains("starts now: task-0, task-1")),
+            "{parallelism:#?}"
+        );
+        assert!(
+            parallelism
+                .iter()
+                .any(|line| line.contains("waits: task-2 after task-0")),
+            "{parallelism:#?}"
+        );
+    }
+
+    #[test]
+    fn orchestrate_preflight_prints_provider_role_table() {
+        let (_temp, _paths, plan) = review_plan_fixture();
+
+        let rows = orchestration_provider_role_rows(&plan, true, Some("smoke:repair"));
+
+        assert!(rows.iter().any(|row| {
+            row.role == "coder" && row.route == "smoke:coder" && row.source == "plan"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.role == "reviewer" && row.route == "smoke:reviewer" && row.source == "plan"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.role == "repair" && row.route == "smoke:repair" && row.source == "flag"
+        }));
+    }
+
+    #[test]
+    fn orchestrate_preflight_names_ready_parallel_children() {
+        let (_temp, _paths, mut plan) = full_plan_fixture(3);
+        plan.tasks[1].depends_on = vec!["task-0".to_string()];
+        plan.tasks[2].status = PlanTaskStatus::Completed;
+
+        let rows = orchestration_dependency_rows(&plan);
+        let lines = orchestration_parallelism_lines(&plan);
+
+        assert!(rows.iter().any(|row| {
+            row.child == "task-0" && row.starts == "now" && row.unblocks == "task-1"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.child == "task-1" && row.starts == "after task-0" && row.waits_for == "task-0"
+        }));
+        assert!(
+            lines.iter().any(|line| line.contains("starts now: task-0")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn merge_repair_summary_snapshot_captures_current_status() {
+        let (_temp, paths, mut plan) = full_plan_fixture(2);
+        plan.status = PlanStatus::Failed;
+        save_plan(&paths, &plan).expect("save plan");
+        let proofs = paths.merge_proofs(&plan.plan_id);
+        std::fs::create_dir_all(&proofs).expect("proofs");
+        std::fs::write(
+            proofs.join("conflicts.json"),
+            serde_json::json!({
+                "schema_version": 2,
+                "plan_id": plan.plan_id,
+                "strategy": "dag-aware",
+                "conflicts": [{ "path": "src/lib.rs" }]
+            })
+            .to_string(),
+        )
+        .expect("conflicts");
+        std::fs::write(
+            proofs.join("repair-request.json"),
+            serde_json::json!({ "provider": "smoke:repair" }).to_string(),
+        )
+        .expect("request");
+        std::fs::write(
+            proofs.join("repair-plan.json"),
+            serde_json::json!({
+                "decision": "spawn_repair_child",
+                "rationale": "needs integration"
+            })
+            .to_string(),
+        )
+        .expect("plan");
+        std::fs::write(
+            proofs.join("repair-run.json"),
+            serde_json::json!({
+                "run_id": "11112222333344445555666677778888",
+                "status": "failed"
+            })
+            .to_string(),
+        )
+        .expect("run");
+        append_plan_event(
+            &paths,
+            &plan.plan_id,
+            PlanEventKind::MergeRepairPlanned {
+                conflict_count: 1,
+                provider: Some("smoke:repair".to_string()),
+            },
+        )
+        .expect("planned");
+        append_plan_event(
+            &paths,
+            &plan.plan_id,
+            PlanEventKind::MergeRepairStarted {
+                mode: "child".to_string(),
+            },
+        )
+        .expect("started");
+
+        let summary = plan_merge_repair_summary_items(&paths, &plan);
+
+        assert!(
+            summary
+                .iter()
+                .any(|(key, value)| key == "mode" && value == "child"),
+            "{summary:#?}"
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|(key, value)| key == "provider" && value == "smoke:repair"),
+            "{summary:#?}"
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|(key, value)| key == "conflicts" && value.contains("src/lib.rs")),
+            "{summary:#?}"
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|(key, value)| key == "repair run" && value.contains("11112222 failed")),
+            "{summary:#?}"
+        );
+        assert!(
+            summary.iter().any(|(key, value)| key == "next action"
+                && value.contains("deadreckon show")
+                && value.contains("--why-failed")),
+            "{summary:#?}"
         );
     }
 
@@ -21526,6 +22255,49 @@ mod tui_tests {
     }
 
     #[test]
+    fn attach_plan_receives_live_plan_child_and_repair_events() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+        let child_run_id = "11112222333344445555666677778888".to_string();
+        let repair_run_id = "99998888777766665555444433332222".to_string();
+        let feed_events = vec![
+            PlanFeedEvent::Plan {
+                event: PlanEvent {
+                    timestamp: Utc::now(),
+                    plan_id: plan.plan_id.clone(),
+                    event: PlanEventKind::PlanStarted,
+                },
+            },
+            PlanFeedEvent::ChildRun {
+                task_id: "task-0".to_string(),
+                run_id: child_run_id.clone(),
+                event: RunEvent {
+                    timestamp: Utc::now(),
+                    run_id: child_run_id,
+                    event: RunEventKind::TurnStarted { turn: 2 },
+                },
+            },
+            PlanFeedEvent::RepairRun {
+                run_id: repair_run_id.clone(),
+                event: RunEvent {
+                    timestamp: Utc::now(),
+                    run_id: repair_run_id,
+                    event: RunEventKind::RunCompleted {
+                        status: "completed".to_string(),
+                    },
+                },
+            },
+        ];
+
+        let text = render_plan_attach_text_with_feed(&paths, &plan, &[], &[], &feed_events, 0);
+
+        assert!(text.contains("plan feed"), "{text}");
+        assert!(text.contains("task-0"), "{text}");
+        assert!(text.contains("turn 2 started"), "{text}");
+        assert!(text.contains("repair run"), "{text}");
+        assert!(text.contains("run completed"), "{text}");
+    }
+
+    #[test]
     fn plan_attach_handles_partial_plan_event_line() {
         let (_temp, paths, plan) = full_plan_fixture(2);
         save_plan(&paths, &plan).expect("save plan");
@@ -21576,6 +22348,18 @@ mod tui_tests {
     }
 
     #[test]
+    fn plan_attach_footer_snapshot_captures_back_navigation_grammar() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+
+        let footer = plan_attach_footer(&paths, &plan, 0, true);
+
+        assert!(footer.starts_with("q/Esc/Ctrl-D detach"), "{footer}");
+        assert!(footer.contains("arrows/Tab focus child"), "{footer}");
+        assert!(footer.contains("Enter waits for child run"), "{footer}");
+        assert!(footer.contains("try: deadreckon fork"), "{footer}");
+    }
+
+    #[test]
     fn attach_plan_enter_opens_selected_child_run_detail() {
         let (temp, paths, mut plan) = full_plan_fixture(2);
         let state = create_run(
@@ -21597,7 +22381,7 @@ mod tui_tests {
 
         let footer = plan_attach_footer(&paths, &plan, 0, true);
 
-        assert!(footer.contains("Enter drill into child"), "{footer}");
+        assert!(footer.contains("Enter child run"), "{footer}");
         assert!(!footer.contains("try: deadreckon fork"), "{footer}");
     }
 
