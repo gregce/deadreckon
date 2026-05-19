@@ -23,6 +23,14 @@ pub const RUN_DECISIONS: &str = "RUN-DECISIONS.md";
 pub const AS_BUILT_DELTA: &str = "AS-BUILT-DELTA.md";
 pub const INCREMENTAL_JSONL: &str = "_incremental.jsonl";
 pub const POLISH_JSON: &str = "polish.json";
+pub const IMPLEMENTATION_NOTES_HTML: &str = "implementation-notes.html";
+
+const IMPLEMENTATION_NOTE_SECTIONS: [(&str, &str); 4] = [
+    ("design-decisions", "Design decisions"),
+    ("deviations", "Deviations"),
+    ("tradeoffs", "Tradeoffs"),
+    ("open-questions", "Open questions"),
+];
 
 #[derive(Debug, Clone)]
 pub struct FrontmatterFields {
@@ -199,11 +207,16 @@ pub fn polish_path(working_dir: &Path) -> PathBuf {
     docs_dir(working_dir).join(POLISH_JSON)
 }
 
+pub fn implementation_notes_path(working_dir: &Path) -> PathBuf {
+    working_dir.join(IMPLEMENTATION_NOTES_HTML)
+}
+
 pub fn public_doc_path(working_dir: &Path, file_name: &str) -> PathBuf {
     public_docs_dir(working_dir).join(file_name)
 }
 
 pub fn ensure_docs_started(state: &PipelineState) -> Result<()> {
+    ensure_implementation_notes_started(state)?;
     let dir = docs_dir(&state.working_dir);
     fs::create_dir_all(&dir).with_path(&dir)?;
     let incremental = incremental_path(&state.working_dir);
@@ -211,6 +224,17 @@ pub fn ensure_docs_started(state: &PipelineState) -> Result<()> {
         fs::write(&incremental, "").with_path(&incremental)?;
     }
     rewrite_templated_docs(state, "templated only")
+}
+
+pub fn ensure_implementation_notes_started(state: &PipelineState) -> Result<()> {
+    let path = implementation_notes_path(&state.working_dir);
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_path(parent)?;
+    }
+    write_file(path, implementation_notes_template(state))
 }
 
 pub fn frontmatter(state: &PipelineState, fields: &FrontmatterFields) -> String {
@@ -376,7 +400,19 @@ pub fn publish_docs_for_promotion(state: &PipelineState) -> Result<()> {
     for name in [RUN_NARRATIVE, RUN_AS_BUILT, RUN_DECISIONS, AS_BUILT_DELTA] {
         let source = internal.join(name);
         if source.exists() {
-            fs::copy(&source, public.join(name)).with_path(&source)?;
+            let dest = public.join(name);
+            if name == RUN_DECISIONS {
+                let mut raw = fs::read_to_string(&source).with_path(&source)?;
+                if implementation_notes_path(&state.working_dir).exists() {
+                    raw = raw.replace(
+                        &format!("](../../{IMPLEMENTATION_NOTES_HTML})"),
+                        &format!("](../{IMPLEMENTATION_NOTES_HTML})"),
+                    );
+                }
+                write_file(dest, raw)?;
+            } else {
+                fs::copy(&source, dest).with_path(&source)?;
+            }
         }
     }
     if delta_path(&state.working_dir).exists() {
@@ -441,6 +477,73 @@ impl DocKind {
             Self::Delta => AS_BUILT_DELTA,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImplementationNotesStatus {
+    Current,
+    Missing,
+    MissingSections(Vec<&'static str>),
+    Stale {
+        notes_turn: Option<u32>,
+        implementation_turn: u32,
+    },
+}
+
+impl ImplementationNotesStatus {
+    pub fn is_current(&self) -> bool {
+        matches!(self, Self::Current)
+    }
+
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Current => "implementation notes are current".to_string(),
+            Self::Missing => format!("{IMPLEMENTATION_NOTES_HTML} is missing"),
+            Self::MissingSections(sections) => {
+                format!(
+                    "{IMPLEMENTATION_NOTES_HTML} is missing required sections: {}",
+                    sections.join(", ")
+                )
+            }
+            Self::Stale {
+                notes_turn,
+                implementation_turn,
+            } => format!(
+                "{IMPLEMENTATION_NOTES_HTML} is stale; latest notes turn {}, latest implementation turn {implementation_turn}",
+                notes_turn
+                    .map(|turn| turn.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        }
+    }
+}
+
+pub fn check_implementation_notes_current(
+    state: &PipelineState,
+) -> Result<ImplementationNotesStatus> {
+    let path = implementation_notes_path(&state.working_dir);
+    if !path.exists() {
+        return Ok(ImplementationNotesStatus::Missing);
+    }
+    let raw = fs::read_to_string(&path).with_path(&path)?;
+    let missing = missing_implementation_note_sections(&raw);
+    if !missing.is_empty() {
+        return Ok(ImplementationNotesStatus::MissingSections(missing));
+    }
+    let records = read_turn_records(&state.working_dir)?;
+    let notes_turn = latest_notes_turn(&records);
+    let implementation_turn = latest_implementation_turn(&records);
+    if let Some(implementation_turn) = implementation_turn
+        && notes_turn
+            .map(|notes_turn| notes_turn < implementation_turn)
+            .unwrap_or(true)
+    {
+        return Ok(ImplementationNotesStatus::Stale {
+            notes_turn,
+            implementation_turn,
+        });
+    }
+    Ok(ImplementationNotesStatus::Current)
 }
 
 pub fn coalesce_into_phases(records: &[TurnRecord]) -> Vec<Phase> {
@@ -848,6 +951,161 @@ fn render_turn_citations(records: &[TurnRecord]) -> String {
     out
 }
 
+fn implementation_notes_template(state: &PipelineState) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Implementation notes</title>
+</head>
+<body>
+  <h1>Implementation notes</h1>
+  <dl>
+    <dt>Run</dt><dd>{}</dd>
+    <dt>Goal</dt><dd>{}</dd>
+    <dt>Last updated</dt><dd>{}</dd>
+  </dl>
+  <section id="design-decisions"><h2>Design decisions</h2><p>None.</p></section>
+  <section id="deviations"><h2>Deviations</h2><p>None.</p></section>
+  <section id="tradeoffs"><h2>Tradeoffs</h2><p>None.</p></section>
+  <section id="open-questions"><h2>Open questions</h2><p>None.</p></section>
+</body>
+</html>
+"#,
+        html_escape(&state.run_id),
+        html_escape(&state.goal),
+        Utc::now().to_rfc3339()
+    )
+}
+
+fn missing_implementation_note_sections(raw: &str) -> Vec<&'static str> {
+    let lower = raw.to_ascii_lowercase();
+    IMPLEMENTATION_NOTE_SECTIONS
+        .iter()
+        .filter_map(|(id, heading)| {
+            let has_id =
+                lower.contains(&format!("id=\"{id}\"")) || lower.contains(&format!("id='{id}'"));
+            let has_heading = lower.contains(&heading.to_ascii_lowercase());
+            (!has_id || !has_heading).then_some(*heading)
+        })
+        .collect()
+}
+
+fn latest_notes_turn(records: &[TurnRecord]) -> Option<u32> {
+    records
+        .iter()
+        .filter(|record| {
+            record
+                .files
+                .iter()
+                .any(|file| is_implementation_notes_file(&file.path))
+        })
+        .map(|record| record.turn)
+        .max()
+}
+
+fn latest_implementation_turn(records: &[TurnRecord]) -> Option<u32> {
+    records
+        .iter()
+        .filter(|record| {
+            record.files.iter().any(|file| {
+                is_documentable_path(&file.path) && !is_implementation_notes_file(&file.path)
+            })
+        })
+        .map(|record| record.turn)
+        .max()
+}
+
+fn is_implementation_notes_file(path: &str) -> bool {
+    path.trim_start_matches("./").replace('\\', "/") == IMPLEMENTATION_NOTES_HTML
+}
+
+fn implementation_note_markdown_sections(working_dir: &Path) -> BTreeMap<&'static str, String> {
+    let path = implementation_notes_path(working_dir);
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    IMPLEMENTATION_NOTE_SECTIONS
+        .iter()
+        .map(|(id, heading)| {
+            let value = extract_html_section(&raw, id)
+                .map(|section| html_fragment_to_markdown(&section))
+                .filter(|section| !section.trim().is_empty())
+                .unwrap_or_else(|| "None.".to_string());
+            (*heading, value)
+        })
+        .collect()
+}
+
+fn extract_html_section(raw: &str, id: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    let id_double = format!("id=\"{id}\"");
+    let id_single = format!("id='{id}'");
+    let id_index = lower.find(&id_double).or_else(|| lower.find(&id_single))?;
+    let start_tag = lower[..id_index].rfind("<section")?;
+    let content_start = lower[start_tag..].find('>')? + start_tag + 1;
+    let content_end = lower[content_start..].find("</section>")? + content_start;
+    Some(raw[content_start..content_end].to_string())
+}
+
+fn html_fragment_to_markdown(fragment: &str) -> String {
+    let mut prepared = fragment
+        .replace("\r\n", "\n")
+        .replace("<li>", "\n- ")
+        .replace("</li>", "\n")
+        .replace("</p>", "\n\n")
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("</div>", "\n")
+        .replace("</section>", "\n");
+    prepared = strip_html_tags(&prepared);
+    let decoded = decode_html_entities(&prepared);
+    let lines = decoded
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            !IMPLEMENTATION_NOTE_SECTIONS
+                .iter()
+                .any(|(_, heading)| line.eq_ignore_ascii_case(heading))
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        "None.".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn strip_html_tags(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_tag = false;
+    for ch in raw.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn html_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn decode_html_entities(raw: &str) -> String {
+    raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
 fn render_as_built(
     state: &PipelineState,
     fields: &FrontmatterFields,
@@ -914,9 +1172,21 @@ fn render_decisions(
 ) -> String {
     let mut out = frontmatter(state, fields);
     out.push_str(&format!(
-        "This document captures meaningful decisions made during run `{}`.\n\n",
+        "This document captures implementation decisions and spec interpretation for run `{}`.\n\n",
         short_id(&state.run_id)
     ));
+    if implementation_notes_path(&state.working_dir).exists() {
+        out.push_str(&format!(
+            "Live working copy: [`{IMPLEMENTATION_NOTES_HTML}`](../../{IMPLEMENTATION_NOTES_HTML})\n\n"
+        ));
+    }
+    let notes = implementation_note_markdown_sections(&state.working_dir);
+    for (_, heading) in IMPLEMENTATION_NOTE_SECTIONS {
+        out.push_str(&format!("## {heading}\n\n"));
+        out.push_str(notes.get(heading).map(String::as_str).unwrap_or("None."));
+        out.push_str("\n\n");
+    }
+    out.push_str("## Multi-alternative decision details\n\n");
     let decisions = records
         .iter()
         .filter(|record| record.decision_candidate)
@@ -929,7 +1199,7 @@ fn render_decisions(
     }
     for (idx, record) in decisions.into_iter().enumerate() {
         out.push_str(&format!(
-            "## Decision {} - {} (turn {})\n\n",
+            "### Decision {} - {} (turn {})\n\n",
             idx + 1,
             record.title,
             record.turn

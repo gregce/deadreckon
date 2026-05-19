@@ -321,6 +321,7 @@ Lifecycle:
   deadreckon doc latest --export ./RUN-NARRATIVE.md
 
 Docs are generated as part of accepted runs and are also shown in the TUI after completion.
+The decisions doc is the implementation decision ledger: design decisions, deviations, tradeoffs, open questions, and multi-alternative decision details.
 Docs can be regenerated with a provider-backed polish pass:
   deadreckon doc latest --polish
   deadreckon doc latest --polish --doc-provider cli:codex --overwrite
@@ -1240,6 +1241,8 @@ pub(crate) enum Commands {
         from_turn: Option<u32>,
         #[arg(long, help = "Override wall-clock cap")]
         max_wall_seconds: Option<f64>,
+        #[arg(long, help = "Skip document polishing while resuming")]
+        no_docs: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
     },

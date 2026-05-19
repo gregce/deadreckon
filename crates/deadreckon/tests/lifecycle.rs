@@ -180,10 +180,10 @@ async fn extend_creates_new_run_with_parent_artifacts() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("started run "), "{stdout}");
-    assert!(stdout.contains("provider mock"), "{stdout}");
-    assert!(stdout.contains("model mock-agent"), "{stdout}");
-    assert!(stdout.contains("attach: deadreckon attach "), "{stdout}");
-    assert!(stdout.contains("state "), "{stdout}");
+    assert!(stdout.contains("provider: mock"), "{stdout}");
+    assert!(stdout.contains("model   : mock-agent"), "{stdout}");
+    assert!(stdout.contains("attach  : deadreckon attach "), "{stdout}");
+    assert!(stdout.contains("state   : "), "{stdout}");
     let child = load_run(&paths, &extended_run_id(&output)).expect("child");
     assert_eq!(child.status, RunStatus::Completed);
     assert_eq!(child.scope, parent.scope);
@@ -746,16 +746,17 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .arg("none")
         .arg("--max-spend")
         .arg("1")
+        .arg("--no-docs")
         .output()
         .expect("run");
     assert_success(&output);
     let run_stdout = stdout(&output);
     assert!(run_stdout.contains("started run "));
-    assert!(run_stdout.contains("attach: deadreckon attach "));
+    assert!(run_stdout.contains("attach  : deadreckon attach "));
     assert!(run_stdout.contains("export:"));
     assert!(run_stdout.contains("extend:"));
     let run_id = run_id_from_stdout(&output);
-    assert!(run_stdout.contains(&format!("attach: deadreckon attach {}", &run_id[..8])));
+    assert!(run_stdout.contains(&format!("attach  : deadreckon attach {}", &run_id[..8])));
     let attach = deadreckon(&paths)
         .arg("attach")
         .arg(&run_id)
@@ -783,6 +784,7 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .arg("--max-spend")
         .arg("1")
         .arg("--no-hints")
+        .arg("--no-docs")
         .output()
         .expect("run no hints");
     assert_success(&output);
@@ -814,6 +816,7 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .arg("none")
         .arg("--max-spend")
         .arg("1")
+        .arg("--no-docs")
         .env("DEADRECKON_HINTS", "0")
         .output()
         .expect("run env no hints");
@@ -1526,7 +1529,8 @@ fn extend_command(paths: &DeadreckonPaths, parent: &PipelineState, goal: &str) -
         .arg("--sandbox")
         .arg("none")
         .arg("--max-spend")
-        .arg("1");
+        .arg("1")
+        .arg("--no-docs");
     command
 }
 
@@ -1559,12 +1563,42 @@ fn extend_script() -> Vec<FixtureResponse> {
             "completion_tokens": 40
         },
         {
+            "content": implementation_notes_write_action(),
+            "prompt_tokens": 120,
+            "completion_tokens": 40
+        },
+        {
             "content": "{\"action\":\"done\",\"summary\":\"extended complete\"}",
             "prompt_tokens": 160,
             "completion_tokens": 40
         }
     ]))
     .expect("script")
+}
+
+fn implementation_notes_write_action() -> String {
+    json!({
+        "action": "write_file",
+        "tool_call_id": "extend-notes",
+        "path": "implementation-notes.html",
+        "content": r#"<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Implementation Notes</title></head>
+<body>
+<h1>Implementation Notes</h1>
+<section id="design-decisions"><h2>Design decisions</h2>
+<ul><li>Extended runs write child artifacts and keep the parent artifacts intact.</li></ul></section>
+<section id="deviations"><h2>Deviations</h2>
+<ul><li>None.</li></ul></section>
+<section id="tradeoffs"><h2>Tradeoffs</h2>
+<ul><li>The fixture uses a separate notes write so tests exercise the freshness gate.</li></ul></section>
+<section id="open-questions"><h2>Open questions</h2>
+<ul><li>None.</li></ul></section>
+</body>
+</html>
+"#
+    })
+    .to_string()
 }
 
 fn extended_run_id(output: &std::process::Output) -> String {

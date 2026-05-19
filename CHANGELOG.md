@@ -1,5 +1,14 @@
 # Changelog
 
+## Implementation notes (alpha) - 2026-05-18
+
+- Added root `implementation-notes.html` seeding for new runs, with required Design decisions, Deviations, Tradeoffs, and Open questions sections.
+- Updated the default run prompt and CLI sub-agent prompt to frame work as `Implement the SPEC` and require the live notes file to stay current while files change.
+- Made `RUN-DECISIONS.md` the converged implementation decision ledger by rendering the same four notes sections plus a separate evidence-filtered multi-alternative decision details section.
+- Added done-time freshness checks so JSON-action providers and CLI sub-agents cannot complete after documentable implementation changes until `implementation-notes.html` is current.
+- Updated `narrator-decisions` and split polish merging so implementation notes can feed the four interpretation sections without turning every note into a multi-alternative decision.
+- Pointed lifecycle/doc hints toward `deadreckon doc <run-id> --kind decisions` as the primary inspection path for implementation interpretation.
+
 ## Orchestration live UX (alpha) - 2026-05-18
 
 - Added shared orchestration role and dependency summaries across plan creation, orchestrate preflight/start, fork completion, plan attach summaries, and merge completion.

@@ -706,10 +706,11 @@ async fn main_inner() -> Result<()> {
             run_id,
             from_turn,
             max_wall_seconds,
+            no_docs,
             plain,
         } => {
             ui::set_plain_output(plain);
-            resume_command(run_id, from_turn, max_wall_seconds, plain).await
+            resume_command(run_id, from_turn, max_wall_seconds, no_docs, plain).await
         }
         Commands::Undo { run, turn } => undo_command(run, turn),
         Commands::Show {
@@ -11819,6 +11820,7 @@ fn child_artifact_root(paths: &DeadreckonPaths, state: &deadreckon_core::Pipelin
 
 fn skip_plan_merge_file(relative: &Path) -> bool {
     relative == Path::new("manifest.json")
+        || relative == Path::new(deadreckon_core::IMPLEMENTATION_NOTES_HTML)
         || relative.starts_with(".deadreckon")
         || path_has_component(relative, ".git")
         || path_has_component(relative, "target")
@@ -13248,7 +13250,10 @@ fn finish_command(
             );
             println!(
                 "  docs:    {}",
-                ui_command(format!("deadreckon doc {}", run_prefix(&state.run_id)))
+                ui_command(format!(
+                    "deadreckon doc {} --kind decisions",
+                    run_prefix(&state.run_id)
+                ))
             );
             println!(
                 "  undo:    {}",
@@ -16426,6 +16431,7 @@ async fn resume_command(
     run_id: String,
     from_turn: Option<u32>,
     max_wall_seconds: Option<f64>,
+    no_docs: bool,
     plain: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
@@ -16500,7 +16506,7 @@ async fn resume_command(
                     doc_skill: defaults
                         .doc_skill
                         .unwrap_or_else(|| "run-narrator".to_string()),
-                    no_docs: false,
+                    no_docs,
                 },
             },
         ),
@@ -17485,6 +17491,14 @@ fn print_run_started_with_label(
         ),
     ));
     rows.push((
+        "notes".to_string(),
+        state
+            .working_dir
+            .join(deadreckon_core::IMPLEMENTATION_NOTES_HTML)
+            .display()
+            .to_string(),
+    ));
+    rows.push((
         "state".to_string(),
         state.state_path().display().to_string(),
     ));
@@ -17532,7 +17546,10 @@ fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
         );
         println!(
             "  docs:    {}",
-            ui_command(format!("deadreckon doc {}", run_prefix(&state.run_id)))
+            ui_command(format!(
+                "deadreckon doc {} --kind decisions",
+                run_prefix(&state.run_id)
+            ))
         );
         return;
     }
@@ -17567,7 +17584,10 @@ fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
     );
     println!(
         "  docs:   {}",
-        ui_command(format!("deadreckon doc {}", run_prefix(&state.run_id)))
+        ui_command(format!(
+            "deadreckon doc {} --kind decisions",
+            run_prefix(&state.run_id)
+        ))
     );
 }
 

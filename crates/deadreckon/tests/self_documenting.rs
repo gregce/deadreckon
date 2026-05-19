@@ -19,14 +19,15 @@ use axum::routing::post;
 use axum::{Json, Router};
 use deadreckon_core::plan::write_plan_narrative;
 use deadreckon_core::{
-    CodebaseMode, CodebaseRecord, DeadreckonPaths, FileChange, FrontmatterFields, Plan, PlanMode,
-    PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunOptions, RunStatus,
-    TurnDocInput, TurnRecord, append_parent_narrative_update, append_turn_doc, apply_commit_body,
-    as_built_path, auto_title, child_summary_relative_path, coalesce_into_phases, decisions_path,
-    diff_samples_markdown, docs_dir, frontmatter, is_decision_candidate,
-    missing_files_in_narrative, narrative_path, polish_path, publish_docs_for_promotion,
-    rewrite_templated_docs, save_state, should_emit_delta, source_layout, tool_stdio_markdown,
-    write_child_summary,
+    CodebaseMode, CodebaseRecord, DeadreckonPaths, FileChange, FrontmatterFields,
+    ImplementationNotesStatus, Plan, PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask,
+    PlanTaskStatus, RunOptions, RunStatus, TurnDocInput, TurnRecord,
+    append_parent_narrative_update, append_turn_doc, apply_commit_body, as_built_path, auto_title,
+    check_implementation_notes_current, child_summary_relative_path, coalesce_into_phases,
+    decisions_path, diff_samples_markdown, docs_dir, frontmatter, implementation_notes_path,
+    is_decision_candidate, missing_files_in_narrative, narrative_path, polish_path,
+    publish_docs_for_promotion, rewrite_templated_docs, save_state, should_emit_delta,
+    source_layout, tool_stdio_markdown, write_child_summary,
 };
 use deadreckon_providers::ProviderRouter;
 use deadreckon_runtime::{
@@ -41,6 +42,42 @@ fn docs_dir_created_at_run_start() {
     let (_temp, _paths, state) = fresh_state("write docs at start");
     assert!(docs_dir(&state.working_dir).is_dir());
     assert!(narrative_path(&state.working_dir).exists());
+}
+
+#[test]
+fn implementation_notes_seed_writes_required_html_sections() {
+    let (_temp, _paths, state) = fresh_state("implementation notes seed");
+    let notes = fs::read_to_string(implementation_notes_path(&state.working_dir)).expect("notes");
+    for expected in [
+        r#"id="design-decisions""#,
+        "Design decisions",
+        r#"id="deviations""#,
+        "Deviations",
+        r#"id="tradeoffs""#,
+        "Tradeoffs",
+        r#"id="open-questions""#,
+        "Open questions",
+    ] {
+        assert!(notes.contains(expected), "missing {expected}");
+    }
+}
+
+#[test]
+fn implementation_notes_seed_preserves_existing_file() {
+    let (_temp, _paths, state) = fresh_state("implementation notes preserve");
+    let path = implementation_notes_path(&state.working_dir);
+    fs::write(&path, "custom notes").expect("custom notes");
+    deadreckon_core::ensure_implementation_notes_started(&state).expect("ensure notes");
+    assert_eq!(fs::read_to_string(path).expect("notes"), "custom notes");
+}
+
+#[test]
+fn implementation_notes_path_is_working_root_file() {
+    let (_temp, _paths, state) = fresh_state("implementation notes path");
+    assert_eq!(
+        implementation_notes_path(&state.working_dir),
+        state.working_dir.join("implementation-notes.html")
+    );
 }
 
 #[test]
@@ -193,7 +230,8 @@ fn templated_decisions_md_lists_each_decision_with_turn_link() {
         ),
     );
     let decisions = fs::read_to_string(decisions_path(&state.working_dir)).expect("decisions");
-    assert!(decisions.contains("## Decision 1"));
+    assert!(decisions.contains("## Multi-alternative decision details"));
+    assert!(decisions.contains("### Decision 1"));
     assert!(decisions.contains("[turn 1](../traces.jsonl)"));
 }
 
@@ -205,6 +243,104 @@ fn no_decisions_emits_single_line_no_decisions_message() {
     assert!(decisions.contains("No multi-alternative decisions detected in this run."));
     assert!(decisions.contains("## Turn citations"));
     assert!(decisions.contains("[trace](../traces.jsonl#turn-1)"));
+}
+
+#[test]
+fn run_decisions_includes_implementation_interpretation_sections() {
+    let (_temp, _paths, state) = fresh_state("decision ledger sections");
+    let decisions = fs::read_to_string(decisions_path(&state.working_dir)).expect("decisions");
+    for heading in [
+        "## Design decisions",
+        "## Deviations",
+        "## Tradeoffs",
+        "## Open questions",
+        "## Multi-alternative decision details",
+    ] {
+        assert!(decisions.contains(heading), "missing {heading}");
+    }
+}
+
+#[test]
+fn implementation_notes_sections_render_into_run_decisions() {
+    let (_temp, _paths, state) = fresh_state("decision ledger projection");
+    write_notes(
+        &state,
+        "Use the existing docs file instead of a new schema.",
+        "Departed from the old no-decisions-only shape.",
+        "Chose HTML working copy over markdown to match the requested artifact.",
+        "Confirm whether HTML styling matters.",
+    );
+    rewrite_templated_docs(&state, "templated only").expect("rewrite");
+    let decisions = fs::read_to_string(decisions_path(&state.working_dir)).expect("decisions");
+    assert!(decisions.contains("Use the existing docs file"));
+    assert!(decisions.contains("Departed from the old"));
+    assert!(decisions.contains("Chose HTML working copy"));
+    assert!(decisions.contains("Confirm whether HTML styling matters"));
+}
+
+#[test]
+fn notes_freshness_passes_when_notes_turn_follows_code_turn() {
+    let (_temp, _paths, state) = fresh_state("fresh notes");
+    append_sample_turn(&state, 1, "write_file", &["src/lib.rs"], "code");
+    write_notes(&state, "Decision", "None.", "Tradeoff", "None.");
+    append_sample_turn(
+        &state,
+        2,
+        "write_file",
+        &["implementation-notes.html"],
+        "notes",
+    );
+    assert_eq!(
+        check_implementation_notes_current(&state).expect("check"),
+        ImplementationNotesStatus::Current
+    );
+}
+
+#[test]
+fn notes_freshness_fails_when_code_turn_follows_notes_turn() {
+    let (_temp, _paths, state) = fresh_state("stale notes");
+    write_notes(&state, "Decision", "None.", "Tradeoff", "None.");
+    append_sample_turn(
+        &state,
+        1,
+        "write_file",
+        &["implementation-notes.html"],
+        "notes",
+    );
+    append_sample_turn(&state, 2, "write_file", &["src/lib.rs"], "code");
+    assert_eq!(
+        check_implementation_notes_current(&state).expect("check"),
+        ImplementationNotesStatus::Stale {
+            notes_turn: Some(1),
+            implementation_turn: 2
+        }
+    );
+}
+
+#[test]
+fn notes_freshness_requires_four_sections() {
+    let (_temp, _paths, state) = fresh_state("missing notes sections");
+    fs::write(
+        implementation_notes_path(&state.working_dir),
+        r#"<section id="design-decisions"><h2>Design decisions</h2></section>"#,
+    )
+    .expect("notes");
+    let status = check_implementation_notes_current(&state).expect("check");
+    assert!(matches!(
+        status,
+        ImplementationNotesStatus::MissingSections(_)
+    ));
+}
+
+#[test]
+fn no_multi_alternative_message_survives_inside_details_section() {
+    let (_temp, _paths, state) = fresh_state("decision ledger no decisions");
+    let decisions = fs::read_to_string(decisions_path(&state.working_dir)).expect("decisions");
+    let details = decisions
+        .split("## Multi-alternative decision details")
+        .nth(1)
+        .expect("details");
+    assert!(details.contains("No multi-alternative decisions detected in this run."));
 }
 
 #[test]
@@ -1607,6 +1743,29 @@ fn append_sample_turn(
         },
     )
     .expect("append docs")
+}
+
+fn write_notes(
+    state: &deadreckon_core::PipelineState,
+    design: &str,
+    deviations: &str,
+    tradeoffs: &str,
+    open_questions: &str,
+) {
+    fs::write(
+        implementation_notes_path(&state.working_dir),
+        format!(
+            r#"<!doctype html>
+<html lang="en"><body>
+<section id="design-decisions"><h2>Design decisions</h2><p>{design}</p></section>
+<section id="deviations"><h2>Deviations</h2><p>{deviations}</p></section>
+<section id="tradeoffs"><h2>Tradeoffs</h2><p>{tradeoffs}</p></section>
+<section id="open-questions"><h2>Open questions</h2><p>{open_questions}</p></section>
+</body></html>
+"#
+        ),
+    )
+    .expect("write notes");
 }
 
 fn turn_record(turn: u32, tool: &str, files: &[&str]) -> TurnRecord {

@@ -4846,7 +4846,29 @@ fn write_fake_cli_subagent_provider(
     fs::create_dir_all(&providers_dir).expect("providers dir");
     let slug = id.replace(':', "-");
     let binary = root.join(format!("{slug}.sh"));
-    fs::write(&binary, format!("#!/bin/sh\n{script_body}")).expect("fake cli");
+    fs::write(
+        &binary,
+        format!(
+            r#"#!/bin/sh
+write_deadreckon_notes() {{
+  stamp=$(date +%s%N 2>/dev/null || date +%s)
+  cat > implementation-notes.html <<HTML
+<h1>Implementation Notes</h1>
+<section id="design-decisions"><h2>Design decisions</h2><p>Fixture updated implementation notes at $stamp.</p></section>
+<section id="deviations"><h2>Deviations</h2><p>None.</p></section>
+<section id="tradeoffs"><h2>Tradeoffs</h2><p>Orchestration fixtures keep notes current for child and repair runs.</p></section>
+<section id="open-questions"><h2>Open questions</h2><p>None.</p></section>
+HTML
+}}
+{script_body}
+case "$1" in
+  *"read-only planning agent"*|*"read-only merge repair planner"*) ;;
+  *) write_deadreckon_notes ;;
+esac
+"#
+        ),
+    )
+    .expect("fake cli");
     let mut perms = fs::metadata(&binary).expect("fake metadata").permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&binary, perms).expect("fake chmod");

@@ -15,9 +15,9 @@ use deadreckon_core::codebase::{read_codebase_record, write_codebase_record};
 use deadreckon_core::docs::{
     AS_BUILT_DELTA, RUN_AS_BUILT, RUN_DECISIONS, RUN_NARRATIVE, append_docs_warning, as_built_path,
     changed_doc_files, decisions_path, delta_path, diff_samples_markdown, docs_dir,
-    is_documentable_path, missing_files_in_narrative, narrative_path, polish_path,
-    publish_docs_for_promotion, read_turn_records, rewrite_templated_docs, source_layout,
-    tool_stdio_markdown,
+    implementation_notes_path, is_documentable_path, missing_files_in_narrative, narrative_path,
+    polish_path, publish_docs_for_promotion, read_turn_records, rewrite_templated_docs,
+    source_layout, tool_stdio_markdown,
 };
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::paths::SOURCE_ROOT;
@@ -911,33 +911,76 @@ fn render_split_decisions(decisions: Option<&Value>, fallback: &str) -> String {
     let Some(value) = decisions else {
         return fallback.to_string();
     };
-    let Some(items) = value.get("decisions").and_then(Value::as_array) else {
-        return fallback.to_string();
-    };
-    if items.is_empty() {
-        return format!("{frontmatter}No multi-alternative decisions detected in this run.\n");
-    }
+    let items = value
+        .get("decisions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let mut out = frontmatter;
+    for (heading, key, next) in [
+        ("Design decisions", "design_decisions", "## Deviations"),
+        ("Deviations", "deviations", "## Tradeoffs"),
+        ("Tradeoffs", "tradeoffs", "## Open questions"),
+        (
+            "Open questions",
+            "open_questions",
+            "## Multi-alternative decision details",
+        ),
+    ] {
+        out.push_str(&format!("## {heading}\n\n"));
+        out.push_str(
+            string_field(value, key)
+                .filter(|field| !field.trim().is_empty())
+                .unwrap_or_else(|| fallback_section(fallback, &format!("## {heading}"), next))
+                .trim(),
+        );
+        out.push_str("\n\n");
+    }
+    out.push_str("## Multi-alternative decision details\n\n");
+    if items.is_empty() {
+        out.push_str("No multi-alternative decisions detected in this run.\n");
+        return out;
+    }
     for (idx, item) in items.iter().enumerate() {
-        out.push_str(&format!("## Decision {}\n\n", idx + 1));
+        out.push_str(&format!("### Decision {}\n\n", idx + 1));
+        if let Some(title) = string_field(item, "title")
+            && !title.trim().is_empty()
+        {
+            out.push_str(&format!("- **Title:** {title}\n"));
+        }
+        if let Some(turn) = item.get("turn").and_then(Value::as_u64) {
+            out.push_str(&format!("- **Turn:** {turn}\n"));
+        }
         out.push_str(&format!(
             "- **Context:** {}\n",
             string_field(item, "context").unwrap_or_else(|| "-".to_string())
         ));
-        out.push_str(&format!(
-            "- **Options considered:** {}\n",
-            string_array_field(item, "options")
-                .unwrap_or_default()
-                .join("; ")
-        ));
+        let considered = string_array_field(item, "considered")
+            .or_else(|| string_array_field(item, "options"))
+            .unwrap_or_default()
+            .join("; ");
+        out.push_str(&format!("- **Options considered:** {}\n", considered));
         out.push_str(&format!(
             "- **Chosen:** {}\n",
             string_field(item, "chosen").unwrap_or_else(|| "-".to_string())
         ));
         out.push_str(&format!(
             "- **Rationale:** {}\n\n",
-            string_field(item, "rationale").unwrap_or_else(|| "-".to_string())
+            string_field(item, "why")
+                .or_else(|| string_field(item, "rationale"))
+                .unwrap_or_else(|| "-".to_string())
         ));
+        if let Some(files) = string_array_field(item, "files_affected")
+            && !files.is_empty()
+        {
+            out.push_str(&format!("- **Files affected:** {}\n", files.join("; ")));
+        }
+        if let Some(citations) = string_array_field(item, "citations")
+            && !citations.is_empty()
+        {
+            out.push_str(&format!("- **Citations:** {}\n", citations.join("; ")));
+        }
+        out.push('\n');
     }
     out
 }
@@ -1049,6 +1092,7 @@ pub fn inputs_hash(state: &PipelineState) -> Result<String> {
         state.run_root.join("provenance.jsonl"),
         state.run_root.join("spend.jsonl"),
         docs_dir(&state.working_dir).join("_incremental.jsonl"),
+        implementation_notes_path(&state.working_dir),
     ] {
         if let Ok(bytes) = fs::read(&path) {
             hasher.update(path.to_string_lossy().as_bytes());
@@ -1077,6 +1121,8 @@ fn polish_prompt(state: &PipelineState, skill_path: &Path, suffix: &str) -> Resu
     let incremental = fs::read_to_string(docs_dir(&state.working_dir).join("_incremental.jsonl"))
         .unwrap_or_default();
     let narrative = fs::read_to_string(narrative_path(&state.working_dir)).unwrap_or_default();
+    let implementation_notes =
+        fs::read_to_string(implementation_notes_path(&state.working_dir)).unwrap_or_default();
     let files = changed_doc_files(state)?.join("\n");
     let records = read_turn_records(&state.working_dir)?;
     let prompt = substitute_placeholders(
@@ -1091,6 +1137,7 @@ fn polish_prompt(state: &PipelineState, skill_path: &Path, suffix: &str) -> Resu
             ("trace_jsonl", traces),
             ("incremental_jsonl", incremental),
             ("current_narrative", narrative),
+            ("implementation_notes", implementation_notes),
             ("changed_files", files),
             ("diff_samples", diff_samples_markdown(&records)),
             ("tool_stdout", tool_stdio_markdown(&records)),
@@ -1159,7 +1206,8 @@ fn write_polished_docs(state: &PipelineState, docs: &PolishedDocs) -> Result<()>
         .with_path(narrative_path(&state.working_dir))?;
     fs::write(as_built_path(&state.working_dir), &docs.as_built)
         .with_path(as_built_path(&state.working_dir))?;
-    fs::write(decisions_path(&state.working_dir), &docs.decisions)
+    let decisions = converged_decisions_markdown(state, &docs.decisions);
+    fs::write(decisions_path(&state.working_dir), decisions)
         .with_path(decisions_path(&state.working_dir))?;
     if docs.delta.trim().is_empty() {
         let path = delta_path(&state.working_dir);
@@ -1171,6 +1219,34 @@ fn write_polished_docs(state: &PipelineState, docs: &PolishedDocs) -> Result<()>
             .with_path(delta_path(&state.working_dir))?;
     }
     Ok(())
+}
+
+fn converged_decisions_markdown(state: &PipelineState, polished: &str) -> String {
+    if decisions_have_interpretation_sections(polished) {
+        return polished.to_string();
+    }
+    let fallback = fs::read_to_string(decisions_path(&state.working_dir)).unwrap_or_default();
+    if fallback.trim().is_empty() {
+        return polished.to_string();
+    }
+    if polished.trim().is_empty()
+        || polished.contains("No multi-alternative decisions detected in this run.")
+    {
+        return fallback;
+    }
+    format!("{fallback}\n\n## Provider-polished decision notes\n\n{polished}")
+}
+
+fn decisions_have_interpretation_sections(markdown: &str) -> bool {
+    [
+        "## Design decisions",
+        "## Deviations",
+        "## Tradeoffs",
+        "## Open questions",
+        "## Multi-alternative decision details",
+    ]
+    .iter()
+    .all(|heading| markdown.contains(heading))
 }
 
 // SAFETY: Call sites construct one-shot records at the boundary where they are persisted.

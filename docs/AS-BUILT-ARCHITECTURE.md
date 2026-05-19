@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-18 (orchestration live UX, plan event bus feed, coherence closure)
+**Last updated:** 2026-05-18 (implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
 **Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -1216,7 +1216,7 @@ The `Commands` enum in `crates/deadreckon/src/main.rs` defines the CLI surface. 
 | `merge` | `cli.rs:756` | Compose completed child library artifacts into a new promoted run (with semantic merge repair) |
 | `def-done` | `cli.rs:502` | Write, add, show, or check the project's English done criteria |
 | `acceptance` | `cli.rs:492` | Create, refine, explain, or check project acceptance criteria |
-| `doc` | `cli.rs:1182` | Print run narrative, as-built, decisions, or delta; with optional polish pass |
+| `doc` | `cli.rs:1182` | Print run narrative, as-built, implementation decision ledger, or delta; with optional polish pass |
 | `history` | `cli.rs:1298` | Search durable run traces and provenance (regex/scope/plan filters) |
 | `library` | `cli.rs:983` | Query promoted run artifacts by goal/date/scope |
 | `detect` | `cli.rs:919` | Probe registered providers and return availability and credential status |
@@ -1597,11 +1597,11 @@ V1 candidates remain in `docs/V1-CANDIDATES.md`: richer apply targets, remote-aw
 
 ### 25.1 The Three Artifacts
 
-Every run starts `working/.deadreckon/docs/` and writes three human-readable Markdown files:
+Every run starts `working/.deadreckon/docs/`, seeds root-level `implementation-notes.html`, and writes three human-readable Markdown files:
 
 - `RUN-NARRATIVE.md` for the chronological implementation story.
 - `RUN-AS-BUILT.md` for the subsystem shape changed by the run.
-- `RUN-DECISIONS.md` for detected multi-alternative decisions.
+- `RUN-DECISIONS.md` as the canonical implementation decision ledger: design decisions, deviations, tradeoffs, open questions, and evidence-filtered multi-alternative decision details.
 
 When the worktree has a nearby `AS-BUILT-ARCHITECTURE.md` or `AS-BUILT.md` and the diff is broad enough, deadreckon also emits `AS-BUILT-DELTA.md` as a proposed amendment.
 
@@ -1611,7 +1611,7 @@ The docs use stoa-style bold frontmatter: Date, Last updated, Status, Run ID, Go
 
 ### 25.3 Per-Turn Templating
 
-After every successful tool/provider turn, `crates/deadreckon-runtime/src/turn_loop.rs` calls the turn-end documentation checkpoint. The deterministic record lands in `_incremental.jsonl`, rewrites the Markdown drafts, and emits a `docs_checkpoint` run event before the loop advances. This happens for both CLI sub-agent turns that complete in one provider process and JSON-action providers that may take many Bash/WriteFile/Done turns.
+After every successful tool/provider turn, `crates/deadreckon-runtime/src/turn_loop.rs` calls the turn-end documentation checkpoint. The deterministic record lands in `_incremental.jsonl`, rewrites the Markdown drafts, projects current `implementation-notes.html` sections into `RUN-DECISIONS.md`, and emits a `docs_checkpoint` run event before the loop advances. This happens for both CLI sub-agent turns that complete in one provider process and JSON-action providers that may take many Bash/WriteFile/Done turns.
 
 Each turn record carries the full provider response capped at 50 KB, a short response summary, per-file add/delete counts, largest diff-hunk excerpts, binary markers, optional stdout/stderr samples, trace citation, snapshot reference, and worktree commit SHA when available.
 
@@ -1623,7 +1623,11 @@ The legacy `run-narrator` single-call path remains available for custom installs
 
 ### 25.5 Phase And Decision Detection
 
-`docs.rs` coalesces turns into 3-8 phases by file overlap and tool-kind continuity. Decision candidates are detected with case-insensitive marker regexes and a minimum response length so incidental short phrases do not become decisions.
+`docs.rs` coalesces turns into 3-8 phases by file overlap and tool-kind continuity. Decision candidates are detected with case-insensitive marker regexes and a minimum response length so incidental short phrases do not become multi-alternative decision details. Implementation interpretations do not need to satisfy that regex: they are read from `implementation-notes.html` and rendered into the four ledger sections of `RUN-DECISIONS.md`.
+
+### 25.5.1 Implementation Notes Freshness
+
+The run prompt frames the task as "Implement the SPEC", where the spec is the stored goal plus any copied `acceptance.md`, `acceptance.yaml`, or orchestration worker spec. `skills/default-coding/SKILL.md` tells the executor to maintain root `implementation-notes.html` with Design decisions, Deviations, Tradeoffs, and Open questions. Before a JSON-action provider's `done` action or a CLI sub-agent completion can advance to docs polish, acceptance, and promotion, the runtime checks that the file exists, contains all four sections, and was updated on or after the latest documentable source/config/test/doc turn. Stale notes do not immediately fail the run; the loop records a docs warning/error event, appends a history instruction asking the provider to update the notes, saves state, and continues. When the notes are current, deterministic docs are rewritten so `deadreckon doc <run-id> --kind decisions` is the primary inspection path.
 
 ### 25.6 Diff Coverage And Retry
 
@@ -1639,7 +1643,7 @@ When `deadreckon apply` builds the default squash or merge message, it reads `RU
 
 ### 25.9 `deadreckon doc`
 
-`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another artifact, `--export <path>` writes it to disk, and `--overwrite` overwrites exports or a prior polish result. `--polish` prints a preview listing provider route, provider source, subskills, token budget, max spend, and inputs hash before it calls the documentation provider route; `--no-confirm` skips the prompt for scripts. `--doc-provider <route>` overrides the automatic documentation provider route and `--max-spend <usd>` limits the polish pass. The older `--force` and `--budget-cap` spellings remain hidden alpha aliases.
+`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another artifact, `--export <path>` writes it to disk, and `--overwrite` overwrites exports or a prior polish result. `--kind decisions` prints the converged implementation decision ledger, not only regex-detected choice points. `--polish` prints a preview listing provider route, provider source, subskills, token budget, max spend, and inputs hash before it calls the documentation provider route; `--no-confirm` skips the prompt for scripts. `--doc-provider <route>` overrides the automatic documentation provider route and `--max-spend <usd>` limits the polish pass. The older `--force` and `--budget-cap` spellings remain hidden alpha aliases.
 
 ### 25.10 Cost And Idempotency
 

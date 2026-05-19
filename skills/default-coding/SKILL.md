@@ -14,6 +14,20 @@ Run unattended coding work through the binary-owned phase machine. The skill lay
 
 Rules:
 
+- Implement the SPEC in the working directory. Treat the user's goal plus any
+  acceptance.md / acceptance.yaml content as the spec.
+- As you work, maintain `implementation-notes.html` at the working-directory
+  root. Keep it current with anything the owner should know about how the
+  implementation interprets or diverges from the spec:
+  - Design decisions: choices made where the spec was ambiguous.
+  - Deviations: intentional departures from the spec, with reasons.
+  - Tradeoffs: alternatives considered and why the chosen path won.
+  - Open questions: anything the owner should confirm or revise.
+- Before reporting done, update `implementation-notes.html` after the latest
+  documentable code/config/test/doc change. If there is nothing to report in a
+  section, say "None" rather than deleting the section.
+- deadreckon renders the same content into `RUN-DECISIONS.md`; treat the HTML
+  file as the live working copy for that published decisions ledger.
 - Keep each turn small enough to snapshot and undo.
 - Prefer structural checks before declaring work complete.
 - Do not write acceptance markers directly; let the binary write and validate gates.

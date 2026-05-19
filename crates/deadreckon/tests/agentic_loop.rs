@@ -46,6 +46,7 @@ async fn mock_provider_records_three_turns_and_artifacts_match() {
         .arg("none")
         .arg("--max-spend")
         .arg("1")
+        .arg("--no-docs")
         .env("DEADRECKON_HOME", temp.path().join("home"))
         .output()
         .expect("run deadreckon");
@@ -66,10 +67,10 @@ async fn mock_provider_records_three_turns_and_artifacts_match() {
         .expect("run");
     let state = load_run(&paths, &run.run_id).expect("state");
     assert_eq!(state.status, RunStatus::Completed);
-    assert_eq!(state.turn, 3);
-    assert_jsonl_count(&state.run_root.join("traces.jsonl"), 5);
-    assert_jsonl_count(&state.run_root.join("spend.jsonl"), 3);
-    assert_jsonl_count(&state.run_root.join("provenance.jsonl"), 2);
+    assert_eq!(state.turn, 4);
+    assert_jsonl_count(&state.run_root.join("traces.jsonl"), 6);
+    assert_jsonl_count(&state.run_root.join("spend.jsonl"), 4);
+    assert_jsonl_count(&state.run_root.join("provenance.jsonl"), 3);
     assert!(state.run_root.join("proofs/turn-acceptance.json").exists());
     assert!(state.working_dir.join("turn1.txt").exists());
     assert!(state.working_dir.join("notes.md").exists());
@@ -177,6 +178,7 @@ async fn resume_preserves_history_file() {
         .arg("none")
         .arg("--max-spend")
         .arg("1")
+        .arg("--no-docs")
         .env("DEADRECKON_HOME", temp.path().join("home"))
         .output()
         .expect("run");
@@ -255,9 +257,23 @@ async fn acceptance_failure_restarts_cli_subagent_until_gate_passes() {
 if [ ! -f .provider-count ]; then
   printf 1 > .provider-count
   printf 'first attempt\n' > first.txt
+  cat > implementation-notes.html <<'HTML'
+<h1>Implementation Notes</h1>
+<section id="design-decisions"><h2>Design decisions</h2><p>First acceptance attempt writes a marker file.</p></section>
+<section id="deviations"><h2>Deviations</h2><p>None.</p></section>
+<section id="tradeoffs"><h2>Tradeoffs</h2><p>Retry fixture keeps notes current on every provider turn.</p></section>
+<section id="open-questions"><h2>Open questions</h2><p>None.</p></section>
+HTML
   printf 'first turn changed files\n'
 else
   printf pass > required.txt
+  cat > implementation-notes.html <<'HTML'
+<h1>Implementation Notes</h1>
+<section id="design-decisions"><h2>Design decisions</h2><p>Second acceptance attempt creates the required file.</p></section>
+<section id="deviations"><h2>Deviations</h2><p>None.</p></section>
+<section id="tradeoffs"><h2>Tradeoffs</h2><p>The fixture uses a retry rather than weakening acceptance.</p></section>
+<section id="open-questions"><h2>Open questions</h2><p>None.</p></section>
+HTML
   printf 'second turn fixed acceptance\n'
 fi
 "#,
@@ -327,6 +343,13 @@ count=$(cat .provider-count 2>/dev/null || printf 0)
 count=$((count + 1))
 printf '%s' "$count" > .provider-count
 printf 'attempt %s\n' "$count" > "attempt-$count.txt"
+cat > implementation-notes.html <<HTML
+<h1>Implementation Notes</h1>
+<section id="design-decisions"><h2>Design decisions</h2><p>Attempt $count writes a tracked file but intentionally misses acceptance.</p></section>
+<section id="deviations"><h2>Deviations</h2><p>Acceptance target is intentionally never created.</p></section>
+<section id="tradeoffs"><h2>Tradeoffs</h2><p>The exhaustion fixture keeps notes current while proving retry limits.</p></section>
+<section id="open-questions"><h2>Open questions</h2><p>None.</p></section>
+HTML
 printf 'changed attempt %s\n' "$count"
 "#,
     )
@@ -483,7 +506,19 @@ async fn cli_wall_clock_budget_enforced() {
     let fake_codex = temp.path().join("fake-codex-sleep");
     fs::write(
         &fake_codex,
-        "#!/bin/sh\nprintf \"wall run %s\\n\" \"$(date +%s%N)\" > notes.md\nsleep 1\nprintf 'changed notes\\n'\n",
+        r#"#!/bin/sh
+stamp=$(date +%s%N 2>/dev/null || date +%s)
+printf "wall run %s\n" "$stamp" > notes.md
+cat > implementation-notes.html <<'HTML'
+<h1>Implementation Notes</h1>
+<section id="design-decisions"><h2>Design decisions</h2><p>Wall-clock fixture writes notes before sleeping.</p></section>
+<section id="deviations"><h2>Deviations</h2><p>None.</p></section>
+<section id="tradeoffs"><h2>Tradeoffs</h2><p>The sleep stays in the provider to exercise pause/resume timing.</p></section>
+HTML
+printf '<section id="open-questions"><h2>Open questions</h2><p>None at %s.</p></section>\n' "$stamp" >> implementation-notes.html
+sleep 1
+printf 'changed notes\n'
+"#,
     )
     .expect("fake codex");
     chmod_exec(&fake_codex);
@@ -531,6 +566,7 @@ async fn cli_wall_clock_budget_enforced() {
         .arg(&run.run_id)
         .arg("--max-wall-seconds")
         .arg("10")
+        .arg("--no-docs")
         .env("DEADRECKON_HOME", &home)
         .output()
         .expect("resume");
@@ -1488,12 +1524,42 @@ fn three_turn_script() -> Vec<FixtureResponse> {
             "completion_tokens": 60
         },
         {
+            "content": implementation_notes_write_action(),
+            "prompt_tokens": 160,
+            "completion_tokens": 40
+        },
+        {
             "content": "{\"action\":\"done\",\"summary\":\"mock task complete\"}",
             "prompt_tokens": 180,
             "completion_tokens": 30
         }
     ]))
     .expect("script")
+}
+
+fn implementation_notes_write_action() -> String {
+    json!({
+        "action": "write_file",
+        "tool_call_id": "tool-notes-3",
+        "path": "implementation-notes.html",
+        "content": r#"<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Implementation Notes</title></head>
+<body>
+<h1>Implementation Notes</h1>
+<section id="design-decisions"><h2>Design decisions</h2>
+<ul><li>The mock provider fixture writes a maintained notes file before done.</li></ul></section>
+<section id="deviations"><h2>Deviations</h2>
+<ul><li>None.</li></ul></section>
+<section id="tradeoffs"><h2>Tradeoffs</h2>
+<ul><li>A separate notes turn exercises the freshness gate for JSON-action providers.</li></ul></section>
+<section id="open-questions"><h2>Open questions</h2>
+<ul><li>None.</li></ul></section>
+</body>
+</html>
+"#
+    })
+    .to_string()
 }
 
 fn kill_script() -> Vec<FixtureResponse> {

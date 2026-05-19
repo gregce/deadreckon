@@ -19,7 +19,10 @@ use deadreckon_core::artifacts::{
 };
 use deadreckon_core::cancel::{cancel_marker_path_for_run_root, cancel_marker_present};
 use deadreckon_core::codebase::{CodebaseMode, read_codebase_record};
-use deadreckon_core::docs::{TurnDocInput, append_turn_doc, incremental_path};
+use deadreckon_core::docs::{
+    IMPLEMENTATION_NOTES_HTML, ImplementationNotesStatus, TurnDocInput, append_turn_doc,
+    check_implementation_notes_current, incremental_path, rewrite_templated_docs,
+};
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::events::{RunEvent, RunEventKind, emit_event, event_preview, tool_args_json};
 use deadreckon_core::gate::{acceptance_spec_path_for_run_root, validate_acceptance_marker};
@@ -352,6 +355,17 @@ pub async fn run_turn_loop(
                     preview: event_preview(&response.content),
                 },
             )?;
+            if !implementation_notes_ready_or_request_followup(
+                state,
+                config.event_sender.as_ref(),
+                turn,
+                &mut history,
+            )? {
+                state.turn = turn;
+                save_history(state, &history)?;
+                save_state(state)?;
+                continue;
+            }
             state.turn = turn;
             save_history(state, &history)?;
             save_state(state)?;
@@ -611,6 +625,17 @@ pub async fn run_turn_loop(
                         tool_stderr: None,
                     },
                 )?;
+                if !implementation_notes_ready_or_request_followup(
+                    state,
+                    config.event_sender.as_ref(),
+                    turn,
+                    &mut history,
+                )? {
+                    state.turn = turn;
+                    save_history(state, &history)?;
+                    save_state(state)?;
+                    continue;
+                }
                 complete_run_docs(state, router, &config).await?;
                 if !acceptance_gate_passed_or_record_failure(
                     state,
@@ -717,12 +742,13 @@ fn build_prompt(state: &PipelineState, history: &[String]) -> String {
     } else {
         history.join("\n")
     };
-    let acceptance_text = acceptance_prompt_text(state);
+    let spec_text = spec_prompt_text(state);
+    let skill_text = run_skill_text(state);
     format!(
-        "You are deadreckon running unattended coding work.\nGoal: {}\nWorking directory: {}\nAcceptance criteria:\n{}\nReturn exactly one JSON object with action bash, write_file, or done.\nHistory:\n{}",
-        state.goal,
+        "You are deadreckon running unattended coding work.\nWorking directory: {}\nSPEC:\n{}\n\nSkill and implementation-notes contract:\n{}\n\nHistory:\n{}\n\nReturn exactly one JSON object with action bash, write_file, or done.",
         state.working_dir.display(),
-        acceptance_text,
+        spec_text,
+        skill_text,
         history_text
     )
 }
@@ -733,13 +759,32 @@ fn build_cli_subagent_prompt(state: &PipelineState, history: &[String]) -> Strin
     } else {
         history.join("\n")
     };
-    let acceptance_text = acceptance_prompt_text(state);
+    let spec_text = spec_prompt_text(state);
+    let skill_text = run_skill_text(state);
     format!(
-        "You are a deadreckon CLI sub-agent running unattended coding work.\nGoal: {}\nWorking directory: {}\nAcceptance criteria:\n{}\nModify files directly in the working directory. Do not write outside it. Do not ask questions. When finished, print a concise summary of changed files.\nHistory:\n{}",
-        state.goal,
+        "You are a deadreckon CLI sub-agent running unattended coding work.\nWorking directory: {}\nSPEC:\n{}\n\nSkill and implementation-notes contract:\n{}\n\nModify files directly in the working directory. Do not write outside it. Do not ask questions. When finished, print a concise summary of changed files.\nHistory:\n{}",
         state.working_dir.display(),
-        acceptance_text,
+        spec_text,
+        skill_text,
         history_text
+    )
+}
+
+fn spec_prompt_text(state: &PipelineState) -> String {
+    format!(
+        "Goal:\n{}\n\nAcceptance criteria:\n{}",
+        state.goal,
+        acceptance_prompt_text(state)
+    )
+}
+
+fn run_skill_text(state: &PipelineState) -> String {
+    std::fs::read_to_string(&state.skill_path).unwrap_or_else(|_| implementation_notes_contract())
+}
+
+fn implementation_notes_contract() -> String {
+    format!(
+        "Implement the SPEC in the working directory.\n\nAs you work, maintain {IMPLEMENTATION_NOTES_HTML} at the working-directory root. Keep it current with anything the owner should know about how the implementation interprets or diverges from the spec:\n- Design decisions: choices made where the spec was ambiguous.\n- Deviations: intentional departures from the spec, with reasons.\n- Tradeoffs: alternatives considered and why the chosen path won.\n- Open questions: anything the owner should confirm or revise.\n\nBefore reporting done, update {IMPLEMENTATION_NOTES_HTML} after the latest documentable code/config/test/doc change. The run docs render the same content into RUN-DECISIONS.md, which is the published Markdown ledger."
     )
 }
 
@@ -1229,6 +1274,73 @@ fn append_turn_doc_checkpoint(
     )
 }
 
+fn implementation_notes_ready_or_request_followup(
+    state: &PipelineState,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+    turn: u32,
+    history: &mut Vec<String>,
+) -> Result<bool> {
+    let status = check_implementation_notes_current(state)?;
+    if status.is_current() {
+        rewrite_templated_docs(state, "templated only")?;
+        return Ok(true);
+    }
+    let reason = status.reason();
+    let try_line = implementation_notes_try_line(&status, state);
+    append_trace(
+        state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn,
+            event: "docs.implementation_notes_required".to_string(),
+            latency_ms: None,
+            detail: json!({
+                "reason": reason,
+                "try": try_line,
+            }),
+        },
+    )?;
+    emit_event(
+        state,
+        sender,
+        RunEventKind::Error {
+            turn: Some(turn),
+            message: event_preview(format!("{reason}; try: {try_line}")),
+        },
+    )?;
+    history.push(format!(
+        "implementation notes are required before done: {reason}. Update {IMPLEMENTATION_NOTES_HTML} with Design decisions, Deviations, Tradeoffs, and Open questions, then report done again."
+    ));
+    Ok(false)
+}
+
+fn implementation_notes_try_line(
+    status: &ImplementationNotesStatus,
+    state: &PipelineState,
+) -> String {
+    match status {
+        ImplementationNotesStatus::Missing => format!(
+            "create {}/{}",
+            state.working_dir.display(),
+            IMPLEMENTATION_NOTES_HTML
+        ),
+        ImplementationNotesStatus::MissingSections(_) => {
+            "add Design decisions, Deviations, Tradeoffs, and Open questions sections".to_string()
+        }
+        ImplementationNotesStatus::Stale { .. } => {
+            format!(
+                "edit {}",
+                state.working_dir.join(IMPLEMENTATION_NOTES_HTML).display()
+            )
+        }
+        ImplementationNotesStatus::Current => {
+            let prefix = state.run_id.chars().take(8).collect::<String>();
+            format!("deadreckon doc {prefix} --kind decisions")
+        }
+    }
+}
+
 fn paths_for_state(state: &PipelineState) -> Result<DeadreckonPaths> {
     let home = state
         .run_root
@@ -1403,10 +1515,12 @@ mod tests {
     use deadreckon_core::events::{RunEventBus, RunEventKind};
     use deadreckon_core::paths::DeadreckonPaths;
     use deadreckon_core::state::{RunOptions, RunStatus, create_run};
+    use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
 
     use super::{
         RunLoopConfig, RunLoopDocsConfig, append_tool_refusal, bash_policy_refusal,
-        build_cli_subagent_prompt, ensure_sandbox_toml, load_or_reconstruct_history,
+        build_cli_subagent_prompt, build_prompt, ensure_sandbox_toml,
+        implementation_notes_ready_or_request_followup, load_or_reconstruct_history,
         load_tool_policy_from_sandbox_toml, provider_output_name, run_turn_loop, safe_working_path,
         safe_working_path_with_policy,
     };
@@ -1421,6 +1535,175 @@ mod tests {
         assert_eq!(provider_output_name("cli:pi"), "pi.out");
         assert_eq!(provider_output_name("cli:local/test"), "local-test.out");
         assert_eq!(provider_output_name("anthropic"), "provider.out");
+    }
+
+    #[test]
+    fn run_prompt_names_implement_spec_and_implementation_notes_contract() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "ship feature".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let prompt = build_prompt(&state, &[]);
+        assert!(prompt.contains("Implement the SPEC"), "{prompt}");
+        assert!(prompt.contains("implementation-notes.html"), "{prompt}");
+        assert!(prompt.contains("RUN-DECISIONS.md"), "{prompt}");
+        assert!(
+            prompt
+                .trim_end()
+                .ends_with("Return exactly one JSON object with action bash, write_file, or done.")
+        );
+    }
+
+    #[test]
+    fn cli_subagent_prompt_includes_same_notes_contract() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "ship cli feature".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("cli:codex".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let prompt = build_cli_subagent_prompt(&state, &[]);
+        assert!(prompt.contains("Implement the SPEC"), "{prompt}");
+        assert!(prompt.contains("implementation-notes.html"), "{prompt}");
+        assert!(prompt.contains("RUN-DECISIONS.md"), "{prompt}");
+    }
+
+    #[test]
+    fn done_without_current_implementation_notes_is_rejected() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "ship stale notes check".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let source = state.working_dir.join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("src");
+        std::fs::write(&source, "pub fn value() -> u8 { 1 }\n").expect("source");
+        append_turn_doc(
+            &state,
+            TurnDocInput {
+                turn: 1,
+                tool_kind: "write_file".to_string(),
+                latency_ms: None,
+                files: vec![source],
+                outcome: "code".to_string(),
+                response_text: "code".to_string(),
+                tool_stdout: None,
+                tool_stderr: None,
+            },
+        )
+        .expect("turn doc");
+        let mut history = Vec::new();
+        let ready = implementation_notes_ready_or_request_followup(&state, None, 2, &mut history)
+            .expect("notes check");
+        assert!(!ready);
+        assert!(history[0].contains("implementation notes are required"));
+    }
+
+    #[test]
+    fn current_implementation_notes_update_run_decisions() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "ship current notes check".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let source = state.working_dir.join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("src");
+        std::fs::write(&source, "pub fn value() -> u8 { 1 }\n").expect("source");
+        append_turn_doc(
+            &state,
+            TurnDocInput {
+                turn: 1,
+                tool_kind: "write_file".to_string(),
+                latency_ms: None,
+                files: vec![source],
+                outcome: "code".to_string(),
+                response_text: "code".to_string(),
+                tool_stdout: None,
+                tool_stderr: None,
+            },
+        )
+        .expect("source turn");
+        let notes = implementation_notes_path(&state.working_dir);
+        std::fs::write(
+            &notes,
+            r#"<!doctype html><html lang="en"><body>
+<section id="design-decisions"><h2>Design decisions</h2><p>Project decisions converge into RUN-DECISIONS.</p></section>
+<section id="deviations"><h2>Deviations</h2><p>None.</p></section>
+<section id="tradeoffs"><h2>Tradeoffs</h2><p>HTML remains the live working copy.</p></section>
+<section id="open-questions"><h2>Open questions</h2><p>None.</p></section>
+</body></html>"#,
+        )
+        .expect("notes");
+        append_turn_doc(
+            &state,
+            TurnDocInput {
+                turn: 2,
+                tool_kind: "write_file".to_string(),
+                latency_ms: None,
+                files: vec![notes],
+                outcome: "notes".to_string(),
+                response_text: "notes".to_string(),
+                tool_stdout: None,
+                tool_stderr: None,
+            },
+        )
+        .expect("notes turn");
+        let mut history = Vec::new();
+        let ready = implementation_notes_ready_or_request_followup(&state, None, 3, &mut history)
+            .expect("notes check");
+        assert!(ready);
+        let decisions =
+            std::fs::read_to_string(deadreckon_core::decisions_path(&state.working_dir))
+                .expect("decisions");
+        assert!(decisions.contains("Project decisions converge into RUN-DECISIONS"));
     }
 
     #[tokio::test]

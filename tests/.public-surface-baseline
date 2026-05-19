@@ -70,6 +70,7 @@ crate: deadreckon-core
   docs::capture_response_summary
   docs::capture_tool_stdio
   docs::changed_doc_files
+  docs::check_implementation_notes_current
   docs::coalesce_into_phases
   docs::copy_public_docs_from_internal
   docs::decisions_path
@@ -83,9 +84,13 @@ crate: deadreckon-core
   docs::docs_status_for_state
   docs::DocsStatus
   docs::ensure_docs_started
+  docs::ensure_implementation_notes_started
   docs::FileChange
   docs::frontmatter
   docs::FrontmatterFields
+  docs::IMPLEMENTATION_NOTES_HTML
+  docs::implementation_notes_path
+  docs::ImplementationNotesStatus
   docs::INCREMENTAL_JSONL
   docs::incremental_path
   docs::is_decision_candidate

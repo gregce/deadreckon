@@ -161,7 +161,8 @@ Each accepted run produces a review packet:
 
 - `RUN-NARRATIVE.md` explains what happened.
 - `RUN-AS-BUILT.md` captures the subsystem shape after the run.
-- `RUN-DECISIONS.md` records meaningful decisions.
+- `RUN-DECISIONS.md` records the implementation decision ledger: design decisions, deviations, tradeoffs, open questions, and multi-alternative decision details.
+- `implementation-notes.html` is the live working copy the agent maintains while changing files.
 - `AS-BUILT-DELTA.md` proposes architecture-doc updates when the run is broad enough.
 - `manifest.json` records what was built and from what.
 

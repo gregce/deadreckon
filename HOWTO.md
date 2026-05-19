@@ -299,6 +299,11 @@ deadreckon doc latest --polish --overwrite
 deadreckon doc latest --polish --doc-provider cli:codex --max-spend 0.25
 ```
 
+`deadreckon doc latest --kind decisions` prints the implementation decision
+ledger: design decisions, deviations, tradeoffs, open questions, and
+multi-alternative decision details. The live working copy for those sections is
+`implementation-notes.html` in the run working directory.
+
 The polish preview lists the provider, why it was selected, the four narrator
 subskills, token budget, max spend, and inputs hash. `--no-confirm` skips the
 prompt for scripts. Results are recorded in `polish.json` with one status line

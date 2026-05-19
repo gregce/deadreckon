@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Implementation notes</title>
+</head>
+<body>
+  <h1>Implementation notes</h1>
+  <section id="design-decisions">
+    <h2>Design decisions</h2>
+    <ul>
+      <li><code>implementation-notes.html</code> is the executor-maintained working file, while <code>RUN-DECISIONS.md</code> remains the published Markdown ledger for reviewers and library copies.</li>
+      <li>The runtime seeds the notes file at the working-directory root and renders its four required sections into every templated or polished decisions document.</li>
+      <li>The completion gate uses the existing turn-document journal to prove the notes file was updated no earlier than the latest documentable implementation change, avoiding any pipeline state schema change.</li>
+      <li>CLI-subagent and JSON-action providers share the same notes contract, but JSON-action fixtures usually need a separate notes-writing turn before <code>done</code>.</li>
+    </ul>
+  </section>
+  <section id="deviations">
+    <h2>Deviations</h2>
+    <ul>
+      <li>No new public doc kind was added. The existing <code>deadreckon doc &lt;id&gt; --kind decisions</code> path is the review surface for the converged ledger.</li>
+      <li>Lifecycle tests opt into <code>--no-docs</code> for mock runs so they verify templated ledger behavior without invoking a real local documentation LLM.</li>
+    </ul>
+  </section>
+  <section id="tradeoffs">
+    <h2>Tradeoffs</h2>
+    <ul>
+      <li>Using HTML for the working notes preserves the requested filename and makes section extraction straightforward, at the cost of requiring stable section IDs.</li>
+      <li>Freshness is turn-based rather than content-diff semantic analysis. It catches stale or missing notes reliably without deciding whether the prose is good enough.</li>
+      <li>Polished narrator output can enrich decisions, but the write path preserves the converged ledger shape if a legacy or partial polish response omits the required sections.</li>
+    </ul>
+  </section>
+  <section id="open-questions">
+    <h2>Open questions</h2>
+    <ul>
+      <li>Should future runs expose a first-class <code>--kind implementation-notes</code> doc view, or is keeping decisions as the single public ledger enough?</li>
+      <li>Should the freshness gate eventually require non-placeholder text in each section, beyond section presence and turn recency?</li>
+    </ul>
+  </section>
+</body>
+</html>

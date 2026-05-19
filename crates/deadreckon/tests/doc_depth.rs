@@ -625,6 +625,16 @@ fn narrator_decisions_prompt_filters_false_positive_candidates() {
 }
 
 #[test]
+fn narrator_decisions_prompt_outputs_interpretation_sections() {
+    let decisions = repo_skill("narrator-decisions");
+    assert!(decisions.contains("design_decisions"));
+    assert!(decisions.contains("deviations"));
+    assert!(decisions.contains("tradeoffs"));
+    assert!(decisions.contains("open_questions"));
+    assert!(decisions.contains("implementation-notes.html"));
+}
+
+#[test]
 fn legacy_run_narrator_skill_still_present() {
     assert!(repo_skill_path("run-narrator").exists());
     let skill = repo_skill("run-narrator");
