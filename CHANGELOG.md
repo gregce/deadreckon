@@ -1,5 +1,9 @@
 # Changelog
 
+## Descriptor import hardening (alpha) - 2026-05-20
+
+- Reworked `deadreckon import` around descriptor-backed provider transcript discovery, concrete session selection, import manifests, and normalized trace/provenance events while preserving Cursor SQLite import.
+
 ## Implementation notes (alpha) - 2026-05-18
 
 - Added root `implementation-notes.html` seeding for new runs, with required Design decisions, Deviations, Tradeoffs, and Open questions sections.

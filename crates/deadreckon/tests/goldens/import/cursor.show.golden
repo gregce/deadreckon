@@ -5,8 +5,8 @@ Mode fresh
 Acceptance default dr-gate behavior
 {
   "version": 1,
-  "goal": "imported cursor history",
-  "task_key": "imported-cursor-history-98b77d99",
+  "goal": "imported cursor session",
+  "task_key": "imported-cursor-session-043244f1",
   "run_id": "<RUN_ID>",
   "scope": "<SCOPE>",
   "status": "completed",
@@ -109,11 +109,19 @@ traces:
   "event": "import.cursor",
   "latency_ms": null,
   "detail": {
-    "content": "cursor edit one",
-    "path": "cursor-one.md",
+    "files": [
+      "cursor-one.md"
+    ],
+    "import_version": 1,
+    "raw_hash": "sha256:11c52d675e2da5430d9ee981b779e47d94a85faefb22b398be1ffd49911f0acd",
     "role": "assistant",
+    "schema": "cursor-sqlite",
+    "session_id": "cursor:chats",
+    "source": "cursor",
+    "source_event": "message",
+    "source_line": 1,
     "source_path": "<IMPORT_ROOT>/chats.db",
-    "source_rowid": 1,
+    "summary": "cursor edit one",
     "tool_call_id": "cursor-tool-1"
   }
 }
@@ -124,11 +132,19 @@ traces:
   "event": "import.cursor",
   "latency_ms": null,
   "detail": {
-    "content": "cursor edit two",
-    "path": "cursor-two.md",
+    "files": [
+      "cursor-two.md"
+    ],
+    "import_version": 1,
+    "raw_hash": "sha256:7b37cf977e0a7e23bf29f9bff19f2f7455db0f5082fe8a7db23e16a2c8b52578",
     "role": "assistant",
+    "schema": "cursor-sqlite",
+    "session_id": "cursor:chats",
+    "source": "cursor",
+    "source_event": "message",
+    "source_line": 2,
     "source_path": "<IMPORT_ROOT>/chats.db",
-    "source_rowid": 2,
+    "summary": "cursor edit two",
     "tool_call_id": "cursor-tool-2"
   }
 }

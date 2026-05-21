@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -685,12 +685,12 @@ async fn doctor_fails_actionably() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn import_claude_code_roundtrip() {
-    import_jsonl_roundtrip("claude-code", "DEADRECKON_IMPORT_CLAUDE_ROOT");
+    import_jsonl_roundtrip("claude-code", "CLAUDE_PROJECTS_DIR");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn import_codex_roundtrip() {
-    import_jsonl_roundtrip("codex", "DEADRECKON_IMPORT_CODEX_ROOT");
+    import_jsonl_roundtrip("codex", "CODEX_SESSIONS_DIR");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -728,8 +728,8 @@ async fn import_cursor_roundtrip() {
     assert!(stdout.contains("import.cursor"));
     assert!(stdout.contains("cursor-one.md"));
     assert!(stdout.contains("cursor-two.md"));
-    assert!(stdout.contains("\"source_rowid\": 1"));
-    assert!(stdout.contains("\"source_rowid\": 2"));
+    assert!(stdout.contains("\"source_line\": 1"));
+    assert!(stdout.contains("\"source_line\": 2"));
     let paths = DeadreckonPaths::from_home(&home);
     let state = load_run(&paths, &run_id).expect("state");
     assert_eq!(state.turn, 2);
@@ -739,14 +739,14 @@ async fn import_cursor_roundtrip() {
 async fn import_claude_code_fixture_round_trips_to_golden() {
     import_fixture_roundtrip_golden(
         "claude-code",
-        "DEADRECKON_IMPORT_CLAUDE_ROOT",
+        "CLAUDE_PROJECTS_DIR",
         "claude-code.show.golden",
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn import_codex_fixture_round_trips_to_golden() {
-    import_fixture_roundtrip_golden("codex", "DEADRECKON_IMPORT_CODEX_ROOT", "codex.show.golden");
+    import_fixture_roundtrip_golden("codex", "CODEX_SESSIONS_DIR", "codex.show.golden");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -785,8 +785,9 @@ async fn import_jsonl_golden_normalizes_order_and_metadata() {
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("import")
         .arg("codex")
+        .arg("--all")
         .env("DEADRECKON_HOME", &home)
-        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .env("CODEX_SESSIONS_DIR", &root)
         .output()
         .expect("import");
     assert!(
@@ -846,7 +847,7 @@ async fn import_renders_provenance_lines_for_each_file_change() {
         .arg("import")
         .arg("codex")
         .env("DEADRECKON_HOME", &home)
-        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .env("CODEX_SESSIONS_DIR", &root)
         .output()
         .expect("import");
     assert!(output.status.success());
@@ -881,7 +882,7 @@ async fn import_normalizes_timestamps_to_rfc3339() {
         .arg("import")
         .arg("codex")
         .env("DEADRECKON_HOME", &home)
-        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .env("CODEX_SESSIONS_DIR", &root)
         .output()
         .expect("import");
     assert!(output.status.success());
@@ -905,7 +906,7 @@ async fn import_jsonl_malformed_line_fails_actionably() {
         .arg("import")
         .arg("codex")
         .env("DEADRECKON_HOME", &home)
-        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .env("CODEX_SESSIONS_DIR", &root)
         .output()
         .expect("import");
     assert!(!output.status.success());
@@ -928,7 +929,7 @@ async fn import_current_pointer_uses_imported_run_id() {
         .arg("import")
         .arg("codex")
         .env("DEADRECKON_HOME", &home)
-        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .env("CODEX_SESSIONS_DIR", &root)
         .output()
         .expect("import");
     assert!(output.status.success());
@@ -948,7 +949,7 @@ async fn import_current_pointer_uses_imported_run_id() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reimport_overwrites_deterministic_import_run() {
+async fn reimport_changed_session_requires_replace() {
     let temp = repo_tempdir();
     let home = temp.path().join("home");
     let root = temp.path().join("codex");
@@ -959,7 +960,7 @@ async fn reimport_overwrites_deterministic_import_run() {
         .arg("import")
         .arg("codex")
         .env("DEADRECKON_HOME", &home)
-        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .env("CODEX_SESSIONS_DIR", &root)
         .output()
         .expect("first import");
     assert!(first.status.success());
@@ -970,11 +971,29 @@ async fn reimport_overwrites_deterministic_import_run() {
         .arg("import")
         .arg("codex")
         .env("DEADRECKON_HOME", &home)
-        .env("DEADRECKON_IMPORT_CODEX_ROOT", &root)
+        .env("CODEX_SESSIONS_DIR", &root)
         .output()
         .expect("second import");
-    assert!(second.status.success());
-    let second_id = imported_run_id(&second);
+    assert!(!second.status.success());
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("changed content"), "{stderr}");
+    assert!(stderr.contains("try:"), "{stderr}");
+
+    let replaced = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .arg("--replace")
+        .env("DEADRECKON_HOME", &home)
+        .env("CODEX_SESSIONS_DIR", &root)
+        .output()
+        .expect("replace import");
+    assert!(
+        replaced.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&replaced.stdout),
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    let second_id = imported_run_id(&replaced);
     assert_eq!(first_id, second_id);
 
     let paths = DeadreckonPaths::from_home(&home);
@@ -984,6 +1003,440 @@ async fn reimport_overwrites_deterministic_import_run() {
     let traces = fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
     assert!(!traces.contains("first.md"));
     assert!(traces.contains("second.md"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_accepts_descriptor_provider_ids_and_legacy_aliases() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let codex = temp.path().join("codex");
+    let claude = temp.path().join("claude");
+    let gemini = temp.path().join("gemini");
+    let opencode = temp.path().join("opencode");
+    let copilot = temp.path().join("copilot");
+    let pi = temp.path().join("pi");
+    let cursor = temp.path().join("cursor");
+    for root in [&codex, &claude, &gemini, &opencode, &copilot, &pi, &cursor] {
+        fs::create_dir_all(root).expect("provider root");
+    }
+    for source in [
+        "codex",
+        "claude-code",
+        "gemini",
+        "opencode",
+        "copilot",
+        "pi",
+        "cursor",
+        "cli:claude-code",
+        "cli:codex",
+        "cli:gemini",
+        "cli:opencode",
+        "cli:copilot",
+        "cli:pi",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+            .arg("import")
+            .arg(source)
+            .arg("--list")
+            .env("DEADRECKON_HOME", &home)
+            .env("CODEX_SESSIONS_DIR", &codex)
+            .env("CLAUDE_PROJECTS_DIR", &claude)
+            .env("GEMINI_DIR", &gemini)
+            .env("OPENCODE_DIR", &opencode)
+            .env("COPILOT_DIR", &copilot)
+            .env("PI_CODING_AGENT_SESSION_DIR", &pi)
+            .env("DEADRECKON_IMPORT_CURSOR_ROOT", &cursor)
+            .output()
+            .expect("import list");
+        assert!(
+            output.status.success(),
+            "{source}\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("source "),
+            "{source}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_preview_does_not_create_run() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("codex");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(root.join("session.jsonl"), "{\"path\":\"preview.md\"}\n").expect("jsonl");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .arg("--preview")
+        .env("DEADRECKON_HOME", &home)
+        .env("CODEX_SESSIONS_DIR", &root)
+        .output()
+        .expect("preview");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("preview import"), "{stdout}");
+    let paths = DeadreckonPaths::from_home(&home);
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_unknown_source_lists_supported_sources_with_try_line() {
+    let temp = repo_tempdir();
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("unknown-agent")
+        .env("DEADRECKON_HOME", temp.path().join("home"))
+        .output()
+        .expect("import");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("accepted sources"), "{stderr}");
+    assert!(stderr.contains("cli:copilot"), "{stderr}");
+    assert!(
+        stderr.contains("try: deadreckon import codex --list"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_writes_manifest_with_source_schema_hash_and_reimport_command() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("codex");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(root.join("session.jsonl"), "{\"path\":\"manifest.md\"}\n").expect("jsonl");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .env("DEADRECKON_HOME", &home)
+        .env("CODEX_SESSIONS_DIR", &root)
+        .output()
+        .expect("import");
+    assert!(output.status.success());
+    let run_id = imported_run_id(&output);
+    let paths = DeadreckonPaths::from_home(&home);
+    let state = load_run(&paths, &run_id).expect("state");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(state.run_root.join("import.json")).expect("manifest"),
+    )
+    .expect("manifest json");
+    assert_eq!(manifest["source"], "cli:codex");
+    assert_eq!(manifest["schema"], "codex-cli");
+    assert_eq!(manifest["storage"], "jsonl");
+    assert!(
+        manifest["content_hash"]
+            .as_str()
+            .expect("content_hash")
+            .starts_with("sha256:")
+    );
+    assert!(
+        manifest["reimport_command"]
+            .as_str()
+            .expect("reimport")
+            .contains("--replace")
+    );
+    assert_eq!(manifest["events_imported"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_ambiguous_sessions_prints_candidate_table_and_try_line() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("codex");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(root.join("one.jsonl"), "{\"path\":\"one.md\"}\n").expect("one");
+    fs::write(root.join("two.jsonl"), "{\"path\":\"two.md\"}\n").expect("two");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .env("DEADRECKON_HOME", &home)
+        .env("CODEX_SESSIONS_DIR", &root)
+        .output()
+        .expect("import");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("two.jsonl") || stderr.contains("codex:two"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("one.jsonl") || stderr.contains("codex:one"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("try: deadreckon import codex --session"),
+        "{stderr}"
+    );
+    let paths = DeadreckonPaths::from_home(&home);
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_gemini_requires_session_when_cwd_match_is_none_and_ambiguous() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("gemini");
+    fs::create_dir_all(root.join("tmp")).expect("root");
+    fs::write(
+        root.join("tmp/one.json"),
+        r#"{"sessionId":"one","messages":[]}"#,
+    )
+    .expect("one");
+    fs::write(
+        root.join("tmp/two.json"),
+        r#"{"sessionId":"two","messages":[]}"#,
+    )
+    .expect("two");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("cli:gemini")
+        .env("DEADRECKON_HOME", &home)
+        .env("GEMINI_DIR", &root)
+        .output()
+        .expect("import");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ambiguous import candidates"), "{stderr}");
+    assert!(
+        stderr.contains("try: deadreckon import cli:gemini --session"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_gemini_fixture_round_trips_to_show() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("gemini");
+    let session = root.join("tmp/session.json");
+    fs::create_dir_all(session.parent().expect("parent")).expect("root");
+    fs::write(
+        &session,
+        json!({
+            "sessionId": "gemini-session",
+            "messages": [{
+                "type": "gemini",
+                "timestamp": "2026-05-13T18:39:00Z",
+                "content": [{"text": "gemini edit"}],
+                "toolCalls": [{
+                    "id": "gemini-tool-1",
+                    "name": "write_file",
+                    "args": {"path": "src/gemini.rs"}
+                }],
+                "tokens": {"input": 10, "output": 2, "cached": 1}
+            }]
+        })
+        .to_string(),
+    )
+    .expect("gemini");
+    let run_id = import_run_with_env(
+        "cli:gemini",
+        &[("--session", session.as_path())],
+        &home,
+        &[("GEMINI_DIR", root.as_path())],
+    );
+    let show = show_import_run(&home, &run_id, temp.path());
+    assert!(show.contains("gemini edit"), "{show}");
+    assert!(show.contains("src/gemini.rs"), "{show}");
+    assert!(show.contains("\"schema\": \"gemini\""), "{show}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_opencode_file_mode_fixture_round_trips_to_show() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("opencode");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("cwd");
+    let session = root.join("storage/session/project/session.json");
+    let message_dir = root.join("storage/message/opencode-session");
+    let part_dir = root.join("storage/part/message-1");
+    fs::create_dir_all(session.parent().expect("session parent")).expect("session root");
+    fs::create_dir_all(&message_dir).expect("message root");
+    fs::create_dir_all(&part_dir).expect("part root");
+    fs::write(
+        &session,
+        json!({"id":"opencode-session","directory": cwd, "time":{"created":1770000000000_i64}})
+            .to_string(),
+    )
+    .expect("session");
+    fs::write(
+        message_dir.join("message-1.json"),
+        json!({"id":"message-1","role":"assistant","time":{"created":1770000000100_i64}})
+            .to_string(),
+    )
+    .expect("message");
+    fs::write(
+        part_dir.join("part-1.json"),
+        json!({"id":"part-1","type":"text","content":"opencode edit","time":{"created":1770000000200_i64}})
+            .to_string(),
+    )
+    .expect("text part");
+    fs::write(
+        part_dir.join("part-2.json"),
+        json!({"id":"part-2","type":"tool","tool":"write","state":{"input":{"path":"src/opencode.rs"}},"time":{"created":1770000000300_i64}})
+            .to_string(),
+    )
+    .expect("tool part");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("import")
+        .arg("cli:opencode")
+        .env("DEADRECKON_HOME", &home)
+        .env("OPENCODE_DIR", &root)
+        .output()
+        .expect("import");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_id = imported_run_id(&output);
+    let show = show_import_run_from(&home, &run_id, &cwd);
+    assert!(show.contains("opencode edit"), "{show}");
+    assert!(show.contains("src/opencode.rs"), "{show}");
+    assert!(show.contains("\"schema\": \"opencode\""), "{show}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_copilot_nested_events_file_is_discovered() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("copilot");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("cwd");
+    let events = root.join("session-state/nested/events.jsonl");
+    fs::create_dir_all(events.parent().expect("events parent")).expect("events root");
+    fs::write(
+        &events,
+        format!(
+            "{}\n",
+            json!({
+                "type": "assistant.message",
+                "timestamp": "2026-05-13T18:39:00Z",
+                "data": {
+                    "context": {"cwd": cwd},
+                    "content": "copilot edit",
+                    "toolRequests": [{
+                        "id": "copilot-tool-1",
+                        "name": "write_file",
+                        "arguments": {"path": "src/copilot.rs"}
+                    }]
+                },
+                "usage": {"inputTokens": 4, "outputTokens": 2}
+            })
+        ),
+    )
+    .expect("events");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("import")
+        .arg("cli:copilot")
+        .env("DEADRECKON_HOME", &home)
+        .env("COPILOT_DIR", &root)
+        .output()
+        .expect("import");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_id = imported_run_id(&output);
+    let show = show_import_run_from(&home, &run_id, &cwd);
+    assert!(show.contains("copilot edit"), "{show}");
+    assert!(show.contains("src/copilot.rs"), "{show}");
+    assert!(show.contains("\"schema\": \"copilot-cli\""), "{show}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_pi_fixture_round_trips_to_show() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("pi");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&root).expect("root");
+    fs::create_dir_all(&cwd).expect("cwd");
+    fs::write(
+        root.join("session.jsonl"),
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session","id":"pi-session","cwd": cwd}),
+            json!({
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "pi edit"},
+                        {"type": "toolCall", "id": "pi-tool-1", "name": "write", "arguments": {"path": "src/pi.rs"}}
+                    ],
+                    "usage": {"input_tokens": 5, "output_tokens": 3}
+                }
+            })
+        ),
+    )
+    .expect("pi");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(&cwd)
+        .arg("import")
+        .arg("cli:pi")
+        .env("DEADRECKON_HOME", &home)
+        .env("PI_CODING_AGENT_SESSION_DIR", &root)
+        .output()
+        .expect("import");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_id = imported_run_id(&output);
+    let show = show_import_run_from(&home, &run_id, &cwd);
+    assert!(show.contains("pi edit"), "{show}");
+    assert!(show.contains("src/pi.rs"), "{show}");
+    assert!(show.contains("\"schema\": \"pi\""), "{show}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_cursor_writes_manifest_with_sqlite_source() {
+    if !command_available("sqlite3") {
+        eprintln!("skipping Cursor manifest test because sqlite3 is unavailable");
+        return;
+    }
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("cursor");
+    fs::create_dir_all(&root).expect("cursor root");
+    let db = root.join("chats.db");
+    let status = Command::new("sqlite3")
+        .arg(&db)
+        .arg("create table messages (role text, content text, tool_call_id text, path text); insert into messages values ('assistant','cursor manifest','cursor-tool','cursor.md');")
+        .status()
+        .expect("sqlite");
+    assert!(status.success());
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("cursor")
+        .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_IMPORT_CURSOR_ROOT", &root)
+        .output()
+        .expect("import");
+    assert!(output.status.success());
+    let run_id = imported_run_id(&output);
+    let paths = DeadreckonPaths::from_home(&home);
+    let state = load_run(&paths, &run_id).expect("state");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(state.run_root.join("import.json")).expect("manifest"),
+    )
+    .expect("manifest");
+    assert_eq!(manifest["source"], "cursor");
+    assert_eq!(manifest["schema"], "cursor-sqlite");
+    assert_eq!(manifest["rows_seen"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -1166,9 +1619,11 @@ fn import_jsonl_roundtrip(source: &str, env_name: &str) {
     let temp = repo_tempdir();
     let home = temp.path().join("home");
     let root = temp.path().join(source);
-    fs::create_dir_all(&root).expect("import root");
+    let cwd = std::env::current_dir().expect("cwd");
+    let storage_root = import_storage_root(source, &root, &cwd);
+    fs::create_dir_all(&storage_root).expect("import root");
     fs::write(
-        root.join("session.jsonl"),
+        storage_root.join("session.jsonl"),
         r#"{"role":"assistant","content":"tool call","tool_call_id":"tool-1","path":"notes.md"}
 {"role":"assistant","content":"file edit","tool_call_id":"tool-2","file":"src/main.rs"}
 "#,
@@ -1205,6 +1660,7 @@ fn import_fixture_roundtrip_golden(source: &str, env_name: &str, golden_name: &s
     let home = temp.path().join("home");
     let root = temp.path().join("import-root");
     let cwd = temp.path().join("workspace");
+    let storage_root = import_storage_root(source, &root, &cwd);
     fs::create_dir_all(&cwd).expect("workspace");
     if source == "cursor" {
         fs::create_dir_all(&root).expect("cursor root");
@@ -1217,17 +1673,22 @@ fn import_fixture_roundtrip_golden(source: &str, env_name: &str, golden_name: &s
             .expect("sqlite3 cursor fixture");
         assert!(status.success());
     } else {
-        copy_test_dir(&Path::new(IMPORT_FIXTURES).join(source), &root);
+        copy_test_dir(&Path::new(IMPORT_FIXTURES).join(source), &storage_root);
     }
 
-    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+    let mut import = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
+    import
         .current_dir(&cwd)
         .arg("import")
         .arg(source)
         .env("DEADRECKON_HOME", &home)
-        .env(env_name, &root)
-        .output()
-        .expect("import");
+        .env(env_name, &root);
+    if source != "cursor" {
+        import
+            .arg("--session")
+            .arg(storage_root.join("session.jsonl"));
+    }
+    let output = import.output().expect("import");
     assert!(
         output.status.success(),
         "{}{}",
@@ -1254,7 +1715,11 @@ fn import_fixture_roundtrip_golden(source: &str, env_name: &str, golden_name: &s
         &String::from_utf8_lossy(&show.stdout),
         temp.path(),
         &home,
-        &root,
+        if source == "cursor" {
+            &root
+        } else {
+            &storage_root
+        },
         &cwd,
         &run_id,
         &state.scope,
@@ -1270,6 +1735,30 @@ fn import_fixture_roundtrip_golden(source: &str, env_name: &str, golden_name: &s
         actual,
         expected
     );
+}
+
+fn import_storage_root(source: &str, root: &Path, cwd: &Path) -> PathBuf {
+    if source == "claude-code" {
+        return root.join(test_claude_project_name(cwd));
+    }
+    root.to_path_buf()
+}
+
+fn test_claude_project_name(working_dir: &Path) -> String {
+    let resolved = fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+    let raw = resolved.to_string_lossy();
+    let mut name = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            name.push(ch);
+        } else {
+            name.push('-');
+        }
+    }
+    if !name.starts_with('-') {
+        name.insert(0, '-');
+    }
+    name
 }
 
 fn copy_test_dir(from: &Path, to: &Path) {
@@ -1346,6 +1835,54 @@ fn imported_run_id(output: &std::process::Output) -> String {
         .find_map(|line| line.strip_prefix("imported "))
         .expect("imported id")
         .to_string()
+}
+
+fn import_run_with_env(
+    source: &str,
+    path_args: &[(&str, &Path)],
+    home: &Path,
+    envs: &[(&str, &Path)],
+) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
+    command
+        .arg("import")
+        .arg(source)
+        .env("DEADRECKON_HOME", home);
+    for (flag, path) in path_args {
+        command.arg(flag).arg(path);
+    }
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    let output = command.output().expect("import");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    imported_run_id(&output)
+}
+
+fn show_import_run(home: &Path, run_id: &str, cwd: &Path) -> String {
+    show_import_run_from(home, run_id, cwd)
+}
+
+fn show_import_run_from(home: &Path, run_id: &str, cwd: &Path) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(cwd)
+        .arg("show")
+        .arg(run_id)
+        .env("DEADRECKON_HOME", home)
+        .output()
+        .expect("show");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 fn kill_storm_script(count: usize) -> Vec<FixtureResponse> {

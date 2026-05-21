@@ -5,8 +5,8 @@ Mode fresh
 Acceptance default dr-gate behavior
 {
   "version": 1,
-  "goal": "imported codex history",
-  "task_key": "imported-codex-history-29c497ee",
+  "goal": "imported codex session",
+  "task_key": "imported-codex-session-43b55ffa",
   "run_id": "<RUN_ID>",
   "scope": "<SCOPE>",
   "status": "completed",
@@ -19,7 +19,7 @@ Acceptance default dr-gate behavior
   "skill_name": "default-coding",
   "skill_path": "/Users/gdc/deadreckon/skills/default-coding/SKILL.md",
   "sandbox": "none",
-  "provider": "import:codex",
+  "provider": "import:cli:codex",
   "max_spend_usd": null,
   "total_spend_usd": 0.0,
   "total_wall_seconds": 0.0,
@@ -84,7 +84,7 @@ provenance:
 {
   "timestamp": "<TIMESTAMP>",
   "prompt_id": "turn-1",
-  "model": "import:codex",
+  "model": "import:cli:codex",
   "tool_call_id": "codex-tool-1",
   "session_id": "<RUN_ID>",
   "files": [
@@ -94,7 +94,7 @@ provenance:
 {
   "timestamp": "<TIMESTAMP>",
   "prompt_id": "turn-2",
-  "model": "import:codex",
+  "model": "import:cli:codex",
   "tool_call_id": "codex-tool-2",
   "session_id": "<RUN_ID>",
   "files": [
@@ -110,11 +110,19 @@ traces:
   "event": "import.codex",
   "latency_ms": null,
   "detail": {
-    "content": "codex edit",
-    "file": "src/main.rs",
+    "files": [
+      "src/main.rs"
+    ],
+    "import_version": 1,
+    "raw_hash": "sha256:3ed994572066979e461cd92a65f8393fbf642cb6bcee56229d90567cd987117a",
     "role": "assistant",
+    "schema": "codex-cli",
+    "session_id": "codex:session",
+    "source": "cli:codex",
+    "source_event": "row",
     "source_line": 1,
     "source_path": "<IMPORT_ROOT>/session.jsonl",
+    "summary": "codex edit",
     "tool_call_id": "codex-tool-1"
   }
 }
@@ -125,14 +133,20 @@ traces:
   "event": "import.codex",
   "latency_ms": null,
   "detail": {
-    "content": "codex multi",
     "files": [
       "Cargo.toml",
       "src/main.rs"
     ],
+    "import_version": 1,
+    "raw_hash": "sha256:f7a29ffc33b31f2c641f6b61602b505a5497a11a9e8f7b1677616fbbb7de07d0",
     "role": "assistant",
+    "schema": "codex-cli",
+    "session_id": "codex:session",
+    "source": "cli:codex",
+    "source_event": "row",
     "source_line": 2,
     "source_path": "<IMPORT_ROOT>/session.jsonl",
+    "summary": "codex multi",
     "tool_call_id": "codex-tool-2"
   }
 }

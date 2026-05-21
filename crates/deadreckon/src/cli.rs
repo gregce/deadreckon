@@ -385,11 +385,18 @@ Status explains the latest run or plan and what to do next. `next` is an alias."
 const IMPORT_HELP: &str = "\
 Lifecycle:
   deadreckon import codex
+  deadreckon import codex --preview
+  deadreckon import codex --list
+  deadreckon import codex --session <id-or-path>
   deadreckon import claude-code
+  deadreckon import cli:copilot
+  deadreckon import cli:pi
   deadreckon import cursor
   deadreckon show <imported-run-id>
 
-Import is read-only and normalizes other tool histories into deadreckon trace/provenance shape.";
+Import is read-only and normalizes concrete provider transcript sessions into
+deadreckon trace/provenance shape. CLI providers use their registry [ingest]
+descriptors; Cursor remains a SQLite adapter.";
 
 const HISTORY_HELP: &str = "\
 Lifecycle:
@@ -1318,8 +1325,38 @@ pub(crate) enum Commands {
         after_help = IMPORT_HELP
     )]
     Import {
-        #[arg(help = "Source: claude-code, codex, or cursor")]
+        #[arg(help = "Source: codex, claude-code, cursor, or a cli:<provider> descriptor")]
         source: String,
+        #[arg(long, help = "Show the selected import session without creating a run")]
+        preview: bool,
+        #[arg(long, help = "List discovered import sessions without creating a run")]
+        list: bool,
+        #[arg(long, help = "Import one explicit session id or source path")]
+        session: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Match sessions for this cwd instead of the launch directory"
+        )]
+        cwd: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Import all discovered source files; required for whole-root imports"
+        )]
+        all: bool,
+        #[arg(
+            long,
+            value_name = "DURATION",
+            help = "Discover sessions modified within a duration such as 10m, 2h, or 1d"
+        )]
+        since: Option<String>,
+        #[arg(
+            long,
+            help = "Replace an existing imported run when source content changed"
+        )]
+        replace: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
 }
 

@@ -1171,17 +1171,27 @@ See `/Users/gdc/deadreckon/docs/RESUME-SEMANTICS.md` for the contract.
 
 ## 16. Cross-Tool Import
 
-`deadreckon import <source>` reads from external coding-agent histories and synthesizes a deadreckon run from them. Today's coverage:
+`deadreckon import <source>` reads from external coding-agent histories and synthesizes a completed deadreckon run from one concrete imported session, or from an explicit `--all` root import. It is read-only with respect to provider-owned transcript roots and writes only deadreckon run-state files.
 
-| Source | Path (overridable via env) | Format |
+Today's sources:
+
+| Source | Discovery | Format |
 |---|---|---|
-| `claude-code` | `~/.claude/projects/` (`DEADRECKON_IMPORT_CLAUDE_ROOT`) | JSONL |
-| `codex` | `~/.codex/sessions/` (`DEADRECKON_IMPORT_CODEX_ROOT`) | JSONL |
-| `cursor` | `~/.cursor/chats/` (`DEADRECKON_IMPORT_CURSOR_ROOT`) | SQLite |
+| `codex` / `cli:codex` | `cli:codex` descriptor `[ingest]`, including `CODEX_SESSIONS_DIR`, `session_meta.payload.cwd`, `*.jsonl`, and `codex-cli` schema | JSONL |
+| `claude-code` / `cli:claude-code` | `cli:claude-code` descriptor `[ingest]`, including `CLAUDE_PROJECTS_DIR` and Claude project-directory cwd mapping | JSONL |
+| `gemini` / `cli:gemini` | `cli:gemini` descriptor `[ingest]`, including `GEMINI_DIR`, JSON/JSONL storage, and `gemini` schema | JSON or JSONL |
+| `opencode` / `cli:opencode` | `cli:opencode` descriptor `[ingest]`, file-mode `storage/session`, `storage/message`, and `storage/part` | JSON |
+| `copilot` / `cli:copilot` | `cli:copilot` descriptor `[ingest]`, including `COPILOT_DIR`, `session-state`, nested `events.jsonl`, and `data.context.cwd` | JSONL |
+| `pi` / `cli:pi` | `cli:pi` descriptor `[ingest]`, including `PI_CODING_AGENT_SESSION_DIR`, top-level `cwd`, and Pi session-header validation | JSONL |
+| `cursor` | `~/.cursor/chats/` (`DEADRECKON_IMPORT_CURSOR_ROOT`) | SQLite via `sqlite3 -json` |
 
-The handler creates an `imported-<hash>` run, parses the source, appends entries to `traces.jsonl` + `provenance.jsonl`, marks the run `Completed` (skipping the gate), and never writes back to the source. Current coverage is **inventory-level**: it produces a listing/summary but doesn't deeply normalize all fields. Round-trip parity (import → `show <id>` → render comparable to source) is a hardening target — see `docs/goals/2026-05-11-1400-deadreckon-robust-rider.md` §7.
+The command surface is `deadreckon import <source> [--preview|--list|--session <id-or-path>|--cwd <path>|--all|--since <duration>|--replace|--json]`. Default import filters candidates to the launch cwd or `--cwd` where the descriptor supports cwd matching. Empty, stale, and ambiguous candidate sets refuse without creating a run and print concrete `try:` lines. `--preview` and `--list` never create run directories. `--all` is the explicit whole-root mode.
 
-`deadreckon import` is the *user-driven* ingest. The *TUI-driven* ingest path that lets `attach` read live provider transcripts (Codex, Claude Code, Gemini, OpenCode, Copilot, Pi) is descriptor-driven and lives in `crates/deadreckon-providers/descriptors/`; see `docs/design/PROVIDER-CLI-INGEST.md` for the schema, candidate discovery, cwd matching, and per-provider parsers.
+The handler creates an `imported-<hash>` run id from the concrete source-session identity, parses selected transcript files, appends normalized source-neutral entries to `traces.jsonl`, writes file provenance to `provenance.jsonl`, marks the run `Completed` (skipping the gate), and writes `import.json` under the run root. The manifest records `source`, `source_alias`, `schema`, `storage`, `cwd`, `mode`, `session_id`, `session_paths`, `content_hash`, source time bounds, row/event/provenance counts, `raw_rows_stored = false`, and the `deadreckon import ... --replace` command needed to reimport. If an existing imported run has a different content hash, import refuses unless `--replace` is explicit.
+
+Trace `detail` rows use a stable import schema: `import_version`, canonical `source`, `schema`, optional `session_id`, `source_path`, optional `source_line`, `source_event`, optional `role`, `summary`, optional tool fields, `files`, optional token `usage`, and `raw_hash`. Raw provider payloads are not copied into every trace row by default; source path/line plus hashes preserve auditability. Parser coverage includes Codex agent messages/function calls/token counts, Claude content/tool blocks, Gemini JSON/JSONL messages/tool calls, OpenCode file-mode sessions/messages/parts, Copilot assistant/reasoning/tool/usage rows, Pi session/message/tool/result rows, and Cursor SQLite rows.
+
+`deadreckon import` is the *user-driven* ingest. The *TUI-driven* ingest path that lets `attach` read live provider transcripts uses the same descriptor `[ingest]` roots, env overrides, storage kinds, file globs, freshness windows, cwd matching, and schema keys for CLI providers; see §18.3 and `docs/design/PROVIDER-CLI-INGEST.md`. OpenCode SQLite, provider transcript mutation/undo, full replay UI, and cross-run import analytics remain V1 candidates in `docs/V1-CANDIDATES.md`.
 
 ---
 
@@ -1208,7 +1218,7 @@ The `Commands` enum in `crates/deadreckon/src/main.rs` defines the CLI surface. 
 | `extend` | `cli.rs:1149` | Re-open a completed run with a follow-up goal that inherits history |
 | `undo` | `cli.rs:1265` | Restore snapshot to a target turn |
 | `show` | `cli.rs:1281` | Pretty-print full state + provenance + traces; `--why-failed` for runs and plans |
-| `import` | `cli.rs:1329` | Read-only import from claude/codex/cursor |
+| `import` | `cli.rs:1329` | Read-only descriptor-backed transcript import from CLI providers plus Cursor SQLite |
 | `chain` | `cli.rs:798` | Create, plan, run, attach, pause/resume/kill, undo, extend, and redo serial autonomous chains |
 | `orchestrate` | `cli.rs:630` | One-command wrappers for `review` and `full-plan` multi-agent runs |
 | `plan` | `cli.rs:679` | Write an orchestration plan (worker specs + `plan.json`) without starting child runs |
@@ -1275,7 +1285,7 @@ The top band is split horizontally into three panels for subscription providers 
 
 ### 18.3 Data source
 
-The run TUI still polls run files on disk every 500 ms: `spend.jsonl`, `traces.jsonl`, `events.jsonl`, `proofs/acceptance-progress.jsonl`, `proofs/turn-acceptance.json`, plus provider-native logs when the active provider writes them. `collect_provider_activity` now resolves provider ingest through descriptor `[ingest]` metadata: candidate roots, env overrides, cwd matching, storage kind, file glob, freshness window, and schema key. `cli:codex` reads `~/.codex/sessions/**.jsonl` and matches `session_meta.payload.cwd`; `cli:claude-code` reads `~/.claude/projects/<cwd-slug>/*.jsonl` using Claude Code's path-to-project mapping and matches top-level `cwd`; `cli:gemini` reads Gemini JSON/JSONL file logs; `cli:opencode` reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON; `cli:copilot` reads `~/.copilot/session-state/*.jsonl` plus nested `events.jsonl` and matches `data.context.cwd`; `cli:pi` reads `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`, validates the first nonblank row is a Pi `session`, and matches the header `cwd`. The shared collector handles candidate discovery, recency filtering, run matching, stream capping, and context telemetry. Schema-specific adapters only decode rows into common activity lines (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`) and normalize tool labels through `deadreckon_providers::taxonomy`.
+The run TUI still polls run files on disk every 500 ms: `spend.jsonl`, `traces.jsonl`, `events.jsonl`, `proofs/acceptance-progress.jsonl`, `proofs/turn-acceptance.json`, plus provider-native logs when the active provider writes them. `collect_provider_activity` now resolves provider ingest through descriptor `[ingest]` metadata: candidate roots, env overrides, cwd matching, storage kind, file glob, freshness window, and schema key. `deadreckon import` reuses the same descriptor metadata for provider transcript discovery and adds import-only session selection, manifest writing, and normalized trace/provenance event creation. `cli:codex` reads `~/.codex/sessions/**.jsonl` and matches `session_meta.payload.cwd`; `cli:claude-code` reads `~/.claude/projects/<cwd-slug>/*.jsonl` using Claude Code's path-to-project mapping and matches top-level `cwd`; `cli:gemini` reads Gemini JSON/JSONL file logs; `cli:opencode` reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON; `cli:copilot` reads `~/.copilot/session-state/*.jsonl` plus nested `events.jsonl` and matches `data.context.cwd`; `cli:pi` reads `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`, validates the first nonblank row is a Pi `session`, and matches the header `cwd`. The shared collector handles candidate discovery, recency filtering, run matching, stream capping, and context telemetry. Schema-specific adapters only decode rows into common activity lines (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`) and normalize tool labels through `deadreckon_providers::taxonomy`.
 
 Same-process run attaches can use the `RunEventBus` broadcast channel directly; cross-process run attaches still poll. Plan attach is different after the live-UX slice: it consumes `PlanEventBus` / `PlanEventFeed`, which owns `plan-events.jsonl` replay/tailing, emits plan snapshots, tolerates malformed or partial plan-event rows, and multiplexes discovered child and repair run `events.jsonl` streams into the plan activity pane. The production feed remains durable-file backed for cross-process attach, with a broadcast-capable API available for same-process plan streams.
 
@@ -1376,7 +1386,7 @@ Three credential paths:
 | `cli_wall_clock_budget_enforced` (line 266) | subscription run pauses at `--max-wall-seconds` cap |
 | `kill_storm_no_leaks` (line 334) | 10 concurrent kills release all PIDs + locks |
 | `doctor_fails_actionably` (line 408) | `doctor` output contains specific fix commands |
-| `import_{claude_code,codex,cursor}_roundtrip` (lines 425+) | import normalizes external histories |
+| `import_*` focused cases (lines 425+) | descriptor-backed import normalizes CLI/Cursor histories, writes manifests, refuses ambiguous/changed imports, and preserves preview/list no-write behavior |
 | `stress_5_concurrent_10min` (line 470, gated `DEADRECKON_STRESS=1`) | 5 concurrent scoped runs complete cleanly |
 
 ### 20.3 Verification gates
@@ -1449,6 +1459,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Shell tab-completion via `completion install` / `completion {bash,zsh,fish,elvish,powershell}` driven from the live clap command tree; `init` opt-out installs completions and (for zsh) appends a managed `.zshrc` block.
 - `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer. Long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
 - Descriptor-driven provider activity ingest for Codex, Claude Code, Gemini JSON/JSONL, OpenCode file-mode logs, GitHub Copilot CLI session-state JSONL, and Pi session JSONL, normalized into `agent` / `thinking` / `tool` / `result` / `todo` / `tokens` rows without rewriting provider-owned logs.
+- Descriptor import hardening: `deadreckon import` accepts legacy aliases and provider descriptor ids, discovers CLI transcripts through descriptor `[ingest]`, selects concrete sessions by cwd or `--session`, writes `import.json`, refuses ambiguous/changed imports with `try:` lines, and normalizes trace/provenance rows for Codex, Claude Code, Gemini, OpenCode file-mode, GitHub Copilot CLI, Pi, and Cursor SQLite.
 - Streaming acceptance progress: `proofs/acceptance-progress.jsonl` reports per-check `started`/`running`/`passed`/`failed` transitions while `dr-gate` is mid-evaluation; the attach TUI tails it alongside the signed marker.
 - Extended runs carry the parent's `acceptance.yaml` into the child run and emit the same `print_run_started` startup details (provider route, doc-provider source) as fresh runs; resume does the same.
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.
@@ -1459,7 +1470,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - YAML acceptance specs: `dr-gate` evaluates required/optional tests, file existence, content matches, shell commands, and build checks, then signs check-level proof results.
 - Exhaustive local doctor: OS, sandbox binaries, provider binaries, config, runstate permissions, disk, and opt-in provider pings all produce actionable `try:` hints.
 - Promoted library query surface: `deadreckon library list|search|show` reads library manifests and reverse materialization markers, filters by goal/date, and searches promoted run docs.
-- Import parity hardening: Claude Code/Codex JSONL and Cursor SQLite imports preserve source metadata, deterministic run IDs, stable row ordering, and provenance paths; committed goldens cover normalized `show` output.
+- Import parity hardening: descriptor-backed CLI imports and Cursor SQLite imports preserve source metadata, deterministic session run IDs, stable row ordering, manifests, content hashes, and provenance paths; committed goldens and fixtures cover normalized `show` output plus provider-specific discovery.
 - CLI usability polish: root help includes command groups, `status` includes run health/library/disk blocks, and `DEADRECKON_HINTS=0` suppresses post-completion prompts.
 - Autonomous sequential chains: `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`, and `chain redo`; chains use `latest`/`last` aliases, `chain.json`, `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps, green-policy auto-apply, and a multi-step ratatui timeline with single-run chain context.
 - Plan observability: orchestration plans now write `plan-events.jsonl`; `attach <plan-id>` renders plan events, drills into child run attach, and returns to the plan context; plain attach, `history grep --plan`, and `show --why-failed <plan-id>` include plan event evidence.
@@ -1478,7 +1489,7 @@ The previously named thin areas now have code paths and depth tests:
 4. **Wall-clock spend for CLI providers.** CLI providers accumulate wall time and caps; richer subscription-to-budget policy remains a future routing concern.
 5. **Sandbox profiles.** `sandbox.toml` drives per-tool policy; policy blocks disallowed filesystem/network access and records refusals.
 6. **Doctor.** Local setup checks are actionable and exhaustive for alpha; provider network pings are opt-in.
-7. **Import normalization.** JSONL/SQLite imports now carry source path/line/row metadata and deterministic imported run IDs, with golden-file `show` round trips.
+7. **Import normalization.** JSONL/JSON/SQLite imports now carry source path/line metadata, raw hashes, content-hash manifests, deterministic imported run IDs, and normalized trace/provenance details, with golden-file `show` round trips and descriptor-provider fixtures.
 8. **Acceptance gate.** `acceptance.yaml` supports structured checks and signed per-check results.
 9. **Multi-run coordination.** Scope-qualified locks, stale reclaim, same-scope refusal tests, and sequential chain coordination are in place; parallel/DAG scheduling remains out of scope.
 10. **Promotion / library workflow.** Promotion is atomic and `library list|search|show` makes artifacts discoverable by scope, goal, date, and promoted-doc content.

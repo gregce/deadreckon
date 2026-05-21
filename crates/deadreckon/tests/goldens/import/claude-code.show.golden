@@ -5,8 +5,8 @@ Mode fresh
 Acceptance default dr-gate behavior
 {
   "version": 1,
-  "goal": "imported claude-code history",
-  "task_key": "imported-claude-code-history-29806911",
+  "goal": "imported claude-code session",
+  "task_key": "imported-claude-code-session-35c1bd79",
   "run_id": "<RUN_ID>",
   "scope": "<SCOPE>",
   "status": "completed",
@@ -19,7 +19,7 @@ Acceptance default dr-gate behavior
   "skill_name": "default-coding",
   "skill_path": "/Users/gdc/deadreckon/skills/default-coding/SKILL.md",
   "sandbox": "none",
-  "provider": "import:claude-code",
+  "provider": "import:cli:claude-code",
   "max_spend_usd": null,
   "total_spend_usd": 0.0,
   "total_wall_seconds": 0.0,
@@ -84,7 +84,7 @@ provenance:
 {
   "timestamp": "<TIMESTAMP>",
   "prompt_id": "turn-1",
-  "model": "import:claude-code",
+  "model": "import:cli:claude-code",
   "tool_call_id": "claude-tool-1",
   "session_id": "<RUN_ID>",
   "files": [
@@ -94,7 +94,7 @@ provenance:
 {
   "timestamp": "<TIMESTAMP>",
   "prompt_id": "turn-2",
-  "model": "import:claude-code",
+  "model": "import:cli:claude-code",
   "tool_call_id": "claude-tool-2",
   "session_id": "<RUN_ID>",
   "files": [
@@ -110,11 +110,19 @@ traces:
   "event": "import.claude-code",
   "latency_ms": null,
   "detail": {
-    "content": "created note",
-    "path": "notes/claude.md",
+    "files": [
+      "notes/claude.md"
+    ],
+    "import_version": 1,
+    "raw_hash": "sha256:75efe33a71dacd44770dcb022afe53d48666823a0fea4d37018c30caf0b7f5ad",
     "role": "assistant",
+    "schema": "claude-code",
+    "session_id": "session",
+    "source": "cli:claude-code",
+    "source_event": "row",
     "source_line": 1,
     "source_path": "<IMPORT_ROOT>/session.jsonl",
+    "summary": "created note",
     "tool_call_id": "claude-tool-1"
   }
 }
@@ -125,14 +133,20 @@ traces:
   "event": "import.claude-code",
   "latency_ms": null,
   "detail": {
-    "content": "updated plan",
     "files": [
-      "src/lib.rs",
-      "README.md"
+      "README.md",
+      "src/lib.rs"
     ],
+    "import_version": 1,
+    "raw_hash": "sha256:914337bc5eec3ecdfc3b8de3d137bb80335818995bcfd048db52f8d8b6a2ada0",
     "role": "assistant",
+    "schema": "claude-code",
+    "session_id": "session",
+    "source": "cli:claude-code",
+    "source_event": "row",
     "source_line": 2,
     "source_path": "<IMPORT_ROOT>/session.jsonl",
+    "summary": "updated plan",
     "tool_call_id": "claude-tool-2"
   }
 }
