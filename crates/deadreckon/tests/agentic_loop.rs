@@ -1176,6 +1176,37 @@ async fn import_ambiguous_sessions_prints_candidate_table_and_try_line() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_stale_sessions_refuse_with_candidate_table_and_try_line() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("codex");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(root.join("stale.jsonl"), "{\"path\":\"stale.md\"}\n").expect("stale");
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .arg("--since")
+        .arg("0s")
+        .env("DEADRECKON_HOME", &home)
+        .env("CODEX_SESSIONS_DIR", &root)
+        .output()
+        .expect("import");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stale candidates"), "{stderr}");
+    assert!(
+        stderr.contains("stale.jsonl") || stderr.contains("codex:stale"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("try: deadreckon import codex --since 1d --preview"),
+        "{stderr}"
+    );
+    let paths = DeadreckonPaths::from_home(&home);
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn import_gemini_requires_session_when_cwd_match_is_none_and_ambiguous() {
     let temp = repo_tempdir();
     let home = temp.path().join("home");

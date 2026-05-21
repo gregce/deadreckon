@@ -17100,6 +17100,19 @@ fn import_command(options: ImportCommandOptions) -> Result<()> {
         return Ok(());
     }
 
+    if candidates.is_empty() {
+        let stale = stale_import_candidates(&resolved, &options, &cwd, since);
+        if !stale.is_empty() {
+            return Err(import_invalid(format!(
+                "no fresh import candidates for {}; stale candidates were found\n{}\ntry: deadreckon import {} --since 1d --preview\ntry: deadreckon import {} --session <id-or-path>",
+                resolved.alias,
+                import_candidate_table(&stale),
+                resolved.alias,
+                resolved.alias
+            )));
+        }
+    }
+
     let (selected, mode) = select_import_candidates(&resolved, &options, &candidates)?;
     if options.preview {
         print_import_selection(&resolved, &selected, mode, options.json)?;
@@ -17390,6 +17403,31 @@ fn discover_import_candidates(
     {
         candidates.push(candidate_from_explicit_path(resolved, Path::new(session)));
     }
+    candidates.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    candidates
+}
+
+fn stale_import_candidates(
+    resolved: &ResolvedImportSource,
+    options: &ImportCommandOptions,
+    cwd: &Path,
+    since: DateTime<Utc>,
+) -> Vec<ImportCandidate> {
+    if options.all || options.session.is_some() {
+        return Vec::new();
+    }
+    let mut candidates = match &resolved.kind {
+        ImportSourceKind::Provider => {
+            discover_provider_import_candidates(resolved, cwd, import_long_ago())
+        }
+        ImportSourceKind::Cursor => discover_cursor_import_candidates(resolved, import_long_ago()),
+    };
+    candidates.retain(|candidate| candidate.updated_at < since);
     candidates.sort_by(|left, right| {
         right
             .updated_at
