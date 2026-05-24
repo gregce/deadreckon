@@ -102,7 +102,7 @@ Source: `crates/deadreckon/src/cli.rs`.
 
 ## Explicit Alpha Deferrals
 
-These are intentionally not alpha-closure blockers. They are captured in `docs/V1-CANDIDATES.md` and should be tackled as follow-up design/implementation work, not as hidden drift in the current CLI.
+These are intentionally not alpha-closure blockers. Rows marked fixed below were closed after the initial matrix; remaining rows are captured in `docs/V1-CANDIDATES.md` and should be tackled as follow-up design/implementation work, not as hidden drift in the current CLI.
 
 ### Style, Streams, And Text Blocks
 
@@ -138,8 +138,8 @@ These are intentionally not alpha-closure blockers. They are captured in `docs/V
 
 | ID | Surface | Current evidence | Deferred change |
 |---|---|---|---|
-| P2 | Provider setup is not one reusable flow. | `init`, `config provider`, run flags, orchestrate flags, doc polish flags. | Shared provider selection/prompt builder. |
-| P5 | Done criteria and acceptance docs can still diverge. | `def-done`, hidden `acceptance`, status/gate labels. | One docs section and help text source for done criteria. |
+| P2 | Provider setup is one reusable runtime flow. | Fixed: `setup.rs` backs `init`, `config provider`, run/extend/resume setup, orchestration roles, provider selection display, and doc polish source labels. | Deeper interactive setup polish can move to the output-layout/prompt-builder V1 slice. |
+| P5 | Done criteria and hidden acceptance compatibility share one setup model. | Fixed: `DoneCriteriaSelection` backs explicit paths, project files, generated criteria, and default `dr-gate`; run/orchestrate previews say `done criteria`. | Golden snapshots can still harden the exact copy once the layout settles. |
 
 ### Machine-Readable And Test Coverage
 
@@ -149,7 +149,7 @@ These are intentionally not alpha-closure blockers. They are captured in `docs/V
 
 ## V1 Target Model
 
-The alpha closure landed the immediate user-facing vocabulary, help, flag, provider-role, JSON, and docs coherence work. A V1 coherence/design pass can still deepen these decisions:
+The alpha closure landed the immediate user-facing vocabulary, help, flag, provider-role, provider/done-criteria setup, JSON, and docs coherence work. A V1 coherence/design pass can still deepen these decisions:
 
 1. One glossary for nouns, verbs, statuses, object kinds, provider roles, and done criteria.
 2. Keep custom top help and help-all on the shared command catalog, with clap coverage tests for row drift.

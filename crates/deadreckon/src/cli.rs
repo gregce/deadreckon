@@ -477,9 +477,9 @@ pub(crate) enum Commands {
         command: Option<CompletionCommand>,
     },
     #[command(
-        next_help_heading = "Acceptance",
+        next_help_heading = "Done Criteria",
         hide = true,
-        about = "Create, refine, explain, and check project acceptance criteria",
+        about = "Create, refine, explain, and check done criteria",
         after_help = ACCEPTANCE_HELP
     )]
     Acceptance {
@@ -590,7 +590,7 @@ pub(crate) enum Commands {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Acceptance spec for this run; defaults to .deadreckon/acceptance.yaml when present"
+            help = "Done criteria file for this run; defaults to .deadreckon/acceptance.yaml when present"
         )]
         acceptance: Option<PathBuf>,
         #[arg(
@@ -647,7 +647,7 @@ pub(crate) enum Commands {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Acceptance spec for child runs; defaults to .deadreckon/acceptance.yaml when present"
+            help = "Done criteria file for child runs; defaults to .deadreckon/acceptance.yaml when present"
         )]
         acceptance: Option<PathBuf>,
         #[arg(long, help = "Confirm the orchestration preflight without prompting")]
@@ -692,7 +692,7 @@ pub(crate) enum Commands {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Acceptance spec for child runs; defaults to .deadreckon/acceptance.yaml when present"
+            help = "Done criteria file for child runs; defaults to .deadreckon/acceptance.yaml when present"
         )]
         acceptance: Option<PathBuf>,
         #[arg(long, help = "Suppress post-action hints")]
@@ -1414,7 +1414,7 @@ pub(crate) struct OrchestrateReviewArgs {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Acceptance spec for child runs; defaults to .deadreckon/acceptance.yaml when present"
+        help = "Done criteria file for child runs; defaults to .deadreckon/acceptance.yaml when present"
     )]
     pub(crate) acceptance: Option<PathBuf>,
     #[arg(
@@ -1467,7 +1467,7 @@ pub(crate) struct OrchestrateFullPlanArgs {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Acceptance spec for child runs; defaults to .deadreckon/acceptance.yaml when present"
+        help = "Done criteria file for child runs; defaults to .deadreckon/acceptance.yaml when present"
     )]
     pub(crate) acceptance: Option<PathBuf>,
     #[arg(
@@ -1622,7 +1622,7 @@ pub(crate) enum AcceptanceCommand {
     },
     #[command(about = "Explain the active acceptance criteria", after_help = ACCEPTANCE_HELP)]
     Explain {
-        #[arg(long, value_name = "PATH", help = "Acceptance spec to explain")]
+        #[arg(long, value_name = "PATH", help = "Done criteria file to explain")]
         spec: Option<PathBuf>,
     },
     #[command(
@@ -1630,7 +1630,7 @@ pub(crate) enum AcceptanceCommand {
         after_help = ACCEPTANCE_HELP
     )]
     Check {
-        #[arg(long, value_name = "PATH", help = "Acceptance spec to check")]
+        #[arg(long, value_name = "PATH", help = "Done criteria file to check")]
         spec: Option<PathBuf>,
         #[arg(
             long,

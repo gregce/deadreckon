@@ -1,5 +1,11 @@
 # Changelog
 
+## Provider and done-criteria setup unification (alpha) - 2026-05-24
+
+- Added a shared runtime setup resolver for provider roles and done-criteria sources so `init`, `config provider`, `run`, `extend`, `resume`, `orchestrate`, and doc polish use the same source labels, unknown-provider refusals, credential/install hints, and preview vocabulary.
+- Switched run/orchestrate previews from `gate` to user-facing `done criteria` rows while preserving `.deadreckon/acceptance.yaml` as the technical file name and signed `dr-gate` as the enforcement mechanism.
+- Updated `--acceptance` help text to describe done-criteria files, kept hidden `acceptance` compatibility wording advanced, and added focused coverage for unknown provider refusal plus run/orchestrate done-criteria preview parity.
+
 ## Descriptor import hardening (alpha) - 2026-05-20
 
 - Reworked `deadreckon import` around descriptor-backed provider transcript discovery, concrete session selection, import manifests, and normalized trace/provenance events while preserving Cursor SQLite import.

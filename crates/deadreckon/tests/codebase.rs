@@ -422,8 +422,8 @@ fn preview_flag_exits_zero_without_state_change() {
     assert_success(&output);
     let stderr = stderr(&output);
     assert!(stderr.contains("deadreckon run preview"));
-    assert!(stderr.contains("goal          preview run"));
-    assert!(stderr.contains("mode          worktree"));
+    assert!(stderr.contains("goal           preview run"));
+    assert!(stderr.contains("mode           worktree"));
     assert!(stderr.contains("on success    deadreckon apply "));
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
@@ -458,6 +458,7 @@ fn preview_block_contains_required_fields_in_order() {
         "sandbox",
         "caps",
         "sleep",
+        "done criteria",
         "on success",
         "on fail",
     ];
@@ -531,8 +532,8 @@ model = "configured-model"
 
     assert_success(&output);
     let stderr = stderr(&output);
-    assert!(stderr.contains("provider      openai"), "{stderr}");
-    assert!(stderr.contains("model         override-model"), "{stderr}");
+    assert!(stderr.contains("provider       openai"), "{stderr}");
+    assert!(stderr.contains("model          override-model"), "{stderr}");
 }
 
 #[test]
@@ -571,6 +572,28 @@ fn config_provider_and_model_are_user_friendly_shortcuts() {
     assert!(stdout.contains("cli:codex"), "{stdout}");
     assert!(stdout.contains("gpt-5.1-codex"), "{stdout}");
     assert!(stdout.contains("deadreckon run \"goal\""), "{stdout}");
+}
+
+#[test]
+fn config_provider_rejects_unknown_route_without_writing_config() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .arg("config")
+        .arg("provider")
+        .arg("cli:missing-provider")
+        .output()
+        .expect("provider");
+
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(
+        err.contains("unknown provider route cli:missing-provider"),
+        "{err}"
+    );
+    assert!(err.contains("deadreckon providers list --all"), "{err}");
+    assert!(!paths.config_path().exists());
 }
 
 #[test]

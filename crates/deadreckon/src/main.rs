@@ -16,6 +16,8 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod setup;
+
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::{Command as ClapCommand, CommandFactory, Parser};
 use clap_complete::{Shell, generate};
@@ -1488,6 +1490,22 @@ async fn init_command(
         }
         None => prompt_provider()?,
     };
+    provider_setup_selection(
+        &paths,
+        setup::ProviderSetupRequest {
+            role: setup::SetupProviderRoleRef::ConfigDefault,
+            explicit_provider: Some(&provider),
+            explicit_model: None,
+            config_default_provider: None,
+            config_doc_provider: None,
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: Some("anthropic"),
+            use_router_default: false,
+            allow_auto_subscription: true,
+            require_usable_route: false,
+        },
+    )?;
     let api_key = api_key.or_else(|| {
         if provider.starts_with("cli:") {
             None
@@ -1503,7 +1521,24 @@ async fn init_command(
         &sandbox,
     );
     fs::write(paths.config_path(), config)?;
+    let provider_setup = provider_setup_selection(
+        &paths,
+        setup::ProviderSetupRequest {
+            role: setup::SetupProviderRoleRef::ConfigDefault,
+            explicit_provider: Some(&provider),
+            explicit_model: None,
+            config_default_provider: None,
+            config_doc_provider: None,
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: Some("anthropic"),
+            use_router_default: false,
+            allow_auto_subscription: true,
+            require_usable_route: false,
+        },
+    )?;
     println!("{} {}", ui_ok("wrote"), paths.config_path().display());
+    print_provider_setup_rows(&[provider_setup]);
     doctor_command(false).await?;
     if !no_completion {
         try_install_completion_after_init();
@@ -1517,18 +1552,90 @@ async fn init_command(
 }
 
 fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String> {
-    registry
-        .iter()
-        .filter(|descriptor| {
-            descriptor.kind == DescriptorKind::Cli
-                && descriptor.subscription
-                && descriptor
-                    .default_binary
-                    .as_deref()
-                    .is_some_and(provider_binary_available)
-        })
-        .map(|descriptor| descriptor.id.clone())
-        .next()
+    setup::auto_subscription_cli_provider(registry)
+}
+
+fn setup_refusal_error(refusal: setup::SetupRefusal) -> CliError {
+    CliError::Core(deadreckon_core::user_error(
+        &refusal.message,
+        &refusal.try_line,
+    ))
+}
+
+fn provider_setup_selection(
+    paths: &DeadreckonPaths,
+    request: setup::ProviderSetupRequest<'_>,
+) -> Result<setup::ProviderSetupSelection> {
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let auto_subscription_provider = if request.allow_auto_subscription {
+        auto_subscription_cli_provider(&registry)
+    } else {
+        None
+    };
+    let request = setup::ProviderSetupRequest {
+        auto_subscription_provider: request
+            .auto_subscription_provider
+            .or(auto_subscription_provider.as_deref()),
+        ..request
+    };
+    setup::select_provider_setup(&paths.config_path(), &registry, request)
+        .map_err(setup_refusal_error)
+}
+
+fn doc_provider_setup_selection(
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+    flag: Option<&str>,
+    run_provider: Option<&str>,
+    require_usable_route: bool,
+) -> Result<setup::ProviderSetupSelection> {
+    provider_setup_selection(
+        paths,
+        setup::ProviderSetupRequest {
+            role: setup::SetupProviderRoleRef::DocPolish,
+            explicit_provider: flag,
+            explicit_model: None,
+            config_default_provider: defaults.provider.as_deref(),
+            config_doc_provider: defaults.doc_provider.as_deref(),
+            run_provider,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: false,
+            allow_auto_subscription: true,
+            require_usable_route,
+        },
+    )
+}
+
+fn doc_provider_selection_from_setup(
+    selection: &setup::ProviderSetupSelection,
+) -> DocProviderSelection {
+    DocProviderSelection {
+        provider: selection.provider.clone(),
+        source: doc_provider_source_from_setup(selection.source),
+    }
+}
+
+fn doc_provider_source_from_setup(source: setup::SetupProviderSource) -> DocProviderSource {
+    match source {
+        setup::SetupProviderSource::Flag => DocProviderSource::Flag,
+        setup::SetupProviderSource::Config => DocProviderSource::Config,
+        setup::SetupProviderSource::AutoSubscription => DocProviderSource::AutoSubscription,
+        setup::SetupProviderSource::RunProvider => DocProviderSource::RunProvider,
+        setup::SetupProviderSource::BuiltInDefault | setup::SetupProviderSource::None => {
+            DocProviderSource::None
+        }
+    }
+}
+
+fn provider_override_from_setup(selection: &setup::ProviderSetupSelection) -> Option<String> {
+    match selection.source {
+        setup::SetupProviderSource::BuiltInDefault | setup::SetupProviderSource::None => None,
+        setup::SetupProviderSource::Flag
+        | setup::SetupProviderSource::Config
+        | setup::SetupProviderSource::AutoSubscription
+        | setup::SetupProviderSource::RunProvider => selection.provider.clone(),
+    }
 }
 
 fn config_command(command: ConfigCommand) -> Result<()> {
@@ -1554,6 +1661,22 @@ fn config_command(command: ConfigCommand) -> Result<()> {
         }
         ConfigCommand::Provider { provider } => match provider {
             Some(provider) => {
+                let selection = provider_setup_selection(
+                    &paths,
+                    setup::ProviderSetupRequest {
+                        role: setup::SetupProviderRoleRef::ConfigDefault,
+                        explicit_provider: Some(&provider),
+                        explicit_model: None,
+                        config_default_provider: None,
+                        config_doc_provider: None,
+                        run_provider: None,
+                        auto_subscription_provider: None,
+                        built_in_default_provider: None,
+                        use_router_default: false,
+                        allow_auto_subscription: false,
+                        require_usable_route: false,
+                    },
+                )?;
                 fs::create_dir_all(paths.home())?;
                 let mut root = load_config_value(&paths)?;
                 set_toml_path(
@@ -1567,7 +1690,8 @@ fn config_command(command: ConfigCommand) -> Result<()> {
                     toml::Value::String(provider.clone()),
                 );
                 fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
-                println!("{} default provider {}", ui_ok("set"), ui_id(provider));
+                println!("{} default provider {}", ui_ok("set"), ui_id(&provider));
+                print_provider_setup_rows(&[selection]);
             }
             None => print_provider_selection(&paths, None)?,
         },
@@ -1601,6 +1725,7 @@ fn config_command(command: ConfigCommand) -> Result<()> {
 fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> Result<()> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), provider)?;
     let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let defaults = config_defaults(paths).ok();
     let routes = router.route_info();
     let selected = router.selected_route_info();
     println!("{}", ui_heading("provider selection"));
@@ -1647,7 +1772,53 @@ fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> 
             ))
         );
     }
+    if let Ok(selection) = provider_setup_selection(
+        paths,
+        setup::ProviderSetupRequest {
+            role: setup::SetupProviderRoleRef::ConfigDefault,
+            explicit_provider: provider,
+            explicit_model: None,
+            config_default_provider: defaults
+                .as_ref()
+                .and_then(|defaults| defaults.provider.as_deref()),
+            config_doc_provider: defaults
+                .as_ref()
+                .and_then(|defaults| defaults.doc_provider.as_deref()),
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: true,
+            allow_auto_subscription: false,
+            require_usable_route: false,
+        },
+    ) {
+        print_provider_setup_rows(&[selection]);
+    }
     Ok(())
+}
+
+fn print_provider_setup_rows(selections: &[setup::ProviderSetupSelection]) {
+    if selections.is_empty() {
+        return;
+    }
+    println!("{}", ui_heading("provider setup"));
+    let rows = selections
+        .iter()
+        .map(|selection| (selection.role.label(), selection.row_value()))
+        .collect::<Vec<_>>();
+    let refs = rows
+        .iter()
+        .map(|(label, value)| (label.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    print_kv_block(&refs);
+    for selection in selections {
+        for warning in &selection.warnings {
+            println!("  {}", ui_warn(warning));
+        }
+        for try_line in &selection.try_lines {
+            println!("  {} {}", ui_command("try:"), ui_command(try_line));
+        }
+    }
 }
 
 fn active_provider_from_config(root: &toml::Value) -> Option<String> {
@@ -5278,17 +5449,48 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     {
         std::process::exit(exit_code);
     }
-    let effective_provider = if smoke {
-        Some("smoke".to_string())
+    let primary_setup = if smoke {
+        provider_setup_selection(
+            &paths,
+            setup::ProviderSetupRequest {
+                role: setup::SetupProviderRoleRef::PrimaryRun,
+                explicit_provider: Some("smoke"),
+                explicit_model: model.as_deref(),
+                config_default_provider: defaults.provider.as_deref(),
+                config_doc_provider: defaults.doc_provider.as_deref(),
+                run_provider: None,
+                auto_subscription_provider: None,
+                built_in_default_provider: None,
+                use_router_default: false,
+                allow_auto_subscription: false,
+                require_usable_route: false,
+            },
+        )?
     } else {
-        provider.clone().or(defaults.provider.clone())
+        provider_setup_selection(
+            &paths,
+            setup::ProviderSetupRequest {
+                role: setup::SetupProviderRoleRef::PrimaryRun,
+                explicit_provider: provider.as_deref(),
+                explicit_model: model.as_deref(),
+                config_default_provider: defaults.provider.as_deref(),
+                config_doc_provider: defaults.doc_provider.as_deref(),
+                run_provider: None,
+                auto_subscription_provider: None,
+                built_in_default_provider: None,
+                use_router_default: true,
+                allow_auto_subscription: false,
+                require_usable_route: false,
+            },
+        )?
     };
+    let provider_override = provider_override_from_setup(&primary_setup);
     let router = if smoke {
         ProviderRouter::smoke()
     } else {
         ProviderRouter::from_config_path_with_model(
             &paths.config_path(),
-            effective_provider.as_deref(),
+            provider_override.as_deref(),
             model.as_deref(),
         )?
     };
@@ -5296,7 +5498,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     let effective_provider = selected_route
         .as_ref()
         .map(|route| route.name.clone())
-        .or(effective_provider);
+        .or(primary_setup.provider.clone());
     let effective_max_spend = max_spend.or(defaults.max_spend).or(Some(10.0));
     let effective_max_wall_seconds = max_wall_seconds
         .or(defaults.cli_max_wall_seconds)
@@ -5304,11 +5506,14 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     let effective_doc_skill = doc_skill
         .or(defaults.doc_skill.clone())
         .unwrap_or_else(|| "run-narrator".to_string());
-    let mut doc_provider_selection = resolve_doc_provider(
-        doc_provider.as_deref(),
+    let doc_provider_setup = doc_provider_setup_selection(
+        &paths,
         &defaults,
+        doc_provider.as_deref(),
         effective_provider.as_deref(),
-    );
+        false,
+    )?;
+    let mut doc_provider_selection = doc_provider_selection_from_setup(&doc_provider_setup);
     let effective_no_docs = no_docs || (smoke && doc_provider.is_none());
     if effective_no_docs {
         doc_provider_selection = DocProviderSelection {
@@ -5334,7 +5539,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         "run",
     )
     .await?;
-    let acceptance_preview = acceptance_preview(&acceptance_source)?;
+    let acceptance_preview = done_criteria_selection(&acceptance_source)?;
     let sleep_preview = sleep::preview(prevent_sleep_prefs, io::stdin().is_terminal());
     let sandbox = sandbox
         .or(defaults.sandbox.clone())
@@ -5392,6 +5597,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         cwd: &cwd,
         codebase: &codebase,
         provider: effective_provider.as_deref(),
+        provider_source: primary_setup.source.as_str(),
         route: selected_route.as_ref(),
         sandbox: &backend.to_string(),
         doc_provider: doc_provider_selection.provider.as_deref(),
@@ -5509,6 +5715,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
         print_run_started(
             &state,
             selected_route.as_ref(),
+            primary_setup.source.as_str(),
             doc_provider_selection.provider.as_deref(),
             doc_provider_selection.source.as_str(),
         );
@@ -5600,7 +5807,7 @@ const PROJECT_ACCEPTANCE_HELPERS: &str = "acceptance";
 #[derive(Clone, Debug)]
 struct AcceptanceSource {
     path: PathBuf,
-    label: String,
+    source: setup::DoneCriteriaSource,
     companion_doc: Option<PathBuf>,
 }
 
@@ -5609,33 +5816,6 @@ struct AcceptanceDraft {
     yaml: String,
     markdown: String,
     files: BTreeMap<PathBuf, String>,
-}
-
-#[derive(Clone, Debug)]
-struct AcceptancePreview {
-    source: String,
-    path: Option<PathBuf>,
-    checks: Option<usize>,
-}
-
-impl AcceptancePreview {
-    fn full_label(&self) -> String {
-        let mut label = self.source.clone();
-        if let Some(checks) = self.checks {
-            label.push_str(&format!(" ({checks} checks)"));
-        }
-        if let Some(path) = self.path.as_ref() {
-            label.push_str(&format!(" from {}", path.display()));
-        }
-        label
-    }
-
-    fn brief_label(&self) -> String {
-        match self.checks {
-            Some(checks) => format!("{}:{checks}", self.source),
-            None => self.source.clone(),
-        }
-    }
 }
 
 async fn acceptance_command(command: AcceptanceCommand) -> Result<()> {
@@ -5782,7 +5962,7 @@ async fn acceptance_agent_command_in_dir(
     let existing_md = read_optional_text(&md_path)?;
     if matches!(mode, AcceptanceAgentMode::Refine) && existing_yaml.is_none() {
         return Err(CliError::Core(deadreckon_core::user_error(
-            "no project acceptance spec found",
+            "no project done criteria found",
             "deadreckon def-done \"what should count as done\"",
         )));
     }
@@ -5827,7 +6007,7 @@ async fn acceptance_agent_command_in_dir(
     .await
     .map_err(|err| {
         CliError::Core(deadreckon_core::user_error(
-            &format!("acceptance provider failed: {err}"),
+            &format!("done criteria provider failed: {err}"),
             "deadreckon def-done \"builds and passes tests\"",
         ))
     })?;
@@ -5877,7 +6057,7 @@ fn acceptance_add_pack_command(cwd: &Path, pack: AcceptancePack, force: bool) ->
     } else {
         AcceptanceDraft {
             yaml: "name: project acceptance\nchecks: []\n".to_string(),
-            markdown: "# Acceptance Criteria\n\n".to_string(),
+            markdown: "# Done Criteria\n\n".to_string(),
             files: BTreeMap::new(),
         }
     };
@@ -6080,7 +6260,7 @@ fn acceptance_request_text(request: &[String], mode: AcceptanceAgentMode) -> Res
     if io::stdin().is_terminal() {
         let prompt_text = match mode {
             AcceptanceAgentMode::Draft => "what should count as done? ",
-            AcceptanceAgentMode::Refine => "how should acceptance change? ",
+            AcceptanceAgentMode::Refine => "how should done criteria change? ",
         };
         let answer = prompt::open(prompt_text, None)?;
         if !answer.trim().is_empty() {
@@ -6374,7 +6554,7 @@ async fn ensure_acceptance_before_start(
     )
     .await
     {
-        Ok(()) => resolve_acceptance_source(cwd, None),
+        Ok(()) => resolve_acceptance_source(cwd, None).map(mark_generated_done_criteria),
         Err(err) => {
             println!("{}", ui_status("done criteria draft failed"));
             println!("  {err}");
@@ -6389,7 +6569,7 @@ async fn ensure_acceptance_before_start(
                 "detected template",
                 acceptance_check_count(&draft.yaml)?,
             );
-            resolve_acceptance_source(cwd, None)
+            resolve_acceptance_source(cwd, None).map(mark_generated_done_criteria)
         }
     }
 }
@@ -6402,13 +6582,13 @@ fn resolve_acceptance_source(
         let path = absolute_from(cwd, path);
         if !path.is_file() {
             return Err(CliError::Core(deadreckon_core::user_error(
-                &format!("acceptance spec not found: {}", path.display()),
+                &format!("done criteria file not found: {}", path.display()),
                 "deadreckon def-done \"what should count as done\"",
             )));
         }
         return Ok(Some(AcceptanceSource {
             path,
-            label: "explicit".to_string(),
+            source: setup::DoneCriteriaSource::ExplicitPath,
             companion_doc: None,
         }));
     }
@@ -6417,28 +6597,49 @@ fn resolve_acceptance_source(
         let project_md = project_acceptance_md(cwd);
         return Ok(Some(AcceptanceSource {
             path: project_yaml,
-            label: "project".to_string(),
+            source: setup::DoneCriteriaSource::ProjectFile,
             companion_doc: project_md.is_file().then_some(project_md),
         }));
     }
     Ok(None)
 }
 
-fn acceptance_preview(source: &Option<AcceptanceSource>) -> Result<AcceptancePreview> {
+fn mark_generated_done_criteria(source: Option<AcceptanceSource>) -> Option<AcceptanceSource> {
+    source.map(|mut source| {
+        source.source = setup::DoneCriteriaSource::Generated;
+        source
+    })
+}
+
+fn done_criteria_selection(
+    source: &Option<AcceptanceSource>,
+) -> Result<setup::DoneCriteriaSelection> {
     match source {
         Some(source) => {
             let raw = fs::read_to_string(&source.path)?;
-            Ok(AcceptancePreview {
-                source: source.label.clone(),
-                path: Some(source.path.clone()),
-                checks: Some(acceptance_check_count(&raw)?),
+            let checks = Some(acceptance_check_count(&raw)?);
+            Ok(match source.source {
+                setup::DoneCriteriaSource::ExplicitPath => setup::DoneCriteriaSelection::explicit(
+                    source.path.clone(),
+                    source.companion_doc.clone(),
+                    checks,
+                ),
+                setup::DoneCriteriaSource::ProjectFile => setup::DoneCriteriaSelection::project(
+                    source.path.clone(),
+                    source.companion_doc.clone(),
+                    checks,
+                ),
+                setup::DoneCriteriaSource::Generated => setup::DoneCriteriaSelection::generated(
+                    source.path.clone(),
+                    source.companion_doc.clone(),
+                    checks,
+                ),
+                setup::DoneCriteriaSource::DefaultGate => {
+                    setup::DoneCriteriaSelection::default_gate()
+                }
             })
         }
-        None => Ok(AcceptancePreview {
-            source: "default".to_string(),
-            path: None,
-            checks: None,
-        }),
+        None => Ok(setup::DoneCriteriaSelection::default_gate()),
     }
 }
 
@@ -6506,7 +6707,7 @@ fn resolve_acceptance_path_for_command(cwd: &Path, spec: Option<&Path>) -> Resul
         let path = absolute_from(cwd, spec);
         if !path.is_file() {
             return Err(CliError::Core(deadreckon_core::user_error(
-                &format!("acceptance spec not found: {}", path.display()),
+                &format!("done criteria file not found: {}", path.display()),
                 "deadreckon def-done \"what should count as done\"",
             )));
         }
@@ -6683,7 +6884,7 @@ checks:
     .to_string();
     let markdown = format!(
         "\
-# Acceptance Criteria
+# Done Criteria
 
 These checks define what `deadreckon` should verify before promoting a completed run.
 
@@ -6782,7 +6983,7 @@ fn acceptance_pack_draft(pack: AcceptancePack, cwd: &Path) -> AcceptanceDraft {
     }
     AcceptanceDraft {
         markdown: format!(
-            "# Acceptance Criteria\n\nAdded the `{}` pack.\n\n{}",
+            "# Done Criteria\n\nAdded the `{}` pack.\n\n{}",
             pack.name(),
             acceptance_markdown_from_yaml(&yaml)
         ),
@@ -7135,47 +7336,6 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
                     .map(|value| value as f64)
             }),
     })
-}
-
-fn resolve_doc_provider(
-    flag: Option<&str>,
-    defaults: &ConfigDefaults,
-    run_provider: Option<&str>,
-) -> DocProviderSelection {
-    if let Some(provider) = flag.filter(|provider| !provider.trim().is_empty()) {
-        return DocProviderSelection {
-            provider: Some(provider.to_string()),
-            source: DocProviderSource::Flag,
-        };
-    }
-    if let Some(provider) = defaults.doc_provider.as_deref() {
-        return DocProviderSelection {
-            provider: Some(provider.to_string()),
-            source: DocProviderSource::Config,
-        };
-    }
-    if command_exists("codex") {
-        return DocProviderSelection {
-            provider: Some("cli:codex".to_string()),
-            source: DocProviderSource::AutoSubscription,
-        };
-    }
-    if command_exists("claude") {
-        return DocProviderSelection {
-            provider: Some("cli:claude-code".to_string()),
-            source: DocProviderSource::AutoSubscription,
-        };
-    }
-    if let Some(provider) = run_provider {
-        return DocProviderSelection {
-            provider: Some(provider.to_string()),
-            source: DocProviderSource::RunProvider,
-        };
-    }
-    DocProviderSelection {
-        provider: None,
-        source: DocProviderSource::None,
-    }
 }
 
 fn effective_doc_subskills(defaults: &ConfigDefaults) -> Vec<String> {
@@ -7740,13 +7900,14 @@ struct RunPreview<'a> {
     cwd: &'a Path,
     codebase: &'a CodebaseRecord,
     provider: Option<&'a str>,
+    provider_source: &'a str,
     route: Option<&'a ProviderRouteInfo>,
     sandbox: &'a str,
     doc_provider: Option<&'a str>,
     doc_provider_source: &'a str,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
-    acceptance: &'a AcceptancePreview,
+    acceptance: &'a setup::DoneCriteriaSelection,
     sleep: &'a sleep::SleepPreview,
     brief: bool,
     plain: bool,
@@ -7759,6 +7920,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         cwd,
         codebase,
         provider,
+        provider_source,
         route,
         sandbox,
         doc_provider,
@@ -7786,7 +7948,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
     );
     if brief {
         return format!(
-            "mode={} branch={} base={} wt={} provider={} model={} docs={} cap={}/{} acceptance={}",
+            "mode={} branch={} base={} wt={} provider={} model={} docs={} cap={}/{} done_criteria={}",
             mode,
             codebase.branch_name.as_deref().unwrap_or("-"),
             codebase.base_ref.as_deref().unwrap_or("-"),
@@ -7855,7 +8017,10 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         ));
     }
     rows.extend([
-        ("provider".to_string(), agent.to_string()),
+        (
+            "provider".to_string(),
+            format!("{agent} ({provider_source})"),
+        ),
         ("model".to_string(), model.to_string()),
         (
             "docs".to_string(),
@@ -7867,7 +8032,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         ("sandbox".to_string(), sandbox.to_string()),
         ("caps".to_string(), caps),
         ("sleep".to_string(), sleep.label()),
-        ("gate".to_string(), acceptance.full_label()),
+        ("done criteria".to_string(), acceptance.full_label()),
     ]);
     if max_spend.is_some_and(|cap| cap > 50.0) {
         rows.push((
@@ -8087,7 +8252,11 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
-    let default_provider = resolve_provider_name(&paths, defaults.provider)?;
+    let default_provider = resolve_provider_name(
+        &paths,
+        setup::SetupProviderRoleRef::DefaultChild,
+        defaults.provider,
+    )?;
     let recommended_mode = recommend_orchestration_mode(&goal);
     println!("{}", ui_heading("Orchestration mode"));
     println!(
@@ -8531,10 +8700,15 @@ fn resolve_plan_providers(
     coder_provider: Option<String>,
     reviewer_provider: Option<String>,
 ) -> Result<PlanProviders> {
-    let default_child = resolve_provider_name(paths, provider.or(defaults.provider.clone()))?;
+    let default_child = resolve_provider_name(
+        paths,
+        setup::SetupProviderRoleRef::DefaultChild,
+        provider.or(defaults.provider.clone()),
+    )?;
     let planner = match mode {
         PlanMode::FullPlan => resolve_provider_name(
             paths,
+            setup::SetupProviderRoleRef::Planner,
             planner_provider
                 .or(default_child.clone())
                 .or(defaults.provider.clone()),
@@ -8544,6 +8718,7 @@ fn resolve_plan_providers(
     let coder = match mode {
         PlanMode::Review => resolve_provider_name(
             paths,
+            setup::SetupProviderRoleRef::Coder,
             coder_provider
                 .or(default_child.clone())
                 .or(defaults.provider.clone()),
@@ -8553,6 +8728,7 @@ fn resolve_plan_providers(
     let reviewer = match mode {
         PlanMode::Review => resolve_provider_name(
             paths,
+            setup::SetupProviderRoleRef::Reviewer,
             reviewer_provider
                 .or(default_child.clone())
                 .or(defaults.provider.clone()),
@@ -8570,6 +8746,7 @@ fn resolve_plan_providers(
 
 fn resolve_provider_name(
     paths: &DeadreckonPaths,
+    role: setup::SetupProviderRoleRef,
     provider: Option<String>,
 ) -> Result<Option<String>> {
     if provider
@@ -8578,22 +8755,23 @@ fn resolve_provider_name(
     {
         return Ok(provider);
     }
-    let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())
-        .map_err(|err| match err {
-            deadreckon_providers::ProviderError::InvalidConfig(message)
-                if message.contains("unknown provider route") =>
-            {
-                CliError::Core(deadreckon_core::user_error(
-                    &message,
-                    "deadreckon providers list --all",
-                ))
-            }
-            other => CliError::Provider(other),
-        })?;
-    Ok(router
-        .selected_route_info()
-        .map(|route| route.name)
-        .or(provider))
+    let selection = provider_setup_selection(
+        paths,
+        setup::ProviderSetupRequest {
+            role,
+            explicit_provider: provider.as_deref(),
+            explicit_model: None,
+            config_default_provider: None,
+            config_doc_provider: None,
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: true,
+            allow_auto_subscription: false,
+            require_usable_route: false,
+        },
+    )?;
+    Ok(selection.provider.or(provider))
 }
 
 fn parse_child_provider_overrides(values: &[String], n: u8) -> Result<BTreeMap<u32, String>> {
@@ -8927,15 +9105,12 @@ fn plan_source_label(plan: &Plan) -> String {
 
 fn plan_acceptance_label(plan: &Plan) -> String {
     let Some(path) = plan.acceptance_path.as_ref() else {
-        return "default".to_string();
+        return setup::DoneCriteriaSelection::default_gate().full_label();
     };
-    match fs::read_to_string(path)
+    let checks = fs::read_to_string(path)
         .ok()
-        .and_then(|raw| acceptance_check_count(&raw).ok())
-    {
-        Some(checks) => format!("configured ({checks} checks) from {}", path.display()),
-        None => format!("configured from {}", path.display()),
-    }
+        .and_then(|raw| acceptance_check_count(&raw).ok());
+    setup::DoneCriteriaSelection::project(path.clone(), None, checks).full_label()
 }
 
 fn plan_next_actions(plan: &Plan) -> Vec<String> {
@@ -9282,7 +9457,7 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
         ("children", children.as_str()),
         ("providers", providers.as_str()),
         ("source", source.as_str()),
-        ("gate", gate.as_str()),
+        ("done criteria", gate.as_str()),
         ("capabilities", capabilities.as_str()),
     ];
     print_kv_block(&items);
@@ -9358,7 +9533,7 @@ fn print_orchestrate_preflight(
         ("children", children.as_str()),
         ("providers", providers.as_str()),
         ("source", source.as_str()),
-        ("gate", gate.as_str()),
+        ("done criteria", gate.as_str()),
         ("merge repair", repair.as_str()),
         ("sandbox", sandbox.as_str()),
         ("spend", spend.as_str()),
@@ -9442,7 +9617,7 @@ fn print_orchestrate_started(
         ("children", children.as_str()),
         ("providers", providers.as_str()),
         ("source", source.as_str()),
-        ("gate", gate.as_str()),
+        ("done criteria", gate.as_str()),
         ("merge repair", repair.as_str()),
         ("sandbox", sandbox.as_str()),
         ("spend", spend.as_str()),
@@ -12663,16 +12838,13 @@ fn free_kb(path: &std::path::Path) -> Option<u64> {
 }
 
 fn prompt_provider() -> Result<String> {
-    let detected = if command_exists("claude") {
-        "cli:claude-code"
-    } else if command_exists("codex") {
-        "cli:codex"
-    } else {
-        "anthropic"
-    };
+    let paths = DeadreckonPaths::discover();
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let detected =
+        auto_subscription_cli_provider(&registry).unwrap_or_else(|| "anthropic".to_string());
     let answer = prompt::open(&format!("provider [{detected}]: "), None)?;
     Ok(if answer.trim().is_empty() {
-        detected.to_string()
+        detected
     } else {
         answer.trim().to_string()
     })
@@ -13132,10 +13304,6 @@ fn command_exists(name: &str) -> bool {
             let path = dir.join(name);
             path.is_file()
         })
-}
-
-fn provider_binary_available(binary: &str) -> bool {
-    command_exists(binary) || PathBuf::from(binary).exists()
 }
 
 // SAFETY: Materialize arguments are owned clap values at the command boundary.
@@ -14029,17 +14197,33 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     }
 
     let defaults = config_defaults(&paths)?;
-    let effective_provider = provider.or(defaults.provider.clone());
+    let primary_setup = provider_setup_selection(
+        &paths,
+        setup::ProviderSetupRequest {
+            role: setup::SetupProviderRoleRef::PrimaryRun,
+            explicit_provider: provider.as_deref(),
+            explicit_model: model.as_deref(),
+            config_default_provider: defaults.provider.as_deref(),
+            config_doc_provider: defaults.doc_provider.as_deref(),
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: true,
+            allow_auto_subscription: false,
+            require_usable_route: false,
+        },
+    )?;
+    let provider_override = provider_override_from_setup(&primary_setup);
     let router = ProviderRouter::from_config_path_with_model(
         &paths.config_path(),
-        effective_provider.as_deref(),
+        provider_override.as_deref(),
         model.as_deref(),
     )?;
     let selected_route = router.selected_route_info();
     let effective_provider = selected_route
         .as_ref()
         .map(|route| route.name.clone())
-        .or(effective_provider);
+        .or(primary_setup.provider.clone());
     let effective_max_spend = max_spend.or(defaults.max_spend).or(Some(10.0));
     let effective_max_wall_seconds = max_wall_seconds
         .or(defaults.cli_max_wall_seconds)
@@ -14047,8 +14231,13 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     let effective_doc_skill = doc_skill
         .or(defaults.doc_skill.clone())
         .unwrap_or_else(|| "run-narrator".to_string());
-    let doc_provider_selection =
-        resolve_doc_provider(None, &defaults, effective_provider.as_deref());
+    let doc_provider_selection = doc_provider_selection_from_setup(&doc_provider_setup_selection(
+        &paths,
+        &defaults,
+        None,
+        effective_provider.as_deref(),
+        false,
+    )?);
     let doc_subskills = effective_doc_subskills(&defaults);
     let doc_token_budget = defaults
         .doc_polish_token_budget
@@ -14086,6 +14275,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             backend,
             router,
             selected_route: selected_route.clone(),
+            provider_source: primary_setup.source.as_str().to_string(),
             post_actions,
             context_turns,
         })
@@ -14167,6 +14357,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     print_run_started(
         &state,
         selected_route.as_ref(),
+        primary_setup.source.as_str(),
         doc_provider_selection.provider.as_deref(),
         doc_provider_selection.source.as_str(),
     );
@@ -14237,6 +14428,7 @@ struct ExtendWorktreeArgs {
     backend: SandboxBackend,
     router: ProviderRouter,
     selected_route: Option<ProviderRouteInfo>,
+    provider_source: String,
     post_actions: bool,
     context_turns: Option<u32>,
 }
@@ -14260,6 +14452,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         backend,
         router,
         selected_route,
+        provider_source,
         post_actions,
         context_turns,
     } = args;
@@ -14349,6 +14542,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     print_run_started(
         &state,
         selected_route.as_ref(),
+        &provider_source,
         doc_provider.as_deref(),
         doc_provider_source.as_deref().unwrap_or("none"),
     );
@@ -15914,11 +16108,14 @@ async fn doc_command(args: DocCommandArgs) -> Result<()> {
             )));
         }
         let defaults = config_defaults(&paths)?;
-        let selection = resolve_doc_provider(
-            doc_provider.as_deref(),
+        let setup_selection = doc_provider_setup_selection(
+            &paths,
             &defaults,
+            doc_provider.as_deref(),
             state.provider.as_deref(),
-        );
+            false,
+        )?;
+        let selection = doc_provider_selection_from_setup(&setup_selection);
         let Some(provider) = selection.provider.clone() else {
             return Err(CliError::Core(deadreckon_core::user_error(
                 "deadreckon: no doc provider available",
@@ -16486,7 +16683,13 @@ async fn resume_command(
     let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
     let selected_route = router.selected_route_info();
     let defaults = config_defaults(&paths)?;
-    let doc_provider_selection = resolve_doc_provider(None, &defaults, provider.as_deref());
+    let doc_provider_selection = doc_provider_selection_from_setup(&doc_provider_setup_selection(
+        &paths,
+        &defaults,
+        None,
+        provider.as_deref(),
+        false,
+    )?);
     let max_spend_usd = state.max_spend_usd;
     let max_wall_seconds = state.max_wall_seconds;
     let wait_label = format!(
@@ -16497,6 +16700,7 @@ async fn resume_command(
         "resumed run",
         &state,
         selected_route.as_ref(),
+        "run_provider",
         doc_provider_selection.provider.as_deref(),
         doc_provider_selection.source.as_str(),
     );
@@ -19720,6 +19924,7 @@ fn chain_context_line_for_working(working_dir: &Path) -> Result<Option<String>> 
 fn print_run_started(
     state: &deadreckon_core::PipelineState,
     route: Option<&ProviderRouteInfo>,
+    provider_source: &str,
     doc_provider: Option<&str>,
     doc_provider_source: &str,
 ) {
@@ -19727,6 +19932,7 @@ fn print_run_started(
         "started run",
         state,
         route,
+        provider_source,
         doc_provider,
         doc_provider_source,
     );
@@ -19736,6 +19942,7 @@ fn print_run_started_with_label(
     label: &str,
     state: &deadreckon_core::PipelineState,
     route: Option<&ProviderRouteInfo>,
+    provider_source: &str,
     doc_provider: Option<&str>,
     doc_provider_source: &str,
 ) {
@@ -19746,10 +19953,16 @@ fn print_run_started_with_label(
     );
     let mut rows = Vec::new();
     if let Some(route) = route {
-        rows.push(("provider".to_string(), route.name.clone()));
+        rows.push((
+            "provider".to_string(),
+            format!("{} ({provider_source})", route.name),
+        ));
         rows.push(("model".to_string(), route.model.clone()));
     } else if let Some(provider) = state.provider.as_deref() {
-        rows.push(("provider".to_string(), provider.to_string()));
+        rows.push((
+            "provider".to_string(),
+            format!("{provider} ({provider_source})"),
+        ));
     }
     rows.push((
         "docs".to_string(),

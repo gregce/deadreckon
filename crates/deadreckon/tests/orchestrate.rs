@@ -185,7 +185,7 @@ fn plan_preview_prints_capabilities_and_provider_table() {
     let out = stdout(&output);
     assert!(out.contains("planner=smoke"), "{out}");
     assert!(out.contains("default-child=smoke"), "{out}");
-    assert!(out.contains("capabilities:"), "{out}");
+    assert!(out.contains("capabilities :"), "{out}");
     assert!(out.contains("deploy=true"), "{out}");
 }
 
@@ -213,7 +213,7 @@ fn orchestrate_review_preview_shows_coder_reviewer_providers_without_forking() {
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("orchestrate preflight"), "{out}");
-    assert!(out.contains("mode        : review"), "{out}");
+    assert!(out.contains("mode         : review"), "{out}");
     assert!(out.contains("coder smoke:coder"), "{out}");
     assert!(out.contains("reviewer smoke:reviewer"), "{out}");
     let plan = newest_plan(&paths);
@@ -250,7 +250,7 @@ fn orchestrate_full_plan_preview_shows_planner_child_providers_without_forking()
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("orchestrate preflight"), "{out}");
-    assert!(out.contains("mode        : full-plan"), "{out}");
+    assert!(out.contains("mode         : full-plan"), "{out}");
     assert!(out.contains("planner smoke:planner"), "{out}");
     assert!(out.contains("default child smoke:child"), "{out}");
     assert!(out.contains("provider=smoke:reviewer"), "{out}");
@@ -258,6 +258,58 @@ fn orchestrate_full_plan_preview_shows_planner_child_providers_without_forking()
     assert_eq!(plan.mode, PlanMode::FullPlan);
     assert_eq!(plan.status, PlanStatus::Pending);
     assert!(plan.tasks.iter().all(|task| task.child_run_id.is_none()));
+}
+
+#[test]
+fn run_and_orchestrate_preview_share_done_criteria_source_label() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    fs::create_dir_all(repo.join(".deadreckon")).expect("deadreckon dir");
+    fs::write(
+        repo.join(".deadreckon/acceptance.yaml"),
+        "name: preview criteria\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("acceptance");
+    git(&repo, &["add", "-A"]).expect("add acceptance");
+    git(&repo, &["commit", "-m", "add done criteria"]).expect("commit acceptance");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let run = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["run", "preview done criteria", "--smoke", "--preview"])
+        .output()
+        .expect("run preview");
+    assert_success(&run);
+    let run_preview = stderr(&run);
+
+    let orchestrate = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "orchestrate",
+            "review",
+            "preview done criteria",
+            "--coder-provider",
+            "smoke:coder",
+            "--reviewer-provider",
+            "smoke:reviewer",
+            "--preview",
+        ])
+        .output()
+        .expect("orchestrate preview");
+    assert_success(&orchestrate);
+    let orchestrate_preview = stdout(&orchestrate);
+
+    let shared_label = "project (1 checks) from";
+    assert!(run_preview.contains("done criteria"), "{run_preview}");
+    assert!(run_preview.contains(shared_label), "{run_preview}");
+    assert!(
+        orchestrate_preview.contains("done criteria"),
+        "{orchestrate_preview}"
+    );
+    assert!(
+        orchestrate_preview.contains(shared_label),
+        "{orchestrate_preview}"
+    );
 }
 
 #[test]

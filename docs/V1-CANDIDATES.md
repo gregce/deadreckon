@@ -12,8 +12,8 @@
 - Mass rename of stored status variants, especially `RunStatus::Executing` to `RunStatus::Running`. The coherence pass changed display text only.
 - Themable palettes via config. Alpha keeps one hard-coded palette in `ui.rs`.
 - Full output-layout facade: universal key/value rows, `try_line`/`next_action` helpers, table header helpers, stream-policy enforcement, and a generic lifecycle summary renderer for run/plan/chain/finish/apply/export/extend/resume/kill/cleanup.
-- Orchestration UI polish beyond the live slice: richer interactive mode/provider/done-criteria setup, a fuller output-layout facade, and deeper golden snapshots once the CLI layout settles. The live slice already added shared plan/fork/merge/orchestrate summaries, role tables, dependency/parallelism summaries, standard plan attach footers, and structured merge-repair panels.
-- Provider and done-criteria setup unification: one reusable provider selection/prompt flow across `init`, `config provider`, run/orchestrate flags, doc polish, and one docs/help source for `def-done` plus the hidden `acceptance` compatibility surface.
+- Orchestration UI polish beyond the live slice: richer interactive mode/child-count setup, a fuller output-layout facade, and deeper golden snapshots once the CLI layout settles. The live slice already added shared plan/fork/merge/orchestrate summaries, role tables, dependency/parallelism summaries, standard plan attach footers, structured merge-repair panels, and the alpha provider/done-criteria setup resolver.
+- Provider/done-criteria setup hardening beyond the alpha resolver: golden snapshots for the exact setup rows, richer guided setup prompts, and any future durable config keys if V1 proves they are worth the schema cost.
 - Command-matrix golden snapshots for help, summaries, prompts, table output, and JSON/plain/no-hints behavior once the CLI layout settles enough that snapshots catch regressions without making normal copy edits brittle.
 - Localization hooks for status words, nouns, prompts, and command hints.
 - Migration from hand-built status cards to a small template engine once the alpha CLI layout settles.

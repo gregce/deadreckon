@@ -1225,7 +1225,7 @@ The `Commands` enum in `crates/deadreckon/src/main.rs` defines the CLI surface. 
 | `fork` | `cli.rs:720` | Spawn ready child runs for a plan and supervise them through completion |
 | `merge` | `cli.rs:756` | Compose completed child library artifacts into a new promoted run (with semantic merge repair) |
 | `def-done` | `cli.rs:502` | Write, add, show, or check the project's English done criteria |
-| `acceptance` | `cli.rs:492` | Create, refine, explain, or check project acceptance criteria |
+| `acceptance` | `cli.rs:492` | Hidden compatibility surface for creating, explaining, or checking done criteria |
 | `doc` | `cli.rs:1182` | Print run narrative, as-built, implementation decision ledger, or delta; with optional polish pass |
 | `history` | `cli.rs:1298` | Search durable run traces and provenance (regex/scope/plan filters) |
 | `library` | `cli.rs:983` | Query promoted run artifacts by goal/date/scope |
@@ -1343,12 +1343,17 @@ output_cost_per_million = 15.0
 ```
 
 Operator affordances: `deadreckon run --preview "goal"` renders the selected
-provider route and model before state is created; `run --model <model>` and
-`extend --model <model>` override one run; `deadreckon config provider
+provider route, source, and model before state is created; `run --model <model>`
+and `extend --model <model>` override one run; `deadreckon config provider
 <route>` and `deadreckon config model <model> --provider <route>` persist the
-defaults. CLI providers pass explicit model overrides through to the underlying
-tool (`codex exec --model ...`, `claude --model ...`) and otherwise display
-`provider default`.
+defaults. `init`, `config provider`, primary run/extend, orchestration roles,
+resume/doc polish, and provider-selection display all route through
+`crates/deadreckon/src/setup.rs`, which reports provider role, route, model,
+source (`flag`, `config`, `auto_subscription`, `run_provider`,
+`built_in_default`, or `none`), credential state, warnings, and `try:` lines
+without adding durable state. CLI providers pass explicit model overrides
+through to the underlying tool (`codex exec --model ...`, `claude --model ...`)
+and otherwise display `provider default`.
 
 Route resolution (`configured_route_names` in `crates/deadreckon-providers/src/router.rs`) now puts `default_provider` at the head of the chain, then appends `fallback` entries that aren't already present, then falls back to the built-in chain (`cli:claude-code` → `cli:codex` → `anthropic` → `openai` → `openai-compatible`) only if neither is configured. `read_config` (`config.rs`) backfills `default_provider` from a top-level `[defaults] provider` key when it's omitted, so the same TOML stanza drives both `init`-style defaults and the router. `--provider` on the CLI still short-circuits the whole chain.
 
@@ -1360,7 +1365,7 @@ Three credential paths:
 2. **CLI subscription.** Run with `--provider cli:claude-code` or `cli:codex`. The binary's presence in `$PATH` is the credential. No key required.
 3. **OpenAI-compatible.** Plug an OpenRouter or `llama.cpp` endpoint into `base_url` + `api_key`.
 
-`deadreckon init` walks the user through option (1) or (2): it queries the provider registry for any subscription CLI provider whose binary is available (`auto_subscription_cli_provider`, `main.rs:1192`) and offers the first match — `cli:claude-code`, `cli:codex`, `cli:gemini`, `cli:opencode`, `cli:copilot`, or `cli:pi`, depending on what's installed — before asking for keys. The interactive fallback still defaults to `claude` or `codex` if both are present (`main.rs:11759`). When the chosen provider is a `cli:*` route, the generated config preserves it in the fallback chain rather than overwriting with the historic claude/codex default (commit `a38f516`).
+`deadreckon init` walks the user through option (1) or (2): it queries the provider registry for any subscription CLI provider whose binary is available (`setup::auto_subscription_cli_provider`) and offers the first match — `cli:claude-code`, `cli:codex`, `cli:gemini`, `cli:opencode`, `cli:copilot`, or `cli:pi`, depending on what's installed — before asking for keys. The chosen route is immediately validated through the shared setup resolver, and the generated config preserves a `cli:*` route in the fallback chain rather than overwriting with the historic claude/codex default.
 
 ---
 
@@ -1467,7 +1472,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Cross-process cancellation: `kill` writes a durable cancel marker before signaling; the run loop observes it while provider calls are in flight and reports killed status through events.
 - Partial-trace resume: resume reconstructs only completed tool boundaries and `resume --from-turn` truncates traces, spend records, and future snapshots together.
 - Durable per-run `sandbox.toml` plus per-tool sandbox policy: bash/write-file paths get specific filesystem and network permissions; refusals include `try:` and are recorded in traces and provenance.
-- YAML acceptance specs: `dr-gate` evaluates required/optional tests, file existence, content matches, shell commands, and build checks, then signs check-level proof results.
+- YAML done-criteria files (`acceptance.yaml`): `dr-gate` evaluates required/optional tests, file existence, content matches, shell commands, and build checks, then signs check-level proof results.
 - Exhaustive local doctor: OS, sandbox binaries, provider binaries, config, runstate permissions, disk, and opt-in provider pings all produce actionable `try:` hints.
 - Promoted library query surface: `deadreckon library list|search|show` reads library manifests and reverse materialization markers, filters by goal/date, and searches promoted run docs.
 - Import parity hardening: descriptor-backed CLI imports and Cursor SQLite imports preserve source metadata, deterministic session run IDs, stable row ordering, manifests, content hashes, and provenance paths; committed goldens and fixtures cover normalized `show` output plus provider-specific discovery.
@@ -1591,7 +1596,7 @@ and source lines. `undo` restores the original source path for in-place runs.
 `extend` chains worktree children from the parent `dr/...` branch and records
 `parent_branch` in the child's `codebase.json`; copy/fresh extension keeps the
 library-seeding path, and in-place parents refuse with a `run --in-place` hint.
-Extend now also carries the parent's acceptance spec into the child run via
+Extend now also carries the parent's done-criteria file into the child run via
 `copy_existing_acceptance_into_run` (looking at `cwd` then `working_dir`),
 matching the behavior of a fresh `run` so an extended turn is held to the same
 gate as the original.
@@ -1670,7 +1675,7 @@ Turn docs preserve the provider response up to 50 KB, stdout/stderr up to 10 KB 
 
 ### 25.13 Doc-Provider Auto-Resolution
 
-Doc polish chooses `--doc-provider`, then `[defaults].doc_provider`, then in-PATH subscription CLIs (`cli:codex`, `cli:claude-code`), then the run provider. If none resolve, the command fails with an actionable `try:` hint instead of silently leaving `Doc-writer: templated only`.
+Doc polish chooses `--doc-provider`, then `[defaults].doc_provider`, then in-PATH subscription CLIs from the provider registry, then the run provider. The same `setup.rs` resolver backs run, extend, resume, and `doc --polish`, so previews and start banners use the same provider-source labels (`flag`, `config`, `auto_subscription`, `run_provider`, `none`). If none resolve, the command fails with an actionable `try:` hint instead of silently leaving `Doc-writer: templated only`.
 
 ### 25.14 Component Inference And Topology
 
@@ -1684,7 +1689,7 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 ## 26. Coherence Pass (alpha)
 
-> **Status (2026-05-18):** The May 2026 coherence pass and closure pass are alpha-complete. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, JSON parity, orchestration commands, plan attach, and polymorphic lifecycle ids now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md` and `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`; the closure matrix is `docs/design/USER-FACING-MATRIX.md`, with larger follow-ups explicitly deferred to `docs/V1-CANDIDATES.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs`.
+> **Status (2026-05-24):** The May 2026 coherence pass and closure pass are alpha-complete. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, provider/done-criteria setup, JSON parity, orchestration commands, plan attach, and polymorphic lifecycle ids now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md`, `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`, and `docs/goals/2026-05-24-1426-deadreckon-provider-done-setup-goal.md`; the closure matrix is `docs/design/USER-FACING-MATRIX.md`, with larger follow-ups explicitly deferred to `docs/V1-CANDIDATES.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs` and runtime setup helpers.
 
 ### 26.1 Glossary
 
@@ -1726,9 +1731,11 @@ The user-facing skip model is split by timing. `--yes` belongs to preflight prev
 
 ### 26.8 Provider And Failure Vocabulary
 
-Provider displays use the provider/route/model/kind vocabulary consistently. Human provider lists and detection rows use the same `kind=cli|http|local-http|scripted` tokens, and the configured route is marked with `*` in the selection and registry views. `show --why-failed` and `chain show --why-failed` now route through one failure-summary renderer with shared `status:`, `reason:`, `evidence:`, and `try:` sections.
+Provider displays use the provider/route/model/kind vocabulary consistently. Human provider lists and detection rows use the same `kind=cli|http|local-http|scripted` tokens, and the configured route is marked with `*` in the selection and registry views. `setup.rs` owns runtime provider setup rows for config/default-provider, primary run, doc polish, planner, child, coder, reviewer, and repair roles; it validates unknown routes before writes, reports source/credential/install state, and leaves built-in fallback routing unforced for normal run defaults. `show --why-failed` and `chain show --why-failed` now route through one failure-summary renderer with shared `status:`, `reason:`, `evidence:`, and `try:` sections.
 
-`deadreckon help-all` includes the provider-role glossary. `--provider` is the primary run provider route and the default child route in full-plan orchestration. `--planner-provider` writes the full-plan child graph. `--child-provider IDX=PROVIDER` overrides a specific child. `--coder-provider` performs the review-mode implementation pass. `--reviewer-provider` independently reviews or fixes the coder result. `--doc-provider` handles documentation polish, resolving through explicit flag, config, then run provider. `--repair-provider` handles merge repair planning and repair-child runs. Normal user surfaces say provider route/model/kind; descriptor remains registry documentation vocabulary.
+`deadreckon help-all` includes the provider-role glossary. `--provider` is the primary run provider route and the default child route in full-plan orchestration. `--planner-provider` writes the full-plan child graph. `--child-provider IDX=PROVIDER` overrides a specific child. `--coder-provider` performs the review-mode implementation pass. `--reviewer-provider` independently reviews or fixes the coder result. `--doc-provider` handles documentation polish, resolving through explicit flag, config, subscription CLI, then run provider. `--repair-provider` handles merge repair planning and repair-child runs. Normal user surfaces say provider route/model/kind; descriptor remains registry documentation vocabulary.
+
+Done-criteria setup also resolves through `setup.rs`. Explicit `--acceptance <path>`, project `.deadreckon/acceptance.yaml`, generated criteria from `def-done`/pre-run drafting, and default `dr-gate` behavior all produce one `DoneCriteriaSelection`. User-facing previews and orchestration preflights say `done criteria`; technical files, gate proofs, and hidden compatibility commands may still say `acceptance.yaml` or `gate`.
 
 Plan merge/result output keeps the plan id as the primary object. The synthesized run id is labeled as a secondary result run, and the promoted path is labeled as the artifact library so users can still inspect implementation details without mistaking them for the main lifecycle id.
 
@@ -1738,7 +1745,7 @@ Inspection surfaces that already read durable state now expose `--json`: `list`,
 
 ### 26.10 Deferred V1 Work
 
-Mass renaming stored enum variants, themable palettes, localization hooks, a full output-layout facade, generic lifecycle renderer, provider/done-criteria setup unification, command-matrix golden snapshots, and a template engine for status cards stay in `docs/V1-CANDIDATES.md`. The orchestration live-UX slice has landed shared role/dependency/repair summaries and the `PlanEventBus` feed; remaining orchestration work is now the broader interactive setup/output-layout polish, not the basic live attach freshness gap.
+Mass renaming stored enum variants, themable palettes, localization hooks, a full output-layout facade, generic lifecycle renderer, command-matrix golden snapshots, and a template engine for status cards stay in `docs/V1-CANDIDATES.md`. Provider and done-criteria setup unification has landed as an alpha runtime layer, so the remaining V1 work is deeper output-layout/golden coverage and richer interactive setup polish rather than another resolver. The orchestration live-UX slice has landed shared role/dependency/repair summaries and the `PlanEventBus` feed; remaining orchestration work is now the broader interactive setup/output-layout polish, not the basic live attach freshness gap.
 
 ---
 
