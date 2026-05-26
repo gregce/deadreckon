@@ -22724,6 +22724,7 @@ async fn attach_tui_with_parent(
         ..AttachTuiState::default()
     };
     let mut quiet_tracker = NarrativeQuietRefreshTracker::new(Utc::now());
+    let mut acceptance_tracker = NarrativeAcceptanceRefreshTracker::default();
 
     let result = loop {
         let now = Utc::now();
@@ -22731,10 +22732,12 @@ async fn attach_tui_with_parent(
         let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
         let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
         let new_events = event_feed.refresh(std::time::Duration::ZERO).await?;
-        let event_refresh = run_narrative_refresh_trigger(&new_events);
-        quiet_tracker.observe_event_trigger(event_refresh, now);
+        let run_event_refresh = run_narrative_refresh_trigger(&new_events);
         events.extend(new_events);
         let live = collect_attach_live(&state);
+        let event_refresh =
+            run_event_refresh.or_else(|| acceptance_tracker.observe(&live.acceptance));
+        quiet_tracker.observe_event_trigger(event_refresh, now);
         let terminal_size = terminal.size()?;
         let terminal_area =
             ratatui::layout::Rect::new(0, 0, terminal_size.width, terminal_size.height);
@@ -25712,6 +25715,50 @@ fn elapsed_seconds(start: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
     now.signed_duration_since(start).num_seconds().max(0) as u64
 }
 
+#[derive(Debug, Default, Clone)]
+struct NarrativeAcceptanceRefreshTracker {
+    latest: Option<AcceptanceRefreshSignature>,
+}
+
+impl NarrativeAcceptanceRefreshTracker {
+    fn observe(&mut self, acceptance: &AcceptanceLive) -> Option<NarrativeRefreshKind> {
+        let next = AcceptanceRefreshSignature::from(acceptance);
+        let previous = self.latest.replace(next);
+        if previous.is_none() || previous == Some(next) {
+            return None;
+        }
+        match acceptance.status {
+            AcceptanceUiStatus::Running => Some(NarrativeRefreshKind::Event("acceptance running")),
+            AcceptanceUiStatus::Passed => Some(NarrativeRefreshKind::Event("acceptance passed")),
+            AcceptanceUiStatus::Failed => Some(NarrativeRefreshKind::Event("acceptance failed")),
+            AcceptanceUiStatus::DefaultGate | AcceptanceUiStatus::Configured => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptanceRefreshSignature {
+    status: AcceptanceUiStatus,
+    total: usize,
+    completed: usize,
+    passed: usize,
+    failed: usize,
+    required_failed: usize,
+}
+
+impl From<&AcceptanceLive> for AcceptanceRefreshSignature {
+    fn from(acceptance: &AcceptanceLive) -> Self {
+        Self {
+            status: acceptance.status,
+            total: acceptance.total,
+            completed: acceptance.completed,
+            passed: acceptance.passed,
+            failed: acceptance.failed,
+            required_failed: acceptance.required_failed,
+        }
+    }
+}
+
 fn run_narrative_refresh_trigger(events: &[RunEvent]) -> Option<NarrativeRefreshKind> {
     events.iter().find_map(|event| match &event.event {
         RunEventKind::Error { .. } => Some(NarrativeRefreshKind::Event("run error")),
@@ -26934,19 +26981,20 @@ mod tui_tests {
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, AttachViewMode,
         COMMAND_HELP_CATALOG, ChainAttachTuiState, CommandDiscovery, CommandHelpEntry,
-        CompletionAction, HELP_ALL_GROUPS, NarrativeQuietRefreshTracker, NarrativeRefreshKind,
-        NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent, ProviderActivity,
-        ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines, attach_banner,
-        attach_header_text, attach_should_return_to_plan, chain_activity_lines,
-        chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
-        chain_step_dot, chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
-        cli_wait_status_line, collect_jsonl_provider_activity, command_discovery,
-        completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
-        deadreckoning_status_text, doc_polish_preview_text, implementation_plan_warnings,
-        kill_banner, live_file_lines, markdown_to_tui_lines, max_panel_scroll, meter_color,
-        orchestration_dependency_rows, orchestration_parallelism_lines,
-        orchestration_provider_role_rows, orchestration_role_table_lines, per_step_wall_cap,
-        plan_attach_footer, plan_merge_repair_summary_items, plan_narrative_refresh_trigger,
+        CompletionAction, HELP_ALL_GROUPS, NarrativeAcceptanceRefreshTracker,
+        NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode,
+        PlanAttachRenderState, PlanFeedEvent, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
+        acceptance_activity_lines, attach_banner, attach_header_text, attach_should_return_to_plan,
+        chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
+        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
+        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
+        command_discovery, completion_action_from_input, completion_hints_enabled,
+        deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
+        implementation_plan_warnings, kill_banner, live_file_lines, markdown_to_tui_lines,
+        max_panel_scroll, meter_color, orchestration_dependency_rows,
+        orchestration_parallelism_lines, orchestration_provider_role_rows,
+        orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
+        plan_merge_repair_summary_items, plan_narrative_refresh_trigger,
         provider_ingest_base_roots, provider_jsonl_activity_lines,
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
@@ -27835,6 +27883,68 @@ mod tui_tests {
         assert_eq!(
             tracker.maybe_trigger(true, 30, start + chrono::Duration::seconds(51)),
             Some(NarrativeRefreshKind::QuietThreshold)
+        );
+    }
+
+    #[test]
+    fn narrative_refresh_triggers_on_acceptance_status_changes() {
+        let mut tracker = NarrativeAcceptanceRefreshTracker::default();
+        let configured = AcceptanceLive {
+            status: AcceptanceUiStatus::Configured,
+            total: 2,
+            completed: 0,
+            passed: 0,
+            failed: 0,
+            required_failed: 0,
+            latest_detail: None,
+            progress_lines: Vec::new(),
+        };
+        assert_eq!(tracker.observe(&configured), None);
+
+        let running = AcceptanceLive {
+            status: AcceptanceUiStatus::Running,
+            total: 2,
+            completed: 1,
+            passed: 1,
+            failed: 0,
+            required_failed: 0,
+            latest_detail: Some("cargo test passed".to_string()),
+            progress_lines: vec!["running 1/2".to_string()],
+        };
+        assert_eq!(
+            tracker.observe(&running),
+            Some(NarrativeRefreshKind::Event("acceptance running"))
+        );
+        assert_eq!(tracker.observe(&running), None);
+
+        let passed = AcceptanceLive {
+            status: AcceptanceUiStatus::Passed,
+            total: 2,
+            completed: 2,
+            passed: 2,
+            failed: 0,
+            required_failed: 0,
+            latest_detail: Some("all checks passed".to_string()),
+            progress_lines: vec!["passed 2/2".to_string()],
+        };
+        assert_eq!(
+            tracker.observe(&passed),
+            Some(NarrativeRefreshKind::Event("acceptance passed"))
+        );
+
+        let failed = AcceptanceLive {
+            status: AcceptanceUiStatus::Failed,
+            total: 2,
+            completed: 2,
+            passed: 1,
+            failed: 1,
+            required_failed: 1,
+            latest_detail: Some("cargo clippy failed".to_string()),
+            progress_lines: vec!["failed 1/2".to_string()],
+        };
+        assert_eq!(
+            tracker.observe(&failed),
+            Some(NarrativeRefreshKind::Event("acceptance failed"))
         );
     }
 
