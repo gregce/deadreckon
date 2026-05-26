@@ -17375,11 +17375,19 @@ fn print_run_narrative_plain(
     parent_plan: Option<&AttachParentPlan>,
     visual: NarrativeVisualMode,
 ) -> Result<()> {
-    let projection = run_projection_for_plain(state, parent_plan, visual)?;
-    for line in narrative::narrative_plain_lines(&projection, visual) {
-        println!("{line}");
-    }
+    print!("{}", run_narrative_plain_text(state, parent_plan, visual)?);
     Ok(())
+}
+
+fn run_narrative_plain_text(
+    state: &deadreckon_core::PipelineState,
+    parent_plan: Option<&AttachParentPlan>,
+    visual: NarrativeVisualMode,
+) -> Result<String> {
+    let projection = run_projection_for_plain(state, parent_plan, visual)?;
+    let mut output = narrative::narrative_plain_lines(&projection, visual).join("\n");
+    output.push('\n');
+    Ok(output)
 }
 
 fn print_run_narrative_json(
@@ -17387,9 +17395,51 @@ fn print_run_narrative_json(
     parent_plan: Option<&AttachParentPlan>,
     visual: NarrativeVisualMode,
 ) -> Result<()> {
-    let projection = run_projection_for_plain(state, parent_plan, visual)?;
-    println!("{}", serde_json::to_string_pretty(&projection)?);
+    println!("{}", run_narrative_json_text(state, parent_plan, visual)?);
     Ok(())
+}
+
+fn run_narrative_json_text(
+    state: &deadreckon_core::PipelineState,
+    parent_plan: Option<&AttachParentPlan>,
+    visual: NarrativeVisualMode,
+) -> Result<String> {
+    let projection = run_projection_for_plain(state, parent_plan, visual)?;
+    Ok(serde_json::to_string_pretty(&projection)?)
+}
+
+fn print_plan_narrative_plain(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    visual: NarrativeVisualMode,
+) -> Result<()> {
+    print!("{}", plan_narrative_plain_text(paths, plan, visual)?);
+    Ok(())
+}
+
+fn plan_narrative_plain_text(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    visual: NarrativeVisualMode,
+) -> Result<String> {
+    let projection = plan_projection_for_plain(paths, plan)?;
+    let mut output = narrative::narrative_plain_lines(&projection, visual).join("\n");
+    output.push('\n');
+    Ok(output)
+}
+
+fn print_plan_narrative_json(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    _visual: NarrativeVisualMode,
+) -> Result<()> {
+    println!("{}", plan_narrative_json_text(paths, plan)?);
+    Ok(())
+}
+
+fn plan_narrative_json_text(paths: &DeadreckonPaths, plan: &Plan) -> Result<String> {
+    let projection = plan_projection_for_plain(paths, plan)?;
+    Ok(serde_json::to_string_pretty(&projection)?)
 }
 
 fn run_projection_for_plain(
@@ -17410,28 +17460,6 @@ fn run_projection_for_plain(
     run_narrative_projection(state, &spend, &traces, &events, &live, &tui_state)
 }
 
-fn print_plan_narrative_plain(
-    paths: &DeadreckonPaths,
-    plan: &Plan,
-    visual: NarrativeVisualMode,
-) -> Result<()> {
-    let projection = plan_projection_for_plain(paths, plan)?;
-    for line in narrative::narrative_plain_lines(&projection, visual) {
-        println!("{line}");
-    }
-    Ok(())
-}
-
-fn print_plan_narrative_json(
-    paths: &DeadreckonPaths,
-    plan: &Plan,
-    _visual: NarrativeVisualMode,
-) -> Result<()> {
-    let projection = plan_projection_for_plain(paths, plan)?;
-    println!("{}", serde_json::to_string_pretty(&projection)?);
-    Ok(())
-}
-
 fn plan_projection_for_plain(
     paths: &DeadreckonPaths,
     plan: &Plan,
@@ -17449,9 +17477,14 @@ fn plan_projection_for_plain(
 }
 
 fn print_chain_narrative_refusal(run_ref: &str, json_output: bool) -> Result<()> {
+    print!("{}", chain_narrative_refusal_text(run_ref, json_output)?);
+    Ok(())
+}
+
+fn chain_narrative_refusal_text(run_ref: &str, json_output: bool) -> Result<String> {
     if json_output {
-        println!(
-            "{}",
+        return Ok(format!(
+            "{}\n",
             serde_json::to_string_pretty(&json!({
                 "status": "unsupported",
                 "kind": "chain",
@@ -17463,14 +17496,11 @@ fn print_chain_narrative_refusal(run_ref: &str, json_output: bool) -> Result<()>
                     "deadreckon attach <plan-id> --view narrative"
                 ]
             }))?
-        );
-    } else {
-        println!("chain narrative attach is not supported yet");
-        println!("try: deadreckon chain status {run_ref}");
-        println!("try: deadreckon attach <run-id> --view narrative");
-        println!("try: deadreckon attach <plan-id> --view narrative");
+        ));
     }
-    Ok(())
+    Ok(format!(
+        "chain narrative attach is not supported yet\ntry: deadreckon chain status {run_ref}\ntry: deadreckon attach <run-id> --view narrative\ntry: deadreckon attach <plan-id> --view narrative\n"
+    ))
 }
 
 // SAFETY: Kill arguments are owned clap values at the command boundary.
@@ -27000,19 +27030,20 @@ mod tui_tests {
         PlanAttachRenderState, PlanFeedEvent, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
         acceptance_activity_lines, attach_banner, attach_header_text, attach_should_return_to_plan,
         chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
-        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
-        command_discovery, completion_action_from_input, completion_hints_enabled,
-        deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
-        implementation_plan_warnings, kill_banner, live_file_lines, markdown_to_tui_lines,
-        max_panel_scroll, meter_color, orchestration_dependency_rows,
-        orchestration_parallelism_lines, orchestration_provider_role_rows,
-        orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
-        plan_merge_repair_summary_items, plan_narrative_refresh_trigger,
+        chain_narrative_refusal_text, chain_should_auto_attach, chain_step_dot,
+        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
+        cli_wait_status_line, collect_jsonl_provider_activity, command_discovery,
+        completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
+        deadreckoning_status_text, doc_polish_preview_text, implementation_plan_warnings,
+        kill_banner, live_file_lines, markdown_to_tui_lines, max_panel_scroll, meter_color,
+        orchestration_dependency_rows, orchestration_parallelism_lines,
+        orchestration_provider_role_rows, orchestration_role_table_lines, per_step_wall_cap,
+        plan_attach_footer, plan_merge_repair_summary_items, plan_narrative_refresh_trigger,
         provider_ingest_base_roots, provider_jsonl_activity_lines,
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
-        render_attach, render_plan_attach, run_narrative_refresh_trigger, threshold_color,
+        render_attach, render_plan_attach, run_narrative_json_text, run_narrative_plain_text,
+        run_narrative_refresh_trigger, threshold_color,
     };
     use crate::cli::{Cli, CliPlanMode};
     use chrono::Utc;
@@ -28061,6 +28092,87 @@ mod tui_tests {
         assert!(text.contains("smoke:child"), "{text}");
         assert!(text.contains("deps=1"), "{text}");
         assert!(text.contains("n narrative/activity"), "{text}");
+    }
+
+    #[test]
+    fn plain_narrative_attach_prints_staleness_and_citations() {
+        let (_temp, state) = doc_preview_state();
+
+        let text = run_narrative_plain_text(&state, None, NarrativeVisualMode::Architecture)
+            .expect("plain");
+
+        assert!(text.contains("freshness: deterministic fallback"), "{text}");
+        assert!(
+            text.contains("Provider-backed narration has not run"),
+            "{text}"
+        );
+        assert!(text.contains("Evidence"), "{text}");
+        assert!(text.contains("file:"), "{text}");
+    }
+
+    #[test]
+    fn json_narrative_attach_emits_state_snapshot_and_graph_objects() {
+        let (_temp, state) = doc_preview_state();
+
+        let text =
+            run_narrative_json_text(&state, None, NarrativeVisualMode::Architecture).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json value");
+
+        assert_eq!(value["state"]["target_id"], state.run_id);
+        assert_eq!(value["snapshot"]["target_id"], state.run_id);
+        assert!(value["graph"]["nodes"].as_array().is_some(), "{value:#}");
+        assert!(value["graph"]["edges"].as_array().is_some(), "{value:#}");
+    }
+
+    #[test]
+    fn non_tty_narrative_attach_does_not_call_provider_without_explicit_refresh() {
+        let (_temp, state) = doc_preview_state();
+
+        let _text = run_narrative_plain_text(&state, None, NarrativeVisualMode::Architecture)
+            .expect("plain");
+        let narrative_state: crate::narrative::NarrativeState = serde_json::from_str(
+            &std::fs::read_to_string(state.run_root.join("narrative/state.json")).expect("state"),
+        )
+        .expect("narrative state");
+
+        assert_eq!(narrative_state.provider.calls, 0);
+        assert_eq!(narrative_state.provider.source, "deterministic");
+        assert!(
+            !state
+                .run_root
+                .join("narrative/provider-refresh.out")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn chain_narrative_attach_has_clear_supported_behavior() {
+        let plain = chain_narrative_refusal_text("chain-1234", false).expect("plain");
+        assert!(
+            plain.contains("chain narrative attach is not supported yet"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("try: deadreckon chain status chain-1234"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("deadreckon attach <run-id> --view narrative"),
+            "{plain}"
+        );
+
+        let json_text = chain_narrative_refusal_text("chain-1234", true).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json_text).expect("json value");
+        assert_eq!(value["status"], "unsupported");
+        assert_eq!(value["kind"], "chain");
+        assert!(
+            value["try"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == "deadreckon attach <plan-id> --view narrative"),
+            "{value:#}"
+        );
     }
 
     #[test]
