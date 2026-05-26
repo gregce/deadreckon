@@ -824,16 +824,13 @@ pub(crate) fn build_plan_projection(input: &PlanNarrativeInput<'_>) -> Narrative
     let agent_table = plan
         .tasks
         .iter()
-        .map(|task| {
-            let evidence = vec![format!("task:{}", task.task_id)];
-            NarrativeAgentRow {
-                task_id: task.task_id.clone(),
-                role: format!("{:?}", task.role).to_ascii_lowercase(),
-                provider: task.provider.clone(),
-                status: plan_task_status_label(task.status).to_string(),
-                summary: task_summary(input.paths, task),
-                evidence,
-            }
+        .map(|task| NarrativeAgentRow {
+            task_id: task.task_id.clone(),
+            role: format!("{:?}", task.role).to_ascii_lowercase(),
+            provider: task.provider.clone(),
+            status: plan_task_status_label(task.status).to_string(),
+            summary: task_summary(input.paths, task),
+            evidence: task_evidence(input.paths, task),
         })
         .collect::<Vec<_>>();
     let mut coordination_notes = Vec::new();
@@ -1904,6 +1901,16 @@ fn plan_citations(
             path: Some(paths.plan_dir(&plan.plan_id).join(&task.worker_spec)),
             summary: format!("{} {}", task.task_id, task.subject),
         });
+        if let Some(run_id) = task.child_run_id.as_ref()
+            && let Some((path, snapshot)) = latest_child_narrative_snapshot(paths, run_id)
+        {
+            citations.push(NarrativeCitation {
+                id: child_narrative_evidence_id(run_id, &snapshot),
+                kind: "child_narrative".to_string(),
+                path: Some(path),
+                summary: one_line(&snapshot.headline, 120),
+            });
+        }
     }
     citations
 }
@@ -2097,6 +2104,14 @@ fn task_summary(paths: &DeadreckonPaths, task: &deadreckon_core::PlanTask) -> St
     if let Some(run_id) = task.child_run_id.as_ref()
         && let Ok(state) = load_run(paths, run_id)
     {
+        if let Some((_path, snapshot)) = latest_child_narrative_snapshot(paths, run_id) {
+            return format!(
+                "{}; child narrative {}: {}",
+                base,
+                snapshot.snapshot_id,
+                one_line(&snapshot.headline, 120)
+            );
+        }
         return format!(
             "{}; run {} turn {} {}",
             base,
@@ -2106,6 +2121,37 @@ fn task_summary(paths: &DeadreckonPaths, task: &deadreckon_core::PlanTask) -> St
         );
     }
     base
+}
+
+fn task_evidence(paths: &DeadreckonPaths, task: &deadreckon_core::PlanTask) -> Vec<String> {
+    let mut evidence = vec![format!("task:{}", task.task_id)];
+    if let Some(run_id) = task.child_run_id.as_ref()
+        && let Some((_path, snapshot)) = latest_child_narrative_snapshot(paths, run_id)
+    {
+        evidence.push(child_narrative_evidence_id(run_id, &snapshot));
+    }
+    evidence
+}
+
+fn latest_child_narrative_snapshot(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+) -> Option<(PathBuf, NarrativeSnapshot)> {
+    let state = load_run(paths, run_id).ok()?;
+    let snapshots_path = state
+        .run_root
+        .join(NARRATIVE_DIR)
+        .join(NARRATIVE_SNAPSHOTS_JSONL);
+    let snapshot = read_latest_snapshot(&state.run_root.join(NARRATIVE_DIR)).snapshot?;
+    Some((snapshots_path, snapshot))
+}
+
+fn child_narrative_evidence_id(run_id: &str, snapshot: &NarrativeSnapshot) -> String {
+    format!(
+        "child-narrative:{}:{}",
+        short_id(run_id),
+        snapshot.snapshot_id
+    )
 }
 
 fn run_event_summary(event: &RunEventKind) -> String {
@@ -2396,7 +2442,9 @@ fn one_line(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deadreckon_core::{RunOptions, create_run};
+    use deadreckon_core::{
+        PlanMode, PlanProviders, PlanRole, PlanTask, PlanTaskStatus, RunOptions, create_run,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -2523,6 +2571,109 @@ mod tests {
         assert!(rendered.contains("Visual: architecture"));
         assert!(rendered.contains("-> touches"));
         assert!(rendered.contains("crates/deadreckon/src/main.rs"));
+    }
+
+    #[test]
+    fn plan_evidence_window_rolls_up_child_narratives() {
+        let temp = TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let child_state = create_run(
+            &paths,
+            RunOptions {
+                goal: "child finds architecture boundary".to_string(),
+                cwd: repo,
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("child-rollup-run".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("child run");
+        let mut child_projection = build_run_projection(&RunNarrativeInput {
+            state: &child_state,
+            spend: &[],
+            traces: &[],
+            events: &[],
+            live_files: vec![LiveFileFact {
+                path: "crates/deadreckon/src/plan_event_bus.rs".to_string(),
+                bytes: 10,
+                modified_at: None,
+            }],
+            file_count: 1,
+            total_bytes: 10,
+            acceptance_summary: "default gate".to_string(),
+            provider_activity: &[],
+            parent_plan: None,
+        });
+        child_projection.snapshot.snapshot_id = "child-nar-rollup".to_string();
+        child_projection.state.latest_snapshot_id = "child-nar-rollup".to_string();
+        child_projection.snapshot.headline =
+            "Child identified the plan event bus boundary.".to_string();
+        persist_run_projection(&child_state, &child_projection).expect("persist child narrative");
+
+        let mut task = PlanTask::new(
+            0,
+            "Inspect plan child feed",
+            "Inspect the child feed",
+            PlanRole::Child,
+            Some("cli:test".to_string()),
+        );
+        task.child_run_id = Some(child_state.run_id.clone());
+        task.status = PlanTaskStatus::Running;
+        let other_task = PlanTask::new(
+            1,
+            "Review child summary",
+            "Review the summary",
+            PlanRole::Child,
+            Some("cli:test".to_string()),
+        );
+        let plan = Plan::new(
+            "roll up child narratives",
+            PlanMode::FullPlan,
+            vec![task, other_task],
+            PlanProviders {
+                planner: Some("cli:test".to_string()),
+                default_child: Some("cli:test".to_string()),
+                coder: None,
+                reviewer: None,
+                children: BTreeMap::new(),
+            },
+            None,
+            "0.1.0",
+        )
+        .expect("plan");
+
+        let projection = build_plan_projection(&PlanNarrativeInput {
+            paths: &paths,
+            plan: &plan,
+            messages: &[],
+            plan_events: &[],
+            feed_events: &[],
+            selected: 0,
+        });
+
+        let row = projection.snapshot.agent_table.first().expect("agent row");
+        assert!(row.summary.contains("Child identified"), "{row:#?}");
+        assert!(
+            row.evidence
+                .iter()
+                .any(|id| id.starts_with("child-narrative:")),
+            "{row:#?}"
+        );
+        assert!(
+            projection
+                .snapshot
+                .citations
+                .iter()
+                .any(|citation| citation.kind == "child_narrative"),
+            "{:#?}",
+            projection.snapshot.citations
+        );
     }
 
     #[test]
