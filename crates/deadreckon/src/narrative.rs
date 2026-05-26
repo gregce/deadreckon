@@ -911,17 +911,21 @@ pub(crate) fn build_plan_projection(input: &PlanNarrativeInput<'_>) -> Narrative
         repair_run_id: repair_run_id_from_feed(input.feed_events),
         ..NarrativeCoverage::default()
     };
+    let mut source_files = plan
+        .tasks
+        .iter()
+        .filter_map(|task| task.summary_path.as_ref())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    source_files.extend(plan_child_graph_files(input.paths, plan));
+    source_files.sort();
+    source_files.dedup();
     let source_window = NarrativeSourceWindow {
         plan_events: seq_window(input.plan_events.len() as u64),
-        files: plan
-            .tasks
-            .iter()
-            .filter_map(|task| task.summary_path.as_ref())
-            .map(|path| path.display().to_string())
-            .collect(),
+        files: source_files,
         ..NarrativeSourceWindow::default()
     };
-    let graph = build_plan_graph(plan, &source_window);
+    let graph = build_plan_graph(input.paths, plan, &source_window);
     debug_assert!(validate_graph(&graph));
     let graph_hash = graph_content_hash(&graph);
     let snapshot_id = snapshot_id(&(
@@ -1690,7 +1694,11 @@ fn build_run_graph(
     }
 }
 
-fn build_plan_graph(plan: &Plan, source_window: &NarrativeSourceWindow) -> ArchitectureGraph {
+fn build_plan_graph(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    source_window: &NarrativeSourceWindow,
+) -> ArchitectureGraph {
     let plan_prefix = short_id(&plan.plan_id);
     let root_id = format!("plan:{plan_prefix}");
     let plan_evidence = format!("plan:{plan_prefix}");
@@ -1704,6 +1712,8 @@ fn build_plan_graph(plan: &Plan, source_window: &NarrativeSourceWindow) -> Archi
         style_token: style_for_plan_status(plan.status).to_string(),
     }];
     let mut edges = Vec::new();
+    let mut child_file_node_ids = Vec::new();
+    let mut child_file_group_evidence = BTreeSet::new();
     for task in &plan.tasks {
         let task_id = format!("task:{}", task.task_id);
         nodes.push(ArchitectureNode {
@@ -1765,6 +1775,46 @@ fn build_plan_graph(plan: &Plan, source_window: &NarrativeSourceWindow) -> Archi
                 kind: "owns".to_string(),
                 evidence: vec![format!("child-run:{run_id}")],
             });
+            if let Some(child_graph) = latest_child_architecture_graph(paths, run_id) {
+                for child_file in child_graph
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind == "file")
+                    .take(4)
+                {
+                    let node_hash = stable_hash(&(task.task_id.as_str(), &child_file.id));
+                    let file_node_id = format!(
+                        "child-file:{}:{}",
+                        task.task_id,
+                        &node_hash[..12.min(node_hash.len())]
+                    );
+                    let evidence = if child_file.evidence.is_empty() {
+                        vec![format!("child-run:{run_id}")]
+                    } else {
+                        child_file.evidence.clone()
+                    };
+                    if !nodes.iter().any(|node| node.id == file_node_id) {
+                        nodes.push(ArchitectureNode {
+                            id: file_node_id.clone(),
+                            label: child_file.label.clone(),
+                            kind: "file".to_string(),
+                            status: child_file.status.clone(),
+                            weight: child_file.weight,
+                            evidence: evidence.clone(),
+                            style_token: child_file.style_token.clone(),
+                        });
+                        child_file_node_ids.push(file_node_id.clone());
+                        child_file_group_evidence.extend(evidence.iter().cloned());
+                    }
+                    edges.push(ArchitectureEdge {
+                        from: task_id.clone(),
+                        to: file_node_id,
+                        label: "touches".to_string(),
+                        kind: "writes".to_string(),
+                        evidence,
+                    });
+                }
+            }
         }
         for dependency in &task.depends_on {
             edges.push(ArchitectureEdge {
@@ -1777,6 +1827,24 @@ fn build_plan_graph(plan: &Plan, source_window: &NarrativeSourceWindow) -> Archi
         }
     }
     let graph_hash = stable_hash(&(source_window, &nodes, &edges));
+    let mut groups = vec![ArchitectureGroup {
+        id: "group:tasks".to_string(),
+        label: "Plan tasks".to_string(),
+        node_ids: plan
+            .tasks
+            .iter()
+            .map(|task| format!("task:{}", task.task_id))
+            .collect(),
+        evidence: vec![plan_evidence],
+    }];
+    if !child_file_node_ids.is_empty() {
+        groups.push(ArchitectureGroup {
+            id: "group:child-files".to_string(),
+            label: "Child file evidence".to_string(),
+            node_ids: child_file_node_ids,
+            evidence: child_file_group_evidence.into_iter().collect(),
+        });
+    }
     ArchitectureGraph {
         version: 1,
         graph_id: format!("arch-{}", &graph_hash[..12.min(graph_hash.len())]),
@@ -1787,16 +1855,7 @@ fn build_plan_graph(plan: &Plan, source_window: &NarrativeSourceWindow) -> Archi
         default_visual: NarrativeVisualMode::Agents,
         nodes,
         edges,
-        groups: vec![ArchitectureGroup {
-            id: "group:tasks".to_string(),
-            label: "Plan tasks".to_string(),
-            node_ids: plan
-                .tasks
-                .iter()
-                .map(|task| format!("task:{}", task.task_id))
-                .collect(),
-            evidence: vec![plan_evidence],
-        }],
+        groups,
         layout: ArchitectureLayout {
             kind: "swimlane".to_string(),
             root_ids: vec![root_id],
@@ -2144,6 +2203,38 @@ fn latest_child_narrative_snapshot(
         .join(NARRATIVE_SNAPSHOTS_JSONL);
     let snapshot = read_latest_snapshot(&state.run_root.join(NARRATIVE_DIR)).snapshot?;
     Some((snapshots_path, snapshot))
+}
+
+fn latest_child_architecture_graph(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+) -> Option<ArchitectureGraph> {
+    let state = load_run(paths, run_id).ok()?;
+    read_json(
+        &state
+            .run_root
+            .join(NARRATIVE_DIR)
+            .join(ARCHITECTURE_GRAPH_JSON),
+    )
+}
+
+fn plan_child_graph_files(paths: &DeadreckonPaths, plan: &Plan) -> Vec<String> {
+    let mut files = plan
+        .tasks
+        .iter()
+        .filter_map(|task| task.child_run_id.as_deref())
+        .filter_map(|run_id| latest_child_architecture_graph(paths, run_id))
+        .flat_map(|graph| {
+            graph
+                .nodes
+                .into_iter()
+                .filter(|node| node.kind == "file")
+                .map(|node| node.label)
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
 }
 
 fn child_narrative_evidence_id(run_id: &str, snapshot: &NarrativeSnapshot) -> String {
@@ -2674,6 +2765,19 @@ mod tests {
             "{:#?}",
             projection.snapshot.citations
         );
+        assert!(
+            projection
+                .snapshot
+                .source_window
+                .files
+                .iter()
+                .any(|file| file.contains("plan_event_bus.rs")),
+            "{:#?}",
+            projection.snapshot.source_window.files
+        );
+        let file_visual =
+            graph_ascii_lines(&projection.graph, NarrativeVisualMode::Files).join("\n");
+        assert!(file_visual.contains("plan_event_bus.rs"), "{file_visual}");
     }
 
     #[test]
