@@ -2026,7 +2026,7 @@ The stream is orchestration-level only. It records plan and task lifecycle edges
 
 Plain/off-TTY `attach <plan-id>` prints the latest plan event, merge repair status when sidecars exist, and an explicit `deadreckon attach <plan-id>` hint. `history grep <pattern> --plan <plan-id>` searches `plan-events.jsonl` before child run trace/provenance files, so repair events are grep-visible. `show <plan-id> --why-failed` includes the latest plan event and merge repair sidecar paths alongside failed child rows and blocker messages.
 
-`attach <plan-id> --view narrative` uses the same plan feed plus current `Plan` state to render a plan-level operator story. The narrative pane lists plan status, task/role/provider rows, dependency and coordination notes, risks, next likely orchestration moves, and an agent or architecture visual. It does not copy child traces into `plan-events.jsonl`; child runs remain normal runs with their own narrative projections and flight files.
+`attach <plan-id> --view narrative` uses the same plan feed plus current `Plan` state to render a plan-level operator story. The narrative pane lists plan status, task/role/provider rows, dependency and coordination notes, risks, next likely orchestration moves, and an agent or architecture visual. The narrative footer keeps `n`/`v`/`r` controls visible even before the selected task has a child run, then appends the `Enter waits`/`try: deadreckon fork` hint so raw activity remains one key away. It does not copy child traces into `plan-events.jsonl`; child runs remain normal runs with their own narrative projections and flight files.
 
 ### 32.4 Current Limits
 

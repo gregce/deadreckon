@@ -11,6 +11,8 @@
 - Added narrative refresh triggers for acceptance running/pass/fail transitions so test evidence can update the operator summary without requiring raw-log watching.
 - Added plan narrative roll-up from child run narrative snapshots so plan agent rows can cite the child's latest operator summary before falling back to child run state.
 - Added plan file-map roll-up from child narrative graphs so plan-level visuals can show cross-agent touched file evidence.
+- Kept plan narrative footer controls visible even when the selected child run is not available yet, preserving the one-key path back to raw activity.
+- Added focused run/plan TUI render coverage for narrative panes, citations, agent rows, and visual-map hints.
 - Added focused coverage for narrative schemas, malformed snapshot tolerance, redaction, claim validation, graph validation, provider refresh validation, cadence/budget decisions, deterministic fallback, and plain map rendering.
 
 ## Self-Improvement Loop (alpha) - 2026-05-26

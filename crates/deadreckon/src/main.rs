@@ -22300,15 +22300,26 @@ fn plan_attach_footer(
     if let Some(task) = plan.tasks.get(selected) {
         match task.child_run_id.as_deref() {
             None => {
-                footer = format!(
-                    "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter waits for child run  |  try: deadreckon fork {}",
+                let wait_hint = format!(
+                    "Enter waits for child run  |  try: deadreckon fork {}",
                     run_prefix(&plan.plan_id)
                 );
+                if view.is_narrative() {
+                    footer = format!("{footer}  |  {wait_hint}");
+                } else {
+                    footer =
+                        format!("q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  {wait_hint}");
+                }
             }
             Some(run_id) if load_run(paths, run_id).is_err() => {
-                footer =
-                    "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  child detail unavailable  |  try: deadreckon list --all"
-                        .to_string();
+                let unavailable_hint = "child detail unavailable  |  try: deadreckon list --all";
+                if view.is_narrative() {
+                    footer = format!("{footer}  |  {unavailable_hint}");
+                } else {
+                    footer = format!(
+                        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  {unavailable_hint}"
+                    );
+                }
             }
             Some(_) => {}
         }
@@ -26984,7 +26995,7 @@ mod tui_tests {
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, AttachViewMode,
         COMMAND_HELP_CATALOG, ChainAttachTuiState, CommandDiscovery, CommandHelpEntry,
-        CompletionAction, HELP_ALL_GROUPS, NarrativeAcceptanceRefreshTracker,
+        CompletionAction, HELP_ALL_GROUPS, LiveFile, NarrativeAcceptanceRefreshTracker,
         NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode,
         PlanAttachRenderState, PlanFeedEvent, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
         acceptance_activity_lines, attach_banner, attach_header_text, attach_should_return_to_plan,
@@ -27311,6 +27322,34 @@ mod tui_tests {
         render_plan_attach_text_with_feed(paths, plan, messages, plan_events, &[], selected)
     }
 
+    fn render_plan_attach_text_with_view(
+        paths: &DeadreckonPaths,
+        plan: &Plan,
+        messages: &[PlanMessage],
+        plan_events: &[PlanEvent],
+        selected: usize,
+        view: AttachViewMode,
+        visual: NarrativeVisualMode,
+    ) -> String {
+        render_plan_attach_text_with_state(
+            paths,
+            plan,
+            messages,
+            plan_events,
+            &[],
+            PlanAttachRenderState {
+                messages,
+                plan_events,
+                feed_events: &[],
+                selected,
+                show_hints: true,
+                view,
+                visual,
+                narrative_notice: None,
+            },
+        )
+    }
+
     fn render_plan_attach_text_with_feed(
         paths: &DeadreckonPaths,
         plan: &Plan,
@@ -27319,26 +27358,37 @@ mod tui_tests {
         feed_events: &[PlanFeedEvent],
         selected: usize,
     ) -> String {
+        render_plan_attach_text_with_state(
+            paths,
+            plan,
+            messages,
+            plan_events,
+            feed_events,
+            PlanAttachRenderState {
+                messages,
+                plan_events,
+                feed_events,
+                selected,
+                show_hints: true,
+                view: AttachViewMode::Activity,
+                visual: NarrativeVisualMode::Architecture,
+                narrative_notice: None,
+            },
+        )
+    }
+
+    fn render_plan_attach_text_with_state(
+        paths: &DeadreckonPaths,
+        plan: &Plan,
+        _messages: &[PlanMessage],
+        _plan_events: &[PlanEvent],
+        _feed_events: &[PlanFeedEvent],
+        state: PlanAttachRenderState<'_>,
+    ) -> String {
         let backend = TestBackend::new(140, 34);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| {
-                render_plan_attach(
-                    frame,
-                    paths,
-                    plan,
-                    &PlanAttachRenderState {
-                        messages,
-                        plan_events,
-                        feed_events,
-                        selected,
-                        show_hints: true,
-                        view: AttachViewMode::Activity,
-                        visual: NarrativeVisualMode::Architecture,
-                        narrative_notice: None,
-                    },
-                )
-            })
+            .draw(|frame| render_plan_attach(frame, paths, plan, &state))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let area = buffer.area;
@@ -27949,6 +27999,68 @@ mod tui_tests {
             tracker.observe(&failed),
             Some(NarrativeRefreshKind::Event("acceptance failed"))
         );
+    }
+
+    #[test]
+    fn run_attach_narrative_pane_renders_headline_current_work_and_citations() {
+        let (_temp, state) = doc_preview_state();
+        let live = AttachLive {
+            file_count: 1,
+            total_bytes: 42,
+            files: vec![LiveFile {
+                path: "crates/deadreckon/src/main.rs".to_string(),
+                bytes: 42,
+                modified_at: None,
+            }],
+            provider_activity: vec!["tool edited crates/deadreckon/src/main.rs".to_string()],
+            working_dir_exists: true,
+            ..AttachLive::default()
+        };
+        let tui_state = AttachTuiState {
+            view: AttachViewMode::Narrative,
+            visual: NarrativeVisualMode::Architecture,
+            ..AttachTuiState::default()
+        };
+
+        let text = render_attach_text_with_tui_state(&state, &[], &live, tui_state);
+
+        assert!(text.contains("narrative"), "{text}");
+        assert!(text.contains("Run "), "{text}");
+        assert!(text.contains("Current work"), "{text}");
+        assert!(text.contains("[file:"), "{text}");
+        assert!(text.contains("crates/deadreckon/src/main.rs"), "{text}");
+    }
+
+    #[test]
+    fn plan_attach_narrative_renders_agent_table_and_visual() {
+        let (_temp, paths, mut plan) = full_plan_fixture(2);
+        plan.tasks[1].depends_on = vec!["task-0".to_string()];
+        plan.tasks[0].status = PlanTaskStatus::Running;
+        let event = PlanEvent {
+            timestamp: Utc::now(),
+            plan_id: plan.plan_id.clone(),
+            event: PlanEventKind::TaskStarted {
+                task_id: "task-0".to_string(),
+                task_index: 0,
+            },
+        };
+
+        let text = render_plan_attach_text_with_view(
+            &paths,
+            &plan,
+            &[],
+            &[event],
+            0,
+            AttachViewMode::Narrative,
+            NarrativeVisualMode::Agents,
+        );
+
+        assert!(text.contains("plan narrative"), "{text}");
+        assert!(text.contains("visual agents"), "{text}");
+        assert!(text.contains("task-0"), "{text}");
+        assert!(text.contains("smoke:child"), "{text}");
+        assert!(text.contains("deps=1"), "{text}");
+        assert!(text.contains("n narrative/activity"), "{text}");
     }
 
     #[test]
