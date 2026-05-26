@@ -3,6 +3,7 @@
 ## Narrative Attach (alpha) - 2026-05-26
 
 - Added `deadreckon attach --view narrative` for cited run and plan overviews, with `n` to return to raw activity and `v` to cycle architecture, agents, files, evidence, and no-visual modes.
+- Added the `Narrated` operator heading for narrative attach projections so the calmer view has a clear product label.
 - Added file-backed run/plan narrative projections under `narrative/state.json`, `narrative/snapshots.jsonl`, and `narrative/architecture-graph.json` without changing `PipelineState`.
 - Added evidence-backed ASCII map rendering for run architecture, plan agents, touched files, and evidence chains, including plain/JSON attach output.
 - Added redacted provider refresh on manual `r`: attach builds bounded prompts, validates structured claims and graph labels against known evidence, enforces budget/cadence guards, and falls back to deterministic stale facts when refresh is unavailable or rejected.
@@ -16,7 +17,8 @@
 - Added focused plain/JSON narrative attach coverage, including deterministic non-TTY fallback behavior and the explicit chain unsupported response.
 - Added acceptance proof/progress citations to run narrative projections so failed done criteria point at the immutable acceptance artifact instead of only generic run state.
 - Added focused run TUI mode coverage for narrative/activity toggling, visual cycling, narrow-terminal footers, and completed-run docs staying separate from narrative attach.
-- Added command-level narrative attach smokes for flight-backed run output, two-child plan agent visuals, and completed-run docs separation.
+- Added command-level narrative attach smokes for flight-backed run output, file/evidence visuals, plan child refs, two-child plan agent visuals, and completed-run docs separation.
+- Added final narrative attach guards for stale provider-refresh fallbacks, attach help copy, provider-neutral examples, and visual-map privacy/no-color documentation.
 - Added focused coverage for narrative schemas, malformed snapshot tolerance, redaction, claim validation, graph validation, provider refresh validation, cadence/budget decisions, deterministic fallback, and plain map rendering.
 
 ## Self-Improvement Loop (alpha) - 2026-05-26

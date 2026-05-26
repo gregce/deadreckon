@@ -636,6 +636,77 @@ fn current_docs_do_not_teach_stale_primary_aliases() {
 }
 
 #[test]
+fn attach_help_explains_narrative_without_log_jargon() {
+    let out = help(["attach", "--help"]);
+
+    assert!(out.contains("[default: activity]"), "{out}");
+    assert!(
+        out.contains("possible values: activity, narrative, split"),
+        "{out}"
+    );
+    assert!(
+        out.contains("possible values: architecture, agents, files, evidence, none"),
+        "{out}"
+    );
+    assert!(
+        out.contains("cited prose plus an evidence-backed visual map"),
+        "{out}"
+    );
+    for jargon in ["JSONL", "provider transcript", "raw diff", "trace DAG"] {
+        assert!(
+            !out.contains(jargon),
+            "attach help should not lead with internal narrative jargon `{jargon}`:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn docs_include_narrative_attach_example_without_provider_brand_lock() {
+    let readme = repo_file_text("README.md");
+    let example = readme
+        .lines()
+        .find(|line| line.contains("deadreckon attach latest --view narrative"))
+        .expect("README narrative attach example");
+
+    assert!(!example.contains("cli:"), "{example}");
+    assert!(!example.contains("--provider"), "{example}");
+    assert!(!example.contains("--narrative-provider"), "{example}");
+}
+
+#[test]
+fn docs_explain_visual_map_evidence_and_color_fallback() {
+    let readme = repo_file_text("README.md");
+    let as_built = repo_file_text("docs/AS-BUILT-ARCHITECTURE.md");
+
+    assert!(readme.contains("evidence-backed visual map"), "{readme}");
+    assert!(
+        as_built.contains("ASCII-compatible labels and color-independent badges"),
+        "{as_built}"
+    );
+    assert!(
+        as_built.contains("The TUI renders architecture, agent, file, and evidence views"),
+        "{as_built}"
+    );
+}
+
+#[test]
+fn privacy_docs_state_summarizer_redaction_limits() {
+    let as_built = repo_file_text("docs/AS-BUILT-ARCHITECTURE.md");
+
+    assert!(as_built.contains("redacted prompt"), "{as_built}");
+    assert!(
+        as_built.contains("send only bounded evidence summaries"),
+        "{as_built}"
+    );
+    assert!(
+        as_built.contains("cites unknown evidence")
+            && as_built.contains("emits secret-like text")
+            && as_built.contains("fails, attach keeps running"),
+        "{as_built}"
+    );
+}
+
+#[test]
 fn plan_result_wording_keeps_plan_primary() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");
@@ -1173,6 +1244,15 @@ fn help_slice(args: &[&str]) -> String {
         .expect("help");
     assert!(output.status.success(), "{}", stderr(&output));
     stdout(&output)
+}
+
+fn repo_file_text(relative: &str) -> String {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo = manifest
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("repo");
+    fs::read_to_string(repo.join(relative)).expect(relative)
 }
 
 fn deadreckon(paths: &DeadreckonPaths) -> Command {

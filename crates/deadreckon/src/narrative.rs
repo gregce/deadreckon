@@ -1008,7 +1008,7 @@ pub(crate) fn narrative_plain_lines(
     let snapshot = &projection.snapshot;
     let mut lines = vec![
         format!(
-            "narrative {}  status {:?}  visual {}",
+            "Narrated {}  status {:?}  visual {}",
             snapshot.snapshot_id,
             projection.state.latest_status,
             visual.label()
