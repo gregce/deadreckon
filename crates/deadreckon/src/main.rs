@@ -4527,6 +4527,33 @@ struct AttachRunNarrativeRefreshRequest {
     kind: NarrativeRefreshKind,
 }
 
+struct AttachPlanNarrativeRefreshJob {
+    plan_id: String,
+    state: AttachNarrativeRefreshState,
+    handle: tokio::task::JoinHandle<String>,
+}
+
+struct AttachPlanNarrativeRefreshRequest {
+    paths: DeadreckonPaths,
+    plan: Plan,
+    messages: Vec<PlanMessage>,
+    plan_events: Vec<PlanEvent>,
+    feed_events: Vec<PlanFeedEvent>,
+    selected: usize,
+    config: NarrativeAttachConfig,
+    kind: NarrativeRefreshKind,
+}
+
+struct PlanNarrativeRefreshInput<'a> {
+    paths: &'a DeadreckonPaths,
+    plan: &'a Plan,
+    messages: &'a [PlanMessage],
+    plan_events: &'a [PlanEvent],
+    feed_events: &'a [PlanFeedEvent],
+    selected: usize,
+    config: &'a NarrativeAttachConfig,
+}
+
 fn start_or_coalesce_run_narrative_refresh_job(
     job: &mut Option<AttachRunNarrativeRefreshJob>,
     request: AttachRunNarrativeRefreshRequest,
@@ -4580,6 +4607,60 @@ fn start_or_coalesce_run_narrative_refresh_job(
     notice
 }
 
+fn start_or_coalesce_plan_narrative_refresh_job(
+    job: &mut Option<AttachPlanNarrativeRefreshJob>,
+    request: AttachPlanNarrativeRefreshRequest,
+    now: DateTime<Utc>,
+) -> String {
+    if let Some(active) = job.as_mut()
+        && active.plan_id == request.plan.plan_id
+    {
+        return active.state.coalesce(request.kind, now);
+    }
+    cancel_plan_narrative_refresh_job(job);
+
+    let token = CancellationToken::new();
+    let plan_id = request.plan.plan_id.clone();
+    let refresh_state = AttachNarrativeRefreshState::new(request.kind, now, token.clone());
+    let notice = refresh_state.start_notice();
+    let handle = tokio::spawn(async move {
+        let AttachPlanNarrativeRefreshRequest {
+            paths,
+            plan,
+            messages,
+            plan_events,
+            feed_events,
+            selected,
+            config,
+            kind,
+        } = request;
+        refresh_plan_narrative_with_provider_for_kind(PlanNarrativeProviderRefresh {
+            paths: &paths,
+            plan: &plan,
+            messages: &messages,
+            plan_events: &plan_events,
+            feed_events: &feed_events,
+            selected,
+            config: &config,
+            kind,
+            cancellation_token: Some(token),
+        })
+        .await
+        .unwrap_or_else(|err| {
+            format!(
+                "provider refresh failed: {}",
+                one_line(&err.to_string(), 120)
+            )
+        })
+    });
+    *job = Some(AttachPlanNarrativeRefreshJob {
+        plan_id,
+        state: refresh_state,
+        handle,
+    });
+    notice
+}
+
 async fn poll_run_narrative_refresh_job(
     job: &mut Option<AttachRunNarrativeRefreshJob>,
 ) -> Option<String> {
@@ -4600,7 +4681,38 @@ async fn poll_run_narrative_refresh_job(
     }
 }
 
+async fn poll_plan_narrative_refresh_job(
+    job: &mut Option<AttachPlanNarrativeRefreshJob>,
+) -> Option<String> {
+    if !job
+        .as_ref()
+        .is_some_and(|active| active.handle.is_finished())
+    {
+        return None;
+    }
+    let AttachPlanNarrativeRefreshJob {
+        mut state, handle, ..
+    } = job.take()?;
+    match handle.await {
+        Ok(notice) => state.completion_notice_once(notice),
+        Err(err) if err.is_cancelled() => None,
+        Err(err) => Some(format!(
+            "provider refresh failed: {}",
+            one_line(&err.to_string(), 120)
+        )),
+    }
+}
+
 fn cancel_run_narrative_refresh_job(job: &mut Option<AttachRunNarrativeRefreshJob>) -> bool {
+    let Some(active) = job.take() else {
+        return false;
+    };
+    active.state.cancel();
+    active.handle.abort();
+    true
+}
+
+fn cancel_plan_narrative_refresh_job(job: &mut Option<AttachPlanNarrativeRefreshJob>) -> bool {
     let Some(active) = job.take() else {
         return false;
     };
@@ -4624,6 +4736,22 @@ fn run_narrative_refresh_request(
         live: input.live.clone(),
         tui_state: input.tui_state.clone(),
         config: config.clone(),
+        kind,
+    }
+}
+
+fn plan_narrative_refresh_request(
+    input: &PlanNarrativeRefreshInput<'_>,
+    kind: NarrativeRefreshKind,
+) -> AttachPlanNarrativeRefreshRequest {
+    AttachPlanNarrativeRefreshRequest {
+        paths: input.paths.clone(),
+        plan: input.plan.clone(),
+        messages: input.messages.to_vec(),
+        plan_events: input.plan_events.to_vec(),
+        feed_events: input.feed_events.to_vec(),
+        selected: input.selected,
+        config: input.config.clone(),
         kind,
     }
 }
@@ -22519,6 +22647,7 @@ async fn attach_plan_tui(
     let mut visual = initial_visual;
     let mut narrative_notice = None;
     let mut quiet_tracker = NarrativeQuietRefreshTracker::new(Utc::now());
+    let mut narrative_refresh_job: Option<AttachPlanNarrativeRefreshJob> = None;
 
     let result = loop {
         let mut tick = AttachTickTiming::new(AttachSurface::Plan, AttachTickBudget::default());
@@ -22552,6 +22681,9 @@ async fn attach_plan_tui(
         let stage_started = Instant::now();
         messages = read_plan_messages(paths, plan_id).unwrap_or_default();
         tick.record_since(AttachLoopStage::PlanMessages, stage_started);
+        if let Some(notice) = poll_plan_narrative_refresh_job(&mut narrative_refresh_job).await {
+            narrative_notice = Some(notice);
+        }
         if selected >= plan.tasks.len() {
             selected = plan.tasks.len().saturating_sub(1);
         }
@@ -22570,26 +22702,20 @@ async fn attach_plan_tui(
             && view.is_narrative()
         {
             let stage_started = Instant::now();
-            narrative_notice = Some(
-                refresh_plan_narrative_with_provider_for_kind(PlanNarrativeProviderRefresh {
-                    paths,
-                    plan: &plan,
-                    messages: &messages,
-                    plan_events: &plan_events,
-                    feed_events: &feed_events,
-                    selected,
-                    config: &narrative_config,
-                    kind,
-                })
-                .await
-                .map(|notice| format!("{}: {notice}", kind.label()))
-                .unwrap_or_else(|err| {
-                    format!(
-                        "provider refresh failed: {}",
-                        one_line(&err.to_string(), 120)
-                    )
-                }),
-            );
+            let refresh_input = PlanNarrativeRefreshInput {
+                paths,
+                plan: &plan,
+                messages: &messages,
+                plan_events: &plan_events,
+                feed_events: &feed_events,
+                selected,
+                config: &narrative_config,
+            };
+            narrative_notice = Some(start_or_coalesce_plan_narrative_refresh_job(
+                &mut narrative_refresh_job,
+                plan_narrative_refresh_request(&refresh_input, kind),
+                now,
+            ));
             tick.record_since(AttachLoopStage::ProviderNarrativeRefresh, stage_started);
         }
         let stage_started = Instant::now();
@@ -22628,8 +22754,25 @@ async fn attach_plan_tui(
                 }
                 Event::Key(key) if key.code == KeyCode::Char('r') && key.modifiers.is_empty() => {
                     view = AttachViewMode::Narrative;
-                    narrative_notice =
-                        Some("manual refresh: contacting narrative provider".to_string());
+                    let stage_started = Instant::now();
+                    let refresh_input = PlanNarrativeRefreshInput {
+                        paths,
+                        plan: &plan,
+                        messages: &messages,
+                        plan_events: &plan_events,
+                        feed_events: &feed_events,
+                        selected,
+                        config: &narrative_config,
+                    };
+                    narrative_notice = Some(start_or_coalesce_plan_narrative_refresh_job(
+                        &mut narrative_refresh_job,
+                        plan_narrative_refresh_request(
+                            &refresh_input,
+                            NarrativeRefreshKind::Manual,
+                        ),
+                        Utc::now(),
+                    ));
+                    tick.record_since(AttachLoopStage::ProviderNarrativeRefresh, stage_started);
                     let stage_started = Instant::now();
                     terminal.draw(|frame| {
                         render_plan_attach(
@@ -22649,26 +22792,6 @@ async fn attach_plan_tui(
                         )
                     })?;
                     tick.record_since(AttachLoopStage::Draw, stage_started);
-                    let stage_started = Instant::now();
-                    narrative_notice = Some(
-                        refresh_plan_narrative_with_provider(
-                            paths,
-                            &plan,
-                            &messages,
-                            &plan_events,
-                            &feed_events,
-                            selected,
-                            &narrative_config,
-                        )
-                        .await
-                        .unwrap_or_else(|err| {
-                            format!(
-                                "provider refresh failed: {}",
-                                one_line(&err.to_string(), 120)
-                            )
-                        }),
-                    );
-                    tick.record_since(AttachLoopStage::ProviderNarrativeRefresh, stage_started);
                 }
                 Event::Key(key)
                     if matches!(
@@ -22696,6 +22819,11 @@ async fn attach_plan_tui(
                             plan_id: plan.plan_id.clone(),
                             task_id: task.task_id.clone(),
                         });
+                        if cancel_plan_narrative_refresh_job(&mut narrative_refresh_job) {
+                            narrative_notice = Some(
+                                "plan refresh cancelled while opening child attach".to_string(),
+                            );
+                        }
                         suspend_tui(&mut terminal)?;
                         let child_result = attach_tui_with_parent(
                             paths,
@@ -22719,6 +22847,7 @@ async fn attach_plan_tui(
         }
     };
 
+    cancel_plan_narrative_refresh_job(&mut narrative_refresh_job);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -26557,28 +26686,6 @@ async fn refresh_run_narrative_with_provider_for_kind_with_token(
     Ok(narrative_refresh_notice(&refreshed))
 }
 
-async fn refresh_plan_narrative_with_provider(
-    paths: &DeadreckonPaths,
-    plan: &Plan,
-    messages: &[PlanMessage],
-    plan_events: &[PlanEvent],
-    feed_events: &[PlanFeedEvent],
-    selected: usize,
-    config: &NarrativeAttachConfig,
-) -> Result<String> {
-    refresh_plan_narrative_with_provider_for_kind(PlanNarrativeProviderRefresh {
-        paths,
-        plan,
-        messages,
-        plan_events,
-        feed_events,
-        selected,
-        config,
-        kind: NarrativeRefreshKind::Manual,
-    })
-    .await
-}
-
 struct PlanNarrativeProviderRefresh<'a> {
     paths: &'a DeadreckonPaths,
     plan: &'a Plan,
@@ -26588,6 +26695,7 @@ struct PlanNarrativeProviderRefresh<'a> {
     selected: usize,
     config: &'a NarrativeAttachConfig,
     kind: NarrativeRefreshKind,
+    cancellation_token: Option<CancellationToken>,
 }
 
 async fn refresh_plan_narrative_with_provider_for_kind(
@@ -26602,6 +26710,7 @@ async fn refresh_plan_narrative_with_provider_for_kind(
         selected,
         config,
         kind,
+        cancellation_token,
     } = request;
     let projection = narrative::ensure_plan_projection(&narrative::PlanNarrativeInput {
         paths,
@@ -26624,7 +26733,7 @@ async fn refresh_plan_narrative_with_provider_for_kind(
             output_path: paths
                 .plan_dir(&plan.plan_id)
                 .join("narrative/provider-refresh.out"),
-            cancellation_token: None,
+            cancellation_token,
         })
         .await?;
     narrative::persist_plan_projection(paths, plan, &refreshed)?;
@@ -27706,29 +27815,30 @@ mod tui_tests {
     use super::{
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachLoopStage,
         AttachNarrativeRefreshState, AttachPanel, AttachPanelCounts, AttachPanelRows,
-        AttachParentPlan, AttachSurface, AttachTickBudget, AttachTickTiming, AttachTuiState,
-        AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG, ChainAttachTuiState,
-        CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS, LiveFile,
-        NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker, NarrativeRefreshKind,
-        NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent, ProviderActivity,
-        ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines, attach_banner,
-        attach_header_text, attach_loop_stage_work, attach_should_return_to_plan,
-        chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-        chain_narrative_refusal_text, chain_should_auto_attach, chain_step_dot,
-        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
-        cli_wait_status_line, collect_jsonl_provider_activity, command_discovery,
-        completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
-        deadreckoning_status_text, doc_polish_preview_text, implementation_plan_warnings,
-        kill_banner, live_file_lines, markdown_to_tui_lines, max_panel_scroll, meter_color,
-        narrative_provider_selection, orchestration_dependency_rows,
+        AttachParentPlan, AttachPlanNarrativeRefreshJob, AttachSurface, AttachTickBudget,
+        AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG,
+        ChainAttachTuiState, CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS,
+        LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
+        NarrativeRefreshKind, NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent,
+        PlanNarrativeRefreshInput, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
+        acceptance_activity_lines, attach_banner, attach_header_text, attach_loop_stage_work,
+        attach_should_return_to_plan, cancel_plan_narrative_refresh_job, chain_activity_lines,
+        chain_attach_footer_text, chain_attach_header_text, chain_narrative_refusal_text,
+        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
+        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
+        command_discovery, completion_action_from_input, completion_hints_enabled,
+        deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
+        implementation_plan_warnings, kill_banner, live_file_lines, markdown_to_tui_lines,
+        max_panel_scroll, meter_color, narrative_provider_selection, orchestration_dependency_rows,
         orchestration_parallelism_lines, orchestration_provider_role_rows,
         orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
-        plan_merge_repair_summary_items, plan_narrative_refresh_trigger,
-        provider_ingest_base_roots, provider_jsonl_activity_lines,
+        plan_merge_repair_summary_items, plan_narrative_refresh_request,
+        plan_narrative_refresh_trigger, provider_ingest_base_roots, provider_jsonl_activity_lines,
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
         render_attach, render_plan_attach, run_narrative_json_text, run_narrative_plain_text,
-        run_narrative_refresh_trigger, threshold_color,
+        run_narrative_refresh_trigger, start_or_coalesce_plan_narrative_refresh_job,
+        threshold_color,
     };
     use crate::cli::{Cli, CliPlanMode};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -27966,6 +28076,113 @@ mod tui_tests {
             state.narrative_notice.as_deref(),
             Some("provider narrative refreshed")
         );
+    }
+
+    #[test]
+    fn plan_attach_manual_refresh_does_not_block_quit() {
+        let token = CancellationToken::new();
+        let refresh =
+            AttachNarrativeRefreshState::new(NarrativeRefreshKind::Manual, Utc::now(), token);
+
+        let notice = refresh.start_notice();
+
+        assert_eq!(
+            attach_loop_stage_work(
+                AttachSurface::Plan,
+                AttachLoopStage::ProviderNarrativeRefresh
+            ),
+            AttachWorkMode::Background
+        );
+        assert!(notice.contains("background"));
+        assert!(notice.contains("q detaches immediately"));
+    }
+
+    #[test]
+    fn plan_attach_event_refresh_spawns_background_job() {
+        let (_, _, plan) = full_plan_fixture(2);
+        let event = PlanEvent {
+            timestamp: Utc::now(),
+            plan_id: plan.plan_id.clone(),
+            event: PlanEventKind::TaskCompleted {
+                task_id: "task-0".to_string(),
+                task_index: 0,
+                run_id: Some("run-1".to_string()),
+                status: "completed".to_string(),
+            },
+        };
+        let kind =
+            plan_narrative_refresh_trigger(&[PlanFeedEvent::Plan { event }]).expect("trigger");
+        let refresh = AttachNarrativeRefreshState::new(kind, Utc::now(), CancellationToken::new());
+
+        let notice = refresh.start_notice();
+
+        assert_eq!(kind, NarrativeRefreshKind::Event("plan child completed"));
+        assert!(notice.contains("plan child completed"));
+        assert!(notice.contains("background"));
+    }
+
+    #[tokio::test]
+    async fn plan_attach_refresh_coalesces_by_plan_id() {
+        let (_, paths, plan) = full_plan_fixture(2);
+        let started_at = Utc::now();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(async { "stale refresh".to_string() });
+        let mut job = Some(AttachPlanNarrativeRefreshJob {
+            plan_id: plan.plan_id.clone(),
+            state: AttachNarrativeRefreshState::new(
+                NarrativeRefreshKind::Manual,
+                started_at,
+                token,
+            ),
+            handle,
+        });
+        let narrative_config = Default::default();
+        let refresh_input = PlanNarrativeRefreshInput {
+            paths: &paths,
+            plan: &plan,
+            messages: &[],
+            plan_events: &[],
+            feed_events: &[],
+            selected: 0,
+            config: &narrative_config,
+        };
+        let request = plan_narrative_refresh_request(
+            &refresh_input,
+            NarrativeRefreshKind::Event("plan child completed"),
+        );
+
+        let notice = start_or_coalesce_plan_narrative_refresh_job(
+            &mut job,
+            request,
+            started_at + ChronoDuration::seconds(3),
+        );
+
+        let active = job.as_ref().expect("job remains active");
+        assert_eq!(active.plan_id, plan.plan_id);
+        assert_eq!(active.state.kind, NarrativeRefreshKind::Manual);
+        assert_eq!(active.state.coalesced_requests, 1);
+        assert!(notice.contains("coalesced plan child completed"));
+        assert!(cancel_plan_narrative_refresh_job(&mut job));
+    }
+
+    #[tokio::test]
+    async fn plan_attach_child_drill_cancels_or_suspends_refresh_cleanly() {
+        let (_, _, plan) = full_plan_fixture(2);
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(async { std::future::pending::<String>().await });
+        let mut job = Some(AttachPlanNarrativeRefreshJob {
+            plan_id: plan.plan_id,
+            state: AttachNarrativeRefreshState::new(
+                NarrativeRefreshKind::Event("plan child completed"),
+                Utc::now(),
+                token.clone(),
+            ),
+            handle,
+        });
+
+        assert!(cancel_plan_narrative_refresh_job(&mut job));
+        assert!(job.is_none());
+        assert!(token.is_cancelled());
     }
 
     fn line_text(line: &Line<'_>) -> String {
