@@ -16,6 +16,7 @@
 - Added focused plain/JSON narrative attach coverage, including deterministic non-TTY fallback behavior and the explicit chain unsupported response.
 - Added acceptance proof/progress citations to run narrative projections so failed done criteria point at the immutable acceptance artifact instead of only generic run state.
 - Added focused run TUI mode coverage for narrative/activity toggling, visual cycling, narrow-terminal footers, and completed-run docs staying separate from narrative attach.
+- Added command-level narrative attach smokes for flight-backed run output, two-child plan agent visuals, and completed-run docs separation.
 - Added focused coverage for narrative schemas, malformed snapshot tolerance, redaction, claim validation, graph validation, provider refresh validation, cadence/budget decisions, deterministic fallback, and plain map rendering.
 
 ## Self-Improvement Loop (alpha) - 2026-05-26
