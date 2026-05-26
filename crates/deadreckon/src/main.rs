@@ -27889,6 +27889,85 @@ mod tui_tests {
         assert!(token.is_cancelled());
     }
 
+    #[test]
+    fn run_attach_event_refresh_spawns_background_job() {
+        let token = CancellationToken::new();
+        let refresh = AttachNarrativeRefreshState::new(
+            NarrativeRefreshKind::Event("run completed"),
+            Utc::now(),
+            token,
+        );
+
+        let notice = refresh.start_notice();
+
+        assert!(notice.contains("run completed"));
+        assert!(notice.contains("background"));
+    }
+
+    #[test]
+    fn run_attach_quiet_refresh_does_not_block_frame_draw() {
+        assert_eq!(
+            attach_loop_stage_work(
+                AttachSurface::Run,
+                AttachLoopStage::ProviderNarrativeRefresh
+            ),
+            AttachWorkMode::Background
+        );
+        assert_eq!(
+            NarrativeRefreshKind::QuietThreshold.label(),
+            "quiet threshold"
+        );
+    }
+
+    #[test]
+    fn run_attach_auto_refresh_skips_when_manual_refresh_in_flight() {
+        let token = CancellationToken::new();
+        let started_at = Utc::now();
+        let mut refresh =
+            AttachNarrativeRefreshState::new(NarrativeRefreshKind::Manual, started_at, token);
+
+        let notice = refresh.coalesce(
+            NarrativeRefreshKind::QuietThreshold,
+            started_at + ChronoDuration::seconds(2),
+        );
+
+        assert_eq!(refresh.kind, NarrativeRefreshKind::Manual);
+        assert_eq!(refresh.coalesced_requests, 1);
+        assert!(notice.contains("coalesced quiet threshold"));
+    }
+
+    #[test]
+    fn run_attach_refresh_failure_remains_visible_until_replaced() {
+        let counts = AttachPanelCounts {
+            activity: 1,
+            files: 0,
+            processes: 0,
+        };
+        let rows = AttachPanelRows {
+            activity: 3,
+            files: 0,
+            processes: 0,
+        };
+        let mut state = AttachTuiState::default();
+        state.record_narrative_refresh("provider refresh failed: timeout".to_string());
+        state.handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            counts,
+            rows,
+        );
+        assert_eq!(
+            state.narrative_notice.as_deref(),
+            Some("provider refresh failed: timeout")
+        );
+
+        state.record_narrative_refresh("provider narrative refreshed".to_string());
+
+        assert_eq!(
+            state.narrative_notice.as_deref(),
+            Some("provider narrative refreshed")
+        );
+    }
+
     fn line_text(line: &Line<'_>) -> String {
         line.spans
             .iter()
