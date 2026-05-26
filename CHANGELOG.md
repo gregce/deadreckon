@@ -1,5 +1,12 @@
 # Changelog
 
+## Provider flight recorder and checkpoint rewind (alpha) - 2026-05-25
+
+- Added durable `flight-manifest.json`, `flight-events.jsonl`, `checkpoints/<id>/`, and `rewind-events.jsonl` files for CLI-backed provider runs, with normalized provider-native events and delta checkpoints.
+- Wrapped CLI provider execution in a polling flight recorder sidecar that ingests descriptor logs, watches working-tree changes, captures tool/quiet/exit checkpoints, and marks rerun sessions as superseded.
+- Added `deadreckon show <run-id> --flight`, `deadreckon show <run-id> --file <path>`, and preview-first `deadreckon rewind` target resolution with hash-guarded `--apply`.
+- Routed attach/TUI provider activity through flight events while keeping descriptor provider-log lines as the live fallback during long CLI subprocesses.
+
 ## Provider and done-criteria setup unification (alpha) - 2026-05-24
 
 - Added a shared runtime setup resolver for provider roles and done-criteria sources so `init`, `config provider`, `run`, `extend`, `resume`, `orchestrate`, and doc polish use the same source labels, unknown-provider refusals, credential/install hints, and preview vocabulary.

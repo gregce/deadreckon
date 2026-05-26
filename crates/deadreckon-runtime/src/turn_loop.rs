@@ -12,7 +12,9 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::IoContext;
+use crate::flight::{ProviderFlightRecorder, ProviderFlightRecorderHandle};
 use crate::polish::{PolishConfig, polish_run_docs};
+use deadreckon_core::FlightSessionStatus;
 use deadreckon_core::artifacts::{
     ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
     inventory_files, snapshot_working,
@@ -141,14 +143,20 @@ pub async fn run_turn_loop(
             RunEventKind::TurnStarted { turn },
         )?;
         snapshot_working(state, turn.saturating_sub(1))?;
-        let prompt = if config.provider.as_deref().is_some_and(is_cli_provider_name) {
+        let selected_provider = config
+            .provider
+            .clone()
+            .or_else(|| router.selected_route_info().map(|route| route.name));
+        let prompt = if selected_provider
+            .as_deref()
+            .is_some_and(is_cli_provider_name)
+        {
             build_cli_subagent_prompt(state, &history)
         } else {
             build_prompt(state, &history)
         };
         let turn_dir = state.run_root.join("turns").join(format!("turn-{turn}"));
-        let stdout_name = config
-            .provider
+        let stdout_name = selected_provider
             .as_deref()
             .map(provider_output_name)
             .unwrap_or_else(|| "provider.out".to_string());
@@ -167,24 +175,48 @@ pub async fn run_turn_loop(
             cancellation_token: Some(turn_token.clone()),
         };
 
+        let mut flight_recorder: Option<ProviderFlightRecorderHandle> =
+            match selected_provider.as_deref() {
+                Some(provider) if is_cli_provider_name(provider) => {
+                    ProviderFlightRecorder::start(state, provider, &config.docs.home, turn)?
+                        .map(|recorder| recorder.spawn(state.clone()))
+                }
+                _ => None,
+            };
         let started = Instant::now();
         let response = match router.complete(&request).await {
             Ok(response) => response,
             Err(err) if should_cancel_run(state, &run_token) => {
+                if let Some(recorder) = flight_recorder.take() {
+                    recorder.finish(state, FlightSessionStatus::Killed).await?;
+                }
                 state.status = deadreckon_core::state::RunStatus::Killed;
                 state.failure_reason = Some(format!("run cancelled during provider call: {err}"));
                 save_state(state)?;
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
                 return Ok(RunLoopOutcome::Killed);
             }
-            Err(err) => return Err(provider_error(&err)),
+            Err(err) => {
+                if let Some(recorder) = flight_recorder.take() {
+                    recorder.finish(state, FlightSessionStatus::Failed).await?;
+                }
+                return Err(provider_error(&err));
+            }
         };
         if should_cancel_run(state, &run_token) {
+            if let Some(recorder) = flight_recorder.take() {
+                recorder.finish(state, FlightSessionStatus::Killed).await?;
+            }
             state.status = deadreckon_core::state::RunStatus::Killed;
             state.failure_reason = Some("run cancelled after provider call".to_string());
             save_state(state)?;
             emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
             return Ok(RunLoopOutcome::Killed);
+        }
+        if let Some(recorder) = flight_recorder.take() {
+            recorder
+                .finish(state, FlightSessionStatus::Completed)
+                .await?;
         }
         let provider_trace_id = format!("llm-turn-{turn}");
         append_trace(
@@ -1515,7 +1547,10 @@ mod tests {
     use deadreckon_core::events::{RunEventBus, RunEventKind};
     use deadreckon_core::paths::DeadreckonPaths;
     use deadreckon_core::state::{RunOptions, RunStatus, create_run};
-    use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
+    use deadreckon_core::{
+        FlightEventKind, TurnDocInput, append_turn_doc, implementation_notes_path,
+        list_checkpoint_manifests, read_flight_events, read_flight_manifest,
+    };
 
     use super::{
         RunLoopConfig, RunLoopDocsConfig, append_tool_refusal, bash_policy_refusal,
@@ -1884,6 +1919,132 @@ mod tests {
         let events = std::fs::read_to_string(state.run_root.join("events.jsonl")).expect("events");
         assert!(events.contains("\"kind\":\"docs_checkpoint\""));
         assert!(events.contains("\"status\":\"turn-end\""));
+    }
+
+    #[tokio::test]
+    async fn cli_provider_run_writes_flight_manifest_events_and_checkpoint() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        std::fs::create_dir_all(paths.home().join("providers.d")).expect("providers");
+        let provider_logs = temp.path().join("provider-logs");
+        std::fs::create_dir_all(&provider_logs).expect("provider logs");
+        let script = temp.path().join("flight-provider.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"mkdir -p src
+printf 'pub fn value() -> u8 {{ 42 }}\n' > src/lib.rs
+mkdir -p "{}"
+printf '%s\n' '{{"type":"tool_call","tool_name":"write_file","path":"src/lib.rs","message":"wrote source"}}' > "{}/session.jsonl"
+printf 'done\n'
+"#,
+                provider_logs.display(),
+                provider_logs.display()
+            ),
+        )
+        .expect("script");
+        std::fs::write(
+            paths.home().join("providers.d/test-flight.toml"),
+            format!(
+                r#"
+id = "cli:test-flight"
+display_name = "Test Flight"
+kind = "cli"
+default_binary = "/bin/sh"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["{}", "{{prompt}}"]
+
+[ingest]
+default_dirs = ["{}"]
+schema = "test-flight"
+file_glob = "*.jsonl"
+storage = "jsonl"
+"#,
+                script.display(),
+                provider_logs.display()
+            ),
+        )
+        .expect("descriptor");
+        let config_path = paths.home().join("config.toml");
+        std::fs::write(&config_path, "default_provider = \"cli:test-flight\"\n").expect("config");
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "record cli provider".to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let router = ProviderRouter::from_config_path(&config_path, None).expect("router");
+
+        let _ = run_turn_loop(
+            &mut state,
+            &router,
+            RunLoopConfig {
+                provider: None,
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                sandbox_backend: SandboxBackend::None,
+                max_turns: 1,
+                from_turn: None,
+                event_sender: None,
+                cancellation_token: None,
+                docs: RunLoopDocsConfig {
+                    home: paths.home().to_path_buf(),
+                    config_path: Some(config_path),
+                    doc_provider: None,
+                    doc_provider_source: None,
+                    doc_subskills: Vec::new(),
+                    token_budget: 0,
+                    budget_cap_usd: None,
+                    doc_skill: "run-narrator".to_string(),
+                    no_docs: true,
+                },
+            },
+        )
+        .await
+        .expect("loop");
+
+        let manifest = read_flight_manifest(&state)
+            .expect("manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.sessions.len(), 1);
+        assert_eq!(manifest.sessions[0].provider, "cli:test-flight");
+        assert_eq!(
+            manifest.sessions[0].status,
+            deadreckon_core::FlightSessionStatus::Completed
+        );
+        let events = read_flight_events(&state).expect("flight events");
+        assert!(events.iter().any(|event| {
+            event.kind == FlightEventKind::Tool && event.files == vec![PathBuf::from("src/lib.rs")]
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == FlightEventKind::Checkpoint)
+        );
+        let checkpoints = list_checkpoint_manifests(&state).expect("checkpoints");
+        assert_eq!(checkpoints.len(), 1);
+        assert!(
+            checkpoints[0]
+                .files
+                .iter()
+                .any(|change| change.path == Path::new("src/lib.rs"))
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 mod error;
 
+pub mod flight;
 pub mod polish;
 pub mod turn_loop;
 

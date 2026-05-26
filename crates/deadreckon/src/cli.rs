@@ -1270,6 +1270,31 @@ pub(crate) enum Commands {
         turn: Option<u32>,
     },
     #[command(
+        next_help_heading = "Cleanup And Recovery",
+        about = "Preview or apply a provider checkpoint rewind"
+    )]
+    Rewind {
+        #[arg(help = "Run id, unique prefix, or latest")]
+        run_id: String,
+        #[arg(long, help = "Rewind to the last provider checkpoint for this turn")]
+        to_turn: Option<u32>,
+        #[arg(
+            long,
+            help = "Rewind to the checkpoint attached to this provider event"
+        )]
+        to_provider_event: Option<u64>,
+        #[arg(long, help = "Rewind to this checkpoint id")]
+        to_checkpoint: Option<String>,
+        #[arg(long, help = "Preview the rewind without changing files")]
+        preview: bool,
+        #[arg(long, help = "Apply the rewind after hash-guarding changed files")]
+        apply: bool,
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
+        plain: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+    #[command(
         next_help_heading = "Inspect And Import",
         hide = true,
         visible_alias = "inspect",
@@ -1287,6 +1312,14 @@ pub(crate) enum Commands {
         plain: bool,
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
+        #[arg(long, help = "Show provider-native flight events and checkpoints")]
+        flight: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Show flight/checkpoint activity for a file"
+        )]
+        file: Option<PathBuf>,
     },
     #[command(
         next_help_heading = "Inspect And Import",

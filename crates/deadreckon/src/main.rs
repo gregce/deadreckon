@@ -43,27 +43,31 @@ use deadreckon_core::update_cache::{read_cache, write_cache};
 use deadreckon_core::{
     AcceptanceMarker, AcceptanceProgressEntry, ApplyMode, ApplyStrategy, BranchPolicy, Chain,
     ChainEvent, ChainEventKind, ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus,
-    CodebaseMode, CodebaseRecord, ConductorState, CoordinatorChild, CoordinatorState,
-    DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DeadreckonError, DeadreckonPaths,
-    DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId,
-    PhaseStatus, Plan, PlanChildMarker, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
-    PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest,
-    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunListEntry, RunOptions,
-    RunStatus, SpendRecord, TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
+    CheckpointManifest, CodebaseMode, CodebaseRecord, ConductorState, CoordinatorChild,
+    CoordinatorState, DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DeadreckonError,
+    DeadreckonPaths, DocKind, DocProviderSelection, DocProviderSource, DocsStatus, FlightEvent,
+    FlightEventKind, FlightSessionStatus, ModeFlags, OnFail, PhaseId, PhaseStatus, Plan,
+    PlanChildMarker, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind, PlanMode,
+    PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest,
+    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RewindEvent, RewindMode, RewindStatus,
+    RewindTarget, RewindTargetKind, RunEvent, RunListEntry, RunOptions, RunStatus, SpendRecord,
+    TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
     acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
     append_parent_narrative_update, append_plan_event, append_plan_message, append_provenance,
-    append_trace, apply_commit_body, cancel_marker_present,
-    chain_status_label as glossary_chain_status_label,
+    append_rewind_event, append_trace, apply_commit_body, build_working_file_index,
+    cancel_marker_present, chain_status_label as glossary_chain_status_label,
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
-    docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files, list_runs,
-    load_chain, load_plan, load_run, marker_path_for_run_root, pid_is_alive, plan_status_label,
+    docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files,
+    list_checkpoint_manifests, list_runs, load_chain, load_plan, load_run,
+    marker_path_for_run_root, materialize_checkpoint, pid_is_alive, plan_status_label,
     plan_task_status_label, prepare_worktree_record, preview_git_state, promote_completed_run,
-    read_chain_step_marker, read_codebase_record, read_plan_messages, record_for_resolved_mode,
-    release_lock_file, resolve_mode, restore_snapshot, run_status_label, save_chain, save_plan,
-    save_state, terminate_pid, validate_acceptance_marker, validate_task_count,
-    write_acceptance_marker, write_cancel_marker, write_chain_step_marker, write_child_summary,
-    write_coordinator_state, write_plan_child_marker, write_worker_spec,
+    read_chain_step_marker, read_codebase_record, read_flight_events, read_flight_manifest,
+    read_plan_messages, record_for_resolved_mode, release_lock_file, resolve_mode,
+    restore_snapshot, run_status_label, save_chain, save_plan, save_state, terminate_pid,
+    validate_acceptance_marker, validate_task_count, write_acceptance_marker, write_cancel_marker,
+    write_chain_step_marker, write_child_summary, write_coordinator_state, write_plan_child_marker,
+    write_worker_spec,
 };
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
@@ -716,15 +720,48 @@ async fn main_inner() -> Result<()> {
             resume_command(run_id, from_turn, max_wall_seconds, no_docs, plain).await
         }
         Commands::Undo { run, turn } => undo_command(run, turn),
+        Commands::Rewind {
+            run_id,
+            to_turn,
+            to_provider_event,
+            to_checkpoint,
+            preview,
+            apply,
+            plain,
+            json,
+        } => {
+            ui::set_plain_output(plain);
+            rewind_command(
+                &run_id,
+                &RewindCliOptions {
+                    to_turn,
+                    to_provider_event,
+                    to_checkpoint,
+                    preview,
+                    apply,
+                    json,
+                },
+            )
+        }
         Commands::Show {
             run_id,
             turn,
             why_failed,
             plain,
             json,
+            flight,
+            file,
         } => {
             ui::set_plain_output(plain);
-            show_command(&run_id, turn, why_failed, plain, json)
+            show_command(
+                &run_id,
+                turn,
+                why_failed,
+                plain,
+                json,
+                flight,
+                file.as_deref(),
+            )
         }
         Commands::History { command } => history_command(command),
         Commands::Status {
@@ -1556,10 +1593,8 @@ fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String>
 }
 
 fn setup_refusal_error(refusal: setup::SetupRefusal) -> CliError {
-    CliError::Core(deadreckon_core::user_error(
-        &refusal.message,
-        &refusal.try_line,
-    ))
+    let setup::SetupRefusal { message, try_line } = refusal;
+    CliError::Core(deadreckon_core::user_error(&message, &try_line))
 }
 
 fn provider_setup_selection(
@@ -4261,7 +4296,7 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
                             .get(tui_state.selected_step)
                             .and_then(|step| step.run_id.clone())
                         {
-                            let _ = show_command(&run_id, None, false, false, false);
+                            let _ = show_command(&run_id, None, false, false, false, false, None);
                         } else {
                             eprintln!("selected step has no run yet");
                         }
@@ -16788,6 +16823,345 @@ fn undo_restore_state(
 }
 
 #[derive(Debug)]
+struct RewindCliOptions {
+    to_turn: Option<u32>,
+    to_provider_event: Option<u64>,
+    to_checkpoint: Option<String>,
+    preview: bool,
+    apply: bool,
+    json: bool,
+}
+
+#[derive(Debug)]
+struct ResolvedRewindTarget {
+    target: RewindTarget,
+    checkpoint_id: String,
+}
+
+fn rewind_command(run_id: &str, options: &RewindCliOptions) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let state = load_cli_run(&paths, run_id)?;
+    let mode = rewind_mode(options)?;
+    let resolved = resolve_rewind_target(&state, options)?;
+    let checkpoint = read_checkpoint_by_id(&state, &resolved.checkpoint_id)?;
+    let preview_dir = state
+        .run_root
+        .join("rewind-preview")
+        .join(&resolved.checkpoint_id);
+    materialize_checkpoint(&state, &resolved.checkpoint_id, &preview_dir)?;
+    let files = changed_files_between_dirs(&state.working_dir, &preview_dir)?;
+
+    if mode == RewindMode::Apply {
+        ensure_checkpoint_applyable(&state, &checkpoint)?;
+        if let Err(reason) = hash_guard_rewind_apply(&state, &preview_dir, &files) {
+            append_rewind_event(
+                &state,
+                &RewindEvent {
+                    version: 1,
+                    timestamp: Utc::now(),
+                    run_id: state.run_id.clone(),
+                    target: resolved.target,
+                    mode,
+                    status: RewindStatus::Refused,
+                    files: files.clone(),
+                    reason: Some(reason.clone()),
+                },
+            )?;
+            return Err(CliError::Core(DeadreckonError::InvalidInput(reason)));
+        }
+        apply_materialized_files(&state, &preview_dir, &files)?;
+    }
+
+    append_rewind_event(
+        &state,
+        &RewindEvent {
+            version: 1,
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            target: resolved.target.clone(),
+            mode,
+            status: RewindStatus::Ok,
+            files: files.clone(),
+            reason: None,
+        },
+    )?;
+
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "run_id": state.run_id,
+                "mode": rewind_mode_label(mode),
+                "target": resolved.target,
+                "checkpoint_id": resolved.checkpoint_id,
+                "preview_dir": preview_dir,
+                "files": files,
+            }))?
+        );
+        return Ok(());
+    }
+
+    match mode {
+        RewindMode::Preview => {
+            println!(
+                "rewind preview {} -> {}",
+                resolved.checkpoint_id,
+                preview_dir.display()
+            );
+        }
+        RewindMode::Apply => {
+            println!("rewound {} to {}", state.run_id, resolved.checkpoint_id);
+        }
+    }
+    if files.is_empty() {
+        println!("files: none");
+    } else {
+        println!("files:");
+        for path in files {
+            println!("  {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn rewind_mode(options: &RewindCliOptions) -> Result<RewindMode> {
+    if options.preview && options.apply {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "choose only one of --preview or --apply".to_string(),
+        )));
+    }
+    if options.apply {
+        Ok(RewindMode::Apply)
+    } else {
+        Ok(RewindMode::Preview)
+    }
+}
+
+fn resolve_rewind_target(
+    state: &deadreckon_core::PipelineState,
+    options: &RewindCliOptions,
+) -> Result<ResolvedRewindTarget> {
+    let target_count = usize::from(options.to_turn.is_some())
+        + usize::from(options.to_provider_event.is_some())
+        + usize::from(options.to_checkpoint.is_some());
+    if target_count != 1 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "choose exactly one of --to-turn, --to-provider-event, or --to-checkpoint".to_string(),
+        )));
+    }
+    let checkpoints = list_checkpoint_manifests(state)?;
+    if checkpoints.is_empty() {
+        return Err(CliError::Core(DeadreckonError::NotFound(
+            "no provider checkpoints for run".to_string(),
+        )));
+    }
+
+    if let Some(checkpoint_id) = options.to_checkpoint.as_ref() {
+        if checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.checkpoint_id == *checkpoint_id)
+        {
+            return Ok(ResolvedRewindTarget {
+                target: RewindTarget {
+                    kind: RewindTargetKind::Checkpoint,
+                    id: checkpoint_id.clone(),
+                },
+                checkpoint_id: checkpoint_id.clone(),
+            });
+        }
+        return Err(CliError::Core(DeadreckonError::NotFound(format!(
+            "checkpoint {checkpoint_id}"
+        ))));
+    }
+
+    if let Some(turn) = options.to_turn {
+        let Some(checkpoint) = checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.deadreckon_turn == turn)
+            .max_by(|left, right| left.checkpoint_id.cmp(&right.checkpoint_id))
+        else {
+            return Err(CliError::Core(DeadreckonError::NotFound(format!(
+                "checkpoint for turn {turn}"
+            ))));
+        };
+        return Ok(ResolvedRewindTarget {
+            target: RewindTarget {
+                kind: RewindTargetKind::Turn,
+                id: turn.to_string(),
+            },
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+        });
+    }
+
+    let Some(seq) = options.to_provider_event else {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "choose exactly one of --to-turn, --to-provider-event, or --to-checkpoint".to_string(),
+        )));
+    };
+    let events = read_flight_events(state)?;
+    let event = events
+        .iter()
+        .find(|event| event.seq == seq)
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::NotFound(format!("provider event {seq}")))
+        })?;
+    let checkpoint_id = event.checkpoint_id.clone().or_else(|| {
+        checkpoints
+            .iter()
+            .filter(|checkpoint| {
+                checkpoint.flight_session_id == event.flight_session_id
+                    && checkpoint.attempt == event.attempt
+                    && checkpoint
+                        .provider_event_seq
+                        .is_some_and(|value| value <= seq)
+            })
+            .max_by(|left, right| left.checkpoint_id.cmp(&right.checkpoint_id))
+            .map(|checkpoint| checkpoint.checkpoint_id.clone())
+    });
+    let Some(checkpoint_id) = checkpoint_id else {
+        return Err(CliError::Core(DeadreckonError::NotFound(format!(
+            "checkpoint for provider event {seq}"
+        ))));
+    };
+    Ok(ResolvedRewindTarget {
+        target: RewindTarget {
+            kind: RewindTargetKind::ProviderEvent,
+            id: seq.to_string(),
+        },
+        checkpoint_id,
+    })
+}
+
+fn read_checkpoint_by_id(
+    state: &deadreckon_core::PipelineState,
+    checkpoint_id: &str,
+) -> Result<CheckpointManifest> {
+    list_checkpoint_manifests(state)?
+        .into_iter()
+        .find(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::NotFound(format!(
+                "checkpoint {checkpoint_id}"
+            )))
+        })
+}
+
+fn ensure_checkpoint_applyable(
+    state: &deadreckon_core::PipelineState,
+    checkpoint: &CheckpointManifest,
+) -> Result<()> {
+    let manifest = read_flight_manifest(state)?.ok_or_else(|| {
+        CliError::Core(DeadreckonError::NotFound(
+            "flight-manifest.json for run".to_string(),
+        ))
+    })?;
+    let status = manifest
+        .sessions
+        .iter()
+        .find(|session| session.flight_session_id == checkpoint.flight_session_id)
+        .map(|session| session.status);
+    if matches!(status, Some(FlightSessionStatus::Superseded)) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "cannot apply a superseded checkpoint; inspect it with show --flight".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+fn hash_guard_rewind_apply(
+    state: &deadreckon_core::PipelineState,
+    target_dir: &Path,
+    files: &[PathBuf],
+) -> std::result::Result<(), String> {
+    let current = build_working_file_index(&state.working_dir).map_err(|err| err.to_string())?;
+    let expected_dir = latest_expected_current_dir(state).map_err(|err| err.to_string())?;
+    let expected = build_working_file_index(&expected_dir).map_err(|err| err.to_string())?;
+    let target = build_working_file_index(target_dir).map_err(|err| err.to_string())?;
+    for path in files {
+        let current_hash = current.files.get(path).map(|fingerprint| &fingerprint.hash);
+        let expected_hash = expected
+            .files
+            .get(path)
+            .map(|fingerprint| &fingerprint.hash);
+        let target_hash = target.files.get(path).map(|fingerprint| &fingerprint.hash);
+        if current_hash != expected_hash && current_hash != target_hash {
+            return Err(format!(
+                "refusing rewind because {} has unrelated edits",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn latest_expected_current_dir(state: &deadreckon_core::PipelineState) -> Result<PathBuf> {
+    let snapshot = state
+        .run_root
+        .join("snapshots")
+        .join(format!("turn-{}", state.turn));
+    if snapshot.exists() {
+        return Ok(snapshot);
+    }
+    let Some(checkpoint) = list_checkpoint_manifests(state)?
+        .into_iter()
+        .max_by(|left, right| left.checkpoint_id.cmp(&right.checkpoint_id))
+    else {
+        return Ok(state.working_dir.clone());
+    };
+    let expected_dir = state
+        .run_root
+        .join("rewind-preview")
+        .join(".expected-current");
+    materialize_checkpoint(state, &checkpoint.checkpoint_id, &expected_dir)?;
+    Ok(expected_dir)
+}
+
+fn changed_files_between_dirs(left: &Path, right: &Path) -> Result<Vec<PathBuf>> {
+    let left = build_working_file_index(left)?;
+    let right = build_working_file_index(right)?;
+    let paths = left
+        .files
+        .keys()
+        .chain(right.files.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    Ok(paths
+        .into_iter()
+        .filter(|path| {
+            left.files.get(path).map(|fingerprint| &fingerprint.hash)
+                != right.files.get(path).map(|fingerprint| &fingerprint.hash)
+        })
+        .collect())
+}
+
+fn apply_materialized_files(
+    state: &deadreckon_core::PipelineState,
+    target_dir: &Path,
+    files: &[PathBuf],
+) -> Result<()> {
+    for relative in files {
+        let source = target_dir.join(relative);
+        let dest = state.working_dir.join(relative);
+        if source.exists() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source, &dest)?;
+        } else if dest.exists() {
+            fs::remove_file(&dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewind_mode_label(mode: RewindMode) -> &'static str {
+    match mode {
+        RewindMode::Preview => "preview",
+        RewindMode::Apply => "apply",
+    }
+}
+
+#[derive(Debug)]
 struct WhyFailedReport {
     kind: &'static str,
     id: String,
@@ -16979,12 +17353,204 @@ fn show_run_why_failed(state: &deadreckon_core::PipelineState) -> Result<()> {
     Ok(())
 }
 
+fn show_flight(
+    state: &deadreckon_core::PipelineState,
+    turn: Option<u32>,
+    file: Option<&Path>,
+    json_output: bool,
+) -> Result<()> {
+    let manifest = read_flight_manifest(state)?;
+    let file_filter = file.and_then(|path| normalize_flight_file_filter(path, &state.working_dir));
+    let events = read_flight_events(state)?;
+    let checkpoints = list_checkpoint_manifests(state)?;
+    let filtered_checkpoints = checkpoints
+        .iter()
+        .filter(|checkpoint| turn.is_none_or(|turn| checkpoint.deadreckon_turn == turn))
+        .filter(|checkpoint| {
+            file_filter
+                .as_ref()
+                .is_none_or(|file| checkpoint_matches_file(checkpoint, file))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let checkpoint_ids = filtered_checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.checkpoint_id.clone())
+        .collect::<BTreeSet<_>>();
+    let filtered_events = events
+        .into_iter()
+        .filter(|event| turn.is_none_or(|turn| event.deadreckon_turn == turn))
+        .filter(|event| {
+            file_filter.as_ref().is_none_or(|file| {
+                event_matches_file(event, file)
+                    || event
+                        .checkpoint_id
+                        .as_ref()
+                        .is_some_and(|checkpoint_id| checkpoint_ids.contains(checkpoint_id))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "flight",
+                "id": &state.run_id,
+                "available": manifest.is_some(),
+                "turn": turn,
+                "file": file_filter,
+                "manifest": manifest,
+                "events": filtered_events,
+                "checkpoints": filtered_checkpoints,
+            }))?
+        );
+        return Ok(());
+    }
+
+    let Some(manifest) = manifest else {
+        println!(
+            "no flight recorder data for run {}",
+            run_prefix(&state.run_id)
+        );
+        println!("try: deadreckon show {}", run_prefix(&state.run_id));
+        return Ok(());
+    };
+
+    println!("flight {}", ui_id(run_prefix(&state.run_id)));
+    if let Some(turn) = turn {
+        println!("turn {turn}");
+    }
+    if let Some(file) = file_filter.as_ref() {
+        println!("file {}", file.display());
+    }
+
+    println!("sessions:");
+    for session in &manifest.sessions {
+        if turn.is_some_and(|turn| session.deadreckon_turn != turn) {
+            continue;
+        }
+        println!(
+            "  turn {} attempt {} {} {} schema {}",
+            session.deadreckon_turn,
+            session.attempt,
+            session.provider,
+            flight_session_status_label(session.status),
+            session.schema
+        );
+        for source in &session.source_paths {
+            println!(
+                "    source {}:{}-{} {}",
+                source.path.display(),
+                source.first_line,
+                source.last_line,
+                source.content_hash
+            );
+        }
+    }
+
+    println!("events:");
+    if filtered_events.is_empty() {
+        println!("  none");
+    }
+    for event in &filtered_events {
+        let checkpoint = event
+            .checkpoint_id
+            .as_deref()
+            .map(|id| format!(" checkpoint={id}"))
+            .unwrap_or_default();
+        let source = event
+            .source_path
+            .as_ref()
+            .zip(event.source_line)
+            .map(|(path, line)| format!(" {}:{line}", path.display()))
+            .unwrap_or_default();
+        println!(
+            "  #{:06} turn {} {}{}{} {}",
+            event.seq,
+            event.deadreckon_turn,
+            flight_event_kind_label(event.kind),
+            checkpoint,
+            source,
+            one_line(&event.summary, 120)
+        );
+    }
+
+    println!("checkpoints:");
+    if filtered_checkpoints.is_empty() {
+        println!("  none");
+    }
+    for checkpoint in &filtered_checkpoints {
+        println!(
+            "  {} turn {} attempt {} files {}{}",
+            checkpoint.checkpoint_id,
+            checkpoint.deadreckon_turn,
+            checkpoint.attempt,
+            checkpoint.files.len(),
+            if checkpoint.full_anchor {
+                " anchor"
+            } else {
+                ""
+            }
+        );
+        if file_filter.is_some() {
+            for change in &checkpoint.files {
+                println!("    {:?} {}", change.change, change.path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_flight_file_filter(path: &Path, working_dir: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        path.strip_prefix(working_dir).ok().map(Path::to_path_buf)
+    } else {
+        Some(path.to_path_buf())
+    }
+}
+
+fn event_matches_file(event: &FlightEvent, file: &Path) -> bool {
+    event.files.iter().any(|path| path == file)
+}
+
+fn checkpoint_matches_file(checkpoint: &CheckpointManifest, file: &Path) -> bool {
+    checkpoint.files.iter().any(|change| change.path == file)
+}
+
+fn flight_event_kind_label(kind: FlightEventKind) -> &'static str {
+    match kind {
+        FlightEventKind::Agent => "agent",
+        FlightEventKind::Thinking => "thinking",
+        FlightEventKind::Tool => "tool",
+        FlightEventKind::Result => "result",
+        FlightEventKind::Todo => "todo",
+        FlightEventKind::Tokens => "tokens",
+        FlightEventKind::Session => "session",
+        FlightEventKind::Checkpoint => "checkpoint",
+        FlightEventKind::Warning => "warning",
+        FlightEventKind::Error => "error",
+    }
+}
+
+fn flight_session_status_label(status: FlightSessionStatus) -> &'static str {
+    match status {
+        FlightSessionStatus::Running => "running",
+        FlightSessionStatus::Completed => "completed",
+        FlightSessionStatus::Failed => "failed",
+        FlightSessionStatus::Killed => "killed",
+        FlightSessionStatus::Superseded => "superseded",
+    }
+}
+
 fn show_command(
     run_id: &str,
     turn: Option<u32>,
     why_failed: bool,
     _plain: bool,
     json_output: bool,
+    flight: bool,
+    file: Option<&Path>,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut child_context: Option<PlanChildSelection> = None;
@@ -17025,6 +17591,9 @@ fn show_command(
             }
         }
     };
+    if flight || file.is_some() {
+        return show_flight(&state, turn, file, json_output);
+    }
     if json_output {
         let status = run_status_label(state.status);
         println!(
@@ -20132,7 +20701,9 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
                 }))
                 .await?
             }
-            Some(CompletionAction::Show) => show_command(&state.run_id, None, false, false, false)?,
+            Some(CompletionAction::Show) => {
+                show_command(&state.run_id, None, false, false, false, false, None)?
+            }
             Some(CompletionAction::Quit) | None => break,
         }
     }
@@ -21052,7 +21623,9 @@ async fn handle_tui_completion_key(
             }))
             .await
         }
-        CompletionAction::Show => show_command(&state.run_id, None, false, false, false),
+        CompletionAction::Show => {
+            show_command(&state.run_id, None, false, false, false, false, None)
+        }
         CompletionAction::Quit => Ok(()),
     };
     if let Err(err) = &action_result {
@@ -21698,10 +22271,62 @@ struct ProviderJsonlLogSpec {
 }
 
 fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> ProviderActivity {
+    let mut flight = collect_flight_provider_activity(state);
     let Some(spec) = provider_jsonl_log_spec(state) else {
+        return flight;
+    };
+    let fallback = collect_jsonl_provider_activity(state, &spec);
+    if flight.lines.is_empty() {
+        return fallback;
+    }
+    if !fallback.lines.is_empty() {
+        flight.lines.extend(
+            fallback
+                .lines
+                .into_iter()
+                .map(|line| format!("provider log {line}")),
+        );
+        flight.context_tokens = flight.context_tokens.or(fallback.context_tokens);
+        flight.context_window = flight.context_window.or(fallback.context_window);
+    }
+    cap_provider_activity(flight, 240)
+}
+
+fn collect_flight_provider_activity(state: &deadreckon_core::PipelineState) -> ProviderActivity {
+    let Ok(events) = read_flight_events(state) else {
         return ProviderActivity::default();
     };
-    collect_jsonl_provider_activity(state, &spec)
+    let mut activity = ProviderActivity::default();
+    for event in events {
+        if let Some(usage) = event.usage.as_ref() {
+            activity.context_tokens = Some(usage.input_tokens + usage.output_tokens);
+            activity.context_window = usage.context_window;
+        }
+        activity.lines.push(flight_activity_line(&event));
+    }
+    cap_provider_activity(activity, 240)
+}
+
+fn flight_activity_line(event: &FlightEvent) -> String {
+    let checkpoint = event
+        .checkpoint_id
+        .as_deref()
+        .map(|id| format!(" checkpoint {id}"))
+        .unwrap_or_default();
+    let file_count = if event.files.is_empty() {
+        String::new()
+    } else {
+        format!(" files {}", event.files.len())
+    };
+    format!(
+        "flight #{:06} turn {} {}{}{} {}",
+        event.seq,
+        event.deadreckon_turn,
+        flight_event_kind_label(event.kind),
+        checkpoint,
+        file_count,
+        one_line(&event.summary, 120)
+    )
 }
 
 fn provider_jsonl_log_spec(state: &deadreckon_core::PipelineState) -> Option<ProviderJsonlLogSpec> {
@@ -23998,6 +24623,180 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
 
 fn read_plan_events_lossy(paths: &DeadreckonPaths, plan_id: &str) -> Vec<PlanEvent> {
     read_jsonl::<PlanEvent>(&paths.plan_events(plan_id)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod flight_cli_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn checkpoint_fixture() -> (TempDir, deadreckon_core::PipelineState) {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "flight rewind".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        deadreckon_core::snapshot_working(&state, 0).expect("snapshot");
+        (temp, state)
+    }
+
+    fn write_manifest(state: &deadreckon_core::PipelineState, status: FlightSessionStatus) {
+        let mut manifest = deadreckon_core::FlightManifest::new(state.run_id.clone());
+        manifest.sessions.push(deadreckon_core::FlightSession {
+            flight_session_id: "flight-turn-1-attempt-1".to_string(),
+            provider: "cli:test".to_string(),
+            schema: "test".to_string(),
+            deadreckon_turn: 1,
+            attempt: 1,
+            status,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            source_paths: Vec::new(),
+        });
+        deadreckon_core::write_flight_manifest(state, &manifest).expect("manifest");
+    }
+
+    fn capture_fixture_checkpoint(state: &deadreckon_core::PipelineState) {
+        let before = build_working_file_index(&state.working_dir).expect("before");
+        let source = state.working_dir.join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().expect("parent")).expect("src");
+        std::fs::write(&source, "pub fn value() -> u8 { 1 }\n").expect("source");
+        let after = build_working_file_index(&state.working_dir).expect("after");
+        deadreckon_core::capture_delta_checkpoint(
+            state,
+            &before,
+            &after,
+            deadreckon_core::CheckpointCaptureRequest {
+                checkpoint_id: "cp-000001".to_string(),
+                flight_session_id: "flight-turn-1-attempt-1".to_string(),
+                deadreckon_turn: 1,
+                attempt: 1,
+                provider_event_seq: Some(3),
+                trigger: deadreckon_core::CheckpointTrigger::ProviderExit,
+                base: deadreckon_core::CheckpointBase {
+                    kind: deadreckon_core::CheckpointBaseKind::TurnSnapshot,
+                    id: "turn-0".to_string(),
+                },
+                full_anchor: false,
+            },
+        )
+        .expect("checkpoint");
+    }
+
+    #[test]
+    fn rewind_target_resolves_provider_event_checkpoint() {
+        let (_temp, state) = checkpoint_fixture();
+        write_manifest(&state, FlightSessionStatus::Completed);
+        capture_fixture_checkpoint(&state);
+        deadreckon_core::append_flight_event(
+            &state,
+            &FlightEvent {
+                version: 1,
+                seq: 3,
+                run_id: state.run_id.clone(),
+                flight_session_id: "flight-turn-1-attempt-1".to_string(),
+                deadreckon_turn: 1,
+                attempt: 1,
+                provider: "cli:test".to_string(),
+                schema: "test".to_string(),
+                timestamp: Some(Utc::now()),
+                source_path: None,
+                source_line: None,
+                source_event: "{}".to_string(),
+                raw_hash: "sha256:test".to_string(),
+                kind: FlightEventKind::Tool,
+                role: None,
+                summary: "tool".to_string(),
+                tool_name: Some("write_file".to_string()),
+                tool_category: None,
+                files: vec![PathBuf::from("src/lib.rs")],
+                usage: None,
+                checkpoint_id: Some("cp-000001".to_string()),
+            },
+        )
+        .expect("event");
+        let resolved = resolve_rewind_target(
+            &state,
+            &RewindCliOptions {
+                to_turn: None,
+                to_provider_event: Some(3),
+                to_checkpoint: None,
+                preview: true,
+                apply: false,
+                json: false,
+            },
+        )
+        .expect("target");
+        assert_eq!(resolved.checkpoint_id, "cp-000001");
+        assert_eq!(resolved.target.kind, RewindTargetKind::ProviderEvent);
+    }
+
+    #[test]
+    fn rewind_apply_hash_guard_refuses_unrelated_file_edits() {
+        let (_temp, mut state) = checkpoint_fixture();
+        write_manifest(&state, FlightSessionStatus::Completed);
+        capture_fixture_checkpoint(&state);
+        state.turn = 1;
+        deadreckon_core::snapshot_working(&state, 1).expect("snapshot");
+        let target_dir = state.run_root.join("rewind-preview/cp-000001-test");
+        materialize_checkpoint(&state, "cp-000001", &target_dir).expect("materialize");
+        std::fs::write(state.working_dir.join("src/lib.rs"), "user edit\n").expect("edit");
+        let result = hash_guard_rewind_apply(&state, &target_dir, &[PathBuf::from("src/lib.rs")]);
+        assert!(result.is_err());
+        assert!(result.expect_err("refusal").contains("unrelated edits"));
+    }
+
+    #[test]
+    fn attach_provider_activity_uses_flight_events() {
+        let (_temp, state) = checkpoint_fixture();
+        deadreckon_core::append_flight_event(
+            &state,
+            &FlightEvent {
+                version: 1,
+                seq: 1,
+                run_id: state.run_id.clone(),
+                flight_session_id: "flight-turn-1-attempt-1".to_string(),
+                deadreckon_turn: 1,
+                attempt: 1,
+                provider: "cli:test".to_string(),
+                schema: "test".to_string(),
+                timestamp: Some(Utc::now()),
+                source_path: None,
+                source_line: None,
+                source_event: "{}".to_string(),
+                raw_hash: "sha256:test".to_string(),
+                kind: FlightEventKind::Tool,
+                role: None,
+                summary: "edited src/lib.rs".to_string(),
+                tool_name: Some("write_file".to_string()),
+                tool_category: None,
+                files: vec![PathBuf::from("src/lib.rs")],
+                usage: Some(deadreckon_core::FlightUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    context_window: Some(100),
+                }),
+                checkpoint_id: Some("cp-000001".to_string()),
+            },
+        )
+        .expect("event");
+        let activity = collect_provider_activity(&state);
+        assert!(activity.lines.join("\n").contains("flight #000001"));
+        assert_eq!(activity.context_tokens, Some(15));
+        assert_eq!(activity.context_window, Some(100));
+    }
 }
 
 #[cfg(test)]

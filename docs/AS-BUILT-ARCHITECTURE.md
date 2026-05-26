@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-18 (implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
+**Last updated:** 2026-05-25 (provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
 **Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -43,6 +43,7 @@ This document captures the system as built today — what's wired, what's load-b
 30. [Plans & Multi-Agent Orchestration](#30-plans--multi-agent-orchestration)
 31. [Distribution & Self-Update](#31-distribution--self-update)
 32. [Plan Observability](#32-plan-observability)
+33. [Provider Flight Recorder & Rewind](#33-provider-flight-recorder--rewind)
 
 ---
 
@@ -2012,6 +2013,41 @@ Plain/off-TTY `attach <plan-id>` prints the latest plan event, merge repair stat
 ### 32.4 Current Limits
 
 The plan event stream is durable and replayable, and plan attach now subscribes to a single `PlanEventBus` feed abstraction. The feed is broadcast-capable in-process, but production plan writers still primarily communicate through append-only JSONL so cross-process attach remains reliable. A future embedded attach mode could pass a long-lived broadcaster through every plan writer for lower-latency same-process delivery.
+
+---
+
+## 33. Provider Flight Recorder & Rewind
+
+### 33.1 Durable Flight Files
+
+CLI-backed providers (`cli:*` and `cli-*`) are no longer represented only as one opaque `tool.cli_subagent` turn. `deadreckon-core/src/flight.rs` defines the durable flight layer:
+
+- `flight-manifest.json` records one `FlightSession` per provider invocation with provider id, schema, DeadReckon turn, attempt number, status, source paths, and checkpoint policy.
+- `flight-events.jsonl` records normalized provider-native rows with ordered `seq`, source path/line/hash, kind (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`, `session`, `checkpoint`, `warning`, `error`), file references, token usage, and optional checkpoint id.
+- `checkpoints/<id>/manifest.json` records delta checkpoints with created/modified/deleted files, base turn snapshot, trigger (`provider_tool`, `file_quiet`, `provider_exit`, or `manual`), and optional full anchors.
+- `rewind-events.jsonl` records preview/apply/refusal attempts for audit.
+
+Checkpoints copy full after-bytes for created/modified files into `checkpoints/<id>/files/...` and record deleted files in the manifest. Materialization starts from the base turn snapshot or nearest anchor and replays deltas through the target checkpoint.
+
+### 33.2 Runtime Recorder
+
+`deadreckon-runtime/src/flight.rs` implements `ProviderFlightRecorder`. The run loop starts it after the pre-turn `snapshot_working(turn-1)` and before the CLI provider subprocess. The recorder loads provider descriptor ingest metadata, marks rerun/resume sessions at or after the new turn as `superseded`, assigns `flight-turn-<n>-attempt-<m>`, and spawns a sidecar polling loop while the provider runs.
+
+The sidecar polls descriptor-discovered provider JSON/JSONL files and the working tree. New provider rows are normalized into `flight-events.jsonl`. Tool-like provider events trigger an immediate checkpoint if files changed. Quiet working-tree changes trigger a `file_quiet` checkpoint after the configured quiet window. Provider exit captures a final checkpoint if the tree differs from the latest checkpoint. Non-CLI HTTP/JSON-action providers keep the existing trace/provenance/snapshot behavior and do not create flight files.
+
+### 33.3 User Surfaces
+
+`deadreckon show <run-id> --flight` prints sessions, provider-native events, source log ranges, and checkpoints. `deadreckon show <run-id> --file <path>` filters that view to the events/checkpoints that mention or changed the file. JSON mode emits the same flight payload as structured data.
+
+`deadreckon rewind <run-id> --to-turn <n>|--to-provider-event <seq>|--to-checkpoint <id>` defaults to preview. Preview materializes the target under `<run-root>/rewind-preview/<checkpoint-id>/` and lists the files that would change. `--apply` first refuses superseded checkpoints, then hash-guards changed files against DeadReckon's latest snapshot/current checkpoint expectation before copying only the guarded changed files into the run working directory. Unrelated user edits produce a refusal in `rewind-events.jsonl`.
+
+The run attach TUI activity collector now reads `flight-events.jsonl` and still appends descriptor-ingested provider log lines when available. That makes completed CLI subturns durable and inspectable while preserving provider-log freshness during a long subprocess.
+
+### 33.4 Operation Modes And Limits
+
+Worktree, copy, fresh, and in-place modes all work through the same mechanism because the recorder reads `PipelineState.working_dir` and writes under `PipelineState.run_root`. Rewind applies to the run working directory; exported directories and promoted library artifacts are not rewritten. Plan children keep their own flight files under their child run roots, and merged plan result runs do not copy child flight events. Imported runs can still have normalized import traces, but they do not get live filesystem checkpoints retroactively.
+
+The recorder normalizes generic provider rows with schema-keyed heuristics rather than provider-specific semantic ASTs. Exact subturn rewind is only available where a checkpoint exists; provider events without a correlated checkpoint resolve to the nearest previous checkpoint or refuse.
 
 ---
 
