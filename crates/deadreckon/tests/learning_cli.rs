@@ -65,7 +65,7 @@ fn learn_index_writes_episode_and_signals_for_completed_run() {
 }
 
 #[test]
-fn improve_self_preview_accepts_goal_file_without_side_effect() {
+fn improve_self_preview_has_no_worktree_or_run_side_effect() {
     let temp = repo_tempdir();
     let goal = temp.path().join("self-goal.md");
     fs::write(&goal, "Make the learning report friendlier.").expect("goal");
@@ -85,6 +85,69 @@ fn improve_self_preview_accepts_goal_file_without_side_effect() {
     let json: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(json["mode"], "isolated-worktree");
     assert!(!temp.path().join("learning").join("candidates").exists());
+}
+
+#[test]
+fn improve_self_launch_uses_isolated_worktree_and_existing_provider_resolver() {
+    let temp = repo_tempdir();
+    let goal = temp.path().join("self-goal.md");
+    fs::write(&goal, "Make the learning report friendlier.").expect("goal");
+
+    let output = deadreckon(temp.path())
+        .args([
+            "improve",
+            "self",
+            goal.to_str().expect("utf8"),
+            "--preview",
+            "--json",
+        ])
+        .output()
+        .expect("improve preview");
+
+    assert_success(&output);
+    let json: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(json["mode"], "isolated-worktree");
+    assert_eq!(json["provider"], "existing resolver");
+}
+
+#[test]
+fn improve_self_refuses_dirty_base_and_sandbox_none() {
+    let temp = repo_tempdir();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    run_git(&repo, &["init"]);
+    fs::write(repo.join("README.md"), "# repo\n").expect("readme");
+    run_git(&repo, &["add", "README.md"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    fs::write(
+        temp.path().join("config.toml"),
+        "default_provider = \"smoke\"\n\n[defaults]\nsandbox = \"none\"\n",
+    )
+    .expect("config");
+    let goal = temp.path().join("goal.md");
+    fs::write(&goal, "Improve from isolated worktree.").expect("goal");
+
+    let output = deadreckon(temp.path())
+        .current_dir(&repo)
+        .args(["improve", "self", goal.to_str().expect("utf8"), "--yes"])
+        .output()
+        .expect("improve self");
+
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("self-improve refuses sandbox none"));
+    assert!(stderr.contains("deadreckon config sandbox auto"));
 }
 
 #[test]
@@ -200,7 +263,7 @@ fn learn_export_import_bundle_preview_roundtrips_redacted_counts() {
 }
 
 #[test]
-fn improve_self_pr_dry_run_writes_body_without_network() {
+fn pr_dry_run_writes_body_without_network_or_push() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path());
     write_synthetic_pr_fixture(&paths);
@@ -218,6 +281,147 @@ fn improve_self_pr_dry_run_writes_body_without_network() {
     assert!(paths.learning_pr_events_path().exists());
 }
 
+#[test]
+fn learn_report_json_matches_text_counts() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path());
+    let cwd = std::env::current_dir().expect("cwd");
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "provider setup failure".to_string(),
+            cwd,
+            sandbox: "seatbelt".to_string(),
+            provider: Some("cli:codex".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: None,
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+    state.status = RunStatus::Failed;
+    state.updated_at = Utc::now();
+    state.failure_reason = Some("provider route cli:missing has no credential".to_string());
+    save_state(&state).expect("save");
+    assert_success(
+        &deadreckon(temp.path())
+            .args(["learn", "index", "--all"])
+            .output()
+            .expect("index"),
+    );
+
+    let json_output = deadreckon(temp.path())
+        .args(["learn", "report", "--json"])
+        .output()
+        .expect("json report");
+    let text_output = deadreckon(temp.path())
+        .args(["learn", "report"])
+        .output()
+        .expect("text report");
+
+    assert_success(&json_output);
+    assert_success(&text_output);
+    let json: Value = serde_json::from_slice(&json_output.stdout).expect("json");
+    let text = String::from_utf8_lossy(&text_output.stdout);
+    assert_text_count(
+        &text,
+        "episodes",
+        json["episodes"].as_u64().expect("episodes"),
+    );
+    assert_text_count(&text, "signals", json["signals"].as_u64().expect("signals"));
+}
+
+#[test]
+fn learn_and_improve_help_use_provider_route_and_done_criteria_vocabulary() {
+    let temp = repo_tempdir();
+    let learn = deadreckon(temp.path())
+        .args(["learn", "--help"])
+        .output()
+        .expect("learn help");
+    let improve = deadreckon(temp.path())
+        .args(["improve", "self", "--help"])
+        .output()
+        .expect("improve help");
+
+    assert_success(&learn);
+    assert_success(&improve);
+    let learn_text = String::from_utf8_lossy(&learn.stdout);
+    let improve_text = String::from_utf8_lossy(&improve.stdout);
+    assert!(learn_text.contains("provider-backed reflection"));
+    assert!(improve_text.contains("Proposal id or goal file"));
+    assert!(improve_text.contains("evidence gate"));
+}
+
+#[test]
+fn improve_self_refusals_emit_canonical_try_footers() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path());
+    let proposal = LearningProposal {
+        version: 1,
+        proposal_id: "prop-refusal".to_string(),
+        created_at: Utc::now(),
+        title: "Refusal".to_string(),
+        insights: Vec::new(),
+        stimulus: Vec::new(),
+        hypothesis: "test".to_string(),
+        target: LearningProposalTarget {
+            repo: "/Users/gdc/deadreckon".to_string(),
+            scope: "cli".to_string(),
+        },
+        goal_text: "goal".to_string(),
+        done_criteria: vec!["focused test passes".to_string()],
+        expected_risk: "low".to_string(),
+        blocked_auto_pr_reasons: Vec::new(),
+    };
+    fs::create_dir_all(paths.learning_proposals_dir()).expect("proposals");
+    fs::write(
+        paths.learning_proposal_path(&proposal.proposal_id),
+        serde_json::to_vec_pretty(&proposal).expect("proposal"),
+    )
+    .expect("proposal write");
+
+    let output = deadreckon(temp.path())
+        .args(["improve", "self", "prop-refusal", "--pr-dry-run"])
+        .output()
+        .expect("refusal");
+
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("try:"));
+    assert!(stderr.contains("deadreckon improve self prop-refusal --yes"));
+}
+
+#[test]
+fn docs_as_built_mentions_learning_files_evidence_gate_and_pr_limits() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let as_built =
+        fs::read_to_string(root.join("docs/AS-BUILT-ARCHITECTURE.md")).expect("as-built");
+
+    assert!(as_built.contains("DEADRECKON_HOME/learning/"));
+    assert!(as_built.contains("Evidence-Gated PR Opening"));
+    assert!(as_built.contains("without network or push"));
+}
+
+#[test]
+fn v1_candidates_record_out_of_scope_learning_items() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let v1 = fs::read_to_string(root.join("docs/V1-CANDIDATES.md")).expect("v1");
+
+    assert!(v1.contains("Self-improvement beyond local PR gating"));
+    assert!(v1.contains("model-training/fine-tuning"));
+}
+
+#[test]
+fn changelog_has_self_improvement_loop_alpha_entry() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let changelog = fs::read_to_string(root.join("CHANGELOG.md")).expect("changelog");
+
+    assert!(changelog.contains("Self-Improvement Loop (alpha)"));
+    assert!(changelog.contains("redacted bundles"));
+}
+
 fn repo_tempdir() -> TempDir {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
     fs::create_dir_all(&root).expect("test tmp root");
@@ -228,6 +432,15 @@ fn deadreckon(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
     command.env("DEADRECKON_HOME", home).env("NO_COLOR", "1");
     command
+}
+
+fn run_git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("git");
+    assert_success(&output);
 }
 
 fn assert_success(output: &std::process::Output) {
@@ -245,6 +458,17 @@ fn assert_failure(output: &std::process::Output) {
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_text_count(text: &str, label: &str, expected: u64) {
+    assert!(
+        text.lines().any(|line| {
+            let normalized = line.replace(':', " ");
+            let parts = normalized.split_whitespace().collect::<Vec<_>>();
+            parts.len() == 2 && parts[0] == label && parts[1] == expected.to_string()
+        }),
+        "missing {label}={expected} in:\n{text}"
     );
 }
 

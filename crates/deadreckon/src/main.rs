@@ -25733,6 +25733,39 @@ mod self_improve_pr_tests {
         assert_eq!(events[0].mode, "open");
     }
 
+    #[test]
+    fn open_pr_adapter_receives_fixed_body_sections_and_evaluated_head() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let candidate = test_learning_candidate(&paths);
+        let dry_run = PrDryRun {
+            title: "Self-improve: test".to_string(),
+            body: [
+                "## Summary",
+                "## Stimulus and Proposal",
+                "## Evidence Packet",
+                "## Verification",
+                "## Risk Classification",
+                "## Rollback",
+                "## Files Changed",
+            ]
+            .join("\n\n"),
+            body_path: temp.path().join("body.md"),
+            branch: candidate.branch.clone(),
+            decision: AutoPrDecision {
+                eligible: true,
+                reasons: Vec::new(),
+            },
+        };
+        let adapter = SectionCheckingPrAdapter;
+
+        let url =
+            open_self_improve_pr_if_eligible(&paths, "prop-test", &candidate, &dry_run, &adapter)
+                .expect("open");
+
+        assert_eq!(url, "https://github.com/example/deadreckon/pull/sections");
+    }
+
     fn test_learning_candidate(paths: &DeadreckonPaths) -> LearningCandidate {
         LearningCandidate {
             version: 1,
@@ -25755,6 +25788,27 @@ mod self_improve_pr_tests {
             },
             status: "verified".to_string(),
             evidence_packet: "evidence.json".to_string(),
+        }
+    }
+
+    struct SectionCheckingPrAdapter;
+
+    impl SelfImprovePrAdapter for SectionCheckingPrAdapter {
+        fn open_pr(&self, candidate: &LearningCandidate, dry_run: &PrDryRun) -> Result<String> {
+            assert_eq!(dry_run.branch, candidate.branch);
+            for section in [
+                "## Summary",
+                "## Stimulus and Proposal",
+                "## Evidence Packet",
+                "## Verification",
+                "## Risk Classification",
+                "## Rollback",
+                "## Files Changed",
+            ] {
+                assert!(dry_run.body.contains(section), "{section}");
+            }
+            assert_ne!(candidate.base_commit, candidate.head_commit);
+            Ok("https://github.com/example/deadreckon/pull/sections".to_string())
         }
     }
 }

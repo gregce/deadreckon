@@ -1952,6 +1952,74 @@ mod tests {
         state
     }
 
+    fn proposal_fixture(done_criteria: Vec<&str>) -> LearningProposal {
+        LearningProposal {
+            version: 1,
+            proposal_id: "prop-1".to_string(),
+            created_at: Utc::now(),
+            title: "Improve".to_string(),
+            insights: vec!["ins-1".to_string()],
+            stimulus: vec![LearningStimulus {
+                signal_id: "sig-1".to_string(),
+                run_id: "run-1".to_string(),
+            }],
+            hypothesis: "helps".to_string(),
+            target: LearningProposalTarget {
+                repo: "/Users/gdc/deadreckon".to_string(),
+                scope: "cli".to_string(),
+            },
+            goal_text: "goal".to_string(),
+            done_criteria: done_criteria.into_iter().map(str::to_string).collect(),
+            expected_risk: "low".to_string(),
+            blocked_auto_pr_reasons: Vec::new(),
+        }
+    }
+
+    fn candidate_fixture(paths: &DeadreckonPaths) -> LearningCandidate {
+        LearningCandidate {
+            version: 1,
+            candidate_id: "cand-1".to_string(),
+            proposal_id: "prop-1".to_string(),
+            branch: "deadreckon/self/cand-1".to_string(),
+            base_commit: "base".to_string(),
+            head_commit: "head".to_string(),
+            run_id: "run-2".to_string(),
+            worktree: paths.learning_candidate_dir("cand-1").join("worktree"),
+            diff: LearningCandidateDiff {
+                files: 1,
+                insertions: 10,
+                deletions: 0,
+                changed_files: vec!["crates/deadreckon/src/main.rs".to_string()],
+            },
+            risk: LearningRisk {
+                class: "low".to_string(),
+                reasons: Vec::new(),
+            },
+            status: "verified".to_string(),
+            evidence_packet: "evidence.json".to_string(),
+        }
+    }
+
+    fn eval_fixture(candidate_id: &str) -> LearningEval {
+        LearningEval {
+            version: 1,
+            candidate_id: candidate_id.to_string(),
+            evaluated_at: Utc::now(),
+            accepted_run: true,
+            commands: vec![LearningEvalCommand {
+                cmd: "cargo test -p deadreckon-core learning --lib".to_string(),
+                status: 0,
+            }],
+            docs_updated: true,
+            redaction_passed: true,
+            evidence_score: 1.0,
+            auto_pr: LearningAutoPrStatus {
+                eligible: false,
+                reasons: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn learning_schemas_roundtrip_and_reject_unknown_major_version() {
         let (_temp, paths) = temp_paths();
@@ -2160,6 +2228,19 @@ mod tests {
     }
 
     #[test]
+    fn learn_propose_refuses_when_no_signal_meets_threshold() {
+        let (_temp, paths) = temp_paths();
+
+        let err = build_reflection_prompt(&paths, None, 3).expect_err("reject");
+
+        assert!(err.to_string().contains("no proposal-worthy signals"));
+        assert!(
+            err.to_string()
+                .contains("try: deadreckon learn index --all")
+        );
+    }
+
+    #[test]
     fn learn_propose_requires_insight_signal_citations_and_done_criteria() {
         let (_temp, paths) = temp_paths();
         let state = completed_state(&paths, "proposal citations");
@@ -2211,6 +2292,37 @@ mod tests {
                 .learning_proposal_path(&report.proposals[0].proposal_id)
                 .exists()
         );
+    }
+
+    #[test]
+    fn learn_propose_invalid_reflection_json_does_not_write_insight_or_proposal() {
+        let (_temp, paths) = temp_paths();
+        let state = completed_state(&paths, "invalid reflection");
+        let episode = episode_from_state(&paths, &state).expect("episode");
+        let sig = signal(
+            &episode,
+            "setup_friction",
+            "high",
+            0.9,
+            "provider setup issue",
+            RUN_EVENTS_JSONL,
+        );
+        append_json_line(&paths.learning_signals_path(), &sig).expect("signal");
+
+        let err = persist_reflection(
+            &paths,
+            &LearningInsightProvider {
+                route: "smoke".to_string(),
+                model: "test".to_string(),
+            },
+            "{not-json",
+            1,
+        )
+        .expect_err("reject");
+
+        assert!(matches!(err, DeadreckonError::Json { .. }));
+        assert!(!paths.learning_insights_path().exists());
+        assert!(!paths.learning_proposals_dir().exists());
     }
 
     #[test]
@@ -2270,6 +2382,78 @@ mod tests {
 
         assert!(err.to_string().contains("bundle hash mismatch"));
         assert!(err.to_string().contains("try: deadreckon learn export"));
+    }
+
+    #[test]
+    fn candidate_archive_records_base_head_diff_and_run_id() {
+        let (_temp, paths) = temp_paths();
+        let candidate = candidate_fixture(&paths);
+
+        write_candidate(&paths, &candidate).expect("candidate");
+        let raw = fs::read(paths.learning_candidate_path(&candidate.candidate_id)).expect("read");
+        let loaded: LearningCandidate = serde_json::from_slice(&raw).expect("json");
+
+        assert_eq!(loaded.base_commit, "base");
+        assert_eq!(loaded.head_commit, "head");
+        assert_eq!(loaded.run_id, "run-2");
+        assert_eq!(loaded.diff.files, 1);
+        assert_eq!(loaded.diff.changed_files, candidate.diff.changed_files);
+    }
+
+    #[test]
+    fn evaluation_policy_blocks_weak_done_criteria() {
+        let (_temp, paths) = temp_paths();
+        let proposal = proposal_fixture(Vec::new());
+        let candidate = candidate_fixture(&paths);
+        let eval = eval_fixture(&candidate.candidate_id);
+
+        let decision = evaluate_auto_pr(
+            &proposal,
+            &candidate,
+            &eval,
+            &LearningPolicy::default(),
+            true,
+        );
+
+        assert!(!decision.eligible);
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("weak or missing done criteria"))
+        );
+    }
+
+    #[test]
+    fn pr_gate_passes_only_with_complete_evidence_packet() {
+        let (_temp, paths) = temp_paths();
+        let proposal = proposal_fixture(vec!["focused tests pass"]);
+        let candidate = candidate_fixture(&paths);
+        let mut eval = eval_fixture(&candidate.candidate_id);
+
+        let pass = evaluate_auto_pr(
+            &proposal,
+            &candidate,
+            &eval,
+            &LearningPolicy::default(),
+            true,
+        );
+        assert!(pass.eligible, "{:?}", pass.reasons);
+
+        eval.redaction_passed = false;
+        let fail = evaluate_auto_pr(
+            &proposal,
+            &candidate,
+            &eval,
+            &LearningPolicy::default(),
+            true,
+        );
+        assert!(!fail.eligible);
+        assert!(
+            fail.reasons
+                .iter()
+                .any(|reason| reason.contains("redaction or secrets scan failed"))
+        );
     }
 
     #[test]
