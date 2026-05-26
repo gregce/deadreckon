@@ -14,7 +14,7 @@ use deadreckon_core::{
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -1161,7 +1161,6 @@ pub(crate) fn build_provider_prompt(
         .into_iter()
         .collect::<Vec<_>>();
     let prompt_value = json!({
-        "system": "You are a narrative projector over cited evidence, not a source of truth. Return only JSON matching the requested schema. Cite every claim. Do not invent evidence, graph nodes, graph edges, files, or actions.",
         "output_schema": {
             "headline": "string",
             "current_work": [{"text": "string", "evidence": ["known evidence id"], "confidence": "high|medium|low"}],
@@ -1175,7 +1174,14 @@ pub(crate) fn build_provider_prompt(
         "snapshot": projection.snapshot,
         "graph": projection.graph,
     });
-    let raw = serde_json::to_string_pretty(&prompt_value)?;
+    let payload = serde_json::to_string_pretty(&prompt_value)?;
+    let raw = format!(
+        "You are a narrative projector over cited evidence, not a source of truth.\n\
+Return exactly one raw JSON object matching the requested schema and nothing else.\n\
+Do not write Markdown, code fences, commentary, or prose outside the JSON object.\n\
+Cite every claim with ids from allowed_evidence_ids. Do not invent evidence, graph nodes, graph edges, files, or actions.\n\n\
+Evidence payload:\n{payload}\n"
+    );
     let redaction = redact_for_provider(&raw);
     Ok(NarrativePromptBundle {
         prompt: redaction.text.clone(),
@@ -1226,13 +1232,7 @@ pub(crate) fn apply_provider_response(
                 .to_string(),
         });
     }
-    let output: ProviderNarrativeOutput =
-        serde_json::from_str(raw_content).map_err(|err| crate::CliError::Exit {
-            code: 1,
-            message: format!("narrative provider returned invalid JSON: {err}"),
-            hint: "try: press r later or use --no-narrative-provider for deterministic fallback"
-                .to_string(),
-        })?;
+    let output = parse_provider_narrative_output(raw_content)?;
     let allowed_evidence = evidence_ids_for_projection(projection);
     validate_provider_claims(&output, &allowed_evidence)?;
     let allowed_graph_ids = graph_ids_for_projection(projection);
@@ -1293,11 +1293,15 @@ pub(crate) fn projection_with_provider_failure(
     error: impl Into<String>,
 ) -> NarrativeProjection {
     let mut next = projection.clone();
+    let error = error.into();
     next.snapshot.status = NarrativeStatus::Stale;
     next.state.latest_status = NarrativeStatus::Stale;
     next.state.provider.route = route;
     next.state.provider.source = "provider_failed".to_string();
-    next.state.last_error = Some(error.into());
+    next.state.last_error = Some(error);
+    let created_at = Utc::now();
+    next.snapshot.created_at = created_at;
+    next.state.latest_created_at = Some(created_at);
     next.snapshot.risks.push(NarrativeClaim {
         text: "Provider-backed narration failed; deterministic facts remain visible.".to_string(),
         evidence: next
@@ -1308,6 +1312,22 @@ pub(crate) fn projection_with_provider_failure(
             .unwrap_or_else(|| vec!["state".to_string()]),
         confidence: "high".to_string(),
     });
+    let graph_hash = graph_content_hash(&next.graph);
+    next.snapshot.snapshot_id = snapshot_id(&(
+        &next.snapshot.scope,
+        &next.snapshot.target_id,
+        &next.snapshot.status,
+        &next.snapshot.headline,
+        &next.snapshot.current_work,
+        &next.snapshot.architecture_notes,
+        &next.snapshot.risks,
+        &next.snapshot.next_likely,
+        &graph_hash,
+        &next.state.provider.route,
+        next.state.provider.calls,
+        &next.state.last_error,
+    ));
+    next.state.latest_snapshot_id = next.snapshot.snapshot_id.clone();
     next
 }
 
@@ -1316,12 +1336,7 @@ fn read_current_projection_if_covered(
     narrative_dir: &Path,
 ) -> Option<NarrativeProjection> {
     let state = read_json::<NarrativeState>(&narrative_dir.join(NARRATIVE_STATE_JSON))?;
-    if state.provider.source == "deterministic"
-        || state.latest_status == NarrativeStatus::Deterministic
-    {
-        return None;
-    }
-    if state.latest_covered != candidate.state.latest_covered {
+    if !same_narrative_input_coverage(&state.latest_covered, &candidate.state.latest_covered) {
         return None;
     }
     let snapshot = read_latest_snapshot(narrative_dir).snapshot?;
@@ -1335,6 +1350,14 @@ fn read_current_projection_if_covered(
         snapshot,
         graph,
     })
+}
+
+fn same_narrative_input_coverage(left: &NarrativeCoverage, right: &NarrativeCoverage) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.architecture_graph_hash = None;
+    right.architecture_graph_hash = None;
+    left == right
 }
 
 fn strip_terminal_controls(raw: &str, findings: &mut Vec<String>) -> String {
@@ -1364,6 +1387,102 @@ fn strip_terminal_controls(raw: &str, findings: &mut Vec<String>) -> String {
         findings.push("terminal control sequence redacted".to_string());
     }
     out
+}
+
+fn parse_provider_narrative_output(raw_content: &str) -> crate::Result<ProviderNarrativeOutput> {
+    let mut last_error = None;
+    for candidate in provider_json_candidates(raw_content) {
+        match serde_json::from_str::<ProviderNarrativeOutput>(&candidate) {
+            Ok(output) if provider_output_has_narrative_fields(&output) => return Ok(output),
+            Ok(_) => {
+                last_error = Some(
+                    "provider JSON did not include headline, claim sections, or graph labels"
+                        .to_string(),
+                );
+            }
+            Err(err) => last_error = Some(err.to_string()),
+        }
+    }
+    Err(crate::CliError::Exit {
+        code: 1,
+        message: format!(
+            "narrative provider returned invalid JSON: {}",
+            last_error.unwrap_or_else(|| "no JSON object found".to_string())
+        ),
+        hint: "try: press r later or use --no-narrative-provider for deterministic fallback"
+            .to_string(),
+    })
+}
+
+fn provider_json_candidates(raw_content: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    push_unique_candidate(&mut candidates, raw_content.trim());
+    for candidate in fenced_json_candidates(raw_content) {
+        push_unique_candidate(&mut candidates, candidate.trim());
+    }
+    if let Some(candidate) = embedded_json_candidate(raw_content) {
+        push_unique_candidate(&mut candidates, candidate.trim());
+    }
+    candidates
+}
+
+fn fenced_json_candidates(raw_content: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut in_fence = false;
+    let mut current = Vec::new();
+    for line in raw_content.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_fence {
+                candidates.push(current.join("\n"));
+                current.clear();
+                in_fence = false;
+            } else {
+                in_fence = true;
+            }
+            continue;
+        }
+        if in_fence {
+            current.push(line);
+        }
+    }
+    candidates
+}
+
+fn embedded_json_candidate(raw_content: &str) -> Option<String> {
+    for (index, ch) in raw_content.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+        let mut deserializer = serde_json::Deserializer::from_str(&raw_content[index..]);
+        if let Ok(value) = Value::deserialize(&mut deserializer)
+            && value.is_object()
+            && let Ok(candidate) = serde_json::to_string(&value)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn push_unique_candidate(candidates: &mut Vec<String>, candidate: &str) {
+    if candidate.is_empty() {
+        return;
+    }
+    if !candidates.iter().any(|existing| existing == candidate) {
+        candidates.push(candidate.to_string());
+    }
+}
+
+fn provider_output_has_narrative_fields(output: &ProviderNarrativeOutput) -> bool {
+    output
+        .headline
+        .as_deref()
+        .is_some_and(|headline| !headline.trim().is_empty())
+        || !output.current_work.is_empty()
+        || !output.architecture_notes.is_empty()
+        || !output.risks.is_empty()
+        || !output.next_likely.is_empty()
+        || !output.graph_labels.is_empty()
 }
 
 fn validate_provider_claims(
@@ -2943,6 +3062,62 @@ mod tests {
     }
 
     #[test]
+    fn provider_prompt_frontloads_json_only_instruction() {
+        let temp = TempDir::new().expect("temp");
+        let projection = sample_projection(&temp);
+
+        let prompt = build_provider_prompt(&projection).expect("prompt");
+
+        assert!(
+            prompt
+                .prompt
+                .starts_with("You are a narrative projector over cited evidence"),
+            "{}",
+            prompt.prompt
+        );
+        assert!(prompt.prompt.contains("Return exactly one raw JSON object"));
+        assert!(prompt.prompt.contains("Do not write Markdown"));
+    }
+
+    #[test]
+    fn summarizer_rejects_json_without_narrative_fields() {
+        let temp = TempDir::new().expect("temp");
+        let projection = sample_projection(&temp);
+        let content = json!({
+            "action": "done",
+            "summary": "This is a coding-provider response, not a narrative response."
+        })
+        .to_string();
+
+        let err = apply_provider_response(&projection, &content, sample_provider())
+            .expect_err("schema-less provider output rejected");
+
+        assert!(err.to_string().contains("did not include headline"));
+    }
+
+    #[test]
+    fn summarizer_accepts_fenced_json_but_still_validates_claims() {
+        let temp = TempDir::new().expect("temp");
+        let projection = sample_projection(&temp);
+        let evidence = projection.snapshot.citations[0].id.clone();
+        let content = format!(
+            "```json\n{}\n```",
+            json!({
+                "headline": "Narrated fenced JSON.",
+                "current_work": [
+                    {"text": "The provider can wrap JSON while preserving citations.", "evidence": [evidence], "confidence": "high"}
+                ]
+            })
+        );
+
+        let refreshed =
+            apply_provider_response(&projection, &content, sample_provider()).expect("refresh");
+
+        assert_eq!(refreshed.state.latest_status, NarrativeStatus::Fresh);
+        assert_eq!(refreshed.snapshot.headline, "Narrated fenced JSON.");
+    }
+
+    #[test]
     fn claim_validation_rejects_missing_evidence_ids() {
         let temp = TempDir::new().expect("temp");
         let projection = sample_projection(&temp);
@@ -3079,6 +3254,132 @@ mod tests {
     }
 
     #[test]
+    fn provider_snapshot_with_graph_labels_survives_redraw() {
+        let temp = TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "redraw keeps provider graph labels".to_string(),
+                cwd: repo,
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("run-redraw-graph-label-test".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let input = RunNarrativeInput {
+            state: &state,
+            spend: &[],
+            traces: &[],
+            events: &[],
+            live_files: vec![LiveFileFact {
+                path: "src/main.rs".to_string(),
+                bytes: 10,
+                modified_at: None,
+            }],
+            file_count: 1,
+            total_bytes: 10,
+            acceptance_summary: "default gate".to_string(),
+            provider_activity: &[],
+            parent_plan: None,
+        };
+        let projection = ensure_run_projection(&input).expect("projection");
+        let evidence = projection.snapshot.citations[0].id.clone();
+        let node = projection.graph.nodes[0].id.clone();
+        let provider_content = json!({
+            "headline": "Narrated provider graph labels survive redraw.",
+            "current_work": [
+                {"text": "Provider prose is current for the same input coverage.", "evidence": [evidence], "confidence": "high"}
+            ],
+            "graph_labels": [
+                {"target_id": node, "label": "provider relabel"}
+            ]
+        })
+        .to_string();
+        let refreshed = apply_provider_response(&projection, &provider_content, sample_provider())
+            .expect("provider projection");
+        persist_run_projection(&state, &refreshed).expect("persist provider");
+
+        let redraw = ensure_run_projection(&input).expect("redraw projection");
+
+        assert_eq!(redraw.state.latest_status, NarrativeStatus::Fresh);
+        assert_eq!(redraw.snapshot.headline, refreshed.snapshot.headline);
+        assert_eq!(
+            redraw.state.latest_snapshot_id,
+            refreshed.state.latest_snapshot_id
+        );
+    }
+
+    #[test]
+    fn deterministic_projection_survives_redraw_without_snapshot_churn() {
+        let temp = TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "redraw keeps deterministic snapshot".to_string(),
+                cwd: repo,
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("run-deterministic-redraw-test".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let input = RunNarrativeInput {
+            state: &state,
+            spend: &[],
+            traces: &[],
+            events: &[],
+            live_files: vec![LiveFileFact {
+                path: "src/main.rs".to_string(),
+                bytes: 10,
+                modified_at: None,
+            }],
+            file_count: 1,
+            total_bytes: 10,
+            acceptance_summary: "default gate".to_string(),
+            provider_activity: &[],
+            parent_plan: None,
+        };
+
+        let first = ensure_run_projection(&input).expect("first projection");
+        let second = ensure_run_projection(&input).expect("second projection");
+        let snapshots = fs::read_to_string(
+            state
+                .run_root
+                .join(NARRATIVE_DIR)
+                .join(NARRATIVE_SNAPSHOTS_JSONL),
+        )
+        .expect("snapshots");
+
+        assert_eq!(second.state.latest_status, NarrativeStatus::Deterministic);
+        assert_eq!(
+            first.state.latest_snapshot_id,
+            second.state.latest_snapshot_id
+        );
+        assert_eq!(
+            snapshots
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn summarizer_respects_min_interval_and_manual_refresh_budget() {
         let temp = TempDir::new().expect("temp");
         let mut projection = sample_projection(&temp);
@@ -3143,6 +3444,8 @@ mod tests {
 
         assert_eq!(stale.state.latest_status, NarrativeStatus::Stale);
         assert_eq!(stale.snapshot.status, NarrativeStatus::Stale);
+        assert_ne!(stale.snapshot.snapshot_id, projection.snapshot.snapshot_id);
+        assert_eq!(stale.state.latest_snapshot_id, stale.snapshot.snapshot_id);
         assert!(
             stale
                 .state

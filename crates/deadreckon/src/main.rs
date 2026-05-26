@@ -22292,6 +22292,25 @@ async fn attach_plan_tui(
                 }
                 Event::Key(key) if key.code == KeyCode::Char('r') && key.modifiers.is_empty() => {
                     view = AttachViewMode::Narrative;
+                    narrative_notice =
+                        Some("manual refresh: contacting narrative provider".to_string());
+                    terminal.draw(|frame| {
+                        render_plan_attach(
+                            frame,
+                            paths,
+                            &plan,
+                            &PlanAttachRenderState {
+                                messages: &messages,
+                                plan_events: &plan_events,
+                                feed_events: &feed_events,
+                                selected,
+                                show_hints,
+                                view,
+                                visual,
+                                narrative_notice: narrative_notice.as_deref(),
+                            },
+                        )
+                    })?;
                     narrative_notice = Some(
                         refresh_plan_narrative_with_provider(
                             paths,
@@ -23125,6 +23144,12 @@ async fn attach_tui_with_parent(
                     tui_state.cycle_visual();
                 }
                 Event::Key(key) if key.code == KeyCode::Char('r') && key.modifiers.is_empty() => {
+                    tui_state.record_narrative_refresh(
+                        "manual refresh: contacting narrative provider".to_string(),
+                    );
+                    terminal.draw(|frame| {
+                        render_attach(frame, &state, &spend, &traces, &events, &live, &tui_state)
+                    })?;
                     let notice = refresh_run_narrative_with_provider(
                         paths,
                         &RunNarrativeRenderInput {
