@@ -7,6 +7,7 @@
 - Added evidence-backed ASCII map rendering for run architecture, plan agents, touched files, and evidence chains, including plain/JSON attach output.
 - Added redacted provider refresh on manual `r`: attach builds bounded prompts, validates structured claims and graph labels against known evidence, enforces budget/cadence guards, and falls back to deterministic stale facts when refresh is unavailable or rejected.
 - Added TTY narrative-view refresh triggers for meaningful run and plan evidence, including errors, completions, tool milestones, docs checkpoints, child-run discovery, task terminal states, and merge-repair milestones.
+- Added quiet-threshold TTY refresh attempts for running runs/plans when no meaningful narrative event arrives for the configured quiet window.
 - Added focused coverage for narrative schemas, malformed snapshot tolerance, redaction, claim validation, graph validation, provider refresh validation, cadence/budget decisions, deterministic fallback, and plain map rendering.
 
 ## Self-Improvement Loop (alpha) - 2026-05-26

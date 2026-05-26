@@ -21882,10 +21882,13 @@ async fn attach_plan_tui(
     let mut view = initial_view;
     let mut visual = initial_visual;
     let mut narrative_notice = None;
+    let mut quiet_tracker = NarrativeQuietRefreshTracker::new(Utc::now());
 
     let result = loop {
+        let now = Utc::now();
         let new_feed_events = feed.refresh(Duration::ZERO).await;
-        let auto_refresh = plan_narrative_refresh_trigger(&new_feed_events);
+        let event_refresh = plan_narrative_refresh_trigger(&new_feed_events);
+        quiet_tracker.observe_event_trigger(event_refresh, now);
         for event in new_feed_events {
             match event {
                 PlanFeedEvent::Plan { event } => {
@@ -21911,6 +21914,17 @@ async fn attach_plan_tui(
         if selected >= plan.tasks.len() {
             selected = plan.tasks.len().saturating_sub(1);
         }
+        let auto_refresh = event_refresh.or_else(|| {
+            if view.is_narrative() {
+                quiet_tracker.maybe_trigger(
+                    plan.status == PlanStatus::Forked,
+                    narrative::NarrativeCadence::default().quiet_seconds,
+                    now,
+                )
+            } else {
+                None
+            }
+        });
         if let Some(kind) = auto_refresh
             && view.is_narrative()
         {
@@ -22709,13 +22723,16 @@ async fn attach_tui_with_parent(
         visual: initial_visual,
         ..AttachTuiState::default()
     };
+    let mut quiet_tracker = NarrativeQuietRefreshTracker::new(Utc::now());
 
     let result = loop {
+        let now = Utc::now();
         let state = load_run(paths, run_id)?;
         let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
         let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
         let new_events = event_feed.refresh(std::time::Duration::ZERO).await?;
-        let auto_refresh = run_narrative_refresh_trigger(&new_events);
+        let event_refresh = run_narrative_refresh_trigger(&new_events);
+        quiet_tracker.observe_event_trigger(event_refresh, now);
         events.extend(new_events);
         let live = collect_attach_live(&state);
         let terminal_size = terminal.size()?;
@@ -22724,6 +22741,17 @@ async fn attach_tui_with_parent(
         let panel_layout = attach_panel_layout(terminal_area);
         let panel_counts = attach_panel_counts(&state, &spend, &traces, &events, &live, &tui_state);
         tui_state.clamp(panel_counts, panel_layout.rows);
+        let auto_refresh = event_refresh.or_else(|| {
+            if tui_state.view.is_narrative() {
+                quiet_tracker.maybe_trigger(
+                    state.status == RunStatus::Executing,
+                    narrative::NarrativeCadence::default().quiet_seconds,
+                    now,
+                )
+            } else {
+                None
+            }
+        });
         if let Some(kind) = auto_refresh
             && tui_state.view.is_narrative()
         {
@@ -25611,6 +25639,7 @@ fn run_narrative_projection(
 enum NarrativeRefreshKind {
     Manual,
     Event(&'static str),
+    QuietThreshold,
 }
 
 impl NarrativeRefreshKind {
@@ -25622,12 +25651,65 @@ impl NarrativeRefreshKind {
         matches!(self, Self::Event(_))
     }
 
+    fn resets_quiet_timer(self) -> bool {
+        matches!(self, Self::Event(_))
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Manual => "manual refresh",
             Self::Event(reason) => reason,
+            Self::QuietThreshold => "quiet threshold",
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct NarrativeQuietRefreshTracker {
+    last_meaningful_at: DateTime<Utc>,
+    last_quiet_attempt_at: Option<DateTime<Utc>>,
+}
+
+impl NarrativeQuietRefreshTracker {
+    fn new(now: DateTime<Utc>) -> Self {
+        Self {
+            last_meaningful_at: now,
+            last_quiet_attempt_at: None,
+        }
+    }
+
+    fn observe_event_trigger(&mut self, trigger: Option<NarrativeRefreshKind>, now: DateTime<Utc>) {
+        if trigger.is_some_and(NarrativeRefreshKind::resets_quiet_timer) {
+            self.last_meaningful_at = now;
+            self.last_quiet_attempt_at = None;
+        }
+    }
+
+    fn maybe_trigger(
+        &mut self,
+        is_running: bool,
+        quiet_seconds: u64,
+        now: DateTime<Utc>,
+    ) -> Option<NarrativeRefreshKind> {
+        if !is_running || quiet_seconds == 0 {
+            return None;
+        }
+        if elapsed_seconds(self.last_meaningful_at, now) < quiet_seconds {
+            return None;
+        }
+        if self
+            .last_quiet_attempt_at
+            .is_some_and(|last| elapsed_seconds(last, now) < quiet_seconds)
+        {
+            return None;
+        }
+        self.last_quiet_attempt_at = Some(now);
+        Some(NarrativeRefreshKind::QuietThreshold)
+    }
+}
+
+fn elapsed_seconds(start: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
+    now.signed_duration_since(start).num_seconds().max(0) as u64
 }
 
 fn run_narrative_refresh_trigger(events: &[RunEvent]) -> Option<NarrativeRefreshKind> {
@@ -26852,19 +26934,19 @@ mod tui_tests {
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, AttachViewMode,
         COMMAND_HELP_CATALOG, ChainAttachTuiState, CommandDiscovery, CommandHelpEntry,
-        CompletionAction, HELP_ALL_GROUPS, NarrativeRefreshKind, NarrativeVisualMode,
-        PlanAttachRenderState, PlanFeedEvent, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
-        acceptance_activity_lines, attach_banner, attach_header_text, attach_should_return_to_plan,
-        chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
-        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
-        command_discovery, completion_action_from_input, completion_hints_enabled,
-        deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
-        implementation_plan_warnings, kill_banner, live_file_lines, markdown_to_tui_lines,
-        max_panel_scroll, meter_color, orchestration_dependency_rows,
-        orchestration_parallelism_lines, orchestration_provider_role_rows,
-        orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
-        plan_merge_repair_summary_items, plan_narrative_refresh_trigger,
+        CompletionAction, HELP_ALL_GROUPS, NarrativeQuietRefreshTracker, NarrativeRefreshKind,
+        NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent, ProviderActivity,
+        ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines, attach_banner,
+        attach_header_text, attach_should_return_to_plan, chain_activity_lines,
+        chain_attach_footer_text, chain_attach_header_text, chain_should_auto_attach,
+        chain_step_dot, chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
+        cli_wait_status_line, collect_jsonl_provider_activity, command_discovery,
+        completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
+        deadreckoning_status_text, doc_polish_preview_text, implementation_plan_warnings,
+        kill_banner, live_file_lines, markdown_to_tui_lines, max_panel_scroll, meter_color,
+        orchestration_dependency_rows, orchestration_parallelism_lines,
+        orchestration_provider_role_rows, orchestration_role_table_lines, per_step_wall_cap,
+        plan_attach_footer, plan_merge_repair_summary_items, plan_narrative_refresh_trigger,
         provider_ingest_base_roots, provider_jsonl_activity_lines,
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
@@ -27711,6 +27793,48 @@ mod tui_tests {
         assert_eq!(
             plan_narrative_refresh_trigger(&[child_event]),
             Some(NarrativeRefreshKind::Event("run completed"))
+        );
+    }
+
+    #[test]
+    fn narrative_quiet_refresh_triggers_after_idle_running_period() {
+        let start = Utc::now();
+        let mut tracker = NarrativeQuietRefreshTracker::new(start);
+
+        assert_eq!(
+            tracker.maybe_trigger(true, 30, start + chrono::Duration::seconds(29)),
+            None
+        );
+        assert_eq!(
+            tracker.maybe_trigger(true, 30, start + chrono::Duration::seconds(31)),
+            Some(NarrativeRefreshKind::QuietThreshold)
+        );
+        assert_eq!(
+            tracker.maybe_trigger(true, 30, start + chrono::Duration::seconds(40)),
+            None
+        );
+        assert_eq!(
+            tracker.maybe_trigger(false, 30, start + chrono::Duration::seconds(70)),
+            None
+        );
+    }
+
+    #[test]
+    fn narrative_quiet_refresh_resets_on_meaningful_event() {
+        let start = Utc::now();
+        let mut tracker = NarrativeQuietRefreshTracker::new(start);
+        tracker.observe_event_trigger(
+            Some(NarrativeRefreshKind::Event("tool started")),
+            start + chrono::Duration::seconds(20),
+        );
+
+        assert_eq!(
+            tracker.maybe_trigger(true, 30, start + chrono::Duration::seconds(45)),
+            None
+        );
+        assert_eq!(
+            tracker.maybe_trigger(true, 30, start + chrono::Duration::seconds(51)),
+            Some(NarrativeRefreshKind::QuietThreshold)
         );
     }
 
