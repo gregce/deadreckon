@@ -1261,6 +1261,12 @@ pub(crate) enum Commands {
         )]
         narrative_provider: Option<String>,
         #[arg(
+            long,
+            conflicts_with = "narrative_provider",
+            help = "Use deterministic narrative facts only; do not call a narrative provider"
+        )]
+        no_narrative_provider: bool,
+        #[arg(
             long = "narrative-max-spend",
             help = "Spend cap in USD for narrative refresh"
         )]

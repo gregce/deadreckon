@@ -1230,7 +1230,7 @@ pub(crate) fn apply_provider_response(
         serde_json::from_str(raw_content).map_err(|err| crate::CliError::Exit {
             code: 1,
             message: format!("narrative provider returned invalid JSON: {err}"),
-            hint: "try: press r later or omit --narrative-provider for deterministic fallback"
+            hint: "try: press r later or use --no-narrative-provider for deterministic fallback"
                 .to_string(),
         })?;
     let allowed_evidence = evidence_ids_for_projection(projection);

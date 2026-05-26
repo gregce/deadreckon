@@ -710,12 +710,18 @@ async fn main_inner() -> Result<()> {
             view,
             visual,
             narrative_provider,
+            no_narrative_provider,
             narrative_max_spend,
             json,
             no_hints,
             plain,
         } => {
             ui::set_plain_output(plain || json);
+            let narrative_provider = if no_narrative_provider {
+                Some("none".to_string())
+            } else {
+                narrative_provider
+            };
             attach_command(AttachCommandArgs {
                 run_id,
                 no_hints,
@@ -17518,6 +17524,10 @@ fn narrative_provider_selection(explicit_provider: Option<&str>) -> NarrativePro
         .map(str::trim)
         .filter(|provider| !provider.is_empty())
     {
+        Some("none" | "off" | "deterministic") => NarrativeProviderSelection {
+            route: None,
+            model: None,
+        },
         Some(provider) => NarrativeProviderSelection {
             route: Some(provider.to_string()),
             model: None,
@@ -28344,6 +28354,10 @@ mod tui_tests {
         let explicit = narrative_provider_selection(Some("cli:codex"));
         assert_eq!(explicit.route.as_deref(), Some("cli:codex"));
         assert_eq!(explicit.model, None);
+
+        let disabled = narrative_provider_selection(Some("none"));
+        assert_eq!(disabled.route, None);
+        assert_eq!(disabled.model, None);
     }
 
     #[test]
