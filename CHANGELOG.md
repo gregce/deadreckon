@@ -1,5 +1,13 @@
 # Changelog
 
+## Narrative Attach (alpha) - 2026-05-26
+
+- Added `deadreckon attach --view narrative` for cited run and plan overviews, with `n` to return to raw activity and `v` to cycle architecture, agents, files, evidence, and no-visual modes.
+- Added file-backed run/plan narrative projections under `narrative/state.json`, `narrative/snapshots.jsonl`, and `narrative/architecture-graph.json` without changing `PipelineState`.
+- Added evidence-backed ASCII map rendering for run architecture, plan agents, touched files, and evidence chains, including plain/JSON attach output.
+- Added redacted provider refresh on manual `r`: attach builds bounded prompts, validates structured claims and graph labels against known evidence, enforces budget/cadence guards, and falls back to deterministic stale facts when refresh is unavailable or rejected.
+- Added focused coverage for narrative schemas, malformed snapshot tolerance, redaction, claim validation, graph validation, provider refresh validation, cadence/budget decisions, deterministic fallback, and plain map rendering.
+
 ## Self-Improvement Loop (alpha) - 2026-05-26
 
 - Added file-backed learning state under `DEADRECKON_HOME/learning/` for episodes, deterministic signals, provider-backed insights, proposals, redacted bundles, candidates, evals, PR dry-run/open events, and local policy.

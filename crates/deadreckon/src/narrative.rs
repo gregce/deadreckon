@@ -11,7 +11,9 @@ use deadreckon_core::{
     PlanTaskStatus, RUN_EVENTS_JSONL, RunEvent, RunEventKind, RunStatus, SpendRecord, TraceRecord,
     load_run, plan_status_label, plan_task_status_label, run_status_label,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -349,6 +351,73 @@ pub(crate) struct NarrativeProjection {
     pub(crate) graph: ArchitectureGraph,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct LatestNarrativeSnapshot {
+    pub(crate) snapshot: Option<NarrativeSnapshot>,
+    pub(crate) skipped_malformed_rows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NarrativeRedactionReport {
+    pub(crate) text: String,
+    pub(crate) findings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NarrativeRefreshDecision {
+    Eligible,
+    NoProvider,
+    OverBudget,
+    TooSoon,
+    CallLimitReached,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NarrativeRefreshPolicy {
+    pub(crate) provider_route: Option<String>,
+    pub(crate) max_spend_usd: Option<f64>,
+    pub(crate) manual: bool,
+    pub(crate) now: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NarrativeProviderRefresh {
+    pub(crate) route: String,
+    pub(crate) model: String,
+    pub(crate) cost_usd: f64,
+    pub(crate) subscription_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct NarrativePromptBundle {
+    pub(crate) prompt: String,
+    pub(crate) redaction: NarrativeRedactionReport,
+    pub(crate) evidence_ids: Vec<String>,
+    pub(crate) graph_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ProviderNarrativeOutput {
+    #[serde(default)]
+    headline: Option<String>,
+    #[serde(default)]
+    current_work: Vec<NarrativeClaim>,
+    #[serde(default)]
+    architecture_notes: Vec<NarrativeClaim>,
+    #[serde(default)]
+    risks: Vec<NarrativeClaim>,
+    #[serde(default)]
+    next_likely: Vec<NarrativeClaim>,
+    #[serde(default)]
+    graph_labels: Vec<ProviderGraphLabel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProviderGraphLabel {
+    target_id: String,
+    label: String,
+}
+
 pub(crate) fn ensure_run_projection(
     input: &RunNarrativeInput<'_>,
 ) -> crate::Result<NarrativeProjection> {
@@ -365,6 +434,24 @@ pub(crate) fn ensure_plan_projection(
     let projection = build_plan_projection(input);
     persist_projection(&projection, &plan_dir.join(NARRATIVE_DIR))?;
     Ok(projection)
+}
+
+pub(crate) fn persist_run_projection(
+    state: &deadreckon_core::PipelineState,
+    projection: &NarrativeProjection,
+) -> crate::Result<()> {
+    persist_projection(projection, &state.run_root.join(NARRATIVE_DIR))
+}
+
+pub(crate) fn persist_plan_projection(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    projection: &NarrativeProjection,
+) -> crate::Result<()> {
+    persist_projection(
+        projection,
+        &paths.plan_dir(&plan.plan_id).join(NARRATIVE_DIR),
+    )
 }
 
 pub(crate) fn build_run_projection(input: &RunNarrativeInput<'_>) -> NarrativeProjection {
@@ -908,8 +995,16 @@ pub(crate) fn narrative_plain_lines(
             visual.label()
         ),
         format!(
-            "freshness: deterministic fallback  covered: {}",
-            coverage_label(&projection.state.latest_covered)
+            "freshness: {} via {}  covered: {}{}",
+            narrative_status_label(&projection.state.latest_status),
+            projection.state.provider.source,
+            coverage_label(&projection.state.latest_covered),
+            projection
+                .state
+                .last_error
+                .as_ref()
+                .map(|error| format!("  error: {}", one_line(error, 120)))
+                .unwrap_or_default()
         ),
         String::new(),
         snapshot.headline.clone(),
@@ -971,12 +1066,456 @@ pub(crate) fn validate_graph(graph: &ArchitectureGraph) -> bool {
         && graph.edges.iter().all(|edge| !edge.evidence.is_empty())
 }
 
-fn persist_projection(projection: &NarrativeProjection, narrative_dir: &Path) -> crate::Result<()> {
-    let latest = read_json::<NarrativeState>(&narrative_dir.join(NARRATIVE_STATE_JSON));
-    if latest
-        .as_ref()
-        .is_some_and(|state| state.latest_snapshot_id == projection.snapshot.snapshot_id)
+pub(crate) fn read_latest_snapshot(narrative_dir: &Path) -> LatestNarrativeSnapshot {
+    let path = narrative_dir.join(NARRATIVE_SNAPSHOTS_JSONL);
+    let Ok(raw) = fs::read_to_string(path) else {
+        return LatestNarrativeSnapshot {
+            snapshot: None,
+            skipped_malformed_rows: 0,
+        };
+    };
+    let mut latest = None;
+    let mut skipped = 0;
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str::<NarrativeSnapshot>(line) {
+            Ok(snapshot) => latest = Some(snapshot),
+            Err(_) => skipped += 1,
+        }
+    }
+    LatestNarrativeSnapshot {
+        snapshot: latest,
+        skipped_malformed_rows: skipped,
+    }
+}
+
+pub(crate) fn redact_for_provider(raw: &str) -> NarrativeRedactionReport {
+    let mut findings = Vec::new();
+    let mut text = strip_terminal_controls(raw, &mut findings);
+    let rules = [
+        (
+            r#"(?i)(authorization|cookie|password|passwd|api[_-]?key|secret|token|access[_-]?token)\s*[:=]\s*['"]?[^'"\s,;]+"#,
+            "<redacted-secret>",
+            "secret-like assignment redacted",
+        ),
+        (
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+            "<redacted-private-key>",
+            "private key block redacted",
+        ),
+        (
+            r"\bgh[pousr]_[A-Za-z0-9_]{12,}\b",
+            "<redacted-github-token>",
+            "github token redacted",
+        ),
+        (
+            r"\bsk-[A-Za-z0-9_-]{12,}\b",
+            "<redacted-api-token>",
+            "api token redacted",
+        ),
+        (
+            r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+            "<redacted-email>",
+            "email redacted",
+        ),
+    ];
+    for (pattern, replacement, finding) in rules {
+        let Ok(regex) = Regex::new(pattern) else {
+            continue;
+        };
+        if regex.is_match(&text) {
+            text = regex.replace_all(&text, replacement).to_string();
+            findings.push(finding.to_string());
+        }
+    }
+    findings.sort();
+    findings.dedup();
+    NarrativeRedactionReport { text, findings }
+}
+
+pub(crate) fn build_provider_prompt(
+    projection: &NarrativeProjection,
+) -> crate::Result<NarrativePromptBundle> {
+    let evidence_ids = evidence_ids_for_projection(projection)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let graph_ids = graph_ids_for_projection(projection)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let prompt_value = json!({
+        "system": "You are a narrative projector over cited evidence, not a source of truth. Return only JSON matching the requested schema. Cite every claim. Do not invent evidence, graph nodes, graph edges, files, or actions.",
+        "output_schema": {
+            "headline": "string",
+            "current_work": [{"text": "string", "evidence": ["known evidence id"], "confidence": "high|medium|low"}],
+            "architecture_notes": [{"text": "string", "evidence": ["known evidence id"], "confidence": "high|medium|low"}],
+            "risks": [{"text": "string", "evidence": ["known evidence id"], "confidence": "high|medium|low"}],
+            "next_likely": [{"text": "string", "evidence": ["known evidence id"], "confidence": "low"}],
+            "graph_labels": [{"target_id": "known graph id", "label": "short label"}]
+        },
+        "allowed_evidence_ids": evidence_ids,
+        "allowed_graph_ids": graph_ids,
+        "snapshot": projection.snapshot,
+        "graph": projection.graph,
+    });
+    let raw = serde_json::to_string_pretty(&prompt_value)?;
+    let redaction = redact_for_provider(&raw);
+    Ok(NarrativePromptBundle {
+        prompt: redaction.text.clone(),
+        redaction,
+        evidence_ids,
+        graph_ids,
+    })
+}
+
+pub(crate) fn provider_refresh_decision(
+    state: &NarrativeState,
+    policy: &NarrativeRefreshPolicy,
+) -> NarrativeRefreshDecision {
+    if policy.provider_route.as_deref().is_none_or(str::is_empty) {
+        return NarrativeRefreshDecision::NoProvider;
+    }
+    if state.provider.calls >= state.cadence.max_provider_calls_per_attach {
+        return NarrativeRefreshDecision::CallLimitReached;
+    }
+    if let Some(max_spend) = policy.max_spend_usd
+        && state.provider.cost_usd >= max_spend
     {
+        return NarrativeRefreshDecision::OverBudget;
+    }
+    if !policy.manual
+        && let Some(last) = state.latest_created_at
+    {
+        let elapsed = (policy.now - last).num_seconds().max(0) as u64;
+        if elapsed < state.cadence.min_seconds_between_provider_calls {
+            return NarrativeRefreshDecision::TooSoon;
+        }
+    }
+    NarrativeRefreshDecision::Eligible
+}
+
+pub(crate) fn apply_provider_response(
+    projection: &NarrativeProjection,
+    raw_content: &str,
+    provider: NarrativeProviderRefresh,
+) -> crate::Result<NarrativeProjection> {
+    let redacted_output = redact_for_provider(raw_content);
+    if !redacted_output.findings.is_empty() {
+        return Err(crate::CliError::Exit {
+            code: 1,
+            message: "narrative provider output contained sensitive or unsafe text".to_string(),
+            hint: "try: inspect provider output and rely on deterministic narrative fallback"
+                .to_string(),
+        });
+    }
+    let output: ProviderNarrativeOutput =
+        serde_json::from_str(raw_content).map_err(|err| crate::CliError::Exit {
+            code: 1,
+            message: format!("narrative provider returned invalid JSON: {err}"),
+            hint: "try: press r later or omit --narrative-provider for deterministic fallback"
+                .to_string(),
+        })?;
+    let allowed_evidence = evidence_ids_for_projection(projection);
+    validate_provider_claims(&output, &allowed_evidence)?;
+    let allowed_graph_ids = graph_ids_for_projection(projection);
+    validate_provider_graph_labels(&output.graph_labels, &allowed_graph_ids)?;
+
+    let mut next = projection.clone();
+    if let Some(headline) = non_empty_redacted_line(output.headline.as_deref()) {
+        next.snapshot.headline = headline;
+    }
+    if !output.current_work.is_empty() {
+        next.snapshot.current_work = output.current_work;
+    }
+    if !output.architecture_notes.is_empty() {
+        next.snapshot.architecture_notes = output.architecture_notes;
+    }
+    if !output.risks.is_empty() {
+        next.snapshot.risks = output.risks;
+    }
+    if !output.next_likely.is_empty() {
+        next.snapshot.next_likely = output.next_likely;
+    }
+    apply_graph_label_suggestions(&mut next.graph, &output.graph_labels);
+    let graph_hash = stable_hash(&next.graph);
+    next.state.latest_covered.architecture_graph_hash = Some(graph_hash.clone());
+    next.snapshot.source_window = next.graph.source_window.clone();
+    next.snapshot.status = NarrativeStatus::Fresh;
+    next.state.latest_status = NarrativeStatus::Fresh;
+    let created_at = Utc::now();
+    next.snapshot.created_at = created_at;
+    next.state.latest_created_at = Some(created_at);
+    next.state.provider.route = Some(provider.route);
+    next.state.provider.model = Some(provider.model);
+    next.state.provider.source = "provider".to_string();
+    next.state.provider.calls = next.state.provider.calls.saturating_add(1);
+    next.state.provider.cost_usd += provider.cost_usd;
+    next.state.provider.subscription_seconds += provider.subscription_seconds.unwrap_or_default();
+    next.state.last_error = None;
+    let snapshot_id = snapshot_id(&(
+        &next.snapshot.scope,
+        &next.snapshot.target_id,
+        &next.snapshot.headline,
+        &next.snapshot.current_work,
+        &next.snapshot.architecture_notes,
+        &next.snapshot.risks,
+        &next.snapshot.next_likely,
+        &graph_hash,
+        &next.state.provider.route,
+        next.state.provider.calls,
+    ));
+    next.snapshot.snapshot_id = snapshot_id.clone();
+    next.state.latest_snapshot_id = snapshot_id;
+    Ok(next)
+}
+
+pub(crate) fn projection_with_provider_failure(
+    projection: &NarrativeProjection,
+    route: Option<String>,
+    error: impl Into<String>,
+) -> NarrativeProjection {
+    let mut next = projection.clone();
+    next.snapshot.status = NarrativeStatus::Stale;
+    next.state.latest_status = NarrativeStatus::Stale;
+    next.state.provider.route = route;
+    next.state.provider.source = "provider_failed".to_string();
+    next.state.last_error = Some(error.into());
+    next.snapshot.risks.push(NarrativeClaim {
+        text: "Provider-backed narration failed; deterministic facts remain visible.".to_string(),
+        evidence: next
+            .snapshot
+            .citations
+            .first()
+            .map(|citation| vec![citation.id.clone()])
+            .unwrap_or_else(|| vec!["state".to_string()]),
+        confidence: "high".to_string(),
+    });
+    next
+}
+
+fn strip_terminal_controls(raw: &str, findings: &mut Vec<String>) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut stripped = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            stripped = true;
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+            stripped = true;
+            continue;
+        }
+        out.push(ch);
+    }
+    if stripped {
+        findings.push("terminal control sequence redacted".to_string());
+    }
+    out
+}
+
+fn validate_provider_claims(
+    output: &ProviderNarrativeOutput,
+    allowed_evidence: &BTreeSet<String>,
+) -> crate::Result<()> {
+    let mut errors = Vec::new();
+    validate_claim_list(
+        "current_work",
+        &output.current_work,
+        allowed_evidence,
+        false,
+        &mut errors,
+    );
+    validate_claim_list(
+        "architecture_notes",
+        &output.architecture_notes,
+        allowed_evidence,
+        false,
+        &mut errors,
+    );
+    validate_claim_list("risks", &output.risks, allowed_evidence, false, &mut errors);
+    validate_claim_list(
+        "next_likely",
+        &output.next_likely,
+        allowed_evidence,
+        true,
+        &mut errors,
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::CliError::Exit {
+            code: 1,
+            message: format!(
+                "narrative provider claims failed validation: {}",
+                errors.join("; ")
+            ),
+            hint: "try: rely on deterministic fallback or refresh after more evidence exists"
+                .to_string(),
+        })
+    }
+}
+
+fn validate_claim_list(
+    section: &str,
+    claims: &[NarrativeClaim],
+    allowed_evidence: &BTreeSet<String>,
+    low_only: bool,
+    errors: &mut Vec<String>,
+) {
+    for (index, claim) in claims.iter().enumerate() {
+        if claim.evidence.is_empty() {
+            errors.push(format!("{section}[{index}] has no evidence"));
+        }
+        for evidence in &claim.evidence {
+            if !allowed_evidence.contains(evidence) {
+                errors.push(format!(
+                    "{section}[{index}] cites unknown evidence {evidence}"
+                ));
+            }
+        }
+        if low_only && claim.confidence != "low" {
+            errors.push(format!(
+                "{section}[{index}] must use low confidence because it is predictive"
+            ));
+        }
+        if claim.text.trim().is_empty() {
+            errors.push(format!("{section}[{index}] has empty text"));
+        }
+    }
+}
+
+fn validate_provider_graph_labels(
+    labels: &[ProviderGraphLabel],
+    allowed_graph_ids: &BTreeSet<String>,
+) -> crate::Result<()> {
+    let unknown = labels
+        .iter()
+        .filter(|label| !allowed_graph_ids.contains(&label.target_id))
+        .map(|label| label.target_id.clone())
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::CliError::Exit {
+            code: 1,
+            message: format!(
+                "narrative provider suggested unknown graph target(s): {}",
+                unknown.join(", ")
+            ),
+            hint: "try: refresh after the architecture map has more deterministic evidence"
+                .to_string(),
+        })
+    }
+}
+
+fn evidence_ids_for_projection(projection: &NarrativeProjection) -> BTreeSet<String> {
+    let mut ids = projection
+        .snapshot
+        .citations
+        .iter()
+        .map(|citation| citation.id.clone())
+        .collect::<BTreeSet<_>>();
+    for claim in projection
+        .snapshot
+        .current_work
+        .iter()
+        .chain(projection.snapshot.architecture_notes.iter())
+        .chain(projection.snapshot.risks.iter())
+        .chain(projection.snapshot.next_likely.iter())
+        .chain(projection.snapshot.coordination_notes.iter())
+    {
+        ids.extend(claim.evidence.iter().cloned());
+    }
+    for row in &projection.snapshot.agent_table {
+        ids.extend(row.evidence.iter().cloned());
+    }
+    for node in &projection.graph.nodes {
+        ids.extend(node.evidence.iter().cloned());
+    }
+    for edge in &projection.graph.edges {
+        ids.extend(edge.evidence.iter().cloned());
+    }
+    for group in &projection.graph.groups {
+        ids.extend(group.evidence.iter().cloned());
+    }
+    ids
+}
+
+fn graph_ids_for_projection(projection: &NarrativeProjection) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    ids.extend(projection.graph.nodes.iter().map(|node| node.id.clone()));
+    ids.extend(
+        projection
+            .graph
+            .edges
+            .iter()
+            .map(|edge| format!("edge:{}:{}:{}", edge.from, edge.kind, edge.to)),
+    );
+    ids.extend(projection.graph.groups.iter().map(|group| group.id.clone()));
+    ids
+}
+
+fn apply_graph_label_suggestions(graph: &mut ArchitectureGraph, labels: &[ProviderGraphLabel]) {
+    for suggestion in labels {
+        let Some(label) = non_empty_redacted_line(Some(&suggestion.label)) else {
+            continue;
+        };
+        if let Some(node) = graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == suggestion.target_id)
+        {
+            node.label = label;
+            continue;
+        }
+        if let Some(group) = graph
+            .groups
+            .iter_mut()
+            .find(|group| group.id == suggestion.target_id)
+        {
+            group.label = label;
+            continue;
+        }
+        if let Some(edge) = graph.edges.iter_mut().find(|edge| {
+            format!("edge:{}:{}:{}", edge.from, edge.kind, edge.to) == suggestion.target_id
+        }) {
+            edge.label = label;
+        }
+    }
+}
+
+fn non_empty_redacted_line(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let redacted = redact_for_provider(value);
+    if redacted.findings.is_empty() && !redacted.text.trim().is_empty() {
+        Some(one_line(&redacted.text, 220))
+    } else {
+        None
+    }
+}
+
+fn persist_projection(projection: &NarrativeProjection, narrative_dir: &Path) -> crate::Result<()> {
+    let latest = read_latest_snapshot(narrative_dir);
+    if latest
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.snapshot_id == projection.snapshot.snapshot_id)
+    {
+        write_json_pretty(&narrative_dir.join(NARRATIVE_STATE_JSON), &projection.state)?;
+        write_json_pretty(
+            &narrative_dir.join(ARCHITECTURE_GRAPH_JSON),
+            &projection.graph,
+        )?;
         return Ok(());
     }
     fs::create_dir_all(narrative_dir)?;
@@ -1648,6 +2187,17 @@ fn coverage_label(coverage: &NarrativeCoverage) -> String {
     }
 }
 
+fn narrative_status_label(status: &NarrativeStatus) -> &'static str {
+    match status {
+        NarrativeStatus::Fresh => "fresh",
+        NarrativeStatus::Stale => "stale",
+        NarrativeStatus::Failed => "failed",
+        NarrativeStatus::Disabled => "disabled",
+        NarrativeStatus::Redacted => "redacted",
+        NarrativeStatus::Deterministic => "deterministic fallback",
+    }
+}
+
 fn docs_hash(state: &deadreckon_core::PipelineState) -> Option<String> {
     let docs_dir = state.working_dir.join(".deadreckon/docs");
     let mut hasher = Sha256::new();
@@ -1760,11 +2310,6 @@ fn append_json_line<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
-}
-
-fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
 }
 
 fn read_jsonl<T: DeserializeOwned>(path: &Path) -> crate::Result<Vec<T>> {
@@ -1923,5 +2468,267 @@ mod tests {
         assert!(rendered.contains("Visual: architecture"));
         assert!(rendered.contains("-> touches"));
         assert!(rendered.contains("crates/deadreckon/src/main.rs"));
+    }
+
+    #[test]
+    fn latest_snapshot_skips_malformed_rows_and_reports_gap() {
+        let temp = TempDir::new().expect("temp");
+        let projection = sample_projection(&temp);
+        let narrative_dir = temp.path().join("narrative");
+        fs::create_dir_all(&narrative_dir).expect("dir");
+        fs::write(
+            narrative_dir.join(NARRATIVE_SNAPSHOTS_JSONL),
+            format!(
+                "{{not json}}\n{}\n",
+                serde_json::to_string(&projection.snapshot).expect("snapshot json")
+            ),
+        )
+        .expect("write");
+
+        let latest = read_latest_snapshot(&narrative_dir);
+
+        assert_eq!(latest.skipped_malformed_rows, 1);
+        assert_eq!(
+            latest
+                .snapshot
+                .as_ref()
+                .map(|snapshot| &snapshot.snapshot_id),
+            Some(&projection.snapshot.snapshot_id)
+        );
+    }
+
+    #[test]
+    fn narrative_redaction_removes_secret_like_values_before_provider_input() {
+        let report = redact_for_provider(
+            "\u{1b}[31mtoken=sk-testsecret123456789 user@example.com -----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        );
+
+        assert!(report.text.contains("<redacted-secret>"));
+        assert!(report.text.contains("<redacted-email>"));
+        assert!(report.text.contains("<redacted-private-key>"));
+        assert!(!report.text.contains("testsecret"));
+        assert!(!report.text.contains("\u{1b}"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.contains("terminal control"))
+        );
+    }
+
+    #[test]
+    fn claim_validation_rejects_missing_evidence_ids() {
+        let temp = TempDir::new().expect("temp");
+        let projection = sample_projection(&temp);
+        let content = json!({
+            "headline": "Narrated run",
+            "current_work": [
+                {"text": "This claim invents evidence.", "evidence": ["run:missing:event:9"], "confidence": "high"}
+            ]
+        })
+        .to_string();
+
+        let err = apply_provider_response(&projection, &content, sample_provider())
+            .expect_err("unknown evidence rejected");
+
+        assert!(err.to_string().contains("unknown evidence"));
+    }
+
+    #[test]
+    fn summarizer_cannot_invent_architecture_graph_nodes() {
+        let temp = TempDir::new().expect("temp");
+        let projection = sample_projection(&temp);
+        let evidence = projection.snapshot.citations[0].id.clone();
+        let content = json!({
+            "headline": "Narrated run",
+            "current_work": [
+                {"text": "The run is explained from evidence.", "evidence": [evidence], "confidence": "high"}
+            ],
+            "graph_labels": [
+                {"target_id": "node:invented", "label": "Invented node"}
+            ]
+        })
+        .to_string();
+
+        let err = apply_provider_response(&projection, &content, sample_provider())
+            .expect_err("invented graph node rejected");
+
+        assert!(err.to_string().contains("unknown graph target"));
+    }
+
+    #[test]
+    fn summarizer_uses_fake_provider_and_writes_cited_snapshot() {
+        let temp = TempDir::new().expect("temp");
+        let projection = sample_projection(&temp);
+        let evidence = projection.snapshot.citations[0].id.clone();
+        let first_node = projection.graph.nodes[0].id.clone();
+        let content = json!({
+            "headline": "Narrated: the run has a cited operator summary.",
+            "current_work": [
+                {"text": "The deterministic run facts have been rewritten as an operator summary.", "evidence": [evidence], "confidence": "high"}
+            ],
+            "architecture_notes": [],
+            "risks": [],
+            "next_likely": [
+                {"text": "The operator can inspect raw activity next if needed.", "evidence": [projection.snapshot.citations[0].id], "confidence": "low"}
+            ],
+            "graph_labels": [
+                {"target_id": first_node, "label": "operator run"}
+            ]
+        })
+        .to_string();
+
+        let refreshed =
+            apply_provider_response(&projection, &content, sample_provider()).expect("refresh");
+        persist_projection(&refreshed, &temp.path().join("narrative")).expect("persist");
+        let latest = read_latest_snapshot(&temp.path().join("narrative"));
+        let rendered =
+            narrative_plain_lines(&refreshed, NarrativeVisualMode::Architecture).join("\n");
+
+        assert_eq!(refreshed.state.latest_status, NarrativeStatus::Fresh);
+        assert_eq!(refreshed.state.provider.source, "provider");
+        assert!(latest.snapshot.is_some());
+        assert!(rendered.contains("freshness: fresh via provider"));
+        assert!(rendered.contains("operator summary"));
+    }
+
+    #[test]
+    fn summarizer_respects_min_interval_and_manual_refresh_budget() {
+        let temp = TempDir::new().expect("temp");
+        let mut projection = sample_projection(&temp);
+        projection.state.latest_created_at = Some(Utc::now());
+        projection.state.provider.route = Some("cli:test".to_string());
+
+        let automatic = NarrativeRefreshPolicy {
+            provider_route: Some("cli:test".to_string()),
+            max_spend_usd: Some(10.0),
+            manual: false,
+            now: Utc::now(),
+        };
+        assert_eq!(
+            provider_refresh_decision(&projection.state, &automatic),
+            NarrativeRefreshDecision::TooSoon
+        );
+
+        let manual = NarrativeRefreshPolicy {
+            manual: true,
+            ..automatic.clone()
+        };
+        assert_eq!(
+            provider_refresh_decision(&projection.state, &manual),
+            NarrativeRefreshDecision::Eligible
+        );
+
+        projection.state.provider.cost_usd = 10.0;
+        assert_eq!(
+            provider_refresh_decision(&projection.state, &manual),
+            NarrativeRefreshDecision::OverBudget
+        );
+
+        projection.state.provider.cost_usd = 0.0;
+        projection.state.provider.calls = projection.state.cadence.max_provider_calls_per_attach;
+        assert_eq!(
+            provider_refresh_decision(&projection.state, &manual),
+            NarrativeRefreshDecision::CallLimitReached
+        );
+    }
+
+    #[test]
+    fn summarizer_failure_keeps_attach_alive_with_stale_status() {
+        let temp = TempDir::new().expect("temp");
+        let projection = sample_projection(&temp);
+
+        let stale = projection_with_provider_failure(
+            &projection,
+            Some("cli:test".to_string()),
+            "provider refused structured JSON",
+        );
+
+        assert_eq!(stale.state.latest_status, NarrativeStatus::Stale);
+        assert_eq!(stale.snapshot.status, NarrativeStatus::Stale);
+        assert!(
+            stale
+                .state
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("refused")
+        );
+        assert!(
+            narrative_plain_lines(&stale, NarrativeVisualMode::None)
+                .join("\n")
+                .contains("deterministic facts remain visible")
+        );
+    }
+
+    #[test]
+    fn provider_prompt_redacts_before_leaving_the_process() {
+        let temp = TempDir::new().expect("temp");
+        let mut projection = sample_projection(&temp);
+        projection.snapshot.current_work.push(NarrativeClaim {
+            text: "Saw token=ghp_abcdefghijklmnopqrstuvwxyz in provider output.".to_string(),
+            evidence: vec![projection.snapshot.citations[0].id.clone()],
+            confidence: "high".to_string(),
+        });
+
+        let prompt = build_provider_prompt(&projection).expect("prompt");
+
+        assert!(prompt.prompt.contains("<redacted-secret>"));
+        assert!(!prompt.prompt.contains("ghp_abcdefghijklmnopqrstuvwxyz"));
+        assert!(
+            prompt
+                .redaction
+                .findings
+                .iter()
+                .any(|finding| finding.contains("secret-like"))
+        );
+        assert!(!prompt.evidence_ids.is_empty());
+        assert!(!prompt.graph_ids.is_empty());
+    }
+
+    fn sample_provider() -> NarrativeProviderRefresh {
+        NarrativeProviderRefresh {
+            route: "cli:test".to_string(),
+            model: "test-model".to_string(),
+            cost_usd: 0.0,
+            subscription_seconds: Some(1.0),
+        }
+    }
+
+    fn sample_projection(temp: &TempDir) -> NarrativeProjection {
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "sample narrative attach".to_string(),
+                cwd: repo,
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some(format!("run-sample-{}", Uuid::new_v4().simple())),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        build_run_projection(&RunNarrativeInput {
+            state: &state,
+            spend: &[],
+            traces: &[],
+            events: &[],
+            live_files: vec![LiveFileFact {
+                path: "src/main.rs".to_string(),
+                bytes: 10,
+                modified_at: None,
+            }],
+            file_count: 1,
+            total_bytes: 10,
+            acceptance_summary: "default gate".to_string(),
+            provider_activity: &[],
+            parent_plan: None,
+        })
     }
 }

@@ -1257,6 +1257,8 @@ The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defau
 
 `attach` dispatches by id kind: a run id opens the run TUI documented below, a chain id opens the chain attach view (`Chains`, §28), and a plan id opens the plan attach TUI (`Plans`, §30.3 / §32.3). All three TUIs draw from the same palette (`ui::TUI_PALETTE`, §26.7) and the same key conventions (`q`/`Esc`/`Ctrl-D` detach; `d` toggles docs view in the run TUI; `Enter` drills into a child run from plan attach).
 
+`attach <id> --view narrative` adds a calmer operator projection for runs, plans, and plan child refs. The default remains `activity`, so raw tool/provider lines still open first unless the user requests the narrative view. In narrative mode, `n` toggles back to raw activity, `v` cycles `architecture -> agents -> files -> evidence -> none`, and `r` requests a provider-backed refresh when a configured route is available. Manual refreshes are bounded: the prompt is built from redacted evidence windows, the provider must return strict cited JSON, graph labels may only target deterministic graph ids, and failures persist a stale deterministic projection instead of breaking attach.
+
 ### 18.2 Layout
 
 `attach_panel_layout` (`main.rs:~10225`):
@@ -1280,6 +1282,7 @@ The top band is split horizontally into three panels for subscription providers 
 - **Context meter**: compact token/window summary with green/yellow/red thresholds.
 - **Acceptance meter**: derived from `AcceptanceLive` (`collect_acceptance_live` in `main.rs:~10172`). When `proofs/acceptance-progress.jsonl` exists, the panel tails it and surfaces `running 2/5`, `passed`, or `failed` with the offending check; once `turn-acceptance.json` is signed, it pivots to a marker view (`acceptance_live_from_marker`). Color thresholds are owned by `acceptance_color`.
 - **Center, left**: wide streaming list of tool calls + provider activity + recent events. Acceptance lines from `acceptance_activity_lines` are interleaved so the operator sees the same progress in the activity stream and the meter.
+- **Narrative view**: `--view narrative` or `n` swaps the center-left activity pane for prose sections: freshness/coverage, headline, current work, architecture notes, risks, next likely action, and citations. Wide terminals split that pane with a right-side visual map; narrow terminals collapse to prose first. Plain/off-TTY narrative attach prints the same projection with citations and ASCII map lines when `--visual` is not `none`; `--json --view narrative` emits the structured state, snapshot, and graph objects.
 - **Completed docs view**: pressing `d` toggles the center-left panel from provider activity to `RUN-NARRATIVE.md` rendered through `pulldown-cmark` into ratatui `Line`/`Span`s. Headings, bullets, inline code, fenced code blocks, links, task markers, math, and horizontal rules receive terminal styles and remain scrollable.
 - **Center, right**: narrower live files list with count/bytes in the panel title.
 - **Bottom**: supervised PIDs + their `ps` lines (alive/dead annotation).
@@ -1290,6 +1293,16 @@ The top band is split horizontally into three panels for subscription providers 
 The run TUI still polls run files on disk every 500 ms: `spend.jsonl`, `traces.jsonl`, `events.jsonl`, `proofs/acceptance-progress.jsonl`, `proofs/turn-acceptance.json`, plus provider-native logs when the active provider writes them. `collect_provider_activity` now resolves provider ingest through descriptor `[ingest]` metadata: candidate roots, env overrides, cwd matching, storage kind, file glob, freshness window, and schema key. `deadreckon import` reuses the same descriptor metadata for provider transcript discovery and adds import-only session selection, manifest writing, and normalized trace/provenance event creation. `cli:codex` reads `~/.codex/sessions/**.jsonl` and matches `session_meta.payload.cwd`; `cli:claude-code` reads `~/.claude/projects/<cwd-slug>/*.jsonl` using Claude Code's path-to-project mapping and matches top-level `cwd`; `cli:gemini` reads Gemini JSON/JSONL file logs; `cli:opencode` reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON; `cli:copilot` reads `~/.copilot/session-state/*.jsonl` plus nested `events.jsonl` and matches `data.context.cwd`; `cli:pi` reads `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`, validates the first nonblank row is a Pi `session`, and matches the header `cwd`. The shared collector handles candidate discovery, recency filtering, run matching, stream capping, and context telemetry. Schema-specific adapters only decode rows into common activity lines (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`) and normalize tool labels through `deadreckon_providers::taxonomy`.
 
 Same-process run attaches can use the `RunEventBus` broadcast channel directly; cross-process run attaches still poll. Plan attach is different after the live-UX slice: it consumes `PlanEventBus` / `PlanEventFeed`, which owns `plan-events.jsonl` replay/tailing, emits plan snapshots, tolerates malformed or partial plan-event rows, and multiplexes discovered child and repair run `events.jsonl` streams into the plan activity pane. The production feed remains durable-file backed for cross-process attach, with a broadcast-capable API available for same-process plan streams.
+
+### 18.4 Narrative projection files
+
+Narrative attach writes projection files, not source-of-truth state. Run projections live under `<run-root>/narrative/`; plan projections live under `<plan-dir>/narrative/`.
+
+- `state.json` records the latest snapshot id/status, coverage, cadence, provider source, provider call count, cost/wall-clock accounting, and last refresh error.
+- `snapshots.jsonl` is append-only. Each row contains cited `current_work`, `architecture_notes`, `risks`, `next_likely`, citations, and plan-only agent/coordination sections. Malformed rows are skipped when reading the latest snapshot.
+- `architecture-graph.json` is a deterministic graph over run files, provider ids, checkpoints, plan tasks, dependencies, child runs, and citation ids. The TUI renders architecture, agent, file, and evidence views from this graph using ASCII-compatible labels and color-independent badges.
+
+Provider-backed narration is an overlay on these projections. `r` builds a redacted prompt from the deterministic projection, sends only bounded evidence summaries to the selected provider route (`--narrative-provider`, then run/plan provider fallback), validates all returned claims against known evidence ids, rejects invented graph ids, and persists a new fresh snapshot only after validation. If the provider is missing, over budget, behind cadence, returns malformed JSON, cites unknown evidence, emits secret-like text, or fails, attach keeps running and persists a stale deterministic snapshot with the error in `state.json`.
 
 ---
 
@@ -2011,6 +2024,8 @@ The stream is orchestration-level only. It records plan and task lifecycle edges
 
 Plain/off-TTY `attach <plan-id>` prints the latest plan event, merge repair status when sidecars exist, and an explicit `deadreckon attach <plan-id>` hint. `history grep <pattern> --plan <plan-id>` searches `plan-events.jsonl` before child run trace/provenance files, so repair events are grep-visible. `show <plan-id> --why-failed` includes the latest plan event and merge repair sidecar paths alongside failed child rows and blocker messages.
 
+`attach <plan-id> --view narrative` uses the same plan feed plus current `Plan` state to render a plan-level operator story. The narrative pane lists plan status, task/role/provider rows, dependency and coordination notes, risks, next likely orchestration moves, and an agent or architecture visual. It does not copy child traces into `plan-events.jsonl`; child runs remain normal runs with their own narrative projections and flight files.
+
 ### 32.4 Current Limits
 
 The plan event stream is durable and replayable, and plan attach now subscribes to a single `PlanEventBus` feed abstraction. The feed is broadcast-capable in-process, but production plan writers still primarily communicate through append-only JSONL so cross-process attach remains reliable. A future embedded attach mode could pass a long-lived broadcaster through every plan writer for lower-latency same-process delivery.
@@ -2043,6 +2058,8 @@ The sidecar polls descriptor-discovered provider JSON/JSONL files and the workin
 `deadreckon rewind <run-id> --to-turn <n>|--to-provider-event <seq>|--to-checkpoint <id>` defaults to preview. Preview materializes the target under `<run-root>/rewind-preview/<checkpoint-id>/` and lists the files that would change. `--apply` first refuses superseded checkpoints, then hash-guards changed files against DeadReckon's latest snapshot/current checkpoint expectation before copying only the guarded changed files into the run working directory. Unrelated user edits produce a refusal in `rewind-events.jsonl`.
 
 The run attach TUI activity collector now reads `flight-events.jsonl` and still appends descriptor-ingested provider log lines when available. That makes completed CLI subturns durable and inspectable while preserving provider-log freshness during a long subprocess.
+
+Narrative attach consumes flight evidence but does not rewrite it. Run snapshots cite flight rows such as `flight:<run-prefix>:seq:<n>`, checkpoint ids, file paths, run events, traces, and plan/task ids. Provider-backed summaries can rewrite prose and suggest labels for existing graph nodes, but they cannot add flight events, alter checkpoints, or create graph nodes without deterministic evidence.
 
 ### 33.4 Operation Modes And Limits
 

@@ -17248,9 +17248,18 @@ struct AttachCommandArgs {
     narrative_max_spend: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct NarrativeAttachConfig {
+    provider: Option<String>,
+    max_spend_usd: Option<f64>,
+}
+
 async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let _narrative_config = (&args.narrative_provider, args.narrative_max_spend);
+    let narrative_config = NarrativeAttachConfig {
+        provider: args.narrative_provider.clone(),
+        max_spend_usd: args.narrative_max_spend,
+    };
     let mut parent_plan = None;
     let run_ref = args.run_id.clone();
     let state = if let Some(selection) = resolve_plan_child_ref(&paths, &run_ref)? {
@@ -17274,8 +17283,15 @@ async fn attach_command(args: AttachCommandArgs) -> Result<()> {
                         print_plan_narrative_plain(&paths, &plan, args.visual)?;
                     } else if io::stdout().is_terminal() && !args.plain && !args.json {
                         print_attach_banner("plan", &plan.plan_id);
-                        attach_plan_tui(&paths, &plan.plan_id, show_hints, args.view, args.visual)
-                            .await?;
+                        attach_plan_tui(
+                            &paths,
+                            &plan.plan_id,
+                            show_hints,
+                            args.view,
+                            args.visual,
+                            narrative_config.clone(),
+                        )
+                        .await?;
                     } else {
                         print_plan_summary(&paths, &plan, show_hints);
                     }
@@ -17311,10 +17327,19 @@ async fn attach_command(args: AttachCommandArgs) -> Result<()> {
                 parent_plan,
                 args.view,
                 args.visual,
+                narrative_config.clone(),
             )
             .await?;
         } else {
-            attach_tui(&paths, &run_id, show_hints, args.view, args.visual).await?;
+            attach_tui(
+                &paths,
+                &run_id,
+                show_hints,
+                args.view,
+                args.visual,
+                narrative_config.clone(),
+            )
+            .await?;
         }
         let state = load_run(&paths, &run_id)?;
         if state.status == RunStatus::Completed && show_hints {
@@ -21841,6 +21866,7 @@ async fn attach_plan_tui(
     show_hints: bool,
     initial_view: AttachViewMode,
     initial_visual: NarrativeVisualMode,
+    narrative_config: NarrativeAttachConfig,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -21855,6 +21881,7 @@ async fn attach_plan_tui(
     let mut feed = PlanEventBus::file_tail(paths.clone(), plan_id.to_string());
     let mut view = initial_view;
     let mut visual = initial_visual;
+    let mut narrative_notice = None;
 
     let result = loop {
         for event in feed.refresh(Duration::ZERO).await {
@@ -21895,6 +21922,7 @@ async fn attach_plan_tui(
                     show_hints,
                     view,
                     visual,
+                    narrative_notice: narrative_notice.as_deref(),
                 },
             )
         })?;
@@ -21907,7 +21935,27 @@ async fn attach_plan_tui(
                 Event::Key(key) if key.code == KeyCode::Char('v') && key.modifiers.is_empty() => {
                     visual = visual.next();
                 }
-                Event::Key(key) if key.code == KeyCode::Char('r') && key.modifiers.is_empty() => {}
+                Event::Key(key) if key.code == KeyCode::Char('r') && key.modifiers.is_empty() => {
+                    view = AttachViewMode::Narrative;
+                    narrative_notice = Some(
+                        refresh_plan_narrative_with_provider(
+                            paths,
+                            &plan,
+                            &messages,
+                            &plan_events,
+                            &feed_events,
+                            selected,
+                            &narrative_config,
+                        )
+                        .await
+                        .unwrap_or_else(|err| {
+                            format!(
+                                "provider refresh failed: {}",
+                                one_line(&err.to_string(), 120)
+                            )
+                        }),
+                    );
+                }
                 Event::Key(key)
                     if matches!(
                         key.code,
@@ -21942,6 +21990,7 @@ async fn attach_plan_tui(
                             parent_plan,
                             view,
                             visual,
+                            narrative_config.clone(),
                         )
                         .await;
                         if let Err(err) = &child_result {
@@ -21974,6 +22023,7 @@ struct PlanAttachRenderState<'a> {
     show_hints: bool,
     view: AttachViewMode,
     visual: NarrativeVisualMode,
+    narrative_notice: Option<&'a str>,
 }
 
 fn render_plan_attach(
@@ -22148,6 +22198,9 @@ fn render_plan_narrative_attach(
         })
     });
     let mut lines = narrative::narrative_plain_lines(&projection, state.visual);
+    if let Some(notice) = state.narrative_notice {
+        lines.insert(2, format!("[fresh] {notice}"));
+    }
     if area.width >= 100 && state.visual != NarrativeVisualMode::None {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -22591,6 +22644,7 @@ async fn attach_tui(
     show_completion_actions: bool,
     initial_view: AttachViewMode,
     initial_visual: NarrativeVisualMode,
+    narrative_config: NarrativeAttachConfig,
 ) -> Result<()> {
     attach_tui_with_parent(
         paths,
@@ -22599,6 +22653,7 @@ async fn attach_tui(
         None,
         initial_view,
         initial_visual,
+        narrative_config,
     )
     .await
 }
@@ -22610,6 +22665,7 @@ async fn attach_tui_with_parent(
     parent_plan: Option<AttachParentPlan>,
     initial_view: AttachViewMode,
     initial_visual: NarrativeVisualMode,
+    narrative_config: NarrativeAttachConfig,
 ) -> Result<()> {
     let initial_state = load_run(paths, run_id)?;
     let mut event_feed =
@@ -22659,7 +22715,26 @@ async fn attach_tui_with_parent(
                     tui_state.cycle_visual();
                 }
                 Event::Key(key) if key.code == KeyCode::Char('r') && key.modifiers.is_empty() => {
-                    tui_state.record_narrative_refresh();
+                    let notice = refresh_run_narrative_with_provider(
+                        paths,
+                        &RunNarrativeRenderInput {
+                            state: &state,
+                            spend: &spend,
+                            traces: &traces,
+                            events: &events,
+                            live: &live,
+                            tui_state: &tui_state,
+                        },
+                        &narrative_config,
+                    )
+                    .await
+                    .unwrap_or_else(|err| {
+                        format!(
+                            "provider refresh failed: {}",
+                            one_line(&err.to_string(), 120)
+                        )
+                    });
+                    tui_state.record_narrative_refresh(notice);
                 }
                 Event::Key(key)
                     if key.code == KeyCode::Char('c')
@@ -22929,13 +23004,12 @@ impl AttachTuiState {
         self.focused_panel = AttachPanel::Activity;
     }
 
-    fn record_narrative_refresh(&mut self) {
+    fn record_narrative_refresh(&mut self, notice: String) {
         self.docs_open = false;
         if self.view == AttachViewMode::Activity {
             self.view = AttachViewMode::Narrative;
         }
-        self.narrative_notice =
-            Some("refresh requested; deterministic narrative is current".to_string());
+        self.narrative_notice = Some(notice);
         self.focused_panel = AttachPanel::Activity;
     }
 
@@ -25480,6 +25554,198 @@ fn run_narrative_projection(
     })
 }
 
+async fn refresh_run_narrative_with_provider(
+    paths: &DeadreckonPaths,
+    input: &RunNarrativeRenderInput<'_>,
+    config: &NarrativeAttachConfig,
+) -> Result<String> {
+    let state = input.state;
+    let spend = input.spend;
+    let traces = input.traces;
+    let events = input.events;
+    let live = input.live;
+    let tui_state = input.tui_state;
+    let projection = run_narrative_projection(state, spend, traces, events, live, tui_state)?;
+    let route = config.provider.clone().or_else(|| state.provider.clone());
+    let refreshed = refresh_narrative_projection_with_provider(
+        paths,
+        projection,
+        route.clone(),
+        config,
+        Some(state.working_dir.clone()),
+        state.run_root.join("narrative/provider-refresh.out"),
+    )
+    .await?;
+    narrative::persist_run_projection(state, &refreshed)?;
+    Ok(narrative_refresh_notice(&refreshed))
+}
+
+async fn refresh_plan_narrative_with_provider(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    messages: &[PlanMessage],
+    plan_events: &[PlanEvent],
+    feed_events: &[PlanFeedEvent],
+    selected: usize,
+    config: &NarrativeAttachConfig,
+) -> Result<String> {
+    let projection = narrative::ensure_plan_projection(&narrative::PlanNarrativeInput {
+        paths,
+        plan,
+        messages,
+        plan_events,
+        feed_events,
+        selected,
+    })?;
+    let route = config
+        .provider
+        .clone()
+        .or_else(|| plan.providers.planner.clone())
+        .or_else(|| plan.providers.default_child.clone())
+        .or_else(|| plan.providers.coder.clone());
+    let refreshed = refresh_narrative_projection_with_provider(
+        paths,
+        projection,
+        route.clone(),
+        config,
+        std::env::current_dir().ok(),
+        paths
+            .plan_dir(&plan.plan_id)
+            .join("narrative/provider-refresh.out"),
+    )
+    .await?;
+    narrative::persist_plan_projection(paths, plan, &refreshed)?;
+    Ok(narrative_refresh_notice(&refreshed))
+}
+
+async fn refresh_narrative_projection_with_provider(
+    paths: &DeadreckonPaths,
+    projection: narrative::NarrativeProjection,
+    route: Option<String>,
+    config: &NarrativeAttachConfig,
+    cwd: Option<PathBuf>,
+    output_path: PathBuf,
+) -> Result<narrative::NarrativeProjection> {
+    let policy = narrative::NarrativeRefreshPolicy {
+        provider_route: route.clone(),
+        max_spend_usd: config.max_spend_usd,
+        manual: true,
+        now: Utc::now(),
+    };
+    match narrative::provider_refresh_decision(&projection.state, &policy) {
+        narrative::NarrativeRefreshDecision::Eligible => {}
+        narrative::NarrativeRefreshDecision::NoProvider => {
+            return Ok(narrative::projection_with_provider_failure(
+                &projection,
+                route,
+                "no narrative provider configured; deterministic fallback is current",
+            ));
+        }
+        narrative::NarrativeRefreshDecision::OverBudget => {
+            return Ok(narrative::projection_with_provider_failure(
+                &projection,
+                route,
+                "narrative provider refresh skipped because the spend cap is exhausted",
+            ));
+        }
+        narrative::NarrativeRefreshDecision::TooSoon => {
+            return Ok(narrative::projection_with_provider_failure(
+                &projection,
+                route,
+                "narrative provider refresh skipped by cadence",
+            ));
+        }
+        narrative::NarrativeRefreshDecision::CallLimitReached => {
+            return Ok(narrative::projection_with_provider_failure(
+                &projection,
+                route,
+                "narrative provider refresh skipped because the attach call limit is reached",
+            ));
+        }
+    }
+    let Some(route) = route else {
+        return Ok(narrative::projection_with_provider_failure(
+            &projection,
+            None,
+            "no narrative provider configured; deterministic fallback is current",
+        ));
+    };
+    let prompt = narrative::build_provider_prompt(&projection)?;
+    let router = match ProviderRouter::from_config_path(&paths.config_path(), Some(&route)) {
+        Ok(router) => router,
+        Err(err) => {
+            return Ok(narrative::projection_with_provider_failure(
+                &projection,
+                Some(route),
+                format!("provider route unavailable: {err}"),
+            ));
+        }
+    };
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let response = match router
+        .complete(&ProviderRequest {
+            prompt: prompt.prompt,
+            max_output_tokens: 2_000,
+            cwd,
+            output_path: Some(output_path),
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return Ok(narrative::projection_with_provider_failure(
+                &projection,
+                Some(route),
+                format!("provider refresh failed: {err}"),
+            ));
+        }
+    };
+    match narrative::apply_provider_response(
+        &projection,
+        &response.content,
+        narrative::NarrativeProviderRefresh {
+            route: response.provider,
+            model: response.model,
+            cost_usd: response.spend.cost_usd,
+            subscription_seconds: response.spend.wall_time_seconds,
+        },
+    ) {
+        Ok(refreshed) => Ok(refreshed),
+        Err(err) => Ok(narrative::projection_with_provider_failure(
+            &projection,
+            Some(route),
+            format!("provider output rejected: {err}"),
+        )),
+    }
+}
+
+fn narrative_refresh_notice(projection: &narrative::NarrativeProjection) -> String {
+    match &projection.state.latest_status {
+        narrative::NarrativeStatus::Fresh => format!(
+            "provider narrative refreshed via {}",
+            projection
+                .state
+                .provider
+                .route
+                .as_deref()
+                .unwrap_or("provider")
+        ),
+        _ => projection
+            .state
+            .last_error
+            .as_ref()
+            .map(|error| format!("provider refresh skipped; {}", one_line(error, 120)))
+            .unwrap_or_else(|| {
+                "provider refresh skipped; deterministic narrative is current".to_string()
+            }),
+    }
+}
+
 fn acceptance_narrative_summary(acceptance: &AcceptanceLive) -> String {
     match acceptance.status {
         AcceptanceUiStatus::DefaultGate => "default gate".to_string(),
@@ -26753,6 +27019,7 @@ mod tui_tests {
                         show_hints: true,
                         view: AttachViewMode::Activity,
                         visual: NarrativeVisualMode::Architecture,
+                        narrative_notice: None,
                     },
                 )
             })
