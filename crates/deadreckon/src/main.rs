@@ -14,7 +14,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod setup;
 
@@ -4320,6 +4320,141 @@ fn chain_attach_summary_line(chain: &Chain) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachTickBudget {
+    target_frame_ms: u64,
+    max_sync_io_ms: u64,
+    slow_warning_ms: u64,
+}
+
+impl Default for AttachTickBudget {
+    fn default() -> Self {
+        Self {
+            target_frame_ms: 500,
+            max_sync_io_ms: 80,
+            slow_warning_ms: 180,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachSurface {
+    Run,
+    Plan,
+    Chain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachLoopStage {
+    LoadState,
+    ReadJsonl,
+    EventFeed,
+    LiveCollect,
+    PlanMessages,
+    ProviderNarrativeRefresh,
+    Draw,
+    InputPoll,
+}
+
+impl AttachLoopStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LoadState => "load state",
+            Self::ReadJsonl => "read jsonl",
+            Self::EventFeed => "event feed",
+            Self::LiveCollect => "live collect",
+            Self::PlanMessages => "plan messages",
+            Self::ProviderNarrativeRefresh => "narrative provider refresh",
+            Self::Draw => "draw",
+            Self::InputPoll => "input poll",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachWorkMode {
+    UiSync,
+    Background,
+}
+
+fn attach_loop_stage_work(surface: AttachSurface, stage: AttachLoopStage) -> AttachWorkMode {
+    match (surface, stage) {
+        (AttachSurface::Run | AttachSurface::Plan, AttachLoopStage::ProviderNarrativeRefresh) => {
+            AttachWorkMode::Background
+        }
+        _ => AttachWorkMode::UiSync,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AttachStageTiming {
+    stage: AttachLoopStage,
+    elapsed: Duration,
+    work: AttachWorkMode,
+}
+
+#[derive(Debug)]
+struct AttachTickTiming {
+    surface: AttachSurface,
+    budget: AttachTickBudget,
+    started_at: Instant,
+    stages: Vec<AttachStageTiming>,
+}
+
+impl AttachTickTiming {
+    fn new(surface: AttachSurface, budget: AttachTickBudget) -> Self {
+        Self {
+            surface,
+            budget,
+            started_at: Instant::now(),
+            stages: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, stage: AttachLoopStage, elapsed: Duration) {
+        self.stages.push(AttachStageTiming {
+            stage,
+            elapsed,
+            work: attach_loop_stage_work(self.surface, stage),
+        });
+    }
+
+    fn record_since(&mut self, stage: AttachLoopStage, started_at: Instant) {
+        self.record(stage, started_at.elapsed());
+    }
+
+    fn total_elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    fn frame_exceeded(&self) -> bool {
+        self.total_elapsed() > Duration::from_millis(self.budget.target_frame_ms)
+    }
+
+    fn slow_sync_stages(&self) -> Vec<&AttachStageTiming> {
+        let max_sync = Duration::from_millis(self.budget.max_sync_io_ms);
+        self.stages
+            .iter()
+            .filter(|stage| stage.work == AttachWorkMode::UiSync && stage.elapsed > max_sync)
+            .collect()
+    }
+
+    fn slow_warning_stages(&self) -> Vec<&AttachStageTiming> {
+        let slow = Duration::from_millis(self.budget.slow_warning_ms);
+        self.stages
+            .iter()
+            .filter(|stage| stage.elapsed > slow)
+            .collect()
+    }
+
+    fn slow_stage_labels(&self) -> Vec<&'static str> {
+        self.slow_warning_stages()
+            .into_iter()
+            .map(|stage| stage.stage.label())
+            .collect()
+    }
+}
+
 fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -4329,12 +4464,25 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
     let mut tui_state = ChainAttachTuiState::default();
 
     let result = loop {
+        let mut tick = AttachTickTiming::new(AttachSurface::Chain, AttachTickBudget::default());
+        let stage_started = Instant::now();
         let chain = load_chain(paths, chain_id)?;
+        tick.record_since(AttachLoopStage::LoadState, stage_started);
+        let stage_started = Instant::now();
         let events = read_jsonl::<ChainEvent>(&paths.chain_events(chain_id))?;
+        tick.record_since(AttachLoopStage::ReadJsonl, stage_started);
         tui_state.clamp(&chain);
+        let stage_started = Instant::now();
         terminal.draw(|frame| render_chain_attach(frame, &chain, &events, &tui_state))?;
+        tick.record_since(AttachLoopStage::Draw, stage_started);
 
-        if event::poll(std::time::Duration::from_millis(200))? {
+        let stage_started = Instant::now();
+        let input_ready = event::poll(Duration::from_millis(200))?;
+        tick.record_since(AttachLoopStage::InputPoll, stage_started);
+        drop(tick.slow_sync_stages());
+        drop(tick.slow_stage_labels());
+        let _ = tick.frame_exceeded();
+        if input_ready {
             match event::read()? {
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key) => match key.code {
@@ -22200,8 +22348,11 @@ async fn attach_plan_tui(
     let mut quiet_tracker = NarrativeQuietRefreshTracker::new(Utc::now());
 
     let result = loop {
+        let mut tick = AttachTickTiming::new(AttachSurface::Plan, AttachTickBudget::default());
         let now = Utc::now();
+        let stage_started = Instant::now();
         let new_feed_events = feed.refresh(Duration::ZERO).await;
+        tick.record_since(AttachLoopStage::EventFeed, stage_started);
         let event_refresh = plan_narrative_refresh_trigger(&new_feed_events);
         quiet_tracker.observe_event_trigger(event_refresh, now);
         for event in new_feed_events {
@@ -22225,7 +22376,9 @@ async fn attach_plan_tui(
             let drain = feed_events.len().saturating_sub(1_000);
             feed_events.drain(0..drain);
         }
+        let stage_started = Instant::now();
         messages = read_plan_messages(paths, plan_id).unwrap_or_default();
+        tick.record_since(AttachLoopStage::PlanMessages, stage_started);
         if selected >= plan.tasks.len() {
             selected = plan.tasks.len().saturating_sub(1);
         }
@@ -22243,6 +22396,7 @@ async fn attach_plan_tui(
         if let Some(kind) = auto_refresh
             && view.is_narrative()
         {
+            let stage_started = Instant::now();
             narrative_notice = Some(
                 refresh_plan_narrative_with_provider_for_kind(PlanNarrativeProviderRefresh {
                     paths,
@@ -22263,7 +22417,9 @@ async fn attach_plan_tui(
                     )
                 }),
             );
+            tick.record_since(AttachLoopStage::ProviderNarrativeRefresh, stage_started);
         }
+        let stage_started = Instant::now();
         terminal.draw(|frame| {
             render_plan_attach(
                 frame,
@@ -22281,7 +22437,14 @@ async fn attach_plan_tui(
                 },
             )
         })?;
-        if event::poll(std::time::Duration::from_millis(250))? {
+        tick.record_since(AttachLoopStage::Draw, stage_started);
+        let stage_started = Instant::now();
+        let input_ready = event::poll(Duration::from_millis(250))?;
+        tick.record_since(AttachLoopStage::InputPoll, stage_started);
+        drop(tick.slow_sync_stages());
+        drop(tick.slow_stage_labels());
+        let _ = tick.frame_exceeded();
+        if input_ready {
             match event::read()? {
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
@@ -22294,6 +22457,7 @@ async fn attach_plan_tui(
                     view = AttachViewMode::Narrative;
                     narrative_notice =
                         Some("manual refresh: contacting narrative provider".to_string());
+                    let stage_started = Instant::now();
                     terminal.draw(|frame| {
                         render_plan_attach(
                             frame,
@@ -22311,6 +22475,8 @@ async fn attach_plan_tui(
                             },
                         )
                     })?;
+                    tick.record_since(AttachLoopStage::Draw, stage_started);
+                    let stage_started = Instant::now();
                     narrative_notice = Some(
                         refresh_plan_narrative_with_provider(
                             paths,
@@ -22329,6 +22495,7 @@ async fn attach_plan_tui(
                             )
                         }),
                     );
+                    tick.record_since(AttachLoopStage::ProviderNarrativeRefresh, stage_started);
                 }
                 Event::Key(key)
                     if matches!(
@@ -23072,14 +23239,23 @@ async fn attach_tui_with_parent(
     let mut acceptance_tracker = NarrativeAcceptanceRefreshTracker::default();
 
     let result = loop {
+        let mut tick = AttachTickTiming::new(AttachSurface::Run, AttachTickBudget::default());
         let now = Utc::now();
+        let stage_started = Instant::now();
         let state = load_run(paths, run_id)?;
+        tick.record_since(AttachLoopStage::LoadState, stage_started);
+        let stage_started = Instant::now();
         let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
         let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
+        tick.record_since(AttachLoopStage::ReadJsonl, stage_started);
+        let stage_started = Instant::now();
         let new_events = event_feed.refresh(std::time::Duration::ZERO).await?;
+        tick.record_since(AttachLoopStage::EventFeed, stage_started);
         let run_event_refresh = run_narrative_refresh_trigger(&new_events);
         events.extend(new_events);
+        let stage_started = Instant::now();
         let live = collect_attach_live(&state);
+        tick.record_since(AttachLoopStage::LiveCollect, stage_started);
         let event_refresh =
             run_event_refresh.or_else(|| acceptance_tracker.observe(&live.acceptance));
         quiet_tracker.observe_event_trigger(event_refresh, now);
@@ -23103,6 +23279,7 @@ async fn attach_tui_with_parent(
         if let Some(kind) = auto_refresh
             && tui_state.view.is_narrative()
         {
+            let stage_started = Instant::now();
             let notice = refresh_run_narrative_with_provider_for_kind(
                 paths,
                 &RunNarrativeRenderInput {
@@ -23124,12 +23301,21 @@ async fn attach_tui_with_parent(
                 )
             });
             tui_state.record_narrative_refresh(format!("{}: {notice}", kind.label()));
+            tick.record_since(AttachLoopStage::ProviderNarrativeRefresh, stage_started);
         }
+        let stage_started = Instant::now();
         terminal.draw(|frame| {
             render_attach(frame, &state, &spend, &traces, &events, &live, &tui_state)
         })?;
+        tick.record_since(AttachLoopStage::Draw, stage_started);
 
-        if event::poll(std::time::Duration::from_millis(200))? {
+        let stage_started = Instant::now();
+        let input_ready = event::poll(Duration::from_millis(200))?;
+        tick.record_since(AttachLoopStage::InputPoll, stage_started);
+        drop(tick.slow_sync_stages());
+        drop(tick.slow_stage_labels());
+        let _ = tick.frame_exceeded();
+        if input_ready {
             match event::read()? {
                 Event::Key(key)
                     if tui_state.parent_plan.is_some() && attach_should_return_to_plan(key) =>
@@ -23147,9 +23333,12 @@ async fn attach_tui_with_parent(
                     tui_state.record_narrative_refresh(
                         "manual refresh: contacting narrative provider".to_string(),
                     );
+                    let stage_started = Instant::now();
                     terminal.draw(|frame| {
                         render_attach(frame, &state, &spend, &traces, &events, &live, &tui_state)
                     })?;
+                    tick.record_since(AttachLoopStage::Draw, stage_started);
+                    let stage_started = Instant::now();
                     let notice = refresh_run_narrative_with_provider(
                         paths,
                         &RunNarrativeRenderInput {
@@ -23170,6 +23359,7 @@ async fn attach_tui_with_parent(
                         )
                     });
                     tui_state.record_narrative_refresh(notice);
+                    tick.record_since(AttachLoopStage::ProviderNarrativeRefresh, stage_started);
                 }
                 Event::Key(key)
                     if key.code == KeyCode::Char('c')
@@ -27345,18 +27535,20 @@ mod self_improve_pr_tests {
 #[cfg(test)]
 mod tui_tests {
     use std::io::Write;
+    use std::time::Duration;
 
     use super::{
-        AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
-        AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, AttachViewMode,
+        AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachLoopStage,
+        AttachPanel, AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachSurface,
+        AttachTickBudget, AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode,
         COMMAND_HELP_CATALOG, ChainAttachTuiState, CommandDiscovery, CommandHelpEntry,
         CompletionAction, HELP_ALL_GROUPS, LiveFile, NarrativeAcceptanceRefreshTracker,
         NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode,
         PlanAttachRenderState, PlanFeedEvent, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
-        acceptance_activity_lines, attach_banner, attach_header_text, attach_should_return_to_plan,
-        chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-        chain_narrative_refusal_text, chain_should_auto_attach, chain_step_dot,
-        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
+        acceptance_activity_lines, attach_banner, attach_header_text, attach_loop_stage_work,
+        attach_should_return_to_plan, chain_activity_lines, chain_attach_footer_text,
+        chain_attach_header_text, chain_narrative_refusal_text, chain_should_auto_attach,
+        chain_step_dot, chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
         cli_wait_status_line, collect_jsonl_provider_activity, command_discovery,
         completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
         deadreckoning_status_text, doc_polish_preview_text, implementation_plan_warnings,
@@ -27418,6 +27610,55 @@ mod tui_tests {
         chain.steps[0].run_id = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
         chain.steps[1].status = ChainStepStatus::Running;
         chain
+    }
+
+    #[test]
+    fn attach_tick_budget_records_slow_sync_stage_without_panicking() {
+        let budget = AttachTickBudget {
+            target_frame_ms: 100,
+            max_sync_io_ms: 5,
+            slow_warning_ms: 8,
+        };
+        let mut timing = AttachTickTiming::new(AttachSurface::Run, budget);
+
+        timing.record(AttachLoopStage::LiveCollect, Duration::from_millis(9));
+
+        let slow_sync = timing.slow_sync_stages();
+        assert_eq!(slow_sync.len(), 1);
+        assert_eq!(slow_sync[0].stage, AttachLoopStage::LiveCollect);
+        assert_eq!(slow_sync[0].stage.label(), "live collect");
+        assert_eq!(timing.slow_warning_stages().len(), 1);
+        assert!(!timing.frame_exceeded());
+    }
+
+    #[test]
+    fn run_attach_loop_model_marks_provider_refresh_as_async_work() {
+        assert_eq!(
+            attach_loop_stage_work(
+                AttachSurface::Run,
+                AttachLoopStage::ProviderNarrativeRefresh
+            ),
+            AttachWorkMode::Background
+        );
+        assert_eq!(
+            attach_loop_stage_work(AttachSurface::Run, AttachLoopStage::LiveCollect),
+            AttachWorkMode::UiSync
+        );
+    }
+
+    #[test]
+    fn plan_attach_loop_model_marks_provider_refresh_as_async_work() {
+        assert_eq!(
+            attach_loop_stage_work(
+                AttachSurface::Plan,
+                AttachLoopStage::ProviderNarrativeRefresh
+            ),
+            AttachWorkMode::Background
+        );
+        assert_eq!(
+            attach_loop_stage_work(AttachSurface::Chain, AttachLoopStage::ReadJsonl),
+            AttachWorkMode::UiSync
+        );
     }
 
     fn line_text(line: &Line<'_>) -> String {

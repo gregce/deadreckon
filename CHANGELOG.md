@@ -1,5 +1,9 @@
 # Changelog
 
+## TUI Responsiveness (alpha) - 2026-05-26
+
+- Added in-memory attach tick budgets and loop-stage timing for run, plan, and chain attach surfaces, with provider narrative refresh classified as background work for the responsive attach scheduler.
+
 ## Narrative Attach (alpha) - 2026-05-26
 
 - Added `deadreckon attach --view narrative` for cited run and plan overviews, with `n` to return to raw activity and `v` to cycle architecture, agents, files, evidence, and no-visual modes.
