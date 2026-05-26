@@ -9,7 +9,8 @@ use deadreckon_core::flight::{FlightEvent, read_flight_events};
 use deadreckon_core::{
     DeadreckonPaths, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind, PlanStatus,
     PlanTaskStatus, RUN_EVENTS_JSONL, RunEvent, RunEventKind, RunStatus, SpendRecord, TraceRecord,
-    load_run, plan_status_label, plan_task_status_label, run_status_label,
+    acceptance_progress_path_for_run_root, load_run, marker_path_for_run_root, plan_status_label,
+    plan_task_status_label, run_status_label,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -476,6 +477,8 @@ pub(crate) fn build_run_projection(input: &RunNarrativeInput<'_>) -> NarrativePr
         .collect::<Vec<_>>();
     let run_prefix = short_id(&state.run_id);
     let state_evidence = format!("file:{}", state.state_path().display());
+    let acceptance_evidence =
+        acceptance_artifact_for_run(state).map(|(kind, path)| (kind, file_evidence_id(&path)));
     let latest_run_event = input.events.last();
     let latest_trace = input.traces.last();
     let latest_flight = flight_events.last();
@@ -508,12 +511,16 @@ pub(crate) fn build_run_projection(input: &RunNarrativeInput<'_>) -> NarrativePr
             format!("Run {run_prefix} is preparing to execute.")
         }
     };
+    let mut run_state_evidence = vec![state_evidence.clone()];
+    if let Some((_, evidence_id)) = acceptance_evidence.as_ref() {
+        run_state_evidence.push(evidence_id.clone());
+    }
     let mut current_work = vec![claim(
         format!(
             "[{}] turn {} in {} ({})",
             status, state.turn, phase, input.acceptance_summary
         ),
-        vec![state_evidence.clone()],
+        run_state_evidence,
         "high",
     )];
     if let Some(event) = latest_run_event {
@@ -631,7 +638,10 @@ pub(crate) fn build_run_projection(input: &RunNarrativeInput<'_>) -> NarrativePr
                 "Acceptance status needs attention: {}.",
                 input.acceptance_summary
             ),
-            vec![state_evidence.clone()],
+            acceptance_evidence
+                .as_ref()
+                .map(|(_, evidence_id)| vec![evidence_id.clone()])
+                .unwrap_or_else(|| vec![state_evidence.clone()]),
             "high",
         ));
     }
@@ -1911,6 +1921,14 @@ fn run_citations(
             summary: format!("turn {} {}", trace.turn, trace.event),
         });
     }
+    if let Some((kind, path)) = acceptance_artifact_for_run(state) {
+        citations.push(NarrativeCitation {
+            id: file_evidence_id(&path),
+            kind,
+            path: Some(path),
+            summary: "acceptance evidence".to_string(),
+        });
+    }
     for event in flight_events.iter().rev().take(5) {
         citations.push(NarrativeCitation {
             id: format!("flight:{prefix}:seq:{}", event.seq),
@@ -1931,6 +1949,23 @@ fn run_citations(
         });
     }
     citations
+}
+
+fn acceptance_artifact_for_run(
+    state: &deadreckon_core::PipelineState,
+) -> Option<(String, PathBuf)> {
+    let marker = marker_path_for_run_root(&state.run_root);
+    if marker.exists() {
+        return Some(("acceptance_marker".to_string(), marker));
+    }
+    let progress = acceptance_progress_path_for_run_root(&state.run_root);
+    progress
+        .exists()
+        .then(|| ("acceptance_progress".to_string(), progress))
+}
+
+fn file_evidence_id(path: &Path) -> String {
+    format!("file:{}", path.display())
 }
 
 fn plan_citations(
@@ -2534,7 +2569,8 @@ fn one_line(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use deadreckon_core::{
-        PlanMode, PlanProviders, PlanRole, PlanTask, PlanTaskStatus, RunOptions, create_run,
+        AcceptanceCheckResult, AcceptanceProgressEntry, PlanMode, PlanProviders, PlanRole,
+        PlanTask, PlanTaskStatus, RunOptions, acceptance_progress_path_for_run_root, create_run,
     };
     use tempfile::TempDir;
 
@@ -2662,6 +2698,86 @@ mod tests {
         assert!(rendered.contains("Visual: architecture"));
         assert!(rendered.contains("-> touches"));
         assert!(rendered.contains("crates/deadreckon/src/main.rs"));
+    }
+
+    #[test]
+    fn run_evidence_window_pins_acceptance_failure_outside_cap() {
+        let temp = TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        fs::create_dir_all(temp.path().join("repo")).expect("repo");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "capture acceptance evidence".to_string(),
+                cwd: temp.path().join("repo"),
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("run-acceptance-evidence".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let progress_path = acceptance_progress_path_for_run_root(&state.run_root);
+        fs::create_dir_all(progress_path.parent().expect("progress parent")).expect("proofs");
+        let failed = AcceptanceProgressEntry {
+            checked_at: Utc::now(),
+            status: "failed".to_string(),
+            index: 24,
+            total: 24,
+            result: Some(AcceptanceCheckResult {
+                kind: "shell".to_string(),
+                passed: false,
+                must_pass: true,
+                detail: "cargo clippy failed after a long acceptance list".to_string(),
+                command: Some("cargo clippy -p deadreckon".to_string()),
+                cwd: None,
+                duration_ms: Some(123),
+                stdout: None,
+                stderr: Some("warning promoted to error".to_string()),
+            }),
+        };
+        fs::write(
+            &progress_path,
+            format!("{}\n", serde_json::to_string(&failed).expect("entry")),
+        )
+        .expect("progress");
+
+        let projection = build_run_projection(&RunNarrativeInput {
+            state: &state,
+            spend: &[],
+            traces: &[],
+            events: &[],
+            live_files: Vec::new(),
+            file_count: 0,
+            total_bytes: 0,
+            acceptance_summary: "failed 1 required, 0 passed of 24".to_string(),
+            provider_activity: &[],
+            parent_plan: None,
+        });
+        let acceptance_evidence = format!("file:{}", progress_path.display());
+
+        assert!(
+            projection
+                .snapshot
+                .risks
+                .iter()
+                .any(|claim| claim.evidence.contains(&acceptance_evidence)),
+            "{:#?}",
+            projection.snapshot.risks
+        );
+        assert!(
+            projection
+                .snapshot
+                .citations
+                .iter()
+                .any(|citation| citation.kind == "acceptance_progress"
+                    && citation.id == acceptance_evidence),
+            "{:#?}",
+            projection.snapshot.citations
+        );
     }
 
     #[test]

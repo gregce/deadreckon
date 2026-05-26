@@ -14,6 +14,7 @@
 - Kept plan narrative footer controls visible even when the selected child run is not available yet, preserving the one-key path back to raw activity.
 - Added focused run/plan TUI render coverage for narrative panes, citations, agent rows, and visual-map hints.
 - Added focused plain/JSON narrative attach coverage, including deterministic non-TTY fallback behavior and the explicit chain unsupported response.
+- Added acceptance proof/progress citations to run narrative projections so failed done criteria point at the immutable acceptance artifact instead of only generic run state.
 - Added focused coverage for narrative schemas, malformed snapshot tolerance, redaction, claim validation, graph validation, provider refresh validation, cadence/budget decisions, deterministic fallback, and plain map rendering.
 
 ## Self-Improvement Loop (alpha) - 2026-05-26
