@@ -8,7 +8,8 @@ It supersedes nothing in prior riders
 `2026-05-18-2226-deadreckon-orchestration-eventbus-rider.md`,
 `2026-05-13-1345-deadreckon-provider-cli-ingest-rider.md`) - their
 invariants still apply. This rider adds a local evidence index, proposal loop,
-self-run mode, and evidence-gated PR opening for DeadReckon improving itself.
+self-run mode, mandatory provider-backed insight synthesis, and evidence-gated
+PR opening for DeadReckon improving itself.
 
 **All paths absolute.** Source `/Users/gdc/deadreckon/`, runtime
 `/Users/gdc/.deadreckon/`.
@@ -20,9 +21,13 @@ self-run mode, and evidence-gated PR opening for DeadReckon improving itself.
   `DEADRECKON_HOME/learning/` and candidate run roots.
 - **Local-first by default.** No cloud sync, model fine-tuning, background
   telemetry, or sharing of other users' data in this milestone.
-- **Self-improvement is proposal-plus-evidence, not blind autopilot.** A
-  proposal must cite observed DeadReckon stimulus and a measurable done
-  contract before any self-run starts.
+- **Self-improvement is insight-plus-evidence, not blind autopilot.** A
+  proposal must pass through provider-backed reflection, cite observed
+  DeadReckon stimulus, and include a measurable done contract before any
+  self-run starts.
+- **Reflection is folded into `learn propose`.** Do not add a separate
+  `learn reflect` verb in this milestone. Indexing stays deterministic;
+  proposal creation always runs the insight/reflection step.
 - **PR opening is opt-in and evidence-gated.** The product may push/open only
   when the user invokes `--open-pr` or an explicit local policy enables it and
   all criteria pass. Implementation tests must use fake/dry-run adapters.
@@ -125,6 +130,27 @@ Each signal is an extracted, explainable observation:
 }
 ```
 
+### `DEADRECKON_HOME/learning/insights.jsonl`
+
+Each insight is provider-backed synthesis over redacted deterministic evidence.
+It is written by `learn propose`; no separate command is exposed.
+
+```json
+{
+  "version": 1,
+  "insight_id": "ins-...",
+  "created_at": "<RFC3339>",
+  "provider": {"route": "cli:codex", "model": "default"},
+  "stimulus": [{"signal_id": "sig-...", "run_id": "dr-..."}],
+  "summary": "Provider setup failures cluster around ambiguous route recovery",
+  "user_need": "Recover from setup failure without knowing provider internals",
+  "hypothesis": "A shared recovery footer will reduce failed first runs",
+  "confidence": "low|medium|high",
+  "evidence_coverage": {"signals": 3, "runs": 2},
+  "rejected_claims": []
+}
+```
+
 ### `DEADRECKON_HOME/learning/proposals/<proposal-id>.json`
 
 ```json
@@ -133,6 +159,7 @@ Each signal is an extracted, explainable observation:
   "proposal_id": "prop-...",
   "created_at": "<RFC3339>",
   "title": "Unify missing-provider recovery hints",
+  "insights": ["ins-..."],
   "stimulus": [{"signal_id": "sig-...", "run_id": "dr-..."}],
   "hypothesis": "A shared recovery footer will reduce repeated setup failures",
   "target": {"repo": "/Users/gdc/deadreckon", "scope": "cli-friendliness"},
@@ -242,7 +269,8 @@ block_high_risk = true
 ### Signal extraction
 
 Classifiers are deterministic rules in this milestone. Do not call an LLM for
-indexing. Examples:
+indexing. Signals are evidence-bearing candidates, not the final user-facing
+interpretation. Examples:
 
 - Repeated provider setup failures across recent runs -> `setup_friction`.
 - Gate failures followed by successful retries -> `acceptance_gap`.
@@ -250,12 +278,16 @@ indexing. Examples:
 - Long wallclock with low file-change count -> `slow_path`.
 - User resumes/rewinds/kills similar runs -> `repeat_failure`.
 
-### Proposal generation
+### Insight synthesis and proposal generation
 
-`learn propose` may use a provider only after it has gathered deterministic
-signals. The prompt must ask for JSON proposals that cite signal ids and
-define testable done criteria. Invalid provider output is refused; it is not
-silently massaged into a proposal.
+`learn propose` must run provider-backed reflection after it has gathered
+deterministic signals. It is the folded command surface for insight synthesis;
+do not add a separate `learn reflect` command. The prompt must include only
+redacted episode/signal summaries and ask for strict JSON insights plus proposal
+JSON. Every insight and proposal claim must cite signal ids and run ids. Every
+proposal must include testable done criteria. Invalid provider output is
+refused; it is not silently massaged into a proposal. If no provider route can
+run reflection, `learn propose` refuses with a recovery footer.
 
 ### Self-run mode
 
@@ -378,7 +410,7 @@ Refusal cases:
 | `learn index` | run root is corrupt and cannot be partially read; continue for other runs |
 | `learn export` | redaction would be disabled for a bundle containing provider/home data |
 | `learn import-bundle` | bundle schema unknown, hashes fail, or bundle is not redacted |
-| `learn propose` | no signals meet confidence threshold |
+| `learn propose` | no signals meet confidence threshold, no provider route resolves, or reflection JSON is invalid |
 | `improve self --yes` | base worktree dirty, sandbox none, weak done criteria, or no provider route resolves |
 | `improve self --open-pr` | any Auto-PR gate criterion fails |
 
@@ -393,8 +425,8 @@ verification by default.
 
 - Add learning path helpers under core or CLI-adjacent code without touching
   `PipelineState`.
-- Define versioned structs for episodes, signals, proposals, candidates, evals,
-  policy, and PR audit rows.
+- Define versioned structs for episodes, signals, insights, proposals,
+  candidates, evals, policy, and PR audit rows.
 - Readers ignore unknown fields and reject unknown major versions.
 
 Depth tests:
@@ -439,14 +471,17 @@ Depth tests:
 
 ### P5 - Proposal generation
 
-- `learn propose` creates proposal JSON tied to signal ids and run ids.
-- Provider-backed proposal text is optional and must validate strictly.
+- `learn propose` creates insight JSONL plus proposal JSON tied to signal ids
+  and run ids.
+- Provider-backed reflection is required and must validate strictly.
+- Do not add a separate reflect command; this is folded into `learn propose`.
 - Store proposal done criteria and expected risk.
 
 Depth tests:
 - `learn_propose_refuses_when_no_signal_meets_threshold`
-- `learn_propose_requires_signal_citations_and_done_criteria`
-- `learn_propose_invalid_provider_json_does_not_write_proposal`
+- `learn_propose_requires_provider_reflection_before_writing_proposal`
+- `learn_propose_requires_insight_signal_citations_and_done_criteria`
+- `learn_propose_invalid_reflection_json_does_not_write_insight_or_proposal`
 
 ### P6 - Candidate archive and evaluation policy
 
@@ -537,10 +572,11 @@ Depth tests:
 
 | Surface | Experience index | Self-run | Auto-PR |
 |---|---|---|---|
-| `run` | source episodes | target execution primitive | evidence source |
+| `run` | source episodes and signals | target execution primitive | evidence source |
 | `extend`/`resume` | lineage signals | not special-cased | evidence source |
 | `orchestrate`/`plan` | plan and child summaries | future multi-candidate mode | evidence source only |
 | `chain` | step-level friction and wallclock | future candidate chains | evidence source only |
+| `learn propose` | required provider-backed insights | source proposal for self-run | no direct PR without self-run |
 | `import` | imported bundles feed signals | no live replay in this goal | no PR from imported-only evidence |
 | flight recorder | provider subturn and checkpoint signals | candidate debug evidence | high-value PR body links |
 | TUI | no new TUI in alpha | attach existing run | future learning dashboard |
@@ -552,6 +588,8 @@ Depth tests:
 | No indexable runs | `try: deadreckon run <goal> --yes` |
 | Bundle is not redacted | `try: deadreckon learn export <id> --redacted` |
 | No proposal-worthy signals | `try: deadreckon learn index --all` |
+| No provider route for reflection | `try: deadreckon config provider` |
+| Reflection JSON invalid | `try: deadreckon learn propose --from-local --limit 1` |
 | Dirty base worktree | `try: git status --short` |
 | Sandbox backend is none | `try: deadreckon config sandbox auto` |
 | Weak done criteria | `try: deadreckon def-done --goal <file>` |
@@ -612,6 +650,9 @@ Tier 3 (blocked):
   and candidate run roots.
 - **Depth tests first.** Every P1-P11 phase has named tests above; if a phase's
   tests were never red, call that out in the commit message.
+- **Reflection is mandatory for proposals.** Deterministic signals are not
+  enough to write proposals; `learn propose` must run and validate a provider
+  reflection step.
 - **Do not trust candidate-modified gate logic.** The outer baseline evaluator
   decides evidence eligibility.
 - **Redaction before sharing.** No raw provider logs, credentials, home paths,
