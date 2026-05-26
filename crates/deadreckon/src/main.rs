@@ -62,11 +62,11 @@ use deadreckon_core::{
     DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId,
     PhaseStatus, Plan, PlanChildMarker, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
     PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest,
-    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunListEntry, RunOptions,
-    RunStatus, SpendRecord, TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
-    acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
-    append_parent_narrative_update, append_plan_event, append_plan_message, append_provenance,
-    append_trace, apply_commit_body, cancel_marker_present,
+    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunEventKind, RunListEntry,
+    RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions,
+    acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root, acquire_lock,
+    append_chain_event, append_parent_narrative_update, append_plan_event, append_plan_message,
+    append_provenance, append_trace, apply_commit_body, cancel_marker_present,
     chain_status_label as glossary_chain_status_label,
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
@@ -21884,7 +21884,9 @@ async fn attach_plan_tui(
     let mut narrative_notice = None;
 
     let result = loop {
-        for event in feed.refresh(Duration::ZERO).await {
+        let new_feed_events = feed.refresh(Duration::ZERO).await;
+        let auto_refresh = plan_narrative_refresh_trigger(&new_feed_events);
+        for event in new_feed_events {
             match event {
                 PlanFeedEvent::Plan { event } => {
                     plan_events.push(event.clone());
@@ -21908,6 +21910,30 @@ async fn attach_plan_tui(
         messages = read_plan_messages(paths, plan_id).unwrap_or_default();
         if selected >= plan.tasks.len() {
             selected = plan.tasks.len().saturating_sub(1);
+        }
+        if let Some(kind) = auto_refresh
+            && view.is_narrative()
+        {
+            narrative_notice = Some(
+                refresh_plan_narrative_with_provider_for_kind(PlanNarrativeProviderRefresh {
+                    paths,
+                    plan: &plan,
+                    messages: &messages,
+                    plan_events: &plan_events,
+                    feed_events: &feed_events,
+                    selected,
+                    config: &narrative_config,
+                    kind,
+                })
+                .await
+                .map(|notice| format!("{}: {notice}", kind.label()))
+                .unwrap_or_else(|err| {
+                    format!(
+                        "provider refresh failed: {}",
+                        one_line(&err.to_string(), 120)
+                    )
+                }),
+            );
         }
         terminal.draw(|frame| {
             render_plan_attach(
@@ -22688,7 +22714,9 @@ async fn attach_tui_with_parent(
         let state = load_run(paths, run_id)?;
         let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
         let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
-        events.extend(event_feed.refresh(std::time::Duration::ZERO).await?);
+        let new_events = event_feed.refresh(std::time::Duration::ZERO).await?;
+        let auto_refresh = run_narrative_refresh_trigger(&new_events);
+        events.extend(new_events);
         let live = collect_attach_live(&state);
         let terminal_size = terminal.size()?;
         let terminal_area =
@@ -22696,6 +22724,31 @@ async fn attach_tui_with_parent(
         let panel_layout = attach_panel_layout(terminal_area);
         let panel_counts = attach_panel_counts(&state, &spend, &traces, &events, &live, &tui_state);
         tui_state.clamp(panel_counts, panel_layout.rows);
+        if let Some(kind) = auto_refresh
+            && tui_state.view.is_narrative()
+        {
+            let notice = refresh_run_narrative_with_provider_for_kind(
+                paths,
+                &RunNarrativeRenderInput {
+                    state: &state,
+                    spend: &spend,
+                    traces: &traces,
+                    events: &events,
+                    live: &live,
+                    tui_state: &tui_state,
+                },
+                &narrative_config,
+                kind,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                format!(
+                    "provider refresh failed: {}",
+                    one_line(&err.to_string(), 120)
+                )
+            });
+            tui_state.record_narrative_refresh(format!("{}: {notice}", kind.label()));
+        }
         terminal.draw(|frame| {
             render_attach(frame, &state, &spend, &traces, &events, &live, &tui_state)
         })?;
@@ -25554,10 +25607,98 @@ fn run_narrative_projection(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NarrativeRefreshKind {
+    Manual,
+    Event(&'static str),
+}
+
+impl NarrativeRefreshKind {
+    fn is_manual(self) -> bool {
+        matches!(self, Self::Manual)
+    }
+
+    fn is_meaningful_delta(self) -> bool {
+        matches!(self, Self::Event(_))
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual refresh",
+            Self::Event(reason) => reason,
+        }
+    }
+}
+
+fn run_narrative_refresh_trigger(events: &[RunEvent]) -> Option<NarrativeRefreshKind> {
+    events.iter().find_map(|event| match &event.event {
+        RunEventKind::Error { .. } => Some(NarrativeRefreshKind::Event("run error")),
+        RunEventKind::RunCompleted { .. } => Some(NarrativeRefreshKind::Event("run completed")),
+        RunEventKind::DocsCheckpoint { .. } => Some(NarrativeRefreshKind::Event("docs checkpoint")),
+        RunEventKind::ToolCallResult { status, .. }
+            if status != "ok" && status != "success" && status != "completed" =>
+        {
+            Some(NarrativeRefreshKind::Event("tool result"))
+        }
+        RunEventKind::ToolCallStarted { .. } => Some(NarrativeRefreshKind::Event("tool started")),
+        _ => None,
+    })
+}
+
+fn plan_narrative_refresh_trigger(events: &[PlanFeedEvent]) -> Option<NarrativeRefreshKind> {
+    events.iter().find_map(|event| match event {
+        PlanFeedEvent::Plan { event } => match &event.event {
+            PlanEventKind::TaskCompleted { .. } => {
+                Some(NarrativeRefreshKind::Event("plan child completed"))
+            }
+            PlanEventKind::TaskBlocked { .. } => {
+                Some(NarrativeRefreshKind::Event("plan child blocked"))
+            }
+            PlanEventKind::TaskFailed { .. } => {
+                Some(NarrativeRefreshKind::Event("plan child failed"))
+            }
+            PlanEventKind::TaskKilled { .. } => {
+                Some(NarrativeRefreshKind::Event("plan child killed"))
+            }
+            PlanEventKind::TaskRunDiscovered { .. } => {
+                Some(NarrativeRefreshKind::Event("child run discovered"))
+            }
+            PlanEventKind::MergeRepairStarted { .. } => {
+                Some(NarrativeRefreshKind::Event("merge repair started"))
+            }
+            PlanEventKind::MergeRepaired { .. } => {
+                Some(NarrativeRefreshKind::Event("merge repaired"))
+            }
+            PlanEventKind::MergeRepairFailed { .. } => {
+                Some(NarrativeRefreshKind::Event("merge repair failed"))
+            }
+            PlanEventKind::PlanCompleted | PlanEventKind::PlanFailed { .. } => {
+                Some(NarrativeRefreshKind::Event("plan terminal"))
+            }
+            _ => None,
+        },
+        PlanFeedEvent::ChildRun { event, .. } | PlanFeedEvent::RepairRun { event, .. } => {
+            run_narrative_refresh_trigger(std::slice::from_ref(event))
+        }
+        PlanFeedEvent::Warning { .. } => Some(NarrativeRefreshKind::Event("plan feed warning")),
+        PlanFeedEvent::Snapshot { .. } => None,
+    })
+}
+
 async fn refresh_run_narrative_with_provider(
     paths: &DeadreckonPaths,
     input: &RunNarrativeRenderInput<'_>,
     config: &NarrativeAttachConfig,
+) -> Result<String> {
+    refresh_run_narrative_with_provider_for_kind(paths, input, config, NarrativeRefreshKind::Manual)
+        .await
+}
+
+async fn refresh_run_narrative_with_provider_for_kind(
+    paths: &DeadreckonPaths,
+    input: &RunNarrativeRenderInput<'_>,
+    config: &NarrativeAttachConfig,
+    kind: NarrativeRefreshKind,
 ) -> Result<String> {
     let state = input.state;
     let spend = input.spend;
@@ -25572,6 +25713,7 @@ async fn refresh_run_narrative_with_provider(
         projection,
         route.clone(),
         config,
+        kind,
         Some(state.working_dir.clone()),
         state.run_root.join("narrative/provider-refresh.out"),
     )
@@ -25589,6 +25731,43 @@ async fn refresh_plan_narrative_with_provider(
     selected: usize,
     config: &NarrativeAttachConfig,
 ) -> Result<String> {
+    refresh_plan_narrative_with_provider_for_kind(PlanNarrativeProviderRefresh {
+        paths,
+        plan,
+        messages,
+        plan_events,
+        feed_events,
+        selected,
+        config,
+        kind: NarrativeRefreshKind::Manual,
+    })
+    .await
+}
+
+struct PlanNarrativeProviderRefresh<'a> {
+    paths: &'a DeadreckonPaths,
+    plan: &'a Plan,
+    messages: &'a [PlanMessage],
+    plan_events: &'a [PlanEvent],
+    feed_events: &'a [PlanFeedEvent],
+    selected: usize,
+    config: &'a NarrativeAttachConfig,
+    kind: NarrativeRefreshKind,
+}
+
+async fn refresh_plan_narrative_with_provider_for_kind(
+    request: PlanNarrativeProviderRefresh<'_>,
+) -> Result<String> {
+    let PlanNarrativeProviderRefresh {
+        paths,
+        plan,
+        messages,
+        plan_events,
+        feed_events,
+        selected,
+        config,
+        kind,
+    } = request;
     let projection = narrative::ensure_plan_projection(&narrative::PlanNarrativeInput {
         paths,
         plan,
@@ -25608,6 +25787,7 @@ async fn refresh_plan_narrative_with_provider(
         projection,
         route.clone(),
         config,
+        kind,
         std::env::current_dir().ok(),
         paths
             .plan_dir(&plan.plan_id)
@@ -25623,13 +25803,15 @@ async fn refresh_narrative_projection_with_provider(
     projection: narrative::NarrativeProjection,
     route: Option<String>,
     config: &NarrativeAttachConfig,
+    kind: NarrativeRefreshKind,
     cwd: Option<PathBuf>,
     output_path: PathBuf,
 ) -> Result<narrative::NarrativeProjection> {
     let policy = narrative::NarrativeRefreshPolicy {
         provider_route: route.clone(),
         max_spend_usd: config.max_spend_usd,
-        manual: true,
+        manual: kind.is_manual(),
+        meaningful_delta: kind.is_meaningful_delta(),
         now: Utc::now(),
     };
     match narrative::provider_refresh_decision(&projection.state, &policy) {
@@ -26670,8 +26852,8 @@ mod tui_tests {
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, AttachViewMode,
         COMMAND_HELP_CATALOG, ChainAttachTuiState, CommandDiscovery, CommandHelpEntry,
-        CompletionAction, HELP_ALL_GROUPS, NarrativeVisualMode, PlanAttachRenderState,
-        PlanFeedEvent, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
+        CompletionAction, HELP_ALL_GROUPS, NarrativeRefreshKind, NarrativeVisualMode,
+        PlanAttachRenderState, PlanFeedEvent, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
         acceptance_activity_lines, attach_banner, attach_header_text, attach_should_return_to_plan,
         chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
         chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
@@ -26682,10 +26864,11 @@ mod tui_tests {
         max_panel_scroll, meter_color, orchestration_dependency_rows,
         orchestration_parallelism_lines, orchestration_provider_role_rows,
         orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
-        plan_merge_repair_summary_items, provider_ingest_base_roots, provider_jsonl_activity_lines,
+        plan_merge_repair_summary_items, plan_narrative_refresh_trigger,
+        provider_ingest_base_roots, provider_jsonl_activity_lines,
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
-        render_attach, render_plan_attach, threshold_color,
+        render_attach, render_plan_attach, run_narrative_refresh_trigger, threshold_color,
     };
     use crate::cli::{Cli, CliPlanMode};
     use chrono::Utc;
@@ -27461,6 +27644,74 @@ mod tui_tests {
         assert!(text.contains("turn 2 started"), "{text}");
         assert!(text.contains("repair run"), "{text}");
         assert!(text.contains("run completed"), "{text}");
+    }
+
+    #[test]
+    fn narrative_refresh_triggers_on_meaningful_run_events() {
+        let run_id = "11112222333344445555666677778888".to_string();
+        let benign = RunEvent {
+            timestamp: Utc::now(),
+            run_id: run_id.clone(),
+            event: RunEventKind::TokenUsageDelta {
+                turn: 1,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        };
+        assert_eq!(run_narrative_refresh_trigger(&[benign]), None);
+
+        let error = RunEvent {
+            timestamp: Utc::now(),
+            run_id,
+            event: RunEventKind::Error {
+                turn: Some(1),
+                message: "provider crashed".to_string(),
+            },
+        };
+
+        assert_eq!(
+            run_narrative_refresh_trigger(&[error]),
+            Some(NarrativeRefreshKind::Event("run error"))
+        );
+    }
+
+    #[test]
+    fn narrative_refresh_triggers_on_plan_and_child_milestones() {
+        let (_temp, _paths, plan) = full_plan_fixture(2);
+        let plan_event = PlanFeedEvent::Plan {
+            event: PlanEvent {
+                timestamp: Utc::now(),
+                plan_id: plan.plan_id.clone(),
+                event: PlanEventKind::TaskCompleted {
+                    task_id: "task-0".to_string(),
+                    task_index: 0,
+                    status: "completed".to_string(),
+                    run_id: Some("run-child".to_string()),
+                },
+            },
+        };
+
+        assert_eq!(
+            plan_narrative_refresh_trigger(&[plan_event]),
+            Some(NarrativeRefreshKind::Event("plan child completed"))
+        );
+
+        let child_event = PlanFeedEvent::ChildRun {
+            task_id: "task-0".to_string(),
+            run_id: "run-child".to_string(),
+            event: RunEvent {
+                timestamp: Utc::now(),
+                run_id: "run-child".to_string(),
+                event: RunEventKind::RunCompleted {
+                    status: "completed".to_string(),
+                },
+            },
+        };
+
+        assert_eq!(
+            plan_narrative_refresh_trigger(&[child_event]),
+            Some(NarrativeRefreshKind::Event("run completed"))
+        );
     }
 
     #[test]

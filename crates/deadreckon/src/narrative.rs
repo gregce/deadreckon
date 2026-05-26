@@ -377,6 +377,7 @@ pub(crate) struct NarrativeRefreshPolicy {
     pub(crate) provider_route: Option<String>,
     pub(crate) max_spend_usd: Option<f64>,
     pub(crate) manual: bool,
+    pub(crate) meaningful_delta: bool,
     pub(crate) now: DateTime<Utc>,
 }
 
@@ -1189,6 +1190,7 @@ pub(crate) fn provider_refresh_decision(
         return NarrativeRefreshDecision::OverBudget;
     }
     if !policy.manual
+        && !policy.meaningful_delta
         && let Some(last) = state.latest_created_at
     {
         let elapsed = (policy.now - last).num_seconds().max(0) as u64;
@@ -2716,6 +2718,7 @@ mod tests {
             provider_route: Some("cli:test".to_string()),
             max_spend_usd: Some(10.0),
             manual: false,
+            meaningful_delta: false,
             now: Utc::now(),
         };
         assert_eq!(
@@ -2729,6 +2732,16 @@ mod tests {
         };
         assert_eq!(
             provider_refresh_decision(&projection.state, &manual),
+            NarrativeRefreshDecision::Eligible
+        );
+
+        let meaningful_delta = NarrativeRefreshPolicy {
+            manual: false,
+            meaningful_delta: true,
+            ..automatic.clone()
+        };
+        assert_eq!(
+            provider_refresh_decision(&projection.state, &meaningful_delta),
             NarrativeRefreshDecision::Eligible
         );
 
