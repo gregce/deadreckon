@@ -5,6 +5,7 @@ use deadreckon_providers::{
 };
 use deadreckon_sandbox::SandboxBackend;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn cli_claude_code_provider_runs_fake_binary_and_captures_output() {
@@ -58,6 +59,62 @@ async fn cli_claude_code_provider_runs_fake_binary_and_captures_output() {
             .expect("out")
             .contains("claude-output")
     );
+}
+
+#[tokio::test]
+async fn cli_provider_cancellation_stops_non_sandbox_process() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("slow-claude");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nsleep 30\nprintf 'should-not-finish\\n'\n",
+    )
+    .expect("write fake binary");
+    chmod_exec(&binary);
+    let pid_file = temp.path().join("provider.pid");
+    let token = CancellationToken::new();
+    let router = ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:claude-code".to_string()]),
+            providers: [(
+                "cli:claude-code".to_string(),
+                ProviderEntry {
+                    kind: Some(ProviderKind::CliClaudeCode),
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: Some("cli:claude-code".to_string()),
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router");
+
+    let request = ProviderRequest {
+        prompt: "make notes".to_string(),
+        max_output_tokens: 128,
+        cwd: Some(temp.path().to_path_buf()),
+        output_path: None,
+        sandbox_backend: None,
+        pid_file: Some(pid_file.clone()),
+        cancellation_token: Some(token.clone()),
+    };
+    let completion = router.complete(&request);
+    tokio::pin!(completion);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    token.cancel();
+    let err = completion.await.expect_err("cancelled completion");
+
+    assert!(err.to_string().contains("request cancelled"));
+    assert!(!pid_file.exists());
 }
 
 #[tokio::test]

@@ -105,10 +105,15 @@ pub(crate) async fn run_cli_with_options(
         });
     }
 
+    let cancellation_token = options.cancellation_token;
+    let pid_file = options.pid_file.clone();
     let mut command = Command::new(binary);
     command.args(args);
     if let Some(cwd) = options.cwd {
         command.current_dir(cwd);
+    }
+    if cancellation_token.is_some() {
+        command.kill_on_drop(true);
     }
     let child = command
         .stdout(Stdio::piped())
@@ -119,7 +124,7 @@ pub(crate) async fn run_cli_with_options(
             detail: source.to_string(),
         })?;
     let pid = child.id();
-    if let (Some(pid), Some(pid_file)) = (pid, options.pid_file.as_ref()) {
+    if let (Some(pid), Some(pid_file)) = (pid, pid_file.as_ref()) {
         if let Some(parent) = pid_file.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -135,14 +140,28 @@ pub(crate) async fn run_cli_with_options(
                 source,
             })?;
     }
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|source| ProviderError::Cli {
-            provider: provider.to_string(),
-            detail: source.to_string(),
-        })?;
-    if let Some(pid_file) = options.pid_file.as_ref() {
+    let wait = child.wait_with_output();
+    let output = if let Some(token) = cancellation_token {
+        tokio::select! {
+            _ = token.cancelled() => {
+                if let Some(pid_file) = pid_file.as_ref() {
+                    let _ = tokio::fs::remove_file(pid_file).await;
+                }
+                return Err(ProviderError::Cli {
+                    provider: provider.to_string(),
+                    detail: "request cancelled".to_string(),
+                });
+            }
+            output = wait => output
+        }
+    } else {
+        wait.await
+    }
+    .map_err(|source| ProviderError::Cli {
+        provider: provider.to_string(),
+        detail: source.to_string(),
+    })?;
+    if let Some(pid_file) = pid_file.as_ref() {
         let _ = tokio::fs::remove_file(pid_file).await;
     }
     Ok(CliOutput {

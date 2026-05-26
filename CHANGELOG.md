@@ -3,6 +3,7 @@
 ## TUI Responsiveness (alpha) - 2026-05-26
 
 - Added in-memory attach tick budgets and loop-stage timing for run, plan, and chain attach surfaces, with provider narrative refresh classified as background work for the responsive attach scheduler.
+- Moved run narrative attach refresh onto a coalesced background job so manual `r` redraws without awaiting the provider and detach cancels in-flight provider work.
 
 ## Narrative Attach (alpha) - 2026-05-26
 
