@@ -423,6 +423,9 @@ pub(crate) fn ensure_run_projection(
 ) -> crate::Result<NarrativeProjection> {
     let narrative_dir = input.state.run_root.join(NARRATIVE_DIR);
     let projection = build_run_projection(input);
+    if let Some(current) = read_current_projection_if_covered(&projection, &narrative_dir) {
+        return Ok(current);
+    }
     persist_projection(&projection, &narrative_dir)?;
     Ok(projection)
 }
@@ -431,8 +434,12 @@ pub(crate) fn ensure_plan_projection(
     input: &PlanNarrativeInput<'_>,
 ) -> crate::Result<NarrativeProjection> {
     let plan_dir = input.paths.plan_dir(&input.plan.plan_id);
+    let narrative_dir = plan_dir.join(NARRATIVE_DIR);
     let projection = build_plan_projection(input);
-    persist_projection(&projection, &plan_dir.join(NARRATIVE_DIR))?;
+    if let Some(current) = read_current_projection_if_covered(&projection, &narrative_dir) {
+        return Ok(current);
+    }
+    persist_projection(&projection, &narrative_dir)?;
     Ok(projection)
 }
 
@@ -668,7 +675,7 @@ pub(crate) fn build_run_projection(input: &RunNarrativeInput<'_>) -> NarrativePr
         &latest_run_event_id,
     );
     debug_assert!(validate_graph(&graph));
-    let graph_hash = stable_hash(&graph);
+    let graph_hash = graph_content_hash(&graph);
     let coverage = NarrativeCoverage {
         run_event_seq: Some(input.events.len() as u64),
         trace_count: Some(input.traces.len()),
@@ -918,7 +925,7 @@ pub(crate) fn build_plan_projection(input: &PlanNarrativeInput<'_>) -> Narrative
     };
     let graph = build_plan_graph(plan, &source_window);
     debug_assert!(validate_graph(&graph));
-    let graph_hash = stable_hash(&graph);
+    let graph_hash = graph_content_hash(&graph);
     let snapshot_id = snapshot_id(&(
         NarrativeScope::Plan,
         &plan.plan_id,
@@ -1235,7 +1242,7 @@ pub(crate) fn apply_provider_response(
         next.snapshot.next_likely = output.next_likely;
     }
     apply_graph_label_suggestions(&mut next.graph, &output.graph_labels);
-    let graph_hash = stable_hash(&next.graph);
+    let graph_hash = graph_content_hash(&next.graph);
     next.state.latest_covered.architecture_graph_hash = Some(graph_hash.clone());
     next.snapshot.source_window = next.graph.source_window.clone();
     next.snapshot.status = NarrativeStatus::Fresh;
@@ -1289,6 +1296,32 @@ pub(crate) fn projection_with_provider_failure(
         confidence: "high".to_string(),
     });
     next
+}
+
+fn read_current_projection_if_covered(
+    candidate: &NarrativeProjection,
+    narrative_dir: &Path,
+) -> Option<NarrativeProjection> {
+    let state = read_json::<NarrativeState>(&narrative_dir.join(NARRATIVE_STATE_JSON))?;
+    if state.provider.source == "deterministic"
+        || state.latest_status == NarrativeStatus::Deterministic
+    {
+        return None;
+    }
+    if state.latest_covered != candidate.state.latest_covered {
+        return None;
+    }
+    let snapshot = read_latest_snapshot(narrative_dir).snapshot?;
+    if snapshot.snapshot_id != state.latest_snapshot_id {
+        return None;
+    }
+    let graph = read_json::<ArchitectureGraph>(&narrative_dir.join(ARCHITECTURE_GRAPH_JSON))
+        .unwrap_or_else(|| candidate.graph.clone());
+    Some(NarrativeProjection {
+        state,
+        snapshot,
+        graph,
+    })
 }
 
 fn strip_terminal_controls(raw: &str, findings: &mut Vec<String>) -> String {
@@ -2225,6 +2258,21 @@ fn stable_hash<T: Serialize>(value: &T) -> String {
     hex_hash(hasher.finalize().as_slice())
 }
 
+fn graph_content_hash(graph: &ArchitectureGraph) -> String {
+    stable_hash(&(
+        graph.version,
+        &graph.scope,
+        &graph.target_id,
+        &graph.source_window,
+        &graph.default_visual,
+        &graph.nodes,
+        &graph.edges,
+        &graph.groups,
+        &graph.layout,
+        &graph.legend,
+    ))
+}
+
 fn hex_hash(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -2310,6 +2358,11 @@ fn append_json_line<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
+}
+
+fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 fn read_jsonl<T: DeserializeOwned>(path: &Path) -> crate::Result<Vec<T>> {
@@ -2590,6 +2643,66 @@ mod tests {
         assert!(latest.snapshot.is_some());
         assert!(rendered.contains("freshness: fresh via provider"));
         assert!(rendered.contains("operator summary"));
+    }
+
+    #[test]
+    fn provider_snapshot_survives_deterministic_redraw_until_coverage_changes() {
+        let temp = TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "redraw keeps provider snapshot".to_string(),
+                cwd: repo,
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("run-redraw-test".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let input = RunNarrativeInput {
+            state: &state,
+            spend: &[],
+            traces: &[],
+            events: &[],
+            live_files: vec![LiveFileFact {
+                path: "src/main.rs".to_string(),
+                bytes: 10,
+                modified_at: None,
+            }],
+            file_count: 1,
+            total_bytes: 10,
+            acceptance_summary: "default gate".to_string(),
+            provider_activity: &[],
+            parent_plan: None,
+        };
+        let projection = ensure_run_projection(&input).expect("projection");
+        let evidence = projection.snapshot.citations[0].id.clone();
+        let provider_content = json!({
+            "headline": "Narrated provider snapshot survives redraw.",
+            "current_work": [
+                {"text": "Provider prose is current for the same evidence coverage.", "evidence": [evidence], "confidence": "high"}
+            ]
+        })
+        .to_string();
+        let refreshed = apply_provider_response(&projection, &provider_content, sample_provider())
+            .expect("provider projection");
+        persist_run_projection(&state, &refreshed).expect("persist provider");
+
+        let redraw = ensure_run_projection(&input).expect("redraw projection");
+
+        assert_eq!(redraw.state.latest_status, NarrativeStatus::Fresh);
+        assert_eq!(redraw.snapshot.headline, refreshed.snapshot.headline);
+        assert_eq!(
+            redraw.state.latest_snapshot_id,
+            refreshed.state.latest_snapshot_id
+        );
     }
 
     #[test]
