@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+
+use crate::narrative::{AttachViewMode, NarrativeVisualMode};
 use deadreckon_core::DocKind;
 
 const TOP_LEVEL_TEMPLATE: &str = "\
@@ -330,13 +332,15 @@ Docs can be regenerated with a provider-backed polish pass:
 const ATTACH_HELP: &str = "\
 Lifecycle:
   deadreckon attach latest
+  deadreckon attach latest --view narrative
+  deadreckon attach <plan-id> --view narrative --visual agents
   deadreckon attach <chain-id>
   deadreckon attach <plan-id>
   deadreckon attach <plan-id>:task-0
   deadreckon status latest
   deadreckon finish latest
 
-Attach opens the live TUI for a run, chain, or plan. `q`, Esc, and Ctrl-D detach without killing the work.";
+Attach opens the live TUI for a run, chain, or plan. The default activity view keeps raw logs visible; `--view narrative` shows cited prose plus an evidence-backed visual map. `q`, Esc, and Ctrl-D detach without killing the work.";
 
 const KILL_HELP: &str = "\
 Lifecycle:
@@ -1237,6 +1241,29 @@ pub(crate) enum Commands {
     Attach {
         #[arg(help = "Run id, chain id, plan id, plan-id:task-id, unique prefix, or latest")]
         run_id: String,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = AttachViewMode::Activity,
+            help = "Attach view: raw activity, human narrative, or split"
+        )]
+        view: AttachViewMode,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = NarrativeVisualMode::Architecture,
+            help = "Narrative visual: architecture, agents, files, evidence, or none"
+        )]
+        visual: NarrativeVisualMode,
+        #[arg(long, help = "Narrative summarizer provider route")]
+        narrative_provider: Option<String>,
+        #[arg(
+            long = "narrative-max-spend",
+            help = "Spend cap in USD for narrative refresh"
+        )]
+        narrative_max_spend: Option<f64>,
+        #[arg(long, help = "Structured JSON output for the selected attach view")]
+        json: bool,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]

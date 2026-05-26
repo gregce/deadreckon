@@ -110,6 +110,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 mod cli;
+mod narrative;
 mod plan_event_bus;
 mod prompt;
 mod tui_events;
@@ -121,6 +122,7 @@ use crate::cli::{
     HistoryKind, ImproveCommand, LearnCommand, LibraryCommand, MergeCommandArgs,
     OrchestrateCommand, PlanCommandArgs, ProvidersCommand, RunCommandArgs,
 };
+use crate::narrative::{AttachViewMode, NarrativeVisualMode};
 use crate::plan_event_bus::{PlanEventBus, PlanFeedEvent};
 use crate::ui::{
     ui_command, ui_error, ui_heading, ui_id, ui_muted, ui_note, ui_ok, ui_status, ui_warn,
@@ -705,11 +707,26 @@ async fn main_inner() -> Result<()> {
         }
         Commands::Attach {
             run_id,
+            view,
+            visual,
+            narrative_provider,
+            narrative_max_spend,
+            json,
             no_hints,
             plain,
         } => {
-            ui::set_plain_output(plain);
-            attach_command(run_id, no_hints, plain).await
+            ui::set_plain_output(plain || json);
+            attach_command(AttachCommandArgs {
+                run_id,
+                no_hints,
+                plain,
+                json,
+                view,
+                visual,
+                narrative_provider,
+                narrative_max_spend,
+            })
+            .await
         }
         Commands::Kill {
             run_id,
@@ -17219,49 +17236,89 @@ fn print_doc_polish_summary(record: &deadreckon_runtime::PolishRecord) {
     }
 }
 
-async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<()> {
+#[derive(Debug)]
+struct AttachCommandArgs {
+    run_id: String,
+    no_hints: bool,
+    plain: bool,
+    json: bool,
+    view: AttachViewMode,
+    visual: NarrativeVisualMode,
+    narrative_provider: Option<String>,
+    narrative_max_spend: Option<f64>,
+}
+
+async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     let paths = DeadreckonPaths::discover();
+    let _narrative_config = (&args.narrative_provider, args.narrative_max_spend);
     let mut parent_plan = None;
-    let state = if let Some(selection) = resolve_plan_child_ref(&paths, &run_id)? {
+    let run_ref = args.run_id.clone();
+    let state = if let Some(selection) = resolve_plan_child_ref(&paths, &run_ref)? {
         parent_plan = Some(AttachParentPlan {
             plan_id: selection.plan_id,
             task_id: selection.task_id,
         });
         load_run(&paths, &selection.run_id)?
     } else {
-        match load_cli_run(&paths, &run_id) {
+        match load_cli_run(&paths, &run_ref) {
             Ok(state) => state,
             Err(run_error) => {
-                if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
+                if let Ok(plan_id) = resolve_plan_id(&paths, &run_ref) {
                     let plan = load_plan(&paths, &plan_id)?;
-                    let show_hints = completion_hints_enabled(no_hints);
-                    if io::stdout().is_terminal() && !plain {
+                    let show_hints = completion_hints_enabled(args.no_hints);
+                    if args.view.is_narrative() && args.json {
+                        print_plan_narrative_json(&paths, &plan, args.visual)?;
+                    } else if args.view.is_narrative()
+                        && (!io::stdout().is_terminal() || args.plain)
+                    {
+                        print_plan_narrative_plain(&paths, &plan, args.visual)?;
+                    } else if io::stdout().is_terminal() && !args.plain && !args.json {
                         print_attach_banner("plan", &plan.plan_id);
-                        attach_plan_tui(&paths, &plan.plan_id, show_hints).await?;
+                        attach_plan_tui(&paths, &plan.plan_id, show_hints, args.view, args.visual)
+                            .await?;
                     } else {
                         print_plan_summary(&paths, &plan, show_hints);
                     }
                     return Ok(());
                 }
-                if resolve_chain_id(&paths, &run_id, false).is_ok() {
-                    return chain_attach_command(&paths, &run_id, plain);
+                if resolve_chain_id(&paths, &run_ref, false).is_ok() {
+                    if args.view.is_narrative() || args.json {
+                        return print_chain_narrative_refusal(&run_ref, args.json);
+                    }
+                    return chain_attach_command(&paths, &run_ref, args.plain);
                 }
                 return Err(run_error);
             }
         }
     };
     let run_id = state.run_id.clone();
-    let show_hints = completion_hints_enabled(no_hints);
-    if io::stdout().is_terminal() && !plain {
+    let show_hints = completion_hints_enabled(args.no_hints);
+    if args.view.is_narrative() && args.json {
+        print_run_narrative_json(&state, parent_plan.as_ref(), args.visual)?;
+        return Ok(());
+    }
+    if args.view.is_narrative() && (!io::stdout().is_terminal() || args.plain) {
+        print_run_narrative_plain(&state, parent_plan.as_ref(), args.visual)?;
+        return Ok(());
+    }
+    if io::stdout().is_terminal() && !args.plain && !args.json {
         print_attach_banner("run", &run_id);
         if parent_plan.is_some() {
-            attach_tui_with_parent(&paths, &run_id, show_hints, parent_plan).await?;
+            attach_tui_with_parent(
+                &paths,
+                &run_id,
+                show_hints,
+                parent_plan,
+                args.view,
+                args.visual,
+            )
+            .await?;
         } else {
-            attach_tui(&paths, &run_id, show_hints).await?;
+            attach_tui(&paths, &run_id, show_hints, args.view, args.visual).await?;
         }
         let state = load_run(&paths, &run_id)?;
         if state.status == RunStatus::Completed && show_hints {
-            print_exit_summary_card(&state, &RunLoopOutcome::Done, plain);
+            print_exit_summary_card(&state, &RunLoopOutcome::Done, args.plain);
             print_chain_context_for_working(&state.working_dir);
             print_lifecycle_hints(&state);
         }
@@ -17276,11 +17333,114 @@ async fn attach_command(run_id: String, no_hints: bool, plain: bool) -> Result<(
         );
     }
     if state.status == RunStatus::Completed && show_hints {
-        print_exit_summary_card(&state, &RunLoopOutcome::Done, plain);
+        print_exit_summary_card(&state, &RunLoopOutcome::Done, args.plain);
         print_chain_context_for_working(&state.working_dir);
         print_lifecycle_hints(&state);
     } else {
         print_run_summary(&state);
+    }
+    Ok(())
+}
+
+fn print_run_narrative_plain(
+    state: &deadreckon_core::PipelineState,
+    parent_plan: Option<&AttachParentPlan>,
+    visual: NarrativeVisualMode,
+) -> Result<()> {
+    let projection = run_projection_for_plain(state, parent_plan, visual)?;
+    for line in narrative::narrative_plain_lines(&projection, visual) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn print_run_narrative_json(
+    state: &deadreckon_core::PipelineState,
+    parent_plan: Option<&AttachParentPlan>,
+    visual: NarrativeVisualMode,
+) -> Result<()> {
+    let projection = run_projection_for_plain(state, parent_plan, visual)?;
+    println!("{}", serde_json::to_string_pretty(&projection)?);
+    Ok(())
+}
+
+fn run_projection_for_plain(
+    state: &deadreckon_core::PipelineState,
+    parent_plan: Option<&AttachParentPlan>,
+    visual: NarrativeVisualMode,
+) -> Result<narrative::NarrativeProjection> {
+    let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
+    let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
+    let events = read_jsonl::<RunEvent>(&state.run_root.join(RUN_EVENTS_JSONL))?;
+    let live = collect_attach_live(state);
+    let tui_state = AttachTuiState {
+        view: AttachViewMode::Narrative,
+        visual,
+        parent_plan: parent_plan.cloned(),
+        ..AttachTuiState::default()
+    };
+    run_narrative_projection(state, &spend, &traces, &events, &live, &tui_state)
+}
+
+fn print_plan_narrative_plain(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    visual: NarrativeVisualMode,
+) -> Result<()> {
+    let projection = plan_projection_for_plain(paths, plan)?;
+    for line in narrative::narrative_plain_lines(&projection, visual) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn print_plan_narrative_json(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    _visual: NarrativeVisualMode,
+) -> Result<()> {
+    let projection = plan_projection_for_plain(paths, plan)?;
+    println!("{}", serde_json::to_string_pretty(&projection)?);
+    Ok(())
+}
+
+fn plan_projection_for_plain(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+) -> Result<narrative::NarrativeProjection> {
+    let messages = read_plan_messages(paths, &plan.plan_id).unwrap_or_default();
+    let plan_events = read_plan_events_lossy(paths, &plan.plan_id);
+    narrative::ensure_plan_projection(&narrative::PlanNarrativeInput {
+        paths,
+        plan,
+        messages: &messages,
+        plan_events: &plan_events,
+        feed_events: &[],
+        selected: 0,
+    })
+}
+
+fn print_chain_narrative_refusal(run_ref: &str, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "unsupported",
+                "kind": "chain",
+                "id": run_ref,
+                "message": "Narrative attach is currently supported for runs, plans, and plan child refs.",
+                "try": [
+                    "deadreckon chain status",
+                    "deadreckon attach <run-id> --view narrative",
+                    "deadreckon attach <plan-id> --view narrative"
+                ]
+            }))?
+        );
+    } else {
+        println!("chain narrative attach is not supported yet");
+        println!("try: deadreckon chain status {run_ref}");
+        println!("try: deadreckon attach <run-id> --view narrative");
+        println!("try: deadreckon attach <plan-id> --view narrative");
     }
     Ok(())
 }
@@ -21675,7 +21835,13 @@ fn is_worktree_run(state: &deadreckon_core::PipelineState) -> bool {
         .unwrap_or(false)
 }
 
-async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: bool) -> Result<()> {
+async fn attach_plan_tui(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+    show_hints: bool,
+    initial_view: AttachViewMode,
+    initial_visual: NarrativeVisualMode,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -21687,6 +21853,8 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
     let mut plan_events = Vec::<PlanEvent>::new();
     let mut feed_events = Vec::<PlanFeedEvent>::new();
     let mut feed = PlanEventBus::file_tail(paths.clone(), plan_id.to_string());
+    let mut view = initial_view;
+    let mut visual = initial_visual;
 
     let result = loop {
         for event in feed.refresh(Duration::ZERO).await {
@@ -21725,12 +21893,21 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
                     feed_events: &feed_events,
                     selected,
                     show_hints,
+                    view,
+                    visual,
                 },
             )
         })?;
         if event::poll(std::time::Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
+                Event::Key(key) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
+                    view = toggle_attach_view(view);
+                }
+                Event::Key(key) if key.code == KeyCode::Char('v') && key.modifiers.is_empty() => {
+                    visual = visual.next();
+                }
+                Event::Key(key) if key.code == KeyCode::Char('r') && key.modifiers.is_empty() => {}
                 Event::Key(key)
                     if matches!(
                         key.code,
@@ -21758,8 +21935,15 @@ async fn attach_plan_tui(paths: &DeadreckonPaths, plan_id: &str, show_hints: boo
                             task_id: task.task_id.clone(),
                         });
                         suspend_tui(&mut terminal)?;
-                        let child_result =
-                            attach_tui_with_parent(paths, run_id, show_hints, parent_plan).await;
+                        let child_result = attach_tui_with_parent(
+                            paths,
+                            run_id,
+                            show_hints,
+                            parent_plan,
+                            view,
+                            visual,
+                        )
+                        .await;
                         if let Err(err) = &child_result {
                             print_error(err);
                             let _ = prompt::open("press Enter to return to plan attach...", None);
@@ -21788,6 +21972,8 @@ struct PlanAttachRenderState<'a> {
     feed_events: &'a [PlanFeedEvent],
     selected: usize,
     show_hints: bool,
+    view: AttachViewMode,
+    visual: NarrativeVisualMode,
 }
 
 fn render_plan_attach(
@@ -21904,25 +22090,98 @@ fn render_plan_attach(
         );
     }
 
-    let activity = plan_activity_lines(
-        state.plan_events,
-        state.messages,
-        state.feed_events,
-        vertical[2].height.saturating_sub(2) as usize,
-    );
-    let activity_title = if !state.feed_events.is_empty() {
-        "plan feed"
-    } else if state.plan_events.is_empty() {
-        "coordinator messages"
+    if state.view.is_narrative() {
+        render_plan_narrative_attach(frame, paths, plan, state, vertical[2]);
     } else {
-        "plan events"
-    };
-    frame.render_widget(
-        List::new(activity).block(Block::default().title(activity_title).borders(Borders::ALL)),
-        vertical[2],
+        let activity = plan_activity_lines(
+            state.plan_events,
+            state.messages,
+            state.feed_events,
+            vertical[2].height.saturating_sub(2) as usize,
+        );
+        let activity_title = if !state.feed_events.is_empty() {
+            "plan feed"
+        } else if state.plan_events.is_empty() {
+            "coordinator messages"
+        } else {
+            "plan events"
+        };
+        frame.render_widget(
+            List::new(activity).block(Block::default().title(activity_title).borders(Borders::ALL)),
+            vertical[2],
+        );
+    }
+    let footer = plan_attach_footer(
+        paths,
+        plan,
+        state.selected,
+        state.show_hints,
+        state.view,
+        state.visual,
     );
-    let footer = plan_attach_footer(paths, plan, state.selected, state.show_hints);
     frame.render_widget(Paragraph::new(footer), vertical[3]);
+}
+
+fn render_plan_narrative_attach(
+    frame: &mut ratatui::Frame<'_>,
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    state: &PlanAttachRenderState<'_>,
+    area: ratatui::layout::Rect,
+) {
+    let projection = narrative::ensure_plan_projection(&narrative::PlanNarrativeInput {
+        paths,
+        plan,
+        messages: state.messages,
+        plan_events: state.plan_events,
+        feed_events: state.feed_events,
+        selected: state.selected,
+    })
+    .unwrap_or_else(|_| {
+        narrative::build_plan_projection(&narrative::PlanNarrativeInput {
+            paths,
+            plan,
+            messages: state.messages,
+            plan_events: state.plan_events,
+            feed_events: state.feed_events,
+            selected: state.selected,
+        })
+    });
+    let mut lines = narrative::narrative_plain_lines(&projection, state.visual);
+    if area.width >= 100 && state.visual != NarrativeVisualMode::None {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area);
+        let visual_lines = narrative::graph_ascii_lines(&projection.graph, state.visual);
+        lines.retain(|line| !line.starts_with("Visual:"));
+        frame.render_widget(
+            List::new(lines.into_iter().map(narrative_list_item)).block(
+                Block::default()
+                    .title("plan narrative")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ui::TUI_PALETTE.border_focused)),
+            ),
+            chunks[0],
+        );
+        frame.render_widget(
+            List::new(visual_lines.into_iter().map(narrative_list_item)).block(
+                Block::default()
+                    .title(format!("visual {}", state.visual.label()))
+                    .borders(Borders::ALL),
+            ),
+            chunks[1],
+        );
+    } else {
+        frame.render_widget(
+            List::new(lines.into_iter().map(narrative_list_item)).block(
+                Block::default()
+                    .title(format!("plan narrative / {}", state.visual.label()))
+                    .borders(Borders::ALL),
+            ),
+            area,
+        );
+    }
 }
 
 fn plan_attach_footer(
@@ -21930,10 +22189,18 @@ fn plan_attach_footer(
     plan: &Plan,
     selected: usize,
     show_hints: bool,
+    view: AttachViewMode,
+    visual: NarrativeVisualMode,
 ) -> String {
-    let mut footer =
-        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter child run  |  b/Backspace back from child"
-            .to_string();
+    let mut footer = if view.is_narrative() {
+        format!(
+            "n narrative/activity  v visual={}  r refresh  |  arrows/Tab child  Enter child run  q detach",
+            visual.label()
+        )
+    } else {
+        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter child run  |  n narrative  b/Backspace back from child"
+            .to_string()
+    };
     if let Some(task) = plan.tasks.get(selected) {
         match task.child_run_id.as_deref() {
             None => {
@@ -22322,8 +22589,18 @@ async fn attach_tui(
     paths: &DeadreckonPaths,
     run_id: &str,
     show_completion_actions: bool,
+    initial_view: AttachViewMode,
+    initial_visual: NarrativeVisualMode,
 ) -> Result<()> {
-    attach_tui_with_parent(paths, run_id, show_completion_actions, None).await
+    attach_tui_with_parent(
+        paths,
+        run_id,
+        show_completion_actions,
+        None,
+        initial_view,
+        initial_visual,
+    )
+    .await
 }
 
 async fn attach_tui_with_parent(
@@ -22331,6 +22608,8 @@ async fn attach_tui_with_parent(
     run_id: &str,
     show_completion_actions: bool,
     parent_plan: Option<AttachParentPlan>,
+    initial_view: AttachViewMode,
+    initial_visual: NarrativeVisualMode,
 ) -> Result<()> {
     let initial_state = load_run(paths, run_id)?;
     let mut event_feed =
@@ -22344,6 +22623,8 @@ async fn attach_tui_with_parent(
     let mut tui_state = AttachTuiState {
         show_completion_actions,
         parent_plan,
+        view: initial_view,
+        visual: initial_visual,
         ..AttachTuiState::default()
     };
 
@@ -22371,6 +22652,15 @@ async fn attach_tui_with_parent(
                     break Ok(());
                 }
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
+                Event::Key(key) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
+                    tui_state.toggle_view();
+                }
+                Event::Key(key) if key.code == KeyCode::Char('v') && key.modifiers.is_empty() => {
+                    tui_state.cycle_visual();
+                }
+                Event::Key(key) if key.code == KeyCode::Char('r') && key.modifiers.is_empty() => {
+                    tui_state.record_narrative_refresh();
+                }
                 Event::Key(key)
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.is_empty()
@@ -22560,10 +22850,14 @@ struct AttachTuiState {
     activity_scroll: usize,
     docs_scroll: usize,
     docs_open: bool,
+    narrative_scroll: usize,
     files_scroll: usize,
     processes_scroll: usize,
+    view: AttachViewMode,
+    visual: NarrativeVisualMode,
     show_completion_actions: bool,
     post_action_notice: Option<AttachActionNotice>,
+    narrative_notice: Option<String>,
     parent_plan: Option<AttachParentPlan>,
 }
 
@@ -22574,10 +22868,14 @@ impl Default for AttachTuiState {
             activity_scroll: 0,
             docs_scroll: 0,
             docs_open: false,
+            narrative_scroll: 0,
             files_scroll: 0,
             processes_scroll: 0,
+            view: AttachViewMode::Activity,
+            visual: NarrativeVisualMode::Architecture,
             show_completion_actions: true,
             post_action_notice: None,
+            narrative_notice: None,
             parent_plan: None,
         }
     }
@@ -22607,18 +22905,51 @@ impl AttachTuiState {
 
     fn toggle_docs(&mut self) {
         self.docs_open = !self.docs_open;
+        if self.docs_open {
+            self.view = AttachViewMode::Activity;
+        }
         self.focused_panel = AttachPanel::Activity;
         self.post_action_notice = None;
     }
 
+    fn toggle_view(&mut self) {
+        self.docs_open = false;
+        self.view = toggle_attach_view(self.view);
+        self.focused_panel = AttachPanel::Activity;
+        self.post_action_notice = None;
+        self.narrative_notice = None;
+    }
+
+    fn cycle_visual(&mut self) {
+        self.visual = self.visual.next();
+        self.docs_open = false;
+        if self.view == AttachViewMode::Activity {
+            self.view = AttachViewMode::Narrative;
+        }
+        self.focused_panel = AttachPanel::Activity;
+    }
+
+    fn record_narrative_refresh(&mut self) {
+        self.docs_open = false;
+        if self.view == AttachViewMode::Activity {
+            self.view = AttachViewMode::Narrative;
+        }
+        self.narrative_notice =
+            Some("refresh requested; deterministic narrative is current".to_string());
+        self.focused_panel = AttachPanel::Activity;
+    }
+
     fn record_post_action(&mut self, notice: AttachActionNotice) {
         self.docs_open = false;
+        self.view = AttachViewMode::Activity;
         self.focused_panel = AttachPanel::Activity;
         self.activity_scroll = 0;
         self.docs_scroll = 0;
+        self.narrative_scroll = 0;
         self.files_scroll = 0;
         self.processes_scroll = 0;
         self.post_action_notice = Some(notice);
+        self.narrative_notice = None;
     }
 
     fn scroll_focused(&mut self, delta: isize, counts: AttachPanelCounts, rows: AttachPanelRows) {
@@ -22639,6 +22970,9 @@ impl AttachTuiState {
         self.docs_scroll =
             self.docs_scroll
                 .min(max_panel_scroll(AttachPanel::Activity, counts, rows));
+        self.narrative_scroll =
+            self.narrative_scroll
+                .min(max_panel_scroll(AttachPanel::Activity, counts, rows));
         self.files_scroll =
             self.files_scroll
                 .min(max_panel_scroll(AttachPanel::Files, counts, rows));
@@ -22650,6 +22984,7 @@ impl AttachTuiState {
     fn focused_scroll(&self) -> usize {
         match self.focused_panel {
             AttachPanel::Activity if self.docs_open => self.docs_scroll,
+            AttachPanel::Activity if self.view.is_narrative() => self.narrative_scroll,
             AttachPanel::Activity => self.activity_scroll,
             AttachPanel::Files => self.files_scroll,
             AttachPanel::Processes => self.processes_scroll,
@@ -22659,10 +22994,18 @@ impl AttachTuiState {
     fn set_focused_scroll(&mut self, offset: usize) {
         match self.focused_panel {
             AttachPanel::Activity if self.docs_open => self.docs_scroll = offset,
+            AttachPanel::Activity if self.view.is_narrative() => self.narrative_scroll = offset,
             AttachPanel::Activity => self.activity_scroll = offset,
             AttachPanel::Files => self.files_scroll = offset,
             AttachPanel::Processes => self.processes_scroll = offset,
         }
+    }
+}
+
+fn toggle_attach_view(view: AttachViewMode) -> AttachViewMode {
+    match view {
+        AttachViewMode::Activity => AttachViewMode::Narrative,
+        AttachViewMode::Narrative | AttachViewMode::Split => AttachViewMode::Activity,
     }
 }
 
@@ -22764,6 +23107,10 @@ fn attach_panel_counts(
     AttachPanelCounts {
         activity: if tui_state.docs_open && state.status == RunStatus::Completed {
             render_markdown_doc_lines(state).len()
+        } else if tui_state.view.is_narrative() {
+            run_narrative_lines(state, spend, traces, events, live, tui_state)
+                .map(|lines| lines.len())
+                .unwrap_or(1)
         } else {
             attach_activity_lines_for_tui(state, spend, traces, events, live, tui_state).len()
         },
@@ -24466,6 +24813,19 @@ fn render_attach(
 
     if tui_state.docs_open && state.status == RunStatus::Completed {
         render_run_docs(frame, layout.activity, state, tui_state);
+    } else if tui_state.view.is_narrative() {
+        render_run_narrative(
+            frame,
+            layout.activity,
+            &RunNarrativeRenderInput {
+                state,
+                spend,
+                traces,
+                events,
+                live,
+                tui_state,
+            },
+        );
     } else {
         let trace_lines =
             attach_activity_lines_for_tui(state, spend, traces, events, live, tui_state);
@@ -24586,20 +24946,29 @@ fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTu
         if is_worktree_run(state) {
             if tui_state.docs_open {
                 "[d] Activity  [a] Apply  [b] Abandon  [s] Show  |  Tab focus  j/k scroll  q detach"
+            } else if tui_state.view.is_narrative() {
+                "[n] Activity  [v] Visual  [r] Refresh  [d] Docs  [a] Apply  [b] Abandon  [s] Show  |  q detach"
             } else {
-                "[d] Docs  [a] Apply  [b] Abandon  [s] Show  |  Tab focus  j/k scroll  q detach"
+                "[n] Narrative  [d] Docs  [a] Apply  [b] Abandon  [s] Show  |  Tab focus  j/k scroll  q detach"
             }
             .to_string()
         } else {
             if tui_state.docs_open {
                 "[d] Activity  [m] Materialize  [e] Extend  [s] Show  |  Tab focus  j/k scroll  q detach"
+            } else if tui_state.view.is_narrative() {
+                "[n] Activity  [v] Visual  [r] Refresh  [d] Docs  [m] Materialize  [e] Extend  [s] Show  |  q detach"
             } else {
-                "[d] Docs  [m] Materialize  [e] Extend  [s] Show  |  Tab focus  j/k scroll  q detach"
+                "[n] Narrative  [d] Docs  [m] Materialize  [e] Extend  [s] Show  |  Tab focus  j/k scroll  q detach"
             }
             .to_string()
         }
+    } else if tui_state.view.is_narrative() {
+        format!(
+            "[n] Activity  [v] Visual={}  [r] Refresh  |  Tab focus  j/k scroll  q detach",
+            tui_state.visual.label()
+        )
     } else {
-        "Detach: q Esc Ctrl-D  |  Focus: Tab  |  Scroll: j/k Up/Down PgUp/PgDn mouse".to_string()
+        "Detach: q Esc Ctrl-D  |  [n] Narrative  |  Focus: Tab  |  Scroll: j/k Up/Down PgUp/PgDn mouse".to_string()
     };
     parent_plan_footer(
         format!("{base}{chain_suffix}"),
@@ -24960,6 +25329,177 @@ fn render_run_docs(
     );
 }
 
+struct RunNarrativeRenderInput<'a> {
+    state: &'a deadreckon_core::PipelineState,
+    spend: &'a [SpendRecord],
+    traces: &'a [TraceRecord],
+    events: &'a [RunEvent],
+    live: &'a AttachLive,
+    tui_state: &'a AttachTuiState,
+}
+
+fn render_run_narrative(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    input: &RunNarrativeRenderInput<'_>,
+) {
+    let &RunNarrativeRenderInput {
+        state,
+        spend,
+        traces,
+        events,
+        live,
+        tui_state,
+    } = input;
+    let rows = area.height.saturating_sub(2) as usize;
+    let Ok(mut lines) = run_narrative_lines(state, spend, traces, events, live, tui_state) else {
+        frame.render_widget(
+            Paragraph::new(
+                "Unable to build narrative projection; raw activity remains available with n.",
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("narrative unavailable"),
+            )
+            .style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    };
+    if area.width >= 110 && tui_state.visual != NarrativeVisualMode::None {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area);
+        let projection = run_narrative_projection(state, spend, traces, events, live, tui_state);
+        let visual_lines = projection
+            .as_ref()
+            .map(|projection| narrative::graph_ascii_lines(&projection.graph, tui_state.visual))
+            .unwrap_or_else(|_| vec!["[stale] visual unavailable".to_string()]);
+        lines.retain(|line| !line.starts_with("Visual:"));
+        let visible = visible_narrative_items(&lines, tui_state.narrative_scroll, rows);
+        frame.render_widget(
+            List::new(visible).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(panel_border_style(
+                        tui_state.focused_panel,
+                        AttachPanel::Activity,
+                    ))
+                    .title(panel_title(
+                        "narrative",
+                        tui_state.focused_panel == AttachPanel::Activity,
+                        tui_state.narrative_scroll,
+                        rows,
+                        lines.len(),
+                    )),
+            ),
+            chunks[0],
+        );
+        frame.render_widget(
+            List::new(visual_lines.into_iter().map(narrative_list_item)).block(
+                Block::default()
+                    .title(format!("visual {}", tui_state.visual.label()))
+                    .borders(Borders::ALL),
+            ),
+            chunks[1],
+        );
+    } else {
+        let visible = visible_narrative_items(&lines, tui_state.narrative_scroll, rows);
+        frame.render_widget(
+            List::new(visible).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(panel_border_style(
+                        tui_state.focused_panel,
+                        AttachPanel::Activity,
+                    ))
+                    .title(panel_title(
+                        &format!("narrative / {}", tui_state.visual.label()),
+                        tui_state.focused_panel == AttachPanel::Activity,
+                        tui_state.narrative_scroll,
+                        rows,
+                        lines.len(),
+                    )),
+            ),
+            area,
+        );
+    }
+}
+
+fn run_narrative_lines(
+    state: &deadreckon_core::PipelineState,
+    spend: &[SpendRecord],
+    traces: &[TraceRecord],
+    events: &[RunEvent],
+    live: &AttachLive,
+    tui_state: &AttachTuiState,
+) -> Result<Vec<String>> {
+    let projection = run_narrative_projection(state, spend, traces, events, live, tui_state)?;
+    let mut lines = narrative::narrative_plain_lines(&projection, tui_state.visual);
+    if let Some(notice) = tui_state.narrative_notice.as_ref() {
+        lines.insert(2, format!("[fresh] {notice}"));
+    }
+    Ok(lines)
+}
+
+fn run_narrative_projection(
+    state: &deadreckon_core::PipelineState,
+    spend: &[SpendRecord],
+    traces: &[TraceRecord],
+    events: &[RunEvent],
+    live: &AttachLive,
+    tui_state: &AttachTuiState,
+) -> Result<narrative::NarrativeProjection> {
+    narrative::ensure_run_projection(&narrative::RunNarrativeInput {
+        state,
+        spend,
+        traces,
+        events,
+        live_files: live
+            .files
+            .iter()
+            .map(|file| narrative::LiveFileFact {
+                path: file.path.clone(),
+                bytes: file.bytes,
+                modified_at: file.modified_at,
+            })
+            .collect(),
+        file_count: live.file_count,
+        total_bytes: live.total_bytes,
+        acceptance_summary: acceptance_narrative_summary(&live.acceptance),
+        provider_activity: &live.provider_activity,
+        parent_plan: tui_state
+            .parent_plan
+            .as_ref()
+            .map(|parent| narrative::ParentPlanFact {
+                plan_id: parent.plan_id.clone(),
+                task_id: parent.task_id.clone(),
+            }),
+    })
+}
+
+fn acceptance_narrative_summary(acceptance: &AcceptanceLive) -> String {
+    match acceptance.status {
+        AcceptanceUiStatus::DefaultGate => "default gate".to_string(),
+        AcceptanceUiStatus::Configured => format!("configured {} check(s)", acceptance.total),
+        AcceptanceUiStatus::Running => {
+            format!(
+                "running {}/{} check(s)",
+                acceptance.completed, acceptance.total
+            )
+        }
+        AcceptanceUiStatus::Passed => {
+            format!("passed {}/{} check(s)", acceptance.passed, acceptance.total)
+        }
+        AcceptanceUiStatus::Failed => format!(
+            "failed {} required, {} passed of {}",
+            acceptance.required_failed, acceptance.passed, acceptance.total
+        ),
+    }
+}
+
 fn render_markdown_doc_lines(state: &deadreckon_core::PipelineState) -> Vec<Line<'static>> {
     let Some(path) = doc_path_for_kind(&state.working_dir, DocKind::Narrative) else {
         return vec![Line::styled(
@@ -25261,6 +25801,49 @@ fn visible_items(lines: &[String], offset: usize, rows: usize) -> Vec<ListItem<'
         .take(rows)
         .map(|line| ListItem::new(line.clone()))
         .collect()
+}
+
+fn visible_narrative_items(lines: &[String], offset: usize, rows: usize) -> Vec<ListItem<'static>> {
+    lines
+        .iter()
+        .skip(offset.min(lines.len()))
+        .take(rows)
+        .cloned()
+        .map(narrative_list_item)
+        .collect()
+}
+
+fn narrative_list_item(line: String) -> ListItem<'static> {
+    let style = if line.starts_with("[done]") || line.contains("[success]") {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with("[risk]")
+        || line.starts_with("[stale]")
+        || line.contains("[warning]")
+        || line.contains("failed")
+    {
+        Style::default().fg(Color::Yellow)
+    } else if line.starts_with("[blocked]") || line.contains("[danger]") {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with("Current work")
+        || line.starts_with("Architecture")
+        || line.starts_with("Agents")
+        || line.starts_with("Coordination")
+        || line.starts_with("Risks")
+        || line.starts_with("Next likely")
+        || line.starts_with("Visual:")
+        || line.starts_with("Evidence")
+    {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with("  ->") || line.contains(" -> ") {
+        Style::default().fg(Color::LightCyan)
+    } else if line.starts_with("- ") {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default()
+    };
+    ListItem::new(Line::styled(line, style))
 }
 
 fn panel_border_style(focused: AttachPanel, panel: AttachPanel) -> Style {
@@ -25819,9 +26402,10 @@ mod tui_tests {
 
     use super::{
         AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachPanel,
-        AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, COMMAND_HELP_CATALOG,
-        ChainAttachTuiState, CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS,
-        PlanAttachRenderState, PlanFeedEvent, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
+        AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachTuiState, AttachViewMode,
+        COMMAND_HELP_CATALOG, ChainAttachTuiState, CommandDiscovery, CommandHelpEntry,
+        CompletionAction, HELP_ALL_GROUPS, NarrativeVisualMode, PlanAttachRenderState,
+        PlanFeedEvent, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
         acceptance_activity_lines, attach_banner, attach_header_text, attach_should_return_to_plan,
         chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
         chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
@@ -26167,6 +26751,8 @@ mod tui_tests {
                         feed_events,
                         selected,
                         show_hints: true,
+                        view: AttachViewMode::Activity,
+                        visual: NarrativeVisualMode::Architecture,
                     },
                 )
             })
@@ -26664,7 +27250,14 @@ mod tui_tests {
     fn plan_attach_footer_snapshot_captures_back_navigation_grammar() {
         let (_temp, paths, plan) = full_plan_fixture(2);
 
-        let footer = plan_attach_footer(&paths, &plan, 0, true);
+        let footer = plan_attach_footer(
+            &paths,
+            &plan,
+            0,
+            true,
+            AttachViewMode::Activity,
+            NarrativeVisualMode::Architecture,
+        );
 
         assert!(footer.starts_with("q/Esc/Ctrl-D detach"), "{footer}");
         assert!(footer.contains("arrows/Tab focus child"), "{footer}");
@@ -26692,7 +27285,14 @@ mod tui_tests {
         .expect("run");
         plan.tasks[0].child_run_id = Some(state.run_id);
 
-        let footer = plan_attach_footer(&paths, &plan, 0, true);
+        let footer = plan_attach_footer(
+            &paths,
+            &plan,
+            0,
+            true,
+            AttachViewMode::Activity,
+            NarrativeVisualMode::Architecture,
+        );
 
         assert!(footer.contains("Enter child run"), "{footer}");
         assert!(!footer.contains("try: deadreckon fork"), "{footer}");
