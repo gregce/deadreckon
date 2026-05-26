@@ -27051,10 +27051,11 @@ mod tui_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use deadreckon_core::{
         ApplyMode, ApplyStrategy, BranchPolicy, CapabilityPreview, Chain, ChainEvent,
-        ChainEventKind, ChainNewOptions, ChainStatus, ChainStepStatus, DeadreckonPaths,
+        ChainEventKind, ChainNewOptions, ChainStatus, ChainStepStatus, DeadreckonPaths, DocKind,
         NetworkCapability, OnFail, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
         PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunEvent,
-        RunEventKind, RunOptions, SpendRecord, append_plan_event, create_run, save_plan,
+        RunEventKind, RunOptions, RunStatus, SpendRecord, append_plan_event, create_run,
+        doc_path_for_kind, save_plan,
     };
     use deadreckon_providers::SpendEstimate;
     use deadreckon_providers::registry::{
@@ -27447,7 +27448,18 @@ mod tui_tests {
         live: &AttachLive,
         tui_state: AttachTuiState,
     ) -> String {
-        let backend = TestBackend::new(140, 34);
+        render_attach_text_with_size(state, spend, live, tui_state, 140, 34)
+    }
+
+    fn render_attach_text_with_size(
+        state: &deadreckon_core::PipelineState,
+        spend: &[SpendRecord],
+        live: &AttachLive,
+        tui_state: AttachTuiState,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| render_attach(frame, state, spend, &[], &[], live, &tui_state))
@@ -28060,6 +28072,95 @@ mod tui_tests {
         assert!(text.contains("Current work"), "{text}");
         assert!(text.contains("[file:"), "{text}");
         assert!(text.contains("crates/deadreckon/src/main.rs"), "{text}");
+    }
+
+    #[test]
+    fn run_attach_visual_cycle_preserves_scroll_and_footer() {
+        let (_temp, state) = doc_preview_state();
+        let mut tui_state = AttachTuiState {
+            view: AttachViewMode::Narrative,
+            visual: NarrativeVisualMode::Architecture,
+            narrative_scroll: 3,
+            ..AttachTuiState::default()
+        };
+
+        tui_state.cycle_visual();
+        let text = render_attach_text_with_tui_state(
+            &state,
+            &[],
+            &AttachLive::default(),
+            AttachTuiState {
+                view: tui_state.view,
+                visual: tui_state.visual,
+                narrative_scroll: tui_state.narrative_scroll,
+                ..AttachTuiState::default()
+            },
+        );
+
+        assert_eq!(tui_state.visual, NarrativeVisualMode::Agents);
+        assert_eq!(tui_state.narrative_scroll, 3);
+        assert!(text.contains("Visual=agents"), "{text}");
+        assert!(text.contains("[n] Activity"), "{text}");
+    }
+
+    #[test]
+    fn run_attach_n_toggles_back_to_provider_activity() {
+        let mut state = AttachTuiState {
+            view: AttachViewMode::Narrative,
+            docs_open: true,
+            narrative_notice: Some("fresh".to_string()),
+            ..AttachTuiState::default()
+        };
+
+        state.toggle_view();
+
+        assert_eq!(state.view, AttachViewMode::Activity);
+        assert!(!state.docs_open);
+        assert!(state.narrative_notice.is_none());
+        assert_eq!(state.focused_panel, AttachPanel::Activity);
+    }
+
+    #[test]
+    fn run_attach_completed_docs_toggle_still_reads_run_narrative_md() {
+        let (_temp, mut state) = doc_preview_state();
+        state.status = RunStatus::Completed;
+        let docs_path =
+            doc_path_for_kind(&state.working_dir, DocKind::Narrative).expect("doc path");
+        std::fs::create_dir_all(docs_path.parent().expect("doc parent")).expect("doc dir");
+        std::fs::write(
+            &docs_path,
+            "# Completed Narrative\n\nThe completed docs view remains distinct.",
+        )
+        .expect("doc");
+        let tui_state = AttachTuiState {
+            docs_open: true,
+            view: AttachViewMode::Narrative,
+            ..AttachTuiState::default()
+        };
+
+        let text =
+            render_attach_text_with_tui_state(&state, &[], &AttachLive::default(), tui_state);
+
+        assert!(text.contains("run docs / narrative"), "{text}");
+        assert!(text.contains("Completed Narrative"), "{text}");
+        assert!(!text.contains("freshness:"), "{text}");
+    }
+
+    #[test]
+    fn run_attach_narrow_terminal_keeps_footer_visible() {
+        let (_temp, state) = doc_preview_state();
+        let tui_state = AttachTuiState {
+            view: AttachViewMode::Narrative,
+            visual: NarrativeVisualMode::Evidence,
+            ..AttachTuiState::default()
+        };
+
+        let text =
+            render_attach_text_with_size(&state, &[], &AttachLive::default(), tui_state, 82, 22);
+
+        assert!(text.contains("[n] Activity"), "{text}");
+        assert!(text.contains("[r] Refresh"), "{text}");
+        assert!(text.contains("q detach"), "{text}");
     }
 
     #[test]
