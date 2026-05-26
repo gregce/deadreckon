@@ -408,6 +408,31 @@ Lifecycle:
 History searches durable JSONL evidence, not terminal scrollback. By default it
 searches the current project's run traces. Use --all to search every project.";
 
+const LEARN_HELP: &str = "\
+Lifecycle:
+  deadreckon learn index
+  deadreckon learn report
+  deadreckon learn export <run-id|proposal-id> --redacted
+  deadreckon learn import-bundle <path> --preview
+  deadreckon learn propose --limit 3
+  deadreckon improve self <proposal-id> --preview
+
+Learn builds a local experience index from redacted run evidence. Indexing is
+deterministic; proposal creation folds provider-backed reflection into
+`learn propose` and requires cited signals before writing proposals.";
+
+const IMPROVE_HELP: &str = "\
+Lifecycle:
+  deadreckon learn index
+  deadreckon learn propose
+  deadreckon improve self <proposal-id> --preview
+  deadreckon improve self <proposal-id> --yes
+  deadreckon improve self <proposal-id> --pr-dry-run
+
+Self-improve uses an isolated worktree and evidence packet. PR opening is
+opt-in and evidence-gated; --pr-dry-run produces the same body without network
+or push.";
+
 #[derive(Parser)]
 #[command(
     name = "deadreckon",
@@ -1391,6 +1416,24 @@ pub(crate) enum Commands {
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
     },
+    #[command(
+        next_help_heading = "Inspect And Import",
+        about = "Index local run evidence and propose DeadReckon improvements",
+        after_help = LEARN_HELP
+    )]
+    Learn {
+        #[command(subcommand)]
+        command: LearnCommand,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Run evidence-backed DeadReckon self-improvement candidates",
+        after_help = IMPROVE_HELP
+    )]
+    Improve {
+        #[command(subcommand)]
+        command: ImproveCommand,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1546,6 +1589,100 @@ pub(crate) enum HistoryCommand {
         limit: usize,
         #[arg(long, help = "Treat the pattern as a regular expression")]
         regex: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum LearnCommand {
+    #[command(about = "Index completed local runs into redacted episodes and signals")]
+    Index {
+        #[arg(long, help = "Filter to a specific scope key")]
+        scope: Option<String>,
+        #[arg(long, help = "Index runs from all project scopes")]
+        all: bool,
+        #[arg(
+            long,
+            help = "Reserved for future duration filtering; currently accepted for command stability"
+        )]
+        since: Option<String>,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+    #[command(about = "Summarize indexed episodes, signals, insights, and proposals")]
+    Report {
+        #[arg(long, help = "Filter to a specific scope key")]
+        scope: Option<String>,
+        #[arg(long, default_value_t = 10, help = "Maximum signals to display")]
+        limit: usize,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+    #[command(about = "Export a redacted learning bundle for a run or proposal")]
+    Export {
+        #[arg(help = "Indexed run id or proposal id")]
+        source: String,
+        #[arg(long, value_name = "PATH", help = "Bundle output path")]
+        output: Option<PathBuf>,
+        #[arg(long, help = "Confirm redacted output; bundles are always redacted")]
+        redacted: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+    #[command(about = "Preview or import a redacted learning bundle")]
+    ImportBundle {
+        #[arg(value_name = "PATH", help = "Redacted learning bundle path")]
+        path: PathBuf,
+        #[arg(long, help = "Preview without writing local learning state")]
+        preview: bool,
+        #[arg(long, help = "Import the bundle into local learning state")]
+        yes: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+    #[command(about = "Reflect on redacted evidence and write improvement proposals")]
+    Propose {
+        #[arg(long, help = "Filter local indexed evidence to a specific scope key")]
+        scope: Option<String>,
+        #[arg(long, help = "Use local indexed evidence from all scopes")]
+        all: bool,
+        #[arg(long, hide = true)]
+        from_local: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Use a redacted learning bundle as the evidence source"
+        )]
+        bundle: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value_t = 3,
+            help = "Maximum insights/proposals to write"
+        )]
+        limit: usize,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ImproveCommand {
+    #[command(
+        name = "self",
+        about = "Run a local self-improvement candidate against DeadReckon"
+    )]
+    SelfRun {
+        #[arg(help = "Proposal id or goal file")]
+        target: String,
+        #[arg(long, help = "Preview without creating a worktree or run")]
+        preview: bool,
+        #[arg(long, help = "Create and run the self-improvement candidate")]
+        yes: bool,
+        #[arg(long, help = "Generate PR title/body without network or push")]
+        pr_dry_run: bool,
+        #[arg(long, help = "Open a PR only after evidence gate success")]
+        open_pr: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
 }
 

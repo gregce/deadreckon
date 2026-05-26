@@ -25,9 +25,11 @@ PR opening for DeadReckon improving itself.
   proposal must pass through provider-backed reflection, cite observed
   DeadReckon stimulus, and include a measurable done contract before any
   self-run starts.
-- **Reflection is folded into `learn propose`.** Do not add a separate
-  `learn reflect` verb in this milestone. Indexing stays deterministic;
-  proposal creation always runs the insight/reflection step.
+- **Reflection/insight is mandatory and folded into `learn propose`.** Do not
+  add a separate `learn reflect` verb, a `--no-reflect` escape hatch, or a
+  required `--from-local` flag for the normal path. Indexing stays
+  deterministic; proposal creation always runs the provider-backed
+  insight/reflection step after resolving its evidence source.
 - **PR opening is opt-in and evidence-gated.** The product may push/open only
   when the user invokes `--open-pr` or an explicit local policy enables it and
   all criteria pass. Implementation tests must use fake/dry-run adapters.
@@ -133,7 +135,8 @@ Each signal is an extracted, explainable observation:
 ### `DEADRECKON_HOME/learning/insights.jsonl`
 
 Each insight is provider-backed synthesis over redacted deterministic evidence.
-It is written by `learn propose`; no separate command is exposed.
+It is written by `learn propose`; no separate command or opt-out flag is
+exposed.
 
 ```json
 {
@@ -282,12 +285,15 @@ interpretation. Examples:
 
 `learn propose` must run provider-backed reflection after it has gathered
 deterministic signals. It is the folded command surface for insight synthesis;
-do not add a separate `learn reflect` command. The prompt must include only
-redacted episode/signal summaries and ask for strict JSON insights plus proposal
-JSON. Every insight and proposal claim must cite signal ids and run ids. Every
-proposal must include testable done criteria. Invalid provider output is
-refused; it is not silently massaged into a proposal. If no provider route can
-run reflection, `learn propose` refuses with a recovery footer.
+do not add a separate `learn reflect` command and do not require users to pass
+`--from-local` for the ordinary local-index path. By default it uses the current
+scope's local index; `--scope`, `--all`, or `--bundle` only change the evidence
+source. The prompt must include only redacted episode/signal summaries and ask
+for strict JSON insights plus proposal JSON. Every insight and proposal claim
+must cite signal ids and run ids. Every proposal must include testable done
+criteria. Invalid provider output is refused; it is not silently massaged into a
+proposal. If no provider route can run reflection, `learn propose` refuses with
+a recovery footer.
 
 ### Self-run mode
 
@@ -390,7 +396,8 @@ deadreckon learn import-bundle <path>
     [--yes]
 
 deadreckon learn propose
-    [--from-local]
+    [--scope <scope>]
+    [--all]
     [--bundle <path>]
     [--limit <n>]
     [--json]
@@ -473,7 +480,9 @@ Depth tests:
 
 - `learn propose` creates insight JSONL plus proposal JSON tied to signal ids
   and run ids.
-- Provider-backed reflection is required and must validate strictly.
+- Provider-backed reflection is required, must validate strictly, and must be
+  invoked by the command without requiring `--from-local` for the normal local
+  evidence path.
 - Do not add a separate reflect command; this is folded into `learn propose`.
 - Store proposal done criteria and expected risk.
 
@@ -589,7 +598,7 @@ Depth tests:
 | Bundle is not redacted | `try: deadreckon learn export <id> --redacted` |
 | No proposal-worthy signals | `try: deadreckon learn index --all` |
 | No provider route for reflection | `try: deadreckon config provider` |
-| Reflection JSON invalid | `try: deadreckon learn propose --from-local --limit 1` |
+| Reflection JSON invalid | `try: deadreckon learn propose --limit 1` |
 | Dirty base worktree | `try: git status --short` |
 | Sandbox backend is none | `try: deadreckon config sandbox auto` |
 | Weak done criteria | `try: deadreckon def-done --goal <file>` |
@@ -652,7 +661,7 @@ Tier 3 (blocked):
   tests were never red, call that out in the commit message.
 - **Reflection is mandatory for proposals.** Deterministic signals are not
   enough to write proposals; `learn propose` must run and validate a provider
-  reflection step.
+  reflection step every time proposal files are created.
 - **Do not trust candidate-modified gate logic.** The outer baseline evaluator
   decides evidence eligibility.
 - **Redaction before sharing.** No raw provider logs, credentials, home paths,

@@ -2,8 +2,8 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-25 (provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
-**Maturity:** alpha. Workspace version `0.1.0`. Build/test/clippy/fmt all green.
+**Last updated:** 2026-05-26 (local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
+**Maturity:** alpha. Workspace version `0.1.0`. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
 
@@ -44,6 +44,7 @@ This document captures the system as built today — what's wired, what's load-b
 31. [Distribution & Self-Update](#31-distribution--self-update)
 32. [Plan Observability](#32-plan-observability)
 33. [Provider Flight Recorder & Rewind](#33-provider-flight-recorder--rewind)
+34. [Local Self-Improvement Loop](#34-local-self-improvement-loop)
 
 ---
 
@@ -2048,6 +2049,36 @@ The run attach TUI activity collector now reads `flight-events.jsonl` and still 
 Worktree, copy, fresh, and in-place modes all work through the same mechanism because the recorder reads `PipelineState.working_dir` and writes under `PipelineState.run_root`. Rewind applies to the run working directory; exported directories and promoted library artifacts are not rewritten. Plan children keep their own flight files under their child run roots, and merged plan result runs do not copy child flight events. Imported runs can still have normalized import traces, but they do not get live filesystem checkpoints retroactively.
 
 The recorder normalizes generic provider rows with schema-keyed heuristics rather than provider-specific semantic ASTs. Exact subturn rewind is only available where a checkpoint exists; provider events without a correlated checkpoint resolve to the nearest previous checkpoint or refuse.
+
+---
+
+## 34. Local Self-Improvement Loop
+
+### 34.1 Experience Index
+
+`deadreckon learn index` scans durable run roots under `DEADRECKON_HOME/runstate/` and writes a local experience index under `DEADRECKON_HOME/learning/`. The index is files, not `PipelineState` fields: `episodes/<scope>/<run-id>.json` summarizes terminal runs, `signals.jsonl` stores deterministic observations, `insights.jsonl` stores provider-backed reflection, `proposals/<proposal-id>.json` stores improvement proposals, `bundles/<bundle-id>.json` stores redacted import/export packets, `candidates/<candidate-id>/candidate.json` stores self-run attempts, `evals/<candidate-id>.json` stores verification results, `pr-events.jsonl` audits PR dry-runs/open attempts, and optional `policy.toml` controls local thresholds.
+
+Episodes are redacted summaries of state, events, traces, spend, acceptance progress, plan/chain context, and flight files. The indexer skips live runs, tolerates corrupt run roots by counting them as skipped, writes unchanged episodes idempotently, and appends deterministic signals such as setup friction, provider gaps, acceptance gaps, slow paths, repeated failures, docs drift, and cost spikes. `deadreckon learn report` renders episode/signal/insight/proposal counts plus top signals, with JSON parity for scripts.
+
+### 34.2 Insights And Proposals
+
+Indexing and signal extraction are deterministic. `deadreckon learn propose` is the required reflection surface: it defaults to the current scope's local indexed evidence, builds a redacted prompt from indexed signals, calls the configured provider route through the existing `ProviderRouter`, and accepts only strict JSON containing both insights and proposals. `--bundle <path>` verifies and imports a redacted, hash-checked learning bundle before using its signals as the evidence source; `--scope` and `--all` only change local evidence selection. Every insight and proposal must cite known `signal_id`/`run_id` pairs, and every proposal must include testable done criteria. Invalid reflection JSON or missing provider routes refuse before any proposal file is written.
+
+`deadreckon learn export <run-id|proposal-id> --redacted` writes a redacted JSON bundle with section hashes for episodes, signals, insights, and proposals. `deadreckon learn import-bundle <path> --preview` verifies schema, redaction, and hashes without writing state; `--yes` imports the bundle into the local learning files. Bundles redact `DEADRECKON_HOME`, project/home paths, and secret-like values, and they do not contain raw provider logs.
+
+### 34.3 Self-Run Candidates
+
+`deadreckon improve self <proposal-id|goal-file> --preview` prints the proposal, isolated-worktree posture, done criteria, provider resolver posture, and PR mode without side effects. `--yes` requires a clean source worktree, refuses a configured `defaults.sandbox = "none"` unless local learning policy allows it, creates `deadreckon/self/<candidate-id>` in a git worktree under `DEADRECKON_HOME/learning/candidates/<candidate-id>/worktree`, writes focused self-run acceptance criteria, then launches a normal `deadreckon run` in that isolated worktree using the existing provider resolver. The coordinator commits candidate changes locally with a deterministic author, records changed files and diff stats, runs focused learning verification, computes an evidence score, performs a simple redaction/secrets scan over the candidate diff, and writes candidate/eval/evidence files.
+
+### 34.4 Evidence-Gated PR Opening
+
+`deadreckon improve self <proposal-id> --pr-dry-run` finds the latest candidate for that proposal, evaluates the same evidence gate used by live open, writes the exact PR title/body to the candidate directory, and appends `pr-events.jsonl` without network or push. `--open-pr` first runs the same evidence gate, then calls a small PR adapter; the production adapter pushes the candidate branch and calls `gh pr create` with the generated body only if the gate is eligible. Tests use a fake adapter and verify it is not called when the gate refuses.
+
+The gate requires explicit opt-in, isolated worktree evidence, non-empty proposal done criteria, accepted self-run, focused verification passing, redaction passing, an evidence score at or above policy, a changed head commit, and no high-risk paths when high-risk blocking is enabled. High-risk paths include acceptance/gate code, sandbox code, provider credential/config handling, release workflows/scripts, and privacy/redaction weakening. PR bodies are fixed-section evidence packets: Summary, Stimulus and Proposal, Evidence Packet, Verification, Risk Classification, Rollback, and Files Changed.
+
+### 34.5 Privacy, Redaction, And Limits
+
+Learning is local-first. No cloud sync, background telemetry, raw provider logs, credentials, or home-directory paths are exported by default. Provider-backed reflection sees redacted episode/signal summaries rather than raw provider-owned logs. Imported-only evidence can produce proposals, but it is not enough by itself to justify live PR opening without local corroborating run evidence. The alpha implementation does not train or fine-tune models, run multi-candidate evolutionary search, automatically change provider routing defaults, auto-merge into `main`, provide a learning TUI dashboard, or make audit logs cryptographically tamper-proof. Those remain V1 candidates.
 
 ---
 

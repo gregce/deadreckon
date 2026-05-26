@@ -1,5 +1,12 @@
 # Changelog
 
+## Self-Improvement Loop (alpha) - 2026-05-26
+
+- Added file-backed learning state under `DEADRECKON_HOME/learning/` for episodes, deterministic signals, provider-backed insights, proposals, redacted bundles, candidates, evals, PR dry-run/open events, and local policy.
+- Added `deadreckon learn index`, `deadreckon learn report`, required-reflection `deadreckon learn propose`, and redacted `learn export`/`learn import-bundle` so proposal creation uses a provider only after deterministic redacted evidence exists.
+- Added `deadreckon improve self <proposal-id|goal-file>` preview, isolated-worktree candidate execution, evidence scoring, high-risk path classification, PR dry-run body generation, diff redaction checks, and a fake-testable live PR adapter gated behind explicit `--open-pr`.
+- Added focused core and CLI coverage for learning paths, schema versioning, episode idempotency, bundle redaction/hash checks, signal extraction, proposal reflection validation, PR risk gating, learning CLI output, public-surface stability, PR dry-run, fake PR adapter behavior, and self-improve preview.
+
 ## Provider flight recorder and checkpoint rewind (alpha) - 2026-05-25
 
 - Added durable `flight-manifest.json`, `flight-events.jsonl`, `checkpoints/<id>/`, and `rewind-events.jsonl` files for CLI-backed provider runs, with normalized provider-native events and delta checkpoints.

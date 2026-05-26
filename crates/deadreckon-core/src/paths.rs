@@ -126,6 +126,72 @@ impl DeadreckonPaths {
     pub fn library_dir(&self, scope: &str, run_id: &str) -> PathBuf {
         self.home.join("library").join(scope).join(run_id)
     }
+
+    pub fn learning_dir(&self) -> PathBuf {
+        self.home.join("learning")
+    }
+
+    pub fn learning_episodes_dir(&self, scope: &str) -> PathBuf {
+        self.learning_dir().join("episodes").join(scope)
+    }
+
+    pub fn learning_episode_path(&self, scope: &str, run_id: &str) -> PathBuf {
+        self.learning_episodes_dir(scope)
+            .join(format!("{run_id}.json"))
+    }
+
+    pub fn learning_signals_path(&self) -> PathBuf {
+        self.learning_dir().join("signals.jsonl")
+    }
+
+    pub fn learning_insights_path(&self) -> PathBuf {
+        self.learning_dir().join("insights.jsonl")
+    }
+
+    pub fn learning_proposals_dir(&self) -> PathBuf {
+        self.learning_dir().join("proposals")
+    }
+
+    pub fn learning_proposal_path(&self, proposal_id: &str) -> PathBuf {
+        self.learning_proposals_dir()
+            .join(format!("{proposal_id}.json"))
+    }
+
+    pub fn learning_candidates_dir(&self) -> PathBuf {
+        self.learning_dir().join("candidates")
+    }
+
+    pub fn learning_candidate_dir(&self, candidate_id: &str) -> PathBuf {
+        self.learning_candidates_dir().join(candidate_id)
+    }
+
+    pub fn learning_candidate_path(&self, candidate_id: &str) -> PathBuf {
+        self.learning_candidate_dir(candidate_id)
+            .join("candidate.json")
+    }
+
+    pub fn learning_eval_path(&self, candidate_id: &str) -> PathBuf {
+        self.learning_dir()
+            .join("evals")
+            .join(format!("{candidate_id}.json"))
+    }
+
+    pub fn learning_pr_events_path(&self) -> PathBuf {
+        self.learning_dir().join("pr-events.jsonl")
+    }
+
+    pub fn learning_policy_path(&self) -> PathBuf {
+        self.learning_dir().join("policy.toml")
+    }
+
+    pub fn learning_bundles_dir(&self) -> PathBuf {
+        self.learning_dir().join("bundles")
+    }
+
+    pub fn learning_bundle_path(&self, bundle_id: &str) -> PathBuf {
+        self.learning_bundles_dir()
+            .join(format!("{bundle_id}.json"))
+    }
 }
 
 pub fn workspace_scope(start: &Path) -> Result<String> {
@@ -213,7 +279,7 @@ fn fnv1a32(input: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_slug, task_key};
+    use super::{DeadreckonPaths, sanitize_slug, task_key};
 
     #[test]
     fn task_key_is_slugged_and_stable() {
@@ -224,5 +290,29 @@ mod tests {
     #[test]
     fn slug_rejects_path_separators() {
         assert_eq!(sanitize_slug("../Hello World"), "hello-world");
+    }
+
+    #[test]
+    fn learning_paths_stay_under_deadreckon_home() {
+        let paths = DeadreckonPaths::from_home("/tmp/deadreckon-home");
+
+        for path in [
+            paths.learning_dir(),
+            paths.learning_episode_path("scope", "run-id"),
+            paths.learning_signals_path(),
+            paths.learning_insights_path(),
+            paths.learning_proposal_path("prop-1"),
+            paths.learning_candidate_path("cand-1"),
+            paths.learning_eval_path("cand-1"),
+            paths.learning_pr_events_path(),
+            paths.learning_policy_path(),
+        ] {
+            assert!(
+                path.starts_with(paths.home()),
+                "{} escaped {}",
+                path.display(),
+                paths.home().display()
+            );
+        }
     }
 }

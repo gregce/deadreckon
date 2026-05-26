@@ -14,7 +14,7 @@ GOAL: Land a local-first self-improvement loop for DeadReckon that turns prior r
 
 - `deadreckon learn index [--scope <scope>|--all]` - index completed runs into redacted episodes, signals, and outcome labels.
 - `deadreckon learn report [--json]` - summarize repeated friction, failure modes, provider/mode patterns, stored insights, and candidate opportunities.
-- `deadreckon learn propose [--from-local|--bundle <path>] [--limit N]` - run required provider-backed reflection over redacted evidence, write insights, and produce proposals tied to concrete evidence.
+- `deadreckon learn propose [--scope <scope>|--all|--bundle <path>] [--limit N]` - default to local indexed evidence, always run provider-backed insight synthesis, write insights, and produce proposals tied to concrete evidence. Reflection/insight is not optional and does not live behind a separate verb.
 - `deadreckon improve self <proposal-id|goal-file> --preview|--yes [--open-pr|--pr-dry-run]` - run a candidate against DeadReckon in an isolated worktree, verify it, archive evidence, and optionally prepare/open a PR.
 
 **Evidence gate for PR opening.**
