@@ -6637,7 +6637,10 @@ async fn ensure_acceptance_before_start(
             println!("{}", ui_status("done criteria draft failed"));
             println!("  {err}");
             if !prompt::confirm("use a detected local check template instead?", true)? {
-                return Ok(existing);
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "done criteria were requested but not configured",
+                    "rerun `deadreckon def-done \"what should count as done\"` or answer yes to the detected template fallback",
+                )));
             }
             let preset = detect_acceptance_preset(cwd);
             let draft = acceptance_template_for_preset(preset, cwd);
