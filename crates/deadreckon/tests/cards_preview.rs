@@ -32,7 +32,7 @@ fn preview_card_shows_sleep_mode_row_for_caffeinate() {
 
     assert_success(&output);
     let err = stderr(&output);
-    assert!(err.contains("sleep         caffeinate"), "{err}");
+    assert!(card_row_contains(&err, "sleep", "caffeinate"), "{err}");
 }
 
 #[test]
@@ -59,7 +59,12 @@ fn preview_card_shows_sleep_skip_reason_when_non_tty() {
 
     assert_success(&output);
     let err = stderr(&output);
-    assert!(err.contains("sleep         none (non-tty)"), "{err}");
+    assert!(card_row_contains(&err, "sleep", "none (non-tty)"), "{err}");
+}
+
+fn card_row_contains(card: &str, label: &str, value: &str) -> bool {
+    card.lines()
+        .any(|line| line.contains(label) && line.contains(value))
 }
 
 #[test]

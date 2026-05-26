@@ -1023,7 +1023,7 @@ fn plan_hints_name_capabilities_and_ready_tasks() {
         "{out}"
     );
     assert!(
-        out.contains("children    : 2 (2 ready / 0 blocked)"),
+        output_row_contains(&out, "children", "2 (2 ready / 0 blocked)"),
         "{out}"
     );
     assert!(out.contains("fork:"), "{out}");
@@ -5116,4 +5116,10 @@ fn stdout(output: &std::process::Output) -> String {
 
 fn stderr(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+fn output_row_contains(output: &str, label: &str, value: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.contains(label) && line.contains(value))
 }

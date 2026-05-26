@@ -36,6 +36,11 @@ use deadreckon::sleep::{self, SleepPrefs, SleepPrevention};
 use deadreckon::ui_card::{
     Card, CardOptions, HintLine, Section, TitleGlyph, TitleLine, render_card,
 };
+use deadreckon_core::flight::{
+    CheckpointManifest, FlightEvent, FlightEventKind, FlightSessionStatus, RewindEvent, RewindMode,
+    RewindStatus, RewindTarget, RewindTargetKind, append_rewind_event, build_working_file_index,
+    list_checkpoint_manifests, materialize_checkpoint, read_flight_events, read_flight_manifest,
+};
 use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt, write_receipt};
 use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::plan::write_plan_narrative;
@@ -43,31 +48,27 @@ use deadreckon_core::update_cache::{read_cache, write_cache};
 use deadreckon_core::{
     AcceptanceMarker, AcceptanceProgressEntry, ApplyMode, ApplyStrategy, BranchPolicy, Chain,
     ChainEvent, ChainEventKind, ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus,
-    CheckpointManifest, CodebaseMode, CodebaseRecord, ConductorState, CoordinatorChild,
-    CoordinatorState, DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DeadreckonError,
-    DeadreckonPaths, DocKind, DocProviderSelection, DocProviderSource, DocsStatus, FlightEvent,
-    FlightEventKind, FlightSessionStatus, ModeFlags, OnFail, PhaseId, PhaseStatus, Plan,
-    PlanChildMarker, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind, PlanMode,
-    PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest,
-    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RewindEvent, RewindMode, RewindStatus,
-    RewindTarget, RewindTargetKind, RunEvent, RunListEntry, RunOptions, RunStatus, SpendRecord,
-    TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
+    CodebaseMode, CodebaseRecord, ConductorState, CoordinatorChild, CoordinatorState,
+    DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DeadreckonError, DeadreckonPaths,
+    DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId,
+    PhaseStatus, Plan, PlanChildMarker, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
+    PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest,
+    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunListEntry, RunOptions,
+    RunStatus, SpendRecord, TraceRecord, WorktreeOptions, acceptance_progress_path_for_run_root,
     acceptance_spec_path_for_run_root, acquire_lock, append_chain_event,
     append_parent_narrative_update, append_plan_event, append_plan_message, append_provenance,
-    append_rewind_event, append_trace, apply_commit_body, build_working_file_index,
-    cancel_marker_present, chain_status_label as glossary_chain_status_label,
+    append_trace, apply_commit_body, cancel_marker_present,
+    chain_status_label as glossary_chain_status_label,
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
-    docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files,
-    list_checkpoint_manifests, list_runs, load_chain, load_plan, load_run,
-    marker_path_for_run_root, materialize_checkpoint, pid_is_alive, plan_status_label,
+    docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files, list_runs,
+    load_chain, load_plan, load_run, marker_path_for_run_root, pid_is_alive, plan_status_label,
     plan_task_status_label, prepare_worktree_record, preview_git_state, promote_completed_run,
-    read_chain_step_marker, read_codebase_record, read_flight_events, read_flight_manifest,
-    read_plan_messages, record_for_resolved_mode, release_lock_file, resolve_mode,
-    restore_snapshot, run_status_label, save_chain, save_plan, save_state, terminate_pid,
-    validate_acceptance_marker, validate_task_count, write_acceptance_marker, write_cancel_marker,
-    write_chain_step_marker, write_child_summary, write_coordinator_state, write_plan_child_marker,
-    write_worker_spec,
+    read_chain_step_marker, read_codebase_record, read_plan_messages, record_for_resolved_mode,
+    release_lock_file, resolve_mode, restore_snapshot, run_status_label, save_chain, save_plan,
+    save_state, terminate_pid, validate_acceptance_marker, validate_task_count,
+    write_acceptance_marker, write_cancel_marker, write_chain_step_marker, write_child_summary,
+    write_coordinator_state, write_plan_child_marker, write_worker_spec,
 };
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
@@ -24628,6 +24629,11 @@ fn read_plan_events_lossy(paths: &DeadreckonPaths, plan_id: &str) -> Vec<PlanEve
 #[cfg(test)]
 mod flight_cli_tests {
     use super::*;
+    use deadreckon_core::flight::{
+        CheckpointBase, CheckpointBaseKind, CheckpointCaptureRequest, CheckpointTrigger,
+        FlightManifest, FlightSession, FlightUsage, append_flight_event, capture_delta_checkpoint,
+        write_flight_manifest,
+    };
     use tempfile::TempDir;
 
     fn checkpoint_fixture() -> (TempDir, deadreckon_core::PipelineState) {
@@ -24653,8 +24659,8 @@ mod flight_cli_tests {
     }
 
     fn write_manifest(state: &deadreckon_core::PipelineState, status: FlightSessionStatus) {
-        let mut manifest = deadreckon_core::FlightManifest::new(state.run_id.clone());
-        manifest.sessions.push(deadreckon_core::FlightSession {
+        let mut manifest = FlightManifest::new(state.run_id.clone());
+        manifest.sessions.push(FlightSession {
             flight_session_id: "flight-turn-1-attempt-1".to_string(),
             provider: "cli:test".to_string(),
             schema: "test".to_string(),
@@ -24665,7 +24671,7 @@ mod flight_cli_tests {
             completed_at: Some(Utc::now()),
             source_paths: Vec::new(),
         });
-        deadreckon_core::write_flight_manifest(state, &manifest).expect("manifest");
+        write_flight_manifest(state, &manifest).expect("manifest");
     }
 
     fn capture_fixture_checkpoint(state: &deadreckon_core::PipelineState) {
@@ -24674,19 +24680,19 @@ mod flight_cli_tests {
         std::fs::create_dir_all(source.parent().expect("parent")).expect("src");
         std::fs::write(&source, "pub fn value() -> u8 { 1 }\n").expect("source");
         let after = build_working_file_index(&state.working_dir).expect("after");
-        deadreckon_core::capture_delta_checkpoint(
+        capture_delta_checkpoint(
             state,
             &before,
             &after,
-            deadreckon_core::CheckpointCaptureRequest {
+            CheckpointCaptureRequest {
                 checkpoint_id: "cp-000001".to_string(),
                 flight_session_id: "flight-turn-1-attempt-1".to_string(),
                 deadreckon_turn: 1,
                 attempt: 1,
                 provider_event_seq: Some(3),
-                trigger: deadreckon_core::CheckpointTrigger::ProviderExit,
-                base: deadreckon_core::CheckpointBase {
-                    kind: deadreckon_core::CheckpointBaseKind::TurnSnapshot,
+                trigger: CheckpointTrigger::ProviderExit,
+                base: CheckpointBase {
+                    kind: CheckpointBaseKind::TurnSnapshot,
                     id: "turn-0".to_string(),
                 },
                 full_anchor: false,
@@ -24700,7 +24706,7 @@ mod flight_cli_tests {
         let (_temp, state) = checkpoint_fixture();
         write_manifest(&state, FlightSessionStatus::Completed);
         capture_fixture_checkpoint(&state);
-        deadreckon_core::append_flight_event(
+        append_flight_event(
             &state,
             &FlightEvent {
                 version: 1,
@@ -24761,7 +24767,7 @@ mod flight_cli_tests {
     #[test]
     fn attach_provider_activity_uses_flight_events() {
         let (_temp, state) = checkpoint_fixture();
-        deadreckon_core::append_flight_event(
+        append_flight_event(
             &state,
             &FlightEvent {
                 version: 1,
@@ -24783,7 +24789,7 @@ mod flight_cli_tests {
                 tool_name: Some("write_file".to_string()),
                 tool_category: None,
                 files: vec![PathBuf::from("src/lib.rs")],
-                usage: Some(deadreckon_core::FlightUsage {
+                usage: Some(FlightUsage {
                     input_tokens: 10,
                     output_tokens: 5,
                     context_window: Some(100),
@@ -24915,6 +24921,19 @@ mod tui_tests {
 
     #[test]
     fn command_help_catalog_points_at_real_clap_commands() {
+        let handle = std::thread::Builder::new()
+            .name("command-help-catalog-clap-tree".to_string())
+            // Clap's generated command tree is large enough to overflow the
+            // default libtest worker stack on macOS.
+            .stack_size(8 * 1024 * 1024)
+            .spawn(assert_command_help_catalog_points_at_real_clap_commands)
+            .expect("spawn clap command tree test");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn assert_command_help_catalog_points_at_real_clap_commands() {
         let clap_names = Cli::command()
             .get_subcommands()
             .map(|command| command.get_name().to_string())

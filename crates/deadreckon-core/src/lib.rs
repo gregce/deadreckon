@@ -62,18 +62,6 @@ pub use error::{DeadreckonError, Result};
 pub use events::{
     RUN_EVENTS_JSONL, RunEvent, RunEventBus, RunEventKind, emit_event, event_preview,
 };
-pub use flight::{
-    CHECKPOINTS_DIR, CheckpointBase, CheckpointBaseKind, CheckpointCaptureRequest,
-    CheckpointChangeKind, CheckpointFileChange, CheckpointManifest, CheckpointPolicy,
-    CheckpointTrigger, FLIGHT_EVENTS_JSONL, FLIGHT_MANIFEST_JSON, FileFingerprint, FlightEvent,
-    FlightEventKind, FlightManifest, FlightSession, FlightSessionStatus, FlightSourcePath,
-    FlightUsage, REWIND_EVENTS_JSONL, RewindEvent, RewindMode, RewindStatus, RewindTarget,
-    RewindTargetKind, WorkingFileIndex, append_flight_event, append_rewind_event,
-    build_working_file_index, capture_delta_checkpoint, checkpoint_dir, checkpoint_manifest_path,
-    checkpoints_dir, flight_events_path, flight_manifest_path, list_checkpoint_manifests,
-    materialize_checkpoint, read_checkpoint_manifest, read_flight_events, read_flight_manifest,
-    read_rewind_events, rewind_events_path, sha256_file, sha256_text, write_flight_manifest,
-};
 pub use gate::{
     ACCEPTANCE_PROGRESS_JSONL, AcceptanceCheck, AcceptanceCheckResult, AcceptanceMarker,
     AcceptanceProgressEntry, AcceptanceSpec, acceptance_progress_path_for_run_root,

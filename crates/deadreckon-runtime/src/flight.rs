@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use chrono::Utc;
 use deadreckon_core::error::{DeadreckonError, Result};
-use deadreckon_core::{
+use deadreckon_core::flight::{
     CheckpointBase, CheckpointBaseKind, CheckpointCaptureRequest, CheckpointTrigger, FlightEvent,
     FlightEventKind, FlightManifest, FlightSession, FlightSessionStatus, FlightSourcePath,
     FlightUsage, WorkingFileIndex, append_flight_event, build_working_file_index,
@@ -865,6 +865,7 @@ fn expand_home_path(path: &Path, home: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deadreckon_core::flight::flight_manifest_path;
     use deadreckon_core::paths::DeadreckonPaths;
     use deadreckon_core::state::{RunOptions, create_run};
     use tempfile::TempDir;
@@ -1103,6 +1104,6 @@ args_template = ["{prompt}"]
         let recorder =
             ProviderFlightRecorder::start(&state, "openai", paths.home(), 1).expect("start");
         assert!(recorder.is_none());
-        assert!(!deadreckon_core::flight_manifest_path(&state).exists());
+        assert!(!flight_manifest_path(&state).exists());
     }
 }

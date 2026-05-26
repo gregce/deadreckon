@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 use crate::error::IoContext;
 use crate::flight::{ProviderFlightRecorder, ProviderFlightRecorderHandle};
 use crate::polish::{PolishConfig, polish_run_docs};
-use deadreckon_core::FlightSessionStatus;
 use deadreckon_core::artifacts::{
     ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
     inventory_files, snapshot_working,
@@ -27,6 +26,7 @@ use deadreckon_core::docs::{
 };
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::events::{RunEvent, RunEventKind, emit_event, event_preview, tool_args_json};
+use deadreckon_core::flight::FlightSessionStatus;
 use deadreckon_core::gate::{acceptance_spec_path_for_run_root, validate_acceptance_marker};
 use deadreckon_core::git::run_git;
 use deadreckon_core::paths::DeadreckonPaths;
@@ -1545,12 +1545,13 @@ mod tests {
     use tempfile::TempDir;
 
     use deadreckon_core::events::{RunEventBus, RunEventKind};
+    use deadreckon_core::flight::{
+        FlightEventKind, FlightSessionStatus, list_checkpoint_manifests, read_flight_events,
+        read_flight_manifest,
+    };
     use deadreckon_core::paths::DeadreckonPaths;
     use deadreckon_core::state::{RunOptions, RunStatus, create_run};
-    use deadreckon_core::{
-        FlightEventKind, TurnDocInput, append_turn_doc, implementation_notes_path,
-        list_checkpoint_manifests, read_flight_events, read_flight_manifest,
-    };
+    use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
 
     use super::{
         RunLoopConfig, RunLoopDocsConfig, append_tool_refusal, bash_policy_refusal,
@@ -2024,10 +2025,7 @@ storage = "jsonl"
             .expect("manifest exists");
         assert_eq!(manifest.sessions.len(), 1);
         assert_eq!(manifest.sessions[0].provider, "cli:test-flight");
-        assert_eq!(
-            manifest.sessions[0].status,
-            deadreckon_core::FlightSessionStatus::Completed
-        );
+        assert_eq!(manifest.sessions[0].status, FlightSessionStatus::Completed);
         let events = read_flight_events(&state).expect("flight events");
         assert!(events.iter().any(|event| {
             event.kind == FlightEventKind::Tool && event.files == vec![PathBuf::from("src/lib.rs")]
