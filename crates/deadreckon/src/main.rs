@@ -9928,14 +9928,14 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         save_plan(&paths, &plan)?;
         write_coordinator_snapshot(&paths, &plan, None)?;
 
-        let (pid_tx, pid_rx) = std::sync::mpsc::channel::<(usize, u32)>();
+        let (signal_tx, signal_rx) = std::sync::mpsc::channel::<PlanChildSignal>();
         let mut handles = Vec::new();
         for task_index in ready {
             let paths_for_child = paths.clone();
             let plan_for_child = plan.clone();
             let parent_cwd_for_child = parent_cwd.clone();
             let sandbox_for_child = sandbox.clone();
-            let pid_tx_for_child = pid_tx.clone();
+            let signal_tx_for_child = signal_tx.clone();
             handles.push((
                 task_index,
                 tokio::task::spawn_blocking(move || {
@@ -9949,41 +9949,77 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                         max_wall_seconds,
                         quiet,
                         plain,
-                        pid_sender: Some(pid_tx_for_child),
+                        forward_output: false,
+                        signal_sender: Some(signal_tx_for_child),
                     })
                 }),
             ));
         }
-        drop(pid_tx);
+        drop(signal_tx);
         let mut live_children = BTreeMap::new();
-        while live_children.len() < handles.len() {
-            match pid_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                Ok((task_index, pid)) => {
-                    live_children.insert(task_index, pid);
-                    if let Some(task) = plan.tasks.get(task_index) {
-                        append_plan_event(
-                            &paths,
-                            &plan.plan_id,
-                            PlanEventKind::TaskRunDiscovered {
-                                task_id: task.task_id.clone(),
-                                task_index,
-                                run_id: task.child_run_id.clone(),
-                                pid: Some(pid),
-                            },
-                        )?;
-                    }
-                    write_coordinator_snapshot_live(&paths, &plan, &live_children)?;
+        let mut outcomes = Vec::new();
+        let mut running = handles;
+        let started = std::time::Instant::now();
+        let mut tick = 0usize;
+        let mut last_plain_status = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(2))
+            .unwrap_or_else(std::time::Instant::now);
+        while !running.is_empty() {
+            drain_plan_child_signals(
+                &paths,
+                &mut plan,
+                &signal_rx,
+                &mut live_children,
+                quiet,
+                plain,
+            )?;
+            let mut index = 0;
+            while index < running.len() {
+                if running[index].1.is_finished() {
+                    let (task_index, handle) = running.remove(index);
+                    let outcome = handle.await.map_err(|err| {
+                        CliError::Core(DeadreckonError::InvalidInput(format!(
+                            "child join failed: {err}"
+                        )))
+                    })?;
+                    outcomes.push((task_index, outcome));
+                } else {
+                    index += 1;
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            if running.is_empty() {
+                break;
+            }
+            if !quiet {
+                if plain {
+                    if last_plain_status.elapsed() >= std::time::Duration::from_secs(2) {
+                        eprintln!("{}", plain_plan_progress_line(&plan, started.elapsed()));
+                        last_plain_status = std::time::Instant::now();
+                    }
+                } else {
+                    tick = tick.wrapping_add(1);
+                    print_cli_wait_status(&plan_wait_status_label(&plan), started.elapsed(), tick);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(if plain {
+                500
+            } else {
+                180
+            }))
+            .await;
         }
-        for (task_index, handle) in handles {
-            let outcome = handle.await.map_err(|err| {
-                CliError::Core(DeadreckonError::InvalidInput(format!(
-                    "child join failed: {err}"
-                )))
-            })?;
+        drain_plan_child_signals(
+            &paths,
+            &mut plan,
+            &signal_rx,
+            &mut live_children,
+            quiet,
+            plain,
+        )?;
+        if !quiet && !plain {
+            clear_cli_wait_status();
+        }
+        for (task_index, outcome) in outcomes {
             let task_id = plan.tasks[task_index].task_id.clone();
             match outcome {
                 Ok(run_id) => {
@@ -10038,6 +10074,9 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                     )?;
                     save_plan(&paths, &plan)?;
                     write_coordinator_snapshot(&paths, &plan, None)?;
+                    if !quiet {
+                        print_plan_child_finished_line(&plan, task_index, status, &run_id, plain);
+                    }
                 }
                 Err(error) => {
                     mark_plan_task_status(&mut plan, task_index, PlanTaskStatus::Failed)?;
@@ -10076,6 +10115,168 @@ async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         print_fork_finished(&plan, no_hints);
     }
     Ok(())
+}
+
+#[derive(Debug)]
+enum PlanChildSignal {
+    Pid { task_index: usize, pid: u32 },
+    RunId { task_index: usize, run_id: String },
+}
+
+fn drain_plan_child_signals(
+    paths: &DeadreckonPaths,
+    plan: &mut Plan,
+    signal_rx: &std::sync::mpsc::Receiver<PlanChildSignal>,
+    live_children: &mut BTreeMap<usize, u32>,
+    quiet: bool,
+    plain: bool,
+) -> Result<()> {
+    while let Ok(signal) = signal_rx.try_recv() {
+        match signal {
+            PlanChildSignal::Pid { task_index, pid } => {
+                live_children.insert(task_index, pid);
+                if let Some(task) = plan.tasks.get(task_index) {
+                    append_plan_event(
+                        paths,
+                        &plan.plan_id,
+                        PlanEventKind::TaskRunDiscovered {
+                            task_id: task.task_id.clone(),
+                            task_index,
+                            run_id: task.child_run_id.clone(),
+                            pid: Some(pid),
+                        },
+                    )?;
+                }
+                write_coordinator_snapshot_live(paths, plan, live_children)?;
+            }
+            PlanChildSignal::RunId { task_index, run_id } => {
+                let mut newly_discovered = false;
+                if let Some(task) = plan.tasks.get_mut(task_index)
+                    && task.child_run_id.as_deref() != Some(run_id.as_str())
+                {
+                    task.child_run_id = Some(run_id.clone());
+                    newly_discovered = true;
+                }
+                if let Some(task) = plan.tasks.get(task_index) {
+                    append_plan_event(
+                        paths,
+                        &plan.plan_id,
+                        PlanEventKind::TaskRunDiscovered {
+                            task_id: task.task_id.clone(),
+                            task_index,
+                            run_id: Some(run_id.clone()),
+                            pid: live_children.get(&task_index).copied(),
+                        },
+                    )?;
+                }
+                save_plan(paths, plan)?;
+                write_coordinator_snapshot_live(paths, plan, live_children)?;
+                if newly_discovered && !quiet {
+                    print_plan_child_run_line(plan, task_index, &run_id, plain);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_plan_child_run_line(plan: &Plan, task_index: usize, run_id: &str, plain: bool) {
+    if !plain {
+        clear_cli_wait_status();
+    }
+    let Some(task) = plan.tasks.get(task_index) else {
+        return;
+    };
+    println!(
+        "{} {} {} -> run {}  {}",
+        ui_heading("plan"),
+        ui_id(run_prefix(&plan.plan_id)),
+        task.task_id,
+        ui_id(run_prefix(run_id)),
+        ui_command(format!(
+            "deadreckon attach {}:{}",
+            run_prefix(&plan.plan_id),
+            task.task_id
+        ))
+    );
+    let _ = io::stdout().flush();
+}
+
+fn print_plan_child_finished_line(
+    plan: &Plan,
+    task_index: usize,
+    status: PlanTaskStatus,
+    run_id: &str,
+    plain: bool,
+) {
+    if !plain {
+        clear_cli_wait_status();
+    }
+    let Some(task) = plan.tasks.get(task_index) else {
+        return;
+    };
+    println!(
+        "{} {} {} {} run {}",
+        ui_heading("plan"),
+        ui_id(run_prefix(&plan.plan_id)),
+        task.task_id,
+        task_status_label(status),
+        ui_id(run_prefix(run_id))
+    );
+    let _ = io::stdout().flush();
+}
+
+fn plan_wait_status_label(plan: &Plan) -> String {
+    format!(
+        "plan {} running; {}; attach deadreckon attach {}",
+        run_prefix(&plan.plan_id),
+        plan_progress_summary(plan),
+        run_prefix(&plan.plan_id)
+    )
+}
+
+fn plain_plan_progress_line(plan: &Plan, elapsed: std::time::Duration) -> String {
+    format!(
+        "[plan {}] {} elapsed={}s attach=deadreckon attach {}",
+        run_prefix(&plan.plan_id),
+        plan_progress_summary(plan),
+        elapsed.as_secs(),
+        run_prefix(&plan.plan_id)
+    )
+}
+
+fn plan_progress_summary(plan: &Plan) -> String {
+    let total = plan.tasks.len();
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .count();
+    let failed = plan
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.status, PlanTaskStatus::Failed | PlanTaskStatus::Killed))
+        .count();
+    let pending = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Pending)
+        .count();
+    let running = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Running)
+        .map(|task| match task.child_run_id.as_deref() {
+            Some(run_id) => format!("{}:{}", task.task_id, run_prefix(run_id)),
+            None => task.task_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let running = if running.is_empty() {
+        "-".to_string()
+    } else {
+        running.join(",")
+    };
+    format!("done={completed}/{total} running={running} pending={pending} failed={failed}")
 }
 
 fn resolve_plan_id(paths: &DeadreckonPaths, id: &str) -> Result<String> {
@@ -10603,7 +10804,8 @@ struct PlanChildLaunch<'a> {
     max_wall_seconds: Option<f64>,
     quiet: bool,
     plain: bool,
-    pid_sender: Option<std::sync::mpsc::Sender<(usize, u32)>>,
+    forward_output: bool,
+    signal_sender: Option<std::sync::mpsc::Sender<PlanChildSignal>>,
 }
 
 fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
@@ -10617,7 +10819,8 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         max_wall_seconds,
         quiet,
         plain,
-        pid_sender,
+        forward_output,
+        signal_sender,
     } = launch;
     let task = &plan.tasks[task_index];
     let source_dir = plan_child_source_dir(paths, plan, task_index, parent_cwd)?;
@@ -10687,8 +10890,11 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;
-    if let Some(sender) = pid_sender {
-        let _ = sender.send((task_index, child.id()));
+    if let Some(sender) = signal_sender.as_ref() {
+        let _ = sender.send(PlanChildSignal::Pid {
+            task_index,
+            pid: child.id(),
+        });
     } else {
         write_coordinator_snapshot(paths, plan, Some((task_index, child.id())))?;
     }
@@ -10708,6 +10914,7 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
     let mut stdout_text = String::new();
     let mut stderr_text = String::new();
     let mut live_run_id = None;
+    let suppress_child_output = quiet || !forward_output;
     let status = loop {
         while let Ok((is_stdout, line)) = rx.try_recv() {
             if let Some(run_id) = capture_chain_step_output(
@@ -10715,10 +10922,15 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
                 &line,
                 &mut stdout_text,
                 &mut stderr_text,
-                quiet,
+                suppress_child_output,
             )? {
-                let _ = fs::write(launch_dir.join("run-id"), &run_id);
-                live_run_id = Some(run_id);
+                note_plan_child_run_id(
+                    &launch_dir,
+                    signal_sender.as_ref(),
+                    task_index,
+                    &mut live_run_id,
+                    run_id,
+                );
             }
         }
         if let Some(status) = child.try_wait()? {
@@ -10729,16 +10941,31 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     while let Ok((is_stdout, line)) = rx.try_recv() {
-        if let Some(run_id) =
-            capture_chain_step_output(is_stdout, &line, &mut stdout_text, &mut stderr_text, quiet)?
-        {
-            let _ = fs::write(launch_dir.join("run-id"), &run_id);
-            live_run_id = Some(run_id);
+        if let Some(run_id) = capture_chain_step_output(
+            is_stdout,
+            &line,
+            &mut stdout_text,
+            &mut stderr_text,
+            suppress_child_output,
+        )? {
+            note_plan_child_run_id(
+                &launch_dir,
+                signal_sender.as_ref(),
+                task_index,
+                &mut live_run_id,
+                run_id,
+            );
         }
     }
     let run_id = live_run_id.or_else(|| parse_started_run_id(&stdout_text));
     if let Some(run_id) = run_id.as_ref() {
         let _ = fs::write(launch_dir.join("run-id"), run_id);
+        if let Some(sender) = signal_sender.as_ref() {
+            let _ = sender.send(PlanChildSignal::RunId {
+                task_index,
+                run_id: run_id.clone(),
+            });
+        }
     }
     if !status.success() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -10752,6 +10979,26 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
             "deadreckon list",
         ))
     })
+}
+
+fn note_plan_child_run_id(
+    launch_dir: &Path,
+    sender: Option<&std::sync::mpsc::Sender<PlanChildSignal>>,
+    task_index: usize,
+    live_run_id: &mut Option<String>,
+    run_id: String,
+) {
+    if live_run_id.as_deref() == Some(run_id.as_str()) {
+        return;
+    }
+    let _ = fs::write(launch_dir.join("run-id"), &run_id);
+    if let Some(sender) = sender {
+        let _ = sender.send(PlanChildSignal::RunId {
+            task_index,
+            run_id: run_id.clone(),
+        });
+    }
+    *live_run_id = Some(run_id);
 }
 
 fn review_parent_run_id(plan: &Plan, task: &PlanTask) -> Option<String> {
@@ -17255,6 +17502,31 @@ struct AttachCommandArgs {
 struct NarrativeAttachConfig {
     provider: Option<String>,
     max_spend_usd: Option<f64>,
+}
+
+const DEFAULT_NARRATIVE_PROVIDER_ROUTE: &str = "cli:claude-code";
+const DEFAULT_NARRATIVE_MODEL: &str = "sonnet";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NarrativeProviderSelection {
+    route: Option<String>,
+    model: Option<String>,
+}
+
+fn narrative_provider_selection(explicit_provider: Option<&str>) -> NarrativeProviderSelection {
+    match explicit_provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+    {
+        Some(provider) => NarrativeProviderSelection {
+            route: Some(provider.to_string()),
+            model: None,
+        },
+        None => NarrativeProviderSelection {
+            route: Some(DEFAULT_NARRATIVE_PROVIDER_ROUTE.to_string()),
+            model: Some(DEFAULT_NARRATIVE_MODEL.to_string()),
+        },
+    }
 }
 
 async fn attach_command(args: AttachCommandArgs) -> Result<()> {
@@ -25880,17 +26152,19 @@ async fn refresh_run_narrative_with_provider_for_kind(
     let live = input.live;
     let tui_state = input.tui_state;
     let projection = run_narrative_projection(state, spend, traces, events, live, tui_state)?;
-    let route = config.provider.clone().or_else(|| state.provider.clone());
-    let refreshed = refresh_narrative_projection_with_provider(
-        paths,
-        projection,
-        route.clone(),
-        config,
-        kind,
-        Some(state.working_dir.clone()),
-        state.run_root.join("narrative/provider-refresh.out"),
-    )
-    .await?;
+    let selection = narrative_provider_selection(config.provider.as_deref());
+    let refreshed =
+        refresh_narrative_projection_with_provider(NarrativeProjectionProviderRefresh {
+            paths,
+            projection,
+            route: selection.route.clone(),
+            model: selection.model.clone(),
+            config,
+            kind,
+            cwd: Some(state.working_dir.clone()),
+            output_path: state.run_root.join("narrative/provider-refresh.out"),
+        })
+        .await?;
     narrative::persist_run_projection(state, &refreshed)?;
     Ok(narrative_refresh_notice(&refreshed))
 }
@@ -25949,37 +26223,49 @@ async fn refresh_plan_narrative_with_provider_for_kind(
         feed_events,
         selected,
     })?;
-    let route = config
-        .provider
-        .clone()
-        .or_else(|| plan.providers.planner.clone())
-        .or_else(|| plan.providers.default_child.clone())
-        .or_else(|| plan.providers.coder.clone());
-    let refreshed = refresh_narrative_projection_with_provider(
-        paths,
-        projection,
-        route.clone(),
-        config,
-        kind,
-        std::env::current_dir().ok(),
-        paths
-            .plan_dir(&plan.plan_id)
-            .join("narrative/provider-refresh.out"),
-    )
-    .await?;
+    let selection = narrative_provider_selection(config.provider.as_deref());
+    let refreshed =
+        refresh_narrative_projection_with_provider(NarrativeProjectionProviderRefresh {
+            paths,
+            projection,
+            route: selection.route.clone(),
+            model: selection.model.clone(),
+            config,
+            kind,
+            cwd: std::env::current_dir().ok(),
+            output_path: paths
+                .plan_dir(&plan.plan_id)
+                .join("narrative/provider-refresh.out"),
+        })
+        .await?;
     narrative::persist_plan_projection(paths, plan, &refreshed)?;
     Ok(narrative_refresh_notice(&refreshed))
 }
 
-async fn refresh_narrative_projection_with_provider(
-    paths: &DeadreckonPaths,
+struct NarrativeProjectionProviderRefresh<'a> {
+    paths: &'a DeadreckonPaths,
     projection: narrative::NarrativeProjection,
     route: Option<String>,
-    config: &NarrativeAttachConfig,
+    model: Option<String>,
+    config: &'a NarrativeAttachConfig,
     kind: NarrativeRefreshKind,
     cwd: Option<PathBuf>,
     output_path: PathBuf,
+}
+
+async fn refresh_narrative_projection_with_provider(
+    request: NarrativeProjectionProviderRefresh<'_>,
 ) -> Result<narrative::NarrativeProjection> {
+    let NarrativeProjectionProviderRefresh {
+        paths,
+        projection,
+        route,
+        model,
+        config,
+        kind,
+        cwd,
+        output_path,
+    } = request;
     let policy = narrative::NarrativeRefreshPolicy {
         provider_route: route.clone(),
         max_spend_usd: config.max_spend_usd,
@@ -26026,7 +26312,11 @@ async fn refresh_narrative_projection_with_provider(
         ));
     };
     let prompt = narrative::build_provider_prompt(&projection)?;
-    let router = match ProviderRouter::from_config_path(&paths.config_path(), Some(&route)) {
+    let router = match ProviderRouter::from_config_path_with_model(
+        &paths.config_path(),
+        Some(&route),
+        model.as_deref(),
+    ) {
         Ok(router) => router,
         Err(err) => {
             return Ok(narrative::projection_with_provider_failure(
@@ -27036,9 +27326,10 @@ mod tui_tests {
         completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
         deadreckoning_status_text, doc_polish_preview_text, implementation_plan_warnings,
         kill_banner, live_file_lines, markdown_to_tui_lines, max_panel_scroll, meter_color,
-        orchestration_dependency_rows, orchestration_parallelism_lines,
-        orchestration_provider_role_rows, orchestration_role_table_lines, per_step_wall_cap,
-        plan_attach_footer, plan_merge_repair_summary_items, plan_narrative_refresh_trigger,
+        narrative_provider_selection, orchestration_dependency_rows,
+        orchestration_parallelism_lines, orchestration_provider_role_rows,
+        orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
+        plan_merge_repair_summary_items, plan_narrative_refresh_trigger,
         provider_ingest_base_roots, provider_jsonl_activity_lines,
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
@@ -28042,6 +28333,17 @@ mod tui_tests {
             tracker.observe(&failed),
             Some(NarrativeRefreshKind::Event("acceptance failed"))
         );
+    }
+
+    #[test]
+    fn narrative_provider_defaults_to_claude_code_sonnet_unless_overridden() {
+        let default = narrative_provider_selection(None);
+        assert_eq!(default.route.as_deref(), Some("cli:claude-code"));
+        assert_eq!(default.model.as_deref(), Some("sonnet"));
+
+        let explicit = narrative_provider_selection(Some("cli:codex"));
+        assert_eq!(explicit.route.as_deref(), Some("cli:codex"));
+        assert_eq!(explicit.model, None);
     }
 
     #[test]

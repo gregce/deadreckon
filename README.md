@@ -93,6 +93,8 @@ The TUI shows live status, current step, spend, recent file edits, and provider 
 
 For longer or multi-agent work, use `deadreckon attach latest --view narrative` for a cited operator overview with an evidence-backed visual map. Raw activity stays one key away with `n`; `v` cycles architecture, agent, file, and evidence views.
 
+Provider-backed narrative refresh defaults to local Claude Code on Sonnet when available; use `--narrative-provider <route>` to override the narrator.
+
 ### Set A Budget And A Time Limit, Then Walk Away
 
 Every provider response appends a spend record and updates totals. API routes track token cost. Subscription CLI routes can be capped by wall-clock time.

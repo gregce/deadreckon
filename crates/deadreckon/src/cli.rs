@@ -1255,7 +1255,10 @@ pub(crate) enum Commands {
             help = "Narrative visual: architecture, agents, files, evidence, or none"
         )]
         visual: NarrativeVisualMode,
-        #[arg(long, help = "Narrative summarizer provider route")]
+        #[arg(
+            long,
+            help = "Narrative summarizer provider route override (default: cli:claude-code sonnet)"
+        )]
         narrative_provider: Option<String>,
         #[arg(
             long = "narrative-max-spend",
