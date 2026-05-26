@@ -13,7 +13,8 @@ use deadreckon_core::flight::{
     sha256_text, write_flight_manifest,
 };
 use deadreckon_providers::registry::{
-    DescriptorKind, IngestDescriptor, IngestStorage, ProviderDescriptor, ProviderRegistry,
+    DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProviderDescriptor,
+    ProviderRegistry,
 };
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -137,9 +138,10 @@ impl ProviderFlightRecorder {
         write_flight_manifest(state, &manifest)?;
 
         let started_system_time = SystemTime::now();
+        let working_dirs = run_working_dirs(state);
         let source_cursors = ingest
             .as_ref()
-            .map(initial_log_cursors)
+            .map(|ingest| initial_log_cursors(ingest, &working_dirs))
             .transpose()?
             .unwrap_or_default();
         let existing_events = read_flight_events(state)?;
@@ -222,7 +224,11 @@ impl ProviderFlightRecorder {
             return Ok(false);
         };
         let mut saw_tool_event = false;
-        for path in discover_log_files(&ingest)? {
+        let working_dirs = run_working_dirs(state);
+        for path in discover_log_files(&ingest, &working_dirs)? {
+            if !provider_log_matches_run(&ingest, &path, &working_dirs) {
+                continue;
+            }
             if !self.source_cursors.contains_key(&path)
                 && !modified_since_provider_start(&path, self.started_system_time)?
             {
@@ -535,17 +541,23 @@ fn next_attempt(manifest: &FlightManifest, deadreckon_turn: u32) -> u32 {
         + 1
 }
 
-fn initial_log_cursors(ingest: &IngestDescriptor) -> Result<BTreeMap<PathBuf, LogCursor>> {
+fn initial_log_cursors(
+    ingest: &IngestDescriptor,
+    working_dirs: &[String],
+) -> Result<BTreeMap<PathBuf, LogCursor>> {
     let mut cursors = BTreeMap::new();
-    for path in discover_log_files(ingest)? {
+    for path in discover_log_files(ingest, working_dirs)? {
+        if !provider_log_matches_run(ingest, &path, working_dirs) {
+            continue;
+        }
         let line_count = read_log_lines(&path)?.len() as u64;
         cursors.insert(path, LogCursor { line_count });
     }
     Ok(cursors)
 }
 
-fn discover_log_files(ingest: &IngestDescriptor) -> Result<Vec<PathBuf>> {
-    let roots = ingest_roots(ingest);
+fn discover_log_files(ingest: &IngestDescriptor, working_dirs: &[String]) -> Result<Vec<PathBuf>> {
+    let roots = ingest_roots(ingest, working_dirs);
     let mut files = Vec::new();
     for root in roots {
         collect_log_files(ingest, &root, 0, &mut files)?;
@@ -555,7 +567,7 @@ fn discover_log_files(ingest: &IngestDescriptor) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn ingest_roots(ingest: &IngestDescriptor) -> Vec<PathBuf> {
+fn ingest_roots(ingest: &IngestDescriptor, working_dirs: &[String]) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(env_var) = ingest.env_var.as_deref()
         && let Some(value) = std::env::var_os(env_var)
@@ -567,6 +579,18 @@ fn ingest_roots(ingest: &IngestDescriptor) -> Vec<PathBuf> {
         Some(home) => expand_home_path(path, home),
         None => path.clone(),
     }));
+
+    if ingest.cwd_match == IngestCwdMatch::ClaudeProjectDir {
+        roots = roots
+            .iter()
+            .flat_map(|base| {
+                working_dirs
+                    .iter()
+                    .map(|working_dir| base.join(claude_project_name_for_workdir(working_dir)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    }
 
     let mut expanded = Vec::new();
     for root in roots {
@@ -640,6 +664,163 @@ fn matches_simple_glob(path: &Path, glob: &str) -> bool {
         return path.extension().and_then(|ext| ext.to_str()) == Some(extension);
     }
     file_name == glob
+}
+
+fn run_working_dirs(state: &PipelineState) -> Vec<String> {
+    let mut dirs = vec![
+        state.working_dir.clone(),
+        state.run_root.join("working"),
+        state.cwd.clone(),
+    ];
+    let mut canonical = dirs
+        .iter()
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .collect::<Vec<_>>();
+    dirs.append(&mut canonical);
+    let mut out = dirs
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn provider_log_matches_run(
+    ingest: &IngestDescriptor,
+    path: &Path,
+    working_dirs: &[String],
+) -> bool {
+    match ingest.cwd_match {
+        IngestCwdMatch::None => true,
+        IngestCwdMatch::SessionMeta => jsonl_session_meta_cwd_matches(path, working_dirs),
+        IngestCwdMatch::TopLevel => jsonl_top_level_cwd_matches(path, working_dirs, 80),
+        IngestCwdMatch::ClaudeProjectDir => {
+            path_is_under_claude_project_dir(path, working_dirs)
+                || jsonl_top_level_cwd_matches(path, working_dirs, 80)
+        }
+        IngestCwdMatch::JsonPointer => ingest
+            .cwd_match_path
+            .as_deref()
+            .is_some_and(|pointer| jsonl_pointer_cwd_matches(path, pointer, working_dirs, 80)),
+        IngestCwdMatch::DirectoryField => {
+            json_file_field_cwd_matches(path, "directory", working_dirs)
+        }
+    }
+}
+
+fn path_is_under_claude_project_dir(path: &Path, working_dirs: &[String]) -> bool {
+    path.ancestors().skip(1).any(|ancestor| {
+        let Some(name) = ancestor.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        working_dirs
+            .iter()
+            .any(|working_dir| name == claude_project_name_for_workdir(working_dir))
+    })
+}
+
+fn jsonl_session_meta_cwd_matches(path: &Path, working_dirs: &[String]) -> bool {
+    for line in read_log_lines(path).unwrap_or_default().into_iter().take(8) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let Some(cwd) = value
+            .get("payload")
+            .and_then(|payload| payload.get("cwd"))
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        return working_dirs.iter().any(|working_dir| working_dir == cwd);
+    }
+    false
+}
+
+fn jsonl_top_level_cwd_matches(path: &Path, working_dirs: &[String], scan_lines: usize) -> bool {
+    for line in read_log_lines(path)
+        .unwrap_or_default()
+        .into_iter()
+        .take(scan_lines)
+    {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value
+            .get("cwd")
+            .and_then(Value::as_str)
+            .is_some_and(|cwd| working_dirs.iter().any(|working_dir| working_dir == cwd))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn jsonl_pointer_cwd_matches(
+    path: &Path,
+    pointer: &str,
+    working_dirs: &[String],
+    scan_lines: usize,
+) -> bool {
+    let pointer = json_pointer_path(pointer);
+    for line in read_log_lines(path)
+        .unwrap_or_default()
+        .into_iter()
+        .take(scan_lines)
+    {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value
+            .pointer(&pointer)
+            .and_then(Value::as_str)
+            .is_some_and(|cwd| working_dirs.iter().any(|working_dir| working_dir == cwd))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn json_file_field_cwd_matches(path: &Path, field: &str, working_dirs: &[String]) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|cwd| working_dirs.iter().any(|working_dir| working_dir == cwd))
+}
+
+fn json_pointer_path(path: &str) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    format!("/{}", path.replace('.', "/"))
+}
+
+fn claude_project_name_for_workdir(working_dir: &str) -> String {
+    let resolved = fs::canonicalize(working_dir).unwrap_or_else(|_| PathBuf::from(working_dir));
+    let raw = resolved.to_string_lossy();
+    let mut name = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            name.push(ch);
+        } else {
+            name.push('-');
+        }
+    }
+    if !name.starts_with('-') {
+        name.insert(0, '-');
+    }
+    name
 }
 
 fn modified_since_provider_start(path: &Path, start: SystemTime) -> Result<bool> {
@@ -957,6 +1138,122 @@ storage = "jsonl"
         let checkpoints = list_checkpoint_manifests(&state).expect("checkpoints");
         assert_eq!(checkpoints.len(), 1);
         assert_eq!(checkpoints[0].checkpoint_id, checkpoint);
+    }
+
+    #[test]
+    fn provider_flight_recorder_scopes_claude_project_dir_to_run_working_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let cwd = temp.path().join("cwd");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "record scoped claude flight".to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: Some("cli:test-claude-flight".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        fs::create_dir_all(paths.home().join("providers.d")).expect("providers");
+        let provider_logs = temp.path().join("claude-projects");
+        fs::create_dir_all(&provider_logs).expect("logs");
+        fs::write(
+            paths.home().join("providers.d/test-claude-flight.toml"),
+            format!(
+                r#"
+id = "cli:test-claude-flight"
+display_name = "Test Claude Flight"
+kind = "cli"
+default_binary = "test-claude-flight"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["{{prompt}}"]
+
+[ingest]
+default_dirs = ["{}"]
+schema = "claude-code"
+cwd_match = "claude-project-dir"
+file_glob = "*.jsonl"
+storage = "jsonl"
+"#,
+                provider_logs.display()
+            ),
+        )
+        .expect("descriptor");
+        deadreckon_core::snapshot_working(&state, 0).expect("snapshot");
+
+        let mut recorder =
+            ProviderFlightRecorder::start(&state, "cli:test-claude-flight", paths.home(), 1)
+                .expect("start")
+                .expect("recorder");
+        let matching_dir = provider_logs.join(claude_project_name_for_workdir(
+            &state.working_dir.to_string_lossy(),
+        ));
+        let unrelated_work = temp.path().join("unrelated-work");
+        fs::create_dir_all(&unrelated_work).expect("unrelated work");
+        let unrelated_dir = provider_logs.join(claude_project_name_for_workdir(
+            &unrelated_work.to_string_lossy(),
+        ));
+        fs::create_dir_all(&matching_dir).expect("matching dir");
+        fs::create_dir_all(&unrelated_dir).expect("unrelated dir");
+        fs::write(
+            matching_dir.join("session.jsonl"),
+            format!(
+                r#"{{"type":"assistant","cwd":"{}","message":"matching run row"}}"#,
+                state.working_dir.display()
+            ),
+        )
+        .expect("matching log");
+        fs::write(
+            unrelated_dir.join("session.jsonl"),
+            format!(
+                r#"{{"type":"assistant","cwd":"{}","message":"unrelated row"}}"#,
+                unrelated_work.display()
+            ),
+        )
+        .expect("unrelated log");
+
+        recorder
+            .finish(&state, FlightSessionStatus::Completed)
+            .expect("finish");
+
+        let events = read_flight_events(&state).expect("events");
+        let source_paths = events
+            .iter()
+            .filter_map(|event| event.source_path.as_ref())
+            .collect::<Vec<_>>();
+        assert!(
+            source_paths
+                .iter()
+                .any(|path| path.starts_with(&matching_dir)),
+            "{source_paths:#?}"
+        );
+        assert!(
+            source_paths
+                .iter()
+                .all(|path| !path.starts_with(&unrelated_dir)),
+            "{source_paths:#?}"
+        );
+        let manifest = read_flight_manifest(&state)
+            .expect("manifest")
+            .expect("manifest exists");
+        assert_eq!(manifest.sessions[0].source_paths.len(), 1);
+        assert!(
+            manifest.sessions[0].source_paths[0]
+                .path
+                .starts_with(&matching_dir)
+        );
     }
 
     #[test]
