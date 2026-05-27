@@ -426,6 +426,7 @@ pub(crate) fn ensure_run_projection(
     let narrative_dir = input.state.run_root.join(NARRATIVE_DIR);
     let projection = build_run_projection(input);
     if let Some(current) = read_current_projection_if_covered(&projection, &narrative_dir) {
+        persist_projection(&current, &narrative_dir)?;
         return Ok(current);
     }
     persist_projection(&projection, &narrative_dir)?;
@@ -439,6 +440,7 @@ pub(crate) fn ensure_plan_projection(
     let narrative_dir = plan_dir.join(NARRATIVE_DIR);
     let projection = build_plan_projection(input);
     if let Some(current) = read_current_projection_if_covered(&projection, &narrative_dir) {
+        persist_projection(&current, &narrative_dir)?;
         return Ok(current);
     }
     persist_projection(&projection, &narrative_dir)?;
@@ -1206,7 +1208,8 @@ pub(crate) fn provider_refresh_decision(
     {
         return NarrativeRefreshDecision::OverBudget;
     }
-    if !policy.manual
+    if state.provider.calls > 0
+        && !policy.manual
         && !policy.meaningful_delta
         && let Some(last) = state.latest_created_at
     {
@@ -1336,12 +1339,20 @@ fn read_current_projection_if_covered(
     narrative_dir: &Path,
 ) -> Option<NarrativeProjection> {
     let state = read_json::<NarrativeState>(&narrative_dir.join(NARRATIVE_STATE_JSON))?;
-    if !same_narrative_input_coverage(&state.latest_covered, &candidate.state.latest_covered) {
-        return None;
-    }
     let snapshot = read_latest_snapshot(narrative_dir).snapshot?;
     if snapshot.snapshot_id != state.latest_snapshot_id {
         return None;
+    }
+    if !same_narrative_input_coverage(&state.latest_covered, &candidate.state.latest_covered) {
+        return provider_projection_for_newer_coverage(
+            candidate,
+            NarrativeProjection {
+                state,
+                snapshot,
+                graph: read_json::<ArchitectureGraph>(&narrative_dir.join(ARCHITECTURE_GRAPH_JSON))
+                    .unwrap_or_else(|| candidate.graph.clone()),
+            },
+        );
     }
     let graph = read_json::<ArchitectureGraph>(&narrative_dir.join(ARCHITECTURE_GRAPH_JSON))
         .unwrap_or_else(|| candidate.graph.clone());
@@ -1350,6 +1361,29 @@ fn read_current_projection_if_covered(
         snapshot,
         graph,
     })
+}
+
+fn provider_projection_for_newer_coverage(
+    candidate: &NarrativeProjection,
+    current: NarrativeProjection,
+) -> Option<NarrativeProjection> {
+    if current.state.provider.source != "provider"
+        || !matches!(
+            current.state.latest_status,
+            NarrativeStatus::Fresh | NarrativeStatus::Stale
+        )
+    {
+        return None;
+    }
+
+    let mut next = current;
+    next.state.latest_status = NarrativeStatus::Stale;
+    next.state.latest_covered = candidate.state.latest_covered.clone();
+    next.graph = candidate.graph.clone();
+    if next.snapshot.snapshot_id != next.state.latest_snapshot_id {
+        return None;
+    }
+    Some(next)
 }
 
 fn same_narrative_input_coverage(left: &NarrativeCoverage, right: &NarrativeCoverage) -> bool {
@@ -3248,11 +3282,137 @@ mod tests {
         let redraw = ensure_run_projection(&input).expect("redraw projection");
 
         assert_eq!(redraw.state.latest_status, NarrativeStatus::Fresh);
+        assert_eq!(redraw.snapshot.status, NarrativeStatus::Fresh);
+        assert_eq!(redraw.state.provider.source, "provider");
+        assert_eq!(redraw.state.provider.calls, 1);
+        assert_eq!(redraw.state.provider.model.as_deref(), Some("test-model"));
         assert_eq!(redraw.snapshot.headline, refreshed.snapshot.headline);
         assert_eq!(
             redraw.state.latest_snapshot_id,
             refreshed.state.latest_snapshot_id
         );
+        let rendered = narrative_plain_lines(&redraw, NarrativeVisualMode::None).join("\n");
+        assert!(
+            rendered.contains("freshness: fresh via provider"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn provider_snapshot_remains_visible_when_coverage_advances_before_refresh() {
+        let temp = TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "redraw keeps stale provider snapshot".to_string(),
+                cwd: repo,
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("run-redraw-stale-provider-test".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let live_files = vec![LiveFileFact {
+            path: "src/main.rs".to_string(),
+            bytes: 10,
+            modified_at: None,
+        }];
+        let input = RunNarrativeInput {
+            state: &state,
+            spend: &[],
+            traces: &[],
+            events: &[],
+            live_files: live_files.clone(),
+            file_count: 1,
+            total_bytes: 10,
+            acceptance_summary: "default gate".to_string(),
+            provider_activity: &[],
+            parent_plan: None,
+        };
+        let projection = ensure_run_projection(&input).expect("projection");
+        let evidence = projection.snapshot.citations[0].id.clone();
+        let provider_content = json!({
+            "headline": "Provider narrative remains visible while refresh is pending.",
+            "current_work": [
+                {"text": "Provider prose remains active until the next provider refresh catches up.", "evidence": [evidence], "confidence": "high"}
+            ]
+        })
+        .to_string();
+        let refreshed = apply_provider_response(&projection, &provider_content, sample_provider())
+            .expect("provider projection");
+        persist_run_projection(&state, &refreshed).expect("persist provider");
+        let snapshot_path = state
+            .run_root
+            .join(NARRATIVE_DIR)
+            .join(NARRATIVE_SNAPSHOTS_JSONL);
+        let snapshot_count_before = fs::read_to_string(&snapshot_path)
+            .expect("snapshots before")
+            .lines()
+            .count();
+        let traces = vec![TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn: 1,
+            event: "provider_activity".to_string(),
+            latency_ms: Some(12),
+            detail: json!({"seq": 1}),
+        }];
+        let advanced_input = RunNarrativeInput {
+            state: &state,
+            spend: &[],
+            traces: &traces,
+            events: &[],
+            live_files,
+            file_count: 1,
+            total_bytes: 10,
+            acceptance_summary: "default gate".to_string(),
+            provider_activity: &[],
+            parent_plan: None,
+        };
+
+        let redraw = ensure_run_projection(&advanced_input).expect("redraw projection");
+
+        assert_eq!(
+            redraw.snapshot.headline,
+            "Provider narrative remains visible while refresh is pending."
+        );
+        assert_eq!(
+            redraw.state.latest_snapshot_id,
+            refreshed.state.latest_snapshot_id
+        );
+        assert_eq!(redraw.snapshot.snapshot_id, refreshed.snapshot.snapshot_id);
+        assert_eq!(redraw.state.latest_status, NarrativeStatus::Stale);
+        assert_eq!(redraw.snapshot.status, NarrativeStatus::Fresh);
+        assert_eq!(redraw.state.provider.source, "provider");
+        assert_eq!(redraw.state.provider.calls, 1);
+        assert_eq!(redraw.state.latest_covered.trace_count, Some(1));
+        let rendered = narrative_plain_lines(&redraw, NarrativeVisualMode::None).join("\n");
+        assert!(
+            rendered.contains("freshness: stale via provider"),
+            "{rendered}"
+        );
+        let persisted_state = read_json::<NarrativeState>(
+            &state
+                .run_root
+                .join(NARRATIVE_DIR)
+                .join(NARRATIVE_STATE_JSON),
+        )
+        .expect("persisted state");
+        assert_eq!(persisted_state.latest_status, NarrativeStatus::Stale);
+        assert_eq!(persisted_state.provider.source, "provider");
+        assert_eq!(persisted_state.provider.calls, 1);
+        let snapshot_count_after = fs::read_to_string(&snapshot_path)
+            .expect("snapshots after")
+            .lines()
+            .count();
+        assert_eq!(snapshot_count_after, snapshot_count_before);
     }
 
     #[test]
@@ -3395,6 +3555,12 @@ mod tests {
             meaningful_delta: false,
             now: Utc::now(),
         };
+        assert_eq!(
+            provider_refresh_decision(&projection.state, &automatic),
+            NarrativeRefreshDecision::Eligible
+        );
+
+        projection.state.provider.calls = 1;
         assert_eq!(
             provider_refresh_decision(&projection.state, &automatic),
             NarrativeRefreshDecision::TooSoon
