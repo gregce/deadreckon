@@ -455,7 +455,7 @@ fn start_non_git_tty_can_choose_init_git_copy_or_fresh() {
     let output = deadreckon_pty(
         &paths,
         &source,
-        &["1", "1", "3"],
+        &["1", "1", "3", "1", "3"],
         &["start", "build the app", "--preview"],
         "workspace.*fresh",
         None,

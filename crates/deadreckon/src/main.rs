@@ -2383,7 +2383,9 @@ fn prompt_start_provider(
         return Ok(());
     };
 
-    decision.provider_source = if previous_route.as_deref() == Some(provider.as_str()) {
+    decision.provider_source = if previous_route.as_deref() == Some(provider.as_str())
+        && !matches!(previous_source, StartProviderSource::Detected)
+    {
         previous_source
     } else {
         StartProviderSource::Interactive

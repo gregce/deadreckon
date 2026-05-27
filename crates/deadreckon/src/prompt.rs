@@ -125,15 +125,15 @@ fn select_one_menu(prompt: &SelectPrompt) -> Result<SelectChoice> {
         }
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                println!();
+                finish_select_menu_line()?;
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "prompt cancelled").into());
             }
             KeyCode::Enter => {
-                println!();
+                finish_select_menu_line()?;
                 return Ok(prompt.choices[selected].clone());
             }
             KeyCode::Char('j' | 'm') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                println!();
+                finish_select_menu_line()?;
                 return Ok(prompt.choices[selected].clone());
             }
             KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
@@ -166,7 +166,7 @@ fn select_one_menu(prompt: &SelectPrompt) -> Result<SelectChoice> {
                     .iter()
                     .position(|choice| choice.id == "cancel")
                 {
-                    println!();
+                    finish_select_menu_line()?;
                     return Ok(prompt.choices[index].clone());
                 }
             }
@@ -186,9 +186,15 @@ fn render_select_menu(prompt: &SelectPrompt, selected: usize, redraw: bool) -> R
         execute!(stdout, Clear(ClearType::CurrentLine))?;
         match choice.detail.as_deref() {
             Some(detail) if !detail.trim().is_empty() => {
-                println!("  {marker} [{ordinal}] {} - {detail}", choice.label);
+                write_select_menu_line(
+                    &mut stdout,
+                    &format!("  {marker} [{ordinal}] {} - {detail}", choice.label),
+                )?;
             }
-            _ => println!("  {marker} [{ordinal}] {}", choice.label),
+            _ => write_select_menu_line(
+                &mut stdout,
+                &format!("  {marker} [{ordinal}] {}", choice.label),
+            )?,
         }
     }
     execute!(stdout, Clear(ClearType::CurrentLine))?;
@@ -196,9 +202,19 @@ fn render_select_menu(prompt: &SelectPrompt, selected: usize, redraw: bool) -> R
         .default_index
         .min(prompt.choices.len().saturating_sub(1))
         + 1;
-    print!("? choose [{default}]: arrows/Enter or number ");
+    write!(stdout, "? choose [{default}]: arrows/Enter or number ")?;
     stdout.flush()?;
     Ok(())
+}
+
+fn write_select_menu_line(stdout: &mut impl io::Write, line: &str) -> io::Result<()> {
+    write!(stdout, "{line}\r\n")
+}
+
+fn finish_select_menu_line() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    write!(stdout, "\r\n")?;
+    stdout.flush()
 }
 
 fn select_index_from_digit(value: char, len: usize) -> Option<usize> {
@@ -266,7 +282,9 @@ fn parse_confirm_answer(answer: &str, default_yes: bool) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_confirm_answer, parse_select_answer, select_index_from_digit};
+    use super::{
+        parse_confirm_answer, parse_select_answer, select_index_from_digit, write_select_menu_line,
+    };
 
     #[test]
     fn confirm_answer_accepts_yes_no_and_default() {
@@ -303,5 +321,12 @@ mod tests {
         assert_eq!(select_index_from_digit('4', 4), Some(3));
         assert_eq!(select_index_from_digit('5', 4), None);
         assert_eq!(select_index_from_digit('0', 4), None);
+    }
+
+    #[test]
+    fn selectable_menu_lines_return_to_column_zero_in_raw_mode() {
+        let mut output = Vec::new();
+        write_select_menu_line(&mut output, "  > [1] Run").expect("write line");
+        assert_eq!(output, b"  > [1] Run\r\n");
     }
 }

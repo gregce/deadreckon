@@ -5,9 +5,30 @@
 <p align="center"><strong>Run your coding agent unattended, and trust the result.</strong></p>
 
 <p align="center">
+DeadReckon is a harness around the agent CLI you already use.<br>
 A separate watchdog process, not the agent, decides when the work is actually done.<br>
 You get a signed, auditable artifact instead of a chat transcript you have to take on faith.
 </p>
+
+---
+
+## Get started
+
+```bash
+cargo build --release          # binary at ./target/release/deadreckon
+```
+
+Then the whole tool is five commands:
+
+| Command | What it does |
+|---|---|
+| `deadreckon start "build the app"` | Kick off a supervised run. Walk away. |
+| `deadreckon attach latest` | Watch it work live. `Ctrl-D` leaves it running. |
+| `deadreckon status` | What happened, and the one thing to do next. |
+| `deadreckon list` | Find recent runs and plans. |
+| `deadreckon finish latest` | Apply it to your branch, or export it. |
+
+For a higher-level read while it runs, `deadreckon attach latest --view narrative` shows cited prose plus an evidence-backed visual map.
 
 <p align="center">
   <img src="docs/assets/providers/claude-logo.png" alt="Claude Code" height="34">&nbsp;&nbsp;&nbsp;
@@ -19,23 +40,6 @@ You get a signed, auditable artifact instead of a chat transcript you have to ta
 </p>
 
 <p align="center"><sub>Supervises the agent CLI you already use: Claude Code · Codex · Gemini · Copilot · OpenCode · Pi · or any Anthropic / OpenAI-compatible API.</sub></p>
-
----
-
-## Get started
-
-```bash
-cargo build --release          # binary at ./target/release/deadreckon
-```
-
-Then the whole tool is four commands:
-
-| Command | What it does |
-|---|---|
-| `deadreckon start "build the app"` | Kick off a supervised run. Walk away. |
-| `deadreckon attach latest` | Watch it work live. `Ctrl-D` leaves it running. |
-| `deadreckon status` | What happened, and the one thing to do next. |
-| `deadreckon finish latest` | Apply it to your branch, or export it. |
 
 Everything else (budgets, undo, multi-step chains, provider routing) is optional power you reach for later. No API keys? `deadreckon run "hello" --smoke --sandbox none` exercises the whole harness against a faked provider.
 
