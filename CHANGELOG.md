@@ -10,6 +10,7 @@
 - Added attach-owned JSONL tail caches for run spend, trace, and flight activity streams so live run attach parses appended complete rows instead of rereading whole files each tick.
 - Added live attach provider-log scan throttling so current flight rows delay fallback root scans, fallback matches are cached by freshness, and matched provider logs invalidate on mtime changes.
 - Added run and plan narrative projection caches for attach rendering so redraws reuse covered projections, preserve stale provider snapshots, and avoid appending narrative snapshots from render paths.
+- Added incremental chain activity tailing for chain attach, including partial-line tolerance and status hints when event reads fall behind.
 
 ## Narrative Attach (alpha) - 2026-05-26
 

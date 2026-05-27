@@ -4764,18 +4764,31 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut tui_state = ChainAttachTuiState::default();
+    let mut event_tail = AttachJsonlTail::<ChainEvent>::new(paths.chain_events(chain_id));
 
     let result = loop {
-        let mut tick = AttachTickTiming::new(AttachSurface::Chain, AttachTickBudget::default());
+        let budget = AttachTickBudget::default();
+        let mut tick = AttachTickTiming::new(AttachSurface::Chain, budget);
         let stage_started = Instant::now();
         let chain = load_chain(paths, chain_id)?;
         tick.record_since(AttachLoopStage::LoadState, stage_started);
         let stage_started = Instant::now();
-        let events = read_jsonl::<ChainEvent>(&paths.chain_events(chain_id))?;
+        event_tail.reset_to_path(paths.chain_events(chain_id));
+        let event_refresh_error = event_tail.refresh().err();
+        let event_read_elapsed = stage_started.elapsed();
         tick.record_since(AttachLoopStage::ReadJsonl, stage_started);
+        tui_state.event_status_hint = chain_event_read_hint(
+            event_tail.rows().len(),
+            event_tail.last_appended_rows,
+            event_tail.partial_bytes,
+            event_read_elapsed,
+            budget,
+            event_refresh_error.as_ref(),
+        );
+        let events = event_tail.rows();
         tui_state.clamp(&chain);
         let stage_started = Instant::now();
-        terminal.draw(|frame| render_chain_attach(frame, &chain, &events, &tui_state))?;
+        terminal.draw(|frame| render_chain_attach(frame, &chain, events, &tui_state))?;
         tick.record_since(AttachLoopStage::Draw, stage_started);
 
         let stage_started = Instant::now();
@@ -4875,6 +4888,7 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
 struct ChainAttachTuiState {
     selected_step: usize,
     events_scroll: u16,
+    event_status_hint: Option<String>,
 }
 
 impl ChainAttachTuiState {
@@ -4919,6 +4933,42 @@ impl ChainAttachTuiState {
     }
 }
 
+fn chain_event_read_hint(
+    event_count: usize,
+    appended_rows: usize,
+    partial_bytes: usize,
+    elapsed: Duration,
+    budget: AttachTickBudget,
+    error: Option<&CliError>,
+) -> Option<String> {
+    if let Some(error) = error {
+        return Some(format!(
+            "activity read delayed: {}",
+            one_line(&error.to_string(), 72)
+        ));
+    }
+    if elapsed > Duration::from_millis(budget.max_sync_io_ms) {
+        return Some(format!(
+            "activity catch-up: {event_count} events, +{appended_rows}, {}ms",
+            elapsed.as_millis()
+        ));
+    }
+    if partial_bytes > 0 {
+        return Some(format!(
+            "activity waiting for complete event line ({partial_bytes} bytes)"
+        ));
+    }
+    None
+}
+
+fn chain_activity_title(tui_state: &ChainAttachTuiState) -> String {
+    tui_state
+        .event_status_hint
+        .as_deref()
+        .map(|hint| format!("chain activity - {}", one_line(hint, 72)))
+        .unwrap_or_else(|| "chain activity".to_string())
+}
+
 fn render_chain_attach(
     frame: &mut ratatui::Frame<'_>,
     chain: &Chain,
@@ -4959,12 +5009,9 @@ fn render_chain_attach(
         .into_iter()
         .map(ListItem::new)
         .collect::<Vec<_>>();
+    let activity_title = chain_activity_title(tui_state);
     frame.render_widget(
-        List::new(event_lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("chain activity"),
-        ),
+        List::new(event_lines).block(Block::default().borders(Borders::ALL).title(activity_title)),
         body[1],
     );
     frame.render_widget(Paragraph::new(chain_attach_footer_text(chain)), rows[2]);
@@ -24231,6 +24278,10 @@ struct AttachJsonlTail<T> {
     offset: u64,
     rows: Vec<T>,
     signature: Option<AttachJsonlSignature>,
+    refresh_count: usize,
+    last_read_bytes: usize,
+    last_appended_rows: usize,
+    partial_bytes: usize,
 }
 
 impl<T> AttachJsonlTail<T>
@@ -24243,6 +24294,10 @@ where
             offset: 0,
             rows: Vec::new(),
             signature: None,
+            refresh_count: 0,
+            last_read_bytes: 0,
+            last_appended_rows: 0,
+            partial_bytes: 0,
         }
     }
 
@@ -24252,14 +24307,25 @@ where
             self.offset = 0;
             self.rows.clear();
             self.signature = None;
+            self.refresh_count = 0;
+            self.last_read_bytes = 0;
+            self.last_appended_rows = 0;
+            self.partial_bytes = 0;
         }
     }
 
+    fn rows(&self) -> &[T] {
+        &self.rows
+    }
+
     fn refresh(&mut self) -> Result<&[T]> {
+        self.last_read_bytes = 0;
+        self.last_appended_rows = 0;
         let Ok(metadata) = fs::metadata(&self.path) else {
             self.offset = 0;
             self.rows.clear();
             self.signature = None;
+            self.partial_bytes = 0;
             return Ok(&self.rows);
         };
         let modified = metadata.modified().ok();
@@ -24276,9 +24342,11 @@ where
         {
             self.offset = 0;
             self.rows.clear();
+            self.partial_bytes = 0;
         }
         if len == self.offset {
             self.signature = Some(current_signature);
+            self.partial_bytes = 0;
             return Ok(&self.rows);
         }
 
@@ -24286,19 +24354,25 @@ where
         file.seek(SeekFrom::Start(self.offset))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
+        self.refresh_count = self.refresh_count.saturating_add(1);
+        self.last_read_bytes = bytes.len();
         let Some(complete_len) = bytes
             .iter()
             .rposition(|byte| *byte == b'\n')
             .map(|index| index + 1)
         else {
+            self.partial_bytes = bytes.len();
             return Ok(&self.rows);
         };
         let complete = String::from_utf8_lossy(&bytes[..complete_len]);
+        let before_len = self.rows.len();
         for line in complete.lines().filter(|line| !line.trim().is_empty()) {
             if let Ok(row) = serde_json::from_str(line) {
                 self.rows.push(row);
             }
         }
+        self.last_appended_rows = self.rows.len().saturating_sub(before_len);
+        self.partial_bytes = bytes.len().saturating_sub(complete_len);
         self.offset = self.offset.saturating_add(complete_len as u64);
         self.signature = Some(AttachJsonlSignature {
             len: self.offset,
@@ -28326,9 +28400,9 @@ mod tui_tests {
         acceptance_activity_lines, attach_banner, attach_header_text, attach_live_inventory,
         attach_loop_stage_work, attach_should_return_to_plan, build_run_narrative_projection,
         cancel_plan_narrative_refresh_job, chain_activity_lines, chain_attach_footer_text,
-        chain_attach_header_text, chain_narrative_refusal_text, chain_should_auto_attach,
-        chain_step_dot, chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
-        cli_wait_status_line, collect_jsonl_provider_activity,
+        chain_attach_header_text, chain_event_read_hint, chain_narrative_refusal_text,
+        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
+        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
         collect_jsonl_provider_activity_scan, command_discovery, completion_action_from_input,
         completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
         doc_polish_preview_text, implementation_plan_warnings, kill_banner, live_file_lines,
@@ -28392,6 +28466,16 @@ mod tui_tests {
         chain.steps[0].run_id = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
         chain.steps[1].status = ChainStepStatus::Running;
         chain
+    }
+
+    fn chain_event_record(chain_id: &str, index: usize) -> ChainEvent {
+        ChainEvent {
+            timestamp: Utc::now(),
+            chain_id: chain_id.to_string(),
+            event: ChainEventKind::ChainStepStarted,
+            step_index: Some(index as u32),
+            detail: serde_json::json!({ "goal": format!("step {index}") }),
+        }
     }
 
     #[test]
@@ -28860,6 +28944,82 @@ mod tui_tests {
         assert_eq!(activity.context_tokens, Some(15));
         assert_eq!(activity.context_window, Some(100));
         assert_eq!(cache.refresh(&state).lines.len(), 2);
+    }
+
+    #[test]
+    fn chain_attach_uses_incremental_event_tail() {
+        let temp = test_tempdir();
+        let path = temp.path().join("chain-events.jsonl");
+        append_jsonl_value(&path, &chain_event_record("chain-test", 0));
+        let mut tail = AttachJsonlTail::<ChainEvent>::new(path.clone());
+
+        assert_eq!(tail.refresh().expect("initial").len(), 1);
+        append_jsonl_value(&path, &chain_event_record("chain-test", 1));
+        let full_len = std::fs::metadata(&path).expect("metadata").len() as usize;
+        let row_count = tail.refresh().expect("appended").len();
+
+        assert_eq!(row_count, 2);
+        assert_eq!(tail.refresh_count, 2);
+        assert_eq!(tail.last_appended_rows, 1);
+        assert!(tail.last_read_bytes < full_len);
+    }
+
+    #[test]
+    fn chain_attach_large_event_file_keeps_tick_under_budget() {
+        let temp = test_tempdir();
+        let path = temp.path().join("chain-events.jsonl");
+        for index in 0..2_000 {
+            append_jsonl_value(&path, &chain_event_record("chain-large", index));
+        }
+        let mut tail = AttachJsonlTail::<ChainEvent>::new(path.clone());
+        assert_eq!(tail.refresh().expect("initial").len(), 2_000);
+        append_jsonl_value(&path, &chain_event_record("chain-large", 2_000));
+
+        let started = Instant::now();
+        let row_count = tail.refresh().expect("incremental").len();
+        let elapsed = started.elapsed();
+        let hint = chain_event_read_hint(
+            row_count,
+            tail.last_appended_rows,
+            tail.partial_bytes,
+            elapsed,
+            AttachTickBudget::default(),
+            None,
+        );
+
+        assert_eq!(row_count, 2_001);
+        assert_eq!(tail.last_appended_rows, 1);
+        assert!(
+            tail.last_read_bytes < 512,
+            "expected appended-only read, read {} bytes",
+            tail.last_read_bytes
+        );
+        assert!(
+            elapsed < Duration::from_millis(AttachTickBudget::default().max_sync_io_ms),
+            "incremental chain event refresh took {elapsed:?}"
+        );
+        assert!(hint.is_none(), "unexpected slow-read hint: {hint:?}");
+    }
+
+    #[test]
+    fn chain_attach_partial_event_line_is_ignored_until_complete() {
+        let temp = test_tempdir();
+        let path = temp.path().join("chain-events.jsonl");
+        let first = serde_json::to_string(&chain_event_record("chain-partial", 0)).expect("first");
+        let second =
+            serde_json::to_string(&chain_event_record("chain-partial", 1)).expect("second");
+        let split = second.len() / 2;
+        std::fs::write(&path, format!("{first}\n{}", &second[..split])).expect("partial");
+        let mut tail = AttachJsonlTail::<ChainEvent>::new(path.clone());
+
+        assert_eq!(tail.refresh().expect("partial").len(), 1);
+        assert!(tail.partial_bytes > 0);
+        append_raw(&path, &format!("{}\n", &second[split..]));
+        let row_count = tail.refresh().expect("completed").len();
+
+        assert_eq!(row_count, 2);
+        assert_eq!(tail.last_appended_rows, 1);
+        assert_eq!(tail.partial_bytes, 0);
     }
 
     #[test]
