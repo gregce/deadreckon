@@ -18,10 +18,10 @@ The loop is the product. The agent CLI does the coding. deadreckon decides when 
 
 **The agent does the coding. deadreckon decides when it's done.**
 
-- **It can't fake the finish.** The watchdog (`dr-gate`) holds a secret the agent process can't read and signs the result with it. No valid signature, no "done" — the agent literally cannot forge its own acceptance.
-- **Walk away for real.** Every turn is saved to disk: state, spend, file lineage, a full snapshot. Close your laptop, lose the network, kill the model — attach from another terminal and resume from the last completed turn. Nothing replays, nothing is lost.
+- **It can't fake the finish.** The watchdog (`dr-gate`) holds a secret the agent process can't read and signs the result with it. No valid signature, no "done." The agent literally cannot forge its own acceptance.
+- **Walk away for real.** Every turn is saved to disk: state, spend, file lineage, a full snapshot. Close your laptop, lose the network, kill the model, then attach from another terminal and resume from the last completed turn. Nothing replays, nothing is lost.
 - **You get evidence, not a transcript.** Each accepted run promotes to a reviewable artifact: what changed, why, which prompt touched which file, what it spent. Auditable on disk, not scrolled back in a chat window.
-- **Bring the agent you already trust.** Claude Code, Codex, Gemini, Copilot, OpenCode, Pi, or a raw API key — deadreckon supervises any of them. It owns the boundary, not the intelligence.
+- **Bring the agent you already trust.** Claude Code, Codex, Gemini, Copilot, OpenCode, Pi, or a raw API key: deadreckon supervises any of them. It owns the boundary, not the intelligence.
 
 ## Bring your own agent CLI
 
@@ -36,7 +36,7 @@ deadreckon owns the run boundary; the CLI does the coding. Route any turn throug
 | <img src="assets/providers/opencode-logo.png" alt="" width="22"> | **OpenCode** | `cli:opencode` |
 | <img src="assets/providers/pi-logo.svg" alt="" width="22"> | **Pi** | `cli:pi` |
 
-Prefer your own keys? Route directly to **Anthropic** (`anthropic`), **OpenAI** (`openai`), or any **OpenAI-compatible** endpoint (`openai-compatible` — OpenRouter, llama.cpp, local models). No keys at all? `--smoke` runs the whole harness against a faked provider.
+Prefer your own keys? Route directly to **Anthropic** (`anthropic`), **OpenAI** (`openai`), or any **OpenAI-compatible** endpoint (`openai-compatible`, e.g. OpenRouter, llama.cpp, local models). No keys at all? `--smoke` runs the whole harness against a faked provider.
 
 Already have history in another tool? `deadreckon import claude-code | codex | cursor` ingests it read-only as a run you can inspect.
 
@@ -53,7 +53,7 @@ deadreckon def-done check
 deadreckon run "finish the app"
 ```
 
-**Why the watchdog matters.** `dr-gate` holds a run-local secret the agent process cannot read, and stamps the result with it. Without a valid stamp, the run can't terminate — and the agent can't produce the stamp itself. If the checks fail, the run doesn't end; the agent gets another turn with a corrective hint.
+**Why the watchdog matters.** `dr-gate` holds a run-local secret the agent process cannot read, and stamps the result with it. Without a valid stamp, the run can't terminate, and the agent can't produce the stamp itself. If the checks fail, the run doesn't end; the agent gets another turn with a corrective hint.
 
 If no acceptance file is configured, the default is "the working directory exists and `cargo test` passes" (when `Cargo.toml` is present). Supported check kinds are `cargo_test`, `file_exists`, `content_match`, `build_success`, and `shell`. Full reference, packs, and the compiled YAML format: [HOWTO § Done Criteria](../HOWTO.md#done-criteria).
 
@@ -71,12 +71,12 @@ Agentic CLIs usually leave you with a patch and a transcript. deadreckon turns t
 
 ## What else it does
 
-Each of these is a first-class capability — usage lives in [HOWTO](../HOWTO.md):
+Each of these is a first-class capability; usage lives in [HOWTO](../HOWTO.md):
 
 - **Your checkout is never touched.** Runs default to an isolated `git worktree` on a `dr/...` branch; your real checkout changes only when you `deadreckon apply`. Copy, fresh, and explicit in-place modes are available too.
 - **Crash-proof.** Every turn writes durable state. If the terminal dies, attach from another; if the run crashes, resume from the last completed turn.
 - **Budgets and time limits.** `--max-spend 15` and `--max-wall-seconds 1800` cap a run, then walk away. High spend requires explicit confirmation.
-- **Undo a single bad turn.** Snapshot-based rollback to any turn (`deadreckon undo --run <id> --turn 3`), recorded in the run trace — not just a `git reset`.
+- **Undo a single bad turn.** Snapshot-based rollback to any turn (`deadreckon undo --run <id> --turn 3`), recorded in the run trace, not just a `git reset`.
 - **Resume, kill, extend, or export any run.** Runs are lifecycle objects, not one terminal session.
 - **Autonomous chains for multi-step work.** Break a big goal into ordered steps, each with its own signed gate; the chain stops on the first gate failure.
 
@@ -127,4 +127,4 @@ Use the agentic CLI for intelligence. Use deadreckon for isolation, supervision,
 
 ## Why "deadreckon"?
 
-Dead reckoning is navigation without perfect visibility: track every move so you know where you are now. Unattended agents are the same problem — long task, partial context, the terminal may be gone when you look back. The name is the contract: don't trust the final answer, navigate by evidence.
+Dead reckoning is navigation without perfect visibility: track every move so you know where you are now. Unattended agents are the same problem: long task, partial context, the terminal may be gone when you look back. The name is the contract: don't trust the final answer, navigate by evidence.

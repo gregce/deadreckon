@@ -2,7 +2,7 @@
 
 ## Product
 
-`deadreckon` runs your coding agent unattended — and a separate watchdog process, not the agent, decides when the work is actually done. It is a Rust 2024 CLI harness that supervises agent CLIs (Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, OpenCode, Pi) and BYOK API routes rather than replacing them. The default user flow is `deadreckon run <goal>`: create durable run state, select a provider route, execute turns in a disposable sandbox, write spend/provenance/traces/snapshots after every turn, gate completion with a signature the agent process cannot forge, and make the run attachable, resumable, killable, inspectable, and undoable. The output is an auditable artifact, not a chat transcript.
+`deadreckon` runs your coding agent unattended, and a separate watchdog process, not the agent, decides when the work is actually done. It is a Rust 2024 CLI harness that supervises agent CLIs (Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, OpenCode, Pi) and BYOK API routes rather than replacing them. The default user flow is `deadreckon run <goal>`: create durable run state, select a provider route, execute turns in a disposable sandbox, write spend/provenance/traces/snapshots after every turn, gate completion with a signature the agent process cannot forge, and make the run attachable, resumable, killable, inspectable, and undoable. The output is an auditable artifact, not a chat transcript.
 
 The alpha implementation is intentionally local-first. Runtime state defaults to `/Users/gdc/.deadreckon/`, and tests or explicit smoke runs can override that with `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke` so this build process does not write outside the allowed implementation tree.
 
