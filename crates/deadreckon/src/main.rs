@@ -24276,12 +24276,14 @@ where
 #[derive(Debug)]
 struct AttachProviderActivityCache {
     flight_tail: AttachJsonlTail<FlightEvent>,
+    provider_log_cache: AttachProviderLogScanCache,
 }
 
 impl AttachProviderActivityCache {
     fn new(state: &deadreckon_core::PipelineState) -> Self {
         Self {
             flight_tail: AttachJsonlTail::new(state.run_root.join(FLIGHT_EVENTS_JSONL)),
+            provider_log_cache: AttachProviderLogScanCache::default(),
         }
     }
 
@@ -24293,7 +24295,13 @@ impl AttachProviderActivityCache {
             .refresh()
             .map(collect_flight_provider_activity_from_events)
             .unwrap_or_default();
-        collect_provider_activity_from_flight(state, flight)
+        let Some(spec) = provider_jsonl_log_spec(state) else {
+            return flight;
+        };
+        let fallback =
+            self.provider_log_cache
+                .refresh(state, &spec, !flight.lines.is_empty(), Instant::now());
+        combine_provider_activity(flight, fallback)
     }
 }
 
@@ -24645,7 +24653,7 @@ fn live_pid(pid: u32) -> LivePid {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ProviderActivity {
     lines: Vec<String>,
     context_tokens: Option<u64>,
@@ -24663,18 +24671,89 @@ struct ProviderJsonlLogSpec {
     file_glob: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct ProviderJsonlActivityScan {
+    activity: ProviderActivity,
+    matched_path: Option<PathBuf>,
+    matched_modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Default)]
+struct AttachProviderLogScanCache {
+    last_scan_at: Option<Instant>,
+    matched_path: Option<PathBuf>,
+    matched_modified: Option<SystemTime>,
+    activity: ProviderActivity,
+    root_scan_count: usize,
+}
+
+const PROVIDER_LOG_SCAN_FRESHNESS: Duration = Duration::from_secs(5);
+const PROVIDER_LOG_SCAN_DELAY_WITH_FLIGHT: Duration = Duration::from_secs(30);
+
+impl AttachProviderLogScanCache {
+    fn refresh(
+        &mut self,
+        state: &deadreckon_core::PipelineState,
+        spec: &ProviderJsonlLogSpec,
+        flight_has_lines: bool,
+        now: Instant,
+    ) -> ProviderActivity {
+        if flight_has_lines && self.last_scan_at.is_none() && self.activity.lines.is_empty() {
+            self.last_scan_at = Some(now);
+            return self.activity.clone();
+        }
+        let window = if flight_has_lines {
+            PROVIDER_LOG_SCAN_DELAY_WITH_FLIGHT
+        } else {
+            PROVIDER_LOG_SCAN_FRESHNESS
+        };
+        let changed = self.matched_log_changed();
+        let due = self
+            .last_scan_at
+            .is_none_or(|last_scan| now.duration_since(last_scan) >= window);
+        if !changed && !due {
+            return self.activity.clone();
+        }
+
+        self.root_scan_count = self.root_scan_count.saturating_add(spec.roots.len().max(1));
+        let scan = collect_jsonl_provider_activity_scan(state, spec);
+        self.last_scan_at = Some(now);
+        self.matched_path = scan.matched_path;
+        self.matched_modified = scan.matched_modified;
+        self.activity = scan.activity;
+        self.activity.clone()
+    }
+
+    fn matched_log_changed(&self) -> bool {
+        let Some(path) = self.matched_path.as_ref() else {
+            return false;
+        };
+        fs::metadata(path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            != self.matched_modified
+    }
+}
+
 fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> ProviderActivity {
     collect_provider_activity_from_flight(state, collect_flight_provider_activity(state))
 }
 
 fn collect_provider_activity_from_flight(
     state: &deadreckon_core::PipelineState,
-    mut flight: ProviderActivity,
+    flight: ProviderActivity,
 ) -> ProviderActivity {
     let Some(spec) = provider_jsonl_log_spec(state) else {
         return flight;
     };
     let fallback = collect_jsonl_provider_activity(state, &spec);
+    combine_provider_activity(flight, fallback)
+}
+
+fn combine_provider_activity(
+    mut flight: ProviderActivity,
+    fallback: ProviderActivity,
+) -> ProviderActivity {
     if flight.lines.is_empty() {
         return fallback;
     }
@@ -24768,6 +24847,13 @@ fn collect_jsonl_provider_activity(
     state: &deadreckon_core::PipelineState,
     spec: &ProviderJsonlLogSpec,
 ) -> ProviderActivity {
+    collect_jsonl_provider_activity_scan(state, spec).activity
+}
+
+fn collect_jsonl_provider_activity_scan(
+    state: &deadreckon_core::PipelineState,
+    spec: &ProviderJsonlLogSpec,
+) -> ProviderJsonlActivityScan {
     let working_dirs = run_working_dirs(state);
     let mut candidates = Vec::new();
     for root in &spec.roots {
@@ -24792,9 +24878,15 @@ fn collect_jsonl_provider_activity(
             continue;
         }
         append_provider_log_line(&mut activity, &path);
-        return cap_provider_activity(activity, 240);
+        return ProviderJsonlActivityScan {
+            activity: cap_provider_activity(activity, 240),
+            matched_modified: fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok()),
+            matched_path: Some(path),
+        };
     }
-    ProviderActivity::default()
+    ProviderJsonlActivityScan::default()
 }
 
 fn run_working_dirs(state: &deadreckon_core::PipelineState) -> Vec<String> {
@@ -28023,30 +28115,31 @@ mod self_improve_pr_tests {
 #[cfg(test)]
 mod tui_tests {
     use std::io::Write;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachActionNotice,
         AttachJsonlTail, AttachLive, AttachLoopStage, AttachNarrativeRefreshState, AttachPanel,
         AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachPlanNarrativeRefreshJob,
-        AttachProviderActivityCache, AttachSurface, AttachTickBudget, AttachTickTiming,
-        AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG, ChainAttachTuiState,
-        CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS, LiveFile,
-        NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker, NarrativeRefreshKind,
-        NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent, PlanNarrativeRefreshInput,
-        ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines,
-        attach_banner, attach_header_text, attach_live_inventory, attach_loop_stage_work,
-        attach_should_return_to_plan, cancel_plan_narrative_refresh_job, chain_activity_lines,
-        chain_attach_footer_text, chain_attach_header_text, chain_narrative_refusal_text,
-        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
-        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
-        command_discovery, completion_action_from_input, completion_hints_enabled,
-        deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
-        implementation_plan_warnings, kill_banner, live_file_lines, markdown_to_tui_lines,
-        max_panel_scroll, meter_color, narrative_provider_selection, orchestration_dependency_rows,
-        orchestration_parallelism_lines, orchestration_provider_role_rows,
-        orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
-        plan_merge_repair_summary_items, plan_narrative_refresh_request,
+        AttachProviderActivityCache, AttachProviderLogScanCache, AttachSurface, AttachTickBudget,
+        AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG,
+        ChainAttachTuiState, CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS,
+        LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
+        NarrativeRefreshKind, NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent,
+        PlanNarrativeRefreshInput, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
+        acceptance_activity_lines, attach_banner, attach_header_text, attach_live_inventory,
+        attach_loop_stage_work, attach_should_return_to_plan, cancel_plan_narrative_refresh_job,
+        chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
+        chain_narrative_refusal_text, chain_should_auto_attach, chain_step_dot,
+        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
+        cli_wait_status_line, collect_jsonl_provider_activity,
+        collect_jsonl_provider_activity_scan, command_discovery, completion_action_from_input,
+        completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
+        doc_polish_preview_text, implementation_plan_warnings, kill_banner, live_file_lines,
+        markdown_to_tui_lines, max_panel_scroll, meter_color, narrative_provider_selection,
+        orchestration_dependency_rows, orchestration_parallelism_lines,
+        orchestration_provider_role_rows, orchestration_role_table_lines, per_step_wall_cap,
+        plan_attach_footer, plan_merge_repair_summary_items, plan_narrative_refresh_request,
         plan_narrative_refresh_trigger, provider_ingest_base_roots, provider_jsonl_activity_lines,
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
@@ -28573,6 +28666,101 @@ mod tui_tests {
         assert_eq!(cache.refresh(&state).lines.len(), 2);
     }
 
+    #[test]
+    fn provider_activity_does_not_rescan_roots_each_tick() {
+        let (_run_temp, state) = doc_preview_state();
+        let temp = test_tempdir();
+        let root = temp.path();
+        let log = root.join("session.jsonl");
+        write_codex_provider_log(&log, &state.working_dir, "first");
+        let spec = provider_log_spec(root, &state);
+        let mut cache = AttachProviderLogScanCache::default();
+        let now = Instant::now();
+
+        let first = cache.refresh(&state, &spec, false, now);
+        let second = cache.refresh(&state, &spec, false, now + Duration::from_secs(1));
+
+        assert_eq!(cache.root_scan_count, 1);
+        assert_eq!(first.lines, second.lines);
+        assert!(first.lines.iter().any(|line| line.contains("agent first")));
+    }
+
+    #[test]
+    fn provider_activity_prefers_flight_rows_over_fallback_scan() {
+        let (_run_temp, state) = doc_preview_state();
+        let temp = test_tempdir();
+        let root = temp.path();
+        write_codex_provider_log(&root.join("session.jsonl"), &state.working_dir, "fallback");
+        let spec = provider_log_spec(root, &state);
+        let mut cache = AttachProviderLogScanCache::default();
+
+        let activity = cache.refresh(&state, &spec, true, Instant::now());
+
+        assert_eq!(cache.root_scan_count, 0);
+        assert!(activity.lines.is_empty());
+    }
+
+    #[test]
+    fn provider_activity_fallback_scan_respects_freshness_and_cwd() {
+        let (_run_temp, state) = doc_preview_state();
+        let temp = test_tempdir();
+        let root = temp.path();
+        write_codex_provider_log(
+            &root.join("wrong.jsonl"),
+            std::path::Path::new("/elsewhere"),
+            "wrong",
+        );
+        write_codex_provider_log(&root.join("right.jsonl"), &state.working_dir, "right");
+        let spec = provider_log_spec(root, &state);
+
+        let scan = collect_jsonl_provider_activity_scan(&state, &spec);
+
+        assert!(
+            scan.matched_path
+                .as_ref()
+                .is_some_and(|path| path.ends_with("right.jsonl"))
+        );
+        assert!(
+            scan.activity
+                .lines
+                .iter()
+                .any(|line| line.contains("agent right"))
+        );
+        assert!(
+            !scan
+                .activity
+                .lines
+                .iter()
+                .any(|line| line.contains("agent wrong"))
+        );
+    }
+
+    #[test]
+    fn provider_activity_cache_invalidates_when_matching_log_changes() {
+        let (_run_temp, state) = doc_preview_state();
+        let temp = test_tempdir();
+        let root = temp.path();
+        let log = root.join("session.jsonl");
+        write_codex_provider_log(&log, &state.working_dir, "first");
+        let spec = provider_log_spec(root, &state);
+        let mut cache = AttachProviderLogScanCache::default();
+        let now = Instant::now();
+
+        let first = cache.refresh(&state, &spec, false, now);
+        std::thread::sleep(Duration::from_millis(20));
+        append_codex_agent_message(&log, "second");
+        let second = cache.refresh(&state, &spec, false, now + Duration::from_secs(1));
+
+        assert_eq!(cache.root_scan_count, 2);
+        assert!(first.lines.iter().any(|line| line.contains("agent first")));
+        assert!(
+            second
+                .lines
+                .iter()
+                .any(|line| line.contains("agent second"))
+        );
+    }
+
     fn append_jsonl_raw(path: &std::path::Path, raw: &str) {
         append_raw(path, &format!("{raw}\n"));
     }
@@ -28643,6 +28831,46 @@ mod tui_tests {
             usage,
             checkpoint_id: None,
         }
+    }
+
+    fn provider_log_spec(
+        root: &std::path::Path,
+        state: &deadreckon_core::PipelineState,
+    ) -> ProviderJsonlLogSpec {
+        ProviderJsonlLogSpec {
+            schema: "codex-cli".to_string(),
+            roots: vec![root.to_path_buf()],
+            since: state.started_at - ChronoDuration::minutes(1),
+            cwd_match: IngestCwdMatch::SessionMeta,
+            cwd_match_path: None,
+            storage: IngestStorage::Jsonl,
+            file_glob: None,
+        }
+    }
+
+    fn write_codex_provider_log(path: &std::path::Path, cwd: &std::path::Path, message: &str) {
+        append_jsonl_value(
+            path,
+            &serde_json::json!({
+                "type": "session_meta",
+                "payload": { "cwd": cwd.to_string_lossy() },
+            }),
+        );
+        append_codex_agent_message(path, message);
+    }
+
+    fn append_codex_agent_message(path: &std::path::Path, message: &str) {
+        append_jsonl_value(
+            path,
+            &serde_json::json!({
+                "timestamp": "2026-05-26T00:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": message,
+                },
+            }),
+        );
     }
 
     fn line_text(line: &Line<'_>) -> String {
