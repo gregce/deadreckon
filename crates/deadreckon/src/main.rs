@@ -293,6 +293,10 @@ async fn main_inner() -> Result<()> {
             mode,
             preview,
             yes,
+            fresh,
+            worktree,
+            from,
+            allow_dirty,
             plain,
             quiet,
             json,
@@ -303,6 +307,10 @@ async fn main_inner() -> Result<()> {
                 mode,
                 preview,
                 yes,
+                fresh,
+                worktree,
+                from,
+                allow_dirty,
                 plain,
                 quiet,
                 json,
@@ -1752,12 +1760,18 @@ impl StartDoneCriteriaSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartSourceMode {
+    Worktree,
+    Copy,
+    Fresh,
     Missing,
 }
 
 impl StartSourceMode {
     fn label(self) -> &'static str {
         match self {
+            Self::Worktree => "worktree",
+            Self::Copy => "copy",
+            Self::Fresh => "fresh",
             Self::Missing => "missing",
         }
     }
@@ -1967,13 +1981,29 @@ fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFa
     }
 }
 
-fn resolve_start_setup(decision: &mut StartLaunchDecision) -> Result<()> {
+fn resolve_start_setup(decision: &mut StartLaunchDecision, args: &StartCommandArgs) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
     resolve_start_provider(decision, &paths, &defaults)?;
+    if decision.recovery.is_some() {
+        return Ok(());
+    }
+    let cwd = std::env::current_dir()?;
+    resolve_start_done_criteria(decision, &cwd)?;
     if decision.recovery.is_none() {
-        let cwd = std::env::current_dir()?;
-        resolve_start_done_criteria(decision, &cwd)?;
+        resolve_start_source_mode(
+            decision,
+            &paths,
+            &cwd,
+            StartSourceModeRequest {
+                fresh: args.fresh,
+                worktree: args.worktree,
+                from: args.from.as_deref(),
+                allow_dirty: args.allow_dirty,
+                stdin_is_tty: io::stdin().is_terminal(),
+                preview: args.preview,
+            },
+        )?;
     }
     Ok(())
 }
@@ -2055,6 +2085,162 @@ fn resolve_start_done_criteria(decision: &mut StartLaunchDecision, cwd: &Path) -
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StartSourceModeRequest<'a> {
+    fresh: bool,
+    worktree: bool,
+    from: Option<&'a Path>,
+    allow_dirty: bool,
+    stdin_is_tty: bool,
+    preview: bool,
+}
+
+fn resolve_start_source_mode(
+    decision: &mut StartLaunchDecision,
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+    request: StartSourceModeRequest<'_>,
+) -> Result<()> {
+    let mut flags = ModeFlags {
+        fresh: request.fresh,
+        worktree: request.worktree,
+        from: request.from.map(PathBuf::from),
+        in_place: false,
+        i_know_its_a_lot: false,
+    };
+    let explicit_mode = flags.fresh || flags.worktree || flags.from.is_some();
+    if !explicit_mode && deadreckon_core::find_git_root(cwd)?.is_none() {
+        if request.stdin_is_tty && !request.preview {
+            match prompt_start_non_git_mode()? {
+                StartNonGitChoice::Init => {
+                    decision.source_mode = StartSourceMode::Missing;
+                    decision.source_mode_label = "git init selected".to_string();
+                    set_start_recovery(
+                        decision,
+                        "source mode needs git before worktree launch",
+                        vec![format!(
+                            "git init && deadreckon start \"{}\"",
+                            shell_display_quote(&decision.goal)
+                        )],
+                    );
+                    return Ok(());
+                }
+                StartNonGitChoice::Copy => flags.from = Some(cwd.to_path_buf()),
+                StartNonGitChoice::Fresh => flags.fresh = true,
+                StartNonGitChoice::Cancel => {
+                    set_start_recovery(
+                        decision,
+                        "guided start cancelled before choosing a source mode",
+                        vec![format!(
+                            "deadreckon start \"{}\"",
+                            shell_display_quote(&decision.goal)
+                        )],
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            decision.source_mode = StartSourceMode::Missing;
+            decision.source_mode_label = "missing source mode".to_string();
+            set_start_recovery(
+                decision,
+                "non-interactive without a source mode",
+                vec![
+                    format!(
+                        "deadreckon start \"{}\" --from .",
+                        shell_display_quote(&decision.goal)
+                    ),
+                    format!(
+                        "deadreckon start \"{}\" --fresh",
+                        shell_display_quote(&decision.goal)
+                    ),
+                    "git init".to_string(),
+                ],
+            );
+            return Ok(());
+        }
+    }
+
+    let resolved_mode = resolve_mode(&flags, cwd, request.stdin_is_tty)?;
+    match resolved_mode {
+        ResolvedMode::Worktree { source_path, .. } => {
+            match prepare_worktree_record(
+                paths,
+                WorktreeOptions {
+                    run_id: Uuid::new_v4().simple().to_string(),
+                    task_key: deadreckon_core::paths::task_key(&decision.goal),
+                    source_path: source_path.clone(),
+                    base_ref: None,
+                    branch_name: None,
+                    allow_dirty: request.allow_dirty,
+                },
+            ) {
+                Ok(_) => {
+                    decision.source_mode = StartSourceMode::Worktree;
+                    decision.source_mode_label = format!("worktree from {}", source_path.display());
+                }
+                Err(DeadreckonError::InvalidInput(message))
+                    if message.contains("working tree has uncommitted changes") =>
+                {
+                    decision.source_mode = StartSourceMode::Worktree;
+                    decision.source_mode_label = "dirty worktree".to_string();
+                    set_start_recovery(
+                        decision,
+                        message.lines().next().unwrap_or("working tree is dirty"),
+                        vec![
+                            format!(
+                                "git stash && deadreckon start \"{}\"",
+                                shell_display_quote(&decision.goal)
+                            ),
+                            format!(
+                                "deadreckon start \"{}\" --allow-dirty",
+                                shell_display_quote(&decision.goal)
+                            ),
+                        ],
+                    );
+                }
+                Err(err) => return Err(CliError::Core(err)),
+            }
+        }
+        ResolvedMode::Copy { source_path } => {
+            decision.source_mode = StartSourceMode::Copy;
+            decision.source_mode_label = format!("copy from {}", source_path.display());
+        }
+        ResolvedMode::Fresh => {
+            decision.source_mode = StartSourceMode::Fresh;
+            decision.source_mode_label = "fresh".to_string();
+        }
+        ResolvedMode::InPlace { source_path } => {
+            decision.source_mode = StartSourceMode::Copy;
+            decision.source_mode_label = format!("in-place from {}", source_path.display());
+        }
+    }
+    Ok(())
+}
+
+enum StartNonGitChoice {
+    Init,
+    Copy,
+    Fresh,
+    Cancel,
+}
+
+fn prompt_start_non_git_mode() -> Result<StartNonGitChoice> {
+    eprintln!("deadreckon start: this is not a git repo. choose source mode:");
+    eprintln!("  [1] git init, then use worktree mode");
+    eprintln!("  [2] copy current directory into a run workspace");
+    eprintln!("  [3] fresh empty workspace");
+    eprintln!("  [4] cancel");
+    let answer = prompt::open("choose [1]: ", None)?;
+    Ok(match answer.trim() {
+        "" | "1" => StartNonGitChoice::Init,
+        "2" => StartNonGitChoice::Copy,
+        "3" => StartNonGitChoice::Fresh,
+        "4" => StartNonGitChoice::Cancel,
+        _ => StartNonGitChoice::Cancel,
+    })
+}
+
 fn set_start_recovery(
     decision: &mut StartLaunchDecision,
     message: impl Into<String>,
@@ -2090,7 +2276,7 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
         requested_mode: args.mode,
         stdin_is_tty: io::stdin().is_terminal(),
     });
-    resolve_start_setup(&mut decision)?;
+    resolve_start_setup(&mut decision, &args)?;
     if args.json {
         let next_actions = if decision.recovery.is_some() {
             decision.try_lines.clone()

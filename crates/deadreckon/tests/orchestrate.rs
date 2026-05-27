@@ -3,7 +3,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use chrono::Utc;
 use deadreckon_core::lock::lock_path;
@@ -405,6 +405,89 @@ fn start_missing_done_criteria_suggests_def_done_in_non_tty() {
     assert!(err.contains("done criteria"), "{err}");
     assert!(err.contains("try: deadreckon def-done"), "{err}");
     assert!(err.contains("deadreckon start \"build the app\""), "{err}");
+}
+
+#[test]
+fn start_non_git_non_tty_refuses_with_source_mode_try_lines() {
+    let temp = TempDir::new().expect("tempdir");
+    let source = temp.path().join("plain");
+    fs::create_dir_all(&source).expect("source");
+    fs::write(source.join("README.md"), "hello").expect("readme");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &source);
+
+    let output = deadreckon(&paths)
+        .current_dir(&source)
+        .args(["start", "build the app", "--plain"])
+        .output()
+        .expect("start non git");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("non-interactive without a source mode"),
+        "{err}"
+    );
+    assert!(
+        err.contains("try: deadreckon start \"build the app\" --from ."),
+        "{err}"
+    );
+    assert!(
+        err.contains("try: deadreckon start \"build the app\" --fresh"),
+        "{err}"
+    );
+    assert!(err.contains("try: git init"), "{err}");
+}
+
+#[test]
+fn start_non_git_tty_can_choose_init_git_copy_or_fresh() {
+    let temp = TempDir::new().expect("tempdir");
+    let source = temp.path().join("plain");
+    fs::create_dir_all(&source).expect("source");
+    fs::write(source.join("README.md"), "hello").expect("readme");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &source);
+
+    let output = deadreckon_pty(
+        &paths,
+        &source,
+        "3\n",
+        &["start", "build the app", "--plain"],
+    );
+
+    assert_success(&output);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(text.contains("git init"), "{text}");
+    assert!(text.contains("copy current directory"), "{text}");
+    assert!(text.contains("fresh empty workspace"), "{text}");
+    assert!(output_row_contains(&text, "workspace", "fresh"), "{text}");
+}
+
+#[test]
+fn start_dirty_git_reuses_allow_dirty_guidance() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    fs::write(repo.join("dirty.txt"), "dirty").expect("dirty");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["start", "build the app", "--plain"])
+        .output()
+        .expect("start dirty repo");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("working tree has uncommitted changes"),
+        "{err}"
+    );
+    assert!(
+        err.contains("try: git stash && deadreckon start \"build the app\""),
+        "{err}"
+    );
+    assert!(err.contains("--allow-dirty"), "{err}");
 }
 
 #[test]
@@ -5109,6 +5192,56 @@ fn write_fake_path_binary(root: &std::path::Path, name: &str, body: &str) {
         .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&binary, perms).expect("fake binary chmod");
+}
+
+fn write_start_ready_setup(paths: &DeadreckonPaths, root: &std::path::Path) {
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(paths.config_path(), "default_provider = \"smoke\"\n").expect("config");
+    fs::create_dir_all(root.join(".deadreckon")).expect("acceptance dir");
+    fs::write(
+        root.join(".deadreckon/acceptance.yaml"),
+        "name: start ready\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("acceptance");
+}
+
+fn deadreckon_pty(
+    paths: &DeadreckonPaths,
+    cwd: &std::path::Path,
+    input: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let command = std::iter::once(env!("CARGO_BIN_EXE_deadreckon").to_string())
+        .chain(args.iter().map(|arg| arg.to_string()))
+        .map(|part| tcl_brace_quote(&part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let answer = input.trim_end_matches('\n').to_string() + "\r";
+    let script = format!(
+        "set timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\nspawn {}\nexpect -re {{choose \\[1\\]:}}\nsend -- \"{}\"\nexpect -re {{workspace[[:space:]]*: fresh}}\nexit 0\n",
+        tcl_brace_quote(&cwd.display().to_string()),
+        tcl_brace_quote(&paths.home().display().to_string()),
+        command,
+        tcl_string_escape(&answer)
+    );
+    Command::new("expect")
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("expect")
+}
+
+fn tcl_brace_quote(value: &str) -> String {
+    format!("{{{}}}", value.replace('\\', "\\\\").replace('}', "\\}"))
+}
+
+fn tcl_string_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
 }
 
 fn write_fake_merge_repair_provider(

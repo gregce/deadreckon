@@ -587,6 +587,21 @@ pub(crate) enum Commands {
         preview: bool,
         #[arg(long, help = "Confirm the launch preview without prompting")]
         yes: bool,
+        #[arg(long, help = "Start from an empty workspace")]
+        fresh: bool,
+        #[arg(long, help = "Force a git worktree source mode")]
+        worktree: bool,
+        #[arg(
+            long = "from",
+            value_name = "PATH",
+            help = "Copy this source directory into runstate before launching"
+        )]
+        from: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Allow uncommitted source changes when using worktree mode"
+        )]
+        allow_dirty: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
         #[arg(long, help = "Suppress success chatter and post-action hints")]
@@ -2076,6 +2091,10 @@ pub(crate) struct StartCommandArgs {
     pub(crate) mode: CliStartMode,
     pub(crate) preview: bool,
     pub(crate) yes: bool,
+    pub(crate) fresh: bool,
+    pub(crate) worktree: bool,
+    pub(crate) from: Option<PathBuf>,
+    pub(crate) allow_dirty: bool,
     pub(crate) plain: bool,
     pub(crate) quiet: bool,
     pub(crate) json: bool,
