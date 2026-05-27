@@ -669,6 +669,40 @@ fn narrator_subskill_prompts_require_doc_depth_contracts() {
     assert!(decisions.contains("decisions"));
 }
 
+#[test]
+fn as_built_documents_nonblocking_attach_contract() {
+    let as_built = repo_file("docs/AS-BUILT-ARCHITECTURE.md");
+
+    assert!(as_built.contains("Data source and responsiveness contract"));
+    assert!(as_built.contains("The render path is pure"));
+    assert!(as_built.contains("background jobs"));
+    assert!(as_built.contains("AttachJsonlTail"));
+    assert!(as_built.contains("PlanEventBus"));
+    assert!(as_built.contains("chain-events.jsonl"));
+    assert!(as_built.contains("stale narrative snapshots survive redraw"));
+}
+
+#[test]
+fn changelog_mentions_tui_responsiveness_alpha_slice() {
+    let changelog = repo_file("CHANGELOG.md");
+
+    assert!(changelog.contains("## TUI Responsiveness (alpha) - 2026-05-26"));
+    assert!(changelog.contains("background job"));
+    assert!(changelog.contains("incremental chain activity tailing"));
+    assert!(changelog.contains("known limits"));
+    assert!(changelog.contains("no attach daemon"));
+}
+
+#[test]
+fn v1_candidates_records_out_of_scope_attach_daemon() {
+    let candidates = repo_file("docs/V1-CANDIDATES.md");
+
+    assert!(candidates.contains("Attach responsiveness platform"));
+    assert!(candidates.contains("long-lived attach daemon"));
+    assert!(candidates.contains("shared broadcaster"));
+    assert!(candidates.contains("diagnostic dashboard"));
+}
+
 fn append_component_turn(state: &deadreckon_core::PipelineState, file: &str) {
     append_turn_doc(
         state,
@@ -695,6 +729,15 @@ fn repo_skill_path(skill: &str) -> std::path::PathBuf {
 
 fn repo_skill(skill: &str) -> String {
     fs::read_to_string(repo_skill_path(skill)).expect("skill")
+}
+
+fn repo_file(path: &str) -> String {
+    fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path),
+    )
+    .expect(path)
 }
 
 fn repo_tempdir() -> TempDir {

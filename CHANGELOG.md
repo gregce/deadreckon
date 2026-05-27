@@ -12,6 +12,7 @@
 - Added run and plan narrative projection caches for attach rendering so redraws reuse covered projections, preserve stale provider snapshots, and avoid appending narrative snapshots from render paths.
 - Added incremental chain activity tailing for chain attach, including partial-line tolerance and status hints when event reads fall behind.
 - Added focused responsiveness smokes for slow narrative refreshes, large worktrees, and max-size chain timelines without invoking full release or stress suites.
+- Documented the TUI responsiveness alpha contract and known limits: no attach daemon, no shared cross-surface broadcaster, and no diagnostic dashboard yet.
 
 ## Narrative Attach (alpha) - 2026-05-26
 

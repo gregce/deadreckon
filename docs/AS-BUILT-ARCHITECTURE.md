@@ -108,8 +108,8 @@ Why this shape works:
 
 - Edition `2024`, resolver `3`, workspace version `0.1.0`.
 - Five workspace members:
-  - `crates/deadreckon-core` — library for durable state, artifacts, gates, docs, locks, chains, and codebase-mode primitives.
-  - `crates/deadreckon-runtime` — library for provider/sandbox orchestration, the turn loop, and doc polish.
+  - `crates/deadreckon-core` — library for durable state, artifacts, gates, docs, locks, chains, plans, codebase modes, the provider flight recorder, and learning primitives.
+  - `crates/deadreckon-runtime` — library for provider/sandbox orchestration, the turn loop, doc polish, and the provider flight recorder.
   - `crates/deadreckon-providers` — library for provider config, adapters, and fallback routing.
   - `crates/deadreckon-sandbox` — library for platform-native sandbox backends and per-tool policy.
   - `crates/deadreckon` — binary (`deadreckon`) + binary (`dr-gate` at `src/bin/dr-gate.rs`).
@@ -120,18 +120,26 @@ Why this shape works:
 
 | Module | Purpose |
 |---|---|
-| `state.rs` | `PipelineState`, `RunStatus`, `PhaseId`, `PhaseState`, `create_run`, `load_run`, atomic writes |
-| `paths.rs` | `DeadreckonPaths`, `workspace_scope`, `task_key`, all path resolution |
-| `lock.rs` | `LockState`, file locks via `fs2`, PID liveness via `nix::kill(pid, 0)`, heartbeat |
-| `promotion.rs` | `promote_completed_run`, manifest writing, atomic working→library swap, crash recovery |
-| `gate.rs` | `AcceptanceMarker`, signature validation, anti-self-attestation |
-| `artifacts.rs` | `copy_tree`, `snapshot_working`, `append_{spend,trace,provenance}` |
-| `cancel.rs` | cancellation markers and run-root cancel checks |
-| `chain.rs` | autonomous goal-chain records and conductor state |
-| `codebase.rs` | worktree/copy/fresh/in-place mode records and source materialization |
-| `docs.rs` | deterministic run-doc templates, frontmatter, inventory, and promotion copies |
-| `events.rs` | `RunEvent`, `RunEventBus`, `tokio::sync::broadcast` channel |
-| `error.rs` | `DeadreckonError`, `Result<T>` |
+| `artifacts.rs` | `copy_tree`, `snapshot_working`, `restore_snapshot`, `append_{spend,trace,provenance}`, `inventory_files` |
+| `cancel.rs` | `CancelMarker`, `write_cancel_marker`, `cancel_marker_present`, run-root cancel checks |
+| `chain.rs` | autonomous goal-chain records, `ChainStatus`, `ChainStep`, `ConductorState`, chain event bus |
+| `codebase.rs` | `CodebaseMode`, `CodebaseRecord`, worktree/copy/fresh/in-place materialization, `create_worktree` |
+| `docs.rs` | run-doc templates (`RUN_NARRATIVE`, `RUN_AS_BUILT`, `RUN_DECISIONS`), frontmatter, inventory, delta JSONL, polish records |
+| `error.rs` | `DeadreckonError`, `Result<T>`, `is_retryable()`, `is_fatal()` |
+| `events.rs` | `RunEvent`, `RunEventBus`, `RunEventKind`, `tokio::sync::broadcast` channel, JSONL emit |
+| `flight.rs` | `FlightManifest`, `FlightSession`, checkpoint policy, provider-log capture, rewind events (`flight-manifest.json`, `flight-events.jsonl`, `rewind-events.jsonl`, `checkpoints/`) |
+| `gate.rs` | `AcceptanceMarker`, `AcceptanceSpec`, `AcceptanceCheck`, signature validation, anti-self-attestation, progress JSONL |
+| `git.rs` | `run_git`, `git_command`, `hardened_git_prefix`/`hardened_git_argv` — gpg-sign disabling for commit-family verbs |
+| `glossary.rs` | user-facing display vocabulary for all status enums (`RunStatus`, `PhaseStatus`, `ChainStatus`, `PlanStatus`, …) |
+| `install_receipt.rs` | `Receipt`, `Channel`, install receipt at `~/.deadreckon/install-receipt.json`, channel detection |
+| `learning.rs` | learning episodes, signals, insights, proposals, candidates, evals, PR events; files under `~/.deadreckon/learning/` |
+| `lock.rs` | `LockState`, `LockGuard`, `acquire_lock`, `heartbeat`, `pid_is_alive` via `nix::kill`, stale detection |
+| `paths.rs` | `DeadreckonPaths`, `workspace_scope`, `task_key`, all runtime path resolution including `plans_*`, `chains_*`, `learning_*` |
+| `plan.rs` | `Plan`, `PlanTask`, `PlanStatus`, `CoordinatorState`, worker specs, summaries, plan event bus |
+| `polish_subcalls.rs` | `PolishSubcallRecord`, `DocProviderSelection`, `DocProviderSource`, `DEFAULT_DOC_SUBSKILLS` (4 narrator skills) |
+| `promotion.rs` | `PromotionManifest`, `promote_completed_run`, manifest writing, atomic staging→library rename, crash recovery |
+| `state.rs` | `PipelineState`, `RunStatus`, `PhaseId`, `PhaseState`, `create_run`, `load_run`, `atomic_write_json`, `append_json_line` |
+| `update_cache.rs` | `Cache`, `update-check.json` at `~/.deadreckon/`, 24-hour TTL staleness check |
 
 **`deadreckon-runtime` (`crates/deadreckon-runtime/src/lib.rs`).** The orchestration layer that depends on core, providers, and sandbox.
 
@@ -139,6 +147,8 @@ Why this shape works:
 |---|---|
 | `turn_loop.rs` | `RunLoopConfig`, `RunLoopOutcome`, `run_turn_loop`, model action parsing, tool dispatch, cancellation, acceptance, and promotion |
 | `polish.rs` | `polish_run_docs`, `PolishConfig`, skill resolution, polish input hashing, and nonfatal doc-provider polish |
+| `flight.rs` | `ProviderFlightRecorder` — spawns a per-CLI-turn sidecar that polls provider logs + the working tree and writes flight events/checkpoints |
+| `error.rs` | runtime `Error` / `Result<T>` |
 
 **`deadreckon-providers` (`crates/deadreckon-providers/src/lib.rs`).** A facade that re-exports the `Provider` trait, config types, HTTP adapter, smoke adapter, and router while keeping implementation modules private.
 
@@ -153,6 +163,9 @@ Why this shape works:
 | `cli_claude_code.rs` | `CliClaudeCodeProvider` — shells `claude --dangerously-skip-permissions -p` |
 | `cli_codex.rs` | `CliCodexProvider` — shells `codex --ask-for-approval never exec --skip-git-repo-check --sandbox <mode>` |
 | `cli_common.rs` | shared subprocess + allowlist machinery |
+| `cli_generic.rs` | `GenericCliProvider` — descriptor-template CLI adapter for registered `cli:*` providers |
+| `registry/mod.rs` | `ProviderRegistry`, `ProviderDescriptor`, compiled-in TOML descriptors + `providers.d` overrides, probe logic |
+| `taxonomy.rs` | provider categorization + normalized tool-label taxonomy |
 
 **`deadreckon-sandbox` (`crates/deadreckon-sandbox/src/lib.rs`).** A facade over sandbox backend resolution, command construction, policy, doctor checks, and subprocess supervision.
 
@@ -165,7 +178,7 @@ Why this shape works:
 | `doctor.rs` | backend availability checks |
 | `process.rs` | `run(SandboxSpec) -> SandboxRunOutput`, PID files, cancellation, SIGTERM/SIGKILL escalation |
 
-**`deadreckon` (`crates/deadreckon/src/cli.rs`, `crates/deadreckon/src/main.rs`, and `crates/deadreckon/src/bin/dr-gate.rs`).** Clap parser definitions, command handlers, ratatui TUI for `attach`, and `dr-gate` as a standalone acceptance-marker writer.
+**`deadreckon` (binary crate, `crates/deadreckon/src/`).** Clap parser definitions (`cli.rs`), command handlers and the ratatui TUIs for run/chain/plan `attach` (`main.rs`, ~31k lines), and `dr-gate` as a standalone acceptance-marker writer (`bin/dr-gate.rs`). Supporting modules: `narrative.rs` (deterministic + provider-backed narrative projection), `plan_event_bus.rs` (`PlanEventBus`/`PlanEventFeed`), `tui_events.rs` (`TuiEventFeed`), `ui.rs` + `ui_card.rs` + `cards/` (CLI/TUI rendering vocabulary and cards), `setup.rs` (provider/done-criteria resolution), `prompt.rs` (confirmation prompts), and `sleep.rs` (sleep-prevention).
 
 ### 2.3 Top-level documentation
 
@@ -174,15 +187,20 @@ Why this shape works:
 - `CHANGELOG.md` — version history.
 - `DEPENDENCIES.md` — Tier 1/2/3 rationale per dependency policy.
 - `HOWTO.md` — usage guide.
+- `docs/AS-BUILT-ARCHITECTURE.md` — this file.
+- `docs/AUDIT-2026-05-11.md` — 2026-05-11 audit findings.
+- `docs/DEVELOPMENT-README.md` — preserved developer-oriented README notes.
 - `docs/GAP-ANALYSIS.md` — outstanding gaps vs. requirements.
 - `docs/MULTI-RUN.md` — multi-run sequencing semantics.
+- `docs/RELEASE.md` — release runbook.
 - `docs/RESUME-SEMANTICS.md` — resume behavior.
 - `docs/V1-CANDIDATES.md` — deferred features.
-- `docs/goals/` — eight dated goal/rider documents.
+- `docs/design/` — supplemental design docs (`PROVIDER-CLI-INGEST.md`, `USER-FACING-MATRIX.md`).
+- `docs/goals/` — 30 dated goal+rider pairs (60 files).
 
 ### 2.4 Skills
 
-`/Users/gdc/deadreckon/skills/default-coding/SKILL.md` is a single Markdown skill loaded at runtime. The skill is opaque to the binary; the run records `skill_name` + `skill_path` in `PipelineState` and includes the skill in the prompt frame. Skill swapping is in scope but only one skill ships today.
+`/Users/gdc/deadreckon/skills/default-coding/SKILL.md` is the coding-agent skill loaded at runtime. The skill is opaque to the binary; the run records `skill_name` + `skill_path` in `PipelineState` and includes the skill in the prompt frame. Six skills ship today: `default-coding` (the executor), the four doc-polish narrator subskills used by `polish_subcalls.rs` (`narrator-overview`, `narrator-phases`, `narrator-as-built`, `narrator-decisions`), and `run-narrator` (the legacy single-call doc-polish skill). New skills can be added under `skills/<name>/SKILL.md` and selected with `deadreckon run --skill <name>`.
 
 ### 2.5 External tools used at runtime
 
@@ -206,7 +224,7 @@ deadreckon mirrors the Printing Press split (AS-BUILT §3):
 
 | Layer | Owns | Lives in | Language |
 |---|---|---|---|
-| **Skill** | Agent-facing prose, judgment, prompt frame | `skills/default-coding/SKILL.md` | Markdown |
+| **Skill** | Agent-facing prose, judgment, prompt frame | `skills/<name>/SKILL.md` (6 skills: `default-coding`, four narrator subskills, `run-narrator`) | Markdown |
 | **Binary** | State, locks, sandboxes, providers, gates | `crates/deadreckon*` | Rust |
 
 The skill is invoked indirectly: it sits at the path recorded in `state.skill_path` and is read into the prompt frame by `build_prompt` in `crates/deadreckon-runtime/src/turn_loop.rs`. The binary never reaches into skill internals. New skills can be added under `skills/<name>/SKILL.md` and selected with `deadreckon run --skill <name>`.
@@ -356,24 +374,37 @@ JSONL files (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) 
 /Users/gdc/deadreckon/
 ├── Cargo.toml                    # workspace
 ├── Cargo.lock
-├── README.md / DESIGN.md / CHANGELOG.md / DEPENDENCIES.md / HOWTO.md
+├── README.md / DESIGN.md / CHANGELOG.md / DEPENDENCIES.md / HOWTO.md / RELEASE.md
+├── Makefile / dist-workspace.toml / clippy.toml / rustfmt.toml
 ├── crates/
-│   ├── deadreckon-core/          # durable state, locks, gates, docs, artifacts
-│   ├── deadreckon-runtime/       # provider loop, sandbox dispatch, doc polish
-│   ├── deadreckon-providers/     # provider trait + adapters
+│   ├── deadreckon-core/          # durable state, locks, gates, docs, artifacts, flight, learning, plans, chains
+│   ├── deadreckon-runtime/       # turn loop, sandbox dispatch, doc polish, flight recorder
+│   ├── deadreckon-providers/     # provider trait + adapters + registry/descriptors
 │   ├── deadreckon-sandbox/       # platform-native sandboxes
-│   └── deadreckon/               # CLI binary + dr-gate binary + tests
+│   └── deadreckon/               # CLI binary + dr-gate binary + TUI + tests
 ├── skills/
-│   └── default-coding/SKILL.md
-├── tests/                        # (currently empty; per-crate tests live in each crate)
+│   ├── default-coding/SKILL.md
+│   ├── narrator-overview/SKILL.md
+│   ├── narrator-phases/SKILL.md
+│   ├── narrator-as-built/SKILL.md
+│   ├── narrator-decisions/SKILL.md
+│   └── run-narrator/SKILL.md
+├── npm/                          # npm wrapper + 5 platform packages
+├── release/                      # Homebrew formula patch script
+├── tests/                        # workspace-level guards (hygiene_config, public_surface, smoke_invariant)
 ├── docs/
 │   ├── AS-BUILT-ARCHITECTURE.md  # this file
+│   ├── AUDIT-2026-05-11.md
+│   ├── DEVELOPMENT-README.md
 │   ├── GAP-ANALYSIS.md
 │   ├── MULTI-RUN.md
+│   ├── RELEASE.md
 │   ├── RESUME-SEMANTICS.md
 │   ├── V1-CANDIDATES.md
-│   └── goals/                    # eight dated goal/rider files
-├── demo.cast                     # asciicast of an end-to-end smoke
+│   ├── assets/
+│   ├── design/                   # PROVIDER-CLI-INGEST.md, USER-FACING-MATRIX.md
+│   └── goals/                    # 30 dated goal+rider pairs (60 files)
+├── demo.cast / demo-codebase.cast / demo-self-documenting.cast
 └── target/
 ```
 
@@ -406,22 +437,37 @@ JSONL files (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) 
 │               ├── provenance.jsonl
 │               ├── spend.jsonl
 │               ├── events.jsonl
-│               ├── history.json   # narrative tool-call summaries
-│               └── acceptance.yaml   # optional spec for dr-gate
+│               ├── history.json          # narrative tool-call summaries
+│               ├── acceptance.yaml       # optional spec for dr-gate
+│               ├── flight-manifest.json  # provider flight recorder manifest
+│               ├── flight-events.jsonl   # normalized provider-native rows
+│               ├── rewind-events.jsonl   # rewind preview/apply/refusal log
+│               ├── checkpoints/
+│               │   └── <checkpoint-id>/  # delta checkpoint (files/ + manifest.json)
+│               └── narrative/            # attach narrative projection (state.json, snapshots.jsonl, architecture-graph.json)
 ├── locks/
 │   └── <scope>--<task_key>.lock   # one lock per task
-└── library/
-    └── <scope>/
-        └── <run_id>/
-            ├── manifest.json      # PromotionManifest
-            └── ...                # promoted working tree
+├── library/
+│   └── <scope>/
+│       └── <run_id>/
+│           ├── manifest.json      # PromotionManifest
+│           └── ...                # promoted working tree
+├── chains/
+│   └── <chain-id>/                # chain.json, chain-events.jsonl, conductor.json
+├── plans/
+│   └── <plan-id>/                 # plan.json, coordinator.json, messages.jsonl, plan-events.jsonl, worker-specs/, summaries/, docs/PLAN-NARRATIVE.md, merge-proofs/
+├── worktrees/
+│   └── <scope>-<run-id-prefix>/   # git worktree for worktree-mode runs
+├── learning/                      # episodes/, signals.jsonl, insights.jsonl, proposals/, candidates/, evals/, bundles/, pr-events.jsonl, policy.toml
+├── install-receipt.json           # install channel receipt (npm|brew|shell|cargo|source)
+└── update-check.json              # 24-hour TTL update-check cache
 ```
 
 The split between `runstate/` (mutable working state) and `library/` (durable promoted artifacts) is deliberate: `runstate/` is per-scope and ephemeral; `library/` is global and intended to outlive cleanup. The `state.working_dir` field starts pointing at `runstate/.../working/` and is rewritten to `library/<scope>/<run_id>/` after promotion.
 
 ### 5.3 Path derivation
 
-`crates/deadreckon-core/src/paths.rs:9-65` exposes:
+`crates/deadreckon-core/src/paths.rs:14-195` exposes (key methods):
 
 ```rust
 impl DeadreckonPaths {
@@ -433,12 +479,13 @@ impl DeadreckonPaths {
     pub fn run_root(&self, scope, run_id) -> PathBuf
     pub fn locks_dir(&self) -> PathBuf                       // home/locks
     pub fn library_dir(&self, scope, run_id) -> PathBuf
+    // … plus plan_dir/plan_events, chain_dir, learning_*, install-receipt, and update-check helpers
 }
 ```
 
-Scope (`paths.rs:67-86`) derives from `DEADRECKON_SCOPE_ROOT` env var, or the nearest `.git` root, or `cwd`. The literal scope string is `"<sanitized-basename>-<fnv1a32-hex>"` of the canonical path — unique per worktree, stable per checkout.
+Scope (`paths.rs:197-216`) derives from `DEADRECKON_SCOPE_ROOT` env var, or the nearest `.git` root, or `cwd`. The literal scope string is `"<sanitized-basename>-<fnv1a32-hex>"` of the canonical path — unique per worktree, stable per checkout.
 
-Task key (`paths.rs:88-99`) is `"<slug-of-goal>-<fnv1a32-hex-of-goal>"` (slug capped at 48 chars). Two runs with the same goal share a task key (and a lock).
+Task key (`paths.rs:218-229`) is `"<slug-of-goal>-<fnv1a32-hex-of-goal>"` (slug capped at 48 chars). Two runs with the same goal share a task key (and a lock).
 
 ---
 
@@ -1199,42 +1246,46 @@ Trace `detail` rows use a stable import schema: `import_version`, canonical `sou
 
 ## 17. CLI Surface
 
-The `Commands` enum in `crates/deadreckon/src/main.rs` defines the CLI surface. Handlers and roles:
+The `Commands` enum in `crates/deadreckon/src/cli.rs` defines the CLI surface; handlers live in `crates/deadreckon/src/main.rs`. Verbs and roles (line numbers are intentionally omitted — `cli.rs` is the source of truth and grows over time):
 
-| Verb | Handler | Role |
-|---|---|---|
-| `init` | `cli.rs:440` | Interactive setup of `~/.deadreckon/config.toml` |
-| `config get/set` | `cli.rs:465` | Non-interactive TOML edits |
-| `run` | `cli.rs:537` | Create + enter turn loop |
-| `doctor` | `cli.rs:910` | 8-point actionable preflight |
-| `status` / `next` | `cli.rs:1308` | Current project's latest run, locations, and next action |
-| `list` | `cli.rs:964` | Project-scoped run inventory by default; `--all` for global history, `--full` for exact values |
-| `apply` | `cli.rs:1062` | Apply a completed worktree run (or merged plan result) to the user's current branch |
-| `finish` | `cli.rs:992` | Choose the right completion action (apply for git worktrees, export for non-git) for a run or merged plan |
-| `abandon` / `discard` | `cli.rs:1103` | Remove a run's worktree branch/path or mark no-op modes abandoned |
-| `materialize` / `export` | `cli.rs:1041` | Copy a completed fresh/copy artifact (or merged plan result) to a normal directory |
-| `cleanup` / `prune` | `cli.rs:1121` | Clean abandoned, stale, or selected completed worktree runs |
-| `attach` | `cli.rs:1216` | TUI on a live or completed run, chain, or plan |
-| `kill` | `cli.rs:1230` | Lock release + child PID termination (run, chain, or plan) |
-| `resume` | `cli.rs:1248` | Re-enter the loop on a non-Completed run |
-| `extend` | `cli.rs:1149` | Re-open a completed run with a follow-up goal that inherits history |
-| `undo` | `cli.rs:1265` | Restore snapshot to a target turn |
-| `show` | `cli.rs:1281` | Pretty-print full state + provenance + traces; `--why-failed` for runs and plans |
-| `import` | `cli.rs:1329` | Read-only descriptor-backed transcript import from CLI providers plus Cursor SQLite |
-| `chain` | `cli.rs:798` | Create, plan, run, attach, pause/resume/kill, undo, extend, and redo serial autonomous chains |
-| `orchestrate` | `cli.rs:630` | One-command wrappers for `review` and `full-plan` multi-agent runs |
-| `plan` | `cli.rs:679` | Write an orchestration plan (worker specs + `plan.json`) without starting child runs |
-| `fork` | `cli.rs:720` | Spawn ready child runs for a plan and supervise them through completion |
-| `merge` | `cli.rs:756` | Compose completed child library artifacts into a new promoted run (with semantic merge repair) |
-| `def-done` | `cli.rs:502` | Write, add, show, or check the project's English done criteria |
-| `acceptance` | `cli.rs:492` | Hidden compatibility surface for creating, explaining, or checking done criteria |
-| `doc` | `cli.rs:1182` | Print run narrative, as-built, implementation decision ledger, or delta; with optional polish pass |
-| `history` | `cli.rs:1298` | Search durable run traces and provenance (regex/scope/plan filters) |
-| `library` | `cli.rs:983` | Query promoted run artifacts by goal/date/scope |
-| `detect` | `cli.rs:919` | Probe registered providers and return availability and credential status |
-| `providers` | `cli.rs:932` | List provider routes, models, kind tokens, and the active selection |
-| `update` | `cli.rs:941` | Check for or route self-updates via npm, Homebrew, shell, Cargo, or source channel |
-| `completion` / `completions` | `cli.rs:482` | Generate or install shell tab-completion scripts (bash, zsh, fish, elvish, powershell) |
+| Verb | Role |
+|---|---|
+| `init` | Interactive setup of `~/.deadreckon/config.toml` |
+| `config get/set` | Non-interactive TOML edits |
+| `run` | Create + enter turn loop |
+| `doctor` | Actionable preflight (OS, sandbox, providers, config, disk, runtime) |
+| `status` / `next` | Current project's latest run, locations, and next action |
+| `list` | Project-scoped run inventory by default; `--all` for global history, `--full` for exact values |
+| `apply` | Apply a completed worktree run (or merged plan result) to the user's current branch |
+| `finish` | Choose the right completion action (apply for git worktrees, export for non-git) for a run or merged plan |
+| `abandon` / `discard` | Remove a run's worktree branch/path or mark no-op modes abandoned |
+| `materialize` / `export` | Copy a completed fresh/copy artifact (or merged plan result) to a normal directory |
+| `cleanup` / `prune` | Clean abandoned, stale, or selected completed worktree runs |
+| `attach` | TUI on a live or completed run, chain, or plan |
+| `kill` | Lock release + child PID termination (run, chain, or plan) |
+| `resume` | Re-enter the loop on a non-Completed run |
+| `extend` | Re-open a completed run with a follow-up goal that inherits history |
+| `undo` | Restore snapshot to a target turn |
+| `rewind` | Preview or apply a provider flight checkpoint rewind (see §33) |
+| `show` | Pretty-print full state + provenance + traces; `--why-failed` for runs and plans; `--flight` / `--file` for the flight recorder |
+| `import` | Read-only descriptor-backed transcript import from CLI providers plus Cursor SQLite |
+| `chain` | Create, plan, run, attach, pause/resume/kill, undo, extend, and redo serial autonomous chains |
+| `orchestrate` | One-command wrappers for `review` and `full-plan` multi-agent runs |
+| `plan` | Write an orchestration plan (worker specs + `plan.json`) without starting child runs |
+| `fork` | Spawn ready child runs for a plan and supervise them through completion |
+| `merge` | Compose completed child library artifacts into a new promoted run (with semantic merge repair) |
+| `def-done` | Write, add, show, or check the project's English done criteria |
+| `acceptance` | Hidden compatibility surface for creating, explaining, or checking done criteria |
+| `doc` | Print run narrative, as-built, implementation decision ledger, or delta; with optional polish pass |
+| `history` | Search durable run traces and provenance (regex/scope/plan filters) |
+| `library` | Query promoted run artifacts by goal/date/scope |
+| `detect` | Probe registered providers and return availability and credential status |
+| `providers` | List provider routes, models, kind tokens, and the active selection |
+| `update` | Check for or route self-updates via npm, Homebrew, shell, Cargo, or source channel |
+| `completion` / `completions` | Generate or install shell tab-completion scripts (bash, zsh, fish, elvish, powershell) |
+| `learn` | Index local run evidence and propose deadreckon improvements (see §34) |
+| `improve` | Run evidence-backed deadreckon self-improvement candidates (see §34) |
+| `help-all` / `commands` | Show every command, including advanced ones hidden from short help |
 
 The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defaults to `$10` (with a confirmation gate above `$50`), `--provider` defaults to the highest-credentialed entry per the fallback chain, `--skill` defaults to `default-coding`.
 
@@ -1257,7 +1308,7 @@ The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defau
 
 `attach` dispatches by id kind: a run id opens the run TUI documented below, a chain id opens the chain attach view (`Chains`, §28), and a plan id opens the plan attach TUI (`Plans`, §30.3 / §32.3). All three TUIs draw from the same palette (`ui::TUI_PALETTE`, §26.7) and the same key conventions (`q`/`Esc`/`Ctrl-D` detach; `d` toggles docs view in the run TUI; `Enter` drills into a child run from plan attach).
 
-`attach <id> --view narrative` adds a calmer operator projection for runs, plans, and plan child refs. The default remains `activity`, so raw tool/provider lines still open first unless the user requests the narrative view. In narrative mode, `n` toggles back to raw activity, `v` cycles `architecture -> agents -> files -> evidence -> none`, and `r` requests a provider-backed refresh when a configured route is available. While the TTY narrative view is open, meaningful run and plan events also request a provider refresh: errors, completions, tool milestones, docs checkpoints, acceptance running/pass/fail transitions, child-run discovery, task terminal states, and merge-repair milestones. Long-running quiet periods request a refresh after the narrative quiet window when the run or plan is still running. Provider refreshes are bounded: the prompt is built from redacted evidence windows, the provider must return strict cited JSON, graph labels may only target deterministic graph ids, and failures persist a stale deterministic projection instead of breaking attach.
+`attach <id> --view narrative` adds a calmer operator projection for runs, plans, and plan child refs. The default remains `activity`, so raw tool/provider lines still open first unless the user requests the narrative view. In narrative mode, `n` toggles back to raw activity, `v` cycles `architecture -> agents -> files -> evidence -> none`, and `r` requests a provider-backed refresh when a configured route is available. While the TTY narrative view is open, meaningful run and plan events also request a provider refresh: errors, completions, tool milestones, docs checkpoints, acceptance running/pass/fail transitions, child-run discovery, task terminal states, and merge-repair milestones. Long-running quiet periods request a refresh after the narrative quiet window when the run or plan is still running. Provider refreshes are background jobs: manual/event/quiet refreshes coalesce while one is active, `q`/`Esc`/`Ctrl-D` detach remains immediate, and child drill-in from plan attach cancels or suspends the in-flight narrator before opening the child run. Provider refreshes are bounded: the prompt is built from redacted evidence windows, the provider must return strict cited JSON, graph labels may only target deterministic graph ids, and failures persist a stale deterministic projection instead of breaking attach.
 
 ### 18.2 Layout
 
@@ -1288,11 +1339,15 @@ The top band is split horizontally into three panels for subscription providers 
 - **Bottom**: supervised PIDs + their `ps` lines (alive/dead annotation).
 - **Footer**: action-first completed footer (`[d] Docs` / `[d] Activity`, `[a] Apply`, `[b] Abandon`, `[s] Show`) or scroll/detach help while running. The footer's second line carries `deadreckoning_status_line` while long operations are in flight.
 
-### 18.3 Data source
+### 18.3 Data source and responsiveness contract
 
-The run TUI still polls run files on disk every 500 ms: `spend.jsonl`, `traces.jsonl`, `events.jsonl`, `proofs/acceptance-progress.jsonl`, `proofs/turn-acceptance.json`, plus provider-native logs when the active provider writes them. `collect_provider_activity` now resolves provider ingest through descriptor `[ingest]` metadata: candidate roots, env overrides, cwd matching, storage kind, file glob, freshness window, and schema key. `deadreckon import` reuses the same descriptor metadata for provider transcript discovery and adds import-only session selection, manifest writing, and normalized trace/provenance event creation. `cli:codex` reads `~/.codex/sessions/**.jsonl` and matches `session_meta.payload.cwd`; `cli:claude-code` reads `~/.claude/projects/<cwd-slug>/*.jsonl` using Claude Code's path-to-project mapping and matches top-level `cwd`; `cli:gemini` reads Gemini JSON/JSONL file logs; `cli:opencode` reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON; `cli:copilot` reads `~/.copilot/session-state/*.jsonl` plus nested `events.jsonl` and matches `data.context.cwd`; `cli:pi` reads `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`, validates the first nonblank row is a Pi `session`, and matches the header `cwd`. The shared collector handles candidate discovery, recency filtering, run matching, stream capping, and context telemetry. Schema-specific adapters only decode rows into common activity lines (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`) and normalize tool labels through `deadreckon_providers::taxonomy`.
+Each attach surface runs a budgeted tick loop. The render path is pure: it must not call providers, recurse through provider roots, append narrative snapshots, or reread unbounded JSONL files. Slow or potentially blocking work is either moved into an attach-owned cache/tailer or into a background refresh job whose completion is polled between frames.
 
-Same-process run attaches can use the `RunEventBus` broadcast channel directly; cross-process run attaches still poll. Plan attach is different after the live-UX slice: it consumes `PlanEventBus` / `PlanEventFeed`, which owns `plan-events.jsonl` replay/tailing, emits plan snapshots, tolerates malformed or partial plan-event rows, and multiplexes discovered child and repair run `events.jsonl` streams into the plan activity pane. The production feed remains durable-file backed for cross-process attach, with a broadcast-capable API available for same-process plan streams.
+Run attach uses `TuiEventFeed` for run events and `AttachJsonlTail` for `spend.jsonl`, `traces.jsonl`, and `flight-events.jsonl`, so redraws parse only appended complete rows after the first load and ignore partial trailing JSONL until it is complete. Live-file collection uses an attach-specific inventory walker that prunes heavy cache/profile directories before descent and caps displayed rows without losing total counts. Provider activity prefers current flight rows; descriptor-backed provider-log fallback scans are throttled by freshness, matched path, root mtime, and file mtime so a live attach does not recursively scan provider homes every frame.
+
+`collect_provider_activity` resolves provider ingest through descriptor `[ingest]` metadata: candidate roots, env overrides, cwd matching, storage kind, file glob, freshness window, and schema key. `deadreckon import` reuses the same descriptor metadata for provider transcript discovery and adds import-only session selection, manifest writing, and normalized trace/provenance event creation. `cli:codex` reads `~/.codex/sessions/**.jsonl` and matches `session_meta.payload.cwd`; `cli:claude-code` reads `~/.claude/projects/<cwd-slug>/*.jsonl` using Claude Code's path-to-project mapping and matches top-level `cwd`; `cli:gemini` reads Gemini JSON/JSONL file logs; `cli:opencode` reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON; `cli:copilot` reads `~/.copilot/session-state/*.jsonl` plus nested `events.jsonl` and matches `data.context.cwd`; `cli:pi` reads `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`, validates the first nonblank row is a Pi `session`, and matches the header `cwd`. Schema-specific adapters only decode rows into common activity lines (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`) and normalize tool labels through `deadreckon_providers::taxonomy`.
+
+Same-process run attaches can use the `RunEventBus` broadcast channel directly; cross-process run attaches still use durable event replay/tailing. Plan attach consumes `PlanEventBus` / `PlanEventFeed`, which owns `plan-events.jsonl` replay/tailing, emits plan snapshots, tolerates malformed or partial plan-event rows, and multiplexes discovered child and repair run `events.jsonl` streams into the plan activity pane. Chain attach keeps its own `AttachJsonlTail<ChainEvent>` for `chain-events.jsonl`, preserves the existing drill/redo/extend/pause/kill controls, ignores partial last lines until complete, and shows an activity-read hint when chain event catch-up falls behind the tick budget. The production feeds remain durable-file backed for cross-process attach, with broadcast-capable APIs available for same-process streams.
 
 ### 18.4 Narrative projection files
 
@@ -1305,6 +1360,8 @@ Narrative attach writes projection files, not source-of-truth state. Run project
 Plan projections prefer each child run's latest narrative snapshot when one exists. The plan agent table cites that child snapshot and uses its headline as the child summary, then falls back to child run state when no child narrative exists. Plan graphs also roll up file nodes from child narrative graphs so the plan-level files visual can show cross-agent touched file evidence without copying child logs into `plan-events.jsonl`.
 
 Provider-backed narration is an overlay on these projections. Manual `r` refresh, TTY narrative-view event refreshes, and TTY narrative-view quiet-threshold refreshes build a redacted prompt from the deterministic projection, send only bounded evidence summaries to the selected provider route, validate all returned claims against known evidence ids, reject invented graph ids, and persist a new fresh snapshot only after validation. The default narrator route is `cli:claude-code` with model override `sonnet`, which the Claude Code adapter launches as `claude --model sonnet --dangerously-skip-permissions -p <prompt>`; `--narrative-provider` overrides the route and leaves model selection to that provider/config entry, while `--no-narrative-provider` keeps attach deterministic-only. Event refreshes can bypass the ordinary freshness interval for meaningful deltas, while quiet-threshold refreshes still obey the freshness interval; budget, provider availability, JSON validation, citation validation, graph validation, and redaction guards always apply. If the provider is missing, over budget, behind cadence, returns malformed JSON, cites unknown evidence, emits secret-like text, or fails, attach keeps running and persists a stale deterministic snapshot with the error in `state.json`.
+
+The run and plan narrative panes cache projection objects by coverage and feed signature. Redraws reuse the cached projection, stale provider snapshots survive ordinary frame churn, and render helpers fall back to deterministic projection builders instead of `ensure_*` persistence calls. This is the nonblocking attach contract: provider-backed narrative work may improve the next frame after it finishes, but it never owns the current frame.
 
 ---
 
@@ -1479,13 +1536,13 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Acceptance gate with signed marker; anti-self-attestation actually enforced.
 - `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import`, `cleanup`/`prune`, `completion` verbs.
 - Shell tab-completion via `completion install` / `completion {bash,zsh,fish,elvish,powershell}` driven from the live clap command tree; `init` opt-out installs completions and (for zsh) appends a managed `.zshrc` block.
-- `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer. Long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
+- `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer. Run, plan, and chain attach now share an explicit responsiveness contract: render paths are provider-free and write-free, JSONL streams are tailed or cached, provider narrative refreshes run in cancellable/coalesced background jobs, stale narrative snapshots survive redraw, and long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
 - Descriptor-driven provider activity ingest for Codex, Claude Code, Gemini JSON/JSONL, OpenCode file-mode logs, GitHub Copilot CLI session-state JSONL, and Pi session JSONL, normalized into `agent` / `thinking` / `tool` / `result` / `todo` / `tokens` rows without rewriting provider-owned logs.
 - Descriptor import hardening: `deadreckon import` accepts legacy aliases and provider descriptor ids, discovers CLI transcripts through descriptor `[ingest]`, selects concrete sessions by cwd or `--session`, writes `import.json`, refuses ambiguous/changed imports with `try:` lines, and normalizes trace/provenance rows for Codex, Claude Code, Gemini, OpenCode file-mode, GitHub Copilot CLI, Pi, and Cursor SQLite.
 - Streaming acceptance progress: `proofs/acceptance-progress.jsonl` reports per-check `started`/`running`/`passed`/`failed` transitions while `dr-gate` is mid-evaluation; the attach TUI tails it alongside the signed marker.
 - Extended runs carry the parent's `acceptance.yaml` into the child run and emit the same `print_run_started` startup details (provider route, doc-provider source) as fresh runs; resume does the same.
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.
-- Event-backed TUI attach: same-process attaches use `RunEventBus`; cross-process attaches replay `events.jsonl` incrementally.
+- Event-backed TUI attach: same-process run attaches use `RunEventBus`; cross-process run attaches replay `events.jsonl` incrementally. Plan attach uses `PlanEventBus` for durable replay/tail plus child/repair event multiplexing, and chain attach tails `chain-events.jsonl` incrementally with partial-line tolerance.
 - Cross-process cancellation: `kill` writes a durable cancel marker before signaling; the run loop observes it while provider calls are in flight and reports killed status through events.
 - Partial-trace resume: resume reconstructs only completed tool boundaries and `resume --from-turn` truncates traces, spend records, and future snapshots together.
 - Durable per-run `sandbox.toml` plus per-tool sandbox policy: bash/write-file paths get specific filesystem and network permissions; refusals include `try:` and are recorded in traces and provenance.
@@ -1505,7 +1562,7 @@ The hygiene rider is purely structural; it does not close prior thin items, but 
 
 The previously named thin areas now have code paths and depth tests:
 
-1. **TUI streaming.** `tui_events.rs` covers broadcast attach, JSONL replay, partial-line handling, and kill visibility.
+1. **TUI streaming and responsiveness.** `tui_events.rs` covers broadcast attach, JSONL replay, partial-line handling, and kill visibility. The May 2026 responsiveness slice adds attach tick budgets, background/coalesced narrative refresh, attach-owned JSONL tailers, provider-log scan throttling, narrative projection caches, chain event tailing, and focused slow-narrator/large-worktree/max-chain smokes.
 2. **Resume from partial trace.** `turn_loop` tests cover mid-tool-call truncation and `--from-turn` cleanup.
 3. **Cancellation model.** `kill` writes a cancel marker before signals; tests cover cross-process marker semantics, HTTP aborts, and kill storms.
 4. **Wall-clock spend for CLI providers.** CLI providers accumulate wall time and caps; richer subscription-to-budget policy remains a future routing concern.
@@ -1839,7 +1896,7 @@ Supported hooks are `pre-step`, `post-step`, `on-promote`, and `on-chain-end`. P
 
 ### 28.8 Events And Promotion
 
-`chain-events.jsonl` is the chain audit log: created, step started, run completed, apply started, applied/refused, step failed, paused/resumed/killed/completed, undo, hooks, extend, and redo. `promotion.rs` also emits `RunPromoted { library_dir }`, so a chain can attach provenance to the promoted inner run artifact.
+`chain-events.jsonl` is the chain audit log: created, step started, run completed, apply started, applied/refused, step failed, paused/resumed/killed/completed, undo, hooks, extend, and redo. `promotion.rs` also emits `RunPromoted { library_dir }`, so a chain can attach provenance to the promoted inner run artifact. Chain attach reads this file through an attach-local JSONL tail cache after the first load; redraws parse appended complete rows only, tolerate a partial final line, and keep the previous activity rows visible if a read is delayed.
 
 ### 28.9 Lifecycle Verbs
 
@@ -1847,7 +1904,7 @@ Supported hooks are `pre-step`, `post-step`, `on-promote`, and `on-chain-end`. P
 
 ### 28.10 TUI Surfaces
 
-`chain attach <id>` opens a ratatui step timeline on TTYs and falls back to a plain snapshot off-TTY. The timeline shows policy, spend, step dots/statuses/run prefixes, recent chain activity, and controls for drill/show, redo, extend, pause, kill, detach, and scrolling. Single-run `attach` reads `.deadreckon/chain-step.json`, renders a chain context banner, and exposes `[c] Chain` to drill out to `chain attach`.
+`chain attach <id>` opens a ratatui step timeline on TTYs and falls back to a plain snapshot off-TTY. The timeline shows policy, spend, step dots/statuses/run prefixes, recent chain activity, and controls for drill/show, redo, extend, pause, kill, detach, and scrolling. Activity reads are incremental and the activity panel title can show a catch-up/partial-line/read-delayed hint when event reading falls behind. Single-run `attach` reads `.deadreckon/chain-step.json`, renders a chain context banner, and exposes `[c] Chain` to drill out to `chain attach`.
 
 ### 28.11 Spend And Budgeting
 
@@ -1943,7 +2000,7 @@ At launch time the coordinator rewrites the spec for dependent tasks with comple
 - `fork <plan-id>` runs ready child tasks through `deadreckon run`, using distinct plan-child scopes via `DEADRECKON_SCOPE_ROOT`. It writes typed progress/blocker messages, child summaries, and plan events for ready/running/run-discovered/terminal child states. While a child starts, the coordinator records the run id in `plans/<plan-id>/launch/<task-id>/run-id` so later plan-level kill/recovery commands can map a live process back to durable run state. Fork completion uses the same provider role table and dependency/parallelism summary as plan and orchestrate.
 - `merge <plan-id>` composes completed child library artifacts into a new promoted run. The default strategy is `dag-aware`: if task B depends on task A and both changed the same file, B's version wins without prompting. True parallel conflicts write `merge-proofs/conflicts.json` and `merge-proofs/repair-request.json`, then automatically ask the repair provider for a JSON decision. Valid decisions can prefer a child file, synthesize only named conflict paths, or launch a normal repair child from `merge-working`; `--no-repair` restores raw conflict refusal, and `--repair-mode`, `--repair-provider`, and `--repair-attempts` are advanced controls. Merge start, conflict, repair, success, and plan completion are recorded as plan events. Merge and plan summaries show structured repair detail: mode, attempts, provider, conflict paths, repair sidecars, repair run status, latest repair event, and next action.
 - `orchestrate review <goal>` and `orchestrate full-plan <goal>` are the one-command wrappers. Both print a preflight with mode, provider role table, dependency/parallelism summary, sandbox, caps, capabilities, merge-repair posture, and task rows before starting child work; headless callers pass `--yes`, `--preview` writes the plan and stops before `fork`, and automatic merge repair stays enabled unless an advanced/debug caller passes `--no-repair`.
-- `attach <plan-id>` opens a plan TUI on TTYs and renders a plain summary off-TTY. The TUI shows child panes with provider/role/status, run prefixes, dependency state, turn/status, spend or token accounting, latest trace activity, acceptance/gate state, summary paths, and plan feed activity. `PlanEventBus` supplies plan events, snapshots, child run events, and repair run events; coordinator messages remain the fallback before events exist. `Enter` drills into the selected child run using the normal run attach view; quitting the child view returns to the plan selection with a parent-plan breadcrumb and back hint.
+- `attach <plan-id>` opens a plan TUI on TTYs and renders a plain summary off-TTY. The TUI shows child panes with provider/role/status, run prefixes, dependency state, turn/status, spend or token accounting, latest trace activity, acceptance/gate state, summary paths, and plan feed activity. `PlanEventBus` supplies plan events, snapshots, child run events, and repair run events; coordinator messages remain the fallback before events exist. `Enter` drills into the selected child run using the normal run attach view; quitting the child view returns to the plan selection with a parent-plan breadcrumb and back hint. Plan narrative refreshes are plan-keyed background jobs, visual toggles remain local, and render uses cached plan projections so a slow narrator cannot block selection, child drill-in, detach, or redraw.
 - Headless flags are honored across this surface: `run --quiet` emits no success stdout, `run --plain --quiet` emits only the final plain status line, and `attach --plain` forces summary output instead of ratatui.
 - `kill <plan-id>` reads `coordinator.json`, launch run-id sidecars, and child run state to signal the coordinator and live children, then marks discovered child states killed, releases their locks, and records task/plan kill events.
 - `history grep <pattern>` searches durable trace or provenance JSONL, can restrict to a plan's child runs with `--plan <plan-id>`, includes matching plan events, and supports regex, scope, age, and limit filters.
@@ -1959,7 +2016,7 @@ Generated run artifacts are intentionally excluded from merge composition: `.dea
 
 ### 30.5 Current Limits
 
-The plan event feed is still durable-file backed for cross-process attach, and long-lived same-process plan writers are not yet all routed through a shared broadcaster. The TUI no longer owns raw `read_plan_events_lossy` polling, but child and repair run detail still ultimately comes from normal run files. There is also no arbitrary child-to-child chat surface: children communicate through durable summaries and typed coordinator messages only.
+The plan event feed is still durable-file backed for cross-process attach, and long-lived same-process plan writers are not yet all routed through a shared broadcaster. The TUI no longer owns raw `read_plan_events_lossy` polling, but child and repair run detail still ultimately comes from normal run files. There is no attach daemon, shared cross-surface broadcaster, or live diagnostic dashboard yet; those remain V1 candidates rather than hidden runtime dependencies. There is also no arbitrary child-to-child chat surface: children communicate through durable summaries and typed coordinator messages only.
 
 ---
 
@@ -2022,7 +2079,7 @@ The stream is orchestration-level only. It records plan and task lifecycle edges
 
 ### 32.3 User Surfaces
 
-`attach <plan-id>` now renders `PlanEventBus` feed activity in the plan activity pane, falling back to coordinator messages only before the event file exists. The feed replays durable plan events, emits snapshots when plan status or child run ids change, and multiplexes discovered child and repair run events without copying child traces into `plan-events.jsonl`. `Enter` on a child with a run id suspends the plan TUI and opens the existing run attach view with a breadcrumb like `plan <prefix> / task-1`; `q`, `Esc`, or `Ctrl-D` returns to the same plan attach context.
+`attach <plan-id>` now renders `PlanEventBus` feed activity in the plan activity pane, falling back to coordinator messages only before the event file exists. The feed replays durable plan events, emits snapshots when plan status or child run ids change, and multiplexes discovered child and repair run events without copying child traces into `plan-events.jsonl`. `Enter` on a child with a run id suspends the plan TUI and opens the existing run attach view with a breadcrumb like `plan <prefix> / task-1`; `q`, `Esc`, or `Ctrl-D` returns to the same plan attach context. Slow provider narration is decoupled from this path: polling a pending plan narrator returns immediately, visual mode changes are local state changes, and completing or cancelling the job only affects the next narrative projection.
 
 Plain/off-TTY `attach <plan-id>` prints the latest plan event, merge repair status when sidecars exist, and an explicit `deadreckon attach <plan-id>` hint. `history grep <pattern> --plan <plan-id>` searches `plan-events.jsonl` before child run trace/provenance files, so repair events are grep-visible. `show <plan-id> --why-failed` includes the latest plan event and merge repair sidecar paths alongside failed child rows and blocker messages.
 
@@ -2030,7 +2087,7 @@ Plain/off-TTY `attach <plan-id>` prints the latest plan event, merge repair stat
 
 ### 32.4 Current Limits
 
-The plan event stream is durable and replayable, and plan attach now subscribes to a single `PlanEventBus` feed abstraction. The feed is broadcast-capable in-process, but production plan writers still primarily communicate through append-only JSONL so cross-process attach remains reliable. A future embedded attach mode could pass a long-lived broadcaster through every plan writer for lower-latency same-process delivery.
+The plan event stream is durable and replayable, and plan attach now subscribes to a single `PlanEventBus` feed abstraction. The feed is broadcast-capable in-process, but production plan writers still primarily communicate through append-only JSONL so cross-process attach remains reliable. A future embedded attach mode could pass a long-lived broadcaster through every plan writer for lower-latency same-process delivery. A broader attach daemon, shared broadcaster across run/plan/chain surfaces, and diagnostic dashboard for slow tick stages are deliberately out of scope for the alpha responsiveness slice.
 
 ---
 
