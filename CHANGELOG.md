@@ -1,5 +1,13 @@
 # Changelog
 
+## Production command model (alpha) - 2026-05-27
+
+- Reframed default help around the production flow: `start`, `attach`, `status`, `list`, `finish`, setup, and control commands.
+- Kept power-user and advanced verbs callable and discoverable through `deadreckon help-all`, per-command help, and completions without crowding the first screen.
+- Made `deadreckon start` history-aware for repos with completed promoted runs: TTY users can choose a follow-up, while preview/JSON output shows exact extend, review, and full-plan commands.
+- Added done-criteria transparency to interactive `start` when project criteria already exist, with keep/view/check/update/cancel choices before launch.
+- Updated README, HOWTO, AS-BUILT, the user-facing matrix, and focused tests without adding runtime schema or durable config.
+
 ## Start picker (alpha) - 2026-05-27
 
 - Added selection-first TTY prompts to `deadreckon start` for launch mode, detected/configured provider routes, missing done-criteria action, non-git and dirty source handling, and final launch confirmation.

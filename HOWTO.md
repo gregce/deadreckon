@@ -14,6 +14,8 @@ For a first serious run:
 ```bash
 deadreckon start "build the app"
 deadreckon attach latest
+deadreckon status latest
+deadreckon list
 deadreckon finish latest
 ```
 
@@ -26,6 +28,7 @@ exactly what is missing:
 deadreckon start "build the app"
 deadreckon attach latest
 deadreckon status latest
+deadreckon list
 deadreckon finish latest
 ```
 
@@ -36,6 +39,27 @@ with `--yes`, `--plain`, `--quiet`, or `--json` so it never waits for input.
 If setup is incomplete, `start` stops before launching work and prints concrete
 `try:` lines for setup, done criteria, or source mode. Paste the suggested
 commands, then run the same `deadreckon start "build the app"` command again.
+
+If this repo already has completed deadreckon history, TTY `start` can offer a
+follow-up from the latest extendable run, a new review pass, or a new full-plan
+pass. For scripts, use preview first:
+
+```bash
+deadreckon start "add settings" --preview --plain
+deadreckon extend <run-id> "add settings"
+deadreckon start "add settings" --mode review --yes
+deadreckon start "add settings" --mode full-plan --yes
+```
+
+When done criteria already exist, TTY `start` shows the current criteria and
+offers keep, view, check, update, or cancel before launch. You can inspect or
+change the same contract directly:
+
+```bash
+deadreckon def-done show
+deadreckon def-done check
+deadreckon def-done "what should count as done"
+```
 
 ## Normal Single Run
 

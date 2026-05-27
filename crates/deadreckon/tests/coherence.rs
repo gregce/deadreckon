@@ -528,6 +528,8 @@ fn readme_first_screen_mentions_start_watch_finish() {
     for text in [
         "deadreckon start \"build the app\"",
         "deadreckon attach latest",
+        "deadreckon status",
+        "deadreckon list",
         "deadreckon finish latest",
     ] {
         assert!(
@@ -548,6 +550,8 @@ fn howto_new_user_path_does_not_require_provider_flags() {
     );
     assert!(
         new_user.contains("deadreckon attach latest")
+            && new_user.contains("deadreckon status latest")
+            && new_user.contains("deadreckon list")
             && new_user.contains("deadreckon finish latest"),
         "{new_user}"
     );
@@ -573,7 +577,7 @@ fn start_as_built_documents_guided_front_door() {
         .expect("CLI surface section");
 
     assert!(
-        cli_surface.contains("| `start` | Guided front door"),
+        cli_surface.contains("| `start` | Guided production front door"),
         "{cli_surface}"
     );
     for required in [
@@ -581,8 +585,10 @@ fn start_as_built_documents_guided_front_door() {
         "`deadreckon start \"<goal>\"`",
         "ephemeral launch decision",
         "No `PipelineState` schema",
-        "provider setup, done criteria, source mode, and run-vs-orchestrate",
-        "dispatches to the existing `run` and `orchestrate` handlers",
+        "provider setup, done criteria, source mode, history, and run-vs-orchestrate",
+        "dispatches to the existing `run`, `extend`, and `orchestrate` handlers",
+        "History-aware `start`",
+        "keep/view/check/update/cancel",
         "previews remain state-free",
     ] {
         assert!(
@@ -611,6 +617,24 @@ fn start_v1_candidates_track_guided_deferrals() {
 #[test]
 fn start_changelog_records_architecture_and_deferral_closeout() {
     let changelog = repo_file_text("CHANGELOG.md");
+    let production = section_between(
+        &changelog,
+        "## Production command model (alpha) - 2026-05-27",
+        "## Start picker",
+    )
+    .expect("production command changelog section");
+    for required in [
+        "default help",
+        "`deadreckon help-all`",
+        "history-aware",
+        "done-criteria transparency",
+    ] {
+        assert!(
+            production.contains(required),
+            "missing {required}:\n{production}"
+        );
+    }
+
     let guided = section_between(
         &changelog,
         "## Guided first use (alpha) - 2026-05-26",
@@ -657,20 +681,42 @@ fn audience_copy_does_not_call_deadreckon_a_provider_replacement() {
 #[test]
 fn top_help_uses_canonical_discovery_words() {
     let top = help(["--help"]);
-    for command in ["detect", "providers", "update", "history"] {
+    for command in [
+        "start", "attach", "status", "list", "finish", "doctor", "kill", "resume", "cleanup",
+    ] {
         assert!(
             top.contains(command),
-            "top help should include {command} in More help:\n{top}"
+            "top help should include {command} in the production model:\n{top}"
         );
     }
+    for advanced in [
+        "run",
+        "orchestrate",
+        "chain",
+        "plan",
+        "fork",
+        "merge",
+        "apply",
+        "export",
+        "history",
+        "learn",
+        "improve",
+    ] {
+        assert!(
+            !top.contains(&format!("{advanced}    ")),
+            "short help should leave {advanced} to help-all:\n{top}"
+        );
+    }
+    assert!(top.contains("Production flow"), "{top}");
+    assert!(top.contains("Start, watch, keep"), "{top}");
     assert!(
-        top.contains("watch a run, chain, or plan in the TUI"),
+        top.contains("watch and understand a run, chain, or plan"),
         "{top}"
     );
-    assert!(top.contains("cancel a run, chain, or plan"), "{top}");
-    assert!(top.contains("show runs and plans"), "{top}");
+    assert!(top.contains("stop a run, chain, or plan"), "{top}");
+    assert!(top.contains("find runs and plans"), "{top}");
     assert!(
-        top.contains("show every command, including advanced commands (alias: commands)"),
+        top.contains("show every command, including advanced commands"),
         "{top}"
     );
     assert!(
@@ -692,7 +738,13 @@ fn top_help_uses_canonical_discovery_words() {
 #[test]
 fn help_all_keeps_aliases_inline() {
     let all = help(["help-all"]);
-    assert!(all.contains("show runs and plans"), "{all}");
+    assert!(all.contains("deadreckon full command map"), "{all}");
+    assert!(all.contains("production flow"), "{all}");
+    assert!(all.contains("power-user launch paths"), "{all}");
+    assert!(all.contains("run"), "{all}");
+    assert!(all.contains("orchestrate"), "{all}");
+    assert!(all.contains("chain"), "{all}");
+    assert!(all.contains("find runs and plans"), "{all}");
     assert!(
         all.contains("copy a completed fresh/copy run (alias: materialize)"),
         "{all}"

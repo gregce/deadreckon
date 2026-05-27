@@ -36,7 +36,7 @@ const INIT_HELP: &str = "\
 Lifecycle:
   deadreckon init
   deadreckon doctor
-  deadreckon run \"build the thing\"
+  deadreckon start \"build the thing\"
 
 Use `deadreckon config provider` and `deadreckon config model` later to see or change defaults.";
 
@@ -50,7 +50,7 @@ Subcommands:
   deadreckon config model gpt-5.1-codex --provider cli:codex
 
 Lifecycle:
-  Configure once, then `deadreckon run \"goal\"`. Per-run flags override these defaults.";
+  Configure once, then `deadreckon start \"goal\"`. Direct run/orchestrate flags override these defaults.";
 
 const DETECT_HELP: &str = "\
 Lifecycle:
@@ -68,6 +68,7 @@ Lifecycle:
   deadreckon providers list
   deadreckon providers list --all
   deadreckon providers list --models
+  deadreckon start \"goal\"
   deadreckon run \"goal\" --provider cli:codex --model gpt-5.1-codex
 
 `providers list` is registry-backed. By default it shows the configured
@@ -84,6 +85,8 @@ command; shell installs preview the target and backup path, then update in
 place by the self-updater.";
 
 const RUN_HELP: &str = "\
+Power-user one-run launcher. Most users can begin with `deadreckon start \"goal\"`.
+
 Lifecycle:
   deadreckon run \"build the thing\"
   deadreckon attach latest
@@ -115,7 +118,13 @@ Lifecycle:
   deadreckon start \"build the app\"
   deadreckon attach latest
   deadreckon status latest
+  deadreckon list
   deadreckon finish latest
+
+Existing project history:
+  In a TTY, start can offer a new run, a follow-up from a completed run,
+  a review pass, or a full-plan pass when this project already has runs.
+  Non-TTY start stays deterministic and prints exact extend/orchestrate commands.
 
 Power users:
   deadreckon run \"build the app\"
@@ -130,10 +139,15 @@ Modes:
 Interactive:
   In a TTY, start uses selection prompts for mode, provider, done criteria,
   source mode, and final confirmation when flags do not decide them.
+  Done-criteria prompts show what will be enforced and offer view/check/update
+  paths before launch.
   Scripts can use --plain, --quiet, --json, --yes, or explicit --mode flags to
   keep start deterministic and non-prompting.";
 
 const ORCHESTRATE_HELP: &str = "\
+Power-user multi-agent launcher. `deadreckon start --mode review` and
+`deadreckon start --mode full-plan` route through this machinery.
+
 Lifecycle:
   deadreckon orchestrate review \"build the thing\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes
   deadreckon orchestrate full-plan \"build the thing\" --planner-provider cli:codex --provider cli:claude-code --yes
@@ -149,6 +163,9 @@ repair is automatic by default; --no-repair is only for debugging raw conflict
 bundles.";
 
 const PLAN_HELP: &str = "\
+Advanced orchestration building block. Most users should begin with
+`deadreckon start --mode full-plan \"goal\"` or `deadreckon orchestrate`.
+
 Lifecycle:
   deadreckon plan \"build the thing\" --mode review --coder-provider cli:claude-code --reviewer-provider cli:codex
   deadreckon fork <plan-id>
@@ -160,6 +177,9 @@ mode asks the planner provider route for a child graph. Review mode writes a
 coder child followed by a fresh reviewer child.";
 
 const FORK_HELP: &str = "\
+Advanced orchestration building block. Most users reach this through
+`deadreckon orchestrate` or `deadreckon start --mode full-plan`.
+
 Lifecycle:
   deadreckon fork <plan-id>
   deadreckon attach <plan-id>
@@ -169,6 +189,9 @@ Fork starts the plan coordinator. Each child is still a normal deadreckon run,
 using the provider route recorded in plan.json unless you override it here.";
 
 const MERGE_HELP: &str = "\
+Advanced orchestration building block. `deadreckon finish <plan-id>` is the
+normal completed-plan path.
+
 Lifecycle:
   deadreckon merge <plan-id>
   deadreckon finish <plan-id>
@@ -187,7 +210,7 @@ plus --apply-strategy for per-step git operations.";
 const DONE_HELP: &str = "\
 Lifecycle:
   deadreckon def-done \"builds, opens in a browser, and has no console errors\"
-  deadreckon run \"finish the app\"
+  deadreckon start \"finish the app\"
 
 Common actions:
   deadreckon def-done \"plain-English definition of done\"
@@ -198,7 +221,8 @@ Common actions:
 
 What it means:
   Write done criteria in English. deadreckon compiles them into checks for dr-gate.
-  `deadreckon run` and `deadreckon chain run` prompt for this when criteria are missing.";
+  Start/run/orchestrate prompts should show, check, and update these criteria
+  before launch instead of asking you to accept an opaque gate.";
 
 const ACCEPTANCE_HELP: &str = "\
 Advanced compatibility command. Most users should use `deadreckon def-done`.
@@ -223,6 +247,9 @@ Packs:
   auto, basic, build, test, rust, node, static-site, browser, playwright, vite, nextjs, python";
 
 pub(crate) const CHAIN_HELP: &str = "\
+Serial multi-step power tool. Start with `deadreckon start \"goal\"` unless you
+already know the ordered step sequence.
+
 Chain subcommands:
   deadreckon chain plan \"large goal\" --n 4
   deadreckon chain \"step one\" \"step two\" --yes
@@ -253,7 +280,7 @@ const DOCTOR_HELP: &str = "\
 Lifecycle:
   deadreckon doctor
   deadreckon init
-  deadreckon run \"goal\"
+  deadreckon start \"goal\"
 
 Doctor checks providers, CLI binaries, sandboxes, disk space, write permissions, and OS details.";
 
@@ -270,6 +297,9 @@ normal runs and plans. Use `show` for full run details or
 `attach <plan-id>` for orchestration progress.";
 
 const LIBRARY_HELP: &str = "\
+Advanced artifact inspection. `deadreckon finish <id>` is the normal way to
+keep completed work.
+
 Subcommands:
   deadreckon library list
   deadreckon library search gallery
@@ -295,6 +325,9 @@ It still respects confirmations unless you pass `--no-confirm`. When finish rout
 to apply, --git-strategy selects squash, merge, or cherry-pick.";
 
 const MATERIALIZE_HELP: &str = "\
+Direct artifact copy operation. `deadreckon finish <id>` is the normal
+completed-work path.
+
 Lifecycle:
   deadreckon export latest --dest ./finished-project
   deadreckon export <plan-id> --dest ./finished-project
@@ -305,6 +338,9 @@ Use export for completed fresh/copy runs and completed plans. `materialize` is a
 Worktree runs use `deadreckon apply` instead.";
 
 const APPLY_HELP: &str = "\
+Direct git apply operation. `deadreckon finish <id>` is the normal
+completed-work path.
+
 Lifecycle:
   deadreckon show latest
   deadreckon apply latest --autostash --cleanup
@@ -331,6 +367,9 @@ completed worktree runs. It does not delete plan state, promoted library
 artifacts, or directories exported with `deadreckon export`.";
 
 const EXTEND_HELP: &str = "\
+Follow-up launcher for completed runs. In a TTY, `deadreckon start \"goal\"`
+can offer this path when the current project already has completed history.
+
 Lifecycle:
   deadreckon extend latest \"add tests\"
   deadreckon attach latest
@@ -339,6 +378,9 @@ Lifecycle:
 Extend creates a new run from a completed parent artifact and includes parent context by default.";
 
 const DOC_HELP: &str = "\
+Direct run-doc reader/regenerator. `deadreckon attach --view narrative` and
+`deadreckon finish <id>` surface the common reading paths.
+
 Lifecycle:
   deadreckon doc latest
   deadreckon doc latest --kind as-built
@@ -391,6 +433,9 @@ Lifecycle:
 Undo restores a run snapshot. It is mainly for in-place runs or recovery inside a run working directory.";
 
 const SHOW_HELP: &str = "\
+Raw inspection command. `deadreckon status` and `deadreckon list` are the
+normal orienting commands.
+
 Lifecycle:
   deadreckon show latest
   deadreckon show <plan-id>

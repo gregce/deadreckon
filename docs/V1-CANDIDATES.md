@@ -7,6 +7,7 @@
 - Personalized onboarding: adapt setup copy and examples to a user's observed provider/source/done-criteria patterns without adding telemetry or background profiling by default.
 - Provider-specific setup wizards: offer richer guided configuration for individual CLIs or APIs once their install/auth flows are stable enough to document without making `start` brand-specific.
 - Advanced `start` role pickers: the alpha picker reuses one selected provider route for review coder/reviewer or full-plan planner/child roles. V1 can add role-specific and per-child provider selection once the simple picker proves useful.
+- Production command release policy: after the default model proves itself, decide whether advanced verbs stay flat forever, move under namespaces, gain stronger aliases, or get deprecation windows. Alpha keeps every command callable and discoverable through `help-all`.
 
 ## General candidates
 

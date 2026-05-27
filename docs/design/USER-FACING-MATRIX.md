@@ -1,6 +1,6 @@
 # User-Facing Surface Matrix
 
-**Status:** Refreshed against the local working tree on 2026-05-18.
+**Status:** Refreshed against the local working tree on 2026-05-27.
 **Scope:** The user-visible CLI, prompts, summaries, TUI labels, JSON/plain modes, help text, docs-facing terminology, and orchestration surfaces in `/Users/gdc/deadreckon`.
 **Method:** Source audit of `crates/deadreckon/src/{cli.rs,main.rs,ui.rs,prompt.rs}` and `crates/deadreckon-core/src/{glossary.rs,state.rs,chain.rs,plan.rs}`, plus the current AS-BUILT and goal docs.
 **Read this as:** the alpha coherence closure record. The prior matrix cited commit `455b91a` and listed 108 issues; the closure fixes the accidental user-facing drift and leaves larger template/palette/orchestration redesigns as explicit V1 deferrals.
@@ -19,8 +19,10 @@
 | Prompt helper | `prompt::open` and `prompt::confirm` provide a shared confirmation shape. | `crates/deadreckon/src/prompt.rs:1` | The old doc polish default-marker bug is fixed. |
 | Error hints | `error_hint` returns actionable strings and uses discovered config paths. | `crates/deadreckon/src/main.rs:147` | Generic provider/core errors now get a fallback hint. |
 | `def-done` naming | Top help and command help use `deadreckon def-done`, not `deadreckon done`. | `crates/deadreckon/src/main.rs:845`, `crates/deadreckon/src/cli.rs:189` | The screenshot miss is fixed in the current source. |
-| Help discovery | Top help and `help-all` render command rows from one catalog, while command help uses canonical words: `status`, `finish`, `export`, `cleanup`, `run/chain/plan`, and aliases inline. | `crates/deadreckon/src/main.rs:846`, `crates/deadreckon/src/main.rs:1181`, `crates/deadreckon/tests/coherence.rs:77` | Catalog tests verify row uniqueness and that rows point at real clap commands. |
-| Advanced command discovery | `help-all` explicitly explains that advanced commands are documented there but hidden from short help, while compatibility aliases stay inline on canonical rows. | `crates/deadreckon/src/main.rs:1116`, `crates/deadreckon/src/main.rs:20873` | `materialize` is not a ghost row; it stays an alias on `export`. |
+| Help discovery | Top help and `help-all` render command rows from one catalog. Default help now teaches the production model (`start`, `attach`, `status`, `list`, `finish`, setup, and control), while `help-all` is the full map. | `crates/deadreckon/src/main.rs`, `crates/deadreckon/tests/coherence.rs` | Catalog tests verify row uniqueness, command existence, audience classification, and the primary-vs-advanced split. |
+| Advanced command discovery | `help-all` explicitly explains that advanced commands remain callable and discoverable outside short help, while compatibility aliases stay inline on canonical rows. | `crates/deadreckon/src/main.rs`, `crates/deadreckon/tests/coherence.rs` | `run`, `orchestrate`, `chain`, `plan`, `fork`, `merge`, `extend`, `apply`, `export`, `doc`, `show`, `history`, `learn`, and `improve` stay available without dominating the first screen. |
+| History-aware `start` | Repos with completed promoted history surface follow-up and new pass options. TTY users can choose a prior run to extend; previews/JSON include exact extend/review/full-plan commands. | `crates/deadreckon/src/main.rs`, `crates/deadreckon/tests/orchestrate.rs` | This adds no runtime schema and skips in-place or unpromoted runs. |
+| Done-criteria prompt transparency | Existing done criteria are no longer an opaque TTY carry-forward in `start`; users can keep, view, check, update, or cancel before launch. | `crates/deadreckon/src/main.rs`, `crates/deadreckon/src/cli.rs` | Direct `def-done show/check/<text>` remains the explicit command surface. |
 | Plain output flag | All `--plain` help uses one definition: "Plain output without TUI, spinner, or ANSI affordances." | `crates/deadreckon/src/cli.rs:545`, `crates/deadreckon/tests/coherence.rs:207` | Command-specific behavior is still implemented per command; the user-facing flag definition is shared. |
 | Cross-scope flags | Run, chain, history, cleanup, and library cross-project help says "all project scopes"; provider `--all` remains provider inventory. | `crates/deadreckon/src/cli.rs:869`, `crates/deadreckon/tests/coherence.rs:70` | This keeps `--all` for ordinary cross-project listing/search and `--all-scopes` for chain/cleanup compatibility-sensitive surfaces. |
 | Force aliases | Visible help uses intent-specific flags: `--escalate`, `--overwrite`, and `--anyway`; old `--force` spellings stay hidden alpha aliases. | `crates/deadreckon/src/cli.rs:917`, `crates/deadreckon/tests/coherence.rs:70` | `update --anyway` replaces the last visible primary-command `--force`. |
@@ -47,43 +49,46 @@
 
 ## Current Command Catalog
 
-Source: `crates/deadreckon/src/cli.rs`.
+Source: parser definitions in `crates/deadreckon/src/cli.rs`, default/help-all catalog in `crates/deadreckon/src/main.rs`.
 
-| Command | Aliases | Visible in top-level clap help | Primary user flow | Coherence note |
+| Command | Aliases | Visible in default help | Primary user flow | Coherence note |
 |---|---|---:|---|---|
-| `init` | `setup` | yes | Configure once. | Good. |
-| `config` | `settings` | yes | Read/change defaults. | Uses provider route/model language. |
-| `help-all` | `commands` | yes | Discover advanced commands. | Alias is shown inline. |
-| `completion` | `completions` | yes | Install/generate completions. | Good. |
-| `acceptance` | none | hidden | Compatibility surface for done criteria. | Should remain advanced and defer to `def-done`. |
-| `def-done` | none | yes | Write/check done criteria. | Canonical user word. |
-| `run` | none | yes | Start one coding run. | Good. |
-| `orchestrate` | none | yes | Plan/fork/merge in one command. | Alpha parity is in place; a fuller shared renderer is deferred. |
-| `plan` | none | yes | Write orchestration plan only. | Good advanced verb. |
-| `fork` | none | yes | Start plan children. | Good advanced verb. |
-| `merge` | none | yes | Compose plan children. | Help teaches `finish <plan-id>` first, then direct `apply`/`export`. |
-| `chain` | none | yes | Serial multi-step goals. | Good; full footer/table templating is deferred. |
-| `doctor` | `check` | yes | Check local setup. | Good. |
-| `detect` | none | yes | Probe providers. | Included in custom top help. |
-| `providers` | none | yes | List provider routes/models. | Included in custom top help. |
-| `update` | none | yes | Self-update. | Included in custom top help. |
-| `list` | `runs` | yes | List runs and plans. | Good. |
-| `library` | `artifacts` | hidden | Inspect promoted artifacts. | Advanced command appears in `help-all`. |
-| `finish` | none | yes | Route completed work. | Best primary verb for most users. |
-| `export` | `materialize`, `copy-out` | hidden command alias | Copy a completed artifact to a directory. | `export` is canonical; `materialize` remains compatibility/internal vocabulary. |
-| `apply` | `keep` | hidden | Merge work back into source git. | Advanced but central after completion. |
-| `abandon` | `discard` | hidden | Remove temporary worktree/branch. | Advanced; common flow prefers `cleanup`. |
-| `cleanup` | `prune`, `clean` | yes | Remove stale/completed worktrees. | Good primary cleanup word. |
-| `extend` | `follow-up` | yes | Continue from completed output. | Good. |
-| `doc` | `docs` | hidden | Print/regenerate run docs. | User sees both "doc" command and "docs" noun. |
-| `attach` | `watch` | yes | Open live TUI for run, chain, or plan. | Good. |
-| `kill` | `stop` | yes | Cancel run, chain, or plan. | Good. |
-| `resume` | `continue` | yes | Resume incomplete run. | Good. |
-| `undo` | `restore` | hidden | Restore in-place snapshot. | Advanced. |
-| `show` | `inspect` | hidden | Detailed state/provenance/plan failure. | Hidden but examples rely on it. |
+| `start` | none | yes | Begin supervised agent work. | Primary front door for run/follow-up/review/full-plan. |
+| `attach` | `watch` | yes | Watch and understand a run, chain, or plan. | Primary observation path. |
 | `status` | `next` | yes | Latest run and next action. | `next` is secondary alias only. |
-| `import` | none | hidden | Import other tool history. | Advanced. |
-| `history` | none | yes | Search traces/provenance. | Included in custom top help. |
+| `list` | `runs` | yes | Find runs and plans. | Primary discovery path. |
+| `finish` | none | yes | Route completed work. | Best primary verb for most users. |
+| `doctor` | `check` | yes | Check local setup. | Primary setup health command. |
+| `init` | `setup` | yes | Configure once. | Setup-support command. |
+| `def-done` | none | yes | Write/check done criteria. | Setup-support command and canonical user word. |
+| `kill` | `stop` | yes | Stop run, chain, or plan. | Primary control command. |
+| `resume` | `continue` | yes | Resume incomplete run. | Primary recovery command. |
+| `cleanup` | `prune`, `clean` | yes | Remove stale/completed worktrees. | Primary cleanup word. |
+| `help-all` | `commands` | yes | Discover advanced commands. | Alias is shown inline. |
+| `config` | `settings` | no | Read/change defaults. | Advanced setup; uses provider route/model language. |
+| `completion` | `completions` | no | Install/generate completions. | Advanced setup, still in `help-all`. |
+| `acceptance` | none | hidden | Compatibility surface for done criteria. | Should remain advanced and defer to `def-done`. |
+| `run` | none | no | Start one coding run directly. | Power-user launch path. |
+| `orchestrate` | none | no | Plan/fork/merge in one command. | Power-user launch path; shared summaries in place. |
+| `chain` | none | no | Serial multi-step goals. | Power-user launch path; full footer/table templating is deferred. |
+| `plan` | none | no | Write orchestration plan only. | Advanced building block. |
+| `fork` | none | no | Start plan children. | Advanced building block. |
+| `merge` | none | no | Compose plan children. | Advanced building block; help teaches `finish <plan-id>` first. |
+| `extend` | `follow-up` | no | Continue from completed output. | Direct command remains available; `start` can offer it from history. |
+| `export` | `materialize`, `copy-out` | no | Copy a completed artifact to a directory. | `export` is canonical; `materialize` remains compatibility/internal vocabulary. |
+| `apply` | `keep` | no | Merge work back into source git. | Advanced but central after completion. |
+| `abandon` | `discard` | hidden | Remove temporary worktree/branch. | Advanced; common flow prefers `cleanup`. |
+| `doc` | `docs` | no | Print/regenerate run docs. | Advanced results command. |
+| `library` | `artifacts` | no | Inspect promoted artifacts. | Advanced results command. |
+| `show` | `inspect` | no | Detailed state/provenance/plan failure. | Advanced inspection command. |
+| `import` | none | no | Import other tool history. | Advanced. |
+| `history` | none | no | Search traces/provenance. | Advanced history command. |
+| `learn` | none | no | Index local evidence and propose improvements. | Advanced learning command. |
+| `improve` | none | no | Run evidence-backed self-improvement candidates. | Advanced learning command. |
+| `detect` | none | no | Probe providers. | Advanced setup command. |
+| `providers` | none | no | List provider routes/models. | Advanced setup command. |
+| `update` | none | no | Self-update. | Advanced install/update command. |
+| `undo` | `restore` | hidden | Restore in-place snapshot. | Advanced. |
 
 ## Current Vocabulary
 

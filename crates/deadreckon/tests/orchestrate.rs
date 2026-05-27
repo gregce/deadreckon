@@ -706,6 +706,47 @@ fn start_plain_preview_strips_ansi() {
 }
 
 #[test]
+fn start_preview_in_existing_repo_shows_extend_and_new_pass_actions() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    let mut parent = create_test_run(
+        &paths,
+        &repo,
+        "aaaabbbbccccdddd1111222233334444",
+        "build original app",
+    );
+    parent.status = RunStatus::Completed;
+    save_state(&parent).expect("save parent");
+    let library = paths.library_dir(&parent.scope, &parent.run_id);
+    fs::create_dir_all(&library).expect("library");
+    fs::write(library.join("README.md"), "completed parent\n").expect("library readme");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["start", "add settings", "--preview", "--plain"])
+        .output()
+        .expect("start preview");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("history"), "{out}");
+    assert!(
+        out.contains("deadreckon extend aaaabbbb \"add settings\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("deadreckon start \"add settings\" --mode review --yes"),
+        "{out}"
+    );
+    assert!(
+        out.contains("deadreckon start \"add settings\" --mode full-plan --yes"),
+        "{out}"
+    );
+}
+
+#[test]
 fn start_quiet_success_obeys_existing_quiet_policy() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

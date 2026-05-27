@@ -937,18 +937,21 @@ fn wants_top_level_help() -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TopHelpGroup {
-    CoreLifecycle,
-    ContinueRecover,
-    MoreHelp,
+    StartWatchKeep,
+    SetupHealth,
+    Control,
+    FindMore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HelpAllGroup {
+    ProductionFlow,
     SetupProviders,
-    CoreLifecycle,
+    PowerUserLaunch,
     Orchestration,
     ContinueRecover,
-    InspectAdvanced,
+    ResultsInspect,
+    LearningAdvanced,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -960,10 +963,20 @@ enum CommandDiscovery {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandAudience {
+    Primary,
+    SetupSupport,
+    Advanced,
+    Compatibility,
+    Pseudo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CommandHelpEntry {
     display: &'static str,
     clap_name: Option<&'static str>,
     purpose: &'static str,
+    audience: CommandAudience,
     top_group: Option<TopHelpGroup>,
     all_group: Option<HelpAllGroup>,
 }
@@ -971,6 +984,8 @@ struct CommandHelpEntry {
 const TYPICAL_FLOW_COMMANDS: &[&str] = &[
     product::PRODUCT_FIRST_COMMAND,
     "deadreckon attach latest",
+    "deadreckon status",
+    "deadreckon list",
     "deadreckon finish latest",
 ];
 
@@ -979,34 +994,39 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         display: "init",
         clap_name: Some("init"),
         purpose: "configure deadreckon",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
+        audience: CommandAudience::SetupSupport,
+        top_group: Some(TopHelpGroup::SetupHealth),
         all_group: Some(HelpAllGroup::SetupProviders),
     },
     CommandHelpEntry {
         display: "doctor",
         clap_name: Some("doctor"),
         purpose: "check provider, sandbox, and local setup",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::SetupHealth),
         all_group: Some(HelpAllGroup::SetupProviders),
     },
     CommandHelpEntry {
         display: "detect",
         clap_name: Some("detect"),
         purpose: "probe registered providers",
-        top_group: Some(TopHelpGroup::MoreHelp),
+        audience: CommandAudience::Advanced,
+        top_group: None,
         all_group: Some(HelpAllGroup::SetupProviders),
     },
     CommandHelpEntry {
         display: "providers",
         clap_name: Some("providers"),
         purpose: "list provider routes and models",
-        top_group: Some(TopHelpGroup::MoreHelp),
+        audience: CommandAudience::Advanced,
+        top_group: None,
         all_group: Some(HelpAllGroup::SetupProviders),
     },
     CommandHelpEntry {
         display: "config",
         clap_name: Some("config"),
         purpose: "read or update configuration",
+        audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::SetupProviders),
     },
@@ -1014,76 +1034,87 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         display: "completion",
         clap_name: Some("completion"),
         purpose: "install or generate shell completions",
-        top_group: Some(TopHelpGroup::MoreHelp),
+        audience: CommandAudience::Advanced,
+        top_group: None,
         all_group: Some(HelpAllGroup::SetupProviders),
     },
     CommandHelpEntry {
         display: "def-done",
         clap_name: Some("def-done"),
         purpose: "write/check done criteria in English",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
-        all_group: Some(HelpAllGroup::CoreLifecycle),
+        audience: CommandAudience::SetupSupport,
+        top_group: Some(TopHelpGroup::SetupHealth),
+        all_group: Some(HelpAllGroup::SetupProviders),
     },
     CommandHelpEntry {
         display: "start",
         clap_name: Some("start"),
-        purpose: "guided front door for a run or orchestration",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
-        all_group: Some(HelpAllGroup::CoreLifecycle),
+        purpose: "begin supervised agent work",
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::StartWatchKeep),
+        all_group: Some(HelpAllGroup::ProductionFlow),
     },
     CommandHelpEntry {
         display: "run",
         clap_name: Some("run"),
-        purpose: "start unattended coding work",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
-        all_group: Some(HelpAllGroup::CoreLifecycle),
+        purpose: "power-user one-run launcher",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::PowerUserLaunch),
     },
     CommandHelpEntry {
         display: "orchestrate",
         clap_name: Some("orchestrate"),
-        purpose: "run coder/reviewer or full-plan multi-agent work",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
-        all_group: Some(HelpAllGroup::Orchestration),
+        purpose: "power-user multi-agent launcher",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::PowerUserLaunch),
     },
     CommandHelpEntry {
         display: "chain",
         clap_name: Some("chain"),
-        purpose: "run several coding steps in sequence",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
-        all_group: Some(HelpAllGroup::CoreLifecycle),
+        purpose: "serial multi-step power tool",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::PowerUserLaunch),
     },
     CommandHelpEntry {
         display: "attach",
         clap_name: Some("attach"),
-        purpose: "watch a run, chain, or plan in the TUI",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
-        all_group: Some(HelpAllGroup::CoreLifecycle),
+        purpose: "watch and understand a run, chain, or plan",
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::StartWatchKeep),
+        all_group: Some(HelpAllGroup::ProductionFlow),
     },
     CommandHelpEntry {
         display: "status",
         clap_name: Some("status"),
         purpose: "see the latest run and next action",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
-        all_group: Some(HelpAllGroup::CoreLifecycle),
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::StartWatchKeep),
+        all_group: Some(HelpAllGroup::ProductionFlow),
     },
     CommandHelpEntry {
         display: "list",
         clap_name: Some("list"),
-        purpose: "show runs and plans",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
-        all_group: Some(HelpAllGroup::CoreLifecycle),
+        purpose: "find runs and plans",
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::StartWatchKeep),
+        all_group: Some(HelpAllGroup::ProductionFlow),
     },
     CommandHelpEntry {
         display: "finish",
         clap_name: Some("finish"),
         purpose: "apply or export completed work",
-        top_group: Some(TopHelpGroup::CoreLifecycle),
-        all_group: Some(HelpAllGroup::CoreLifecycle),
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::StartWatchKeep),
+        all_group: Some(HelpAllGroup::ProductionFlow),
     },
     CommandHelpEntry {
         display: "plan",
         clap_name: Some("plan"),
         purpose: "write a multi-agent plan without starting it",
+        audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::Orchestration),
     },
@@ -1091,6 +1122,7 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         display: "fork",
         clap_name: Some("fork"),
         purpose: "start child runs for a plan",
+        audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::Orchestration),
     },
@@ -1098,6 +1130,7 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         display: "merge",
         clap_name: Some("merge"),
         purpose: "compose completed plan children",
+        audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::Orchestration),
     },
@@ -1105,34 +1138,39 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         display: "extend",
         clap_name: Some("extend"),
         purpose: "continue from a completed run",
-        top_group: Some(TopHelpGroup::ContinueRecover),
+        audience: CommandAudience::Advanced,
+        top_group: None,
         all_group: Some(HelpAllGroup::ContinueRecover),
     },
     CommandHelpEntry {
         display: "resume",
         clap_name: Some("resume"),
         purpose: "resume an incomplete run",
-        top_group: Some(TopHelpGroup::ContinueRecover),
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::Control),
         all_group: Some(HelpAllGroup::ContinueRecover),
     },
     CommandHelpEntry {
         display: "kill",
         clap_name: Some("kill"),
-        purpose: "cancel a run, chain, or plan",
-        top_group: Some(TopHelpGroup::ContinueRecover),
+        purpose: "stop a run, chain, or plan",
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::Control),
         all_group: Some(HelpAllGroup::ContinueRecover),
     },
     CommandHelpEntry {
         display: "cleanup",
         clap_name: Some("cleanup"),
         purpose: "remove stale or completed worktrees",
-        top_group: Some(TopHelpGroup::ContinueRecover),
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::Control),
         all_group: Some(HelpAllGroup::ContinueRecover),
     },
     CommandHelpEntry {
         display: "undo",
         clap_name: Some("undo"),
         purpose: "restore an in-place snapshot",
+        audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::ContinueRecover),
     },
@@ -1140,6 +1178,7 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         display: "abandon",
         clap_name: Some("abandon"),
         purpose: "discard a temporary worktree run",
+        audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::ContinueRecover),
     },
@@ -1147,104 +1186,122 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         display: "update",
         clap_name: Some("update"),
         purpose: "check for or route self-updates",
-        top_group: Some(TopHelpGroup::MoreHelp),
-        all_group: Some(HelpAllGroup::InspectAdvanced),
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::LearningAdvanced),
     },
     CommandHelpEntry {
         display: "history",
         clap_name: Some("history"),
         purpose: "search run traces and provenance",
-        top_group: Some(TopHelpGroup::MoreHelp),
-        all_group: Some(HelpAllGroup::InspectAdvanced),
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::LearningAdvanced),
     },
     CommandHelpEntry {
         display: "learn",
         clap_name: Some("learn"),
         purpose: "index run evidence and propose improvements",
-        top_group: Some(TopHelpGroup::MoreHelp),
-        all_group: Some(HelpAllGroup::InspectAdvanced),
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::LearningAdvanced),
     },
     CommandHelpEntry {
         display: "improve",
         clap_name: Some("improve"),
         purpose: "run evidence-backed self-improvement candidates",
+        audience: CommandAudience::Advanced,
         top_group: None,
-        all_group: Some(HelpAllGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::LearningAdvanced),
     },
     CommandHelpEntry {
         display: "apply",
         clap_name: Some("apply"),
         purpose: "merge a completed worktree run",
+        audience: CommandAudience::Advanced,
         top_group: None,
-        all_group: Some(HelpAllGroup::InspectAdvanced),
+        all_group: Some(HelpAllGroup::ResultsInspect),
     },
     CommandHelpEntry {
         display: "export",
         clap_name: Some("materialize"),
         purpose: "copy a completed fresh/copy run (alias: materialize)",
+        audience: CommandAudience::Advanced,
         top_group: None,
-        all_group: Some(HelpAllGroup::InspectAdvanced),
+        all_group: Some(HelpAllGroup::ResultsInspect),
     },
     CommandHelpEntry {
         display: "doc",
         clap_name: Some("doc"),
         purpose: "read or regenerate run docs",
+        audience: CommandAudience::Advanced,
         top_group: None,
-        all_group: Some(HelpAllGroup::InspectAdvanced),
+        all_group: Some(HelpAllGroup::ResultsInspect),
     },
     CommandHelpEntry {
         display: "library",
         clap_name: Some("library"),
         purpose: "inspect promoted artifacts",
+        audience: CommandAudience::Advanced,
         top_group: None,
-        all_group: Some(HelpAllGroup::InspectAdvanced),
+        all_group: Some(HelpAllGroup::ResultsInspect),
     },
     CommandHelpEntry {
         display: "show",
         clap_name: Some("show"),
         purpose: "show raw state, traces, and provenance",
+        audience: CommandAudience::Advanced,
         top_group: None,
-        all_group: Some(HelpAllGroup::InspectAdvanced),
+        all_group: Some(HelpAllGroup::ResultsInspect),
     },
     CommandHelpEntry {
         display: "import",
         clap_name: Some("import"),
         purpose: "import other tool history",
+        audience: CommandAudience::Advanced,
         top_group: None,
-        all_group: Some(HelpAllGroup::InspectAdvanced),
+        all_group: Some(HelpAllGroup::LearningAdvanced),
     },
     CommandHelpEntry {
         display: "acceptance",
         clap_name: Some("acceptance"),
         purpose: "advanced compatibility command for done criteria",
+        audience: CommandAudience::Compatibility,
         top_group: None,
-        all_group: Some(HelpAllGroup::InspectAdvanced),
+        all_group: Some(HelpAllGroup::SetupProviders),
     },
     CommandHelpEntry {
         display: "help-all",
         clap_name: Some("help-all"),
-        purpose: "show every command, including advanced commands (alias: commands)",
-        top_group: Some(TopHelpGroup::MoreHelp),
+        purpose: "show every command, including advanced commands",
+        audience: CommandAudience::Pseudo,
+        top_group: Some(TopHelpGroup::FindMore),
         all_group: None,
     },
     CommandHelpEntry {
         display: "<command> --help",
         clap_name: None,
         purpose: "detailed help for one command",
-        top_group: Some(TopHelpGroup::MoreHelp),
+        audience: CommandAudience::Pseudo,
+        top_group: Some(TopHelpGroup::FindMore),
         all_group: None,
     },
 ];
 
 const HELP_ALL_GROUPS: &[(HelpAllGroup, &str)] = &[
-    (HelpAllGroup::SetupProviders, "setup and providers"),
-    (HelpAllGroup::CoreLifecycle, "core lifecycle"),
-    (HelpAllGroup::Orchestration, "orchestration"),
+    (HelpAllGroup::ProductionFlow, "production flow"),
+    (HelpAllGroup::SetupProviders, "setup and provider tools"),
+    (HelpAllGroup::PowerUserLaunch, "power-user launch paths"),
+    (HelpAllGroup::Orchestration, "orchestration building blocks"),
     (HelpAllGroup::ContinueRecover, "continue and recover"),
-    (HelpAllGroup::InspectAdvanced, "inspect and advanced"),
+    (HelpAllGroup::ResultsInspect, "results and inspection"),
+    (
+        HelpAllGroup::LearningAdvanced,
+        "history, learning, and update",
+    ),
 ];
 
-const HELP_ALL_DISCOVERY_NOTE: &str = "Advanced commands are documented here but hidden from short help; compatibility aliases stay inline on their canonical command row.";
+const HELP_ALL_DISCOVERY_NOTE: &str = "Default help shows the production model; this full map keeps every power-user and advanced command easy to find. Compatibility aliases stay inline on their canonical command row.";
 
 const FLAG_POLICY_ROWS: &[(&str, &str)] = &[
     (
@@ -1324,13 +1381,11 @@ const CAP_POLICY_ROWS: &[(&str, &str)] = &[
 ];
 
 fn command_discovery(entry: &CommandHelpEntry) -> CommandDiscovery {
-    match entry.display {
-        "apply" | "export" | "doc" | "library" | "show" | "import" | "undo" | "abandon" => {
-            CommandDiscovery::Advanced
-        }
-        "acceptance" => CommandDiscovery::Compatibility,
-        "<command> --help" => CommandDiscovery::Pseudo,
-        _ => CommandDiscovery::Public,
+    match entry.audience {
+        CommandAudience::Advanced => CommandDiscovery::Advanced,
+        CommandAudience::Compatibility => CommandDiscovery::Compatibility,
+        CommandAudience::Pseudo => CommandDiscovery::Pseudo,
+        CommandAudience::Primary | CommandAudience::SetupSupport => CommandDiscovery::Public,
     }
 }
 
@@ -1373,16 +1428,18 @@ fn print_top_help() {
     println!("{}", ui_heading("Usage:"));
     println!("  {}", ui_command("deadreckon [command]"));
     println!();
-    println!("{}", ui_heading("Typical flow:"));
+    println!("{}", ui_heading("Production flow:"));
     for command in TYPICAL_FLOW_COMMANDS {
         println!("  {}", ui_command(command));
     }
     println!();
-    print_top_help_group("Core lifecycle:", TopHelpGroup::CoreLifecycle);
+    print_top_help_group("Start, watch, keep:", TopHelpGroup::StartWatchKeep);
     println!();
-    print_top_help_group("Continue or recover:", TopHelpGroup::ContinueRecover);
+    print_top_help_group("Setup and health:", TopHelpGroup::SetupHealth);
     println!();
-    print_top_help_group("More help:", TopHelpGroup::MoreHelp);
+    print_top_help_group("Control:", TopHelpGroup::Control);
+    println!();
+    print_top_help_group("Find more:", TopHelpGroup::FindMore);
     println!();
     println!(
         "{} Run, chain, and plan ids accept unique prefixes where that command accepts the kind. {} means the newest item for the current project.",
@@ -1400,7 +1457,7 @@ fn print_top_help() {
 }
 
 fn print_help_all() {
-    println!("{}", ui_heading("deadreckon commands"));
+    println!("{}", ui_heading("deadreckon full command map"));
     if COMMAND_HELP_CATALOG
         .iter()
         .any(|entry| command_discovery(entry) == CommandDiscovery::Advanced)
@@ -1408,7 +1465,7 @@ fn print_help_all() {
         println!("{}", ui_muted(HELP_ALL_DISCOVERY_NOTE));
     }
     println!();
-    println!("{}", ui_heading("typical flow"));
+    println!("{}", ui_heading("production flow"));
     for command in TYPICAL_FLOW_COMMANDS {
         println!("  {}", ui_command(command));
     }
@@ -1686,6 +1743,7 @@ fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String>
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartSelectedMode {
+    Extend,
     Run,
     Review,
     FullPlan,
@@ -1694,6 +1752,7 @@ enum StartSelectedMode {
 impl StartSelectedMode {
     fn label(self) -> &'static str {
         match self {
+            Self::Extend => "extend",
             Self::Run => "run",
             Self::Review => "review",
             Self::FullPlan => "full-plan",
@@ -1702,6 +1761,7 @@ impl StartSelectedMode {
 
     fn path_label(self) -> &'static str {
         match self {
+            Self::Extend => "follow-up run",
             Self::Run => "run",
             Self::Review => "review orchestration",
             Self::FullPlan => "full-plan orchestration",
@@ -1770,6 +1830,7 @@ impl StartDoneCriteriaSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartSourceMode {
+    ParentArtifact,
     Worktree,
     InitGit,
     Copy,
@@ -1780,6 +1841,7 @@ enum StartSourceMode {
 impl StartSourceMode {
     fn label(self) -> &'static str {
         match self {
+            Self::ParentArtifact => "parent-artifact",
             Self::Worktree => "worktree",
             Self::InitGit => "init-git",
             Self::Copy => "copy",
@@ -1871,6 +1933,10 @@ struct StartLaunchDecision {
     source_from: Option<PathBuf>,
     source_init_git: bool,
     source_allow_dirty: bool,
+    base_run_id: Option<String>,
+    base_run_label: Option<String>,
+    history_action_label: Option<String>,
+    history_next_actions: Vec<String>,
     requires_confirmation: bool,
     confirmed_by_start_picker: bool,
     try_lines: Vec<String>,
@@ -1920,6 +1986,10 @@ fn start_launch_decision(input: StartLaunchInput<'_>) -> StartLaunchDecision {
         source_from: None,
         source_init_git: false,
         source_allow_dirty: false,
+        base_run_id: None,
+        base_run_label: None,
+        history_action_label: None,
+        history_next_actions: Vec::new(),
         requires_confirmation: false,
         confirmed_by_start_picker: false,
         try_lines: Vec::new(),
@@ -2011,13 +2081,14 @@ fn start_goal_contains_word(lower_goal: &str, needle: &str) -> bool {
 fn maybe_prompt_start_mode(
     decision: &mut StartLaunchDecision,
     args: &StartCommandArgs,
+    latest_completed_run: Option<&RunListEntry>,
     prompter: &mut dyn StartPrompter,
 ) -> Result<()> {
     if !matches!(args.mode, crate::cli::CliStartMode::Auto) || decision.recovery.is_some() {
         return Ok(());
     }
     let recommended = decision.selected_mode;
-    let choices = vec![
+    let mut choices = vec![
         prompt::SelectChoice::with_detail(
             "recommended",
             format!("Recommended: {}", recommended.path_label()),
@@ -2025,21 +2096,30 @@ fn maybe_prompt_start_mode(
         ),
         prompt::SelectChoice::with_detail(
             "run",
-            "Single supervised run",
+            "New single supervised run",
             "equivalent to --mode run",
         ),
+    ];
+    if let Some(run) = latest_completed_run {
+        choices.push(prompt::SelectChoice::with_detail(
+            format!("extend:{}", run.run_id),
+            format!("Follow up from {}", run_prefix(&run.run_id)),
+            format!("extends completed run: {}", run.goal),
+        ));
+    }
+    choices.extend([
         prompt::SelectChoice::with_detail(
             "review",
-            "Coder/reviewer orchestration",
+            "New coder/reviewer pass",
             "equivalent to --mode review",
         ),
         prompt::SelectChoice::with_detail(
             "full-plan",
-            "Full-plan orchestration",
+            "New full-plan pass",
             "equivalent to --mode full-plan",
         ),
         prompt::SelectChoice::new("cancel", "Cancel"),
-    ];
+    ]);
     let choice = prompter.select_one(prompt::SelectPrompt {
         title: "Choose launch path".to_string(),
         help: Some("Pick how DeadReckon should shape this goal.".to_string()),
@@ -2054,6 +2134,20 @@ fn maybe_prompt_start_mode(
             decision.selected_mode = StartSelectedMode::Run;
             decision.selection_source = StartSelectionSource::InteractiveChoice;
             decision.reason = "interactive picker selected one supervised coding run".to_string();
+        }
+        choice if choice.starts_with("extend:") => {
+            let run_id = choice
+                .strip_prefix("extend:")
+                .expect("prefix checked")
+                .to_string();
+            decision.selected_mode = StartSelectedMode::Extend;
+            decision.selection_source = StartSelectionSource::InteractiveChoice;
+            decision.reason =
+                "interactive picker selected a follow-up from prior history".to_string();
+            decision.base_run_label = Some(format!("run {}", run_prefix(&run_id)));
+            decision.base_run_id = Some(run_id);
+            decision.source_mode = StartSourceMode::ParentArtifact;
+            decision.source_mode_label = "parent artifact".to_string();
         }
         "review" => {
             decision.selected_mode = StartSelectedMode::Review;
@@ -2131,6 +2225,50 @@ fn start_command_exists(command: &str) -> bool {
         return false;
     };
     std::env::split_paths(&paths).any(|path| path.join(command).is_file())
+}
+
+fn start_latest_extendable_run(
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+) -> Result<Option<RunListEntry>> {
+    let scope = workspace_scope(cwd).map_err(CliError::from)?;
+    let mut runs = list_runs(paths, Some(scope.as_str()))?
+        .into_iter()
+        .filter(|run| run.status == RunStatus::Completed)
+        .filter(|run| start_run_is_extendable(paths, run))
+        .collect::<Vec<_>>();
+    runs.sort_by_key(|run| run.updated_at);
+    Ok(runs.pop())
+}
+
+fn start_run_is_extendable(paths: &DeadreckonPaths, run: &RunListEntry) -> bool {
+    let Ok(state) = load_run(paths, &run.run_id) else {
+        return false;
+    };
+    if !paths.library_dir(&state.scope, &state.run_id).is_dir() {
+        return false;
+    }
+    !read_run_codebase_record(paths, &state)
+        .ok()
+        .is_some_and(|record| record.mode == CodebaseMode::InPlace)
+}
+
+fn add_start_history_actions(decision: &mut StartLaunchDecision, run: Option<&RunListEntry>) {
+    let Some(run) = run else {
+        return;
+    };
+    let prefix = run_prefix(&run.run_id);
+    let goal = shell_display_quote(&decision.goal);
+    let actions = vec![
+        format!("deadreckon extend {prefix} \"{goal}\""),
+        format!("deadreckon start \"{goal}\" --mode review --yes"),
+        format!("deadreckon start \"{goal}\" --mode full-plan --yes"),
+    ];
+    decision.history_action_label = Some(format!(
+        "extend: {}; review: {}; full-plan: {}",
+        actions[0], actions[1], actions[2]
+    ));
+    decision.history_next_actions = actions;
 }
 
 fn start_provider_picker_choices(
@@ -2311,6 +2449,164 @@ fn prompt_start_done_criteria(
     Ok(())
 }
 
+fn done_criteria_inspection_try_lines(selection: &setup::DoneCriteriaSelection) -> Vec<String> {
+    let mut lines = Vec::new();
+    match selection.path.as_ref() {
+        Some(path) => {
+            lines.push(format!(
+                "deadreckon def-done show --spec {}",
+                path.display()
+            ));
+            lines.push(format!(
+                "deadreckon def-done check --spec {}",
+                path.display()
+            ));
+        }
+        None => {
+            lines.push("deadreckon def-done show".to_string());
+            lines.push("deadreckon def-done check".to_string());
+        }
+    }
+    lines.push("deadreckon def-done \"what should count as done\"".to_string());
+    lines
+}
+
+fn done_criteria_prompt_detail(selection: &setup::DoneCriteriaSelection) -> String {
+    let checks = selection
+        .checks
+        .map(|checks| format!("{checks} check(s)"))
+        .unwrap_or_else(|| {
+            "working directory exists, or cargo test when Cargo.toml is present".to_string()
+        });
+    match selection.path.as_ref() {
+        Some(path) => format!("{} from {}", checks, path.display()),
+        None => checks,
+    }
+}
+
+fn print_start_done_criteria_summary(selection: &setup::DoneCriteriaSelection) {
+    println!("{}", ui_heading("done criteria"));
+    print_kv_block(&[
+        ("source", selection.source.as_str()),
+        ("summary", &done_criteria_prompt_detail(selection)),
+        ("view", "deadreckon def-done show"),
+        ("check", "deadreckon def-done check"),
+        (
+            "update",
+            "deadreckon def-done \"what should count as done\"",
+        ),
+    ]);
+}
+
+fn check_start_done_criteria(cwd: &Path, selection: &setup::DoneCriteriaSelection) -> Result<()> {
+    let temp_root = std::env::temp_dir().join(format!(
+        "deadreckon-start-done-check-{}",
+        Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(&temp_root)?;
+    if let Some(path) = selection.path.as_ref() {
+        fs::copy(path, acceptance_spec_path_for_run_root(&temp_root))?;
+    }
+    let result = evaluate_acceptance_checks(&temp_root, cwd);
+    let _ = fs::remove_dir_all(&temp_root);
+    println!("{}", ui_heading("done criteria check"));
+    match result {
+        Ok(results) => {
+            let failed_required = results
+                .iter()
+                .any(|result| result.must_pass && !result.passed);
+            if failed_required {
+                println!("{}", ui_status("done criteria failed"));
+            } else {
+                println!("{}", ui_ok("done criteria passed"));
+            }
+            print_acceptance_results(&results);
+        }
+        Err(err) => {
+            println!(
+                "{}",
+                ui_warn(&format!("done criteria check could not run: {err}"))
+            );
+        }
+    }
+    Ok(())
+}
+
+fn prompt_start_existing_done_criteria(
+    decision: &mut StartLaunchDecision,
+    cwd: &Path,
+    selection: &setup::DoneCriteriaSelection,
+    prompter: &mut dyn StartPrompter,
+) -> Result<()> {
+    loop {
+        let choice = prompter.select_one(prompt::SelectPrompt {
+            title: "Review done criteria".to_string(),
+            help: Some(format!(
+                "Current criteria: {}. You can view, check, update, keep, or cancel before launch.",
+                done_criteria_prompt_detail(selection)
+            )),
+            choices: vec![
+                start_prompt_choice(
+                    "keep",
+                    "Keep current done criteria",
+                    done_criteria_prompt_detail(selection),
+                ),
+                start_prompt_choice(
+                    "view",
+                    "View current criteria summary",
+                    "prints source, path/check count, and manual commands",
+                ),
+                start_prompt_choice(
+                    "check",
+                    "Check current criteria now",
+                    "dry-runs the configured checks against this working tree",
+                ),
+                start_prompt_choice(
+                    "update",
+                    "Update criteria before launch",
+                    "writes new plain-English criteria through the def-done flow",
+                ),
+                prompt::SelectChoice::new("cancel", "Cancel and show done-criteria commands"),
+            ],
+            default_index: 0,
+        })?;
+
+        match choice.id.as_str() {
+            "keep" => {
+                decision.done_criteria_source = StartDoneCriteriaSource::Project;
+                decision.done_action = StartDoneAction::Existing;
+                decision.done_criteria_label = selection.full_label();
+                return Ok(());
+            }
+            "view" => print_start_done_criteria_summary(selection),
+            "check" => check_start_done_criteria(cwd, selection)?,
+            "update" => {
+                let text = prompter.input("updated definition of done: ", None)?;
+                if text.trim().is_empty() {
+                    set_start_recovery(
+                        decision,
+                        "empty done criteria were not saved",
+                        done_criteria_inspection_try_lines(selection),
+                    );
+                    return Ok(());
+                }
+                decision.done_criteria_source = StartDoneCriteriaSource::Manual;
+                decision.done_action = StartDoneAction::ManualText(text.trim().to_string());
+                decision.done_criteria_label = "update done criteria before launch".to_string();
+                return Ok(());
+            }
+            _ => {
+                set_start_recovery(
+                    decision,
+                    "guided start cancelled before accepting done criteria",
+                    done_criteria_inspection_try_lines(selection),
+                );
+                return Ok(());
+            }
+        }
+    }
+}
+
 fn prompt_start_non_git_mode(prompter: &mut dyn StartPrompter) -> Result<StartNonGitChoice> {
     let choice = prompter.select_one(prompt::SelectPrompt {
         title: "Choose source mode".to_string(),
@@ -2374,6 +2670,8 @@ struct LaunchPreviewFacts<'a> {
     path: &'a str,
     provider: &'a str,
     roles: Option<String>,
+    base: Option<String>,
+    history: Option<String>,
     done: &'a str,
     workspace: &'a str,
     watch: String,
@@ -2390,6 +2688,12 @@ fn launch_preview_rows(facts: &LaunchPreviewFacts<'_>) -> Vec<(String, String)> 
     ];
     if let Some(roles) = facts.roles.as_ref() {
         rows.push(("roles".to_string(), roles.clone()));
+    }
+    if let Some(base) = facts.base.as_ref() {
+        rows.push(("base".to_string(), base.clone()));
+    }
+    if let Some(history) = facts.history.as_ref() {
+        rows.push(("history".to_string(), history.clone()));
     }
     rows.extend([
         ("done".to_string(), facts.done.to_string()),
@@ -2415,6 +2719,7 @@ fn print_launch_preview_rows(rows: &[(String, String)]) {
 fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFacts<'_> {
     let override_command = match decision.selected_mode {
         StartSelectedMode::Run => Some("deadreckon start <goal> --mode review".to_string()),
+        StartSelectedMode::Extend => Some("deadreckon start <goal> --mode run".to_string()),
         StartSelectedMode::Review | StartSelectedMode::FullPlan => {
             Some("deadreckon start <goal> --mode run".to_string())
         }
@@ -2424,6 +2729,8 @@ fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFa
         path: decision.selected_mode.path_label(),
         provider: &decision.provider_label,
         roles: start_provider_role_summary(decision),
+        base: decision.base_run_label.clone(),
+        history: decision.history_action_label.clone(),
         done: &decision.done_criteria_label,
         workspace: &decision.source_mode_label,
         watch: "deadreckon attach <after-start>".to_string(),
@@ -2436,7 +2743,7 @@ fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFa
 fn start_provider_role_summary(decision: &StartLaunchDecision) -> Option<String> {
     let route = decision.provider_route.as_deref()?;
     match decision.selected_mode {
-        StartSelectedMode::Run => None,
+        StartSelectedMode::Extend | StartSelectedMode::Run => None,
         StartSelectedMode::Review => Some(format!("coder={route}, reviewer={route}")),
         StartSelectedMode::FullPlan => Some(format!("planner={route}, child={route}")),
     }
@@ -2457,7 +2764,9 @@ fn resolve_start_setup(
         }
         let cwd = std::env::current_dir()?;
         resolve_start_done_criteria(decision, &cwd, Some(&mut *prompter))?;
-        if decision.recovery.is_none() {
+        if decision.recovery.is_none()
+            && !matches!(decision.selected_mode, StartSelectedMode::Extend)
+        {
             resolve_start_source_mode(
                 decision,
                 &paths,
@@ -2479,7 +2788,9 @@ fn resolve_start_setup(
         }
         let cwd = std::env::current_dir()?;
         resolve_start_done_criteria(decision, &cwd, None)?;
-        if decision.recovery.is_none() {
+        if decision.recovery.is_none()
+            && !matches!(decision.selected_mode, StartSelectedMode::Extend)
+        {
             resolve_start_source_mode(
                 decision,
                 &paths,
@@ -2571,6 +2882,10 @@ fn resolve_start_done_criteria(
     let source = resolve_acceptance_source(cwd, None)?;
     if source.is_some() {
         let selection = done_criteria_selection(&source)?;
+        if let Some(prompter) = prompter {
+            prompt_start_existing_done_criteria(decision, cwd, &selection, prompter)?;
+            return Ok(());
+        }
         decision.done_criteria_source = StartDoneCriteriaSource::Project;
         decision.done_action = StartDoneAction::Existing;
         decision.done_criteria_label = selection.full_label();
@@ -2912,15 +3227,24 @@ fn prompt_start_launch_confirmation(
 
 async fn start_command(args: StartCommandArgs) -> Result<()> {
     let stdin_is_tty = io::stdin().is_terminal();
+    let paths = DeadreckonPaths::discover();
+    let cwd = std::env::current_dir()?;
+    let latest_extendable_run = start_latest_extendable_run(&paths, &cwd)?;
     let mut decision = start_launch_decision(StartLaunchInput {
         goal: &args.goal,
         requested_mode: args.mode,
         stdin_is_tty,
     });
+    add_start_history_actions(&mut decision, latest_extendable_run.as_ref());
     let eligibility = StartPromptEligibility::from_args(&args, stdin_is_tty);
     let mut terminal_prompter = TerminalStartPrompter;
     if eligibility.allows_prompts() {
-        maybe_prompt_start_mode(&mut decision, &args, &mut terminal_prompter)?;
+        maybe_prompt_start_mode(
+            &mut decision,
+            &args,
+            latest_extendable_run.as_ref(),
+            &mut terminal_prompter,
+        )?;
         if decision.recovery.is_none() {
             resolve_start_setup(
                 &mut decision,
@@ -2933,8 +3257,20 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
         resolve_start_setup(&mut decision, &args, None, stdin_is_tty)?;
     }
     if args.json {
-        let next_actions = if decision.recovery.is_some() {
+        let mut next_actions = if decision.recovery.is_some() {
             decision.try_lines.clone()
+        } else if matches!(decision.selected_mode, StartSelectedMode::Extend) {
+            decision
+                .base_run_id
+                .as_ref()
+                .map(|run_id| {
+                    vec![format!(
+                        "deadreckon extend {} \"{}\"",
+                        run_prefix(run_id),
+                        shell_display_quote(&decision.goal)
+                    )]
+                })
+                .unwrap_or_else(|| vec!["deadreckon list".to_string()])
         } else {
             vec![format!(
                 "deadreckon start \"{}\" --mode {} --yes",
@@ -2942,6 +3278,15 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
                 decision.selected_mode.label()
             )]
         };
+        if decision.recovery.is_none()
+            && !matches!(decision.selected_mode, StartSelectedMode::Extend)
+        {
+            for action in &decision.history_next_actions {
+                if !next_actions.iter().any(|existing| existing == action) {
+                    next_actions.push(action.clone());
+                }
+            }
+        }
         let payload = json!({
             "kind": "start",
             "goal": decision.goal,
@@ -2955,6 +3300,7 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
             "source_mode": decision.source_mode.label(),
             "requires_confirmation": decision.requires_confirmation,
             "will_start": false,
+            "history_actions": decision.history_next_actions,
             "next_actions": next_actions,
             "try_lines": decision.try_lines
         });
@@ -3055,6 +3401,47 @@ async fn dispatch_start_command(
             }
             result
         }
+        StartSelectedMode::Extend => {
+            if start_source_flags_present(&args) {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "source mode flags are not used when start extends prior history",
+                    "omit source flags or use deadreckon extend directly",
+                )));
+            }
+            let parent_run_id = decision.base_run_id.clone().ok_or_else(|| {
+                CliError::Core(deadreckon_core::user_error(
+                    "guided start did not select a parent run to extend",
+                    "deadreckon list",
+                ))
+            })?;
+            let paths = DeadreckonPaths::discover();
+            let before = start_run_ids(&paths)?;
+            let goal = args.goal.clone();
+            let quiet = args.quiet;
+            let result = extend_command(ExtendCommandArgs {
+                parent_run_id,
+                new_goal: args.goal,
+                dest: None,
+                max_context_turns: None,
+                no_context: false,
+                max_spend: None,
+                max_wall_seconds: None,
+                provider: decision.provider_route.clone(),
+                model: None,
+                sandbox: None,
+                no_docs: false,
+                doc_skill: None,
+                post_actions: !args.quiet,
+            })
+            .await;
+            if result.is_ok()
+                && !quiet
+                && let Some(run) = newest_start_run(&paths, &before, &goal)?
+            {
+                print_start_lifecycle_footer("run", &run.run_id);
+            }
+            result
+        }
         StartSelectedMode::Review | StartSelectedMode::FullPlan => {
             if start_source_flags_present(&args)
                 || decision.source_fresh
@@ -3071,7 +3458,9 @@ async fn dispatch_start_command(
             let goal = args.goal.clone();
             let quiet = args.quiet;
             let mode = match decision.selected_mode {
-                StartSelectedMode::Run => unreachable!("run handled above"),
+                StartSelectedMode::Extend | StartSelectedMode::Run => {
+                    unreachable!("run and extend handled above")
+                }
                 StartSelectedMode::Review => CliPlanMode::Review,
                 StartSelectedMode::FullPlan => CliPlanMode::FullPlan,
             };
@@ -10111,6 +10500,8 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         path: "run",
         provider: agent,
         roles: None,
+        base: None,
+        history: None,
         done: &done_label,
         workspace: &workspace,
         watch: format!("deadreckon attach {run_id}"),
@@ -11708,6 +12099,8 @@ fn print_orchestrate_preflight(
         path,
         provider: &providers,
         roles: None,
+        base: None,
+        history: None,
         done: &gate,
         workspace: &source,
         watch: format!("deadreckon attach {plan_ref}"),
@@ -30017,34 +30410,36 @@ mod tui_tests {
         AttachParentPlan, AttachPlanNarrativeRefreshJob, AttachProviderActivityCache,
         AttachProviderLogScanCache, AttachRunNarrativeRefreshJob, AttachSurface, AttachTickBudget,
         AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG,
-        ChainAttachTuiState, CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS,
-        LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
+        ChainAttachTuiState, CommandAudience, CommandDiscovery, CommandHelpEntry, CompletionAction,
+        HELP_ALL_GROUPS, LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
         NarrativeRefreshKind, NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent,
         PlanNarrativeRefreshInput, ProviderActivity, ProviderJsonlLogSpec, Result,
         RunNarrativeRenderInput, StartDoneAction, StartDoneCriteriaSource, StartLaunchInput,
         StartPromptEligibility, StartPrompter, StartSelectedMode, StartSelectionSource,
-        TopHelpGroup, acceptance_activity_lines, attach_banner, attach_header_text,
-        attach_live_inventory, attach_loop_stage_work, attach_should_return_to_plan,
-        build_run_narrative_projection, cancel_plan_narrative_refresh_job,
-        cancel_run_narrative_refresh_job, chain_activity_lines, chain_attach_footer_text,
-        chain_attach_header_text, chain_event_read_hint, chain_narrative_refusal_text,
-        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
-        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
+        StartSourceMode, TopHelpGroup, acceptance_activity_lines, add_start_history_actions,
+        attach_banner, attach_header_text, attach_live_inventory, attach_loop_stage_work,
+        attach_should_return_to_plan, build_run_narrative_projection,
+        cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job, chain_activity_lines,
+        chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
+        chain_narrative_refusal_text, chain_should_auto_attach, chain_step_dot,
+        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
+        cli_wait_status_line, collect_jsonl_provider_activity,
         collect_jsonl_provider_activity_scan, command_discovery, completion_action_from_input,
         completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
-        doc_polish_preview_text, implementation_plan_warnings, kill_banner, live_file_lines,
-        markdown_to_tui_lines, max_panel_scroll, maybe_prompt_start_mode, meter_color,
-        narrative_provider_selection, orchestration_dependency_rows,
+        doc_polish_preview_text, implementation_plan_warnings, kill_banner, launch_preview_rows,
+        live_file_lines, markdown_to_tui_lines, max_panel_scroll, maybe_prompt_start_mode,
+        meter_color, narrative_provider_selection, orchestration_dependency_rows,
         orchestration_parallelism_lines, orchestration_provider_role_rows,
         orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
         plan_merge_repair_summary_items, plan_narrative_refresh_request,
         plan_narrative_refresh_trigger, poll_plan_narrative_refresh_job,
-        poll_run_narrative_refresh_job, prompt_start_done_criteria, provider_ingest_base_roots,
+        poll_run_narrative_refresh_job, prompt_start_done_criteria,
+        prompt_start_existing_done_criteria, provider_ingest_base_roots,
         provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
         provider_jsonl_session_matches_run, read_plan_events_lossy, recommend_child_count_for_goal,
         recommend_orchestration_mode, render_attach, render_plan_attach, run_narrative_json_text,
         run_narrative_plain_text, run_narrative_refresh_trigger, start_launch_decision,
-        start_or_coalesce_plan_narrative_refresh_job, threshold_color,
+        start_launch_preview_facts, start_or_coalesce_plan_narrative_refresh_job, threshold_color,
     };
     use crate::cli::{Cli, CliPlanMode, CliStartMode, StartCommandArgs};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -30056,8 +30451,8 @@ mod tui_tests {
         ChainEventKind, ChainNewOptions, ChainStatus, ChainStepStatus, DeadreckonPaths, DocKind,
         NetworkCapability, OnFail, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
         PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunEvent,
-        RunEventKind, RunOptions, RunStatus, SpendRecord, TraceRecord, append_plan_event,
-        create_run, doc_path_for_kind, save_plan,
+        RunEventKind, RunListEntry, RunOptions, RunStatus, SpendRecord, TraceRecord,
+        append_plan_event, create_run, doc_path_for_kind, save_plan,
     };
     use deadreckon_providers::SpendEstimate;
     use deadreckon_providers::registry::{
@@ -31173,9 +31568,10 @@ mod tui_tests {
         }
 
         for group in [
-            TopHelpGroup::CoreLifecycle,
-            TopHelpGroup::ContinueRecover,
-            TopHelpGroup::MoreHelp,
+            TopHelpGroup::StartWatchKeep,
+            TopHelpGroup::SetupHealth,
+            TopHelpGroup::Control,
+            TopHelpGroup::FindMore,
         ] {
             assert!(top_groups.contains(&format!("{group:?}")));
         }
@@ -31193,14 +31589,50 @@ mod tui_tests {
                 .unwrap_or_else(|| panic!("missing catalog row {name}"))
         };
 
-        for name in ["apply", "export", "abandon", "doc", "show"] {
+        for name in [
+            "run",
+            "orchestrate",
+            "chain",
+            "extend",
+            "apply",
+            "export",
+            "abandon",
+            "doc",
+            "show",
+        ] {
             assert_eq!(command_discovery(entry(name)), CommandDiscovery::Advanced);
+            assert_eq!(
+                entry(name).top_group,
+                None,
+                "{name} should stay out of short help"
+            );
         }
         assert_eq!(
             command_discovery(entry("acceptance")),
             CommandDiscovery::Compatibility
         );
-        assert_eq!(command_discovery(entry("run")), CommandDiscovery::Public);
+        for name in [
+            "start", "attach", "status", "list", "finish", "doctor", "kill", "resume", "cleanup",
+        ] {
+            assert_eq!(command_discovery(entry(name)), CommandDiscovery::Public);
+            assert_eq!(
+                entry(name).audience,
+                CommandAudience::Primary,
+                "{name} should be part of the primary production model"
+            );
+            assert!(
+                entry(name).top_group.is_some(),
+                "{name} should be in short help"
+            );
+        }
+        for name in ["init", "def-done"] {
+            assert_eq!(command_discovery(entry(name)), CommandDiscovery::Public);
+            assert_eq!(entry(name).audience, CommandAudience::SetupSupport);
+            assert!(
+                entry(name).top_group.is_some(),
+                "{name} should support setup"
+            );
+        }
         assert!(
             COMMAND_HELP_CATALOG
                 .iter()
@@ -31653,7 +32085,7 @@ mod tui_tests {
         let args = start_args_for_test("improve the app");
         let mut prompter = ScriptedStartPrompter::new(&["review"]);
 
-        maybe_prompt_start_mode(&mut decision, &args, &mut prompter).expect("mode prompt");
+        maybe_prompt_start_mode(&mut decision, &args, None, &mut prompter).expect("mode prompt");
 
         assert_eq!(decision.selected_mode, StartSelectedMode::Review);
         assert_eq!(
@@ -31661,6 +32093,85 @@ mod tui_tests {
             StartSelectionSource::InteractiveChoice
         );
         assert_eq!(prompter.prompt_titles, vec!["Choose launch path"]);
+    }
+
+    #[test]
+    fn start_fake_prompter_can_choose_extend_from_completed_history() {
+        let parent = RunListEntry {
+            run_id: "aaaabbbbccccdddd1111222233334444".to_string(),
+            scope: "scope".to_string(),
+            goal: "build the original app".to_string(),
+            status: RunStatus::Completed,
+            updated_at: Utc::now(),
+            state_path: std::path::PathBuf::from("state.json"),
+        };
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "add settings",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+        let args = start_args_for_test("add settings");
+        let mut prompter = ScriptedStartPrompter::new(&["extend:aaaabbbbccccdddd1111222233334444"]);
+
+        maybe_prompt_start_mode(&mut decision, &args, Some(&parent), &mut prompter)
+            .expect("mode prompt");
+
+        assert_eq!(decision.selected_mode, StartSelectedMode::Extend);
+        assert_eq!(
+            decision.selection_source,
+            StartSelectionSource::InteractiveChoice
+        );
+        assert_eq!(decision.source_mode, StartSourceMode::ParentArtifact);
+        assert_eq!(
+            decision.base_run_id.as_deref(),
+            Some("aaaabbbbccccdddd1111222233334444")
+        );
+        let rows = launch_preview_rows(&start_launch_preview_facts(&decision));
+        assert!(
+            rows.iter()
+                .any(|(key, value)| key == "base" && value == "run aaaabbbb"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn start_history_actions_name_extend_and_new_orchestration_passes() {
+        let parent = RunListEntry {
+            run_id: "bbbbaaaaccccdddd1111222233334444".to_string(),
+            scope: "scope".to_string(),
+            goal: "build the original app".to_string(),
+            status: RunStatus::Completed,
+            updated_at: Utc::now(),
+            state_path: std::path::PathBuf::from("state.json"),
+        };
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "add charts",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: false,
+        });
+
+        add_start_history_actions(&mut decision, Some(&parent));
+
+        assert_eq!(
+            decision.history_action_label.as_deref(),
+            Some(
+                "extend: deadreckon extend bbbbaaaa \"add charts\"; review: deadreckon start \"add charts\" --mode review --yes; full-plan: deadreckon start \"add charts\" --mode full-plan --yes"
+            )
+        );
+        assert_eq!(
+            decision.history_next_actions,
+            vec![
+                "deadreckon extend bbbbaaaa \"add charts\"".to_string(),
+                "deadreckon start \"add charts\" --mode review --yes".to_string(),
+                "deadreckon start \"add charts\" --mode full-plan --yes".to_string(),
+            ]
+        );
+        let rows = launch_preview_rows(&start_launch_preview_facts(&decision));
+        assert!(
+            rows.iter().any(|(key, value)| key == "history"
+                && value == "extend: deadreckon extend bbbbaaaa \"add charts\"; review: deadreckon start \"add charts\" --mode review --yes; full-plan: deadreckon start \"add charts\" --mode full-plan --yes"),
+            "{rows:?}"
+        );
     }
 
     #[test]
@@ -31680,6 +32191,118 @@ mod tui_tests {
         );
         assert_eq!(decision.done_action, StartDoneAction::DefaultGate);
         assert!(decision.done_criteria_label.contains("default"));
+    }
+
+    #[test]
+    fn start_existing_done_criteria_prompt_can_keep_current_criteria() {
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "build the app",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+        let selection = crate::setup::DoneCriteriaSelection::project(
+            std::path::PathBuf::from(".deadreckon/acceptance.yaml"),
+            None,
+            Some(2),
+        );
+        let mut prompter = ScriptedStartPrompter::new(&["keep"]);
+
+        prompt_start_existing_done_criteria(
+            &mut decision,
+            std::path::Path::new("."),
+            &selection,
+            &mut prompter,
+        )
+        .expect("existing done criteria prompt");
+
+        assert_eq!(
+            decision.done_criteria_source,
+            StartDoneCriteriaSource::Project
+        );
+        assert_eq!(decision.done_action, StartDoneAction::Existing);
+        assert!(
+            decision.done_criteria_label.contains("project (2 checks)"),
+            "{}",
+            decision.done_criteria_label
+        );
+    }
+
+    #[test]
+    fn start_existing_done_criteria_prompt_can_update_before_launch() {
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "build the app",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+        let selection = crate::setup::DoneCriteriaSelection::project(
+            std::path::PathBuf::from(".deadreckon/acceptance.yaml"),
+            None,
+            Some(1),
+        );
+        let mut prompter = ScriptedStartPrompter::new(&["update"]);
+        prompter
+            .inputs
+            .push_back("tests pass and screenshots are clean".to_string());
+
+        prompt_start_existing_done_criteria(
+            &mut decision,
+            std::path::Path::new("."),
+            &selection,
+            &mut prompter,
+        )
+        .expect("existing done criteria update prompt");
+
+        assert_eq!(
+            decision.done_criteria_source,
+            StartDoneCriteriaSource::Manual
+        );
+        assert_eq!(
+            decision.done_action,
+            StartDoneAction::ManualText("tests pass and screenshots are clean".to_string())
+        );
+        assert_eq!(
+            decision.done_criteria_label,
+            "update done criteria before launch"
+        );
+    }
+
+    #[test]
+    fn start_existing_done_criteria_prompt_can_view_then_update() {
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "build the app",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+        let selection = crate::setup::DoneCriteriaSelection::project(
+            std::path::PathBuf::from(".deadreckon/acceptance.yaml"),
+            None,
+            Some(1),
+        );
+        let mut prompter = ScriptedStartPrompter::new(&["view", "update"]);
+        prompter
+            .inputs
+            .push_back("browser loads and smoke tests pass".to_string());
+
+        prompt_start_existing_done_criteria(
+            &mut decision,
+            std::path::Path::new("."),
+            &selection,
+            &mut prompter,
+        )
+        .expect("existing done criteria view/update prompt");
+
+        assert_eq!(
+            decision.done_action,
+            StartDoneAction::ManualText("browser loads and smoke tests pass".to_string())
+        );
+        assert_eq!(
+            prompter.prompt_titles,
+            vec![
+                "Review done criteria",
+                "Review done criteria",
+                "updated definition of done: "
+            ]
+        );
     }
 
     #[test]

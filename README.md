@@ -16,6 +16,8 @@ You bring the agent CLI you already trust. You tell deadreckon what "done" looks
 deadreckon start "build the app"
 # walk away, attach later from any terminal
 deadreckon attach latest
+deadreckon status
+deadreckon list
 deadreckon finish latest
 ```
 
@@ -270,6 +272,8 @@ Start with the guided front door:
 ```bash
 deadreckon start "build the app"
 deadreckon attach latest    # watch live, Ctrl-D to detach
+deadreckon status           # see latest run and next action
+deadreckon list             # find runs and plans for this project
 deadreckon finish latest
 ```
 
@@ -281,6 +285,19 @@ scripts or CI, use explicit flags plus `--yes`, `--plain`, `--quiet`, or
 If setup is incomplete, `start` stops before launching work and prints exact
 `try:` lines for configuration, done criteria, or source mode. Paste those,
 then run the same `deadreckon start "build the app"` command again.
+
+If the current repo already has completed deadreckon history, interactive
+`start` can offer a follow-up from the latest extendable artifact, a new
+coder/reviewer pass, or a new full-plan pass. In non-interactive use,
+`deadreckon start "goal" --preview --plain` prints exact commands such as
+`deadreckon extend <run-id> "goal"` and
+`deadreckon start "goal" --mode review --yes`.
+
+When done criteria already exist, interactive `start` shows what will be
+enforced and lets you keep, view, check, update, or cancel before launch. The
+same contract is available directly through `deadreckon def-done show`,
+`deadreckon def-done check`, and `deadreckon def-done "what should count as
+done"`.
 
 Use direct commands when you already know the shape of the work:
 
@@ -357,46 +374,49 @@ Use the agentic CLI for intelligence. Use deadreckon for isolation, supervision,
 
 ## Command Surface
 
-Core lifecycle:
+Default production model:
 
 ```text
-init          create local config
-config        inspect or edit config keys
-run           start an unattended coding run
+start         begin supervised agent work
 attach        open the live dashboard
 status        latest run and next action for this project
-list          list runs (current project; --all for every scope)
-show          inspect state, lineage, spend, files
-doc           print or export run documentation
-apply         apply a completed worktree run to your branch
-abandon       remove a worktree run and temporary branch
-export        copy a completed artifact to a normal directory
-extend        continue from a completed run
-resume        continue an interrupted run
-kill          stop a live run and child processes
-undo          restore a previous turn snapshot
-cleanup       clean abandoned, stale, or completed worktrees
-finish        choose apply or export from completed run
-import        normalize histories from other coding tools
+list          find runs and plans
+finish        choose apply or export from completed work
 doctor        check config, providers, sandboxes, disk, runtime
+init          create local config
+def-done      compile English "done" criteria into checks
+kill          stop a live run, chain, or plan
+resume        continue an interrupted run
+cleanup       clean abandoned, stale, or completed worktrees
+help-all      show every advanced and compatibility command
 ```
 
-Multi-agent, evidence, and self-improvement:
+Power-user and advanced commands remain available:
 
 ```text
-def-done      compile English "done" criteria into checks
-chain         plan and run ordered multi-step work
+run           start one unattended coding run directly
 orchestrate   one-command review / full-plan multi-agent runs
+chain         plan and run ordered multi-step work
 plan          write an orchestration plan (no child runs yet)
 fork          start a plan's ready child runs
 merge         compose plan children into one promoted artifact
+apply         apply a completed worktree run to your branch
+export        copy a completed artifact to a normal directory
+extend        continue from a completed run
+show          inspect state, lineage, spend, files
+doc           print or export run documentation
 rewind        preview or apply a provider flight checkpoint
 history       search durable traces and provenance
 library       query promoted run artifacts
 providers     list provider routes (detect probes availability)
+detect        probe registered providers
+config        inspect or edit config keys
 update        check for or apply self-updates
 learn         index run evidence and propose improvements
 improve       run evidence-gated self-improvement candidates
+import        normalize histories from other coding tools
+undo          restore a previous turn snapshot
+abandon       remove a worktree run and temporary branch
 completion    install shell tab-completion
 ```
 

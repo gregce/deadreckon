@@ -1263,12 +1263,19 @@ Trace `detail` rows use a stable import schema: `import_version`, canonical `sou
 
 The `Commands` enum in `crates/deadreckon/src/cli.rs` defines the CLI surface; handlers live in `crates/deadreckon/src/main.rs`. Verbs and roles (line numbers are intentionally omitted — `cli.rs` is the source of truth and grows over time):
 
+Default top-level help presents the production model: `start`, `attach`,
+`status`, `list`, `finish`, `doctor`, `init`, `def-done`, `kill`, `resume`,
+`cleanup`, `help-all`, and `<command> --help`. Power-user launchers and
+building-block verbs remain callable, documented by `help-all`, exposed through
+their own `--help`, and available to completions, but they are no longer the
+first screen.
+
 | Verb | Role |
 |---|---|
 | `init` | Interactive setup of `~/.deadreckon/config.toml` |
 | `config get/set` | Non-interactive TOML edits |
-| `start` | Guided front door for choosing and launching a run or orchestration path |
-| `run` | Create + enter turn loop |
+| `start` | Guided production front door for choosing and launching a run, follow-up, or orchestration path |
+| `run` | Advanced direct one-run launcher; create + enter turn loop |
 | `doctor` | Actionable preflight (OS, sandbox, providers, config, disk, runtime) |
 | `status` / `next` | Current project's latest run, locations, and next action |
 | `list` | Project-scoped run inventory by default; `--all` for global history, `--full` for exact values |
@@ -1286,10 +1293,10 @@ The `Commands` enum in `crates/deadreckon/src/cli.rs` defines the CLI surface; h
 | `show` | Pretty-print full state + provenance + traces; `--why-failed` for runs and plans; `--flight` / `--file` for the flight recorder |
 | `import` | Read-only descriptor-backed transcript import from CLI providers plus Cursor SQLite |
 | `chain` | Create, plan, run, attach, pause/resume/kill, undo, extend, and redo serial autonomous chains |
-| `orchestrate` | One-command wrappers for `review` and `full-plan` multi-agent runs |
-| `plan` | Write an orchestration plan (worker specs + `plan.json`) without starting child runs |
-| `fork` | Spawn ready child runs for a plan and supervise them through completion |
-| `merge` | Compose completed child library artifacts into a new promoted run (with semantic merge repair) |
+| `orchestrate` | Advanced one-command wrappers for `review` and `full-plan` multi-agent runs |
+| `plan` | Advanced building block that writes an orchestration plan (worker specs + `plan.json`) without starting child runs |
+| `fork` | Advanced building block that spawns ready child runs for a plan and supervises them through completion |
+| `merge` | Advanced building block that composes completed child library artifacts into a new promoted run (with semantic merge repair) |
 | `def-done` | Write, add, show, or check the project's English done criteria |
 | `acceptance` | Hidden compatibility surface for creating, explaining, or checking done criteria |
 | `doc` | Print run narrative, as-built, implementation decision ledger, or delta; with optional polish pass |
@@ -1305,13 +1312,15 @@ The `Commands` enum in `crates/deadreckon/src/cli.rs` defines the CLI surface; h
 
 ### 17.1 Guided first use
 
-`deadreckon start "<goal>"` is the guided first-use command. It is intentionally a thin CLI-layer decision helper, not a new runtime state machine: each invocation builds an ephemeral launch decision, prints the selected path and reason, and either previews or dispatches to the existing `run` and `orchestrate` handlers. In an interactive TTY, `start` now uses normal terminal selection prompts for launch mode, provider route, missing done criteria, source mode, and final confirmation when flags have not already made those choices explicit. No `PipelineState` schema changes were introduced for this path, and previews remain state-free.
+`deadreckon start "<goal>"` is the guided production command. It is intentionally a thin CLI-layer decision helper, not a new runtime state machine: each invocation builds an ephemeral launch decision, prints the selected path and reason, and either previews or dispatches to the existing `run`, `extend`, and `orchestrate` handlers. In an interactive TTY, `start` uses normal terminal selection prompts for launch mode, provider route, done criteria, source mode, and final confirmation when flags have not already made those choices explicit. No `PipelineState` schema changes were introduced for this path, and previews remain state-free.
 
-The launch decision resolves provider setup, done criteria, source mode, and run-vs-orchestrate mode before any provider work begins. Provider resolution uses configured defaults first and only probes installed subscription CLIs when no default route is configured; TTY users can select a detected route ephemerally for that launch without writing config, while non-TTY or scripted users still get concrete `try:` lines for `init`, `detect`, `config provider`, or `providers list --all`. Done-criteria resolution uses the same `def-done` and `.deadreckon/acceptance.yaml` contract as direct runs: existing project criteria are reused, TTY users can choose default gate behavior or ask `start` to compile criteria after final confirmation, and non-TTY callers get the same deterministic recovery lines. Source-mode resolution follows the existing run safety posture: git worktree by default in repositories, TTY selection for init-git/copy/fresh in non-git directories, and explicit stash or `--allow-dirty` choices for dirty worktrees.
+The launch decision resolves provider setup, done criteria, source mode, history, and run-vs-orchestrate mode before any provider work begins. Provider resolution uses configured defaults first and only probes installed subscription CLIs when no default route is configured; TTY users can select a detected route ephemerally for that launch without writing config, while non-TTY or scripted users still get concrete `try:` lines for `init`, `detect`, `config provider`, or `providers list --all`. Done-criteria resolution uses the same `def-done` and `.deadreckon/acceptance.yaml` contract as direct runs: existing project criteria trigger a TTY keep/view/check/update/cancel prompt so users can inspect or change the contract before launch, missing criteria can be generated or defaulted, and non-TTY callers get deterministic recovery lines. Source-mode resolution follows the existing run safety posture: git worktree by default in repositories, TTY selection for init-git/copy/fresh in non-git directories, and explicit stash or `--allow-dirty` choices for dirty worktrees.
+
+History-aware `start` scans the current project scope for the newest completed, promoted, non-in-place run. When one exists, the TTY launch picker adds a "Follow up" choice that dispatches through `extend`; preview and JSON output also include exact commands for `deadreckon extend <run-id> "<goal>"`, `deadreckon start "<goal>" --mode review --yes`, and `deadreckon start "<goal>" --mode full-plan --yes`. This keeps scripted `start` deterministic while making it obvious how to continue prior work or launch a new orchestration pass.
 
 Auto mode is deterministic in alpha. It chooses single-run, review orchestration, or full-plan orchestration from local goal text and explicit flags, then reports the override flag (`--mode run`, `--mode review`, or `--mode full-plan`) a user can pass if the heuristic guessed wrong. In a TTY, the recommendation appears first in the mode picker and the user can override it with a selection. The guided command does not ask a provider to classify the goal and does not persist personal preferences.
 
-`start --preview`, `run --preview`, and `orchestrate --preview` share launch-preview rows: path, provider, done criteria, workspace, watch, stop, and finish. Orchestrated `start` previews also show the alpha role reuse when one selected provider route is used for coder/reviewer or planner/child roles. Successful guided launches add a `start lifecycle` footer with exact `attach`, `status`, `kill`, and `finish` commands for the created run or plan. Existing `run` and `orchestrate` remain the canonical direct commands for users who already know the path they want.
+`start --preview`, `run --preview`, and `orchestrate --preview` share launch-preview rows: path, provider, done criteria, workspace, watch, stop, and finish, with optional base/history rows when a follow-up is selected or available. Orchestrated `start` previews also show the alpha role reuse when one selected provider route is used for coder/reviewer or planner/child roles. Successful guided launches add a `start lifecycle` footer with exact `attach`, `status`, `kill`, and `finish` commands for the created run or plan. Existing `run`, `extend`, and `orchestrate` remain the canonical direct commands for users who already know the path they want.
 
 Prompt eligibility is deliberately narrow: `--json`, `--plain`, `--quiet`, `--yes`, and non-TTY execution never start the picker and never block on stdin. Those paths preserve deterministic JSON/recovery output and scriptable launch behavior. `--preview` may ask TTY users for selections, but it remains state-free; provider config is not written by a provider selection, and done-criteria files are only generated for an actual launch after final confirmation.
 
@@ -1802,7 +1811,7 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 ## 26. Coherence Pass (alpha)
 
-> **Status (2026-05-24):** The May 2026 coherence pass and closure pass are alpha-complete. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, provider/done-criteria setup, JSON parity, orchestration commands, plan attach, and polymorphic lifecycle ids now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md`, `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`, and `docs/goals/2026-05-24-1426-deadreckon-provider-done-setup-goal.md`; the closure matrix is `docs/design/USER-FACING-MATRIX.md`, with larger follow-ups explicitly deferred to `docs/V1-CANDIDATES.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs` and runtime setup helpers.
+> **Status (2026-05-27):** The May 2026 coherence pass, closure pass, and production command model are alpha-complete. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, provider/done-criteria setup, JSON parity, orchestration commands, plan attach, polymorphic lifecycle ids, default-help command audience, history-aware `start`, and done-criteria review prompts now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md`, `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`, `docs/goals/2026-05-24-1426-deadreckon-provider-done-setup-goal.md`, and `docs/goals/2026-05-27-1152-deadreckon-production-command-model-goal.md`; the closure matrix is `docs/design/USER-FACING-MATRIX.md`, with larger follow-ups explicitly deferred to `docs/V1-CANDIDATES.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs` and runtime setup helpers.
 
 ### 26.1 Glossary
 
@@ -1812,7 +1821,7 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 `crates/deadreckon/src/ui.rs` owns ANSI rendering through `Tone`, `Stream`, `write`, `writeln`, `hint`, and `kv_block`. The small CLI facade (`ui_heading`, `ui_muted`, `ui_id`, `ui_command`, `ui_ok`, `ui_warn`, `ui_note`, `ui_status`, and `ui_error`) also lives there, so `main.rs` imports style intent instead of defining its own wrappers. Raw ANSI escapes are confined to `ui.rs`, and status labels route through `ui::status_tone` before choosing a tone. `failed`/`killed`, `paused`, `warning`, and `note` are separate style intents even when two intents currently share the same terminal color. The cyan `deadreckoning` banner, blue `* ^ . -` course strip, magenta IDs, spend gauge gradient, and chain glyph family remain product affordances.
 
-Custom top-level help and `help-all` command discovery now render from `COMMAND_HELP_CATALOG` in `crates/deadreckon/src/main.rs`. The top-level clap after-help no longer carries a duplicate command table; unit tests verify catalog row uniqueness and that every catalog entry points at a real clap subcommand or explicit pseudo-row such as `<command> --help`. `help-all` also states the discovery policy: advanced commands are documented there but hidden from short help, and compatibility aliases stay inline on their canonical row.
+Custom top-level help and `help-all` command discovery now render from `COMMAND_HELP_CATALOG` in `crates/deadreckon/src/main.rs`. The default help first screen presents the production model (`start`, `attach`, `status`, `list`, `finish`, setup, and control) rather than every callable verb. The top-level clap after-help no longer carries a duplicate command table; unit tests verify catalog row uniqueness, command audience classification, and that every catalog entry points at a real clap subcommand or explicit pseudo-row such as `<command> --help`. `help-all` states the discovery policy: advanced commands remain callable and documented there, while compatibility aliases stay inline on their canonical row.
 
 ### 26.3 Key/Value Layout
 
