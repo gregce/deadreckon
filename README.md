@@ -273,6 +273,11 @@ deadreckon attach latest    # watch live, Ctrl-D to detach
 deadreckon finish latest
 ```
 
+In an interactive terminal, `start` uses selection prompts for the launch path,
+provider route, missing done criteria, source mode, and final confirmation. In
+scripts or CI, use explicit flags plus `--yes`, `--plain`, `--quiet`, or
+`--json` to keep it non-prompting.
+
 If setup is incomplete, `start` stops before launching work and prints exact
 `try:` lines for configuration, done criteria, or source mode. Paste those,
 then run the same `deadreckon start "build the app"` command again.

@@ -1,5 +1,13 @@
 # Changelog
 
+## Start picker (alpha) - 2026-05-27
+
+- Added selection-first TTY prompts to `deadreckon start` for launch mode, detected/configured provider routes, missing done-criteria action, non-git and dirty source handling, and final launch confirmation.
+- Kept scripted surfaces deterministic: non-TTY, `--json`, `--plain`, `--quiet`, and `--yes` never enter the picker and continue to emit structured output or `try:` recovery lines.
+- Let interactive users choose a detected CLI provider ephemerally for a launch without writing provider config.
+- Routed selected provider routes into existing run/review/full-plan dispatch, with previews showing alpha role reuse for review and full-plan orchestration.
+- Documented the picker behavior and remaining V1 deferrals without adding durable launch profiles or runtime state schemas.
+
 ## Guided first use (alpha) - 2026-05-26
 
 - Reframed README/HOWTO first-run examples around provider-neutral `deadreckon start`, while keeping direct `run` and `orchestrate` paths documented for power users.

@@ -1713,6 +1713,7 @@ impl StartSelectedMode {
 enum StartSelectionSource {
     ExplicitFlag,
     Heuristic,
+    InteractiveChoice,
     Default,
 }
 
@@ -1721,6 +1722,7 @@ impl StartSelectionSource {
         match self {
             Self::ExplicitFlag => "explicit_flag",
             Self::Heuristic => "heuristic",
+            Self::InteractiveChoice => "interactive_choice",
             Self::Default => "default",
         }
     }
@@ -1730,6 +1732,7 @@ impl StartSelectionSource {
 enum StartProviderSource {
     Configured,
     Detected,
+    Interactive,
     Missing,
 }
 
@@ -1738,6 +1741,7 @@ impl StartProviderSource {
         match self {
             Self::Configured => "configured",
             Self::Detected => "detected",
+            Self::Interactive => "interactive",
             Self::Missing => "missing",
         }
     }
@@ -1746,6 +1750,9 @@ impl StartProviderSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartDoneCriteriaSource {
     Project,
+    Generated,
+    Manual,
+    DefaultGate,
     Missing,
 }
 
@@ -1753,6 +1760,9 @@ impl StartDoneCriteriaSource {
     fn label(self) -> &'static str {
         match self {
             Self::Project => "project",
+            Self::Generated => "generated",
+            Self::Manual => "manual",
+            Self::DefaultGate => "default",
             Self::Missing => "missing",
         }
     }
@@ -1761,6 +1771,7 @@ impl StartDoneCriteriaSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartSourceMode {
     Worktree,
+    InitGit,
     Copy,
     Fresh,
     Missing,
@@ -1770,10 +1781,67 @@ impl StartSourceMode {
     fn label(self) -> &'static str {
         match self {
             Self::Worktree => "worktree",
+            Self::InitGit => "init-git",
             Self::Copy => "copy",
             Self::Fresh => "fresh",
             Self::Missing => "missing",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartDoneAction {
+    Existing,
+    GenerateFromGoal,
+    ManualText(String),
+    DefaultGate,
+    Missing,
+}
+
+trait StartPrompter {
+    fn select_one(&mut self, prompt: prompt::SelectPrompt) -> Result<prompt::SelectChoice>;
+    fn confirm(&mut self, question: &str, default_yes: bool) -> Result<bool>;
+    fn input(&mut self, message: &str, default: Option<&str>) -> Result<String>;
+}
+
+struct TerminalStartPrompter;
+
+impl StartPrompter for TerminalStartPrompter {
+    fn select_one(&mut self, prompt: prompt::SelectPrompt) -> Result<prompt::SelectChoice> {
+        prompt::select_one(&prompt)
+    }
+
+    fn confirm(&mut self, question: &str, default_yes: bool) -> Result<bool> {
+        prompt::confirm(question, default_yes)
+    }
+
+    fn input(&mut self, message: &str, default: Option<&str>) -> Result<String> {
+        prompt::open(message, default)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StartPromptEligibility {
+    stdin_is_tty: bool,
+    json: bool,
+    plain: bool,
+    quiet: bool,
+    yes: bool,
+}
+
+impl StartPromptEligibility {
+    fn from_args(args: &StartCommandArgs, stdin_is_tty: bool) -> Self {
+        Self {
+            stdin_is_tty,
+            json: args.json,
+            plain: args.plain,
+            quiet: args.quiet,
+            yes: args.yes,
+        }
+    }
+
+    fn allows_prompts(self) -> bool {
+        self.stdin_is_tty && !self.json && !self.plain && !self.quiet && !self.yes
     }
 }
 
@@ -1791,12 +1859,20 @@ struct StartLaunchDecision {
     selection_source: StartSelectionSource,
     reason: String,
     provider_source: StartProviderSource,
+    provider_route: Option<String>,
     provider_label: String,
     done_criteria_source: StartDoneCriteriaSource,
+    done_action: StartDoneAction,
     done_criteria_label: String,
     source_mode: StartSourceMode,
     source_mode_label: String,
+    source_fresh: bool,
+    source_worktree: bool,
+    source_from: Option<PathBuf>,
+    source_init_git: bool,
+    source_allow_dirty: bool,
     requires_confirmation: bool,
+    confirmed_by_start_picker: bool,
     try_lines: Vec<String>,
     recovery: Option<StartRecovery>,
 }
@@ -1832,12 +1908,20 @@ fn start_launch_decision(input: StartLaunchInput<'_>) -> StartLaunchDecision {
         selection_source,
         reason,
         provider_source: StartProviderSource::Missing,
+        provider_route: None,
         provider_label: StartProviderSource::Missing.label().to_string(),
         done_criteria_source: StartDoneCriteriaSource::Missing,
+        done_action: StartDoneAction::Missing,
         done_criteria_label: StartDoneCriteriaSource::Missing.label().to_string(),
         source_mode: StartSourceMode::Missing,
         source_mode_label: StartSourceMode::Missing.label().to_string(),
+        source_fresh: false,
+        source_worktree: false,
+        source_from: None,
+        source_init_git: false,
+        source_allow_dirty: false,
         requires_confirmation: false,
+        confirmed_by_start_picker: false,
         try_lines: Vec::new(),
         recovery: None,
     }
@@ -1924,10 +2008,372 @@ fn start_goal_contains_word(lower_goal: &str, needle: &str) -> bool {
         .any(|word| word == needle)
 }
 
+fn maybe_prompt_start_mode(
+    decision: &mut StartLaunchDecision,
+    args: &StartCommandArgs,
+    prompter: &mut dyn StartPrompter,
+) -> Result<()> {
+    if !matches!(args.mode, crate::cli::CliStartMode::Auto) || decision.recovery.is_some() {
+        return Ok(());
+    }
+    let recommended = decision.selected_mode;
+    let choices = vec![
+        prompt::SelectChoice::with_detail(
+            "recommended",
+            format!("Recommended: {}", recommended.path_label()),
+            decision.reason.clone(),
+        ),
+        prompt::SelectChoice::with_detail(
+            "run",
+            "Single supervised run",
+            "equivalent to --mode run",
+        ),
+        prompt::SelectChoice::with_detail(
+            "review",
+            "Coder/reviewer orchestration",
+            "equivalent to --mode review",
+        ),
+        prompt::SelectChoice::with_detail(
+            "full-plan",
+            "Full-plan orchestration",
+            "equivalent to --mode full-plan",
+        ),
+        prompt::SelectChoice::new("cancel", "Cancel"),
+    ];
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Choose launch path".to_string(),
+        help: Some("Pick how DeadReckon should shape this goal.".to_string()),
+        choices,
+        default_index: 0,
+    })?;
+    match choice.id.as_str() {
+        "recommended" => {
+            decision.selection_source = StartSelectionSource::InteractiveChoice;
+        }
+        "run" => {
+            decision.selected_mode = StartSelectedMode::Run;
+            decision.selection_source = StartSelectionSource::InteractiveChoice;
+            decision.reason = "interactive picker selected one supervised coding run".to_string();
+        }
+        "review" => {
+            decision.selected_mode = StartSelectedMode::Review;
+            decision.selection_source = StartSelectionSource::InteractiveChoice;
+            decision.reason =
+                "interactive picker selected coder/reviewer orchestration".to_string();
+        }
+        "full-plan" => {
+            decision.selected_mode = StartSelectedMode::FullPlan;
+            decision.selection_source = StartSelectionSource::InteractiveChoice;
+            decision.reason = "interactive picker selected full-plan orchestration".to_string();
+        }
+        _ => set_start_recovery(
+            decision,
+            "guided start cancelled before choosing a launch path",
+            vec![format!(
+                "deadreckon start \"{}\"",
+                shell_display_quote(&decision.goal)
+            )],
+        ),
+    }
+    Ok(())
+}
+
+fn start_prompt_choice(
+    id: impl Into<String>,
+    label: impl Into<String>,
+    detail: impl Into<String>,
+) -> prompt::SelectChoice {
+    prompt::SelectChoice::with_detail(id, label, detail)
+}
+
+fn start_detected_cli_provider_ids(paths: &DeadreckonPaths) -> Result<Vec<String>> {
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let mut ids = Vec::new();
+    for descriptor in registry.iter() {
+        if descriptor.kind == DescriptorKind::Cli
+            && descriptor.subscription
+            && descriptor
+                .default_binary
+                .as_deref()
+                .is_some_and(start_command_exists)
+        {
+            push_unique(&mut ids, descriptor.id.clone());
+        }
+    }
+    Ok(ids)
+}
+
+fn start_configured_provider_ids(paths: &DeadreckonPaths) -> Vec<String> {
+    let Ok(config) = read_config(&paths.config_path()) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    if let Some(default_provider) = config.default_provider {
+        push_unique(&mut ids, default_provider);
+    }
+    if let Some(fallback) = config.fallback {
+        for provider in fallback {
+            push_unique(&mut ids, provider);
+        }
+    }
+    for provider in config.providers.into_keys() {
+        push_unique(&mut ids, provider);
+    }
+    ids
+}
+
+fn start_command_exists(command: &str) -> bool {
+    let explicit = PathBuf::from(command);
+    if explicit.components().count() > 1 {
+        return explicit.is_file();
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|path| path.join(command).is_file())
+}
+
+fn start_provider_picker_choices(
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+) -> Result<Vec<prompt::SelectChoice>> {
+    let mut choices = Vec::new();
+    let mut seen = Vec::new();
+    if let Some(provider) = defaults.provider.as_deref() {
+        push_unique(&mut seen, provider.to_string());
+        choices.push(start_prompt_choice(
+            format!("route:{provider}"),
+            format!("Use configured default {provider}"),
+            "current DeadReckon default provider",
+        ));
+    }
+    for provider in start_detected_cli_provider_ids(paths)? {
+        if seen.iter().any(|seen| seen == &provider) {
+            continue;
+        }
+        push_unique(&mut seen, provider.clone());
+        choices.push(start_prompt_choice(
+            format!("route:{provider}"),
+            format!("Use detected CLI {provider}"),
+            "ephemeral for this launch; config is not changed",
+        ));
+    }
+    for provider in start_configured_provider_ids(paths) {
+        if seen.iter().any(|seen| seen == &provider) {
+            continue;
+        }
+        push_unique(&mut seen, provider.clone());
+        choices.push(start_prompt_choice(
+            format!("route:{provider}"),
+            format!("Use configured route {provider}"),
+            "ephemeral for this launch",
+        ));
+    }
+    choices.push(start_prompt_choice(
+        "typed",
+        "Type another provider route",
+        "advanced escape hatch",
+    ));
+    choices.push(prompt::SelectChoice::new(
+        "cancel",
+        "Cancel and show setup commands",
+    ));
+    Ok(choices)
+}
+
+fn prompt_start_provider(
+    decision: &mut StartLaunchDecision,
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+    prompter: &mut dyn StartPrompter,
+) -> Result<()> {
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Choose provider".to_string(),
+        help: Some(
+            "Pick the provider route for this launch. Defaults are not changed.".to_string(),
+        ),
+        choices: start_provider_picker_choices(paths, defaults)?,
+        default_index: 0,
+    })?;
+    let route = if let Some(route) = choice.id.strip_prefix("route:") {
+        route.to_string()
+    } else if choice.id == "typed" {
+        let route = prompter.input("provider route: ", None)?;
+        if route.trim().is_empty() {
+            set_start_recovery(
+                decision,
+                "no provider route selected",
+                vec!["deadreckon providers list --all".to_string()],
+            );
+            return Ok(());
+        }
+        route.trim().to_string()
+    } else {
+        set_start_recovery(
+            decision,
+            "provider setup is incomplete",
+            vec![
+                "deadreckon init".to_string(),
+                "deadreckon detect".to_string(),
+                "deadreckon providers list --all".to_string(),
+            ],
+        );
+        return Ok(());
+    };
+
+    let selection = provider_setup_selection(
+        paths,
+        setup::ProviderSetupRequest {
+            role: setup::SetupProviderRoleRef::PrimaryRun,
+            explicit_provider: Some(&route),
+            explicit_model: None,
+            config_default_provider: defaults.provider.as_deref(),
+            config_doc_provider: defaults.doc_provider.as_deref(),
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: false,
+            allow_auto_subscription: false,
+            require_usable_route: true,
+        },
+    )?;
+    let provider = selection.provider.unwrap_or(route);
+    decision.provider_source = StartProviderSource::Interactive;
+    decision.provider_route = Some(provider.clone());
+    decision.provider_label = format!("{provider} ({})", decision.provider_source.label());
+    Ok(())
+}
+
+fn prompt_start_done_criteria(
+    decision: &mut StartLaunchDecision,
+    prompter: &mut dyn StartPrompter,
+) -> Result<()> {
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Choose done criteria".to_string(),
+        help: Some("No project done criteria were found.".to_string()),
+        choices: vec![
+            start_prompt_choice(
+                "default",
+                "Use the default gate for this launch",
+                "working directory exists, or cargo test for Rust projects",
+            ),
+            start_prompt_choice(
+                "generate",
+                "Create from the goal before launch",
+                "uses the existing def-done compiler after final confirmation",
+            ),
+            start_prompt_choice(
+                "manual",
+                "Write criteria in English",
+                "compiled through the existing def-done flow after confirmation",
+            ),
+            prompt::SelectChoice::new("cancel", "Cancel and show def-done command"),
+        ],
+        default_index: 0,
+    })?;
+    match choice.id.as_str() {
+        "default" => {
+            decision.done_criteria_source = StartDoneCriteriaSource::DefaultGate;
+            decision.done_action = StartDoneAction::DefaultGate;
+            decision.done_criteria_label = "default dr-gate behavior".to_string();
+        }
+        "generate" => {
+            decision.done_criteria_source = StartDoneCriteriaSource::Generated;
+            decision.done_action = StartDoneAction::GenerateFromGoal;
+            decision.done_criteria_label = "create from goal before launch".to_string();
+        }
+        "manual" => {
+            let text = prompter.input("definition of done: ", None)?;
+            if text.trim().is_empty() {
+                set_start_recovery(
+                    decision,
+                    "empty done criteria were not saved",
+                    vec![format!(
+                        "deadreckon def-done \"what should count as done\" && deadreckon start \"{}\"",
+                        shell_display_quote(&decision.goal)
+                    )],
+                );
+                return Ok(());
+            }
+            decision.done_criteria_source = StartDoneCriteriaSource::Manual;
+            decision.done_action = StartDoneAction::ManualText(text.trim().to_string());
+            decision.done_criteria_label = "write manual criteria before launch".to_string();
+        }
+        _ => set_start_recovery(
+            decision,
+            "done criteria are missing for this repo",
+            vec![format!(
+                "deadreckon def-done \"what should count as done\" && deadreckon start \"{}\"",
+                shell_display_quote(&decision.goal)
+            )],
+        ),
+    }
+    Ok(())
+}
+
+fn prompt_start_non_git_mode(prompter: &mut dyn StartPrompter) -> Result<StartNonGitChoice> {
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Choose source mode".to_string(),
+        help: Some("This directory is not a git repo.".to_string()),
+        choices: vec![
+            start_prompt_choice(
+                "init",
+                "Initialize git, then use worktree mode",
+                "runs git init after final confirmation",
+            ),
+            start_prompt_choice(
+                "copy",
+                "Copy current directory into a run workspace",
+                "leaves this directory untouched",
+            ),
+            start_prompt_choice(
+                "fresh",
+                "Fresh empty workspace",
+                "starts with no source files",
+            ),
+            prompt::SelectChoice::new("cancel", "Cancel"),
+        ],
+        default_index: 0,
+    })?;
+    Ok(match choice.id.as_str() {
+        "init" => StartNonGitChoice::Init,
+        "copy" => StartNonGitChoice::Copy,
+        "fresh" => StartNonGitChoice::Fresh,
+        _ => StartNonGitChoice::Cancel,
+    })
+}
+
+fn prompt_start_dirty_worktree(prompter: &mut dyn StartPrompter) -> Result<StartDirtyGitChoice> {
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Choose dirty worktree handling".to_string(),
+        help: Some("The source repo has uncommitted changes.".to_string()),
+        choices: vec![
+            start_prompt_choice(
+                "stop",
+                "Stop and stash or commit first",
+                "shows recovery commands",
+            ),
+            start_prompt_choice(
+                "allow-dirty",
+                "Seed dirty files into the worktree",
+                "equivalent to --allow-dirty",
+            ),
+            prompt::SelectChoice::new("cancel", "Cancel"),
+        ],
+        default_index: 0,
+    })?;
+    Ok(match choice.id.as_str() {
+        "allow-dirty" => StartDirtyGitChoice::AllowDirty,
+        "cancel" => StartDirtyGitChoice::Cancel,
+        _ => StartDirtyGitChoice::Stop,
+    })
+}
+
 struct LaunchPreviewFacts<'a> {
     goal: &'a str,
     path: &'a str,
     provider: &'a str,
+    roles: Option<String>,
     done: &'a str,
     workspace: &'a str,
     watch: String,
@@ -1941,12 +2387,17 @@ fn launch_preview_rows(facts: &LaunchPreviewFacts<'_>) -> Vec<(String, String)> 
         ("goal".to_string(), facts.goal.to_string()),
         ("path".to_string(), facts.path.to_string()),
         ("provider".to_string(), facts.provider.to_string()),
+    ];
+    if let Some(roles) = facts.roles.as_ref() {
+        rows.push(("roles".to_string(), roles.clone()));
+    }
+    rows.extend([
         ("done".to_string(), facts.done.to_string()),
         ("workspace".to_string(), facts.workspace.to_string()),
         ("watch".to_string(), facts.watch.clone()),
         ("stop".to_string(), facts.stop.clone()),
         ("finish".to_string(), facts.finish.clone()),
-    ];
+    ]);
     if let Some(command) = facts.override_command.as_ref() {
         rows.push(("override".to_string(), command.clone()));
     }
@@ -1972,8 +2423,9 @@ fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFa
         goal: &decision.goal,
         path: decision.selected_mode.path_label(),
         provider: &decision.provider_label,
+        roles: start_provider_role_summary(decision),
         done: &decision.done_criteria_label,
-        workspace: decision.source_mode.label(),
+        workspace: &decision.source_mode_label,
         watch: "deadreckon attach <after-start>".to_string(),
         stop: "deadreckon kill <after-start>".to_string(),
         finish: "deadreckon finish <after-start>".to_string(),
@@ -1981,29 +2433,70 @@ fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFa
     }
 }
 
-fn resolve_start_setup(decision: &mut StartLaunchDecision, args: &StartCommandArgs) -> Result<()> {
+fn start_provider_role_summary(decision: &StartLaunchDecision) -> Option<String> {
+    let route = decision.provider_route.as_deref()?;
+    match decision.selected_mode {
+        StartSelectedMode::Run => None,
+        StartSelectedMode::Review => Some(format!("coder={route}, reviewer={route}")),
+        StartSelectedMode::FullPlan => Some(format!("planner={route}, child={route}")),
+    }
+}
+
+fn resolve_start_setup(
+    decision: &mut StartLaunchDecision,
+    args: &StartCommandArgs,
+    prompter: Option<&mut dyn StartPrompter>,
+    stdin_is_tty: bool,
+) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
-    resolve_start_provider(decision, &paths, &defaults)?;
-    if decision.recovery.is_some() {
-        return Ok(());
-    }
-    let cwd = std::env::current_dir()?;
-    resolve_start_done_criteria(decision, &cwd)?;
-    if decision.recovery.is_none() {
-        resolve_start_source_mode(
-            decision,
-            &paths,
-            &cwd,
-            StartSourceModeRequest {
-                fresh: args.fresh,
-                worktree: args.worktree,
-                from: args.from.as_deref(),
-                allow_dirty: args.allow_dirty,
-                stdin_is_tty: io::stdin().is_terminal(),
-                preview: args.preview,
-            },
-        )?;
+    match prompter {
+        Some(prompter) => {
+            resolve_start_provider(decision, &paths, &defaults, Some(&mut *prompter))?;
+            if decision.recovery.is_some() {
+                return Ok(());
+            }
+            let cwd = std::env::current_dir()?;
+            resolve_start_done_criteria(decision, &cwd, Some(&mut *prompter))?;
+            if decision.recovery.is_none() {
+                resolve_start_source_mode(
+                    decision,
+                    &paths,
+                    &cwd,
+                    Some(&mut *prompter),
+                    StartSourceModeRequest {
+                        fresh: args.fresh,
+                        worktree: args.worktree,
+                        from: args.from.as_deref(),
+                        allow_dirty: args.allow_dirty,
+                        stdin_is_tty,
+                    },
+                )?;
+            }
+        }
+        None => {
+            resolve_start_provider(decision, &paths, &defaults, None)?;
+            if decision.recovery.is_some() {
+                return Ok(());
+            }
+            let cwd = std::env::current_dir()?;
+            resolve_start_done_criteria(decision, &cwd, None)?;
+            if decision.recovery.is_none() {
+                resolve_start_source_mode(
+                    decision,
+                    &paths,
+                    &cwd,
+                    None,
+                    StartSourceModeRequest {
+                        fresh: args.fresh,
+                        worktree: args.worktree,
+                        from: args.from.as_deref(),
+                        allow_dirty: args.allow_dirty,
+                        stdin_is_tty,
+                    },
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -2012,6 +2505,7 @@ fn resolve_start_provider(
     decision: &mut StartLaunchDecision,
     paths: &DeadreckonPaths,
     defaults: &ConfigDefaults,
+    mut prompter: Option<&mut dyn StartPrompter>,
 ) -> Result<()> {
     let selection = provider_setup_selection(
         paths,
@@ -2031,6 +2525,10 @@ fn resolve_start_provider(
     )?;
 
     let Some(provider) = selection.provider.as_ref() else {
+        if let Some(prompter) = prompter.as_mut() {
+            prompt_start_provider(decision, paths, defaults, &mut **prompter)?;
+            return Ok(());
+        }
         decision.provider_source = StartProviderSource::Missing;
         decision.provider_label = "missing provider".to_string();
         set_start_recovery(
@@ -2052,8 +2550,13 @@ fn resolve_start_provider(
         | setup::SetupProviderSource::BuiltInDefault
         | setup::SetupProviderSource::None => StartProviderSource::Configured,
     };
+    decision.provider_route = Some(provider.clone());
     decision.provider_label = format!("{provider} ({})", decision.provider_source.label());
     if matches!(decision.provider_source, StartProviderSource::Detected) {
+        if let Some(prompter) = prompter.as_mut() {
+            prompt_start_provider(decision, paths, defaults, &mut **prompter)?;
+            return Ok(());
+        }
         set_start_recovery(
             decision,
             format!("detected {provider}, but no default provider is configured"),
@@ -2063,12 +2566,22 @@ fn resolve_start_provider(
     Ok(())
 }
 
-fn resolve_start_done_criteria(decision: &mut StartLaunchDecision, cwd: &Path) -> Result<()> {
+fn resolve_start_done_criteria(
+    decision: &mut StartLaunchDecision,
+    cwd: &Path,
+    prompter: Option<&mut dyn StartPrompter>,
+) -> Result<()> {
     let source = resolve_acceptance_source(cwd, None)?;
     if source.is_some() {
         let selection = done_criteria_selection(&source)?;
         decision.done_criteria_source = StartDoneCriteriaSource::Project;
+        decision.done_action = StartDoneAction::Existing;
         decision.done_criteria_label = selection.full_label();
+        return Ok(());
+    }
+
+    if let Some(prompter) = prompter {
+        prompt_start_done_criteria(decision, prompter)?;
         return Ok(());
     }
 
@@ -2092,13 +2605,13 @@ struct StartSourceModeRequest<'a> {
     from: Option<&'a Path>,
     allow_dirty: bool,
     stdin_is_tty: bool,
-    preview: bool,
 }
 
 fn resolve_start_source_mode(
     decision: &mut StartLaunchDecision,
     paths: &DeadreckonPaths,
     cwd: &Path,
+    mut prompter: Option<&mut dyn StartPrompter>,
     request: StartSourceModeRequest<'_>,
 ) -> Result<()> {
     let mut flags = ModeFlags {
@@ -2110,23 +2623,43 @@ fn resolve_start_source_mode(
     };
     let explicit_mode = flags.fresh || flags.worktree || flags.from.is_some();
     if !explicit_mode && deadreckon_core::find_git_root(cwd)?.is_none() {
-        if request.stdin_is_tty && !request.preview {
-            match prompt_start_non_git_mode()? {
+        if let Some(prompter) = prompter.as_mut() {
+            match prompt_start_non_git_mode(&mut **prompter)? {
                 StartNonGitChoice::Init => {
-                    decision.source_mode = StartSourceMode::Missing;
-                    decision.source_mode_label = "git init selected".to_string();
-                    set_start_recovery(
-                        decision,
-                        "source mode needs git before worktree launch",
-                        vec![format!(
-                            "git init && deadreckon start \"{}\"",
-                            shell_display_quote(&decision.goal)
-                        )],
-                    );
+                    decision.source_mode = StartSourceMode::InitGit;
+                    decision.source_mode_label = "git init, then worktree".to_string();
+                    decision.source_init_git = true;
+                    decision.source_worktree = true;
                     return Ok(());
                 }
-                StartNonGitChoice::Copy => flags.from = Some(cwd.to_path_buf()),
-                StartNonGitChoice::Fresh => flags.fresh = true,
+                StartNonGitChoice::Copy => {
+                    if !matches!(decision.selected_mode, StartSelectedMode::Run) {
+                        set_start_recovery(
+                            decision,
+                            "copy source mode is only supported by start --mode run in this alpha",
+                            vec![format!(
+                                "deadreckon start \"{}\" --mode run --from .",
+                                shell_display_quote(&decision.goal)
+                            )],
+                        );
+                        return Ok(());
+                    }
+                    flags.from = Some(cwd.to_path_buf());
+                }
+                StartNonGitChoice::Fresh => {
+                    if !matches!(decision.selected_mode, StartSelectedMode::Run) {
+                        set_start_recovery(
+                            decision,
+                            "fresh source mode is only supported by start --mode run in this alpha",
+                            vec![format!(
+                                "deadreckon start \"{}\" --mode run --fresh",
+                                shell_display_quote(&decision.goal)
+                            )],
+                        );
+                        return Ok(());
+                    }
+                    flags.fresh = true;
+                }
                 StartNonGitChoice::Cancel => {
                     set_start_recovery(
                         decision,
@@ -2164,7 +2697,7 @@ fn resolve_start_source_mode(
     let resolved_mode = resolve_mode(&flags, cwd, request.stdin_is_tty)?;
     match resolved_mode {
         ResolvedMode::Worktree { source_path, .. } => {
-            match prepare_worktree_record(
+            let first = prepare_worktree_record(
                 paths,
                 WorktreeOptions {
                     run_id: Uuid::new_v4().simple().to_string(),
@@ -2174,30 +2707,91 @@ fn resolve_start_source_mode(
                     branch_name: None,
                     allow_dirty: request.allow_dirty,
                 },
-            ) {
+            );
+            match first {
                 Ok(_) => {
                     decision.source_mode = StartSourceMode::Worktree;
                     decision.source_mode_label = format!("worktree from {}", source_path.display());
+                    decision.source_worktree = flags.worktree;
+                    decision.source_allow_dirty = request.allow_dirty;
                 }
                 Err(DeadreckonError::InvalidInput(message))
                     if message.contains("working tree has uncommitted changes") =>
                 {
-                    decision.source_mode = StartSourceMode::Worktree;
-                    decision.source_mode_label = "dirty worktree".to_string();
-                    set_start_recovery(
-                        decision,
-                        message.lines().next().unwrap_or("working tree is dirty"),
-                        vec![
-                            format!(
-                                "git stash && deadreckon start \"{}\"",
-                                shell_display_quote(&decision.goal)
+                    if let Some(prompter) = prompter.as_mut() {
+                        match prompt_start_dirty_worktree(&mut **prompter)? {
+                            StartDirtyGitChoice::AllowDirty => {
+                                if !matches!(decision.selected_mode, StartSelectedMode::Run) {
+                                    set_start_recovery(
+                                        decision,
+                                        "allow-dirty source mode is only supported by start --mode run in this alpha",
+                                        vec![format!(
+                                            "deadreckon start \"{}\" --mode run --allow-dirty",
+                                            shell_display_quote(&decision.goal)
+                                        )],
+                                    );
+                                    return Ok(());
+                                }
+                                prepare_worktree_record(
+                                    paths,
+                                    WorktreeOptions {
+                                        run_id: Uuid::new_v4().simple().to_string(),
+                                        task_key: deadreckon_core::paths::task_key(&decision.goal),
+                                        source_path: source_path.clone(),
+                                        base_ref: None,
+                                        branch_name: None,
+                                        allow_dirty: true,
+                                    },
+                                )?;
+                                decision.source_mode = StartSourceMode::Worktree;
+                                decision.source_mode_label = format!(
+                                    "worktree from {} with dirty files",
+                                    source_path.display()
+                                );
+                                decision.source_worktree = flags.worktree;
+                                decision.source_allow_dirty = true;
+                            }
+                            StartDirtyGitChoice::Cancel => set_start_recovery(
+                                decision,
+                                "guided start cancelled before choosing dirty-worktree handling",
+                                vec![format!(
+                                    "deadreckon start \"{}\"",
+                                    shell_display_quote(&decision.goal)
+                                )],
                             ),
-                            format!(
-                                "deadreckon start \"{}\" --allow-dirty",
-                                shell_display_quote(&decision.goal)
+                            StartDirtyGitChoice::Stop => set_start_recovery(
+                                decision,
+                                message.lines().next().unwrap_or("working tree is dirty"),
+                                vec![
+                                    format!(
+                                        "git stash && deadreckon start \"{}\"",
+                                        shell_display_quote(&decision.goal)
+                                    ),
+                                    format!(
+                                        "deadreckon start \"{}\" --allow-dirty",
+                                        shell_display_quote(&decision.goal)
+                                    ),
+                                ],
                             ),
-                        ],
-                    );
+                        }
+                    } else {
+                        decision.source_mode = StartSourceMode::Worktree;
+                        decision.source_mode_label = "dirty worktree".to_string();
+                        set_start_recovery(
+                            decision,
+                            message.lines().next().unwrap_or("working tree is dirty"),
+                            vec![
+                                format!(
+                                    "git stash && deadreckon start \"{}\"",
+                                    shell_display_quote(&decision.goal)
+                                ),
+                                format!(
+                                    "deadreckon start \"{}\" --allow-dirty",
+                                    shell_display_quote(&decision.goal)
+                                ),
+                            ],
+                        );
+                    }
                 }
                 Err(err) => return Err(CliError::Core(err)),
             }
@@ -2205,14 +2799,17 @@ fn resolve_start_source_mode(
         ResolvedMode::Copy { source_path } => {
             decision.source_mode = StartSourceMode::Copy;
             decision.source_mode_label = format!("copy from {}", source_path.display());
+            decision.source_from = Some(source_path);
         }
         ResolvedMode::Fresh => {
             decision.source_mode = StartSourceMode::Fresh;
             decision.source_mode_label = "fresh".to_string();
+            decision.source_fresh = true;
         }
         ResolvedMode::InPlace { source_path } => {
             decision.source_mode = StartSourceMode::Copy;
             decision.source_mode_label = format!("in-place from {}", source_path.display());
+            decision.source_from = Some(source_path);
         }
     }
     Ok(())
@@ -2225,20 +2822,10 @@ enum StartNonGitChoice {
     Cancel,
 }
 
-fn prompt_start_non_git_mode() -> Result<StartNonGitChoice> {
-    eprintln!("deadreckon start: this is not a git repo. choose source mode:");
-    eprintln!("  [1] git init, then use worktree mode");
-    eprintln!("  [2] copy current directory into a run workspace");
-    eprintln!("  [3] fresh empty workspace");
-    eprintln!("  [4] cancel");
-    let answer = prompt::open("choose [1]: ", None)?;
-    Ok(match answer.trim() {
-        "" | "1" => StartNonGitChoice::Init,
-        "2" => StartNonGitChoice::Copy,
-        "3" => StartNonGitChoice::Fresh,
-        "4" => StartNonGitChoice::Cancel,
-        _ => StartNonGitChoice::Cancel,
-    })
+enum StartDirtyGitChoice {
+    Stop,
+    AllowDirty,
+    Cancel,
 }
 
 fn set_start_recovery(
@@ -2270,21 +2857,93 @@ fn shell_display_quote(value: &str) -> String {
     value.replace('"', "\\\"")
 }
 
+async fn materialize_start_done_criteria(decision: &mut StartLaunchDecision) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let request = match decision.done_action.clone() {
+        StartDoneAction::GenerateFromGoal => format!(
+            "For this start, define practical acceptance checks for: {}",
+            decision.goal
+        ),
+        StartDoneAction::ManualText(text) => text,
+        StartDoneAction::Existing | StartDoneAction::DefaultGate | StartDoneAction::Missing => {
+            return Ok(());
+        }
+    };
+    acceptance_agent_command_in_dir(
+        &cwd,
+        AcceptanceAgentMode::Draft,
+        vec![request],
+        decision.provider_route.clone(),
+        None,
+        false,
+    )
+    .await?;
+    if let Some(source) = mark_generated_done_criteria(resolve_acceptance_source(&cwd, None)?) {
+        let selection = done_criteria_selection(&Some(source))?;
+        decision.done_criteria_source = StartDoneCriteriaSource::Generated;
+        decision.done_action = StartDoneAction::Existing;
+        decision.done_criteria_label = selection.full_label();
+    }
+    Ok(())
+}
+
+fn prompt_start_launch_confirmation(
+    decision: &mut StartLaunchDecision,
+    args: &StartCommandArgs,
+    prompter: &mut dyn StartPrompter,
+) -> Result<()> {
+    if args.preview || args.yes || args.quiet {
+        return Ok(());
+    }
+    println!("{}", ui_heading("deadreckon start preview"));
+    let rows = launch_preview_rows(&start_launch_preview_facts(decision));
+    print_launch_preview_rows(&rows);
+    decision.requires_confirmation = true;
+    if prompter.confirm("start this launch?", true)? {
+        decision.confirmed_by_start_picker = true;
+        Ok(())
+    } else {
+        Err(start_recovery_error(&StartRecovery {
+            message: "guided start cancelled before launch".to_string(),
+            try_lines: vec![format!(
+                "deadreckon start \"{}\" --preview",
+                shell_display_quote(&decision.goal)
+            )],
+        }))
+    }
+}
+
 async fn start_command(args: StartCommandArgs) -> Result<()> {
+    let stdin_is_tty = io::stdin().is_terminal();
     let mut decision = start_launch_decision(StartLaunchInput {
         goal: &args.goal,
         requested_mode: args.mode,
-        stdin_is_tty: io::stdin().is_terminal(),
+        stdin_is_tty,
     });
-    resolve_start_setup(&mut decision, &args)?;
+    let eligibility = StartPromptEligibility::from_args(&args, stdin_is_tty);
+    let mut terminal_prompter = TerminalStartPrompter;
+    if eligibility.allows_prompts() {
+        maybe_prompt_start_mode(&mut decision, &args, &mut terminal_prompter)?;
+        if decision.recovery.is_none() {
+            resolve_start_setup(
+                &mut decision,
+                &args,
+                Some(&mut terminal_prompter),
+                stdin_is_tty,
+            )?;
+        }
+    } else if decision.recovery.is_none() {
+        resolve_start_setup(&mut decision, &args, None, stdin_is_tty)?;
+    }
     if args.json {
         let next_actions = if decision.recovery.is_some() {
             decision.try_lines.clone()
         } else {
-            vec![
-                "deadreckon start launch dispatch is implemented in the next guided phase"
-                    .to_string(),
-            ]
+            vec![format!(
+                "deadreckon start \"{}\" --mode {} --yes",
+                shell_display_quote(&decision.goal),
+                decision.selected_mode.label()
+            )]
         };
         let payload = json!({
             "kind": "start",
@@ -2313,6 +2972,9 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
         }
         return Ok(());
     }
+    if decision.recovery.is_none() && eligibility.allows_prompts() {
+        prompt_start_launch_confirmation(&mut decision, &args, &mut terminal_prompter)?;
+    }
     if !args.quiet {
         println!("{}", ui_heading("guided start"));
         let mode = decision.selected_mode.label();
@@ -2340,6 +3002,7 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
     if let Some(recovery) = decision.recovery.as_ref() {
         return Err(start_recovery_error(recovery));
     }
+    materialize_start_done_criteria(&mut decision).await?;
     dispatch_start_command(args, &decision).await
 }
 
@@ -2353,17 +3016,18 @@ async fn dispatch_start_command(
             let before = start_run_ids(&paths)?;
             let goal = args.goal.clone();
             let quiet = args.quiet;
+            let auto_confirm = args.yes || args.quiet || decision.confirmed_by_start_picker;
             let result = run_command(RunCommandArgs {
                 goal: args.goal,
-                fresh: args.fresh,
-                worktree: args.worktree,
-                from: args.from,
+                fresh: args.fresh || decision.source_fresh,
+                worktree: args.worktree || decision.source_worktree,
+                from: args.from.or_else(|| decision.source_from.clone()),
                 in_place: false,
                 base: None,
                 branch: None,
-                allow_dirty: args.allow_dirty,
-                init_git: false,
-                yes: args.yes,
+                allow_dirty: args.allow_dirty || decision.source_allow_dirty,
+                init_git: decision.source_init_git,
+                yes: auto_confirm,
                 preview: false,
                 brief: false,
                 plain: args.plain,
@@ -2372,14 +3036,15 @@ async fn dispatch_start_command(
                 max_spend: None,
                 max_wall_seconds: None,
                 sandbox: None,
-                provider: None,
+                provider: decision.provider_route.clone(),
                 model: None,
                 doc_provider: None,
                 acceptance: None,
                 skill: "deadreckon".to_string(),
                 smoke: false,
                 i_know_its_a_lot: false,
-                no_confirm: args.yes || args.quiet,
+                no_confirm: auto_confirm
+                    || matches!(decision.done_action, StartDoneAction::DefaultGate),
                 no_hints: args.quiet,
                 no_docs: false,
                 doc_skill: None,
@@ -2394,7 +3059,11 @@ async fn dispatch_start_command(
             result
         }
         StartSelectedMode::Review | StartSelectedMode::FullPlan => {
-            if start_source_flags_present(&args) {
+            if start_source_flags_present(&args)
+                || decision.source_fresh
+                || decision.source_from.is_some()
+                || decision.source_allow_dirty
+            {
                 return Err(CliError::Core(deadreckon_core::user_error(
                     "source mode flags are only supported by start --mode run in this alpha",
                     "omit source flags or use deadreckon run directly",
@@ -2409,6 +3078,8 @@ async fn dispatch_start_command(
                 StartSelectedMode::Review => CliPlanMode::Review,
                 StartSelectedMode::FullPlan => CliPlanMode::FullPlan,
             };
+            let auto_confirm = args.yes || args.quiet || decision.confirmed_by_start_picker;
+            let provider_route = decision.provider_route.clone();
             let result = orchestrate_command(OrchestrateRunArgs {
                 plan: PlanCommandArgs {
                     goal: args.goal,
@@ -2417,21 +3088,38 @@ async fn dispatch_start_command(
                     max_spend: None,
                     max_wall_seconds: None,
                     sandbox: None,
-                    planner_provider: None,
-                    provider: None,
+                    planner_provider: if mode == CliPlanMode::FullPlan {
+                        provider_route.clone()
+                    } else {
+                        None
+                    },
+                    provider: if mode == CliPlanMode::FullPlan {
+                        provider_route.clone()
+                    } else {
+                        None
+                    },
                     child_provider: Vec::new(),
-                    coder_provider: None,
-                    reviewer_provider: None,
-                    init_git: false,
+                    coder_provider: if mode == CliPlanMode::Review {
+                        provider_route.clone()
+                    } else {
+                        None
+                    },
+                    reviewer_provider: if mode == CliPlanMode::Review {
+                        provider_route
+                    } else {
+                        None
+                    },
+                    init_git: decision.source_init_git,
                     acceptance: None,
-                    skip_acceptance_prompt: args.yes || args.quiet,
+                    skip_acceptance_prompt: auto_confirm
+                        || matches!(decision.done_action, StartDoneAction::DefaultGate),
                     no_hints: args.quiet,
                     quiet: args.quiet,
                     json: false,
                     plain: args.plain,
                 },
                 preview: false,
-                yes: args.yes || args.quiet,
+                yes: auto_confirm,
                 no_repair: false,
             })
             .await;
@@ -9425,6 +10113,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         goal,
         path: "run",
         provider: agent,
+        roles: None,
         done: &done_label,
         workspace: &workspace,
         watch: format!("deadreckon attach {run_id}"),
@@ -11021,6 +11710,7 @@ fn print_orchestrate_preflight(
         goal: &plan.root_goal,
         path,
         provider: &providers,
+        roles: None,
         done: &gate,
         workspace: &source,
         watch: format!("deadreckon attach {plan_ref}"),
@@ -29319,6 +30009,7 @@ mod self_improve_pr_tests {
 
 #[cfg(test)]
 mod tui_tests {
+    use std::collections::VecDeque;
     use std::io::Write;
     use std::time::{Duration, Instant};
 
@@ -29332,31 +30023,33 @@ mod tui_tests {
         ChainAttachTuiState, CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS,
         LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
         NarrativeRefreshKind, NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent,
-        PlanNarrativeRefreshInput, ProviderActivity, ProviderJsonlLogSpec, RunNarrativeRenderInput,
-        StartLaunchInput, StartSelectedMode, StartSelectionSource, TopHelpGroup,
-        acceptance_activity_lines, attach_banner, attach_header_text, attach_live_inventory,
-        attach_loop_stage_work, attach_should_return_to_plan, build_run_narrative_projection,
-        cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job, chain_activity_lines,
-        chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
-        chain_narrative_refusal_text, chain_should_auto_attach, chain_step_dot,
-        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
-        cli_wait_status_line, collect_jsonl_provider_activity,
+        PlanNarrativeRefreshInput, ProviderActivity, ProviderJsonlLogSpec, Result,
+        RunNarrativeRenderInput, StartDoneAction, StartDoneCriteriaSource, StartLaunchInput,
+        StartPromptEligibility, StartPrompter, StartSelectedMode, StartSelectionSource,
+        TopHelpGroup, acceptance_activity_lines, attach_banner, attach_header_text,
+        attach_live_inventory, attach_loop_stage_work, attach_should_return_to_plan,
+        build_run_narrative_projection, cancel_plan_narrative_refresh_job,
+        cancel_run_narrative_refresh_job, chain_activity_lines, chain_attach_footer_text,
+        chain_attach_header_text, chain_event_read_hint, chain_narrative_refusal_text,
+        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
+        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
         collect_jsonl_provider_activity_scan, command_discovery, completion_action_from_input,
         completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
         doc_polish_preview_text, implementation_plan_warnings, kill_banner, live_file_lines,
-        markdown_to_tui_lines, max_panel_scroll, meter_color, narrative_provider_selection,
-        orchestration_dependency_rows, orchestration_parallelism_lines,
-        orchestration_provider_role_rows, orchestration_role_table_lines, per_step_wall_cap,
-        plan_attach_footer, plan_merge_repair_summary_items, plan_narrative_refresh_request,
+        markdown_to_tui_lines, max_panel_scroll, maybe_prompt_start_mode, meter_color,
+        narrative_provider_selection, orchestration_dependency_rows,
+        orchestration_parallelism_lines, orchestration_provider_role_rows,
+        orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
+        plan_merge_repair_summary_items, plan_narrative_refresh_request,
         plan_narrative_refresh_trigger, poll_plan_narrative_refresh_job,
-        poll_run_narrative_refresh_job, provider_ingest_base_roots, provider_jsonl_activity_lines,
-        provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
-        read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
-        render_attach, render_plan_attach, run_narrative_json_text, run_narrative_plain_text,
-        run_narrative_refresh_trigger, start_launch_decision,
+        poll_run_narrative_refresh_job, prompt_start_done_criteria, provider_ingest_base_roots,
+        provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
+        provider_jsonl_session_matches_run, read_plan_events_lossy, recommend_child_count_for_goal,
+        recommend_orchestration_mode, render_attach, render_plan_attach, run_narrative_json_text,
+        run_narrative_plain_text, run_narrative_refresh_trigger, start_launch_decision,
         start_or_coalesce_plan_narrative_refresh_job, threshold_color,
     };
-    use crate::cli::{Cli, CliPlanMode, CliStartMode};
+    use crate::cli::{Cli, CliPlanMode, CliStartMode, StartCommandArgs};
     use chrono::{Duration as ChronoDuration, Utc};
     use clap::CommandFactory;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -30777,6 +31470,65 @@ mod tui_tests {
         text
     }
 
+    struct ScriptedStartPrompter {
+        choices: VecDeque<String>,
+        inputs: VecDeque<String>,
+        confirms: VecDeque<bool>,
+        prompt_titles: Vec<String>,
+    }
+
+    impl ScriptedStartPrompter {
+        fn new(choices: &[&str]) -> Self {
+            Self {
+                choices: choices.iter().map(|choice| choice.to_string()).collect(),
+                inputs: VecDeque::new(),
+                confirms: VecDeque::new(),
+                prompt_titles: Vec::new(),
+            }
+        }
+    }
+
+    impl StartPrompter for ScriptedStartPrompter {
+        fn select_one(
+            &mut self,
+            prompt: crate::prompt::SelectPrompt,
+        ) -> Result<crate::prompt::SelectChoice> {
+            self.prompt_titles.push(prompt.title.clone());
+            let id = self.choices.pop_front().expect("scripted choice");
+            Ok(prompt
+                .choices
+                .into_iter()
+                .find(|choice| choice.id == id)
+                .unwrap_or_else(|| panic!("choice {id} not found")))
+        }
+
+        fn confirm(&mut self, question: &str, _default_yes: bool) -> Result<bool> {
+            self.prompt_titles.push(question.to_string());
+            Ok(self.confirms.pop_front().unwrap_or(true))
+        }
+
+        fn input(&mut self, message: &str, _default: Option<&str>) -> Result<String> {
+            self.prompt_titles.push(message.to_string());
+            Ok(self.inputs.pop_front().unwrap_or_default())
+        }
+    }
+
+    fn start_args_for_test(goal: &str) -> StartCommandArgs {
+        StartCommandArgs {
+            goal: goal.to_string(),
+            mode: CliStartMode::Auto,
+            preview: true,
+            yes: false,
+            fresh: false,
+            worktree: false,
+            from: None,
+            allow_dirty: false,
+            plain: false,
+            quiet: false,
+            json: false,
+        }
+    }
+
     #[test]
     fn orchestration_mode_recommendation_prefers_full_plan_for_broad_products() {
         assert_eq!(
@@ -30839,6 +31591,98 @@ mod tui_tests {
         assert_eq!(decision.selected_mode, StartSelectedMode::Run);
         assert_eq!(decision.selection_source, StartSelectionSource::Default);
         assert!(decision.reason.contains("non-interactive"));
+    }
+
+    #[test]
+    fn start_prompt_eligibility_skips_scripted_modes() {
+        assert!(
+            StartPromptEligibility {
+                stdin_is_tty: true,
+                json: false,
+                plain: false,
+                quiet: false,
+                yes: false,
+            }
+            .allows_prompts()
+        );
+        for eligibility in [
+            StartPromptEligibility {
+                stdin_is_tty: false,
+                json: false,
+                plain: false,
+                quiet: false,
+                yes: false,
+            },
+            StartPromptEligibility {
+                stdin_is_tty: true,
+                json: true,
+                plain: false,
+                quiet: false,
+                yes: false,
+            },
+            StartPromptEligibility {
+                stdin_is_tty: true,
+                json: false,
+                plain: true,
+                quiet: false,
+                yes: false,
+            },
+            StartPromptEligibility {
+                stdin_is_tty: true,
+                json: false,
+                plain: false,
+                quiet: true,
+                yes: false,
+            },
+            StartPromptEligibility {
+                stdin_is_tty: true,
+                json: false,
+                plain: false,
+                quiet: false,
+                yes: true,
+            },
+        ] {
+            assert!(!eligibility.allows_prompts(), "{eligibility:?}");
+        }
+    }
+
+    #[test]
+    fn start_fake_prompter_can_choose_review_mode() {
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "improve the app",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+        let args = start_args_for_test("improve the app");
+        let mut prompter = ScriptedStartPrompter::new(&["review"]);
+
+        maybe_prompt_start_mode(&mut decision, &args, &mut prompter).expect("mode prompt");
+
+        assert_eq!(decision.selected_mode, StartSelectedMode::Review);
+        assert_eq!(
+            decision.selection_source,
+            StartSelectionSource::InteractiveChoice
+        );
+        assert_eq!(prompter.prompt_titles, vec!["Choose launch path"]);
+    }
+
+    #[test]
+    fn start_fake_prompter_done_default_uses_default_gate() {
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "build the app",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+        let mut prompter = ScriptedStartPrompter::new(&["default"]);
+
+        prompt_start_done_criteria(&mut decision, &mut prompter).expect("done prompt");
+
+        assert_eq!(
+            decision.done_criteria_source,
+            StartDoneCriteriaSource::DefaultGate
+        );
+        assert_eq!(decision.done_action, StartDoneAction::DefaultGate);
+        assert!(decision.done_criteria_label.contains("default"));
     }
 
     #[test]

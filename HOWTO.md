@@ -29,6 +29,10 @@ deadreckon status latest
 deadreckon finish latest
 ```
 
+In a TTY, `start` presents selection prompts for mode, provider, missing done
+criteria, source mode, and final confirmation. For scripts, pass explicit flags
+with `--yes`, `--plain`, `--quiet`, or `--json` so it never waits for input.
+
 If setup is incomplete, `start` stops before launching work and prints concrete
 `try:` lines for setup, done criteria, or source mode. Paste the suggested
 commands, then run the same `deadreckon start "build the app"` command again.

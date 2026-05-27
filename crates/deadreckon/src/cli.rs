@@ -125,7 +125,13 @@ Modes:
   auto picks a conservative path and explains why.
   run starts one supervised coding run.
   review runs a coder/reviewer orchestration.
-  full-plan plans, forks, and merges multi-agent work.";
+  full-plan plans, forks, and merges multi-agent work.
+
+Interactive:
+  In a TTY, start uses selection prompts for mode, provider, done criteria,
+  source mode, and final confirmation when flags do not decide them.
+  Scripts can use --plain, --quiet, --json, --yes, or explicit --mode flags to
+  keep start deterministic and non-prompting.";
 
 const ORCHESTRATE_HELP: &str = "\
 Lifecycle:

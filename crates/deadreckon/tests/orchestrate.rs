@@ -455,16 +455,76 @@ fn start_non_git_tty_can_choose_init_git_copy_or_fresh() {
     let output = deadreckon_pty(
         &paths,
         &source,
-        "3\n",
-        &["start", "build the app", "--plain"],
+        &["1", "3"],
+        &["start", "build the app", "--preview"],
+        "workspace.*fresh",
+        None,
     );
 
-    assert_success(&output);
     let text = format!("{}{}", stdout(&output), stderr(&output));
     assert!(text.contains("git init"), "{text}");
-    assert!(text.contains("copy current directory"), "{text}");
-    assert!(text.contains("fresh empty workspace"), "{text}");
+    assert!(text.contains("Copy current directory"), "{text}");
+    assert!(text.contains("Fresh empty workspace"), "{text}");
     assert!(output_row_contains(&text, "workspace", "fresh"), "{text}");
+}
+
+#[test]
+fn pty_start_picker_choose_full_plan_preview() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon_pty(
+        &paths,
+        &repo,
+        &["1"],
+        &[
+            "start",
+            "parallelize the API frontend docs and tests",
+            "--preview",
+        ],
+        "path[[:space:]]*: full-plan orchestration",
+        None,
+    );
+
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(text.contains("Choose launch path"), "{text}");
+    assert!(text.contains("full-plan orchestration"), "{text}");
+}
+
+#[test]
+fn pty_start_picker_choose_detected_provider_preview_without_config_write() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(repo.join(".deadreckon")).expect("acceptance dir");
+    fs::write(
+        repo.join(".deadreckon/acceptance.yaml"),
+        "name: start ready\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("acceptance");
+    git(&repo, &["add", ".deadreckon/acceptance.yaml"]).expect("add acceptance");
+    git(&repo, &["commit", "-m", "add acceptance"]).expect("commit acceptance");
+    let bin = temp.path().join("bin");
+    write_fake_path_binary(&bin, "codex", "printf 'codex-cli 9.9.9\\n'\n");
+
+    let output = deadreckon_pty(
+        &paths,
+        &repo,
+        &["1"],
+        &["start", "build the app", "--mode", "run", "--preview"],
+        "provider[[:space:]]*: cli:codex",
+        Some(&bin),
+    );
+
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(text.contains("Choose provider"), "{text}");
+    assert!(text.contains("cli:codex (interactive)"), "{text}");
+    assert!(
+        !paths.config_path().exists(),
+        "interactive provider choice should not write config"
+    );
 }
 
 #[test]
@@ -617,6 +677,8 @@ fn start_preview_json_has_next_actions_and_try_lines_without_ansi() {
     assert!(stderr(&output).is_empty(), "{}", stderr(&output));
     let out = stdout(&output);
     assert!(!out.contains("\u{1b}["), "{out}");
+    assert!(!out.contains("Choose launch path"), "{out}");
+    assert!(!out.contains("Choose provider"), "{out}");
     let value: Value = serde_json::from_str(&out).expect("json");
     assert_eq!(value["kind"], "start");
     assert_eq!(value["will_start"], false);
@@ -5522,21 +5584,39 @@ fn write_start_ready_setup(paths: &DeadreckonPaths, root: &std::path::Path) {
 fn deadreckon_pty(
     paths: &DeadreckonPaths,
     cwd: &std::path::Path,
-    input: &str,
+    answers: &[&str],
     args: &[&str],
+    _final_pattern: &str,
+    path_prefix: Option<&std::path::Path>,
 ) -> std::process::Output {
     let command = std::iter::once(env!("CARGO_BIN_EXE_deadreckon").to_string())
         .chain(args.iter().map(|arg| arg.to_string()))
         .map(|part| tcl_brace_quote(&part))
         .collect::<Vec<_>>()
         .join(" ");
-    let answer = input.trim_end_matches('\n').to_string() + "\r";
+    let mut interactions = String::new();
+    for answer in answers {
+        interactions.push_str("expect -re {choose \\[[0-9]+\\]:}\n");
+        interactions.push_str(&format!(
+            "send -- \"{}\"\n",
+            tcl_string_escape(&format!("{answer}\r"))
+        ));
+    }
+    let path_setup = path_prefix
+        .map(|path| {
+            format!(
+                "set env(PATH) \"{}:/usr/bin:/bin:/usr/sbin:/sbin\"\n",
+                tcl_string_escape(&path.display().to_string())
+            )
+        })
+        .unwrap_or_default();
     let script = format!(
-        "set timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\nspawn {}\nexpect -re {{choose \\[1\\]:}}\nsend -- \"{}\"\nexpect -re {{workspace[[:space:]]*: fresh}}\nexit 0\n",
+        "set timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\n{}spawn {}\n{}catch {{ expect eof }}\nexit 0\n",
         tcl_brace_quote(&cwd.display().to_string()),
         tcl_brace_quote(&paths.home().display().to_string()),
+        path_setup,
         command,
-        tcl_string_escape(&answer)
+        interactions
     );
     Command::new("expect")
         .arg("-c")

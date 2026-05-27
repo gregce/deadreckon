@@ -465,6 +465,9 @@ fn start_mode_values_parse_and_reject_unknown_modes() {
             "missing mode {mode}:\n{start_help}"
         );
     }
+    assert!(start_help.contains("selection prompts"), "{start_help}");
+    assert!(start_help.contains("--plain"), "{start_help}");
+    assert!(start_help.contains("--json"), "{start_help}");
 
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .args(["start", "build the app", "--mode", "unknown", "--preview"])
