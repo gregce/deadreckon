@@ -1676,30 +1676,250 @@ fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String>
     setup::auto_subscription_cli_provider(registry)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartSelectedMode {
+    Run,
+    Review,
+    FullPlan,
+}
+
+impl StartSelectedMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Review => "review",
+            Self::FullPlan => "full-plan",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartSelectionSource {
+    ExplicitFlag,
+    Heuristic,
+    Default,
+}
+
+impl StartSelectionSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExplicitFlag => "explicit_flag",
+            Self::Heuristic => "heuristic",
+            Self::Default => "default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartProviderSource {
+    Missing,
+}
+
+impl StartProviderSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartDoneCriteriaSource {
+    Missing,
+}
+
+impl StartDoneCriteriaSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartSourceMode {
+    Missing,
+}
+
+impl StartSourceMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StartLaunchInput<'a> {
+    goal: &'a str,
+    requested_mode: crate::cli::CliStartMode,
+    stdin_is_tty: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StartLaunchDecision {
+    goal: String,
+    selected_mode: StartSelectedMode,
+    selection_source: StartSelectionSource,
+    reason: String,
+    provider_source: StartProviderSource,
+    done_criteria_source: StartDoneCriteriaSource,
+    source_mode: StartSourceMode,
+    requires_confirmation: bool,
+    try_lines: Vec<String>,
+}
+
+fn start_launch_decision(input: StartLaunchInput<'_>) -> StartLaunchDecision {
+    let (selected_mode, selection_source, reason) = match input.requested_mode {
+        crate::cli::CliStartMode::Run => (
+            StartSelectedMode::Run,
+            StartSelectionSource::ExplicitFlag,
+            "explicit --mode run selected one supervised coding run".to_string(),
+        ),
+        crate::cli::CliStartMode::Review => (
+            StartSelectedMode::Review,
+            StartSelectionSource::ExplicitFlag,
+            "explicit --mode review selected coder/reviewer orchestration".to_string(),
+        ),
+        crate::cli::CliStartMode::FullPlan => (
+            StartSelectedMode::FullPlan,
+            StartSelectionSource::ExplicitFlag,
+            "explicit --mode full-plan selected multi-agent planning".to_string(),
+        ),
+        crate::cli::CliStartMode::Auto => start_auto_mode_decision(input.goal, input.stdin_is_tty),
+    };
+    StartLaunchDecision {
+        goal: input.goal.to_string(),
+        selected_mode,
+        selection_source,
+        reason,
+        provider_source: StartProviderSource::Missing,
+        done_criteria_source: StartDoneCriteriaSource::Missing,
+        source_mode: StartSourceMode::Missing,
+        requires_confirmation: false,
+        try_lines: vec![
+            "deadreckon init".to_string(),
+            "deadreckon def-done \"describe what must be true\"".to_string(),
+        ],
+    }
+}
+
+fn start_auto_mode_decision(
+    goal: &str,
+    stdin_is_tty: bool,
+) -> (StartSelectedMode, StartSelectionSource, String) {
+    let lower = goal.to_ascii_lowercase();
+    if start_goal_recommends_review(&lower) {
+        return (
+            StartSelectedMode::Review,
+            StartSelectionSource::Heuristic,
+            "goal asks for review, hardening, validation, or a second pass".to_string(),
+        );
+    }
+    if start_goal_recommends_full_plan(&lower) {
+        return (
+            StartSelectedMode::FullPlan,
+            StartSelectionSource::Heuristic,
+            "goal names parallel or separable workstreams that fit full-plan orchestration"
+                .to_string(),
+        );
+    }
+    if !stdin_is_tty {
+        return (
+            StartSelectedMode::Run,
+            StartSelectionSource::Default,
+            "non-interactive auto mode uses the conservative single supervised run".to_string(),
+        );
+    }
+    (
+        StartSelectedMode::Run,
+        StartSelectionSource::Default,
+        "goal looks focused enough for a single supervised run".to_string(),
+    )
+}
+
+fn start_goal_recommends_review(lower_goal: &str) -> bool {
+    [
+        "review",
+        "audit",
+        "critique",
+        "validate",
+        "validation",
+        "verify",
+        "verification",
+        "hardening",
+        "harden",
+        "second pass",
+        "second-pass",
+        "cleanup",
+        "clean up",
+    ]
+    .iter()
+    .any(|needle| lower_goal.contains(needle))
+}
+
+fn start_goal_recommends_full_plan(lower_goal: &str) -> bool {
+    [
+        "parallel",
+        "parallelize",
+        "workstream",
+        "workstreams",
+        "multiple independent",
+        "many modules",
+        "several modules",
+        "separable",
+        "frontend, docs",
+        "api, frontend",
+    ]
+    .iter()
+    .any(|needle| lower_goal.contains(needle))
+}
+
 async fn start_command(args: StartCommandArgs) -> Result<()> {
+    let decision = start_launch_decision(StartLaunchInput {
+        goal: &args.goal,
+        requested_mode: args.mode,
+        stdin_is_tty: io::stdin().is_terminal(),
+    });
     if args.json {
         let payload = json!({
             "kind": "start",
-            "goal": args.goal,
-            "selected_mode": args.mode.label(),
+            "goal": decision.goal,
+            "selected_mode": decision.selected_mode.label(),
+            "selection_source": decision.selection_source.label(),
+            "reason": decision.reason,
+            "provider": decision.provider_source.label(),
+            "done_criteria": decision.done_criteria_source.label(),
+            "source_mode": decision.source_mode.label(),
+            "requires_confirmation": decision.requires_confirmation,
             "will_start": false,
             "next_actions": [
                 "deadreckon start launch decisions are implemented in the next guided phase"
             ],
-            "try_lines": [
-                "deadreckon run \"build the app\"",
-                "deadreckon orchestrate \"build and review the app\""
-            ]
+            "try_lines": decision.try_lines
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
     if !args.quiet {
         println!("{}", ui_heading("guided start"));
-        let mode = args.mode.label();
+        let mode = decision.selected_mode.label();
         print_kv_block(&[
-            ("goal", &args.goal),
+            ("goal", &decision.goal),
             ("mode", mode),
+            ("selection", decision.selection_source.label()),
+            ("reason", &decision.reason),
+            ("provider", decision.provider_source.label()),
+            ("done", decision.done_criteria_source.label()),
+            ("workspace", decision.source_mode.label()),
+            (
+                "confirmation",
+                if decision.requires_confirmation {
+                    "required"
+                } else {
+                    "not required"
+                },
+            ),
             ("preview", if args.preview { "yes" } else { "no" }),
             ("confirmed", if args.yes { "yes" } else { "no" }),
             ("plain", if args.plain { "yes" } else { "no" }),
@@ -28466,13 +28686,14 @@ mod tui_tests {
         LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
         NarrativeRefreshKind, NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent,
         PlanNarrativeRefreshInput, ProviderActivity, ProviderJsonlLogSpec, RunNarrativeRenderInput,
-        TopHelpGroup, acceptance_activity_lines, attach_banner, attach_header_text,
-        attach_live_inventory, attach_loop_stage_work, attach_should_return_to_plan,
-        build_run_narrative_projection, cancel_plan_narrative_refresh_job,
-        cancel_run_narrative_refresh_job, chain_activity_lines, chain_attach_footer_text,
-        chain_attach_header_text, chain_event_read_hint, chain_narrative_refusal_text,
-        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
-        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
+        StartLaunchInput, StartSelectedMode, StartSelectionSource, TopHelpGroup,
+        acceptance_activity_lines, attach_banner, attach_header_text, attach_live_inventory,
+        attach_loop_stage_work, attach_should_return_to_plan, build_run_narrative_projection,
+        cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job, chain_activity_lines,
+        chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
+        chain_narrative_refusal_text, chain_should_auto_attach, chain_step_dot,
+        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
+        cli_wait_status_line, collect_jsonl_provider_activity,
         collect_jsonl_provider_activity_scan, command_discovery, completion_action_from_input,
         completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
         doc_polish_preview_text, implementation_plan_warnings, kill_banner, live_file_lines,
@@ -28485,10 +28706,10 @@ mod tui_tests {
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
         render_attach, render_plan_attach, run_narrative_json_text, run_narrative_plain_text,
-        run_narrative_refresh_trigger, start_or_coalesce_plan_narrative_refresh_job,
-        threshold_color,
+        run_narrative_refresh_trigger, start_launch_decision,
+        start_or_coalesce_plan_narrative_refresh_job, threshold_color,
     };
-    use crate::cli::{Cli, CliPlanMode};
+    use crate::cli::{Cli, CliPlanMode, CliStartMode};
     use chrono::{Duration as ChronoDuration, Utc};
     use clap::CommandFactory;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -29919,6 +30140,58 @@ mod tui_tests {
             recommend_orchestration_mode("fix the provider table spacing"),
             CliPlanMode::Review
         );
+    }
+
+    #[test]
+    fn start_auto_defaults_to_run_for_simple_goal() {
+        let decision = start_launch_decision(StartLaunchInput {
+            goal: "fix the provider table spacing",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+
+        assert_eq!(decision.selected_mode, StartSelectedMode::Run);
+        assert_eq!(decision.selection_source, StartSelectionSource::Default);
+        assert!(decision.reason.contains("single supervised run"));
+    }
+
+    #[test]
+    fn start_auto_recommends_review_for_review_goal() {
+        let decision = start_launch_decision(StartLaunchInput {
+            goal: "review and harden the provider setup flow",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+
+        assert_eq!(decision.selected_mode, StartSelectedMode::Review);
+        assert_eq!(decision.selection_source, StartSelectionSource::Heuristic);
+        assert!(decision.reason.contains("review"));
+    }
+
+    #[test]
+    fn start_auto_recommends_full_plan_for_parallel_goal() {
+        let decision = start_launch_decision(StartLaunchInput {
+            goal: "parallelize the API, frontend, docs, and release workstreams",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+
+        assert_eq!(decision.selected_mode, StartSelectedMode::FullPlan);
+        assert_eq!(decision.selection_source, StartSelectionSource::Heuristic);
+        assert!(decision.reason.contains("parallel"));
+    }
+
+    #[test]
+    fn non_tty_ambiguous_auto_chooses_run() {
+        let decision = start_launch_decision(StartLaunchInput {
+            goal: "improve the app",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: false,
+        });
+
+        assert_eq!(decision.selected_mode, StartSelectedMode::Run);
+        assert_eq!(decision.selection_source, StartSelectionSource::Default);
+        assert!(decision.reason.contains("non-interactive"));
     }
 
     #[test]

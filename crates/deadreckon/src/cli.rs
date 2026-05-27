@@ -1537,17 +1537,6 @@ pub(crate) enum CliStartMode {
     FullPlan,
 }
 
-impl CliStartMode {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Run => "run",
-            Self::Review => "review",
-            Self::FullPlan => "full-plan",
-        }
-    }
-}
-
 #[derive(Subcommand)]
 pub(crate) enum OrchestrateCommand {
     #[command(
