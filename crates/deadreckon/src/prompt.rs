@@ -1,7 +1,11 @@
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal as _, Write as _};
 
 use crate::Result;
 use crate::ui::{self, Stream, Tone};
+use crossterm::cursor::{MoveToColumn, MoveUp};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{self, Clear, ClearType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SelectChoice {
@@ -50,6 +54,24 @@ pub(crate) fn open(message: &str, _default: Option<&str>) -> Result<String> {
 }
 
 pub(crate) fn select_one(prompt: &SelectPrompt) -> Result<SelectChoice> {
+    if prompt.choices.is_empty() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "select prompt has no choices").into(),
+        );
+    }
+    if should_use_selectable_menu() {
+        return select_one_menu(prompt);
+    }
+    select_one_line(prompt)
+}
+
+fn should_use_selectable_menu() -> bool {
+    io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && std::env::var_os("DEADRECKON_PROMPT_LINE_MODE").is_none()
+}
+
+fn select_one_line(prompt: &SelectPrompt) -> Result<SelectChoice> {
     println!("{}", prompt.title);
     if let Some(help) = prompt
         .help
@@ -77,6 +99,129 @@ pub(crate) fn select_one(prompt: &SelectPrompt) -> Result<SelectChoice> {
             return Ok(prompt.choices[index].clone());
         }
         println!("Please choose a number from 1 to {}.", prompt.choices.len());
+    }
+}
+
+fn select_one_menu(prompt: &SelectPrompt) -> Result<SelectChoice> {
+    println!("{}", prompt.title);
+    if let Some(help) = prompt
+        .help
+        .as_deref()
+        .filter(|help| !help.trim().is_empty())
+    {
+        println!("  {help}");
+    }
+    let mut selected = prompt
+        .default_index
+        .min(prompt.choices.len().saturating_sub(1));
+    let _raw_mode = RawModeGuard::enable()?;
+    render_select_menu(prompt, selected, false)?;
+    loop {
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if matches!(key.kind, KeyEventKind::Release) {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                println!();
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "prompt cancelled").into());
+            }
+            KeyCode::Enter => {
+                println!();
+                return Ok(prompt.choices[selected].clone());
+            }
+            KeyCode::Char('j' | 'm') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                println!();
+                return Ok(prompt.choices[selected].clone());
+            }
+            KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
+                selected = selected.saturating_sub(1);
+                render_select_menu(prompt, selected, true)?;
+            }
+            KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
+                if selected + 1 < prompt.choices.len() {
+                    selected += 1;
+                }
+                render_select_menu(prompt, selected, true)?;
+            }
+            KeyCode::Home => {
+                selected = 0;
+                render_select_menu(prompt, selected, true)?;
+            }
+            KeyCode::End => {
+                selected = prompt.choices.len().saturating_sub(1);
+                render_select_menu(prompt, selected, true)?;
+            }
+            KeyCode::Char(value) if key.modifiers.is_empty() && value.is_ascii_digit() => {
+                if let Some(index) = select_index_from_digit(value, prompt.choices.len()) {
+                    selected = index;
+                    render_select_menu(prompt, selected, true)?;
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(index) = prompt
+                    .choices
+                    .iter()
+                    .position(|choice| choice.id == "cancel")
+                {
+                    println!();
+                    return Ok(prompt.choices[index].clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn render_select_menu(prompt: &SelectPrompt, selected: usize, redraw: bool) -> Result<()> {
+    let mut stdout = io::stdout();
+    if redraw {
+        execute!(stdout, MoveUp(prompt.choices.len() as u16), MoveToColumn(0))?;
+    }
+    for (index, choice) in prompt.choices.iter().enumerate() {
+        let ordinal = index + 1;
+        let marker = if index == selected { ">" } else { " " };
+        execute!(stdout, Clear(ClearType::CurrentLine))?;
+        match choice.detail.as_deref() {
+            Some(detail) if !detail.trim().is_empty() => {
+                println!("  {marker} [{ordinal}] {} - {detail}", choice.label);
+            }
+            _ => println!("  {marker} [{ordinal}] {}", choice.label),
+        }
+    }
+    execute!(stdout, Clear(ClearType::CurrentLine))?;
+    let default = prompt
+        .default_index
+        .min(prompt.choices.len().saturating_sub(1))
+        + 1;
+    print!("? choose [{default}]: arrows/Enter or number ");
+    stdout.flush()?;
+    Ok(())
+}
+
+fn select_index_from_digit(value: char, len: usize) -> Option<usize> {
+    let digit = value.to_digit(10)? as usize;
+    if (1..=len).contains(&digit) {
+        Some(digit - 1)
+    } else {
+        None
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
     }
 }
 
@@ -121,7 +266,7 @@ fn parse_confirm_answer(answer: &str, default_yes: bool) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_confirm_answer, parse_select_answer};
+    use super::{parse_confirm_answer, parse_select_answer, select_index_from_digit};
 
     #[test]
     fn confirm_answer_accepts_yes_no_and_default() {
@@ -150,5 +295,13 @@ mod tests {
         assert_eq!(parse_select_answer("0", 2, 4), None);
         assert_eq!(parse_select_answer("5", 2, 4), None);
         assert_eq!(parse_select_answer("review", 2, 4), None);
+    }
+
+    #[test]
+    fn selectable_menu_digit_shortcuts_match_numbered_rows() {
+        assert_eq!(select_index_from_digit('1', 4), Some(0));
+        assert_eq!(select_index_from_digit('4', 4), Some(3));
+        assert_eq!(select_index_from_digit('5', 4), None);
+        assert_eq!(select_index_from_digit('0', 4), None);
     }
 }

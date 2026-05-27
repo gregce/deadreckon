@@ -1855,7 +1855,10 @@ impl StartSourceMode {
 enum StartDoneAction {
     Existing,
     GenerateFromGoal,
-    ManualText(String),
+    ManualText {
+        text: String,
+        overwrite_existing: bool,
+    },
     DefaultGate,
     Missing,
 }
@@ -2431,7 +2434,10 @@ fn prompt_start_done_criteria(
                 return Ok(());
             }
             decision.done_criteria_source = StartDoneCriteriaSource::Manual;
-            decision.done_action = StartDoneAction::ManualText(text.trim().to_string());
+            decision.done_action = StartDoneAction::ManualText {
+                text: text.trim().to_string(),
+                overwrite_existing: false,
+            };
             decision.done_criteria_label = "write manual criteria before launch".to_string();
         }
         _ => set_start_recovery(
@@ -2585,7 +2591,10 @@ fn prompt_start_existing_done_criteria(
                     return Ok(());
                 }
                 decision.done_criteria_source = StartDoneCriteriaSource::Manual;
-                decision.done_action = StartDoneAction::ManualText(text.trim().to_string());
+                decision.done_action = StartDoneAction::ManualText {
+                    text: text.trim().to_string(),
+                    overwrite_existing: true,
+                };
                 decision.done_criteria_label = "update done criteria before launch".to_string();
                 return Ok(());
             }
@@ -3163,17 +3172,27 @@ fn shell_display_quote(value: &str) -> String {
     value.replace('"', "\\\"")
 }
 
+fn start_done_materialization_request(decision: &StartLaunchDecision) -> Option<(String, bool)> {
+    match decision.done_action.clone() {
+        StartDoneAction::GenerateFromGoal => Some((
+            format!(
+                "For this start, define practical acceptance checks for: {}",
+                decision.goal
+            ),
+            false,
+        )),
+        StartDoneAction::ManualText {
+            text,
+            overwrite_existing,
+        } => Some((text, overwrite_existing)),
+        StartDoneAction::Existing | StartDoneAction::DefaultGate | StartDoneAction::Missing => None,
+    }
+}
+
 async fn materialize_start_done_criteria(decision: &mut StartLaunchDecision) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let request = match decision.done_action.clone() {
-        StartDoneAction::GenerateFromGoal => format!(
-            "For this start, define practical acceptance checks for: {}",
-            decision.goal
-        ),
-        StartDoneAction::ManualText(text) => text,
-        StartDoneAction::Existing | StartDoneAction::DefaultGate | StartDoneAction::Missing => {
-            return Ok(());
-        }
+    let Some((request, overwrite_existing)) = start_done_materialization_request(decision) else {
+        return Ok(());
     };
     acceptance_agent_command_in_dir(
         &cwd,
@@ -3181,7 +3200,7 @@ async fn materialize_start_done_criteria(decision: &mut StartLaunchDecision) -> 
         vec![request],
         decision.provider_route.clone(),
         None,
-        false,
+        overwrite_existing,
     )
     .await?;
     if let Some(source) = mark_generated_done_criteria(resolve_acceptance_source(&cwd, None)?) {
@@ -3332,7 +3351,14 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
                 },
             ),
             ("preview", if args.preview { "yes" } else { "no" }),
-            ("confirmed", if args.yes { "yes" } else { "no" }),
+            (
+                "confirmed",
+                if args.yes || decision.confirmed_by_start_picker {
+                    "yes"
+                } else {
+                    "no"
+                },
+            ),
             ("plain", if args.plain { "yes" } else { "no" }),
         ]);
     }
@@ -30432,8 +30458,9 @@ mod tui_tests {
         provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
         provider_jsonl_session_matches_run, read_plan_events_lossy, recommend_child_count_for_goal,
         recommend_orchestration_mode, render_attach, render_plan_attach, run_narrative_json_text,
-        run_narrative_plain_text, run_narrative_refresh_trigger, start_launch_decision,
-        start_launch_preview_facts, start_or_coalesce_plan_narrative_refresh_job, threshold_color,
+        run_narrative_plain_text, run_narrative_refresh_trigger,
+        start_done_materialization_request, start_launch_decision, start_launch_preview_facts,
+        start_or_coalesce_plan_narrative_refresh_job, threshold_color,
     };
     use crate::cli::{Cli, CliPlanMode, CliStartMode, StartCommandArgs};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -32188,6 +32215,26 @@ mod tui_tests {
     }
 
     #[test]
+    fn start_fake_prompter_manual_done_creates_without_overwrite() {
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "build the app",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+        let mut prompter = ScriptedStartPrompter::new(&["manual"]);
+        prompter
+            .inputs
+            .push_back("tests pass and screenshots are clean".to_string());
+
+        prompt_start_done_criteria(&mut decision, &mut prompter).expect("done prompt");
+
+        assert_eq!(
+            start_done_materialization_request(&decision),
+            Some(("tests pass and screenshots are clean".to_string(), false))
+        );
+    }
+
+    #[test]
     fn start_existing_done_criteria_prompt_can_keep_current_criteria() {
         let mut decision = start_launch_decision(StartLaunchInput {
             goal: "build the app",
@@ -32252,7 +32299,14 @@ mod tui_tests {
         );
         assert_eq!(
             decision.done_action,
-            StartDoneAction::ManualText("tests pass and screenshots are clean".to_string())
+            StartDoneAction::ManualText {
+                text: "tests pass and screenshots are clean".to_string(),
+                overwrite_existing: true,
+            }
+        );
+        assert_eq!(
+            start_done_materialization_request(&decision),
+            Some(("tests pass and screenshots are clean".to_string(), true))
         );
         assert_eq!(
             decision.done_criteria_label,
@@ -32287,7 +32341,10 @@ mod tui_tests {
 
         assert_eq!(
             decision.done_action,
-            StartDoneAction::ManualText("browser loads and smoke tests pass".to_string())
+            StartDoneAction::ManualText {
+                text: "browser loads and smoke tests pass".to_string(),
+                overwrite_existing: true,
+            }
         );
         assert_eq!(
             prompter.prompt_titles,

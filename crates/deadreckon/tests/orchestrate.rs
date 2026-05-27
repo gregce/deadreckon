@@ -478,7 +478,7 @@ fn pty_start_picker_choose_full_plan_preview() {
     let output = deadreckon_pty(
         &paths,
         &repo,
-        &["1"],
+        &["1", "1"],
         &[
             "start",
             "parallelize the API frontend docs and tests",
