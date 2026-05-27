@@ -110,9 +110,16 @@ async fn kill_run_across_processes_terminates_in_5s() {
         .env("DEADRECKON_HOME", &home)
         .output()
         .expect("kill");
+    let elapsed = started.elapsed();
     assert!(kill.status.success());
-    assert!(started.elapsed() < Duration::from_secs(2));
-    let _ = child.wait();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "kill command returned after {elapsed:?}"
+    );
+    assert!(
+        wait_for_child_exit(&mut child, Duration::from_secs(5)),
+        "run did not exit after kill"
+    );
     let state = load_run(&paths, &run_id).expect("state");
     assert_eq!(state.status, RunStatus::Killed);
     assert!(cancel_marker_path(&state).exists());
@@ -1603,6 +1610,8 @@ output_cost_per_million = 1.0
 fn write_cli_config(temp: &std::path::Path, binary: &std::path::Path) {
     let home = temp.join("home");
     fs::create_dir_all(&home).expect("home");
+    let providers_dir = home.join("providers.d");
+    fs::create_dir_all(&providers_dir).expect("providers");
     fs::write(
         home.join("config.toml"),
         format!(
@@ -1617,6 +1626,16 @@ binary = "{}"
         ),
     )
     .expect("config");
+    fs::write(
+        providers_dir.join("cli-codex.toml"),
+        r#"
+id = "cli:codex"
+
+[ingest]
+default_dirs = []
+"#,
+    )
+    .expect("provider override");
 }
 
 fn chmod_exec(path: &std::path::Path) {

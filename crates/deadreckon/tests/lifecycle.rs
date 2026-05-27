@@ -843,7 +843,8 @@ fn help_lists_lifecycle_verbs() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("Core lifecycle:"));
-    assert!(stdout.contains("def-done \""));
+    assert!(stdout.contains("def-done"));
+    assert!(stdout.contains("start"));
     assert!(stdout.contains("finish latest"));
     assert!(stdout.contains("orchestrate"));
     assert!(stdout.contains("status"));

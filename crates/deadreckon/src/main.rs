@@ -27366,7 +27366,7 @@ fn parent_plan_footer(footer: String, parent_plan: Option<&AttachParentPlan>) ->
     let Some(parent_plan) = parent_plan else {
         return footer;
     };
-    let mut footer = footer
+    let footer = footer
         .replace(
             "q/Esc/Ctrl-D detach",
             "b/Backspace/q/Esc/Ctrl-D back to plan",
@@ -27376,12 +27376,15 @@ fn parent_plan_footer(footer: String, parent_plan: Option<&AttachParentPlan>) ->
             "Back to plan: b Backspace q Esc Ctrl-D",
         )
         .replace("q detach", "b/Backspace/q back to plan");
-    footer.push_str(&format!(
-        "  |  parent plan {} {}",
+    let parent_label = format!(
+        "parent plan {} {}",
         run_prefix(&parent_plan.plan_id),
         parent_plan.task_id
-    ));
-    footer
+    );
+    match footer.split_once("  |  ") {
+        Some((lead, rest)) => format!("{lead}  |  {parent_label}  |  {rest}"),
+        None => format!("{footer}  |  {parent_label}"),
+    }
 }
 
 fn deadreckoning_status_line(
