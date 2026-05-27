@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-26 (local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
+**Last updated:** 2026-05-26 (local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure; followed by a 2026-05-26 agent-team code-verification pass that re-checked the module map, file-system layout, CLI surface, provider/sandbox/gate code locations, and the attach event-bus model against source)
 **Maturity:** alpha. Workspace version `0.1.0`. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -240,11 +240,11 @@ This split lets each side do what it's good at:
 
 ### 4.1 `PipelineState`
 
-`crates/deadreckon-core/src/state.rs:77-110`:
+`crates/deadreckon-core/src/state.rs:66-98`:
 
 ```rust
 pub struct PipelineState {
-    pub version: u32,                       // STATE_VERSION = 1 (line 15)
+    pub version: u32,                       // STATE_VERSION = 1 (line 18)
     pub goal: String,
     pub task_key: String,
     pub run_id: String,
@@ -276,7 +276,7 @@ pub struct PipelineState {
 
 ### 4.2 Status and phase enums
 
-`state.rs:17-26`:
+`state.rs:22-29`:
 
 ```rust
 pub enum RunStatus {
@@ -284,7 +284,7 @@ pub enum RunStatus {
 }
 ```
 
-`state.rs:42-75`:
+`state.rs:38-63`:
 
 ```rust
 pub struct PhaseId(pub u16);
@@ -300,7 +300,7 @@ pub struct PhaseState {
 
 ### 4.3 Phase numbering (gap-numbered)
 
-`state.rs:233-254` initializes seven phases for every new run:
+`state.rs:252-273` initializes seven phases for every new run:
 
 | `PhaseId` | name | role |
 |---|---|---|
@@ -342,7 +342,7 @@ Key rule: `RunStatus::Completed` is reachable **only** through `Phase(60).Comple
 
 ### 4.5 Atomic persistence
 
-`state.rs:353-373`:
+`state.rs:435-445`:
 
 ```rust
 pub(crate) fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -358,11 +358,11 @@ pub(crate) fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<
 
 Every state-changing function ends with `save_state(state)?`. Crashes never leave a half-written `state.json`.
 
-JSONL files (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) use `append_json_line` (`state.rs:375-388`): open in append mode, write line + newline, `sync_all`.
+JSONL files (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) use `append_json_line` (`state.rs:457-470`): open in append mode, write line + newline, `sync_all`.
 
 ### 4.6 Schema versioning
 
-`STATE_VERSION = 1` (`state.rs:15`) gates future migrations. `load_state` rejects unknown versions; migrations would land here.
+`STATE_VERSION = 1` (`state.rs:18`) gates future migrations. `load_state` rejects unknown versions; migrations would land here.
 
 ---
 
@@ -527,7 +527,7 @@ main.rs run_command()
 `Completed` is only reached if the turn loop emits `RunLoopOutcome::Done`, which itself requires:
 
 1. The loop saw `Action::Done` (or a CLI sub-agent finished with file changes), **and**
-2. `acceptance_gate_passed_or_record_failure(state, ...)` returned `true` after invoking `dr-gate` and validating the signed marker (`turn_loop.rs:1298`). Gate failures are non-terminal: the helper logs them and returns `false`, letting the loop continue until the gate passes or the turn budget is exhausted (§13.6), **and**
+2. `acceptance_gate_passed_or_record_failure(state, ...)` returned `true` after invoking `dr-gate` and validating the signed marker (`turn_loop.rs:1442`). Gate failures are non-terminal: the helper logs them and returns `false`, letting the loop continue until the gate passes or the turn budget is exhausted (§13.6), **and**
 3. `promote_if_ready(state)` swapped `working/` → `library/<scope>/<run_id>/`, **and**
 4. `set_phase_status(PhaseId(60), Completed)` ran (which is the only path to `RunStatus::Completed`).
 
@@ -561,8 +561,8 @@ Lock file lives at `~/.deadreckon/locks/<scope>--<task_key>.lock` (`lock.rs:86`)
 
 1. Create the `.lock` file.
 2. `fs2::FileExt::try_lock_exclusive` for OS-level advisory lock.
-3. If `EWOULDBLOCK`, read existing `LockState` from disk. If owner matches **or** lock is stale, proceed. Otherwise refuse.
-4. Stale detection: `acquired_at` age > `DEFAULT_STALE_AFTER` (30 min, `lock.rs:13`) **or** `pid_is_alive(pid)` returns false. PID liveness is `nix::sys::signal::kill(pid, 0)` (`lock.rs:235-245`): `ESRCH` → dead, anything else → alive.
+3. If `EWOULDBLOCK`, read the existing `LockState` from disk and return `LockHeld` immediately — an `fs2` advisory lock that won't acquire is held by a *live* process.
+4. If the OS lock **is** acquired, read any existing `LockState` from the file (a crashed holder's advisory lock is auto-released on death, so its file may linger). Stale detection: `acquired_at` age > `DEFAULT_STALE_AFTER` (30 min, `lock.rs:13`) **or** `pid_is_alive(pid)` returns false. PID liveness is `nix::sys::signal::kill(pid, 0)` (`lock.rs:237-248`): `ESRCH` → dead, `EPERM` → alive. A different, live, non-stale holder causes the OS lock to be released and `LockHeld` returned.
 5. Write the new `LockState` to disk.
 6. Return a `LockGuard` that releases on drop.
 
@@ -594,7 +594,7 @@ If the process holding the lock dies, the lock file persists but `pid_is_alive(p
 
 ### 8.1 `PromotionManifest`
 
-`crates/deadreckon-core/src/promotion.rs:14-23`:
+`crates/deadreckon-core/src/promotion.rs:17-25`:
 
 ```rust
 pub struct PromotionManifest {
@@ -610,13 +610,13 @@ pub struct PromotionManifest {
 
 ### 8.2 Promotion flow
 
-`promotion.rs:25-63`:
+`promotion.rs:27-76`:
 
 1. **Guard.** `validate_acceptance_marker(state)?` — refuses if marker missing / wrong run_id / unsigned.
 2. **Recovery.** `recover_promotion()` — idempotent if a previous attempt half-completed (§8.4).
 3. **Idempotency check.** If `library/<scope>/<run_id>/manifest.json` already exists, update state and return — no work to do.
 4. **Staging.** Create `library/<scope>/.{run_id}.promoting/` (parent dir created if needed).
-5. **Move.** `fs::rename(working_dir, staging)` — atomic on same filesystem.
+5. **Move/Copy.** If `working_dir` is the run's own `working/` dir, `fs::rename(working_dir, staging)` — atomic on same filesystem. Otherwise (worktree/in-place modes, where `working_dir` lives elsewhere) `copy_tree(working_dir, staging)`.
 6. **Manifest.** Write `manifest.json` inside staging.
 7. **Final rename.** `fs::rename(staging, library/<scope>/<run_id>/)` — atomic.
 8. **State update.** `state.working_dir = library_dir`; `state.promoted_library_dir = Some(library_dir)`; `save_state()`.
@@ -627,7 +627,7 @@ In `crates/deadreckon-runtime/src/turn_loop.rs`, **before** `set_phase_status(Ph
 
 ### 8.4 Crash recovery between rename steps
 
-`promotion.rs:65-84` handles the half-completed states:
+`promotion.rs:78-97` handles the half-completed states:
 
 - If `staging` exists and final dir doesn't: complete the rename.
 - If both exist: the final rename happened but didn't atomically remove staging; clean up staging.
@@ -655,7 +655,12 @@ pub struct RunLoopConfig {
     pub from_turn: Option<u32>,     // resume override
     pub event_sender: Option<broadcast::Sender<RunEvent>>,
     pub cancellation_token: Option<CancellationToken>,
+    pub docs: RunLoopDocsConfig,    // doc-polish settings (see below)
 }
+
+// RunLoopDocsConfig is resolved before the loop and carries:
+//   home, config_path, doc_provider (+ doc_provider_source), doc_subskills,
+//   token_budget, budget_cap_usd, doc_skill, no_docs.
 ```
 
 ### 9.2 Top-level signature
@@ -673,9 +678,9 @@ pub async fn run_turn_loop(
 ### 9.3 Loop body (paraphrased; see `crates/deadreckon-runtime/src/turn_loop.rs`)
 
 ```text
-load_or_reconstruct_history()      # lines 69, 550-631
-set Phase(40)=Executing            # line 70
-save_state(); save_history()       # line 71
+load_or_reconstruct_history()      # load history.json, else replay traces.jsonl
+set Phase(40)=Executing
+save_state(); save_history()
 
 for turn in (state.turn+1)..=max_turns:
     if cancelled or status=Killed:
@@ -688,7 +693,9 @@ for turn in (state.turn+1)..=max_turns:
         pid_file=run_root/child-pids/provider-turn-N.pid,
         cancellation_token=turn_token,
     }
+    if provider is cli:*: flight = ProviderFlightRecorder::start().spawn()  # sidecar polls provider logs + tree
     response = router.complete(&request).await
+    if provider is cli:*: flight.finish(status)   # writes flight-events.jsonl + checkpoints
     append_trace(llm.complete, latency, response.trace)
     state.total_spend_usd += response.spend.cost_usd
     state.total_wall_seconds += response.spend.wall_time_seconds
@@ -702,8 +709,10 @@ for turn in (state.turn+1)..=max_turns:
         snapshot_working(turn)
         append_trace(tool.cli_subagent, files=changed)
         append_provenance_for_files(turn, tool_call_id, model, changed)
-        run_acceptance_gate(state)        # dr-gate
-        validate_acceptance_marker(state) # signed?
+        commit_worktree_turn(turn); append turn-doc checkpoint
+        if !implementation_notes_ready_or_request_followup(): continue   # nudge, do not fail
+        complete_run_docs(state, router, config)                         # deterministic + optional polish
+        if !acceptance_gate_passed_or_record_failure(): continue         # dr-gate; non-terminal (§13.6)
         promote_if_ready(state)           # working → library
         set Phase(60)=Completed
         return Done
@@ -725,7 +734,11 @@ for turn in (state.turn+1)..=max_turns:
             append_provenance(turn, [path])
             history.push("tool {id} result: wrote file")
         Done { summary } =>
-            run_acceptance_gate; validate_marker; promote_if_ready
+            append turn-doc checkpoint
+            if !implementation_notes_ready_or_request_followup(): continue
+            complete_run_docs(state, router, config)
+            if !acceptance_gate_passed_or_record_failure(): continue      # non-terminal (§13.6)
+            promote_if_ready(state)
             set Phase(60)=Completed
             return Done
 
@@ -808,7 +821,7 @@ pub enum ProviderKind {
 
 ### 10.3 HTTP adapters
 
-A single `ProviderAdapter` (`lib.rs:135-323`) handles all three HTTP kinds via shared `reqwest::Client`:
+A single `ProviderAdapter` (`http.rs:12-211`) handles all three HTTP kinds via shared `reqwest::Client` (`lib.rs` is a ~309-line facade of `pub use` re-exports + tests, no logic):
 
 | Kind | Endpoint | Auth header | Default model |
 |---|---|---|---|
@@ -816,15 +829,15 @@ A single `ProviderAdapter` (`lib.rs:135-323`) handles all three HTTP kinds via s
 | OpenAI | `{base_url}/chat/completions` | `Authorization: Bearer <key>` | configurable |
 | OpenAI-compatible | `{base_url}/chat/completions` | `Authorization: Bearer <key>` | configurable |
 
-Pricing defaults (`lib.rs:531-617`): Anthropic $3/$15 per million in/out; OpenAI $1.25/$10 per million; OpenAI-compatible $0/$0 (user-configured).
+Pricing defaults come from the registry descriptor model catalogs (e.g. `descriptors/anthropic.toml`, `descriptors/openai.toml`) and are fed into each `ProviderEntry` by `config.rs`; `http.rs` falls back to $0/$0 when a model carries no catalog price. Anthropic `claude-sonnet-4-5`: $3/$15 per million in/out; OpenAI: $1.25/$10 per million; OpenAI-compatible: user-configured.
 
-Response parsing: `parse_anthropic_response` (`lib.rs:688-705`) extracts `content[0].text` + `usage.{input_tokens, output_tokens}`; `parse_openai_response` (`lib.rs:669-686`) extracts `choices[0].message.content` + `usage.{prompt_tokens, completion_tokens}`. The `Action` tag-typed enum is parsed in the **turn loop**, not the provider; providers return text.
+Response parsing: `parse_anthropic_response` (`http.rs:260-277`) extracts `content[0].text` + `usage.{input_tokens, output_tokens}`; `parse_openai_response` (`http.rs:241-258`) extracts `choices[0].message.content` + `usage.{prompt_tokens, completion_tokens}`. The `Action` tag-typed enum is parsed in the **turn loop**, not the provider; providers return text.
 
-Cancellation: `tokio::select!` on `token.cancelled()` vs `client.post().send()` (`lib.rs:226-263`).
+Cancellation: `tokio::select!` on `token.cancelled()` vs `client.post().send()` (`http.rs:119-134`).
 
 ### 10.4 CLI sub-agent adapters
 
-**`cli:claude-code` (`crates/deadreckon-providers/src/cli_claude_code.rs:1-127`).** Invocation:
+**`cli:claude-code` (`crates/deadreckon-providers/src/cli_claude_code.rs:1-142`).** Invocation:
 
 ```zsh
 claude [--model <model>] --dangerously-skip-permissions -p "<prompt>"
@@ -832,7 +845,7 @@ claude [--model <model>] --dangerously-skip-permissions -p "<prompt>"
 
 The `--dangerously-skip-permissions` flag is non-negotiable (no human is in the loop). The subprocess runs **inside** the deadreckon sandbox profile, so Claude's bypass only disables its own permission gate; deadreckon's outer Seatbelt/bwrap still scopes the process. Stdout is captured to `request.output_path` (the turn's `claude.out`).
 
-**`cli:codex` (`crates/deadreckon-providers/src/cli_codex.rs:1-143`).** Invocation:
+**`cli:codex` (`crates/deadreckon-providers/src/cli_codex.rs:1-164`).** Invocation:
 
 ```zsh
 codex --ask-for-approval never exec --skip-git-repo-check --sandbox <mode> -- "<prompt>"
@@ -874,7 +887,7 @@ Zero cost, no subscription. Reachable only via `--smoke` flag. The trace records
 
 ### 10.6 `ProviderRouter` and fallback chain
 
-`crates/deadreckon-providers/src/router.rs`. Reads config (TOML), loads the provider registry with `providers.d` overrides, resolves a route list (`fallback` array > `default_provider` > built-in chain `cli:claude-code` → `cli:codex` → `anthropic` → `openai` → `openai-compatible`), and constructs a `Box<dyn Provider>` per route. Concrete providers handle Anthropic/OpenAI/OpenAI-compatible/smoke/Codex/Claude; descriptor-backed generic CLI providers handle any registered CLI descriptor that does not need a concrete adapter. On `complete()`:
+`crates/deadreckon-providers/src/router.rs`. Reads config (TOML), loads the provider registry with `providers.d` overrides, resolves a route list (`default_provider` leads if set, then `fallback` entries deduped, then the built-in chain `cli:claude-code` → `cli:codex` → `anthropic` → `openai` → `openai-compatible` only when neither is configured; see `configured_route_names`), and constructs a `Box<dyn Provider>` per route. Concrete providers handle Anthropic/OpenAI/OpenAI-compatible/smoke/Codex/Claude; descriptor-backed generic CLI providers handle any registered CLI descriptor that does not need a concrete adapter. On `complete()`:
 
 ```rust
 for route in &self.routes {
@@ -912,7 +925,7 @@ pub enum SandboxBackend {
 
 ### 11.2 Auto resolution
 
-`lib.rs:208-244`. Platform-conditional:
+`backend.rs:93-128` (`resolve_backend`). Platform-conditional:
 
 - macOS: probes `sandbox-exec` via `which`. Falls back to `None` with a warning if unavailable.
 - Linux: probes `bwrap`. Falls back to `None` with a warning.
@@ -922,18 +935,18 @@ The fallback to `None` is loud — the warning ends up in `SandboxRunOutput.warn
 
 ### 11.3 `run(SandboxSpec) -> SandboxRunOutput`
 
-`lib.rs:111-169` is the single dispatch entry point. It:
+`process.rs:22-80` (`run`) is the single dispatch entry point. It:
 
-1. Calls `build_command(spec)` to construct the per-backend invocation.
+1. Calls `build_command(spec)` (`commands.rs:18`) to construct the per-backend invocation.
 2. Spawns the child via `tokio::process::Command`, capturing stdout + stderr piped.
-3. Persists the child PID to `spec.pid_file` (line 129) for `kill` supervision.
-4. Reads stdout/stderr in parallel async tasks (`read_pipe`, lines 171–181).
-5. Runs the cancellation `tokio::select!` (lines 131–151).
+3. Persists the child PID to `spec.pid_file` (`process.rs:36-41`) for `kill` supervision.
+4. Reads stdout/stderr in parallel async tasks (`read_pipe`, `process.rs:82-92`).
+5. Runs the cancellation `tokio::select!` (`process.rs:42-62`).
 6. Returns `SandboxRunOutput { stdout, stderr, status_code, pid, backend, warning }`.
 
 ### 11.4 macOS Seatbelt profile
 
-`lib.rs:390-441` generates a per-run profile string:
+`commands.rs:149-199` generates a per-run profile string:
 
 ```
 (version 1)
@@ -949,11 +962,11 @@ The fallback to `None` is loud — the warning ends up in `SandboxRunOutput.warn
 {write_rules})                ; spec.write_allowlist
 ```
 
-Optionally writes the profile to `spec.profile_dir` for debugging (`lib.rs:436-439`). Otherwise inline via `sandbox-exec -p '<profile>' -- <program> <args...>`.
+Optionally writes the profile to `spec.profile_dir` for debugging (`commands.rs:195-199`). Otherwise inline via `sandbox-exec -p '<profile>' -- <program> <args...>`.
 
 ### 11.5 Linux Bubblewrap
 
-`lib.rs:303-357`. Constructs `bwrap` args with:
+`commands.rs:62-116`. Constructs `bwrap` args with:
 
 - `--die-with-parent --unshare-pid --unshare-ipc --unshare-uts`
 - `--tmpfs <cwd>/.deadreckon-home` and `--setenv HOME <cwd>/.deadreckon-home` (ephemeral tmpfs `$HOME`)
@@ -964,15 +977,15 @@ Optionally writes the profile to `spec.profile_dir` for debugging (`lib.rs:436-4
 
 ### 11.6 Docker
 
-`lib.rs:359-388`. Constructs `docker run --rm -v <cwd>:<cwd> -w <cwd> [--network none] [-e KEY=VAL]... rust:1 <program> <args...>`. Hardcoded base image is `rust:1`. Only the cwd is mounted.
+`commands.rs:118-147`. Constructs `docker run --rm -v <cwd>:<cwd> -w <cwd> [--network none] [-e KEY=VAL]... rust:1 <program> <args...>`. Hardcoded base image is `rust:1`. Only the cwd is mounted.
 
 ### 11.7 None
 
-`lib.rs:191-203`. No isolation. Always returns a warning: `"sandbox backend none is unsafe; use only for explicit local verification"`. The warning lands in the trace.
+`commands.rs:26-39`. No isolation. Always returns a warning: `"sandbox backend none is unsafe; use only for explicit local verification"`. The warning lands in the trace.
 
 ### 11.8 SIGTERM/SIGKILL escalation
 
-`lib.rs:131-151`:
+`process.rs:42-58`:
 
 ```rust
 if let Some(token) = spec.cancellation_token.as_ref() {
@@ -996,7 +1009,7 @@ if let Some(token) = spec.cancellation_token.as_ref() {
 }
 ```
 
-`signal_pid` is defined at `lib.rs:473-483` (uses `nix::sys::signal::kill`).
+`signal_pid` is defined at `process.rs:95-108` (uses `nix::sys::signal::kill`).
 
 ---
 
@@ -1021,7 +1034,7 @@ Multiple sources contribute PIDs to track:
 
 ### 12.3 What `kill` cannot do
 
-`kill` does **not** flip a cancellation token in a running deadreckon process. If a deadreckon `run` is still running, `kill` only signals its child PIDs; the deadreckon process itself relies on its own cancellation token tree, which `kill` doesn't reach across processes. In practice this works because killing the children causes the providers/sandbox to error out, which the turn loop sees and propagates as a failure. This remains a hardening target.
+`kill` cannot reach directly into another process's in-memory cancellation token, so it bridges across processes with a **durable cancel marker**: `kill` writes `cancel.marker` under the run root before signaling child PIDs, and the running turn loop's `CancelMarkerGuard` polls for it (~50 ms) and trips the run-level `CancellationToken` while a provider call is in flight. Killing the children additionally makes the provider/sandbox error out, which the loop also propagates as a failure. The marker path means a cross-process `kill` deterministically stops the loop and records killed status through events, rather than relying solely on child-process death.
 
 ---
 
@@ -1033,7 +1046,7 @@ The agent (LLM) **cannot** be trusted to declare a run done. `Completed` is reac
 
 ### 13.2 `AcceptanceMarker`
 
-`crates/deadreckon-core/src/gate.rs:16-28`:
+`crates/deadreckon-core/src/gate.rs:20-33`:
 
 ```rust
 pub struct AcceptanceMarker {
@@ -1043,8 +1056,10 @@ pub struct AcceptanceMarker {
     pub produced_by: String,      // must be "dr-gate"
     pub checked_at: DateTime<Utc>,
     pub working_dir: PathBuf,
-    pub signature: String,        // hash over fields + nonce
+    pub signature: String,        // hash over fields + nonce + checks
     pub check_count: usize,
+    #[serde(default)]
+    pub checks: Vec<AcceptanceCheckResult>,  // per-check evidence, also covered by the signature
 }
 ```
 
@@ -1052,7 +1067,7 @@ Marker location: `<run_root>/proofs/turn-acceptance.json`.
 
 ### 13.3 `dr-gate` binary
 
-`crates/deadreckon/src/bin/dr-gate.rs` (33 lines). Standalone binary that:
+`crates/deadreckon/src/bin/dr-gate.rs` (73 lines). Standalone binary that:
 
 1. Reads `--run <id>` and `--working-dir <path>`.
 2. Loads `acceptance.yaml` (if present) from the run root.
@@ -1063,7 +1078,7 @@ The marker's `signature` is computed from `gate/nonce` (a UUID written at run-in
 
 ### 13.4 Validation
 
-`gate.rs:88-118`:
+`gate.rs:124-154`:
 
 ```rust
 pub fn validate_acceptance_marker(state: &PipelineState) -> Result<AcceptanceMarker> {
@@ -1085,11 +1100,11 @@ pub fn validate_acceptance_marker(state: &PipelineState) -> Result<AcceptanceMar
 }
 ```
 
-A forged marker by the agent fails the signature check at line 114.
+A forged marker by the agent fails the signature check (`gate.rs:149`).
 
 ### 13.5 Streaming progress
 
-While checks are running, `evaluate_acceptance_checks_with_progress` (`gate.rs:228-244`) appends one `AcceptanceProgressEntry` per state transition to `proofs/acceptance-progress.jsonl`:
+While checks are running, `evaluate_acceptance_checks_with_progress` (`gate.rs:233-249`) appends one `AcceptanceProgressEntry` per state transition to `proofs/acceptance-progress.jsonl`:
 
 ```rust
 pub struct AcceptanceProgressEntry {
@@ -1105,14 +1120,14 @@ The progress file is truncated at the start of each evaluation so resumed/extend
 
 ### 13.6 Where the gate is invoked
 
-When the turn loop emits `Action::Done` — either through a CLI sub-agent finishing or a JSON-action provider returning `Done` — it routes through `acceptance_gate_passed_or_record_failure` (`crates/deadreckon-runtime/src/turn_loop.rs:1298`). Both call sites (`turn_loop.rs:359` for JSON Done, `turn_loop.rs:615` for CLI sub-agent Done) use this helper.
+When the turn loop emits `Action::Done` — either through a CLI sub-agent finishing or a JSON-action provider returning `Done` — it routes through `acceptance_gate_passed_or_record_failure` (`crates/deadreckon-runtime/src/turn_loop.rs:1442`). Both call sites (`turn_loop.rs:405` for CLI sub-agent Done, `turn_loop.rs:672` for JSON Done) use this helper.
 
 The helper composes `run_acceptance_gate` (invokes `dr-gate` as a subprocess) and `validate_acceptance_marker` (signature + run_id check):
 
 - **If the gate passes:** the helper returns `true` and the loop continues into `promote_if_ready`.
 - **If the gate fails:** the helper logs `acceptance.failed` to `traces.jsonl`, appends an explicit corrective hint to the run history (`"acceptance failed after turn N: <reason>. Continue by fixing the failing done criteria; do not declare done until dr-gate passes."`), emits a `RunEventKind::Error` event, records the reason in `state.failure_reason`, and **returns `false` — the run does not terminate**.
 
-The agent sees the failure inside the next turn doc and can revise the working tree and re-declare `Done`. Only when the turn budget is exhausted does the run fail; at that point the accumulated reasons in `state.failure_reason` become the final `failure_reason` text (`turn_loop.rs:633`).
+The agent sees the failure inside the next turn doc and can revise the working tree and re-declare `Done`. Only when the turn budget is exhausted does the run fail; at that point the accumulated reasons in `state.failure_reason` become the final `failure_reason` text (`turn_loop.rs:693-695`).
 
 ---
 
@@ -1178,17 +1193,17 @@ One line per file changed by a tool call. Lets `show <run-id>` answer "which pro
 
 ### 14.4 `events.jsonl`
 
-Structured `RunEvent` log: `TurnStarted { turn }`, `ToolCallStarted { tool_call_id, kind }`, `ToolCallResult { tool_call_id, status, latency_ms }`, `RunCompleted { outcome }`. Also published on a `tokio::sync::broadcast` channel (`events.rs`) for in-process subscribers (the TUI uses this when implemented; today the TUI polls files instead — see §22).
+Structured `RunEvent` log: `TurnStarted { turn }`, `ToolCallStarted { tool_call_id, kind }`, `ToolCallResult { tool_call_id, status, latency_ms }`, `RunCompleted { outcome }`. Also published on a `tokio::sync::broadcast` channel (`events.rs`): `emit_event` writes the JSONL line and sends on the channel together. In production, `attach` always reads live events by tailing `events.jsonl` (`TuiEventFeed::file_tail`) — even for same-process runs; the broadcast-receiver path (`TuiEventFeed::from_broadcast`) is `#[cfg(test)]` only. The channel is wired and reserved for a future same-process subscriber (see §18.3).
 
 ---
 
 ## 15. Resume Semantics
 
-`crates/deadreckon/src/main.rs:940-1000` is the `resume_command` handler.
+`crates/deadreckon/src/main.rs:18484` is the `resume_command` handler.
 
 ### 15.1 The Completed guard
 
-`main.rs:947`:
+`main.rs:18493`:
 
 ```rust
 if state.status == RunStatus::Completed {
@@ -1299,7 +1314,7 @@ The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defau
 
 ## 18. TUI (`attach`)
 
-`crates/deadreckon/src/main.rs:874-1289` houses `attach_command` plus the rendering helpers.
+`attach_command` lives at `main.rs:18043`; `attach_tui` / `attach_tui_with_parent` at `main.rs:23560`/`23580`; the layout and collectors follow (`attach_panel_layout`, `collect_acceptance_live`, `collect_provider_activity`). `main.rs` is ~31k lines, so treat these line numbers as approximate locators.
 
 ### 18.1 Behavior
 
@@ -1312,7 +1327,7 @@ The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defau
 
 ### 18.2 Layout
 
-`attach_panel_layout` (`main.rs:~10225`):
+`attach_panel_layout` (`main.rs:24166`):
 
 ```rust
 let vertical = Layout::default()
@@ -1331,7 +1346,7 @@ The top band is split horizontally into three panels for subscription providers 
 - **Header** (short run id, status, phase, provider, sandbox, turn timer, truncated goal, working/artifact path; degrades to an identity strip when live status is unavailable).
 - **Spend meter** only for metered API providers; CLI subscription providers omit cost and emphasize context/wall time.
 - **Context meter**: compact token/window summary with green/yellow/red thresholds.
-- **Acceptance meter**: derived from `AcceptanceLive` (`collect_acceptance_live` in `main.rs:~10172`). When `proofs/acceptance-progress.jsonl` exists, the panel tails it and surfaces `running 2/5`, `passed`, or `failed` with the offending check; once `turn-acceptance.json` is signed, it pivots to a marker view (`acceptance_live_from_marker`). Color thresholds are owned by `acceptance_color`.
+- **Acceptance meter**: derived from `AcceptanceLive` (`collect_acceptance_live` in `main.rs:24615`). When `proofs/acceptance-progress.jsonl` exists, the panel tails it and surfaces `running 2/5`, `passed`, or `failed` with the offending check; once `turn-acceptance.json` is signed, it pivots to a marker view (`acceptance_live_from_marker`). Color thresholds are owned by `acceptance_color`.
 - **Center, left**: wide streaming list of tool calls + provider activity + recent events. Acceptance lines from `acceptance_activity_lines` are interleaved so the operator sees the same progress in the activity stream and the meter.
 - **Narrative view**: `--view narrative` or `n` swaps the center-left activity pane for prose sections under the `Narrated` operator heading: freshness/coverage, headline, current work, architecture notes, risks, next likely action, and citations. Wide terminals split that pane with a right-side visual map; narrow terminals collapse to prose first. Run narratives cite `proofs/acceptance-progress.jsonl` or `proofs/turn-acceptance.json` when acceptance evidence exists, so failed done criteria point at the durable proof artifact. Plain/off-TTY narrative attach prints the same projection with citations and ASCII map lines when `--visual` is not `none`; `--json --view narrative` emits the structured state, snapshot, and graph objects. Non-TTY narrative attach stays deterministic and does not call a provider unless a future explicit refresh surface opts in. Chain narrative attach currently returns an unsupported response with `try:` lines for run and plan narrative attach.
 - **Completed docs view**: pressing `d` toggles the center-left panel from provider activity or narrative view to `RUN-NARRATIVE.md` rendered through `pulldown-cmark` into ratatui `Line`/`Span`s. Headings, bullets, inline code, fenced code blocks, links, task markers, math, and horizontal rules receive terminal styles and remain scrollable. The docs view remains a separate completed-run artifact rather than being merged into the live narrative projection.
@@ -1347,7 +1362,7 @@ Run attach uses `TuiEventFeed` for run events and `AttachJsonlTail` for `spend.j
 
 `collect_provider_activity` resolves provider ingest through descriptor `[ingest]` metadata: candidate roots, env overrides, cwd matching, storage kind, file glob, freshness window, and schema key. `deadreckon import` reuses the same descriptor metadata for provider transcript discovery and adds import-only session selection, manifest writing, and normalized trace/provenance event creation. `cli:codex` reads `~/.codex/sessions/**.jsonl` and matches `session_meta.payload.cwd`; `cli:claude-code` reads `~/.claude/projects/<cwd-slug>/*.jsonl` using Claude Code's path-to-project mapping and matches top-level `cwd`; `cli:gemini` reads Gemini JSON/JSONL file logs; `cli:opencode` reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON; `cli:copilot` reads `~/.copilot/session-state/*.jsonl` plus nested `events.jsonl` and matches `data.context.cwd`; `cli:pi` reads `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`, validates the first nonblank row is a Pi `session`, and matches the header `cwd`. Schema-specific adapters only decode rows into common activity lines (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`) and normalize tool labels through `deadreckon_providers::taxonomy`.
 
-Same-process run attaches can use the `RunEventBus` broadcast channel directly; cross-process run attaches still use durable event replay/tailing. Plan attach consumes `PlanEventBus` / `PlanEventFeed`, which owns `plan-events.jsonl` replay/tailing, emits plan snapshots, tolerates malformed or partial plan-event rows, and multiplexes discovered child and repair run `events.jsonl` streams into the plan activity pane. Chain attach keeps its own `AttachJsonlTail<ChainEvent>` for `chain-events.jsonl`, preserves the existing drill/redo/extend/pause/kill controls, ignores partial last lines until complete, and shows an activity-read hint when chain event catch-up falls behind the tick budget. The production feeds remain durable-file backed for cross-process attach, with broadcast-capable APIs available for same-process streams.
+Production run attaches — same-process and cross-process alike — read run events by tailing `events.jsonl` via `TuiEventFeed::file_tail`; `TuiEventFeed::from_broadcast` is `#[cfg(test)]` only. (The loop's `emit_event` writes the file and sends on the `RunEventBus` channel together, so the file tail stays current; the broadcast path is reserved for a future same-process attach.) Plan attach consumes `PlanEventBus` / `PlanEventFeed`, which owns `plan-events.jsonl` replay/tailing, emits plan snapshots, tolerates malformed or partial plan-event rows, and multiplexes discovered child and repair run `events.jsonl` streams into the plan activity pane. Chain attach keeps its own `AttachJsonlTail<ChainEvent>` for `chain-events.jsonl`, preserves the existing drill/redo/extend/pause/kill controls, ignores partial last lines until complete, and shows an activity-read hint when chain event catch-up falls behind the tick budget. The production feeds remain durable-file backed for cross-process attach, with broadcast-capable APIs available for same-process streams.
 
 ### 18.4 Narrative projection files
 
@@ -1359,7 +1374,7 @@ Narrative attach writes projection files, not source-of-truth state. Run project
 
 Plan projections prefer each child run's latest narrative snapshot when one exists. The plan agent table cites that child snapshot and uses its headline as the child summary, then falls back to child run state when no child narrative exists. Plan graphs also roll up file nodes from child narrative graphs so the plan-level files visual can show cross-agent touched file evidence without copying child logs into `plan-events.jsonl`.
 
-Provider-backed narration is an overlay on these projections. Manual `r` refresh, TTY narrative-view event refreshes, and TTY narrative-view quiet-threshold refreshes build a redacted prompt from the deterministic projection, send only bounded evidence summaries to the selected provider route, validate all returned claims against known evidence ids, reject invented graph ids, and persist a new fresh snapshot only after validation. The default narrator route is `cli:claude-code` with model override `sonnet`, which the Claude Code adapter launches as `claude --model sonnet --dangerously-skip-permissions -p <prompt>`; `--narrative-provider` overrides the route and leaves model selection to that provider/config entry, while `--no-narrative-provider` keeps attach deterministic-only. Event refreshes can bypass the ordinary freshness interval for meaningful deltas, while quiet-threshold refreshes still obey the freshness interval; budget, provider availability, JSON validation, citation validation, graph validation, and redaction guards always apply. If the provider is missing, over budget, behind cadence, returns malformed JSON, cites unknown evidence, emits secret-like text, or fails, attach keeps running and persists a stale deterministic snapshot with the error in `state.json`.
+Provider-backed narration is an overlay on these projections. Manual `r` refresh, TTY narrative-view event refreshes, and TTY narrative-view quiet-threshold refreshes start an asynchronous off-loop job (`tokio::spawn`); each attach tick only polls the job handle non-blockingly, so the render loop never stalls on a provider call. The job builds a redacted prompt from the deterministic projection, sends only bounded evidence summaries to the selected provider route, validates all returned claims against known evidence ids, rejects invented graph ids, and persists a new fresh snapshot only after validation. The default narrator route is `cli:claude-code` with model override `sonnet`, which the Claude Code adapter launches as `claude --model sonnet --dangerously-skip-permissions -p <prompt>`; `--narrative-provider` overrides the route and leaves model selection to that provider/config entry, while `--no-narrative-provider` keeps attach deterministic-only. Event refreshes can bypass the ordinary freshness interval for meaningful deltas, while quiet-threshold refreshes still obey the freshness interval; budget, provider availability, JSON validation, citation validation, graph validation, and redaction guards always apply. If the provider is missing, over budget, behind cadence, returns malformed JSON, cites unknown evidence, emits secret-like text, or fails, attach keeps running and persists a stale deterministic snapshot with the error in `state.json`.
 
 The run and plan narrative panes cache projection objects by coverage and feed signature. Redraws reuse the cached projection, stale provider snapshots survive ordinary frame churn, and render helpers fall back to deterministic projection builders instead of `ensure_*` persistence calls. This is the nonblocking attach contract: provider-backed narrative work may improve the next frame after it finishes, but it never owns the current frame.
 
@@ -1539,7 +1554,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Self-documenting run artifacts in stoa shape: `RUN-NARRATIVE.md`, `RUN-AS-BUILT.md`, `RUN-DECISIONS.md`, optional `AS-BUILT-DELTA.md`, per-turn `_incremental.jsonl`, explicit `docs_checkpoint` run events, and `polish.json` schema v2.
 - `deadreckon doc`, `list` DOCS status, doc-aware `apply` commit bodies, extend-parent narrative updates, diff coverage retry, the legacy repo/user/project `run-narrator` skill mechanism, and default split polish skills (`narrator-overview`, `narrator-phases`, `narrator-as-built`, `narrator-decisions`).
 - Acceptance gate with signed marker; anti-self-attestation actually enforced.
-- `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `show`, `import`, `cleanup`/`prune`, `completion` verbs.
+- `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `rewind`, `show`, `import`, `cleanup`/`prune`, `completion`, `learn`, and `improve` verbs.
 - Shell tab-completion via `completion install` / `completion {bash,zsh,fish,elvish,powershell}` driven from the live clap command tree; `init` opt-out installs completions and (for zsh) appends a managed `.zshrc` block.
 - `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer. Run, plan, and chain attach now share an explicit responsiveness contract: render paths are provider-free and write-free, JSONL streams are tailed or cached, provider narrative refreshes run in cancellable/coalesced background jobs, stale narrative snapshots survive redraw, and long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
 - Descriptor-driven provider activity ingest for Codex, Claude Code, Gemini JSON/JSONL, OpenCode file-mode logs, GitHub Copilot CLI session-state JSONL, and Pi session JSONL, normalized into `agent` / `thinking` / `tool` / `result` / `todo` / `tokens` rows without rewriting provider-owned logs.
@@ -1547,7 +1562,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Streaming acceptance progress: `proofs/acceptance-progress.jsonl` reports per-check `started`/`running`/`passed`/`failed` transitions while `dr-gate` is mid-evaluation; the attach TUI tails it alongside the signed marker.
 - Extended runs carry the parent's `acceptance.yaml` into the child run and emit the same `print_run_started` startup details (provider route, doc-provider source) as fresh runs; resume does the same.
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.
-- Event-backed TUI attach: same-process run attaches use `RunEventBus`; cross-process run attaches replay `events.jsonl` incrementally. Plan attach uses `PlanEventBus` for durable replay/tail plus child/repair event multiplexing, and chain attach tails `chain-events.jsonl` incrementally with partial-line tolerance.
+- Event-backed TUI attach: production run attaches (same- and cross-process) tail `events.jsonl` incrementally via `TuiEventFeed::file_tail` — `TuiEventFeed::from_broadcast` is `#[cfg(test)]` only. Plan attach uses `PlanEventBus` for durable replay/tail plus child/repair event multiplexing, and chain attach tails `chain-events.jsonl` incrementally with partial-line tolerance.
 - Cross-process cancellation: `kill` writes a durable cancel marker before signaling; the run loop observes it while provider calls are in flight and reports killed status through events.
 - Partial-trace resume: resume reconstructs only completed tool boundaries and `resume --from-turn` truncates traces, spend records, and future snapshots together.
 - Durable per-run `sandbox.toml` plus per-tool sandbox policy: bash/write-file paths get specific filesystem and network permissions; refusals include `try:` and are recorded in traces and provenance.
@@ -1559,6 +1574,8 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Autonomous sequential chains: `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`, and `chain redo`; chains use `latest`/`last` aliases, `chain.json`, `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps, green-policy auto-apply, and a multi-step ratatui timeline with single-run chain context.
 - Plan observability: orchestration plans now write `plan-events.jsonl`; `attach <plan-id>` renders plan events, drills into child run attach, and returns to the plan context; plain attach, `history grep --plan`, and `show --why-failed <plan-id>` include plan event evidence.
 - Semantic merge repair: `merge <plan-id>` now defaults to DAG-aware composition, lets descendant tasks supersede ancestor file edits, writes conflict/repair sidecars under `merge-proofs/`, and automatically invokes a repair provider for true parallel conflicts unless `--no-repair` is set.
+- Provider flight recorder & rewind: CLI-backed provider turns record `flight-manifest.json`, `flight-events.jsonl`, and delta `checkpoints/`; `show --flight` / `--file` inspects them and `rewind --to-turn|--to-provider-event|--to-checkpoint` previews or applies a hash-guarded checkpoint restore.
+- Local self-improvement loop: `learn index|report|propose|export|import-bundle` builds a redacted local experience index and provider-backed proposals; `improve self … --preview|--yes|--pr-dry-run|--open-pr` runs evidence-gated self-run candidates with PR opening held behind an explicit evidence gate.
 - Mock HTTP server for tests; CLI provider tests with fake binaries; integration coverage for stress, import round-trips, lifecycle, codebase modes, docs, sandbox policy, and gate proof.
 
 The hygiene rider is purely structural; it does not close prior thin items, but it raises the floor for every future rider.
@@ -1746,7 +1763,7 @@ When `deadreckon apply` builds the default squash or merge message, it reads `RU
 
 ### 25.10 Cost And Idempotency
 
-`polish.json` stores a SHA-256 inputs hash over goal, traces, provenance, spend, incremental records, changed files, and source AS-BUILT content. Schema v2 records `doc_provider_source`, `subcalls[]` with skill/status/provider/tokens/cost/duration/retries, `merged_at`, and `diff_coverage`. A matching polished hash skips duplicate provider calls unless forced. CLI subscription providers report wall time rather than USD cost, but the doc-provider resolver still records whether the route came from a flag, config, auto-detected subscription CLI, run provider fallback, or no provider.
+`polish.json` stores a SHA-256 inputs hash over goal, traces, provenance, spend, incremental records, changed files, and source AS-BUILT content. Split-subcall paths write schema v2, recording `doc_provider_source`, `subcalls[]` with skill/status/provider/tokens/cost/duration/retries, `merged_at`, and `diff_coverage`; the legacy single-call path writes schema v1. A matching polished hash skips duplicate provider calls unless forced. CLI subscription providers report wall time rather than USD cost, but the doc-provider resolver still records whether the route came from a flag, config, auto-detected subscription CLI, run provider fallback, or no provider.
 
 ### 25.11 Skill Split Into Four Subskills
 
@@ -1810,7 +1827,7 @@ The user-facing skip model is split by timing. `--yes` belongs to preflight prev
 
 ### 26.7 TUI Palette And Parity
 
-`ui::TUI_PALETTE` names the shared TUI color slots for focused borders, acceptance states, run states, and spend thresholds. The chain attach poll cadence matches the run TUI at 200 ms. Applied chain steps render `◉`, so applied and running no longer share `●`. The spend gauge keeps the green, yellow, red, and cap-paused magenta thresholds; above 60 percent, the title exposes the budget percentage so the label remains readable at narrow widths.
+`ui::TUI_PALETTE` names the shared TUI color slots for focused borders, acceptance states, run states, and spend thresholds. The chain attach poll cadence matches the run TUI at 200 ms (`event::poll` timeout); the plan TUI uses 250 ms. Applied chain steps render `◉`, so applied and running no longer share `●`. The spend gauge keeps the green, yellow, red, and cap-paused magenta thresholds; above 60 percent, the title exposes the budget percentage so the label remains readable at narrow widths.
 
 ### 26.8 Provider And Failure Vocabulary
 
@@ -1842,7 +1859,7 @@ Mass renaming stored enum variants, themable palettes, localization hooks, a ful
 
 `deadreckon run --prevent-sleep <auto|on|off>` defaults through `[defaults].prevent_sleep`. `auto` arms only for interactive runs; `on` forces a platform attempt; `off` skips. macOS launches `caffeinate -di` for the run-loop lifetime. Linux re-execs under `systemd-inhibit` with a trusted tmpdir ready-file handshake before run state is created, then writes run-local metadata from the inhibited child. Windows reports unsupported and remains a V1 candidate.
 
-Sleep state is file-based, not a `PipelineState` field: `working/.deadreckon/sleep-prevention.json` records mode, pid, binary, arm time, reason, and skip reason. The RAII handle removes the file and reaps the inhibitor on drop.
+Sleep state is file-based, not a `PipelineState` field: `working/.deadreckon/sleep-prevention.json` records `mode`, `pid`, `armed_at`, `inhibitor_binary`, `reason`, and `skip_reason`. The RAII handle removes the file and reaps the inhibitor on drop.
 
 ### 27.3 Unattended-Git Hardening
 
@@ -2012,7 +2029,7 @@ At launch time the coordinator rewrites the spec for dependent tasks with comple
 
 ### 30.4 Merge Artifact
 
-Merge creates a normal promoted run so existing `materialize`, `library`, and run inspection paths keep working. Plan ids resolve through the same prefix-matching path as run ids, so `apply <plan-id>`, `finish <plan-id>`, `export <plan-id>`, and `materialize <plan-id>` all accept either a full plan id or an unambiguous prefix and route through `resolve_plan_result_run` (`main.rs:12508`) onto the merged promoted run. `apply <plan-id>` lands the merged tree on the source branch (with `--autostash` / `--cleanup` honored exactly as for normal runs); `finish <plan-id>` picks `apply` for git worktrees and `export` for non-git sources; `export <plan-id> --dest <path>` writes the merged library to disk. The promoted library also gets `deadreckon-plan-manifest.json` with plan id, root goal, mode, provider roles, capability preview, task graph, child run ids, summary paths, coordinator message counts, and recorded conflicts.
+Merge creates a normal promoted run so existing `materialize`, `library`, and run inspection paths keep working. Plan ids resolve through the same prefix-matching path as run ids, so `apply <plan-id>`, `finish <plan-id>`, `export <plan-id>`, and `materialize <plan-id>` all accept either a full plan id or an unambiguous prefix and route through `resolve_plan_result_run` (`main.rs:10788`) onto the merged promoted run. `apply <plan-id>` lands the merged tree on the source branch (with `--autostash` / `--cleanup` honored exactly as for normal runs); `finish <plan-id>` picks `apply` for git worktrees and `export` for non-git sources; `export <plan-id> --dest <path>` writes the merged library to disk. The promoted library also gets `deadreckon-plan-manifest.json` with plan id, root goal, mode, provider roles, capability preview, task graph, child run ids, summary paths, coordinator message counts, and recorded conflicts.
 
 Conflict bundles are versioned JSON objects. `conflicts.json` records the strategy, conflict path, child indexes, task ids, run ids, artifact roots, artifact file paths, content hashes, and dependency edges. `repair-request.json` adds root goal, task graph, worker-spec paths, child summary paths, recent plan events, and `merge-working` so the planner can decide without reading sibling transcripts. `repair-plan.json` stores the validated provider decision and rationale. If the planner chooses a repair child, `repair-run.json` stores the normal run id/scope/status, and the repaired promoted library is copied back into `merge-working` before the final plan merge run is created.
 
@@ -2162,4 +2179,4 @@ Learning is local-first. No cloud sync, background telemetry, raw provider logs,
 
 ---
 
-*This document is canonical for the alpha-tier reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, and 32 in particular. Last regenerated by an agent team from a deep code map; cross-check against the current code before relying on any specific line number.*
+*This document is canonical for the alpha-tier reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, and 32 in particular. Last verified 2026-05-26 by an agent team auditing each section against the current source. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~31k lines) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

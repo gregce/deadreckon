@@ -89,7 +89,7 @@ Every turn writes state, traces, spend, file provenance, and a working-directory
 deadreckon attach latest
 ```
 
-The TUI shows live status, current step, spend, recent file edits, and provider activity. Completed runs render `RUN-NARRATIVE.md` inline. Press `Ctrl-D` to detach without killing the run.
+The TUI shows live status, current step, spend, recent file edits, and provider activity. For a completed run, press `d` to toggle an in-TUI docs view that renders `RUN-NARRATIVE.md`. Press `Ctrl-D` to detach without killing the run.
 
 For longer or multi-agent work, use `deadreckon attach latest --view narrative` for a cited operator overview with an evidence-backed visual map. Raw activity stays one key away with `n`; `v` cycles architecture, agent, file, and evidence views.
 
@@ -364,6 +364,25 @@ import        normalize histories from other coding tools
 doctor        check config, providers, sandboxes, disk, runtime
 ```
 
+Multi-agent, evidence, and self-improvement:
+
+```text
+def-done      compile English "done" criteria into checks
+chain         plan and run ordered multi-step work
+orchestrate   one-command review / full-plan multi-agent runs
+plan          write an orchestration plan (no child runs yet)
+fork          start a plan's ready child runs
+merge         compose plan children into one promoted artifact
+rewind        preview or apply a provider flight checkpoint
+history       search durable traces and provenance
+library       query promoted run artifacts
+providers     list provider routes (detect probes availability)
+update        check for or apply self-updates
+learn         index run evidence and propose improvements
+improve       run evidence-gated self-improvement candidates
+completion    install shell tab-completion
+```
+
 Aliases: `keep` → `apply`, `materialize` → `export`, `discard` → `abandon`, `prune` → `cleanup`, `follow-up` → `extend`, `continue` → `resume`, `stop` → `kill`, `next` → `status`.
 
 ## Verification
@@ -387,13 +406,9 @@ The workspace test suite covers provider routing, mock OpenAI-compatible runs, C
 
 ## Status
 
-deadreckon is alpha software. The core lifecycle (isolated runs, signed gates, durable state, undo, docs, and apply) is implemented and tested.
+deadreckon is alpha software. The core lifecycle (isolated runs, signed gates, durable state, undo, docs, and apply) is implemented and tested — alongside multi-agent orchestration (`plan` / `fork` / `merge`), autonomous chains, the provider flight recorder with `rewind`, and a local self-improvement loop (`learn` / `improve`).
 
-The V1 candidate list is deliberately short. The next big feature is explicit sub-agent forking:
-
-```text
-deadreckon fork <run-id> --prompt "..."
-```
+A note on `fork`: `deadreckon fork <plan-id>` already ships — it launches the ready worker tasks of an orchestration plan. The still-unbuilt capability is ad-hoc, run-level sub-agent forking (`deadreckon fork <run-id> --prompt "..."`) that spawns a child agent from any run with a fresh prompt. Remaining deferred work is tracked in [docs/V1-CANDIDATES.md](docs/V1-CANDIDATES.md).
 
 ## Documentation
 
