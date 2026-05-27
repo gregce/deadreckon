@@ -888,6 +888,10 @@ pub(crate) enum Commands {
         coder_provider: Option<String>,
         #[arg(long, help = "Reviewer provider route override for review mode")]
         reviewer_provider: Option<String>,
+        #[arg(long, help = "Debug only: disable automatic dependency merge repair")]
+        no_repair: bool,
+        #[arg(long, help = "Repair provider route for dependency merge repair")]
+        repair_provider: Option<String>,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
         #[arg(long, help = "Suppress success chatter and post-action hints")]
@@ -2204,6 +2208,8 @@ pub(crate) struct ForkCommandArgs {
     pub(crate) child_provider: Vec<String>,
     pub(crate) coder_provider: Option<String>,
     pub(crate) reviewer_provider: Option<String>,
+    pub(crate) no_repair: bool,
+    pub(crate) repair_provider: Option<String>,
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
     pub(crate) plain: bool,

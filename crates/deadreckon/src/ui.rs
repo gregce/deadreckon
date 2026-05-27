@@ -81,10 +81,7 @@ pub(crate) fn enabled(stream: Stream) -> bool {
     if std::env::var("TERM").is_ok_and(|term| term == "dumb") {
         return false;
     }
-    match stream {
-        Stream::Stdout => io::stdout().is_terminal(),
-        Stream::Stderr => io::stderr().is_terminal(),
-    }
+    stream_is_terminal(stream)
 }
 
 pub(crate) fn render(stream: Stream, tone: Tone, text: impl AsRef<str>) -> String {
@@ -268,6 +265,9 @@ where
 }
 
 pub(crate) fn clear_current_line(stream: Stream) -> io::Result<()> {
+    if !stream_is_terminal(stream) {
+        return Ok(());
+    }
     match stream {
         Stream::Stdout => {
             print!("\r\x1b[K");
@@ -281,16 +281,74 @@ pub(crate) fn clear_current_line(stream: Stream) -> io::Result<()> {
 }
 
 pub(crate) fn replace_current_line(stream: Stream, text: impl AsRef<str>) -> io::Result<()> {
+    if !stream_is_terminal(stream) {
+        return Ok(());
+    }
+    let text = replacement_line_text(text.as_ref(), current_terminal_width());
     match stream {
         Stream::Stdout => {
-            print!("\r{}\x1b[K", text.as_ref());
+            print!("\r{text}\x1b[K");
             io::stdout().flush()
         }
         Stream::Stderr => {
-            eprint!("\r{}\x1b[K", text.as_ref());
+            eprint!("\r{text}\x1b[K");
             io::stderr().flush()
         }
     }
+}
+
+fn stream_is_terminal(stream: Stream) -> bool {
+    match stream {
+        Stream::Stdout => io::stdout().is_terminal(),
+        Stream::Stderr => io::stderr().is_terminal(),
+    }
+}
+
+fn current_terminal_width() -> usize {
+    crossterm::terminal::size()
+        .ok()
+        .map(|(columns, _)| usize::from(columns))
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|columns| columns.parse::<usize>().ok())
+        })
+        .filter(|columns| *columns > 0)
+        .unwrap_or(120)
+}
+
+fn replacement_line_text(text: &str, terminal_width: usize) -> String {
+    let visible_limit = terminal_width.saturating_sub(1);
+    truncate_visible_single_line(text, visible_limit)
+}
+
+fn truncate_visible_single_line(text: &str, max_visible: usize) -> String {
+    if max_visible == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(text.len().min(max_visible));
+    let mut chars = text.chars().peekable();
+    let mut visible = 0usize;
+    let mut style_active = false;
+    while let Some(ch) = chars.next() {
+        if let Some((sequence, active)) = read_ansi_sequence(ch, &mut chars) {
+            style_active = active;
+            out.push_str(&sequence);
+            continue;
+        }
+        if visible >= max_visible {
+            break;
+        }
+        match ch {
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(ch),
+        }
+        visible += 1;
+    }
+    if style_active {
+        out.push_str(ANSI_RESET);
+    }
+    out
 }
 
 fn tone_code(tone: Tone) -> Option<&'static str> {
@@ -312,7 +370,7 @@ fn tone_code(tone: Tone) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tone, status_tone};
+    use super::{Tone, replacement_line_text, status_tone, strip_ansi};
 
     #[test]
     fn status_tone_maps_known_lifecycle_words() {
@@ -327,5 +385,31 @@ mod tests {
         assert_eq!(status_tone("note"), Tone::Note);
         assert_eq!(status_tone("warning"), Tone::Warn);
         assert_eq!(status_tone("unknown"), Tone::Note);
+    }
+
+    #[test]
+    fn replacement_line_stays_one_column_short_of_terminal_width() {
+        let line = replacement_line_text(
+            "\x1b[1;36mdeadreckoning\x1b[0m plan 4b4fdc93 running; done=1/4 running=task-1:f0c66203,task-2:f63cbe05 pending=1 failed=0; attach deadreckon attach 4b4fdc93",
+            40,
+        );
+
+        assert_eq!(strip_ansi(&line).chars().count(), 39);
+        assert!(line.contains("\x1b[0m"));
+    }
+
+    #[test]
+    fn replacement_line_resets_truncated_active_style() {
+        let line = replacement_line_text("\x1b[1;36mdeadreckoning plan is still running", 18);
+
+        assert_eq!(strip_ansi(&line).chars().count(), 17);
+        assert!(line.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn replacement_line_collapses_newlines_before_printing() {
+        let line = replacement_line_text("first\nsecond\rthird", 80);
+
+        assert_eq!(line, "first second third");
     }
 }

@@ -2562,10 +2562,14 @@ fn full_plan_multi_dependency_conflict_fails_before_launching_child() {
         temp.path(),
         "cli:conflicting-source-chain",
         r#"
-case "$1" in
-  *"Task: task-0"*)
-    printf 'from task 0\n' > shared.txt
-    ;;
+	case "$1" in
+	  *"read-only merge repair planner"*)
+	    printf 'repair planner should not be called\n' >&2
+	    exit 45
+	    ;;
+	  *"Task: task-0"*)
+	    printf 'from task 0\n' > shared.txt
+	    ;;
   *"Task: task-1"*)
     printf 'from task 1\n' > shared.txt
     ;;
@@ -2603,7 +2607,14 @@ printf 'done\n'
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
-        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--quiet"])
+        .args([
+            "fork",
+            &plan.plan_id[..8],
+            "--sandbox",
+            "none",
+            "--no-repair",
+            "--quiet",
+        ])
         .output()
         .expect("fork");
     assert_success(&output);
@@ -2617,6 +2628,108 @@ printf 'done\n'
         &event.event,
         PlanEventKind::TaskFailed { task_id, reason, .. }
             if task_id == "task-2" && reason.contains("dependency source conflict")
+    )));
+}
+
+#[test]
+fn full_plan_multi_dependency_conflict_repairs_before_launching_child() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_fake_cli_subagent_provider(
+        &paths,
+        temp.path(),
+        "cli:repairing-source-chain",
+        r#"
+case "$1" in
+  *"read-only merge repair planner"*)
+    printf '{"decision":"synthesize","rationale":"combine sibling dependency outputs","actions":[{"path":"shared.txt","action":"write_synthesized","content":"merged dependency\\n","preserve":["task-0 shared output","task-1 shared output"]}]}'
+    ;;
+  *"Task: task-2"*)
+    test "$(cat shared.txt)" = "merged dependency" || {
+      printf 'unexpected shared content: %s\n' "$(cat shared.txt)" >&2
+      exit 46
+    }
+    printf 'task 2 saw repaired dependency\n' > saw-repaired.txt
+    ;;
+  *"Task: task-0"*)
+    printf 'from task 0\n' > shared.txt
+    ;;
+  *"Task: task-1"*)
+    printf 'from task 1\n' > shared.txt
+    ;;
+  *)
+    printf 'unknown task prompt\n' >&2
+    exit 44
+    ;;
+esac
+printf 'done\n'
+"#,
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "conflicting source chaining example",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "cli:repairing-source-chain",
+            "--n",
+            "3",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.tasks[2].depends_on = vec![plan.tasks[0].task_id.clone(), plan.tasks[1].task_id.clone()];
+    save_plan(&paths, &plan).expect("save dependency");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "fork",
+            &plan.plan_id[..8],
+            "--sandbox",
+            "none",
+            "--repair-provider",
+            "cli:repairing-source-chain",
+            "--quiet",
+        ])
+        .output()
+        .expect("fork");
+    assert_success(&output);
+
+    let plan = load_plan(&paths, &plan.plan_id).expect("forked plan");
+    assert_eq!(plan.status, PlanStatus::Forked);
+    assert_eq!(plan.tasks[2].status, PlanTaskStatus::Completed);
+    let task_2_run = plan.tasks[2].child_run_id.as_deref().expect("task 2 run");
+    let task_2_state = deadreckon_core::load_run(&paths, task_2_run).expect("task 2 state");
+    let task_2_library = paths.library_dir(&task_2_state.scope, &task_2_state.run_id);
+    assert_eq!(
+        fs::read_to_string(task_2_library.join("shared.txt")).expect("shared"),
+        "merged dependency\n"
+    );
+    assert!(
+        task_2_library.join("saw-repaired.txt").is_file(),
+        "{}",
+        task_2_library.display()
+    );
+    assert!(
+        paths
+            .plan_dir(&plan.plan_id)
+            .join("launch")
+            .join(&plan.tasks[2].task_id)
+            .join("merge-proofs")
+            .join("repair-plan.json")
+            .is_file()
+    );
+    let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        PlanEventKind::MergeRepaired { strategy, .. } if strategy == "dependency-synthesize"
     )));
 }
 
