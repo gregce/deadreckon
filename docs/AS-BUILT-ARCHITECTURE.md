@@ -1447,26 +1447,31 @@ Three credential paths:
 
 ### 20.1 Test locations
 
-- `crates/deadreckon-providers/tests/cli_providers.rs` (297 lines) — CLI provider routing, fake `claude`/`codex` binaries, output capture, spend.
-- `crates/deadreckon-providers/tests/mock_server.rs` (220 lines) — axum-based OpenAI-compatible mock for HTTP provider tests.
-- `crates/deadreckon-providers/src/lib.rs` (inline) and focused module tests — config parsing, spend math, credential check, smoke determinism.
-- `crates/deadreckon/tests/agentic_loop.rs` (841 lines) — end-to-end: run, kill, resume, list, attach, import, doctor, stress.
+Tests span four `tests/` directories plus inline module tests (~34 integration test files):
+
+- **`deadreckon-core/tests/`** — `git_hardening.rs`, `install_receipt.rs`, `spend_summary.rs`, `update_cache.rs`.
+- **`deadreckon-providers/tests/`** — `cli_providers.rs` (CLI provider routing, fake `claude`/`codex` binaries, output capture, spend), `mock_server.rs` (axum-based OpenAI-compatible mock for HTTP provider tests), `registry.rs` (provider registry + descriptors). Inline module tests cover config parsing, spend math, credential checks, and smoke determinism.
+- **`deadreckon/tests/`** — `agentic_loop.rs` (~2170 lines; end-to-end run/kill/resume/list/attach/import/doctor + acceptance-gate cycling), plus `attach_inline_card.rs`, `audit_harden.rs`, `cards_{exit_summary,friendliness,preview,status}.rs`, `chain.rs`, `codebase.rs`, `coherence.rs`, `detect.rs`, `doc_depth.rs`, `hygiene_config.rs`, `learning_cli.rs`, `lifecycle.rs`, `narrative_attach.rs`, `npm_wrapper.rs`, `orchestrate.rs`, `providers_list.rs`, `public_surface.rs`, `release_plan.rs`, `self_documenting.rs`, `sleep_{linux,macos}.rs`, `smoke_invariant.rs`, `ui_card.rs`, `update_cli.rs`.
+- **Top-level `tests/`** — workspace-wide guards: `hygiene_config.rs`, `public_surface.rs`, `smoke_invariant.rs`.
 
 ### 20.2 Notable integration tests
 
-| Test (in `agentic_loop.rs`) | What it proves |
+| Test (in `agentic_loop.rs` unless noted) | What it proves |
 |---|---|
-| `mock_provider_records_three_turns_and_artifacts_match` (line 19) | mock-driven run produces 3 turns, ≥ 5 trace lines, 3 spend lines, signed acceptance marker, working files |
-| `kill_mid_turn_sets_killed_and_stops_process` (line 65) | kill interrupts within 2 s, sets `Killed` |
-| `resume_preserves_history_file` (line 103) | resume preserves `history.json` tool_call_ids |
-| `cli_subagent_without_file_changes_fails_run` (line 134) | CLI provider with no file effects → `Failed` |
-| `init_config_and_default_spend_work` (line 180) | `init` writes config; `config get/set` works; `--smoke` respects defaults |
-| `high_spend_requires_confirmation_flag_in_scripts` (line 246) | `--max-spend 51` without `--i-know-its-a-lot` fails with a hint |
-| `cli_wall_clock_budget_enforced` (line 266) | subscription run pauses at `--max-wall-seconds` cap |
-| `kill_storm_no_leaks` (line 334) | 10 concurrent kills release all PIDs + locks |
-| `doctor_fails_actionably` (line 408) | `doctor` output contains specific fix commands |
-| `import_*` focused cases (lines 425+) | descriptor-backed import normalizes CLI/Cursor histories, writes manifests, refuses ambiguous/changed imports, and preserves preview/list no-write behavior |
-| `stress_5_concurrent_10min` (line 470, gated `DEADRECKON_STRESS=1`) | 5 concurrent scoped runs complete cleanly |
+| `mock_provider_records_three_turns_and_artifacts_match` | mock-driven run produces 3 turns, ≥ 5 trace lines, 3 spend lines, signed acceptance marker, working files |
+| `kill_run_across_processes_terminates_in_5s` | cross-process `kill` interrupts within 5 s and sets `Killed` |
+| `kill_during_http_streaming_aborts_request` | `kill` aborts an in-flight HTTP provider stream |
+| `resume_preserves_history_file` | resume preserves `history.json` tool_call_ids |
+| `cli_subagent_without_file_changes_fails_run` | CLI provider with no file effects → `Failed` |
+| `acceptance_failure_restarts_cli_subagent_until_gate_passes` | gate failure loops the agent until the gate passes |
+| `acceptance_failure_exhaustion_persists_failed_state` | gate exhaustion leaves a persisted `Failed` state |
+| `init_config_and_default_spend_work` | `init` writes config; `config get/set` works; `--smoke` respects defaults |
+| `high_spend_requires_confirmation_flag_in_scripts` | `--max-spend 51` without `--i-know-its-a-lot` fails with a hint |
+| `cli_wall_clock_budget_enforced` | subscription run pauses at `--max-wall-seconds` cap |
+| `kill_storm_no_leaks` | concurrent kills release all PIDs + locks |
+| `doctor_fails_actionably` | `doctor` output contains specific fix commands |
+| `import_*` focused cases | descriptor-backed import normalizes CLI/Cursor histories, writes manifests, refuses ambiguous/changed imports, round-trips to goldens, and preserves preview/list no-write behavior |
+| stress run (gated by `DEADRECKON_STRESS=1`, via `make stress`) | concurrent scoped runs complete cleanly |
 
 ### 20.3 Verification gates
 
@@ -1601,6 +1606,10 @@ The codebase-mode rider adds capability; it does not close the robust-rider thin
 - **Acceptance marker** — a signed JSON file (`proofs/turn-acceptance.json`) written by `dr-gate`. Its signature is tied to a per-run nonce only `dr-gate` reads.
 - **Spend** — a record of LLM cost per turn. USD for HTTP providers; wall-clock seconds + `subscription: true` for CLI providers.
 - **Provenance** — per-file attribution: which `tool_call_id` produced which file in which turn under which model.
+- **Trace** — every LLM call and every tool dispatch, with latency + structured detail.
+- **CLI sub-agent** — a `cli:*` provider whose `complete()` invocation is one whole turn (the sub-agent does its own tool calls inside). Detected by `response.trace["kind"] == "cli_subagent"`.
+- **dr-gate** — the standalone binary at `crates/deadreckon/src/bin/dr-gate.rs` that owns acceptance verification. The agent cannot impersonate it.
+- **BYOK** — Bring Your Own Key. In deadreckon this extends to subscriptions: a Claude Max or ChatGPT Pro user can drive deadreckon via `cli:*` providers without an API key.
 
 ---
 
@@ -1913,11 +1922,6 @@ Supported hooks are `pre-step`, `post-step`, `on-promote`, and `on-chain-end`. P
 ### 28.12 Not Yet Built
 
 Out of scope for this alpha pass: mid-chain provider replanning, parallel/DAG steps inside one chain, cross-machine handoff, cloud sync, and a richer conflict-resolution UI. Those remain V1 candidates.
-
-- **Trace** — every LLM call and every tool dispatch, with latency + structured detail.
-- **CLI sub-agent** — a `cli:*` provider whose `complete()` invocation is one whole turn (the sub-agent does its own tool calls inside). Detected by `response.trace["kind"] == "cli_subagent"`.
-- **dr-gate** — the standalone binary at `crates/deadreckon/src/bin/dr-gate.rs` that owns acceptance verification. The agent cannot impersonate it.
-- **BYOK** — Bring Your Own Key. In deadreckon this extends to subscriptions: a Claude Max or ChatGPT Pro user can drive deadreckon via `cli:*` providers without an API key.
 
 ---
 
