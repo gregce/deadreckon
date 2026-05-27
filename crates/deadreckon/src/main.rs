@@ -2450,52 +2450,49 @@ fn resolve_start_setup(
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
-    match prompter {
-        Some(prompter) => {
-            resolve_start_provider(decision, &paths, &defaults, Some(&mut *prompter))?;
-            if decision.recovery.is_some() {
-                return Ok(());
-            }
-            let cwd = std::env::current_dir()?;
-            resolve_start_done_criteria(decision, &cwd, Some(&mut *prompter))?;
-            if decision.recovery.is_none() {
-                resolve_start_source_mode(
-                    decision,
-                    &paths,
-                    &cwd,
-                    Some(&mut *prompter),
-                    StartSourceModeRequest {
-                        fresh: args.fresh,
-                        worktree: args.worktree,
-                        from: args.from.as_deref(),
-                        allow_dirty: args.allow_dirty,
-                        stdin_is_tty,
-                    },
-                )?;
-            }
+    if let Some(prompter) = prompter {
+        resolve_start_provider(decision, &paths, &defaults, Some(&mut *prompter))?;
+        if decision.recovery.is_some() {
+            return Ok(());
         }
-        None => {
-            resolve_start_provider(decision, &paths, &defaults, None)?;
-            if decision.recovery.is_some() {
-                return Ok(());
-            }
-            let cwd = std::env::current_dir()?;
-            resolve_start_done_criteria(decision, &cwd, None)?;
-            if decision.recovery.is_none() {
-                resolve_start_source_mode(
-                    decision,
-                    &paths,
-                    &cwd,
-                    None,
-                    StartSourceModeRequest {
-                        fresh: args.fresh,
-                        worktree: args.worktree,
-                        from: args.from.as_deref(),
-                        allow_dirty: args.allow_dirty,
-                        stdin_is_tty,
-                    },
-                )?;
-            }
+        let cwd = std::env::current_dir()?;
+        resolve_start_done_criteria(decision, &cwd, Some(&mut *prompter))?;
+        if decision.recovery.is_none() {
+            resolve_start_source_mode(
+                decision,
+                &paths,
+                &cwd,
+                Some(&mut *prompter),
+                StartSourceModeRequest {
+                    fresh: args.fresh,
+                    worktree: args.worktree,
+                    from: args.from.as_deref(),
+                    allow_dirty: args.allow_dirty,
+                    stdin_is_tty,
+                },
+            )?;
+        }
+    } else {
+        resolve_start_provider(decision, &paths, &defaults, None)?;
+        if decision.recovery.is_some() {
+            return Ok(());
+        }
+        let cwd = std::env::current_dir()?;
+        resolve_start_done_criteria(decision, &cwd, None)?;
+        if decision.recovery.is_none() {
+            resolve_start_source_mode(
+                decision,
+                &paths,
+                &cwd,
+                None,
+                StartSourceModeRequest {
+                    fresh: args.fresh,
+                    worktree: args.worktree,
+                    from: args.from.as_deref(),
+                    allow_dirty: args.allow_dirty,
+                    stdin_is_tty,
+                },
+            )?;
         }
     }
     Ok(())

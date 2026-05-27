@@ -459,13 +459,15 @@ pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         DeadreckonError::InvalidInput(format!("path has no parent: {}", path.display()))
     })?;
     fs::create_dir_all(parent).with_path(parent)?;
+    let mut line = Vec::new();
+    serde_json::to_writer(&mut line, value).with_json_path(path)?;
+    line.push(b'\n');
     let mut file = File::options()
         .create(true)
         .append(true)
         .open(path)
         .with_path(path)?;
-    serde_json::to_writer(&mut file, value).with_json_path(path)?;
-    file.write_all(b"\n").with_path(path)?;
+    file.write_all(&line).with_path(path)?;
     file.sync_all().with_path(path)
 }
 
