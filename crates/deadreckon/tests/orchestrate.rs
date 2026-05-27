@@ -491,6 +491,110 @@ fn start_dirty_git_reuses_allow_dirty_guidance() {
 }
 
 #[test]
+fn start_run_preview_creates_no_state() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "preview run dispatch",
+            "--mode",
+            "run",
+            "--preview",
+        ])
+        .output()
+        .expect("start run preview");
+
+    assert_success(&output);
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
+fn start_review_preview_creates_no_plan_state() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "preview review dispatch",
+            "--mode",
+            "review",
+            "--preview",
+        ])
+        .output()
+        .expect("start review preview");
+
+    assert_success(&output);
+    assert_eq!(saved_plan_count(&paths), 0);
+}
+
+#[test]
+fn start_dispatches_explicit_run_to_run() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "run through guided start",
+            "--mode",
+            "run",
+            "--yes",
+            "--quiet",
+            "--plain",
+        ])
+        .output()
+        .expect("start run dispatch");
+
+    assert_success(&output);
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.goal, "run through guided start");
+}
+
+#[test]
+fn start_dispatches_explicit_review_to_orchestrate() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "review through guided start",
+            "--mode",
+            "review",
+            "--yes",
+            "--quiet",
+            "--plain",
+        ])
+        .output()
+        .expect("start review dispatch");
+
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.root_goal, "review through guided start");
+    assert_eq!(plan.mode, PlanMode::Review);
+}
+
+#[test]
 fn run_preview_uses_same_done_and_workspace_labels() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -5203,6 +5307,10 @@ fn write_start_ready_setup(paths: &DeadreckonPaths, root: &std::path::Path) {
         "name: start ready\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
     )
     .expect("acceptance");
+    if root.join(".git").is_dir() {
+        git(root, &["add", ".deadreckon/acceptance.yaml"]).expect("add acceptance");
+        git(root, &["commit", "-m", "add acceptance"]).expect("commit acceptance");
+    }
 }
 
 fn deadreckon_pty(

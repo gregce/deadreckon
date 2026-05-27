@@ -2340,11 +2340,92 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
     if let Some(recovery) = decision.recovery.as_ref() {
         return Err(start_recovery_error(recovery));
     }
-    Err(CliError::Exit {
-        code: 1,
-        message: "guided start launch decisions are not wired yet".to_string(),
-        hint: "try: deadreckon run \"build the app\"".to_string(),
-    })
+    dispatch_start_command(args, &decision).await
+}
+
+async fn dispatch_start_command(
+    args: StartCommandArgs,
+    decision: &StartLaunchDecision,
+) -> Result<()> {
+    match decision.selected_mode {
+        StartSelectedMode::Run => {
+            run_command(RunCommandArgs {
+                goal: args.goal,
+                fresh: args.fresh,
+                worktree: args.worktree,
+                from: args.from,
+                in_place: false,
+                base: None,
+                branch: None,
+                allow_dirty: args.allow_dirty,
+                init_git: false,
+                yes: args.yes,
+                preview: false,
+                brief: false,
+                plain: args.plain,
+                prevent_sleep: None,
+                quiet: args.quiet,
+                max_spend: None,
+                max_wall_seconds: None,
+                sandbox: None,
+                provider: None,
+                model: None,
+                doc_provider: None,
+                acceptance: None,
+                skill: "deadreckon".to_string(),
+                smoke: false,
+                i_know_its_a_lot: false,
+                no_confirm: args.yes || args.quiet,
+                no_hints: args.quiet,
+                no_docs: false,
+                doc_skill: None,
+            })
+            .await
+        }
+        StartSelectedMode::Review | StartSelectedMode::FullPlan => {
+            if start_source_flags_present(&args) {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "source mode flags are only supported by start --mode run in this alpha",
+                    "omit source flags or use deadreckon run directly",
+                )));
+            }
+            let mode = match decision.selected_mode {
+                StartSelectedMode::Run => unreachable!("run handled above"),
+                StartSelectedMode::Review => CliPlanMode::Review,
+                StartSelectedMode::FullPlan => CliPlanMode::FullPlan,
+            };
+            orchestrate_command(OrchestrateRunArgs {
+                plan: PlanCommandArgs {
+                    goal: args.goal,
+                    n: recommend_child_count_for_goal(&decision.goal, mode),
+                    mode,
+                    max_spend: None,
+                    max_wall_seconds: None,
+                    sandbox: None,
+                    planner_provider: None,
+                    provider: None,
+                    child_provider: Vec::new(),
+                    coder_provider: None,
+                    reviewer_provider: None,
+                    init_git: false,
+                    acceptance: None,
+                    skip_acceptance_prompt: args.yes || args.quiet,
+                    no_hints: args.quiet,
+                    quiet: args.quiet,
+                    json: false,
+                    plain: args.plain,
+                },
+                preview: false,
+                yes: args.yes || args.quiet,
+                no_repair: false,
+            })
+            .await
+        }
+    }
+}
+
+fn start_source_flags_present(args: &StartCommandArgs) -> bool {
+    args.fresh || args.worktree || args.from.is_some() || args.allow_dirty
 }
 
 fn setup_refusal_error(refusal: setup::SetupRefusal) -> CliError {
