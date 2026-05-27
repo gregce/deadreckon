@@ -22649,6 +22649,7 @@ async fn attach_plan_tui(
     let mut narrative_notice = None;
     let mut quiet_tracker = NarrativeQuietRefreshTracker::new(Utc::now());
     let mut narrative_refresh_job: Option<AttachPlanNarrativeRefreshJob> = None;
+    let mut narrative_projection_cache = AttachNarrativeProjectionCache::default();
 
     let result = loop {
         let mut tick = AttachTickTiming::new(AttachSurface::Plan, AttachTickBudget::default());
@@ -22683,6 +22684,7 @@ async fn attach_plan_tui(
         messages = read_plan_messages(paths, plan_id).unwrap_or_default();
         tick.record_since(AttachLoopStage::PlanMessages, stage_started);
         if let Some(notice) = poll_plan_narrative_refresh_job(&mut narrative_refresh_job).await {
+            narrative_projection_cache.invalidate();
             narrative_notice = Some(notice);
         }
         if selected >= plan.tasks.len() {
@@ -22719,6 +22721,22 @@ async fn attach_plan_tui(
             ));
             tick.record_since(AttachLoopStage::ProviderNarrativeRefresh, stage_started);
         }
+        let narrative_projection = if view.is_narrative() {
+            let input = narrative::PlanNarrativeInput {
+                paths,
+                plan: &plan,
+                messages: &messages,
+                plan_events: &plan_events,
+                feed_events: &feed_events,
+                selected,
+            };
+            narrative_projection_cache
+                .refresh_plan(&input)
+                .or_else(|_| Ok::<_, CliError>(narrative::build_plan_projection(&input)))
+                .ok()
+        } else {
+            None
+        };
         let stage_started = Instant::now();
         terminal.draw(|frame| {
             render_plan_attach(
@@ -22734,6 +22752,7 @@ async fn attach_plan_tui(
                     view,
                     visual,
                     narrative_notice: narrative_notice.as_deref(),
+                    narrative_projection: narrative_projection.as_ref(),
                 },
             )
         })?;
@@ -22789,6 +22808,7 @@ async fn attach_plan_tui(
                                 view,
                                 visual,
                                 narrative_notice: narrative_notice.as_deref(),
+                                narrative_projection: narrative_projection.as_ref(),
                             },
                         )
                     })?;
@@ -22868,6 +22888,7 @@ struct PlanAttachRenderState<'a> {
     view: AttachViewMode,
     visual: NarrativeVisualMode,
     narrative_notice: Option<&'a str>,
+    narrative_projection: Option<&'a narrative::NarrativeProjection>,
 }
 
 fn render_plan_attach(
@@ -23023,15 +23044,7 @@ fn render_plan_narrative_attach(
     state: &PlanAttachRenderState<'_>,
     area: ratatui::layout::Rect,
 ) {
-    let projection = narrative::ensure_plan_projection(&narrative::PlanNarrativeInput {
-        paths,
-        plan,
-        messages: state.messages,
-        plan_events: state.plan_events,
-        feed_events: state.feed_events,
-        selected: state.selected,
-    })
-    .unwrap_or_else(|_| {
+    let projection = state.narrative_projection.cloned().unwrap_or_else(|| {
         narrative::build_plan_projection(&narrative::PlanNarrativeInput {
             paths,
             plan,
@@ -23546,6 +23559,7 @@ async fn attach_tui_with_parent(
     let mut trace_tail =
         AttachJsonlTail::<TraceRecord>::new(initial_state.run_root.join("traces.jsonl"));
     let mut provider_activity_cache = AttachProviderActivityCache::new(&initial_state);
+    let mut narrative_projection_cache = AttachNarrativeProjectionCache::default();
 
     let result = loop {
         let mut tick = AttachTickTiming::new(AttachSurface::Run, AttachTickBudget::default());
@@ -23572,8 +23586,25 @@ async fn attach_tui_with_parent(
             run_event_refresh.or_else(|| acceptance_tracker.observe(&live.acceptance));
         quiet_tracker.observe_event_trigger(event_refresh, now);
         if let Some(notice) = poll_run_narrative_refresh_job(&mut narrative_refresh_job).await {
+            narrative_projection_cache.invalidate();
             tui_state.record_narrative_refresh(notice);
         }
+        tui_state.narrative_projection = if tui_state.view.is_narrative() {
+            let input = RunNarrativeRenderInput {
+                state: &state,
+                spend,
+                traces,
+                events: &events,
+                live: &live,
+                tui_state: &tui_state,
+            };
+            narrative_projection_cache
+                .refresh_run(&input)
+                .or_else(|_| Ok::<_, CliError>(build_run_narrative_projection(&input)))
+                .ok()
+        } else {
+            None
+        };
         let terminal_size = terminal.size()?;
         let terminal_area =
             ratatui::layout::Rect::new(0, 0, terminal_size.width, terminal_size.height);
@@ -23866,6 +23897,7 @@ struct AttachTuiState {
     show_completion_actions: bool,
     post_action_notice: Option<AttachActionNotice>,
     narrative_notice: Option<String>,
+    narrative_projection: Option<narrative::NarrativeProjection>,
     parent_plan: Option<AttachParentPlan>,
 }
 
@@ -23884,6 +23916,7 @@ impl Default for AttachTuiState {
             show_completion_actions: true,
             post_action_notice: None,
             narrative_notice: None,
+            narrative_projection: None,
             parent_plan: None,
         }
     }
@@ -23926,6 +23959,9 @@ impl AttachTuiState {
         self.focused_panel = AttachPanel::Activity;
         self.post_action_notice = None;
         self.narrative_notice = None;
+        if !self.view.is_narrative() {
+            self.narrative_projection = None;
+        }
     }
 
     fn cycle_visual(&mut self) {
@@ -23957,6 +23993,7 @@ impl AttachTuiState {
         self.processes_scroll = 0;
         self.post_action_notice = Some(notice);
         self.narrative_notice = None;
+        self.narrative_projection = None;
     }
 
     fn scroll_focused(&mut self, delta: isize, counts: AttachPanelCounts, rows: AttachPanelRows) {
@@ -24115,9 +24152,7 @@ fn attach_panel_counts(
         activity: if tui_state.docs_open && state.status == RunStatus::Completed {
             render_markdown_doc_lines(state).len()
         } else if tui_state.view.is_narrative() {
-            run_narrative_lines(state, spend, traces, events, live, tui_state)
-                .map(|lines| lines.len())
-                .unwrap_or(1)
+            run_narrative_lines(state, spend, traces, events, live, tui_state).len()
         } else {
             attach_activity_lines_for_tui(state, spend, traces, events, live, tui_state).len()
         },
@@ -24302,6 +24337,53 @@ impl AttachProviderActivityCache {
             self.provider_log_cache
                 .refresh(state, &spec, !flight.lines.is_empty(), Instant::now());
         combine_provider_activity(flight, fallback)
+    }
+}
+
+#[derive(Debug, Default)]
+struct AttachNarrativeProjectionCache {
+    signature: Option<u64>,
+    projection: Option<narrative::NarrativeProjection>,
+    refresh_count: usize,
+}
+
+impl AttachNarrativeProjectionCache {
+    fn refresh_run(
+        &mut self,
+        input: &RunNarrativeRenderInput<'_>,
+    ) -> Result<narrative::NarrativeProjection> {
+        let signature = run_narrative_projection_signature(input);
+        if self.signature == Some(signature)
+            && let Some(projection) = self.projection.as_ref()
+        {
+            return Ok(projection.clone());
+        }
+        let projection = ensure_run_narrative_projection(input)?;
+        self.signature = Some(signature);
+        self.projection = Some(projection.clone());
+        self.refresh_count = self.refresh_count.saturating_add(1);
+        Ok(projection)
+    }
+
+    fn refresh_plan(
+        &mut self,
+        input: &narrative::PlanNarrativeInput<'_>,
+    ) -> Result<narrative::NarrativeProjection> {
+        let signature = plan_narrative_projection_signature(input);
+        if self.signature == Some(signature)
+            && let Some(projection) = self.projection.as_ref()
+        {
+            return Ok(projection.clone());
+        }
+        let projection = narrative::ensure_plan_projection(input)?;
+        self.signature = Some(signature);
+        self.projection = Some(projection.clone());
+        self.refresh_count = self.refresh_count.saturating_add(1);
+        Ok(projection)
+    }
+
+    fn invalidate(&mut self) {
+        self.signature = None;
     }
 }
 
@@ -26640,40 +26722,16 @@ fn render_run_narrative(
     area: ratatui::layout::Rect,
     input: &RunNarrativeRenderInput<'_>,
 ) {
-    let &RunNarrativeRenderInput {
-        state,
-        spend,
-        traces,
-        events,
-        live,
-        tui_state,
-    } = input;
+    let tui_state = input.tui_state;
     let rows = area.height.saturating_sub(2) as usize;
-    let Ok(mut lines) = run_narrative_lines(state, spend, traces, events, live, tui_state) else {
-        frame.render_widget(
-            Paragraph::new(
-                "Unable to build narrative projection; raw activity remains available with n.",
-            )
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("narrative unavailable"),
-            )
-            .style(Style::default().fg(Color::Yellow)),
-            area,
-        );
-        return;
-    };
+    let projection = run_narrative_projection_for_render(input);
+    let mut lines = run_narrative_lines_from_projection(&projection, tui_state);
     if area.width >= 110 && tui_state.visual != NarrativeVisualMode::None {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
             .split(area);
-        let projection = run_narrative_projection(state, spend, traces, events, live, tui_state);
-        let visual_lines = projection
-            .as_ref()
-            .map(|projection| narrative::graph_ascii_lines(&projection.graph, tui_state.visual))
-            .unwrap_or_else(|_| vec!["[stale] visual unavailable".to_string()]);
+        let visual_lines = narrative::graph_ascii_lines(&projection.graph, tui_state.visual);
         lines.retain(|line| !line.starts_with("Visual:"));
         let visible = visible_narrative_items(&lines, tui_state.narrative_scroll, rows);
         frame.render_widget(
@@ -26732,13 +26790,27 @@ fn run_narrative_lines(
     events: &[RunEvent],
     live: &AttachLive,
     tui_state: &AttachTuiState,
-) -> Result<Vec<String>> {
-    let projection = run_narrative_projection(state, spend, traces, events, live, tui_state)?;
-    let mut lines = narrative::narrative_plain_lines(&projection, tui_state.visual);
+) -> Vec<String> {
+    let projection = run_narrative_projection_for_render(&RunNarrativeRenderInput {
+        state,
+        spend,
+        traces,
+        events,
+        live,
+        tui_state,
+    });
+    run_narrative_lines_from_projection(&projection, tui_state)
+}
+
+fn run_narrative_lines_from_projection(
+    projection: &narrative::NarrativeProjection,
+    tui_state: &AttachTuiState,
+) -> Vec<String> {
+    let mut lines = narrative::narrative_plain_lines(projection, tui_state.visual);
     if let Some(notice) = tui_state.narrative_notice.as_ref() {
         lines.insert(2, format!("[fresh] {notice}"));
     }
-    Ok(lines)
+    lines
 }
 
 fn run_narrative_projection(
@@ -26749,11 +26821,48 @@ fn run_narrative_projection(
     live: &AttachLive,
     tui_state: &AttachTuiState,
 ) -> Result<narrative::NarrativeProjection> {
-    narrative::ensure_run_projection(&narrative::RunNarrativeInput {
+    ensure_run_narrative_projection(&RunNarrativeRenderInput {
         state,
         spend,
         traces,
         events,
+        live,
+        tui_state,
+    })
+}
+
+fn run_narrative_projection_for_render(
+    input: &RunNarrativeRenderInput<'_>,
+) -> narrative::NarrativeProjection {
+    if let Some(projection) = input.tui_state.narrative_projection.as_ref() {
+        return projection.clone();
+    }
+    build_run_narrative_projection(input)
+}
+
+fn build_run_narrative_projection(
+    input: &RunNarrativeRenderInput<'_>,
+) -> narrative::NarrativeProjection {
+    narrative::build_run_projection(&run_narrative_input(input))
+}
+
+fn ensure_run_narrative_projection(
+    input: &RunNarrativeRenderInput<'_>,
+) -> Result<narrative::NarrativeProjection> {
+    narrative::ensure_run_projection(&run_narrative_input(input))
+}
+
+fn run_narrative_input<'a>(
+    input: &'a RunNarrativeRenderInput<'a>,
+) -> narrative::RunNarrativeInput<'a> {
+    let state = input.state;
+    let live = input.live;
+    let tui_state = input.tui_state;
+    narrative::RunNarrativeInput {
+        state,
+        spend: input.spend,
+        traces: input.traces,
+        events: input.events,
         live_files: live
             .files
             .iter()
@@ -26774,7 +26883,93 @@ fn run_narrative_projection(
                 plan_id: parent.plan_id.clone(),
                 task_id: parent.task_id.clone(),
             }),
-    })
+    }
+}
+
+fn run_narrative_projection_signature(input: &RunNarrativeRenderInput<'_>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    input.state.run_id.hash(&mut hasher);
+    format!("{:?}", input.state.status).hash(&mut hasher);
+    input.state.turn.hash(&mut hasher);
+    input
+        .state
+        .active_phase()
+        .map(|phase| &phase.name)
+        .hash(&mut hasher);
+    input.spend.len().hash(&mut hasher);
+    input
+        .spend
+        .last()
+        .map(|record| record.total_cost_usd.to_bits())
+        .hash(&mut hasher);
+    input.traces.len().hash(&mut hasher);
+    input
+        .traces
+        .last()
+        .map(|record| (&record.turn, &record.event))
+        .hash(&mut hasher);
+    input.events.len().hash(&mut hasher);
+    input.live.file_count.hash(&mut hasher);
+    input.live.total_bytes.hash(&mut hasher);
+    input
+        .live
+        .files
+        .first()
+        .map(|file| {
+            (
+                &file.path,
+                file.bytes,
+                file.modified_at.map(|date| date.timestamp_millis()),
+            )
+        })
+        .hash(&mut hasher);
+    input.live.provider_activity.len().hash(&mut hasher);
+    input.live.provider_activity.last().hash(&mut hasher);
+    format!("{:?}", input.live.acceptance.status).hash(&mut hasher);
+    input.live.acceptance.completed.hash(&mut hasher);
+    input.live.acceptance.failed.hash(&mut hasher);
+    input.live.acceptance.latest_detail.hash(&mut hasher);
+    input
+        .tui_state
+        .parent_plan
+        .as_ref()
+        .map(|parent| (&parent.plan_id, &parent.task_id))
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn plan_narrative_projection_signature(input: &narrative::PlanNarrativeInput<'_>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    input.plan.plan_id.hash(&mut hasher);
+    format!("{:?}", input.plan.status).hash(&mut hasher);
+    input.plan.tasks.len().hash(&mut hasher);
+    for task in &input.plan.tasks {
+        task.task_id.hash(&mut hasher);
+        format!("{:?}", task.status).hash(&mut hasher);
+        task.child_run_id.hash(&mut hasher);
+        task.summary_path.hash(&mut hasher);
+        task.depends_on.hash(&mut hasher);
+    }
+    input.messages.len().hash(&mut hasher);
+    input
+        .messages
+        .last()
+        .map(|message| (&message.from, &message.to, &message.summary))
+        .hash(&mut hasher);
+    input.plan_events.len().hash(&mut hasher);
+    input
+        .plan_events
+        .last()
+        .map(|event| format!("{:?}", event.event))
+        .hash(&mut hasher);
+    input.feed_events.len().hash(&mut hasher);
+    input
+        .feed_events
+        .last()
+        .map(|event| format!("{event:?}"))
+        .hash(&mut hasher);
+    input.selected.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28119,19 +28314,20 @@ mod tui_tests {
 
     use super::{
         ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachActionNotice,
-        AttachJsonlTail, AttachLive, AttachLoopStage, AttachNarrativeRefreshState, AttachPanel,
-        AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachPlanNarrativeRefreshJob,
-        AttachProviderActivityCache, AttachProviderLogScanCache, AttachSurface, AttachTickBudget,
-        AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG,
-        ChainAttachTuiState, CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS,
-        LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
-        NarrativeRefreshKind, NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent,
-        PlanNarrativeRefreshInput, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
+        AttachJsonlTail, AttachLive, AttachLoopStage, AttachNarrativeProjectionCache,
+        AttachNarrativeRefreshState, AttachPanel, AttachPanelCounts, AttachPanelRows,
+        AttachParentPlan, AttachPlanNarrativeRefreshJob, AttachProviderActivityCache,
+        AttachProviderLogScanCache, AttachSurface, AttachTickBudget, AttachTickTiming,
+        AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG, ChainAttachTuiState,
+        CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS, LiveFile,
+        NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker, NarrativeRefreshKind,
+        NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent, PlanNarrativeRefreshInput,
+        ProviderActivity, ProviderJsonlLogSpec, RunNarrativeRenderInput, TopHelpGroup,
         acceptance_activity_lines, attach_banner, attach_header_text, attach_live_inventory,
-        attach_loop_stage_work, attach_should_return_to_plan, cancel_plan_narrative_refresh_job,
-        chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-        chain_narrative_refusal_text, chain_should_auto_attach, chain_step_dot,
-        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
+        attach_loop_stage_work, attach_should_return_to_plan, build_run_narrative_projection,
+        cancel_plan_narrative_refresh_job, chain_activity_lines, chain_attach_footer_text,
+        chain_attach_header_text, chain_narrative_refusal_text, chain_should_auto_attach,
+        chain_step_dot, chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
         cli_wait_status_line, collect_jsonl_provider_activity,
         collect_jsonl_provider_activity_scan, command_discovery, completion_action_from_input,
         completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
@@ -28761,6 +28957,126 @@ mod tui_tests {
         );
     }
 
+    #[test]
+    fn run_narrative_render_uses_cached_projection_when_coverage_unchanged() {
+        let (_temp, state) = doc_preview_state();
+        let live = AttachLive {
+            working_dir_exists: true,
+            ..AttachLive::default()
+        };
+        let tui_state = AttachTuiState {
+            view: AttachViewMode::Narrative,
+            ..AttachTuiState::default()
+        };
+        let input = RunNarrativeRenderInput {
+            state: &state,
+            spend: &[],
+            traces: &[],
+            events: &[],
+            live: &live,
+            tui_state: &tui_state,
+        };
+        let mut cache = AttachNarrativeProjectionCache::default();
+
+        let first = cache.refresh_run(&input).expect("first projection");
+        let second = cache.refresh_run(&input).expect("cached projection");
+
+        assert_eq!(cache.refresh_count, 1);
+        assert_eq!(first.snapshot.snapshot_id, second.snapshot.snapshot_id);
+    }
+
+    #[test]
+    fn plan_narrative_render_uses_cached_projection_when_feed_unchanged() {
+        let (_temp, paths, plan) = full_plan_fixture(2);
+        let input = crate::narrative::PlanNarrativeInput {
+            paths: &paths,
+            plan: &plan,
+            messages: &[],
+            plan_events: &[],
+            feed_events: &[],
+            selected: 0,
+        };
+        let mut cache = AttachNarrativeProjectionCache::default();
+
+        let first = cache.refresh_plan(&input).expect("first projection");
+        let second = cache.refresh_plan(&input).expect("cached projection");
+
+        assert_eq!(cache.refresh_count, 1);
+        assert_eq!(first.snapshot.snapshot_id, second.snapshot.snapshot_id);
+    }
+
+    #[test]
+    fn render_attach_text_does_not_append_narrative_snapshots() {
+        let (_temp, state) = doc_preview_state();
+        let snapshots = state.run_root.join("narrative/snapshots.jsonl");
+        let tui_state = AttachTuiState {
+            view: AttachViewMode::Narrative,
+            ..AttachTuiState::default()
+        };
+
+        let _ = render_attach_text_with_tui_state(
+            &state,
+            &[],
+            &AttachLive::default(),
+            tui_state.clone(),
+        );
+        let _ = render_attach_text_with_tui_state(&state, &[], &AttachLive::default(), tui_state);
+
+        assert_eq!(jsonl_line_count(&snapshots), 0);
+    }
+
+    #[test]
+    fn stale_provider_snapshot_survives_redraw_without_churn() {
+        let (_temp, state) = doc_preview_state();
+        let live = AttachLive {
+            working_dir_exists: true,
+            ..AttachLive::default()
+        };
+        let tui_state = AttachTuiState {
+            view: AttachViewMode::Narrative,
+            ..AttachTuiState::default()
+        };
+        let input = RunNarrativeRenderInput {
+            state: &state,
+            spend: &[],
+            traces: &[],
+            events: &[],
+            live: &live,
+            tui_state: &tui_state,
+        };
+        let deterministic = build_run_narrative_projection(&input);
+        let stale = crate::narrative::projection_with_provider_failure(
+            &deterministic,
+            Some("cli:test".to_string()),
+            "timeout",
+        );
+        crate::narrative::persist_run_projection(&state, &stale).expect("persist stale");
+        let snapshots = state.run_root.join("narrative/snapshots.jsonl");
+        let before = jsonl_line_count(&snapshots);
+        let mut cache = AttachNarrativeProjectionCache::default();
+
+        let first = cache.refresh_run(&input).expect("first projection");
+        let second = cache.refresh_run(&input).expect("cached projection");
+        let after = jsonl_line_count(&snapshots);
+
+        assert_eq!(cache.refresh_count, 1);
+        assert_eq!(before, after);
+        assert_eq!(
+            first.state.latest_status,
+            crate::narrative::NarrativeStatus::Stale
+        );
+        assert_eq!(
+            second.state.latest_status,
+            crate::narrative::NarrativeStatus::Stale
+        );
+    }
+
+    fn jsonl_line_count(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+            .unwrap_or(0)
+    }
+
     fn append_jsonl_raw(path: &std::path::Path, raw: &str) {
         append_raw(path, &format!("{raw}\n"));
     }
@@ -29157,6 +29473,7 @@ mod tui_tests {
                 view,
                 visual,
                 narrative_notice: None,
+                narrative_projection: None,
             },
         )
     }
@@ -29184,6 +29501,7 @@ mod tui_tests {
                 view: AttachViewMode::Activity,
                 visual: NarrativeVisualMode::Architecture,
                 narrative_notice: None,
+                narrative_projection: None,
             },
         )
     }
