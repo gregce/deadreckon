@@ -2,6 +2,7 @@
 
 ## Guided first use (alpha) - 2026-05-26
 
+- Reframed README/HOWTO first-run examples around provider-neutral `deadreckon start`, while keeping direct `run` and `orchestrate` paths documented for power users.
 - Added a `start lifecycle` footer after successful guided launches so the new front door ends with exact attach, status, kill, and finish commands for the created run or plan.
 - Locked `deadreckon start` JSON, plain, and quiet output behavior with focused coverage for structured recovery, ANSI-free previews, and quiet successful launches.
 - Connected confirmed `deadreckon start` launches to the existing run and orchestrate handlers while keeping start previews state-free.

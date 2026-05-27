@@ -265,19 +265,29 @@ deadreckon completion install
 
 For raw generated scripts or shell overrides, run `deadreckon completion --help`.
 
-Configure and run a task end-to-end:
+Start with the guided front door:
 
 ```bash
-deadreckon init --provider cli:claude-code --sandbox auto --max-spend 10
-
-deadreckon def-done   "users can sign up, log in, and save a drawing"
-deadreckon run    "build the app"
+deadreckon start "build the app"
 deadreckon attach latest    # watch live, Ctrl-D to detach
-deadreckon doc    latest    # read the narrative once done
-deadreckon apply  latest --autostash --cleanup
+deadreckon finish latest
 ```
 
-`run` prints the run id and attach command immediately, and shows a preview of mode, branch, base ref, and worktree path before creating anything. Use `--preview` to print the preview and exit.
+If setup is incomplete, `start` stops before launching work and prints exact
+`try:` lines for configuration, done criteria, or source mode. Paste those,
+then run the same `deadreckon start "build the app"` command again.
+
+Use direct commands when you already know the shape of the work:
+
+```bash
+deadreckon run "goal"
+deadreckon orchestrate review "goal" --yes
+deadreckon orchestrate full-plan "goal" --n 4 --yes
+```
+
+`run` prints the run id and attach command immediately, and shows a preview of
+mode, branch, base ref, and worktree path before creating anything. Use
+`--preview` to print the preview and exit.
 
 ### Try It Without API Keys
 

@@ -17,6 +17,51 @@ deadreckon attach latest
 deadreckon finish latest
 ```
 
+## New User Path
+
+Use `start` when you want DeadReckon to choose the right first path and tell you
+exactly what is missing:
+
+```bash
+deadreckon start "build the app"
+deadreckon attach latest
+deadreckon status latest
+deadreckon finish latest
+```
+
+If setup is incomplete, `start` stops before launching work and prints concrete
+`try:` lines for setup, done criteria, or source mode. Paste the suggested
+commands, then run the same `deadreckon start "build the app"` command again.
+
+## Normal Single Run
+
+Use `run` directly when you already know this should be one supervised coding
+run:
+
+```bash
+deadreckon run "goal"
+deadreckon attach latest
+deadreckon finish latest
+```
+
+`run` is still the canonical power-user command for source-mode flags, spend
+caps, sandbox overrides, and one-run scripting.
+
+## Multi-Agent Work
+
+Use `orchestrate` directly when the goal needs a coder/reviewer pass or a
+planner-led split into child runs:
+
+```bash
+deadreckon orchestrate review "goal" --yes
+deadreckon orchestrate full-plan "goal" --n 4 --yes
+deadreckon attach latest
+deadreckon finish latest
+```
+
+`start --mode review` and `start --mode full-plan` route through the same
+orchestration machinery when you want the guided front door first.
+
 ## Build And Install Alias
 
 ```bash
@@ -170,7 +215,7 @@ Then attach to or finish it:
 deadreckon attach latest
 ```
 
-## Normal Coding Run
+## Normal Single Run Details
 
 After `init`, the normal path in a git repo is:
 

@@ -516,6 +516,54 @@ fn public_docs_first_screen_explains_harness_of_harnesses() {
 }
 
 #[test]
+fn readme_first_screen_mentions_start_watch_finish() {
+    let first_screen = repo_file_text("README.md")
+        .lines()
+        .take(35)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for text in [
+        "deadreckon start \"build the app\"",
+        "deadreckon attach latest",
+        "deadreckon finish latest",
+    ] {
+        assert!(
+            first_screen.contains(text),
+            "missing {text}:\n{first_screen}"
+        );
+    }
+}
+
+#[test]
+fn howto_new_user_path_does_not_require_provider_flags() {
+    let howto = repo_file_text("HOWTO.md");
+    let new_user = section_between(&howto, "## New User Path", "## Normal Single Run")
+        .expect("new user section");
+    assert!(
+        new_user.contains("deadreckon start \"build the app\""),
+        "{new_user}"
+    );
+    assert!(
+        new_user.contains("deadreckon attach latest")
+            && new_user.contains("deadreckon finish latest"),
+        "{new_user}"
+    );
+    assert!(!new_user.contains("--provider"), "{new_user}");
+    assert!(!new_user.contains("cli:"), "{new_user}");
+}
+
+#[test]
+fn docs_still_document_run_and_orchestrate_directly() {
+    let docs = format!(
+        "{}\n{}",
+        repo_file_text("README.md"),
+        repo_file_text("HOWTO.md")
+    );
+    assert!(docs.contains("deadreckon run \"goal\""), "{docs}");
+    assert!(docs.contains("deadreckon orchestrate"), "{docs}");
+}
+
+#[test]
 fn audience_copy_does_not_call_deadreckon_a_provider_replacement() {
     let docs = [
         help(["--help"]),
@@ -1377,6 +1425,15 @@ fn repo_file_text(relative: &str) -> String {
         .and_then(|path| path.parent())
         .expect("repo");
     fs::read_to_string(repo.join(relative)).expect(relative)
+}
+
+fn section_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let after_start = text.split_once(start)?.1;
+    Some(
+        after_start
+            .split_once(end)
+            .map_or(after_start, |(section, _)| section),
+    )
 }
 
 fn deadreckon(paths: &DeadreckonPaths) -> Command {
