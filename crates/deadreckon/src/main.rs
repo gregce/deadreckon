@@ -28391,15 +28391,16 @@ mod tui_tests {
         AttachJsonlTail, AttachLive, AttachLoopStage, AttachNarrativeProjectionCache,
         AttachNarrativeRefreshState, AttachPanel, AttachPanelCounts, AttachPanelRows,
         AttachParentPlan, AttachPlanNarrativeRefreshJob, AttachProviderActivityCache,
-        AttachProviderLogScanCache, AttachSurface, AttachTickBudget, AttachTickTiming,
-        AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG, ChainAttachTuiState,
-        CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS, LiveFile,
-        NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker, NarrativeRefreshKind,
-        NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent, PlanNarrativeRefreshInput,
-        ProviderActivity, ProviderJsonlLogSpec, RunNarrativeRenderInput, TopHelpGroup,
-        acceptance_activity_lines, attach_banner, attach_header_text, attach_live_inventory,
-        attach_loop_stage_work, attach_should_return_to_plan, build_run_narrative_projection,
-        cancel_plan_narrative_refresh_job, chain_activity_lines, chain_attach_footer_text,
+        AttachProviderLogScanCache, AttachRunNarrativeRefreshJob, AttachSurface, AttachTickBudget,
+        AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG,
+        ChainAttachTuiState, CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS,
+        LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
+        NarrativeRefreshKind, NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent,
+        PlanNarrativeRefreshInput, ProviderActivity, ProviderJsonlLogSpec, RunNarrativeRenderInput,
+        TopHelpGroup, acceptance_activity_lines, attach_banner, attach_header_text,
+        attach_live_inventory, attach_loop_stage_work, attach_should_return_to_plan,
+        build_run_narrative_projection, cancel_plan_narrative_refresh_job,
+        cancel_run_narrative_refresh_job, chain_activity_lines, chain_attach_footer_text,
         chain_attach_header_text, chain_event_read_hint, chain_narrative_refusal_text,
         chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
         claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
@@ -28410,7 +28411,8 @@ mod tui_tests {
         orchestration_dependency_rows, orchestration_parallelism_lines,
         orchestration_provider_role_rows, orchestration_role_table_lines, per_step_wall_cap,
         plan_attach_footer, plan_merge_repair_summary_items, plan_narrative_refresh_request,
-        plan_narrative_refresh_trigger, provider_ingest_base_roots, provider_jsonl_activity_lines,
+        plan_narrative_refresh_trigger, poll_plan_narrative_refresh_job,
+        poll_run_narrative_refresh_job, provider_ingest_base_roots, provider_jsonl_activity_lines,
         provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
         read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
         render_attach, render_plan_attach, run_narrative_json_text, run_narrative_plain_text,
@@ -28538,6 +28540,39 @@ mod tui_tests {
             KeyCode::Char('q'),
             KeyModifiers::empty()
         )));
+    }
+
+    #[tokio::test]
+    async fn slow_run_narrator_still_allows_quit() {
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(async { std::future::pending::<String>().await });
+        let mut job = Some(AttachRunNarrativeRefreshJob {
+            state: AttachNarrativeRefreshState::new(
+                NarrativeRefreshKind::Manual,
+                Utc::now(),
+                token.clone(),
+            ),
+            handle,
+        });
+
+        let poll = tokio::time::timeout(
+            Duration::from_millis(20),
+            poll_run_narrative_refresh_job(&mut job),
+        )
+        .await
+        .expect("poll should return without waiting for slow narrator");
+
+        assert!(poll.is_none());
+        assert!(super::attach_should_quit(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::empty()
+        )));
+        assert!(attach_should_return_to_plan(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::empty()
+        )));
+        assert!(cancel_run_narrative_refresh_job(&mut job));
+        assert!(token.is_cancelled());
     }
 
     #[test]
@@ -28683,6 +28718,34 @@ mod tui_tests {
         );
         assert!(notice.contains("background"));
         assert!(notice.contains("q detaches immediately"));
+    }
+
+    #[tokio::test]
+    async fn slow_plan_narrator_still_allows_visual_toggle() {
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(async { std::future::pending::<String>().await });
+        let mut job = Some(AttachPlanNarrativeRefreshJob {
+            plan_id: "plan-slow".to_string(),
+            state: AttachNarrativeRefreshState::new(
+                NarrativeRefreshKind::Manual,
+                Utc::now(),
+                token.clone(),
+            ),
+            handle,
+        });
+        let visual = NarrativeVisualMode::Architecture;
+
+        let poll = tokio::time::timeout(
+            Duration::from_millis(20),
+            poll_plan_narrative_refresh_job(&mut job),
+        )
+        .await
+        .expect("poll should return without waiting for slow narrator");
+
+        assert!(poll.is_none());
+        assert_eq!(visual.next(), NarrativeVisualMode::Agents);
+        assert!(cancel_plan_narrative_refresh_job(&mut job));
+        assert!(token.is_cancelled());
     }
 
     #[test]
@@ -28864,6 +28927,50 @@ mod tui_tests {
                 .last()
                 .is_some_and(|line| line == "... 3 more files not shown")
         );
+    }
+
+    #[test]
+    fn large_worktree_live_files_still_draws_recent_files() {
+        let (_temp, state) = doc_preview_state();
+        let root = &state.working_dir;
+        std::fs::create_dir_all(root.join("bulk")).expect("bulk");
+        for index in 0..(ATTACH_LIVE_FILE_DISPLAY_LIMIT + 80) {
+            std::fs::write(
+                root.join("bulk").join(format!("file-{index:03}.txt")),
+                "old",
+            )
+            .expect("bulk file");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join("src/recent-feature.rs"), "pub fn recent() {}\n")
+            .expect("recent file");
+
+        let inventory = attach_live_inventory(root);
+        let live = AttachLive {
+            file_count: inventory.file_count,
+            total_bytes: inventory.total_bytes,
+            files: inventory.files,
+            working_dir_exists: true,
+            ..AttachLive::default()
+        };
+        let text = render_attach_text_with_tui_state(
+            &state,
+            &[],
+            &live,
+            AttachTuiState {
+                focused_panel: AttachPanel::Files,
+                ..AttachTuiState::default()
+            },
+        );
+
+        assert!(live.file_count > ATTACH_LIVE_FILE_DISPLAY_LIMIT);
+        assert!(
+            live_file_lines(&live)
+                .iter()
+                .any(|line| line.contains("src/recent-feature.rs"))
+        );
+        assert!(text.contains("src/recent-feature.rs"), "{text}");
     }
 
     #[test]
@@ -30870,6 +30977,50 @@ mod tui_tests {
         assert!(lines[0].contains("◉ step  1 applied"));
         assert!(lines[0].contains("run aaaaaaaa"));
         assert!(lines[1].contains("● step  2 running"));
+    }
+
+    #[test]
+    fn large_chain_timeline_still_scrolls() {
+        let chain = Chain::new(ChainNewOptions {
+            root_goal: "large chain".to_string(),
+            goals: (0..12)
+                .map(|index| format!("step goal {index}"))
+                .collect::<Vec<_>>(),
+            scope: "scope".to_string(),
+            base_branch: "main".to_string(),
+            base_sha: "abcdef123456".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/project"),
+            provider: Some("smoke".to_string()),
+            model: None,
+            sandbox: "none".to_string(),
+            branch_policy: BranchPolicy::Stack,
+            apply_mode: ApplyMode::Auto,
+            apply_strategy: ApplyStrategy::Squash,
+            apply_allowlist: Vec::new(),
+            on_fail: OnFail::Stop,
+            circuit_breaker_threshold: 2,
+            max_spend_usd: Some(5.0),
+            max_wall_seconds: Some(600.0),
+            deadreckon_version: "0.1.0".to_string(),
+        })
+        .expect("chain");
+        let mut tui_state = ChainAttachTuiState::default();
+
+        for _ in 0..15 {
+            tui_state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), &chain);
+        }
+        let lines = chain_timeline_lines(&chain, &tui_state)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(tui_state.selected_step, 11);
+        assert!(lines[11].contains(">"));
+        assert!(lines[11].contains("step 12"));
+
+        tui_state.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::empty()), &chain);
+
+        assert_eq!(tui_state.selected_step, 11);
     }
 
     #[test]
