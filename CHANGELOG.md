@@ -12,6 +12,7 @@
 - Added deterministic `start --mode auto` launch-decision heuristics for run, review, and full-plan paths.
 - Added the visible `deadreckon start` parser and help surface for the guided front door.
 - Clarified DeadReckon's audience as the harness around agent CLIs for unattended, sandboxed, auditable work, and pointed first-use help/docs at `deadreckon start`.
+- Documented the guided first-use architecture and V1 deferrals in AS-BUILT and V1 candidates without adding durable launch state.
 
 ## TUI Responsiveness (alpha) - 2026-05-26
 

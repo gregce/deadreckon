@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-26 (local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure; followed by a 2026-05-26 agent-team code-verification pass that re-checked the module map, file-system layout, CLI surface, provider/sandbox/gate code locations, and the attach event-bus model against source)
+**Last updated:** 2026-05-26 (guided first use, local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure; followed by a 2026-05-26 agent-team code-verification pass that re-checked the module map, file-system layout, CLI surface, provider/sandbox/gate code locations, and the attach event-bus model against source)
 **Maturity:** alpha. Workspace version `0.1.0`. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -1267,6 +1267,7 @@ The `Commands` enum in `crates/deadreckon/src/cli.rs` defines the CLI surface; h
 |---|---|
 | `init` | Interactive setup of `~/.deadreckon/config.toml` |
 | `config get/set` | Non-interactive TOML edits |
+| `start` | Guided front door for choosing and launching a run or orchestration path |
 | `run` | Create + enter turn loop |
 | `doctor` | Actionable preflight (OS, sandbox, providers, config, disk, runtime) |
 | `status` / `next` | Current project's latest run, locations, and next action |
@@ -1301,6 +1302,16 @@ The `Commands` enum in `crates/deadreckon/src/cli.rs` defines the CLI surface; h
 | `learn` | Index local run evidence and propose deadreckon improvements (see §34) |
 | `improve` | Run evidence-backed deadreckon self-improvement candidates (see §34) |
 | `help-all` / `commands` | Show every command, including advanced ones hidden from short help |
+
+### 17.1 Guided first use
+
+`deadreckon start "<goal>"` is the guided first-use command. It is intentionally a thin CLI-layer decision helper, not a new runtime state machine: each invocation builds an ephemeral launch decision, prints the selected path and reason, and either previews or dispatches to the existing `run` and `orchestrate` handlers. No `PipelineState` schema changes were introduced for this path, and previews remain state-free.
+
+The launch decision resolves provider setup, done criteria, source mode, and run-vs-orchestrate mode before any provider work begins. Provider resolution uses configured defaults first and only probes installed subscription CLIs when no default route is configured; incomplete setup exits with concrete `try:` lines for `init`, `detect`, or `config provider` instead of guessing a brand. Done-criteria resolution uses the same `def-done` and `.deadreckon/acceptance.yaml` contract as direct runs. Source-mode resolution follows the existing run safety posture: git worktree by default in repositories, guided `--from .` or `--fresh` recovery in non-git directories, and explicit `--allow-dirty` guidance for dirty worktrees.
+
+Auto mode is deterministic in alpha. It chooses single-run, review orchestration, or full-plan orchestration from local goal text and explicit flags, then reports the override flag (`--mode run`, `--mode review`, or `--mode full-plan`) a user can pass if the heuristic guessed wrong. The guided command does not ask a provider to classify the goal and does not persist personal preferences.
+
+`start --preview`, `run --preview`, and `orchestrate --preview` share launch-preview rows: path, provider, done criteria, workspace, watch, stop, and finish. Successful guided launches add a `start lifecycle` footer with exact `attach`, `status`, `kill`, and `finish` commands for the created run or plan. Existing `run` and `orchestrate` remain the canonical direct commands for users who already know the path they want.
 
 The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defaults to `$10` (with a confirmation gate above `$50`), `--provider` defaults to the highest-credentialed entry per the fallback chain, `--skill` defaults to `default-coding`.
 

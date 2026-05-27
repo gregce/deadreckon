@@ -1,5 +1,14 @@
 # V1 Candidates
 
+## Guided first-use follow-ups
+
+- Durable launch profiles: save a reusable launch shape only after the alpha `start` path proves which choices users actually repeat. This would be new durable config, so it stays out of the guided alpha.
+- LLM mode classification: replace or augment deterministic `start --mode auto` heuristics with provider-backed goal classification when the prompt, evidence limits, fallback behavior, and test fixtures are explicit.
+- Personalized onboarding: adapt setup copy and examples to a user's observed provider/source/done-criteria patterns without adding telemetry or background profiling by default.
+- Provider-specific setup wizards: offer richer guided configuration for individual CLIs or APIs once their install/auth flows are stable enough to document without making `start` brand-specific.
+
+## General candidates
+
 - Explicit sub-agent forking command: `deadreckon fork <run-id> --prompt "..."`, from AS-BUILT §10 and REPORT.md coordination needs.
 - Provider HTTP retry taxonomy: `ProviderError::Http` currently carries provider/detail text but no HTTP status field, so the hygiene taxonomy treats it as fatal. Add a status/code field before retrying 408, 429, or 5xx provider failures.
 - OpenCode SQLite ingest: current provider CLI ingest reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON only. Add SQLite-backed discovery/parsing after choosing a dependency-light strategy and fixture shape.

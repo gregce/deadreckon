@@ -564,6 +564,64 @@ fn docs_still_document_run_and_orchestrate_directly() {
 }
 
 #[test]
+fn start_as_built_documents_guided_front_door() {
+    let as_built = repo_file_text("docs/AS-BUILT-ARCHITECTURE.md");
+    let cli_surface = section_between(&as_built, "## 17. CLI Surface", "## 18. TUI (`attach`)")
+        .expect("CLI surface section");
+
+    assert!(
+        cli_surface.contains("| `start` | Guided front door"),
+        "{cli_surface}"
+    );
+    for required in [
+        "Guided first use",
+        "`deadreckon start \"<goal>\"`",
+        "ephemeral launch decision",
+        "No `PipelineState` schema",
+        "provider setup, done criteria, source mode, and run-vs-orchestrate",
+        "dispatches to the existing `run` and `orchestrate` handlers",
+        "previews remain state-free",
+    ] {
+        assert!(
+            as_built.contains(required),
+            "missing {required}:\n{as_built}"
+        );
+    }
+}
+
+#[test]
+fn start_v1_candidates_track_guided_deferrals() {
+    let v1 = repo_file_text("docs/V1-CANDIDATES.md");
+    let guided = section_between(&v1, "## Guided first-use follow-ups", "## ")
+        .unwrap_or_else(|| panic!("missing guided deferral section:\n{v1}"));
+
+    for required in [
+        "Durable launch profiles",
+        "LLM mode classification",
+        "Personalized onboarding",
+        "Provider-specific setup wizards",
+    ] {
+        assert!(guided.contains(required), "missing {required}:\n{guided}");
+    }
+}
+
+#[test]
+fn start_changelog_records_architecture_and_deferral_closeout() {
+    let changelog = repo_file_text("CHANGELOG.md");
+    let guided = section_between(
+        &changelog,
+        "## Guided first use (alpha) - 2026-05-26",
+        "## TUI Responsiveness",
+    )
+    .expect("guided changelog section");
+
+    assert!(
+        guided.contains("Documented the guided first-use architecture and V1 deferrals"),
+        "{guided}"
+    );
+}
+
+#[test]
 fn audience_copy_does_not_call_deadreckon_a_provider_replacement() {
     let docs = [
         help(["--help"]),
