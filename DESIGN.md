@@ -2,7 +2,7 @@
 
 ## Product
 
-`deadreckon` is a Rust 2024 CLI harness for unattended long-running coding tasks. The default user flow is `deadreckon run <goal>`: create durable run state, select a BYOK provider route, execute turns in a disposable sandbox, write spend/provenance/traces/snapshots after every turn, and make the run attachable, resumable, killable, inspectable, and undoable.
+`deadreckon` runs your coding agent unattended — and a separate watchdog process, not the agent, decides when the work is actually done. It is a Rust 2024 CLI harness that supervises agent CLIs (Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, OpenCode, Pi) and BYOK API routes rather than replacing them. The default user flow is `deadreckon run <goal>`: create durable run state, select a provider route, execute turns in a disposable sandbox, write spend/provenance/traces/snapshots after every turn, gate completion with a signature the agent process cannot forge, and make the run attachable, resumable, killable, inspectable, and undoable. The output is an auditable artifact, not a chat transcript.
 
 The alpha implementation is intentionally local-first. Runtime state defaults to `/Users/gdc/.deadreckon/`, and tests or explicit smoke runs can override that with `DEADRECKON_HOME=/Users/gdc/deadreckon/.deadreckon-smoke` so this build process does not write outside the allowed implementation tree.
 
@@ -26,7 +26,7 @@ Source lives under `/Users/gdc/deadreckon/`:
 
 - `crates/deadreckon-core`: run paths, phase machine, JSON state, codebase mode records, locks, heartbeats, snapshots, provenance, spend, traces, gates, imports, chains, and run docs primitives.
 - `crates/deadreckon-runtime`: provider turn loop, sandboxed tool dispatch, cancellation checks, docs polish orchestration, `dr-gate` invocation, and promotion orchestration.
-- `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, OpenAI-compatible, `cli:claude-code`, `cli:codex`, and explicit `--smoke` scripted adapters, fallback routing, spend estimates.
+- `crates/deadreckon-providers`: BYOK config at `/Users/gdc/.deadreckon/config.toml`, provider trait, Anthropic, OpenAI, OpenAI-compatible, `cli:claude-code`, `cli:codex`, `cli:gemini`, `cli:copilot`, `cli:opencode`, `cli:pi`, and explicit `--smoke` scripted adapters, fallback routing, spend estimates.
 - `crates/deadreckon-sandbox`: `sandbox-exec`, `bwrap`, `docker`, and `none` backends using `tokio::process::Command`; default `auto`.
 - `crates/deadreckon`: clap parser, command handlers, ratatui attach UI, init/setup, config/settings, run, status/next, list/runs, doc/docs, attach/watch, kill/stop, resume/continue, undo/restore, show/inspect, import, materialize/export, finish/done, apply/keep, abandon/discard, cleanup/prune, extend/follow-up, library/artifacts, chain, and doctor/check.
 - `skills/default-coding/SKILL.md`: Markdown skill loaded at runtime.

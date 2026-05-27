@@ -653,6 +653,97 @@ STRESS_SECONDS=30 make stress
 
 The stress test asserts completed states, unique scopes, provenance identity, and no leftover lock files.
 
+## Configuration
+
+Runtime config lives at `~/.deadreckon/config.toml`. Set `DEADRECKON_HOME` to
+relocate all runtime state (config, runstate, library) for isolated local runs
+or tests.
+
+Switch providers, models, or defaults:
+
+```bash
+deadreckon init --provider cli:codex --sandbox auto --max-spend 10
+deadreckon init --provider anthropic --api-key "$ANTHROPIC_API_KEY"
+deadreckon config provider cli:claude-code
+deadreckon config model sonnet --provider cli:claude-code
+deadreckon config set defaults.max_spend 15
+```
+
+Override per run:
+
+```bash
+deadreckon run "goal" --provider cli:codex --model gpt-5.1-codex
+deadreckon run --preview "goal"     # show route and model, don't start
+```
+
+### Sandbox Backends
+
+| Backend | What it is |
+|---|---|
+| `auto` | Picks the right native sandbox for your OS (default) |
+| `sandbox-exec` | macOS native |
+| `bwrap` | Linux native (bubblewrap) |
+| `docker` | Opt-in container sandbox |
+| `none` | Off (unsafe for real unattended work) |
+
+Check what your machine supports with `deadreckon doctor`. See
+[Sandboxes](#sandboxes) above for run examples.
+
+## Full Command Reference
+
+The production model is a small set of verbs; every other command stays
+findable through `deadreckon help-all`, `<command> --help`, and completion.
+
+Default production model:
+
+```text
+start         begin supervised agent work
+attach        open the live dashboard
+status        latest run and next action for this project
+list          find runs and plans
+finish        choose apply or export from completed work
+doctor        check config, providers, sandboxes, disk, runtime
+init          create local config
+def-done      compile English "done" criteria into checks
+kill          stop a live run, chain, or plan
+resume        continue an interrupted run
+cleanup       clean abandoned, stale, or completed worktrees
+help-all      show every advanced and compatibility command
+```
+
+Power-user and advanced commands:
+
+```text
+run           start one unattended coding run directly
+orchestrate   one-command review / full-plan multi-agent runs
+chain         plan and run ordered multi-step work
+plan          write an orchestration plan (no child runs yet)
+fork          start a plan's ready child runs
+merge         compose plan children into one promoted artifact
+apply         apply a completed worktree run to your branch
+export        copy a completed artifact to a normal directory
+extend        continue from a completed run
+show          inspect state, lineage, spend, files
+doc           print or export run documentation
+rewind        preview or apply a provider flight checkpoint
+history       search durable traces and provenance
+library       query promoted run artifacts
+providers     list provider routes (detect probes availability)
+detect        probe registered providers
+config        inspect or edit config keys
+update        check for or apply self-updates
+learn         index run evidence and propose improvements
+improve       run evidence-gated self-improvement candidates
+import        normalize histories from other coding tools
+undo          restore a previous turn snapshot
+abandon       remove a worktree run and temporary branch
+completion    install shell tab-completion
+```
+
+Aliases: `keep` → `apply`, `materialize` → `export`, `discard` → `abandon`,
+`prune` → `cleanup`, `follow-up` → `extend`, `continue` → `resume`,
+`stop` → `kill`, `next` → `status`.
+
 ## Troubleshooting
 
 Run:
