@@ -2136,10 +2136,7 @@ fn maybe_prompt_start_mode(
             decision.reason = "interactive picker selected one supervised coding run".to_string();
         }
         choice if choice.starts_with("extend:") => {
-            let run_id = choice
-                .strip_prefix("extend:")
-                .expect("prefix checked")
-                .to_string();
+            let run_id = choice["extend:".len()..].to_string();
             decision.selected_mode = StartSelectedMode::Extend;
             decision.selection_source = StartSelectionSource::InteractiveChoice;
             decision.reason =
@@ -2451,21 +2448,18 @@ fn prompt_start_done_criteria(
 
 fn done_criteria_inspection_try_lines(selection: &setup::DoneCriteriaSelection) -> Vec<String> {
     let mut lines = Vec::new();
-    match selection.path.as_ref() {
-        Some(path) => {
-            lines.push(format!(
-                "deadreckon def-done show --spec {}",
-                path.display()
-            ));
-            lines.push(format!(
-                "deadreckon def-done check --spec {}",
-                path.display()
-            ));
-        }
-        None => {
-            lines.push("deadreckon def-done show".to_string());
-            lines.push("deadreckon def-done check".to_string());
-        }
+    if let Some(path) = selection.path.as_ref() {
+        lines.push(format!(
+            "deadreckon def-done show --spec {}",
+            path.display()
+        ));
+        lines.push(format!(
+            "deadreckon def-done check --spec {}",
+            path.display()
+        ));
+    } else {
+        lines.push("deadreckon def-done show".to_string());
+        lines.push("deadreckon def-done check".to_string());
     }
     lines.push("deadreckon def-done \"what should count as done\"".to_string());
     lines
@@ -2525,7 +2519,7 @@ fn check_start_done_criteria(cwd: &Path, selection: &setup::DoneCriteriaSelectio
         Err(err) => {
             println!(
                 "{}",
-                ui_warn(&format!("done criteria check could not run: {err}"))
+                ui_warn(format!("done criteria check could not run: {err}"))
             );
         }
     }

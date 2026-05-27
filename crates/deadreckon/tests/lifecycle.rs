@@ -842,15 +842,20 @@ fn help_lists_lifecycle_verbs() {
     let output = deadreckon(&paths).arg("--help").output().expect("help");
     assert_success(&output);
     let stdout = stdout(&output);
-    assert!(stdout.contains("Core lifecycle:"));
+    assert!(stdout.contains("Production flow:"));
     assert!(stdout.contains("def-done"));
     assert!(stdout.contains("start"));
-    assert!(stdout.contains("finish latest"));
-    assert!(stdout.contains("orchestrate"));
+    assert!(stdout.contains("attach latest"));
     assert!(stdout.contains("status"));
+    assert!(stdout.contains("list"));
+    assert!(stdout.contains("finish latest"));
+    assert!(stdout.contains("doctor"));
+    assert!(stdout.contains("kill"));
+    assert!(stdout.contains("resume"));
     assert!(stdout.contains("cleanup"));
-    assert!(stdout.contains("completion"));
     assert!(stdout.contains("help-all"));
+    assert!(!stdout.contains("orchestrate    "));
+    assert!(!stdout.contains("completion    "));
     assert!(!stdout.contains("acceptance"));
     assert!(stdout.contains(
         "Run, chain, and plan ids accept unique prefixes where that command accepts the kind"
@@ -864,9 +869,10 @@ fn help_groups_verbs_by_lifecycle_stage() {
     let output = deadreckon(&paths).arg("--help").output().expect("help");
     assert_success(&output);
     let stdout = stdout(&output);
-    assert!(stdout.contains("Core lifecycle:"));
-    assert!(stdout.contains("Continue or recover:"));
-    assert!(stdout.contains("More help:"));
+    assert!(stdout.contains("Start, watch, keep:"));
+    assert!(stdout.contains("Setup and health:"));
+    assert!(stdout.contains("Control:"));
+    assert!(stdout.contains("Find more:"));
     assert!(!stdout.contains("Inspect And Import"));
 }
 

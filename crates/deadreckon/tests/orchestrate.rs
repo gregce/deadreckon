@@ -455,7 +455,7 @@ fn start_non_git_tty_can_choose_init_git_copy_or_fresh() {
     let output = deadreckon_pty(
         &paths,
         &source,
-        &["1", "3"],
+        &["1", "1", "3"],
         &["start", "build the app", "--preview"],
         "workspace.*fresh",
         None,
@@ -512,7 +512,7 @@ fn pty_start_picker_choose_detected_provider_preview_without_config_write() {
     let output = deadreckon_pty(
         &paths,
         &repo,
-        &["1"],
+        &["1", "1"],
         &["start", "build the app", "--mode", "run", "--preview"],
         "provider[[:space:]]*: cli:codex",
         Some(&bin),
