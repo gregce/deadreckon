@@ -2,6 +2,7 @@
 
 ## Guided first use (alpha) - 2026-05-26
 
+- Locked `deadreckon start` JSON, plain, and quiet output behavior with focused coverage for structured recovery, ANSI-free previews, and quiet successful launches.
 - Connected confirmed `deadreckon start` launches to the existing run and orchestrate handlers while keeping start previews state-free.
 - Added source-mode recovery to `deadreckon start`, including `--fresh`, `--worktree`, `--from`, and `--allow-dirty` parsing plus non-git and dirty-worktree recovery that points to valid guided commands.
 - Wired `deadreckon start` into shared provider setup and done-criteria recovery so missing providers, detected-but-unconfigured CLIs, and absent done criteria end with concrete `try:` lines instead of the placeholder launcher error.

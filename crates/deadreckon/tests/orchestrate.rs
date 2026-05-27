@@ -595,6 +595,77 @@ fn start_dispatches_explicit_review_to_orchestrate() {
 }
 
 #[test]
+fn start_preview_json_has_next_actions_and_try_lines_without_ansi() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let empty_bin = temp.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .env("PATH", &empty_bin)
+        .args(["start", "json recovery", "--preview", "--json"])
+        .output()
+        .expect("start json preview");
+
+    assert_success(&output);
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(!out.contains("\u{1b}["), "{out}");
+    let value: Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(value["kind"], "start");
+    assert_eq!(value["will_start"], false);
+    assert_eq!(value["try_lines"][0], "deadreckon init");
+    assert_eq!(value["next_actions"][0], "deadreckon init");
+}
+
+#[test]
+fn start_plain_preview_strips_ansi() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["start", "plain preview", "--preview", "--plain"])
+        .output()
+        .expect("start plain preview");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("deadreckon start preview"), "{out}");
+    assert!(!out.contains("\u{1b}["), "{out}");
+}
+
+#[test]
+fn start_quiet_success_obeys_existing_quiet_policy() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "quiet guided run",
+            "--mode",
+            "run",
+            "--yes",
+            "--quiet",
+            "--plain",
+        ])
+        .output()
+        .expect("start quiet run");
+
+    assert_success(&output);
+    assert!(stdout(&output).trim().is_empty(), "{}", stdout(&output));
+    assert!(stderr(&output).trim().is_empty(), "{}", stderr(&output));
+}
+
+#[test]
 fn run_preview_uses_same_done_and_workspace_labels() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
