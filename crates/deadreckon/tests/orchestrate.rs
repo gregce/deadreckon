@@ -341,6 +341,73 @@ fn start_preview_names_path_provider_done_workspace_and_finish() {
 }
 
 #[test]
+fn start_missing_provider_refuses_with_init_and_detect_try_lines() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let empty_bin = temp.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .env("PATH", &empty_bin)
+        .args(["start", "build the app", "--plain"])
+        .output()
+        .expect("start missing provider");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("provider"), "{err}");
+    assert!(err.contains("try: deadreckon init"), "{err}");
+    assert!(err.contains("try: deadreckon detect"), "{err}");
+}
+
+#[test]
+fn start_detected_unconfigured_provider_suggests_config_provider() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let bin = temp.path().join("bin");
+    write_fake_path_binary(&bin, "codex", "printf 'codex-cli 9.9.9\\n'\n");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .env("PATH", &bin)
+        .args(["start", "build the app", "--plain"])
+        .output()
+        .expect("start detected provider");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("cli:codex"), "{err}");
+    assert!(
+        err.contains("try: deadreckon config provider cli:codex"),
+        "{err}"
+    );
+}
+
+#[test]
+fn start_missing_done_criteria_suggests_def_done_in_non_tty() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(paths.config_path(), "default_provider = \"smoke\"\n").expect("config");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["start", "build the app", "--plain"])
+        .output()
+        .expect("start missing done criteria");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("done criteria"), "{err}");
+    assert!(err.contains("try: deadreckon def-done"), "{err}");
+    assert!(err.contains("deadreckon start \"build the app\""), "{err}");
+}
+
+#[test]
 fn run_preview_uses_same_done_and_workspace_labels() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -5031,6 +5098,17 @@ binary = "{binary}"
         ),
     )
     .expect("config");
+}
+
+fn write_fake_path_binary(root: &std::path::Path, name: &str, body: &str) {
+    fs::create_dir_all(root).expect("fake binary root");
+    let binary = root.join(name);
+    fs::write(&binary, format!("#!/bin/sh\n{body}")).expect("fake binary");
+    let mut perms = fs::metadata(&binary)
+        .expect("fake binary metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&binary, perms).expect("fake binary chmod");
 }
 
 fn write_fake_merge_repair_provider(

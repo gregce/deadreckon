@@ -1720,12 +1720,16 @@ impl StartSelectionSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartProviderSource {
+    Configured,
+    Detected,
     Missing,
 }
 
 impl StartProviderSource {
     fn label(self) -> &'static str {
         match self {
+            Self::Configured => "configured",
+            Self::Detected => "detected",
             Self::Missing => "missing",
         }
     }
@@ -1733,12 +1737,14 @@ impl StartProviderSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartDoneCriteriaSource {
+    Project,
     Missing,
 }
 
 impl StartDoneCriteriaSource {
     fn label(self) -> &'static str {
         match self {
+            Self::Project => "project",
             Self::Missing => "missing",
         }
     }
@@ -1771,9 +1777,19 @@ struct StartLaunchDecision {
     selection_source: StartSelectionSource,
     reason: String,
     provider_source: StartProviderSource,
+    provider_label: String,
     done_criteria_source: StartDoneCriteriaSource,
+    done_criteria_label: String,
     source_mode: StartSourceMode,
+    source_mode_label: String,
     requires_confirmation: bool,
+    try_lines: Vec<String>,
+    recovery: Option<StartRecovery>,
+}
+
+#[derive(Debug, Clone)]
+struct StartRecovery {
+    message: String,
     try_lines: Vec<String>,
 }
 
@@ -1802,13 +1818,14 @@ fn start_launch_decision(input: StartLaunchInput<'_>) -> StartLaunchDecision {
         selection_source,
         reason,
         provider_source: StartProviderSource::Missing,
+        provider_label: StartProviderSource::Missing.label().to_string(),
         done_criteria_source: StartDoneCriteriaSource::Missing,
+        done_criteria_label: StartDoneCriteriaSource::Missing.label().to_string(),
         source_mode: StartSourceMode::Missing,
+        source_mode_label: StartSourceMode::Missing.label().to_string(),
         requires_confirmation: false,
-        try_lines: vec![
-            "deadreckon init".to_string(),
-            "deadreckon def-done \"describe what must be true\"".to_string(),
-        ],
+        try_lines: Vec::new(),
+        recovery: None,
     }
 }
 
@@ -1940,8 +1957,8 @@ fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFa
     LaunchPreviewFacts {
         goal: &decision.goal,
         path: decision.selected_mode.path_label(),
-        provider: decision.provider_source.label(),
-        done: decision.done_criteria_source.label(),
+        provider: &decision.provider_label,
+        done: &decision.done_criteria_label,
         workspace: decision.source_mode.label(),
         watch: "deadreckon attach <after-start>".to_string(),
         stop: "deadreckon kill <after-start>".to_string(),
@@ -1950,27 +1967,153 @@ fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFa
     }
 }
 
+fn resolve_start_setup(decision: &mut StartLaunchDecision) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let defaults = config_defaults(&paths)?;
+    resolve_start_provider(decision, &paths, &defaults)?;
+    if decision.recovery.is_none() {
+        let cwd = std::env::current_dir()?;
+        resolve_start_done_criteria(decision, &cwd)?;
+    }
+    Ok(())
+}
+
+fn resolve_start_provider(
+    decision: &mut StartLaunchDecision,
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+) -> Result<()> {
+    let selection = provider_setup_selection(
+        paths,
+        setup::ProviderSetupRequest {
+            role: setup::SetupProviderRoleRef::PrimaryRun,
+            explicit_provider: None,
+            explicit_model: None,
+            config_default_provider: defaults.provider.as_deref(),
+            config_doc_provider: defaults.doc_provider.as_deref(),
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: false,
+            allow_auto_subscription: true,
+            require_usable_route: true,
+        },
+    )?;
+
+    let Some(provider) = selection.provider.as_ref() else {
+        decision.provider_source = StartProviderSource::Missing;
+        decision.provider_label = "missing provider".to_string();
+        set_start_recovery(
+            decision,
+            "provider setup is incomplete",
+            vec![
+                "deadreckon init".to_string(),
+                "deadreckon detect".to_string(),
+            ],
+        );
+        return Ok(());
+    };
+
+    decision.provider_source = match selection.source {
+        setup::SetupProviderSource::AutoSubscription => StartProviderSource::Detected,
+        setup::SetupProviderSource::Config
+        | setup::SetupProviderSource::Flag
+        | setup::SetupProviderSource::RunProvider
+        | setup::SetupProviderSource::BuiltInDefault
+        | setup::SetupProviderSource::None => StartProviderSource::Configured,
+    };
+    decision.provider_label = format!("{provider} ({})", decision.provider_source.label());
+    if matches!(decision.provider_source, StartProviderSource::Detected) {
+        set_start_recovery(
+            decision,
+            format!("detected {provider}, but no default provider is configured"),
+            vec![format!("deadreckon config provider {provider}")],
+        );
+    }
+    Ok(())
+}
+
+fn resolve_start_done_criteria(decision: &mut StartLaunchDecision, cwd: &Path) -> Result<()> {
+    let source = resolve_acceptance_source(cwd, None)?;
+    if source.is_some() {
+        let selection = done_criteria_selection(&source)?;
+        decision.done_criteria_source = StartDoneCriteriaSource::Project;
+        decision.done_criteria_label = selection.full_label();
+        return Ok(());
+    }
+
+    decision.done_criteria_source = StartDoneCriteriaSource::Missing;
+    decision.done_criteria_label = "missing done criteria".to_string();
+    set_start_recovery(
+        decision,
+        "done criteria are missing for this repo",
+        vec![format!(
+            "deadreckon def-done \"what should count as done\" && deadreckon start \"{}\"",
+            shell_display_quote(&decision.goal)
+        )],
+    );
+    Ok(())
+}
+
+fn set_start_recovery(
+    decision: &mut StartLaunchDecision,
+    message: impl Into<String>,
+    try_lines: Vec<String>,
+) {
+    decision.try_lines = try_lines.clone();
+    decision.recovery = Some(StartRecovery {
+        message: message.into(),
+        try_lines,
+    });
+}
+
+fn start_recovery_error(recovery: &StartRecovery) -> CliError {
+    CliError::Exit {
+        code: 1,
+        message: recovery.message.clone(),
+        hint: recovery
+            .try_lines
+            .iter()
+            .map(|line| format!("try: {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn shell_display_quote(value: &str) -> String {
+    value.replace('"', "\\\"")
+}
+
 async fn start_command(args: StartCommandArgs) -> Result<()> {
-    let decision = start_launch_decision(StartLaunchInput {
+    let mut decision = start_launch_decision(StartLaunchInput {
         goal: &args.goal,
         requested_mode: args.mode,
         stdin_is_tty: io::stdin().is_terminal(),
     });
+    resolve_start_setup(&mut decision)?;
     if args.json {
+        let next_actions = if decision.recovery.is_some() {
+            decision.try_lines.clone()
+        } else {
+            vec![
+                "deadreckon start launch dispatch is implemented in the next guided phase"
+                    .to_string(),
+            ]
+        };
         let payload = json!({
             "kind": "start",
             "goal": decision.goal,
             "selected_mode": decision.selected_mode.label(),
             "selection_source": decision.selection_source.label(),
             "reason": decision.reason,
-            "provider": decision.provider_source.label(),
-            "done_criteria": decision.done_criteria_source.label(),
+            "provider": decision.provider_label,
+            "provider_source": decision.provider_source.label(),
+            "done_criteria": decision.done_criteria_label,
+            "done_criteria_source": decision.done_criteria_source.label(),
             "source_mode": decision.source_mode.label(),
             "requires_confirmation": decision.requires_confirmation,
             "will_start": false,
-            "next_actions": [
-                "deadreckon start launch decisions are implemented in the next guided phase"
-            ],
+            "next_actions": next_actions,
             "try_lines": decision.try_lines
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -1992,9 +2135,9 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
             ("mode", mode),
             ("selection", decision.selection_source.label()),
             ("reason", &decision.reason),
-            ("provider", decision.provider_source.label()),
-            ("done", decision.done_criteria_source.label()),
-            ("workspace", decision.source_mode.label()),
+            ("provider", &decision.provider_label),
+            ("done", &decision.done_criteria_label),
+            ("workspace", &decision.source_mode_label),
             (
                 "confirmation",
                 if decision.requires_confirmation {
@@ -2007,6 +2150,9 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
             ("confirmed", if args.yes { "yes" } else { "no" }),
             ("plain", if args.plain { "yes" } else { "no" }),
         ]);
+    }
+    if let Some(recovery) = decision.recovery.as_ref() {
+        return Err(start_recovery_error(recovery));
     }
     Err(CliError::Exit {
         code: 1,
