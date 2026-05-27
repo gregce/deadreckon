@@ -12,9 +12,9 @@ use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
 use std::fs;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 mod setup;
 
@@ -37,9 +37,10 @@ use deadreckon::ui_card::{
     Card, CardOptions, HintLine, Section, TitleGlyph, TitleLine, render_card,
 };
 use deadreckon_core::flight::{
-    CheckpointManifest, FlightEvent, FlightEventKind, FlightSessionStatus, RewindEvent, RewindMode,
-    RewindStatus, RewindTarget, RewindTargetKind, append_rewind_event, build_working_file_index,
-    list_checkpoint_manifests, materialize_checkpoint, read_flight_events, read_flight_manifest,
+    CheckpointManifest, FLIGHT_EVENTS_JSONL, FlightEvent, FlightEventKind, FlightSessionStatus,
+    RewindEvent, RewindMode, RewindStatus, RewindTarget, RewindTargetKind, append_rewind_event,
+    build_working_file_index, list_checkpoint_manifests, materialize_checkpoint,
+    read_flight_events, read_flight_manifest,
 };
 use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt, write_receipt};
 use deadreckon_core::learning::{
@@ -23540,6 +23541,11 @@ async fn attach_tui_with_parent(
     let mut quiet_tracker = NarrativeQuietRefreshTracker::new(Utc::now());
     let mut acceptance_tracker = NarrativeAcceptanceRefreshTracker::default();
     let mut narrative_refresh_job: Option<AttachRunNarrativeRefreshJob> = None;
+    let mut spend_tail =
+        AttachJsonlTail::<SpendRecord>::new(initial_state.run_root.join("spend.jsonl"));
+    let mut trace_tail =
+        AttachJsonlTail::<TraceRecord>::new(initial_state.run_root.join("traces.jsonl"));
+    let mut provider_activity_cache = AttachProviderActivityCache::new(&initial_state);
 
     let result = loop {
         let mut tick = AttachTickTiming::new(AttachSurface::Run, AttachTickBudget::default());
@@ -23548,8 +23554,10 @@ async fn attach_tui_with_parent(
         let state = load_run(paths, run_id)?;
         tick.record_since(AttachLoopStage::LoadState, stage_started);
         let stage_started = Instant::now();
-        let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
-        let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
+        spend_tail.reset_to_path(state.run_root.join("spend.jsonl"));
+        trace_tail.reset_to_path(state.run_root.join("traces.jsonl"));
+        let spend = spend_tail.refresh()?;
+        let traces = trace_tail.refresh()?;
         tick.record_since(AttachLoopStage::ReadJsonl, stage_started);
         let stage_started = Instant::now();
         let new_events = event_feed.refresh(std::time::Duration::ZERO).await?;
@@ -23557,7 +23565,8 @@ async fn attach_tui_with_parent(
         let run_event_refresh = run_narrative_refresh_trigger(&new_events);
         events.extend(new_events);
         let stage_started = Instant::now();
-        let live = collect_attach_live(&state);
+        let provider_activity = provider_activity_cache.refresh(&state);
+        let live = collect_attach_live_with_provider_activity(&state, provider_activity);
         tick.record_since(AttachLoopStage::LiveCollect, stage_started);
         let event_refresh =
             run_event_refresh.or_else(|| acceptance_tracker.observe(&live.acceptance));
@@ -23569,7 +23578,7 @@ async fn attach_tui_with_parent(
         let terminal_area =
             ratatui::layout::Rect::new(0, 0, terminal_size.width, terminal_size.height);
         let panel_layout = attach_panel_layout(terminal_area);
-        let panel_counts = attach_panel_counts(&state, &spend, &traces, &events, &live, &tui_state);
+        let panel_counts = attach_panel_counts(&state, spend, traces, &events, &live, &tui_state);
         tui_state.clamp(panel_counts, panel_layout.rows);
         let auto_refresh = event_refresh.or_else(|| {
             if tui_state.view.is_narrative() {
@@ -23588,8 +23597,8 @@ async fn attach_tui_with_parent(
             let stage_started = Instant::now();
             let input = RunNarrativeRenderInput {
                 state: &state,
-                spend: &spend,
-                traces: &traces,
+                spend,
+                traces,
                 events: &events,
                 live: &live,
                 tui_state: &tui_state,
@@ -23604,7 +23613,7 @@ async fn attach_tui_with_parent(
         }
         let stage_started = Instant::now();
         terminal.draw(|frame| {
-            render_attach(frame, &state, &spend, &traces, &events, &live, &tui_state)
+            render_attach(frame, &state, spend, traces, &events, &live, &tui_state)
         })?;
         tick.record_since(AttachLoopStage::Draw, stage_started);
 
@@ -23632,8 +23641,8 @@ async fn attach_tui_with_parent(
                     let provider_stage_started = Instant::now();
                     let input = RunNarrativeRenderInput {
                         state: &state,
-                        spend: &spend,
-                        traces: &traces,
+                        spend,
+                        traces,
                         events: &events,
                         live: &live,
                         tui_state: &tui_state,
@@ -23655,7 +23664,7 @@ async fn attach_tui_with_parent(
                     );
                     let stage_started = Instant::now();
                     terminal.draw(|frame| {
-                        render_attach(frame, &state, &spend, &traces, &events, &live, &tui_state)
+                        render_attach(frame, &state, spend, traces, &events, &live, &tui_state)
                     })?;
                     tick.record_since(AttachLoopStage::Draw, stage_started);
                 }
@@ -24175,6 +24184,119 @@ struct AttachLiveInventory {
 
 const ATTACH_LIVE_FILE_DISPLAY_LIMIT: usize = 240;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachJsonlSignature {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug)]
+struct AttachJsonlTail<T> {
+    path: PathBuf,
+    offset: u64,
+    rows: Vec<T>,
+    signature: Option<AttachJsonlSignature>,
+}
+
+impl<T> AttachJsonlTail<T>
+where
+    T: DeserializeOwned,
+{
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            offset: 0,
+            rows: Vec::new(),
+            signature: None,
+        }
+    }
+
+    fn reset_to_path(&mut self, path: PathBuf) {
+        if self.path != path {
+            self.path = path;
+            self.offset = 0;
+            self.rows.clear();
+            self.signature = None;
+        }
+    }
+
+    fn refresh(&mut self) -> Result<&[T]> {
+        let Ok(metadata) = fs::metadata(&self.path) else {
+            self.offset = 0;
+            self.rows.clear();
+            self.signature = None;
+            return Ok(&self.rows);
+        };
+        let modified = metadata.modified().ok();
+        let len = metadata.len();
+        let current_signature = AttachJsonlSignature { len, modified };
+        if self.signature == Some(current_signature) {
+            return Ok(&self.rows);
+        }
+        if len < self.offset
+            || (len == self.offset
+                && self
+                    .signature
+                    .is_some_and(|previous| previous.modified != modified))
+        {
+            self.offset = 0;
+            self.rows.clear();
+        }
+        if len == self.offset {
+            self.signature = Some(current_signature);
+            return Ok(&self.rows);
+        }
+
+        let mut file = fs::File::open(&self.path)?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let Some(complete_len) = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+        else {
+            return Ok(&self.rows);
+        };
+        let complete = String::from_utf8_lossy(&bytes[..complete_len]);
+        for line in complete.lines().filter(|line| !line.trim().is_empty()) {
+            if let Ok(row) = serde_json::from_str(line) {
+                self.rows.push(row);
+            }
+        }
+        self.offset = self.offset.saturating_add(complete_len as u64);
+        self.signature = Some(AttachJsonlSignature {
+            len: self.offset,
+            modified,
+        });
+        Ok(&self.rows)
+    }
+}
+
+#[derive(Debug)]
+struct AttachProviderActivityCache {
+    flight_tail: AttachJsonlTail<FlightEvent>,
+}
+
+impl AttachProviderActivityCache {
+    fn new(state: &deadreckon_core::PipelineState) -> Self {
+        Self {
+            flight_tail: AttachJsonlTail::new(state.run_root.join(FLIGHT_EVENTS_JSONL)),
+        }
+    }
+
+    fn refresh(&mut self, state: &deadreckon_core::PipelineState) -> ProviderActivity {
+        self.flight_tail
+            .reset_to_path(state.run_root.join(FLIGHT_EVENTS_JSONL));
+        let flight = self
+            .flight_tail
+            .refresh()
+            .map(collect_flight_provider_activity_from_events)
+            .unwrap_or_default();
+        collect_provider_activity_from_flight(state, flight)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AcceptanceLive {
     status: AcceptanceUiStatus,
@@ -24226,12 +24348,19 @@ struct LivePid {
 }
 
 fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
+    let provider_activity = collect_provider_activity(state);
+    collect_attach_live_with_provider_activity(state, provider_activity)
+}
+
+fn collect_attach_live_with_provider_activity(
+    state: &deadreckon_core::PipelineState,
+    provider_activity: ProviderActivity,
+) -> AttachLive {
     let inventory = attach_live_inventory(&state.working_dir);
     let pids = supervised_pids(state)
         .into_iter()
         .map(live_pid)
         .collect::<Vec<_>>();
-    let provider_activity = collect_provider_activity(state);
     let acceptance = collect_acceptance_live(state);
     AttachLive {
         file_count: inventory.file_count,
@@ -24535,7 +24664,13 @@ struct ProviderJsonlLogSpec {
 }
 
 fn collect_provider_activity(state: &deadreckon_core::PipelineState) -> ProviderActivity {
-    let mut flight = collect_flight_provider_activity(state);
+    collect_provider_activity_from_flight(state, collect_flight_provider_activity(state))
+}
+
+fn collect_provider_activity_from_flight(
+    state: &deadreckon_core::PipelineState,
+    mut flight: ProviderActivity,
+) -> ProviderActivity {
     let Some(spec) = provider_jsonl_log_spec(state) else {
         return flight;
     };
@@ -24560,13 +24695,17 @@ fn collect_flight_provider_activity(state: &deadreckon_core::PipelineState) -> P
     let Ok(events) = read_flight_events(state) else {
         return ProviderActivity::default();
     };
+    collect_flight_provider_activity_from_events(&events)
+}
+
+fn collect_flight_provider_activity_from_events(events: &[FlightEvent]) -> ProviderActivity {
     let mut activity = ProviderActivity::default();
     for event in events {
         if let Some(usage) = event.usage.as_ref() {
             activity.context_tokens = Some(usage.input_tokens + usage.output_tokens);
             activity.context_window = usage.context_window;
         }
-        activity.lines.push(flight_activity_line(&event));
+        activity.lines.push(flight_activity_line(event));
     }
     cap_provider_activity(activity, 240)
 }
@@ -27888,15 +28027,15 @@ mod tui_tests {
 
     use super::{
         ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachActionNotice,
-        AttachLive, AttachLoopStage, AttachNarrativeRefreshState, AttachPanel, AttachPanelCounts,
-        AttachPanelRows, AttachParentPlan, AttachPlanNarrativeRefreshJob, AttachSurface,
-        AttachTickBudget, AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode,
-        COMMAND_HELP_CATALOG, ChainAttachTuiState, CommandDiscovery, CommandHelpEntry,
-        CompletionAction, HELP_ALL_GROUPS, LiveFile, NarrativeAcceptanceRefreshTracker,
-        NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode,
-        PlanAttachRenderState, PlanFeedEvent, PlanNarrativeRefreshInput, ProviderActivity,
-        ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines, attach_banner,
-        attach_header_text, attach_live_inventory, attach_loop_stage_work,
+        AttachJsonlTail, AttachLive, AttachLoopStage, AttachNarrativeRefreshState, AttachPanel,
+        AttachPanelCounts, AttachPanelRows, AttachParentPlan, AttachPlanNarrativeRefreshJob,
+        AttachProviderActivityCache, AttachSurface, AttachTickBudget, AttachTickTiming,
+        AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG, ChainAttachTuiState,
+        CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS, LiveFile,
+        NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker, NarrativeRefreshKind,
+        NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent, PlanNarrativeRefreshInput,
+        ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines,
+        attach_banner, attach_header_text, attach_live_inventory, attach_loop_stage_work,
         attach_should_return_to_plan, cancel_plan_narrative_refresh_job, chain_activity_lines,
         chain_attach_footer_text, chain_attach_header_text, chain_narrative_refusal_text,
         chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
@@ -27919,13 +28058,14 @@ mod tui_tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use clap::CommandFactory;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use deadreckon_core::flight::{FLIGHT_EVENTS_JSONL, FlightEvent, FlightEventKind, FlightUsage};
     use deadreckon_core::{
         ApplyMode, ApplyStrategy, BranchPolicy, CapabilityPreview, Chain, ChainEvent,
         ChainEventKind, ChainNewOptions, ChainStatus, ChainStepStatus, DeadreckonPaths, DocKind,
         NetworkCapability, OnFail, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
         PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunEvent,
-        RunEventKind, RunOptions, RunStatus, SpendRecord, append_plan_event, create_run,
-        doc_path_for_kind, save_plan,
+        RunEventKind, RunOptions, RunStatus, SpendRecord, TraceRecord, append_plan_event,
+        create_run, doc_path_for_kind, save_plan,
     };
     use deadreckon_providers::SpendEstimate;
     use deadreckon_providers::registry::{
@@ -28351,6 +28491,158 @@ mod tui_tests {
                 .last()
                 .is_some_and(|line| line == "... 3 more files not shown")
         );
+    }
+
+    #[test]
+    fn attach_jsonl_tail_reads_only_appended_rows() {
+        let temp = test_tempdir();
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(&path, "{\"n\":1}\n").expect("jsonl");
+        let mut tail = AttachJsonlTail::<serde_json::Value>::new(path.clone());
+
+        assert_eq!(tail.refresh().expect("first").len(), 1);
+        append_jsonl_raw(&path, "{\"n\":2}");
+        assert_eq!(tail.refresh().expect("second").len(), 2);
+        assert_eq!(tail.refresh().expect("third").len(), 2);
+    }
+
+    #[test]
+    fn attach_jsonl_tail_tolerates_partial_last_line() {
+        let temp = test_tempdir();
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(&path, "{\"n\":1}\n{\"n\"").expect("partial");
+        let mut tail = AttachJsonlTail::<serde_json::Value>::new(path.clone());
+
+        assert_eq!(tail.refresh().expect("partial read").len(), 1);
+        append_raw(&path, ":2}\n");
+        let rows = tail.refresh().expect("completed partial");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["n"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn run_attach_spend_and_trace_cache_updates_from_mtime() {
+        let temp = test_tempdir();
+        let spend_path = temp.path().join("spend.jsonl");
+        let trace_path = temp.path().join("traces.jsonl");
+        let mut spend_tail = AttachJsonlTail::<SpendRecord>::new(spend_path.clone());
+        let mut trace_tail = AttachJsonlTail::<TraceRecord>::new(trace_path.clone());
+        append_jsonl_value(&spend_path, &spend_record(1));
+        append_jsonl_value(&trace_path, &trace_record("run-1", 1));
+
+        assert_eq!(spend_tail.refresh().expect("spend first").len(), 1);
+        assert_eq!(trace_tail.refresh().expect("trace first").len(), 1);
+
+        append_jsonl_value(&spend_path, &spend_record(2));
+        append_jsonl_value(&trace_path, &trace_record("run-1", 2));
+
+        assert_eq!(spend_tail.refresh().expect("spend second").len(), 2);
+        assert_eq!(trace_tail.refresh().expect("trace second").len(), 2);
+    }
+
+    #[test]
+    fn run_attach_flight_activity_uses_incremental_rows() {
+        let (_temp, state) = doc_preview_state();
+        let path = state.run_root.join(FLIGHT_EVENTS_JSONL);
+        append_jsonl_value(&path, &flight_event(&state.run_id, 1, None));
+        let mut cache = AttachProviderActivityCache::new(&state);
+
+        let activity = cache.refresh(&state);
+        assert_eq!(activity.lines.len(), 1);
+        assert!(activity.lines[0].contains("flight #000001"));
+
+        append_jsonl_value(
+            &path,
+            &flight_event(
+                &state.run_id,
+                2,
+                Some(FlightUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    context_window: Some(100),
+                }),
+            ),
+        );
+        let activity = cache.refresh(&state);
+
+        assert_eq!(activity.lines.len(), 2);
+        assert!(activity.lines[1].contains("flight #000002"));
+        assert_eq!(activity.context_tokens, Some(15));
+        assert_eq!(activity.context_window, Some(100));
+        assert_eq!(cache.refresh(&state).lines.len(), 2);
+    }
+
+    fn append_jsonl_raw(path: &std::path::Path, raw: &str) {
+        append_raw(path, &format!("{raw}\n"));
+    }
+
+    fn append_raw(path: &std::path::Path, raw: &str) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open jsonl");
+        file.write_all(raw.as_bytes()).expect("write jsonl");
+    }
+
+    fn append_jsonl_value<T: serde::Serialize>(path: &std::path::Path, value: &T) {
+        append_jsonl_raw(path, &serde_json::to_string(value).expect("json"));
+    }
+
+    fn spend_record(turn: u32) -> SpendRecord {
+        SpendRecord {
+            timestamp: Utc::now(),
+            turn,
+            provider: "cli:test".to_string(),
+            model: "test".to_string(),
+            input_tokens: turn as u64,
+            output_tokens: 2 * turn as u64,
+            cost_usd: 0.0,
+            total_cost_usd: 0.0,
+            cap_usd: None,
+            subscription: false,
+            estimated: false,
+            wall_time_seconds: None,
+            wall_time_cap_seconds: None,
+        }
+    }
+
+    fn trace_record(run_id: &str, turn: u32) -> TraceRecord {
+        TraceRecord {
+            timestamp: Utc::now(),
+            run_id: run_id.to_string(),
+            turn,
+            event: "test".to_string(),
+            latency_ms: None,
+            detail: serde_json::json!({ "turn": turn }),
+        }
+    }
+
+    fn flight_event(run_id: &str, seq: u64, usage: Option<FlightUsage>) -> FlightEvent {
+        FlightEvent {
+            version: 1,
+            seq,
+            run_id: run_id.to_string(),
+            flight_session_id: "flight-test".to_string(),
+            deadreckon_turn: 1,
+            attempt: 1,
+            provider: "cli:test".to_string(),
+            schema: "test".to_string(),
+            timestamp: Some(Utc::now()),
+            source_path: None,
+            source_line: Some(seq),
+            source_event: format!("event-{seq}"),
+            raw_hash: format!("hash-{seq}"),
+            kind: FlightEventKind::Tool,
+            role: None,
+            summary: format!("tool event {seq}"),
+            tool_name: Some("edit".to_string()),
+            tool_category: Some("write".to_string()),
+            files: Vec::new(),
+            usage,
+            checkpoint_id: None,
+        }
     }
 
     fn line_text(line: &Line<'_>) -> String {
