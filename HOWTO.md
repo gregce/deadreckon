@@ -3,6 +3,20 @@
 This repo builds a Rust CLI named `deadreckon` for unattended coding runs.
 The CLI is the control plane; the TUI is an attachable live dashboard.
 
+DeadReckon is for people who already use agent CLIs and need unattended,
+sandboxed, auditable work with a real definition of done. It is the harness around
+those harnesses: provider CLIs do the coding while DeadReckon owns isolation,
+done criteria, lifecycle, logs, evidence, recovery, and promotion. It supervises
+agent CLIs instead of replacing them.
+
+For a first serious run:
+
+```bash
+deadreckon start "build the app"
+deadreckon attach latest
+deadreckon finish latest
+```
+
 ## Build And Install Alias
 
 ```bash

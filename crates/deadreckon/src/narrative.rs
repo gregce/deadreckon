@@ -3044,9 +3044,11 @@ mod tests {
 
     #[test]
     fn narrative_redaction_removes_secret_like_values_before_provider_input() {
-        let report = redact_for_provider(
-            "\u{1b}[31mtoken=sk-testsecret123456789 user@example.com -----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        let raw = format!(
+            "{}[31mtoken=sk-testsecret123456789 user@example.com -----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+            '\u{1b}'
         );
+        let report = redact_for_provider(&raw);
 
         assert!(report.text.contains("<redacted-secret>"));
         assert!(report.text.contains("<redacted-email>"));

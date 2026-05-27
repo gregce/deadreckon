@@ -1,5 +1,9 @@
 # Changelog
 
+## Guided first use (alpha) - 2026-05-26
+
+- Clarified DeadReckon's audience as the harness around agent CLIs for unattended, sandboxed, auditable work, and pointed first-use help/docs at `deadreckon start`.
+
 ## TUI Responsiveness (alpha) - 2026-05-26
 
 - Added in-memory attach tick budgets and loop-stage timing for run, plan, and chain attach surfaces, with provider narrative refresh classified as background work for the responsive attach scheduler.

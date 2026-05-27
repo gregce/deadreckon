@@ -422,6 +422,77 @@ fn all_scope_flag_help_uses_scope_vocabulary() {
 }
 
 #[test]
+fn top_help_names_audience_and_start_path() {
+    let top = help(["--help"]);
+
+    assert!(
+        top.contains("already use agent CLIs"),
+        "top help should name the intended audience:\n{top}"
+    );
+    assert!(
+        top.contains("unattended, sandboxed, auditable work"),
+        "top help should say why DeadReckon exists:\n{top}"
+    );
+    assert!(
+        top.contains("deadreckon start \"build the app\""),
+        "top help should point first-time users at start:\n{top}"
+    );
+}
+
+#[test]
+fn public_docs_first_screen_explains_harness_of_harnesses() {
+    for relative in ["README.md", "HOWTO.md"] {
+        let first_screen = repo_file_text(relative)
+            .lines()
+            .take(35)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            first_screen.contains("harness around"),
+            "{relative} first screen should describe DeadReckon as a harness:\n{first_screen}"
+        );
+        assert!(
+            first_screen.contains("agent CLI") || first_screen.contains("agent CLIs"),
+            "{relative} first screen should name agent CLI users:\n{first_screen}"
+        );
+        assert!(
+            first_screen.contains("deadreckon start \"build the app\""),
+            "{relative} first screen should show the guided first command:\n{first_screen}"
+        );
+    }
+}
+
+#[test]
+fn audience_copy_does_not_call_deadreckon_a_provider_replacement() {
+    let docs = [
+        help(["--help"]),
+        repo_file_text("README.md"),
+        repo_file_text("HOWTO.md"),
+        repo_file_text("docs/AS-BUILT-ARCHITECTURE.md"),
+    ]
+    .join("\n");
+
+    for stale in [
+        "provider replacement",
+        "replaces your provider",
+        "replaces provider CLIs",
+        "replacement for Claude",
+        "replacement for Codex",
+        "autonomous employee",
+        "cloud IDE",
+    ] {
+        assert!(
+            !docs.to_lowercase().contains(&stale.to_lowercase()),
+            "public copy should avoid overclaim `{stale}`"
+        );
+    }
+    assert!(
+        docs.contains("instead of replacing them") || docs.contains("not a provider replacement"),
+        "public copy should explicitly frame providers as supervised, not replaced"
+    );
+}
+
+#[test]
 fn top_help_uses_canonical_discovery_words() {
     let top = help(["--help"]);
     for command in ["detect", "providers", "update", "history"] {

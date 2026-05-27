@@ -114,6 +114,7 @@ use uuid::Uuid;
 mod cli;
 mod narrative;
 mod plan_event_bus;
+mod product;
 mod prompt;
 mod tui_events;
 mod ui;
@@ -939,8 +940,7 @@ struct CommandHelpEntry {
 }
 
 const TYPICAL_FLOW_COMMANDS: &[&str] = &[
-    "deadreckon def-done \"builds, tests pass, and opens in a browser\"",
-    "deadreckon run \"build the thing\"",
+    product::PRODUCT_FIRST_COMMAND,
     "deadreckon attach latest",
     "deadreckon finish latest",
 ];
@@ -1330,9 +1330,9 @@ fn print_top_help() {
         ui_heading("deadreckon"),
         ui_muted(env!("CARGO_PKG_VERSION"))
     );
-    println!(
-        "deadreckon runs long coding goals in an isolated worktree or sandbox, tracks durable state, and gives you explicit apply/export/cleanup steps."
-    );
+    println!("{}", product::PRODUCT_AUDIENCE);
+    println!("{}", product::PRODUCT_HARNESS);
+    println!("{}", product::PRODUCT_NOT_PROVIDER_REPLACEMENT);
     println!();
     println!("{}", ui_heading("Usage:"));
     println!("  {}", ui_command("deadreckon [command]"));

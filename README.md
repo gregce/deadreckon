@@ -6,15 +6,17 @@
 
 **A harness around the agent CLI you already use, so you can actually walk away.**
 
-Claude Code, Codex, Cursor CLI, and the rest are good at writing code. They are not built to run unattended for hours and tell you, honestly, whether the work got done. deadreckon is.
+deadreckon is for builders, maintainers, founders, and engineering leads who already use agent CLIs and need those agents to run longer, safer, and more accountably than a raw terminal session allows.
+
+Claude Code, Codex, Cursor CLI, and the rest are good at writing code. They are not built to run unattended for hours and tell you, honestly, whether the work got done. deadreckon supervises them instead of replacing them.
 
 You bring the agent CLI you already trust. You tell deadreckon what "done" looks like in plain English. It runs the work in an isolated sandbox, saves every turn, and uses a separate watchdog process to decide when the run is actually finished: a watchdog the agent cannot fool.
 
 ```bash
-deadreckon def-done "users can sign up, log in, and save a drawing"
-deadreckon run "build the app"
+deadreckon start "build the app"
 # walk away, attach later from any terminal
 deadreckon attach latest
+deadreckon finish latest
 ```
 
 > [!TIP]
