@@ -110,6 +110,23 @@ Modes:
   In a git repo, the default is an isolated worktree.
   Use `--fresh`, `--from <dir>`, `--worktree`, or `--in-place --i-know-its-a-lot` to force a mode.";
 
+const START_HELP: &str = "\
+Lifecycle:
+  deadreckon start \"build the app\"
+  deadreckon attach latest
+  deadreckon status latest
+  deadreckon finish latest
+
+Power users:
+  deadreckon run \"build the app\"
+  deadreckon orchestrate \"build and review the app\"
+
+Modes:
+  auto picks a conservative path and explains why.
+  run starts one supervised coding run.
+  review runs a coder/reviewer orchestration.
+  full-plan plans, forks, and merges multi-agent work.";
+
 const ORCHESTRATE_HELP: &str = "\
 Lifecycle:
   deadreckon orchestrate review \"build the thing\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes
@@ -550,6 +567,32 @@ pub(crate) enum Commands {
             help = "Working directory to check; defaults to current directory"
         )]
         against: Option<PathBuf>,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Guided front door for a run or orchestration",
+        after_help = START_HELP
+    )]
+    Start {
+        #[arg(help = "Natural-language coding goal")]
+        goal: String,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = CliStartMode::Auto,
+            help = "Guided path: auto, run, review, or full-plan"
+        )]
+        mode: CliStartMode,
+        #[arg(long, help = "Show the resolved launch preview without starting work")]
+        preview: bool,
+        #[arg(long, help = "Confirm the launch preview without prompting")]
+        yes: bool,
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
+        plain: bool,
+        #[arg(long, help = "Suppress success chatter and post-action hints")]
+        quiet: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -1486,6 +1529,25 @@ pub(crate) enum CliPlanMode {
     Review,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliStartMode {
+    Auto,
+    Run,
+    Review,
+    FullPlan,
+}
+
+impl CliStartMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Run => "run",
+            Self::Review => "review",
+            Self::FullPlan => "full-plan",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum OrchestrateCommand {
     #[command(
@@ -2018,6 +2080,16 @@ pub(crate) struct RunCommandArgs {
     pub(crate) no_hints: bool,
     pub(crate) no_docs: bool,
     pub(crate) doc_skill: Option<String>,
+}
+
+pub(crate) struct StartCommandArgs {
+    pub(crate) goal: String,
+    pub(crate) mode: CliStartMode,
+    pub(crate) preview: bool,
+    pub(crate) yes: bool,
+    pub(crate) plain: bool,
+    pub(crate) quiet: bool,
+    pub(crate) json: bool,
 }
 
 pub(crate) struct PlanCommandArgs {

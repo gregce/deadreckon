@@ -440,6 +440,59 @@ fn top_help_names_audience_and_start_path() {
 }
 
 #[test]
+fn start_command_is_visible_in_top_help_and_help_all() {
+    let top = help(["--help"]);
+    let all = help(["help-all"]);
+
+    for text in [&top, &all] {
+        assert!(
+            text.contains("start"),
+            "guided start command should be discoverable:\n{text}"
+        );
+        assert!(
+            text.contains("deadreckon start \"build the app\""),
+            "guided first command should be shown:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn start_mode_values_parse_and_reject_unknown_modes() {
+    let start_help = help(["start", "--help"]);
+    for mode in ["auto", "run", "review", "full-plan"] {
+        assert!(
+            start_help.contains(mode),
+            "missing mode {mode}:\n{start_help}"
+        );
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .args(["start", "build the app", "--mode", "unknown", "--preview"])
+        .output()
+        .expect("start invalid mode");
+    assert!(!output.status.success(), "unknown mode should fail");
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("unknown") && stderr.contains("possible values"),
+        "unknown mode should show valid values:\n{stderr}"
+    );
+}
+
+#[test]
+fn start_help_points_to_run_or_orchestrate_for_power_users() {
+    let start_help = help(["start", "--help"]);
+
+    assert!(
+        start_help.contains("deadreckon run \"build the app\""),
+        "start help should point power users at run:\n{start_help}"
+    );
+    assert!(
+        start_help.contains("deadreckon orchestrate \"build and review the app\""),
+        "start help should point power users at orchestrate:\n{start_help}"
+    );
+}
+
+#[test]
 fn public_docs_first_screen_explains_harness_of_harnesses() {
     for relative in ["README.md", "HOWTO.md"] {
         let first_screen = repo_file_text(relative)

@@ -2,6 +2,7 @@
 
 ## Guided first use (alpha) - 2026-05-26
 
+- Added the visible `deadreckon start` parser and help surface for the guided front door.
 - Clarified DeadReckon's audience as the harness around agent CLIs for unattended, sandboxed, auditable work, and pointed first-use help/docs at `deadreckon start`.
 
 ## TUI Responsiveness (alpha) - 2026-05-26

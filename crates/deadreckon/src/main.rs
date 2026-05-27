@@ -123,7 +123,7 @@ use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, CliPlanMode, Commands,
     CompletionCommand, ConfigCommand, ExtendCommandArgs, ForkCommandArgs, HistoryCommand,
     HistoryKind, ImproveCommand, LearnCommand, LibraryCommand, MergeCommandArgs,
-    OrchestrateCommand, PlanCommandArgs, ProvidersCommand, RunCommandArgs,
+    OrchestrateCommand, PlanCommandArgs, ProvidersCommand, RunCommandArgs, StartCommandArgs,
 };
 use crate::narrative::{AttachViewMode, NarrativeVisualMode};
 use crate::plan_event_bus::{PlanEventBus, PlanFeedEvent};
@@ -288,6 +288,27 @@ async fn main_inner() -> Result<()> {
             spec,
             against,
         } => done_command(args, provider, model, force, spec, against).await,
+        Commands::Start {
+            goal,
+            mode,
+            preview,
+            yes,
+            plain,
+            quiet,
+            json,
+        } => {
+            ui::set_plain_output(plain || json);
+            start_command(StartCommandArgs {
+                goal,
+                mode,
+                preview,
+                yes,
+                plain,
+                quiet,
+                json,
+            })
+            .await
+        }
         Commands::Run {
             goal,
             fresh,
@@ -996,6 +1017,13 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         all_group: Some(HelpAllGroup::CoreLifecycle),
     },
     CommandHelpEntry {
+        display: "start",
+        clap_name: Some("start"),
+        purpose: "guided front door for a run or orchestration",
+        top_group: Some(TopHelpGroup::CoreLifecycle),
+        all_group: Some(HelpAllGroup::CoreLifecycle),
+    },
+    CommandHelpEntry {
         display: "run",
         clap_name: Some("run"),
         purpose: "start unattended coding work",
@@ -1371,6 +1399,11 @@ fn print_help_all() {
     {
         println!("{}", ui_muted(HELP_ALL_DISCOVERY_NOTE));
     }
+    println!();
+    println!("{}", ui_heading("typical flow"));
+    for command in TYPICAL_FLOW_COMMANDS {
+        println!("  {}", ui_command(command));
+    }
     for (group, title) in HELP_ALL_GROUPS {
         println!();
         println!("{}", ui_heading(title));
@@ -1641,6 +1674,42 @@ async fn init_command(
 
 fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String> {
     setup::auto_subscription_cli_provider(registry)
+}
+
+async fn start_command(args: StartCommandArgs) -> Result<()> {
+    if args.json {
+        let payload = json!({
+            "kind": "start",
+            "goal": args.goal,
+            "selected_mode": args.mode.label(),
+            "will_start": false,
+            "next_actions": [
+                "deadreckon start launch decisions are implemented in the next guided phase"
+            ],
+            "try_lines": [
+                "deadreckon run \"build the app\"",
+                "deadreckon orchestrate \"build and review the app\""
+            ]
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    if !args.quiet {
+        println!("{}", ui_heading("guided start"));
+        let mode = args.mode.label();
+        print_kv_block(&[
+            ("goal", &args.goal),
+            ("mode", mode),
+            ("preview", if args.preview { "yes" } else { "no" }),
+            ("confirmed", if args.yes { "yes" } else { "no" }),
+            ("plain", if args.plain { "yes" } else { "no" }),
+        ]);
+    }
+    Err(CliError::Exit {
+        code: 1,
+        message: "guided start launch decisions are not wired yet".to_string(),
+        hint: "try: deadreckon run \"build the app\"".to_string(),
+    })
 }
 
 fn setup_refusal_error(refusal: setup::SetupRefusal) -> CliError {
