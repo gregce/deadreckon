@@ -139,6 +139,7 @@ Modes:
 Interactive:
   In a TTY, start uses selection prompts for mode, provider, done criteria,
   source mode, and final confirmation when flags do not decide them.
+  Review/full-plan starts also ask for role providers and full-plan child count.
   Done-criteria prompts show what will be enforced and offer view/check/update
   paths before launch.
   Scripts can use --plain, --quiet, --json, --yes, or explicit --mode flags to
@@ -634,6 +635,22 @@ pub(crate) enum Commands {
             help = "Guided path: auto, run, review, or full-plan"
         )]
         mode: CliStartMode,
+        #[arg(long, help = "Provider route for this start launch")]
+        provider: Option<String>,
+        #[arg(long, value_name = "N", help = "Full-plan child count, 2 through 6")]
+        children: Option<u8>,
+        #[arg(long, help = "Planner provider route for full-plan start")]
+        planner_provider: Option<String>,
+        #[arg(
+            long,
+            value_name = "IDX=PROVIDER",
+            help = "Per-child provider route override for full-plan start"
+        )]
+        child_provider: Vec<String>,
+        #[arg(long, help = "Coder provider route for review start")]
+        coder_provider: Option<String>,
+        #[arg(long, help = "Reviewer provider route for review start")]
+        reviewer_provider: Option<String>,
         #[arg(long, help = "Show the resolved launch preview without starting work")]
         preview: bool,
         #[arg(long, help = "Confirm the launch preview without prompting")]
@@ -2140,6 +2157,12 @@ pub(crate) struct RunCommandArgs {
 pub(crate) struct StartCommandArgs {
     pub(crate) goal: String,
     pub(crate) mode: CliStartMode,
+    pub(crate) provider: Option<String>,
+    pub(crate) children: Option<u8>,
+    pub(crate) planner_provider: Option<String>,
+    pub(crate) child_provider: Vec<String>,
+    pub(crate) coder_provider: Option<String>,
+    pub(crate) reviewer_provider: Option<String>,
     pub(crate) preview: bool,
     pub(crate) yes: bool,
     pub(crate) fresh: bool,

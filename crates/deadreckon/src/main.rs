@@ -291,6 +291,12 @@ async fn main_inner() -> Result<()> {
         Commands::Start {
             goal,
             mode,
+            provider,
+            children,
+            planner_provider,
+            child_provider,
+            coder_provider,
+            reviewer_provider,
             preview,
             yes,
             fresh,
@@ -305,6 +311,12 @@ async fn main_inner() -> Result<()> {
             start_command(StartCommandArgs {
                 goal,
                 mode,
+                provider,
+                children,
+                planner_provider,
+                child_provider,
+                coder_provider,
+                reviewer_provider,
                 preview,
                 yes,
                 fresh,
@@ -1790,6 +1802,7 @@ impl StartSelectionSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartProviderSource {
+    ExplicitFlag,
     Configured,
     Detected,
     Interactive,
@@ -1799,6 +1812,7 @@ enum StartProviderSource {
 impl StartProviderSource {
     fn label(self) -> &'static str {
         match self {
+            Self::ExplicitFlag => "explicit_flag",
             Self::Configured => "configured",
             Self::Detected => "detected",
             Self::Interactive => "interactive",
@@ -1926,6 +1940,12 @@ struct StartLaunchDecision {
     provider_source: StartProviderSource,
     provider_route: Option<String>,
     provider_label: String,
+    child_count: Option<u8>,
+    planner_provider_route: Option<String>,
+    child_provider_route: Option<String>,
+    child_provider_overrides: Vec<String>,
+    coder_provider_route: Option<String>,
+    reviewer_provider_route: Option<String>,
     done_criteria_source: StartDoneCriteriaSource,
     done_action: StartDoneAction,
     done_criteria_label: String,
@@ -1979,6 +1999,12 @@ fn start_launch_decision(input: StartLaunchInput<'_>) -> StartLaunchDecision {
         provider_source: StartProviderSource::Missing,
         provider_route: None,
         provider_label: StartProviderSource::Missing.label().to_string(),
+        child_count: None,
+        planner_provider_route: None,
+        child_provider_route: None,
+        child_provider_overrides: Vec::new(),
+        coder_provider_route: None,
+        reviewer_provider_route: None,
         done_criteria_source: StartDoneCriteriaSource::Missing,
         done_action: StartDoneAction::Missing,
         done_criteria_label: StartDoneCriteriaSource::Missing.label().to_string(),
@@ -2274,16 +2300,29 @@ fn add_start_history_actions(decision: &mut StartLaunchDecision, run: Option<&Ru
 fn start_provider_picker_choices(
     paths: &DeadreckonPaths,
     defaults: &ConfigDefaults,
+    current: Option<&str>,
 ) -> Result<Vec<prompt::SelectChoice>> {
     let mut choices = Vec::new();
     let mut seen = Vec::new();
-    if let Some(provider) = defaults.provider.as_deref() {
+    if let Some(provider) = current {
         push_unique(&mut seen, provider.to_string());
         choices.push(start_prompt_choice(
             format!("route:{provider}"),
-            format!("Use configured default {provider}"),
-            "current DeadReckon default provider",
+            format!("Use current route {provider}"),
+            "selected for this guided start",
         ));
+    }
+    if let Some(provider) = defaults.provider.as_deref() {
+        if seen.iter().any(|seen| seen == provider) {
+            // The current route row is more specific than the config row.
+        } else {
+            push_unique(&mut seen, provider.to_string());
+            choices.push(start_prompt_choice(
+                format!("route:{provider}"),
+                format!("Use configured default {provider}"),
+                "current DeadReckon default provider",
+            ));
+        }
     }
     for provider in start_detected_cli_provider_ids(paths)? {
         if seen.iter().any(|seen| seen == &provider) {
@@ -2325,12 +2364,48 @@ fn prompt_start_provider(
     defaults: &ConfigDefaults,
     prompter: &mut dyn StartPrompter,
 ) -> Result<()> {
+    let previous_route = decision.provider_route.clone();
+    let previous_source = decision.provider_source;
+    let Some(provider) = prompt_start_provider_route(
+        decision,
+        paths,
+        defaults,
+        setup::SetupProviderRoleRef::PrimaryRun,
+        "Choose provider",
+        "Pick the provider route for this launch. Defaults are not changed.",
+        prompter,
+    )?
+    else {
+        return Ok(());
+    };
+
+    decision.provider_source = if previous_route.as_deref() == Some(provider.as_str()) {
+        previous_source
+    } else {
+        StartProviderSource::Interactive
+    };
+    decision.provider_route = Some(provider.clone());
+    decision.provider_label = format!("{provider} ({})", decision.provider_source.label());
+    Ok(())
+}
+
+fn prompt_start_provider_route(
+    decision: &mut StartLaunchDecision,
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+    role: setup::SetupProviderRoleRef,
+    title: &str,
+    help: &str,
+    prompter: &mut dyn StartPrompter,
+) -> Result<Option<String>> {
     let choice = prompter.select_one(prompt::SelectPrompt {
-        title: "Choose provider".to_string(),
-        help: Some(
-            "Pick the provider route for this launch. Defaults are not changed.".to_string(),
-        ),
-        choices: start_provider_picker_choices(paths, defaults)?,
+        title: title.to_string(),
+        help: Some(help.to_string()),
+        choices: start_provider_picker_choices(
+            paths,
+            defaults,
+            decision.provider_route.as_deref(),
+        )?,
         default_index: 0,
     })?;
     let route = if let Some(route) = choice.id.strip_prefix("route:") {
@@ -2343,7 +2418,7 @@ fn prompt_start_provider(
                 "no provider route selected",
                 vec!["deadreckon providers list --all".to_string()],
             );
-            return Ok(());
+            return Ok(None);
         }
         route.trim().to_string()
     } else {
@@ -2356,13 +2431,13 @@ fn prompt_start_provider(
                 "deadreckon providers list --all".to_string(),
             ],
         );
-        return Ok(());
+        return Ok(None);
     };
 
     let selection = provider_setup_selection(
         paths,
         setup::ProviderSetupRequest {
-            role: setup::SetupProviderRoleRef::PrimaryRun,
+            role,
             explicit_provider: Some(&route),
             explicit_model: None,
             config_default_provider: defaults.provider.as_deref(),
@@ -2375,10 +2450,306 @@ fn prompt_start_provider(
             require_usable_route: true,
         },
     )?;
-    let provider = selection.provider.unwrap_or(route);
-    decision.provider_source = StartProviderSource::Interactive;
-    decision.provider_route = Some(provider.clone());
-    decision.provider_label = format!("{provider} ({})", decision.provider_source.label());
+    Ok(Some(selection.provider.unwrap_or(route)))
+}
+
+fn resolve_explicit_start_provider(
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+    role: setup::SetupProviderRoleRef,
+    route: &str,
+) -> Result<String> {
+    let selection = provider_setup_selection(
+        paths,
+        setup::ProviderSetupRequest {
+            role,
+            explicit_provider: Some(route),
+            explicit_model: None,
+            config_default_provider: defaults.provider.as_deref(),
+            config_doc_provider: defaults.doc_provider.as_deref(),
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: false,
+            allow_auto_subscription: false,
+            require_usable_route: true,
+        },
+    )?;
+    Ok(selection.provider.unwrap_or_else(|| route.to_string()))
+}
+
+fn prompt_start_role_provider(
+    decision: &mut StartLaunchDecision,
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+    role: setup::SetupProviderRoleRef,
+    role_label: &str,
+    prompter: &mut dyn StartPrompter,
+) -> Result<Option<String>> {
+    let title = format!("Choose {role_label} provider");
+    let help =
+        format!("Pick the {role_label} provider route for this launch. Defaults are not changed.");
+    prompt_start_provider_route(decision, paths, defaults, role, &title, &help, prompter)
+}
+
+fn prompt_start_child_count(
+    decision: &mut StartLaunchDecision,
+    prompter: &mut dyn StartPrompter,
+) -> Result<()> {
+    let recommended = recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan);
+    let mut choices = vec![start_prompt_choice(
+        format!("n:{recommended}"),
+        format!("Recommended: {recommended} children"),
+        "based on goal complexity",
+    )];
+    for n in 2..=6 {
+        choices.push(start_prompt_choice(
+            format!("n:{n}"),
+            format!("{n} children"),
+            "full-plan child count",
+        ));
+    }
+    choices.push(prompt::SelectChoice::new("cancel", "Cancel"));
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Choose child count".to_string(),
+        help: Some(
+            "Pick how many implementation children the full-plan planner should create."
+                .to_string(),
+        ),
+        choices,
+        default_index: 0,
+    })?;
+    let Some(raw) = choice.id.strip_prefix("n:") else {
+        set_start_recovery(
+            decision,
+            "guided start cancelled before choosing child count",
+            vec![format!(
+                "deadreckon start \"{}\" --mode full-plan --children {recommended}",
+                shell_display_quote(&decision.goal)
+            )],
+        );
+        return Ok(());
+    };
+    let n = raw.parse::<u8>().map_err(|_| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("child count is not a number: {raw}"),
+            "enter a value from 2 through 6",
+        ))
+    })?;
+    validate_task_count(usize::from(n)).map_err(CliError::Core)?;
+    decision.child_count = Some(n);
+    Ok(())
+}
+
+fn prompt_start_child_provider_overrides(
+    decision: &mut StartLaunchDecision,
+    n: u8,
+    prompter: &mut dyn StartPrompter,
+) -> Result<()> {
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Choose child provider overrides".to_string(),
+        help: Some(format!(
+            "Optional per-child routes. Child indexes are 0 through {}.",
+            n.saturating_sub(1)
+        )),
+        choices: vec![
+            start_prompt_choice(
+                "none",
+                "No per-child overrides",
+                "all children use the default child provider",
+            ),
+            start_prompt_choice(
+                "typed",
+                "Type overrides",
+                "comma-separated IDX=PROVIDER entries, for example 1=cli:codex",
+            ),
+            prompt::SelectChoice::new("cancel", "Cancel"),
+        ],
+        default_index: 0,
+    })?;
+    match choice.id.as_str() {
+        "none" => {
+            decision.child_provider_overrides.clear();
+            Ok(())
+        }
+        "typed" => {
+            let answer = prompter.input("child provider overrides: ", None)?;
+            let overrides = answer
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            parse_child_provider_overrides(&overrides, n)?;
+            decision.child_provider_overrides = overrides;
+            Ok(())
+        }
+        _ => {
+            set_start_recovery(
+                decision,
+                "guided start cancelled before choosing child provider overrides",
+                vec![format!(
+                    "deadreckon start \"{}\" --mode full-plan --yes",
+                    shell_display_quote(&decision.goal)
+                )],
+            );
+            Ok(())
+        }
+    }
+}
+
+fn resolve_start_orchestration_options(
+    decision: &mut StartLaunchDecision,
+    args: &StartCommandArgs,
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+    mut prompter: Option<&mut dyn StartPrompter>,
+) -> Result<()> {
+    if matches!(
+        decision.selected_mode,
+        StartSelectedMode::Run | StartSelectedMode::Extend
+    ) {
+        if start_orchestration_flags_present(args) {
+            set_start_recovery(
+                decision,
+                "orchestration options require start --mode review or --mode full-plan",
+                vec![format!(
+                    "deadreckon start \"{}\" --mode full-plan --preview",
+                    shell_display_quote(&decision.goal)
+                )],
+            );
+        }
+        return Ok(());
+    }
+
+    match decision.selected_mode {
+        StartSelectedMode::FullPlan => {
+            if let Some(n) = args.children {
+                validate_task_count(usize::from(n)).map_err(CliError::Core)?;
+                decision.child_count = Some(n);
+            } else if let Some(prompter) = prompter.as_mut() {
+                prompt_start_child_count(decision, &mut **prompter)?;
+                if decision.recovery.is_some() {
+                    return Ok(());
+                }
+            } else {
+                decision.child_count = Some(recommend_child_count_for_goal(
+                    &decision.goal,
+                    CliPlanMode::FullPlan,
+                ));
+            }
+
+            if let Some(route) = args.planner_provider.as_deref() {
+                decision.planner_provider_route = Some(resolve_explicit_start_provider(
+                    paths,
+                    defaults,
+                    setup::SetupProviderRoleRef::Planner,
+                    route,
+                )?);
+            } else if args.provider.is_none()
+                && let Some(prompter) = prompter.as_mut()
+            {
+                decision.planner_provider_route = prompt_start_role_provider(
+                    decision,
+                    paths,
+                    defaults,
+                    setup::SetupProviderRoleRef::Planner,
+                    "planner",
+                    &mut **prompter,
+                )?;
+                if decision.recovery.is_some() {
+                    return Ok(());
+                }
+            }
+
+            if args.provider.is_none()
+                && let Some(prompter) = prompter.as_mut()
+            {
+                decision.child_provider_route = prompt_start_role_provider(
+                    decision,
+                    paths,
+                    defaults,
+                    setup::SetupProviderRoleRef::DefaultChild,
+                    "default child",
+                    &mut **prompter,
+                )?;
+                if decision.recovery.is_some() {
+                    return Ok(());
+                }
+            }
+
+            if !args.child_provider.is_empty() {
+                let n = decision.child_count.unwrap_or_else(|| {
+                    recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan)
+                });
+                parse_child_provider_overrides(&args.child_provider, n)?;
+                decision.child_provider_overrides = args.child_provider.clone();
+            } else if let Some(prompter) = prompter.as_mut() {
+                let n = decision.child_count.unwrap_or_else(|| {
+                    recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan)
+                });
+                prompt_start_child_provider_overrides(decision, n, &mut **prompter)?;
+            }
+        }
+        StartSelectedMode::Review => {
+            if args.children.is_some()
+                || args.planner_provider.is_some()
+                || !args.child_provider.is_empty()
+            {
+                set_start_recovery(
+                    decision,
+                    "full-plan options cannot be used with start --mode review",
+                    vec![format!(
+                        "deadreckon start \"{}\" --mode full-plan --preview",
+                        shell_display_quote(&decision.goal)
+                    )],
+                );
+                return Ok(());
+            }
+            if let Some(route) = args.coder_provider.as_deref() {
+                decision.coder_provider_route = Some(resolve_explicit_start_provider(
+                    paths,
+                    defaults,
+                    setup::SetupProviderRoleRef::Coder,
+                    route,
+                )?);
+            } else if args.provider.is_none()
+                && let Some(prompter) = prompter.as_mut()
+            {
+                decision.coder_provider_route = prompt_start_role_provider(
+                    decision,
+                    paths,
+                    defaults,
+                    setup::SetupProviderRoleRef::Coder,
+                    "coder",
+                    &mut **prompter,
+                )?;
+                if decision.recovery.is_some() {
+                    return Ok(());
+                }
+            }
+            if let Some(route) = args.reviewer_provider.as_deref() {
+                decision.reviewer_provider_route = Some(resolve_explicit_start_provider(
+                    paths,
+                    defaults,
+                    setup::SetupProviderRoleRef::Reviewer,
+                    route,
+                )?);
+            } else if args.provider.is_none()
+                && let Some(prompter) = prompter.as_mut()
+            {
+                decision.reviewer_provider_route = prompt_start_role_provider(
+                    decision,
+                    paths,
+                    defaults,
+                    setup::SetupProviderRoleRef::Reviewer,
+                    "reviewer",
+                    &mut **prompter,
+                )?;
+            }
+        }
+        StartSelectedMode::Extend | StartSelectedMode::Run => {}
+    }
     Ok(())
 }
 
@@ -2744,11 +3115,28 @@ fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFa
 }
 
 fn start_provider_role_summary(decision: &StartLaunchDecision) -> Option<String> {
-    let route = decision.provider_route.as_deref()?;
     match decision.selected_mode {
         StartSelectedMode::Extend | StartSelectedMode::Run => None,
-        StartSelectedMode::Review => Some(format!("coder={route}, reviewer={route}")),
-        StartSelectedMode::FullPlan => Some(format!("planner={route}, child={route}")),
+        StartSelectedMode::Review => {
+            let route = decision.provider_route.as_deref()?;
+            let coder = decision.coder_provider_route.as_deref().unwrap_or(route);
+            let reviewer = decision.reviewer_provider_route.as_deref().unwrap_or(route);
+            Some(format!("coder={coder}, reviewer={reviewer}"))
+        }
+        StartSelectedMode::FullPlan => {
+            let route = decision.provider_route.as_deref()?;
+            let planner = decision.planner_provider_route.as_deref().unwrap_or(route);
+            let child = decision.child_provider_route.as_deref().unwrap_or(route);
+            let n = decision.child_count.unwrap_or_else(|| {
+                recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan)
+            });
+            let mut summary = format!("children={n}, planner={planner}, child={child}");
+            if !decision.child_provider_overrides.is_empty() {
+                summary.push_str(", overrides=");
+                summary.push_str(&decision.child_provider_overrides.join(","));
+            }
+            Some(summary)
+        }
     }
 }
 
@@ -2761,7 +3149,17 @@ fn resolve_start_setup(
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
     if let Some(prompter) = prompter {
-        resolve_start_provider(decision, &paths, &defaults, Some(&mut *prompter))?;
+        resolve_start_provider(decision, args, &paths, &defaults, Some(&mut *prompter))?;
+        if decision.recovery.is_some() {
+            return Ok(());
+        }
+        resolve_start_orchestration_options(
+            decision,
+            args,
+            &paths,
+            &defaults,
+            Some(&mut *prompter),
+        )?;
         if decision.recovery.is_some() {
             return Ok(());
         }
@@ -2785,7 +3183,11 @@ fn resolve_start_setup(
             )?;
         }
     } else {
-        resolve_start_provider(decision, &paths, &defaults, None)?;
+        resolve_start_provider(decision, args, &paths, &defaults, None)?;
+        if decision.recovery.is_some() {
+            return Ok(());
+        }
+        resolve_start_orchestration_options(decision, args, &paths, &defaults, None)?;
         if decision.recovery.is_some() {
             return Ok(());
         }
@@ -2814,10 +3216,24 @@ fn resolve_start_setup(
 
 fn resolve_start_provider(
     decision: &mut StartLaunchDecision,
+    args: &StartCommandArgs,
     paths: &DeadreckonPaths,
     defaults: &ConfigDefaults,
     mut prompter: Option<&mut dyn StartPrompter>,
 ) -> Result<()> {
+    if let Some(provider) = args.provider.as_deref() {
+        let provider = resolve_explicit_start_provider(
+            paths,
+            defaults,
+            setup::SetupProviderRoleRef::PrimaryRun,
+            provider,
+        )?;
+        decision.provider_source = StartProviderSource::ExplicitFlag;
+        decision.provider_route = Some(provider.clone());
+        decision.provider_label = format!("{provider} ({})", decision.provider_source.label());
+        return Ok(());
+    }
+
     let selection = provider_setup_selection(
         paths,
         setup::ProviderSetupRequest {
@@ -2873,6 +3289,9 @@ fn resolve_start_provider(
             format!("detected {provider}, but no default provider is configured"),
             vec![format!("deadreckon config provider {provider}")],
         );
+    }
+    if let Some(prompter) = prompter.as_mut() {
+        prompt_start_provider(decision, paths, defaults, &mut **prompter)?;
     }
     Ok(())
 }
@@ -3486,32 +3905,47 @@ async fn dispatch_start_command(
             };
             let auto_confirm = args.yes || args.quiet || decision.confirmed_by_start_picker;
             let provider_route = decision.provider_route.clone();
+            let planner_provider = decision
+                .planner_provider_route
+                .clone()
+                .or_else(|| provider_route.clone());
+            let child_provider = decision
+                .child_provider_route
+                .clone()
+                .or_else(|| provider_route.clone());
+            let coder_provider = decision
+                .coder_provider_route
+                .clone()
+                .or_else(|| provider_route.clone());
+            let reviewer_provider = decision.reviewer_provider_route.clone().or(provider_route);
             let result = orchestrate_command(OrchestrateRunArgs {
                 plan: PlanCommandArgs {
                     goal: args.goal,
-                    n: recommend_child_count_for_goal(&decision.goal, mode),
+                    n: decision
+                        .child_count
+                        .unwrap_or_else(|| recommend_child_count_for_goal(&decision.goal, mode)),
                     mode,
                     max_spend: None,
                     max_wall_seconds: None,
                     sandbox: None,
                     planner_provider: if mode == CliPlanMode::FullPlan {
-                        provider_route.clone()
+                        planner_provider
                     } else {
                         None
                     },
                     provider: if mode == CliPlanMode::FullPlan {
-                        provider_route.clone()
+                        child_provider
                     } else {
                         None
                     },
-                    child_provider: Vec::new(),
+                    child_provider: decision.child_provider_overrides.clone(),
                     coder_provider: if mode == CliPlanMode::Review {
-                        provider_route.clone()
+                        coder_provider
                     } else {
                         None
                     },
                     reviewer_provider: if mode == CliPlanMode::Review {
-                        provider_route
+                        reviewer_provider
                     } else {
                         None
                     },
@@ -3542,6 +3976,14 @@ async fn dispatch_start_command(
 
 fn start_source_flags_present(args: &StartCommandArgs) -> bool {
     args.fresh || args.worktree || args.from.is_some() || args.allow_dirty
+}
+
+fn start_orchestration_flags_present(args: &StartCommandArgs) -> bool {
+    args.children.is_some()
+        || args.planner_provider.is_some()
+        || !args.child_provider.is_empty()
+        || args.coder_provider.is_some()
+        || args.reviewer_provider.is_some()
 }
 
 fn start_run_ids(paths: &DeadreckonPaths) -> Result<BTreeSet<String>> {
@@ -30431,13 +30873,14 @@ mod tui_tests {
         AttachProviderLogScanCache, AttachRunNarrativeRefreshJob, AttachSurface, AttachTickBudget,
         AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG,
         ChainAttachTuiState, CommandAudience, CommandDiscovery, CommandHelpEntry, CompletionAction,
-        HELP_ALL_GROUPS, LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
-        NarrativeRefreshKind, NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent,
-        PlanNarrativeRefreshInput, ProviderActivity, ProviderJsonlLogSpec, Result,
-        RunNarrativeRenderInput, StartDoneAction, StartDoneCriteriaSource, StartLaunchInput,
-        StartPromptEligibility, StartPrompter, StartSelectedMode, StartSelectionSource,
-        StartSourceMode, TopHelpGroup, acceptance_activity_lines, add_start_history_actions,
-        attach_banner, attach_header_text, attach_live_inventory, attach_loop_stage_work,
+        ConfigDefaults, HELP_ALL_GROUPS, LiveFile, NarrativeAcceptanceRefreshTracker,
+        NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode,
+        PlanAttachRenderState, PlanFeedEvent, PlanNarrativeRefreshInput, ProviderActivity,
+        ProviderJsonlLogSpec, Result, RunNarrativeRenderInput, StartDoneAction,
+        StartDoneCriteriaSource, StartLaunchInput, StartPromptEligibility, StartPrompter,
+        StartProviderSource, StartSelectedMode, StartSelectionSource, StartSourceMode,
+        TopHelpGroup, acceptance_activity_lines, add_start_history_actions, attach_banner,
+        attach_header_text, attach_live_inventory, attach_loop_stage_work,
         attach_should_return_to_plan, build_run_narrative_projection,
         cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job, chain_activity_lines,
         chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
@@ -30457,10 +30900,11 @@ mod tui_tests {
         prompt_start_existing_done_criteria, provider_ingest_base_roots,
         provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
         provider_jsonl_session_matches_run, read_plan_events_lossy, recommend_child_count_for_goal,
-        recommend_orchestration_mode, render_attach, render_plan_attach, run_narrative_json_text,
-        run_narrative_plain_text, run_narrative_refresh_trigger,
-        start_done_materialization_request, start_launch_decision, start_launch_preview_facts,
-        start_or_coalesce_plan_narrative_refresh_job, threshold_color,
+        recommend_orchestration_mode, render_attach, render_plan_attach,
+        resolve_start_orchestration_options, run_narrative_json_text, run_narrative_plain_text,
+        run_narrative_refresh_trigger, start_done_materialization_request, start_launch_decision,
+        start_launch_preview_facts, start_or_coalesce_plan_narrative_refresh_job,
+        start_provider_role_summary, threshold_color,
     };
     use crate::cli::{Cli, CliPlanMode, CliStartMode, StartCommandArgs};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -31967,6 +32411,12 @@ mod tui_tests {
         StartCommandArgs {
             goal: goal.to_string(),
             mode: CliStartMode::Auto,
+            provider: None,
+            children: None,
+            planner_provider: None,
+            child_provider: Vec::new(),
+            coder_provider: None,
+            reviewer_provider: None,
             preview: true,
             yes: false,
             fresh: false,
@@ -32192,6 +32642,53 @@ mod tui_tests {
             rows.iter().any(|(key, value)| key == "history"
                 && value == "extend: deadreckon extend bbbbaaaa \"add charts\"; review: deadreckon start \"add charts\" --mode review --yes; full-plan: deadreckon start \"add charts\" --mode full-plan --yes"),
             "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn start_full_plan_picker_collects_child_count_and_role_providers() {
+        let temp = test_tempdir();
+        let paths = DeadreckonPaths::from_home(temp.path());
+        let defaults = ConfigDefaults::default();
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "build a realtime 3d game",
+            requested_mode: CliStartMode::FullPlan,
+            stdin_is_tty: true,
+        });
+        decision.provider_source = StartProviderSource::Configured;
+        decision.provider_route = Some("smoke".to_string());
+        decision.provider_label = "smoke (configured)".to_string();
+        let args = start_args_for_test("build a realtime 3d game");
+        let mut prompter =
+            ScriptedStartPrompter::new(&["n:5", "route:smoke", "route:smoke", "typed"]);
+        prompter.inputs.push_back("1=smoke".to_string());
+
+        resolve_start_orchestration_options(
+            &mut decision,
+            &args,
+            &paths,
+            &defaults,
+            Some(&mut prompter),
+        )
+        .expect("orchestration options");
+
+        assert_eq!(decision.child_count, Some(5));
+        assert_eq!(decision.planner_provider_route.as_deref(), Some("smoke"));
+        assert_eq!(decision.child_provider_route.as_deref(), Some("smoke"));
+        assert_eq!(decision.child_provider_overrides, vec!["1=smoke"]);
+        assert_eq!(
+            prompter.prompt_titles,
+            vec![
+                "Choose child count",
+                "Choose planner provider",
+                "Choose default child provider",
+                "Choose child provider overrides",
+                "child provider overrides: "
+            ]
+        );
+        assert_eq!(
+            start_provider_role_summary(&decision).as_deref(),
+            Some("children=5, planner=smoke, child=smoke, overrides=1=smoke")
         );
     }
 
