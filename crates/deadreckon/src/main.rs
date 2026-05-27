@@ -2349,7 +2349,11 @@ async fn dispatch_start_command(
 ) -> Result<()> {
     match decision.selected_mode {
         StartSelectedMode::Run => {
-            run_command(RunCommandArgs {
+            let paths = DeadreckonPaths::discover();
+            let before = start_run_ids(&paths)?;
+            let goal = args.goal.clone();
+            let quiet = args.quiet;
+            let result = run_command(RunCommandArgs {
                 goal: args.goal,
                 fresh: args.fresh,
                 worktree: args.worktree,
@@ -2380,7 +2384,14 @@ async fn dispatch_start_command(
                 no_docs: false,
                 doc_skill: None,
             })
-            .await
+            .await;
+            if result.is_ok()
+                && !quiet
+                && let Some(run) = newest_start_run(&paths, &before, &goal)?
+            {
+                print_start_lifecycle_footer("run", &run.run_id);
+            }
+            result
         }
         StartSelectedMode::Review | StartSelectedMode::FullPlan => {
             if start_source_flags_present(&args) {
@@ -2389,12 +2400,16 @@ async fn dispatch_start_command(
                     "omit source flags or use deadreckon run directly",
                 )));
             }
+            let paths = DeadreckonPaths::discover();
+            let before = start_plan_ids(&paths)?;
+            let goal = args.goal.clone();
+            let quiet = args.quiet;
             let mode = match decision.selected_mode {
                 StartSelectedMode::Run => unreachable!("run handled above"),
                 StartSelectedMode::Review => CliPlanMode::Review,
                 StartSelectedMode::FullPlan => CliPlanMode::FullPlan,
             };
-            orchestrate_command(OrchestrateRunArgs {
+            let result = orchestrate_command(OrchestrateRunArgs {
                 plan: PlanCommandArgs {
                     goal: args.goal,
                     n: recommend_child_count_for_goal(&decision.goal, mode),
@@ -2419,13 +2434,76 @@ async fn dispatch_start_command(
                 yes: args.yes || args.quiet,
                 no_repair: false,
             })
-            .await
+            .await;
+            if result.is_ok()
+                && !quiet
+                && let Some(plan) = newest_start_plan(&paths, &before, &goal)?
+            {
+                print_start_lifecycle_footer("plan", &plan.plan_id);
+            }
+            result
         }
     }
 }
 
 fn start_source_flags_present(args: &StartCommandArgs) -> bool {
     args.fresh || args.worktree || args.from.is_some() || args.allow_dirty
+}
+
+fn start_run_ids(paths: &DeadreckonPaths) -> Result<BTreeSet<String>> {
+    Ok(list_runs(paths, None)?
+        .into_iter()
+        .map(|run| run.run_id)
+        .collect())
+}
+
+fn start_plan_ids(paths: &DeadreckonPaths) -> Result<BTreeSet<String>> {
+    Ok(list_plan_entries(paths, None)?
+        .into_iter()
+        .map(|plan| plan.plan_id)
+        .collect())
+}
+
+fn newest_start_run(
+    paths: &DeadreckonPaths,
+    before: &BTreeSet<String>,
+    goal: &str,
+) -> Result<Option<RunListEntry>> {
+    let mut runs = list_runs(paths, None)?
+        .into_iter()
+        .filter(|run| run.goal == goal && !before.contains(&run.run_id))
+        .collect::<Vec<_>>();
+    runs.sort_by_key(|run| run.updated_at);
+    Ok(runs.pop())
+}
+
+fn newest_start_plan(
+    paths: &DeadreckonPaths,
+    before: &BTreeSet<String>,
+    goal: &str,
+) -> Result<Option<PlanListEntry>> {
+    let mut plans = list_plan_entries(paths, None)?
+        .into_iter()
+        .filter(|plan| plan.goal == goal && !before.contains(&plan.plan_id))
+        .collect::<Vec<_>>();
+    plans.sort_by_key(|plan| plan.updated_at);
+    Ok(plans.pop())
+}
+
+fn print_start_lifecycle_footer(kind: &str, id: &str) {
+    let id = run_prefix(id);
+    let attach = format!("deadreckon attach {id}");
+    let status = format!("deadreckon status {id}");
+    let kill = format!("deadreckon kill {id}");
+    let finish = format!("deadreckon finish {id}");
+    println!("{}", ui_heading("start lifecycle"));
+    print_kv_block(&[
+        ("target", kind),
+        ("attach", attach.as_str()),
+        ("status", status.as_str()),
+        ("kill", kill.as_str()),
+        ("finish", finish.as_str()),
+    ]);
 }
 
 fn setup_refusal_error(refusal: setup::SetupRefusal) -> CliError {

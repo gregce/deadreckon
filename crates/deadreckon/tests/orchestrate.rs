@@ -392,7 +392,11 @@ fn start_missing_done_criteria_suggests_def_done_in_non_tty() {
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     fs::create_dir_all(paths.home()).expect("home");
-    fs::write(paths.config_path(), "default_provider = \"smoke\"\n").expect("config");
+    fs::write(
+        paths.config_path(),
+        "default_provider = \"smoke\"\n\n[defaults]\nprovider = \"smoke\"\ndoc_provider = \"smoke\"\n",
+    )
+    .expect("config");
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
@@ -663,6 +667,137 @@ fn start_quiet_success_obeys_existing_quiet_policy() {
     assert_success(&output);
     assert!(stdout(&output).trim().is_empty(), "{}", stdout(&output));
     assert!(stderr(&output).trim().is_empty(), "{}", stderr(&output));
+}
+
+#[test]
+fn start_run_success_prints_attach_status_kill_finish() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "footer guided run",
+            "--mode",
+            "run",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("start run footer");
+
+    assert_success(&output);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .find(|run| run.goal == "footer guided run")
+        .expect("run");
+    let run_ref = &run.run_id[..8];
+    assert!(text.contains("start lifecycle"), "{text}");
+    assert!(
+        text.contains(&format!("deadreckon attach {run_ref}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("deadreckon status {run_ref}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("deadreckon kill {run_ref}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("deadreckon finish {run_ref}")),
+        "{text}"
+    );
+}
+
+#[test]
+fn start_orchestrate_success_prints_plan_lifecycle_commands() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "footer guided review",
+            "--mode",
+            "review",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("start review footer");
+
+    assert_success(&output);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    let plan = newest_plan(&paths);
+    let plan_ref = &plan.plan_id[..8];
+    assert!(text.contains("start lifecycle"), "{text}");
+    assert!(
+        text.contains(&format!("deadreckon attach {plan_ref}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("deadreckon status {plan_ref}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("deadreckon kill {plan_ref}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("deadreckon finish {plan_ref}")),
+        "{text}"
+    );
+}
+
+#[test]
+fn start_footer_uses_plan_id_for_orchestrated_goal() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "plan id footer review",
+            "--mode",
+            "review",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("start plan id footer");
+
+    assert_success(&output);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    let plan = newest_plan(&paths);
+    let plan_ref = &plan.plan_id[..8];
+    assert!(
+        text.contains(&format!("deadreckon attach {plan_ref}")),
+        "{text}"
+    );
+    for task in &plan.tasks {
+        if let Some(run_id) = task.child_run_id.as_ref() {
+            assert!(
+                !text.contains(&format!(
+                    "start lifecycle\nattach: deadreckon attach {}",
+                    &run_id[..8]
+                )),
+                "{text}"
+            );
+        }
+    }
 }
 
 #[test]
