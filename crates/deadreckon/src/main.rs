@@ -24166,6 +24166,15 @@ struct AttachLive {
     working_dir_exists: bool,
 }
 
+#[derive(Debug, Default)]
+struct AttachLiveInventory {
+    file_count: usize,
+    total_bytes: u64,
+    files: Vec<LiveFile>,
+}
+
+const ATTACH_LIVE_FILE_DISPLAY_LIMIT: usize = 240;
+
 #[derive(Debug, Clone)]
 struct AcceptanceLive {
     status: AcceptanceUiStatus,
@@ -24217,17 +24226,7 @@ struct LivePid {
 }
 
 fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
-    let mut files = inventory_files(&state.working_dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|path| {
-            !path_has_component(path, "node_modules") && !path_has_component(path, ".git")
-        })
-        .filter_map(|path| live_file(&state.working_dir, &path))
-        .collect::<Vec<_>>();
-    files.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
-    let file_count = files.len();
-    let total_bytes = files.iter().map(|file| file.bytes).sum();
+    let inventory = attach_live_inventory(&state.working_dir);
     let pids = supervised_pids(state)
         .into_iter()
         .map(live_pid)
@@ -24235,9 +24234,9 @@ fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
     let provider_activity = collect_provider_activity(state);
     let acceptance = collect_acceptance_live(state);
     AttachLive {
-        file_count,
-        total_bytes,
-        files,
+        file_count: inventory.file_count,
+        total_bytes: inventory.total_bytes,
+        files: inventory.files,
         pids,
         provider_context_tokens: provider_activity.context_tokens,
         provider_context_window: provider_activity.context_window,
@@ -24245,6 +24244,75 @@ fn collect_attach_live(state: &deadreckon_core::PipelineState) -> AttachLive {
         acceptance,
         working_dir_exists: state.working_dir.exists(),
     }
+}
+
+fn attach_live_inventory(root: &Path) -> AttachLiveInventory {
+    let mut inventory = AttachLiveInventory::default();
+    if !root.exists() {
+        return inventory;
+    }
+    collect_attach_inventory_dir(root, root, &mut inventory);
+    inventory.files.sort_by(|left, right| {
+        right
+            .modified_at
+            .cmp(&left.modified_at)
+            .then(left.path.cmp(&right.path))
+    });
+    inventory.files.truncate(ATTACH_LIVE_FILE_DISPLAY_LIMIT);
+    inventory
+}
+
+fn collect_attach_inventory_dir(root: &Path, dir: &Path, inventory: &mut AttachLiveInventory) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if attach_live_inventory_should_prune_dir(root, &path) {
+                continue;
+            }
+            collect_attach_inventory_dir(root, &path, inventory);
+        } else if file_type.is_file()
+            && let Some(file) = live_file(root, &path)
+        {
+            inventory.file_count = inventory.file_count.saturating_add(1);
+            inventory.total_bytes = inventory.total_bytes.saturating_add(file.bytes);
+            inventory.files.push(file);
+        }
+    }
+}
+
+fn attach_live_inventory_should_prune_dir(root: &Path, path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    if matches!(
+        name.as_ref(),
+        ".git"
+            | ".deadreckon"
+            | ".cache"
+            | ".next"
+            | ".turbo"
+            | "build"
+            | "coverage"
+            | "dist"
+            | "node_modules"
+            | "playwright-report"
+            | "target"
+            | "test-results"
+    ) {
+        return true;
+    }
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative
+        .parent()
+        .is_some_and(|parent| path_has_component(parent, ".tmp"))
+        && name.starts_with("chrome-profile")
 }
 
 fn collect_acceptance_live(state: &deadreckon_core::PipelineState) -> AcceptanceLive {
@@ -27159,6 +27227,12 @@ fn live_file_lines(live: &AttachLive) -> Vec<String> {
             file.path
         )
     }));
+    if live.file_count > live.files.len() {
+        lines.push(format!(
+            "... {} more files not shown",
+            live.file_count - live.files.len()
+        ));
+    }
     lines
 }
 
@@ -27813,15 +27887,16 @@ mod tui_tests {
     use std::time::Duration;
 
     use super::{
-        AcceptanceLive, AcceptanceUiStatus, AttachActionNotice, AttachLive, AttachLoopStage,
-        AttachNarrativeRefreshState, AttachPanel, AttachPanelCounts, AttachPanelRows,
-        AttachParentPlan, AttachPlanNarrativeRefreshJob, AttachSurface, AttachTickBudget,
-        AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG,
-        ChainAttachTuiState, CommandDiscovery, CommandHelpEntry, CompletionAction, HELP_ALL_GROUPS,
-        LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
-        NarrativeRefreshKind, NarrativeVisualMode, PlanAttachRenderState, PlanFeedEvent,
-        PlanNarrativeRefreshInput, ProviderActivity, ProviderJsonlLogSpec, TopHelpGroup,
-        acceptance_activity_lines, attach_banner, attach_header_text, attach_loop_stage_work,
+        ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachActionNotice,
+        AttachLive, AttachLoopStage, AttachNarrativeRefreshState, AttachPanel, AttachPanelCounts,
+        AttachPanelRows, AttachParentPlan, AttachPlanNarrativeRefreshJob, AttachSurface,
+        AttachTickBudget, AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode,
+        COMMAND_HELP_CATALOG, ChainAttachTuiState, CommandDiscovery, CommandHelpEntry,
+        CompletionAction, HELP_ALL_GROUPS, LiveFile, NarrativeAcceptanceRefreshTracker,
+        NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode,
+        PlanAttachRenderState, PlanFeedEvent, PlanNarrativeRefreshInput, ProviderActivity,
+        ProviderJsonlLogSpec, TopHelpGroup, acceptance_activity_lines, attach_banner,
+        attach_header_text, attach_live_inventory, attach_loop_stage_work,
         attach_should_return_to_plan, cancel_plan_narrative_refresh_job, chain_activity_lines,
         chain_attach_footer_text, chain_attach_header_text, chain_narrative_refusal_text,
         chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
@@ -28183,6 +28258,99 @@ mod tui_tests {
         assert!(cancel_plan_narrative_refresh_job(&mut job));
         assert!(job.is_none());
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn attach_live_inventory_prunes_node_modules_before_descending() {
+        let temp = test_tempdir();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::create_dir_all(root.join("node_modules/pkg/deep")).expect("node modules");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("source");
+        std::fs::write(root.join("node_modules/pkg/deep/index.js"), "ignored\n").expect("ignored");
+
+        let inventory = attach_live_inventory(root);
+
+        assert_eq!(inventory.file_count, 1);
+        assert_eq!(inventory.files.len(), 1);
+        assert_eq!(inventory.files[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn attach_live_inventory_prunes_chrome_profile_tmp_before_descending() {
+        let temp = test_tempdir();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("app")).expect("app");
+        std::fs::create_dir_all(root.join(".tmp/chrome-profile-123/Default")).expect("profile");
+        std::fs::write(root.join("app/index.ts"), "export {}\n").expect("source");
+        std::fs::write(
+            root.join(".tmp/chrome-profile-123/Default/Cookies"),
+            "sqlite-ish",
+        )
+        .expect("profile file");
+
+        let inventory = attach_live_inventory(root);
+
+        assert_eq!(inventory.file_count, 1);
+        assert_eq!(inventory.files.len(), 1);
+        assert_eq!(inventory.files[0].path, "app/index.ts");
+    }
+
+    #[test]
+    fn attach_live_inventory_still_counts_recent_project_files() {
+        let temp = test_tempdir();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join("README.md"), "hello\n").expect("readme");
+        std::fs::write(root.join("src/lib.rs"), "pub fn value() {}\n").expect("lib");
+
+        let inventory = attach_live_inventory(root);
+        let paths = inventory
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(inventory.file_count, 2);
+        assert_eq!(
+            inventory.total_bytes,
+            "hello\n".len() as u64 + "pub fn value() {}\n".len() as u64
+        );
+        assert!(paths.contains(&"README.md"));
+        assert!(paths.contains(&"src/lib.rs"));
+    }
+
+    #[test]
+    fn attach_live_inventory_caps_display_without_losing_total_count() {
+        let temp = test_tempdir();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        for index in 0..(ATTACH_LIVE_FILE_DISPLAY_LIMIT + 3) {
+            std::fs::write(root.join("src").join(format!("file-{index:03}.txt")), "x")
+                .expect("file");
+        }
+
+        let inventory = attach_live_inventory(root);
+        let live = AttachLive {
+            file_count: inventory.file_count,
+            total_bytes: inventory.total_bytes,
+            files: inventory.files,
+            working_dir_exists: true,
+            ..AttachLive::default()
+        };
+        let lines = live_file_lines(&live);
+
+        assert_eq!(live.file_count, ATTACH_LIVE_FILE_DISPLAY_LIMIT + 3);
+        assert_eq!(live.files.len(), ATTACH_LIVE_FILE_DISPLAY_LIMIT);
+        assert_eq!(
+            live.total_bytes,
+            (ATTACH_LIVE_FILE_DISPLAY_LIMIT + 3) as u64
+        );
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line == "... 3 more files not shown")
+        );
     }
 
     fn line_text(line: &Line<'_>) -> String {

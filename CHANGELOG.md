@@ -6,6 +6,7 @@
 - Moved run narrative attach refresh onto a coalesced background job so manual `r` redraws without awaiting the provider and detach cancels in-flight provider work.
 - Routed run attach event and quiet-threshold narrative refreshes through the same background job, preserving failure notices until a later refresh replaces them.
 - Moved plan narrative attach refresh onto a plan-keyed background job so manual, event, and quiet-threshold refreshes coalesce while child drill-in and detach cancel in-flight provider work.
+- Replaced run attach live-file collection with an attach-specific inventory walker that prunes heavy cache/profile directories before descent and caps displayed files without losing total counts.
 
 ## Narrative Attach (alpha) - 2026-05-26
 
