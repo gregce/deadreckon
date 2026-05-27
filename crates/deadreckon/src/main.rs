@@ -1691,6 +1691,14 @@ impl StartSelectedMode {
             Self::FullPlan => "full-plan",
         }
     }
+
+    fn path_label(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Review => "review orchestration",
+            Self::FullPlan => "full-plan orchestration",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1839,7 +1847,7 @@ fn start_auto_mode_decision(
 }
 
 fn start_goal_recommends_review(lower_goal: &str) -> bool {
-    [
+    let words = [
         "review",
         "audit",
         "critique",
@@ -1849,30 +1857,97 @@ fn start_goal_recommends_review(lower_goal: &str) -> bool {
         "verification",
         "hardening",
         "harden",
-        "second pass",
-        "second-pass",
         "cleanup",
-        "clean up",
-    ]
-    .iter()
-    .any(|needle| lower_goal.contains(needle))
+    ];
+    let phrases = ["second pass", "second-pass", "clean up"];
+    words
+        .iter()
+        .any(|word| start_goal_contains_word(lower_goal, word))
+        || phrases.iter().any(|phrase| lower_goal.contains(phrase))
 }
 
 fn start_goal_recommends_full_plan(lower_goal: &str) -> bool {
-    [
+    let words = [
         "parallel",
         "parallelize",
         "workstream",
         "workstreams",
+        "separable",
+    ];
+    let phrases = [
         "multiple independent",
         "many modules",
         "several modules",
-        "separable",
         "frontend, docs",
         "api, frontend",
-    ]
-    .iter()
-    .any(|needle| lower_goal.contains(needle))
+    ];
+    words
+        .iter()
+        .any(|word| start_goal_contains_word(lower_goal, word))
+        || phrases.iter().any(|phrase| lower_goal.contains(phrase))
+}
+
+fn start_goal_contains_word(lower_goal: &str, needle: &str) -> bool {
+    lower_goal
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|word| word == needle)
+}
+
+struct LaunchPreviewFacts<'a> {
+    goal: &'a str,
+    path: &'a str,
+    provider: &'a str,
+    done: &'a str,
+    workspace: &'a str,
+    watch: String,
+    stop: String,
+    finish: String,
+    override_command: Option<String>,
+}
+
+fn launch_preview_rows(facts: &LaunchPreviewFacts<'_>) -> Vec<(String, String)> {
+    let mut rows = vec![
+        ("goal".to_string(), facts.goal.to_string()),
+        ("path".to_string(), facts.path.to_string()),
+        ("provider".to_string(), facts.provider.to_string()),
+        ("done".to_string(), facts.done.to_string()),
+        ("workspace".to_string(), facts.workspace.to_string()),
+        ("watch".to_string(), facts.watch.clone()),
+        ("stop".to_string(), facts.stop.clone()),
+        ("finish".to_string(), facts.finish.clone()),
+    ];
+    if let Some(command) = facts.override_command.as_ref() {
+        rows.push(("override".to_string(), command.clone()));
+    }
+    rows
+}
+
+fn print_launch_preview_rows(rows: &[(String, String)]) {
+    let refs = rows
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    print_kv_block(&refs);
+}
+
+fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFacts<'_> {
+    let override_command = match decision.selected_mode {
+        StartSelectedMode::Run => Some("deadreckon start <goal> --mode review".to_string()),
+        StartSelectedMode::Review | StartSelectedMode::FullPlan => {
+            Some("deadreckon start <goal> --mode run".to_string())
+        }
+    };
+    LaunchPreviewFacts {
+        goal: &decision.goal,
+        path: decision.selected_mode.path_label(),
+        provider: decision.provider_source.label(),
+        done: decision.done_criteria_source.label(),
+        workspace: decision.source_mode.label(),
+        watch: "deadreckon attach <after-start>".to_string(),
+        stop: "deadreckon kill <after-start>".to_string(),
+        finish: "deadreckon finish <after-start>".to_string(),
+        override_command,
+    }
 }
 
 async fn start_command(args: StartCommandArgs) -> Result<()> {
@@ -1899,6 +1974,14 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
             "try_lines": decision.try_lines
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    if args.preview {
+        if !args.quiet {
+            println!("{}", ui_heading("deadreckon start preview"));
+            let rows = launch_preview_rows(&start_launch_preview_facts(&decision));
+            print_launch_preview_rows(&rows);
+        }
         return Ok(());
     }
     if !args.quiet {
@@ -8845,13 +8928,36 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         Ok(Some(git)) => format!("git: clean, branch={} @ {}", git.branch, git.head_sha),
         _ => "not git".to_string(),
     };
+    let workspace = codebase.mode.to_string();
+    let done_label = acceptance.full_label();
+    let launch_rows = launch_preview_rows(&LaunchPreviewFacts {
+        goal,
+        path: "run",
+        provider: agent,
+        done: &done_label,
+        workspace: &workspace,
+        watch: format!("deadreckon attach {run_id}"),
+        stop: format!("deadreckon kill {run_id}"),
+        finish: format!("deadreckon finish {run_id}"),
+        override_command: Some("deadreckon orchestrate \"goal\"".to_string()),
+    });
     let mut rows = vec![
         ("goal".to_string(), goal.to_string()),
+        launch_rows
+            .iter()
+            .find(|(key, _)| key == "path")
+            .cloned()
+            .unwrap_or_else(|| ("path".to_string(), "run".to_string())),
         (
             "source".to_string(),
             format!("{} ({git_label})", cwd.display()),
         ),
         ("mode".to_string(), mode),
+        launch_rows
+            .iter()
+            .find(|(key, _)| key == "workspace")
+            .cloned()
+            .unwrap_or_else(|| ("workspace".to_string(), workspace.clone())),
     ];
     if codebase.mode == CodebaseMode::Worktree {
         rows.extend([
@@ -8905,7 +9011,15 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         ("sandbox".to_string(), sandbox.to_string()),
         ("caps".to_string(), caps),
         ("sleep".to_string(), sleep.label()),
-        ("done criteria".to_string(), acceptance.full_label()),
+        (
+            "done".to_string(),
+            launch_rows
+                .iter()
+                .find(|(key, _)| key == "done")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| done_label.clone()),
+        ),
+        ("done criteria".to_string(), done_label),
     ]);
     if max_spend.is_some_and(|cap| cap > 50.0) {
         rows.push((
@@ -8946,6 +9060,15 @@ fn run_preview(input: &RunPreview<'_>) -> String {
             sections.push(Section::Command {
                 label: "inspect".to_string(),
                 command: format!("deadreckon show {run_id}"),
+            });
+        }
+    }
+    sections.push(Section::Blank);
+    for label in ["watch", "stop", "finish"] {
+        if let Some((_, command)) = launch_rows.iter().find(|(key, _)| key == label) {
+            sections.push(Section::Command {
+                label: label.to_string(),
+                command: command.clone(),
             });
         }
     }
@@ -10401,19 +10524,42 @@ fn print_orchestrate_preflight(
     let source = plan_source_label(plan);
     let gate = plan_acceptance_label(plan);
     let repair = plan_repair_label(plan, no_repair);
-    let items = [
-        ("mode", plan_mode_label(plan.mode)),
-        ("children", children.as_str()),
-        ("providers", providers.as_str()),
-        ("source", source.as_str()),
-        ("done criteria", gate.as_str()),
-        ("merge repair", repair.as_str()),
-        ("sandbox", sandbox.as_str()),
-        ("spend", spend.as_str()),
-        ("wall", wall.as_str()),
-        ("capabilities", capabilities.as_str()),
+    let plan_ref = run_prefix(&plan.plan_id);
+    let path = orchestration_path_label(plan.mode);
+    let launch_rows = launch_preview_rows(&LaunchPreviewFacts {
+        goal: &plan.root_goal,
+        path,
+        provider: &providers,
+        done: &gate,
+        workspace: &source,
+        watch: format!("deadreckon attach {plan_ref}"),
+        stop: format!("deadreckon kill {plan_ref}"),
+        finish: format!("deadreckon finish {plan_ref}"),
+        override_command: Some("deadreckon start <goal> --mode run".to_string()),
+    });
+    let mut items = vec![
+        ("goal".to_string(), plan.root_goal.clone()),
+        ("path".to_string(), path.to_string()),
+        ("mode".to_string(), plan_mode_label(plan.mode).to_string()),
+        ("children".to_string(), children),
+        ("providers".to_string(), providers.clone()),
+        ("provider".to_string(), providers),
+        ("source".to_string(), source.clone()),
+        ("workspace".to_string(), source),
+        ("done criteria".to_string(), gate.clone()),
+        ("done".to_string(), gate),
+        ("merge repair".to_string(), repair),
+        ("sandbox".to_string(), sandbox),
+        ("spend".to_string(), spend),
+        ("wall".to_string(), wall),
+        ("capabilities".to_string(), capabilities),
     ];
-    print_kv_block(&items);
+    items.extend(
+        launch_rows
+            .into_iter()
+            .filter(|(key, _)| matches!(key.as_str(), "watch" | "stop" | "finish" | "override")),
+    );
+    print_launch_preview_rows(&items);
     print_orchestration_role_table(plan, !no_repair, None);
     print_orchestration_dependency_summary(plan);
     for task in &plan.tasks {
@@ -10452,6 +10598,13 @@ fn print_orchestrate_preflight(
         DeadreckonPaths::discover().home().display(),
         plan.plan_id
     );
+}
+
+fn orchestration_path_label(mode: PlanMode) -> &'static str {
+    match mode {
+        PlanMode::Review => "review orchestration",
+        PlanMode::FullPlan => "full-plan orchestration",
+    }
 }
 
 fn print_orchestrate_started(

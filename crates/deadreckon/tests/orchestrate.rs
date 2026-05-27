@@ -313,6 +313,82 @@ fn run_and_orchestrate_preview_share_done_criteria_source_label() {
 }
 
 #[test]
+fn start_preview_names_path_provider_done_workspace_and_finish() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["start", "preview guided start", "--preview", "--plain"])
+        .output()
+        .expect("start preview");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    for field in [
+        "path",
+        "provider",
+        "done",
+        "workspace",
+        "watch",
+        "stop",
+        "finish",
+    ] {
+        assert!(out.contains(field), "missing {field}:\n{out}");
+    }
+    assert!(out.contains("run"), "{out}");
+}
+
+#[test]
+fn run_preview_uses_same_done_and_workspace_labels() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["run", "preview shared labels", "--smoke", "--preview"])
+        .output()
+        .expect("run preview");
+
+    assert_success(&output);
+    let out = stderr(&output);
+    for field in ["path", "done", "workspace", "watch", "stop", "finish"] {
+        assert!(out.contains(field), "missing {field}:\n{out}");
+    }
+}
+
+#[test]
+fn orchestrate_preview_uses_same_watch_stop_finish_labels() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "orchestrate",
+            "review",
+            "preview shared lifecycle",
+            "--coder-provider",
+            "smoke:coder",
+            "--reviewer-provider",
+            "smoke:reviewer",
+            "--preview",
+        ])
+        .output()
+        .expect("orchestrate preview");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    for field in ["path", "done", "workspace", "watch", "stop", "finish"] {
+        assert!(out.contains(field), "missing {field}:\n{out}");
+    }
+    assert!(out.contains("review orchestration"), "{out}");
+}
+
+#[test]
 fn orchestrate_start_prints_run_like_context() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

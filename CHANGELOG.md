@@ -2,6 +2,7 @@
 
 ## Guided first use (alpha) - 2026-05-26
 
+- Shared launch preview rows for start, run, and orchestrate so previews name path, provider, done criteria, workspace, watch, stop, and finish actions.
 - Added deterministic `start --mode auto` launch-decision heuristics for run, review, and full-plan paths.
 - Added the visible `deadreckon start` parser and help surface for the guided front door.
 - Clarified DeadReckon's audience as the harness around agent CLIs for unattended, sandboxed, auditable work, and pointed first-use help/docs at `deadreckon start`.
