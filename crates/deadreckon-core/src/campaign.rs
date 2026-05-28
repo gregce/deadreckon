@@ -419,11 +419,74 @@ pub fn read_campaign_events(plan_dir: &Path) -> Result<Vec<CampaignEvent>> {
     }
 }
 
+/// Split a campaign's tree-wide spend ceiling evenly across N sub-orchestrators.
+/// Computed in whole cents so the shares sum back to the ceiling exactly; any
+/// leftover cent goes to the earliest subs (remainder-to-first).
+pub fn allocate_budget(tree_budget: f64, n: usize) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let total_cents = (tree_budget * 100.0).round() as i64;
+    let base = total_cents / n as i64;
+    let remainder = total_cents - base * n as i64;
+    (0..n)
+        .map(|index| {
+            let cents = if (index as i64) < remainder {
+                base + 1
+            } else {
+                base
+            };
+            cents as f64 / 100.0
+        })
+        .collect()
+}
+
+/// Whether the aggregate spend across already-launched leaf runs has reached the
+/// campaign's tree ceiling. An absent ceiling is never exhausted.
+pub fn tree_budget_exhausted(tree_budget: Option<f64>, spent_usd: f64) -> bool {
+    tree_budget.is_some_and(|cap| spent_usd >= cap)
+}
+
+/// The warning to surface when a campaign runs with no tree budget: each
+/// sub-orchestrator falls back to the default per-run cap, so the whole tree is
+/// unbounded. Returns `None` when a ceiling is set.
+pub fn unbounded_budget_warning(tree_budget: Option<f64>) -> Option<String> {
+    if tree_budget.is_none() {
+        Some(
+            "campaign tree budget is unbounded: each sub-orchestrator inherits the default \
+             per-run cap. pass --max-spend to bound the whole tree"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn tree_budget_splits_evenly_with_remainder_to_first() {
+        assert_eq!(allocate_budget(10.0, 2), vec![5.0, 5.0]);
+        let three = allocate_budget(10.0, 3);
+        assert_eq!(three.len(), 3);
+        assert!((three.iter().sum::<f64>() - 10.0).abs() < 1e-9);
+        assert!(three[0] >= three[2]); // leftover cent lands on the earliest sub
+        assert_eq!(allocate_budget(9.0, 3), vec![3.0, 3.0, 3.0]);
+        assert!(allocate_budget(10.0, 0).is_empty());
+    }
+
+    #[test]
+    fn null_tree_budget_logs_unbounded_warning() {
+        assert!(unbounded_budget_warning(None).is_some());
+        assert!(unbounded_budget_warning(Some(10.0)).is_none());
+        assert!(!tree_budget_exhausted(None, 1_000_000.0));
+        assert!(tree_budget_exhausted(Some(10.0), 10.0));
+        assert!(!tree_budget_exhausted(Some(10.0), 9.99));
+    }
 
     #[test]
     fn campaign_at_depth_one_is_refused() {

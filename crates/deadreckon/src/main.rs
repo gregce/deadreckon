@@ -16238,23 +16238,27 @@ fn record_sub_orchestrator_result(plan_id: &str, launch_dir: &Path, ok: bool) {
 /// a concurrent batch cannot guarantee. The `launch` closure performs the actual
 /// spawn; tests inject a fake. A failed sub never aborts its siblings.
 #[allow(dead_code)] // wired by the campaign command in P9
-fn run_campaign_fork<F>(
+fn run_campaign_fork<F, S>(
     campaign_dir: &Path,
     campaign: &mut deadreckon_core::campaign::Campaign,
     mut launch: F,
+    spend_of: S,
 ) -> Result<()>
 where
     F: FnMut(
         &deadreckon_core::campaign::SubGoal,
         &Path,
     ) -> Result<deadreckon_core::campaign::SubResult>,
+    S: Fn(&deadreckon_core::campaign::SubResult) -> f64,
 {
     use deadreckon_core::campaign::{
-        self, CampaignStatus, SubGoalStatus, append_campaign_event, write_campaign,
+        self, CampaignStatus, SubGoalStatus, append_campaign_event, tree_budget_exhausted,
+        write_campaign,
     };
 
     campaign.status = CampaignStatus::Forked;
     campaign.forked_at = Some(chrono::Utc::now());
+    let tree_budget = campaign.tree_budget_usd;
     write_campaign(campaign_dir, campaign)?;
     append_campaign_event(
         campaign_dir,
@@ -16262,7 +16266,16 @@ where
         serde_json::json!({ "n": campaign.n }),
     )?;
 
+    let mut spent_usd = 0.0_f64;
     for index in 0..campaign.sub_goals.len() {
+        if tree_budget_exhausted(tree_budget, spent_usd) {
+            append_campaign_event(
+                campaign_dir,
+                "budget_exhausted",
+                serde_json::json!({ "spent_usd": spent_usd, "tree_budget_usd": tree_budget }),
+            )?;
+            break;
+        }
         let sub = campaign.sub_goals[index].clone();
         let launch_dir = campaign_dir.join("launch").join(&sub.sub_id);
         fs::create_dir_all(&launch_dir)?;
@@ -16273,6 +16286,7 @@ where
         )?;
         match launch(&sub, &launch_dir) {
             Ok(result) => {
+                spent_usd += spend_of(&result);
                 let target = &mut campaign.sub_goals[index];
                 target.sub_plan_id = result.plan_id.clone();
                 target.result_run_id = result.result_run_id.clone();
@@ -16429,16 +16443,21 @@ mod campaign_spawn_tests {
         let mut campaign = fixture_campaign();
 
         let mut launched = Vec::new();
-        run_campaign_fork(&campaign_dir, &mut campaign, |sub, _launch_dir| {
-            launched.push(sub.sub_id.clone());
-            Ok(SubResult {
-                schema_version: 1,
-                sub_id: sub.sub_id.clone(),
-                plan_id: Some(format!("plan-{}", sub.sub_id)),
-                result_run_id: Some(format!("run-{}", sub.sub_id)),
-                ok: true,
-            })
-        })
+        run_campaign_fork(
+            &campaign_dir,
+            &mut campaign,
+            |sub, _launch_dir| {
+                launched.push(sub.sub_id.clone());
+                Ok(SubResult {
+                    schema_version: 1,
+                    sub_id: sub.sub_id.clone(),
+                    plan_id: Some(format!("plan-{}", sub.sub_id)),
+                    result_run_id: Some(format!("run-{}", sub.sub_id)),
+                    ok: true,
+                })
+            },
+            |_| 0.0,
+        )
         .expect("fork");
 
         assert_eq!(launched, vec!["sub-0", "sub-1"]);
@@ -16470,22 +16489,27 @@ mod campaign_spawn_tests {
         let mut campaign = fixture_campaign();
 
         let mut launched = Vec::new();
-        run_campaign_fork(&campaign_dir, &mut campaign, |sub, _launch_dir| {
-            launched.push(sub.sub_id.clone());
-            if sub.sub_id == "sub-0" {
-                Err(CliError::Core(DeadreckonError::InvalidInput(
-                    "sub-0 blew up".to_string(),
-                )))
-            } else {
-                Ok(SubResult {
-                    schema_version: 1,
-                    sub_id: sub.sub_id.clone(),
-                    plan_id: Some("plan-sub-1".to_string()),
-                    result_run_id: Some("run-sub-1".to_string()),
-                    ok: true,
-                })
-            }
-        })
+        run_campaign_fork(
+            &campaign_dir,
+            &mut campaign,
+            |sub, _launch_dir| {
+                launched.push(sub.sub_id.clone());
+                if sub.sub_id == "sub-0" {
+                    Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "sub-0 blew up".to_string(),
+                    )))
+                } else {
+                    Ok(SubResult {
+                        schema_version: 1,
+                        sub_id: sub.sub_id.clone(),
+                        plan_id: Some("plan-sub-1".to_string()),
+                        result_run_id: Some("run-sub-1".to_string()),
+                        ok: true,
+                    })
+                }
+            },
+            |_| 0.0,
+        )
         .expect("fork continues past failure");
 
         // The sibling still launched despite sub-0 failing.
@@ -16496,6 +16520,39 @@ mod campaign_spawn_tests {
             campaign.sub_goals[1].result_run_id.as_deref(),
             Some("run-sub-1")
         );
+    }
+
+    #[test]
+    fn aggregate_spend_exhaustion_refuses_next_sub_launch() {
+        use deadreckon_core::campaign::SubResult;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let campaign_dir = tmp.path().join("plans").join("camp-3");
+        let mut campaign = fixture_campaign(); // tree_budget_usd = 10.0, 2 subs
+
+        let mut launched = Vec::new();
+        run_campaign_fork(
+            &campaign_dir,
+            &mut campaign,
+            |sub, _launch_dir| {
+                launched.push(sub.sub_id.clone());
+                Ok(SubResult {
+                    schema_version: 1,
+                    sub_id: sub.sub_id.clone(),
+                    plan_id: Some(format!("plan-{}", sub.sub_id)),
+                    result_run_id: Some(format!("run-{}", sub.sub_id)),
+                    ok: true,
+                })
+            },
+            // sub-0 alone spends the whole $10 tree budget.
+            |_| 12.0,
+        )
+        .expect("fork");
+
+        // sub-1 is never launched because the tree budget is exhausted after sub-0.
+        assert_eq!(launched, vec!["sub-0"]);
+        let events =
+            deadreckon_core::campaign::read_campaign_events(&campaign_dir).expect("events");
+        assert!(events.iter().any(|e| e.kind == "budget_exhausted"));
     }
 }
 
