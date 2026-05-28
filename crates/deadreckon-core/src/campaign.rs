@@ -586,6 +586,17 @@ where
     }
 }
 
+/// A campaign reaches clean completion only when every sub merged *and* the
+/// roll-up permits completion (no refused leaf). This is where the no-laundering
+/// invariant meets the all-subs-done requirement.
+pub fn campaign_can_complete(campaign: &Campaign, rollup: &CampaignRollup) -> bool {
+    campaign
+        .sub_goals
+        .iter()
+        .all(|sub| sub.status == SubGoalStatus::Merged)
+        && rollup_permits_completion(rollup.rollup_verdict)
+}
+
 pub fn rollup_path_for_plan_dir(plan_dir: &Path) -> PathBuf {
     plan_dir.join(ROLLUP_FILE)
 }
@@ -693,6 +704,43 @@ mod tests {
         let rollup2 = build_rollup(&missing, lookup_clean);
         assert_eq!(rollup2.rollup_verdict, RollupVerdict::Refused);
         assert_eq!(rollup2.refused_subs, vec!["sub-1"]);
+    }
+
+    #[test]
+    fn campaign_completes_only_when_all_subs_merged_and_no_refusal() {
+        let mut campaign = campaign_with_results();
+        for sub in &mut campaign.sub_goals {
+            sub.status = SubGoalStatus::Merged;
+        }
+        let clean = build_rollup(&campaign, lookup_clean);
+        assert!(campaign_can_complete(&campaign, &clean));
+
+        // A sub that has not merged blocks completion even with a clean roll-up.
+        let mut pending = campaign.clone();
+        pending.sub_goals[1].status = SubGoalStatus::Pending;
+        assert!(!campaign_can_complete(&pending, &clean));
+    }
+
+    #[test]
+    fn campaign_with_refused_sub_never_reaches_completed() {
+        let mut campaign = campaign_with_results();
+        for sub in &mut campaign.sub_goals {
+            sub.status = SubGoalStatus::Merged;
+        }
+        // Even with all subs merged, a refused roll-up blocks completion.
+        let refused = build_rollup(&campaign, |run_id| {
+            if run_id == "run-0" {
+                (
+                    "signed".to_string(),
+                    AcceptanceTamperVerdict::Refuse,
+                    Vec::new(),
+                )
+            } else {
+                lookup_clean(run_id)
+            }
+        });
+        assert_eq!(refused.rollup_verdict, RollupVerdict::Refused);
+        assert!(!campaign_can_complete(&campaign, &refused));
     }
 
     #[test]
