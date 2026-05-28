@@ -285,6 +285,92 @@ pub fn write_campaign(plan_dir: &Path, campaign: &Campaign) -> Result<()> {
     crate::state::atomic_write_json(&campaign_path_for_plan_dir(plan_dir), campaign)
 }
 
+/// Environment variables that carry campaign lineage across the spawn boundary.
+/// The meta-coordinator sets these on each sub-orchestrator subprocess; the
+/// sub-orchestrator reads them at startup (before it has a plan dir) to learn its
+/// depth, and writes its result to the sidecar named by [`ENV_SUB_RESULT`].
+pub const ENV_DEPTH: &str = "DEADRECKON_CAMPAIGN_DEPTH";
+pub const ENV_ROOT: &str = "DEADRECKON_CAMPAIGN_ROOT";
+pub const ENV_ANCESTOR_TASK_KEYS: &str = "DEADRECKON_CAMPAIGN_ANCESTOR_TASK_KEYS";
+pub const ENV_ANCESTOR_SCOPES: &str = "DEADRECKON_CAMPAIGN_ANCESTOR_SCOPES";
+pub const ENV_SUB_RESULT: &str = "DEADRECKON_CAMPAIGN_SUB_RESULT";
+
+const SUB_RESULT_FILE: &str = "sub-result.json";
+
+/// What a sub-orchestrator reports back to the meta-coordinator: the plan it ran
+/// and the normal run its merge promoted. Written to `<launch-dir>/sub-result.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubResult {
+    pub schema_version: u32,
+    pub sub_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_run_id: Option<String>,
+    pub ok: bool,
+}
+
+pub fn sub_result_path(launch_dir: &Path) -> PathBuf {
+    launch_dir.join(SUB_RESULT_FILE)
+}
+
+pub fn read_sub_result(launch_dir: &Path) -> Result<Option<SubResult>> {
+    let path = sub_result_path(launch_dir);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|source| DeadreckonError::Json { path, source }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(DeadreckonError::Io { path, source }),
+    }
+}
+
+pub fn write_sub_result(launch_dir: &Path, result: &SubResult) -> Result<()> {
+    crate::state::atomic_write_json(&sub_result_path(launch_dir), result)
+}
+
+/// Build a [`Lineage`] from the campaign env-var values (any may be absent). This
+/// is the pure core of reading lineage out of the process environment; absent
+/// depth means depth 0 (a top-level invocation).
+pub fn parse_lineage(
+    depth: Option<&str>,
+    campaign_root_id: Option<&str>,
+    ancestor_task_keys: Option<&str>,
+    ancestor_scopes: Option<&str>,
+) -> Lineage {
+    let split = |value: Option<&str>| -> Vec<String> {
+        value
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Lineage {
+        schema_version: 1,
+        depth: depth.and_then(|raw| raw.trim().parse().ok()).unwrap_or(0),
+        campaign_root_id: campaign_root_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        ancestor_task_keys: split(ancestor_task_keys),
+        ancestor_scopes: split(ancestor_scopes),
+    }
+}
+
+/// Read the campaign lineage from the current process environment.
+pub fn lineage_from_env() -> Lineage {
+    parse_lineage(
+        std::env::var(ENV_DEPTH).ok().as_deref(),
+        std::env::var(ENV_ROOT).ok().as_deref(),
+        std::env::var(ENV_ANCESTOR_TASK_KEYS).ok().as_deref(),
+        std::env::var(ENV_ANCESTOR_SCOPES).ok().as_deref(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -392,6 +478,41 @@ mod tests {
         )
         .expect_err("duplicate sub-goals must be refused");
         assert!(err.to_string().contains("duplicate campaign sub-goal"));
+    }
+
+    #[test]
+    fn parse_lineage_reads_strings_and_defaults_depth_zero() {
+        let lineage = parse_lineage(
+            Some("1"),
+            Some("camp-root"),
+            Some("root-key, sub-0-key"),
+            Some("repo-abc"),
+        );
+        assert_eq!(lineage.depth, 1);
+        assert_eq!(lineage.campaign_root_id.as_deref(), Some("camp-root"));
+        assert_eq!(lineage.ancestor_task_keys, vec!["root-key", "sub-0-key"]);
+        assert_eq!(lineage.ancestor_scopes, vec!["repo-abc"]);
+
+        let absent = parse_lineage(None, None, None, None);
+        assert_eq!(absent.depth, 0);
+        assert!(absent.campaign_root_id.is_none());
+        assert!(absent.ancestor_task_keys.is_empty());
+    }
+
+    #[test]
+    fn sub_result_round_trips_and_absent_is_none() {
+        let temp = TempDir::new().expect("tempdir");
+        let launch_dir = temp.path().join("launch").join("sub-0");
+        assert!(read_sub_result(&launch_dir).expect("absent").is_none());
+        let result = SubResult {
+            schema_version: 1,
+            sub_id: "sub-0".to_string(),
+            plan_id: Some("plan-xyz".to_string()),
+            result_run_id: Some("run-abc".to_string()),
+            ok: true,
+        };
+        write_sub_result(&launch_dir, &result).expect("write");
+        assert_eq!(read_sub_result(&launch_dir).expect("read"), Some(result));
     }
 
     #[test]

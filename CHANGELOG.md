@@ -4,6 +4,7 @@
 
 - P1: Added `deadreckon-core::campaign` module with the nesting `Lineage` record, the `CAMPAIGN_MAX_DEPTH = 2` hard cap, and a `guard` that refuses a campaign at depth >= 1 or a sub-goal that cycles to an ancestor `task_key`/scope.
 - P2: Added the file-backed `Campaign`/`SubGoal` model (`campaign.json`) with `build_sub_goals` decomposition validation (exactly-N planner output, non-empty, distinct sub-goals) and `Campaign::new` reusing `validate_task_count` (2..=6).
+- P3: Added the sub-orchestrator spawn (`build_sub_orchestrator_command`, lineage env transport + `sub-result.json` sidecar) reusing the plan-child isolation idiom, and wired `orchestrate full-plan` to report its merged result when launched by a campaign.
 
 ## Tamper-Evident Gate (production release) - 2026-05-28
 

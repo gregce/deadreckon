@@ -11956,8 +11956,9 @@ async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
         plain,
     })
     .await?;
-    merge_command(MergeCommandArgs {
-        plan_id,
+    let sub_result_launch_dir = std::env::var(deadreckon_core::campaign::ENV_SUB_RESULT).ok();
+    let merge_result = merge_command(MergeCommandArgs {
+        plan_id: plan_id.clone(),
         strategy: "dag-aware".to_string(),
         prefer_child: None,
         no_repair: args.no_repair,
@@ -11970,7 +11971,15 @@ async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
         quiet,
         plain,
     })
-    .await
+    .await;
+    if let Some(launch_dir) = sub_result_launch_dir {
+        record_sub_orchestrator_result(
+            &plan_id,
+            std::path::Path::new(&launch_dir),
+            merge_result.is_ok(),
+        );
+    }
+    merge_result
 }
 
 async fn plan_command(args: PlanCommandArgs) -> Result<()> {
@@ -16121,6 +16130,198 @@ fn note_plan_child_run_id(
         });
     }
     *live_run_id = Some(run_id);
+}
+
+// --- Campaign: sub-orchestrator spawn (P3) ---------------------------------
+// A campaign launches each sub-goal as a full `orchestrate full-plan`
+// subprocess, isolated by DEADRECKON_SCOPE_ROOT exactly like a plan child, plus
+// the campaign lineage env so a depth-1 process refuses to fan out again. The
+// sub reports back through a sub-result.json sidecar in its launch dir.
+
+#[allow(dead_code)] // fields/fn wired by the campaign fork in P4
+struct CampaignSubLaunch<'a> {
+    home: &'a Path,
+    source_dir: &'a Path,
+    launch_dir: &'a Path,
+    campaign_id: &'a str,
+    sub_goal: &'a str,
+    sub_n: u8,
+    sandbox: &'a str,
+    max_spend: Option<f64>,
+    plain: bool,
+    planner_provider: Option<&'a str>,
+    child_provider: Option<&'a str>,
+    ancestor_task_keys: &'a [String],
+    ancestor_scopes: &'a [String],
+}
+
+#[allow(dead_code)] // wired by the campaign fork in P4
+fn build_sub_orchestrator_command(launch: &CampaignSubLaunch<'_>) -> Result<std::process::Command> {
+    use deadreckon_core::campaign;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .current_dir(launch.source_dir)
+        .env("DEADRECKON_HOME", launch.home)
+        .env("DEADRECKON_HINTS", "0")
+        .env("DEADRECKON_SCOPE_ROOT", launch.launch_dir)
+        .env(campaign::ENV_DEPTH, "1")
+        .env(campaign::ENV_ROOT, launch.campaign_id)
+        .env(campaign::ENV_SUB_RESULT, launch.launch_dir);
+    if !launch.ancestor_task_keys.is_empty() {
+        command.env(
+            campaign::ENV_ANCESTOR_TASK_KEYS,
+            launch.ancestor_task_keys.join(","),
+        );
+    }
+    if !launch.ancestor_scopes.is_empty() {
+        command.env(
+            campaign::ENV_ANCESTOR_SCOPES,
+            launch.ancestor_scopes.join(","),
+        );
+    }
+    command
+        .arg("orchestrate")
+        .arg("full-plan")
+        .arg(launch.sub_goal)
+        .arg("--n")
+        .arg(launch.sub_n.to_string())
+        .arg("--yes")
+        .arg("--no-hints")
+        .arg("--sandbox")
+        .arg(launch.sandbox);
+    if launch.plain {
+        command.arg("--plain");
+    }
+    if let Some(max_spend) = launch.max_spend {
+        command.arg("--max-spend").arg(format!("{max_spend:.6}"));
+    }
+    if let Some(planner) = launch.planner_provider {
+        command.arg("--planner-provider").arg(planner);
+    }
+    if let Some(provider) = launch.child_provider {
+        command.arg("--provider").arg(provider);
+    }
+    Ok(command)
+}
+
+#[allow(dead_code)] // wired by the campaign fork in P5
+fn discover_sub_result(launch_dir: &Path) -> Result<Option<deadreckon_core::campaign::SubResult>> {
+    deadreckon_core::campaign::read_sub_result(launch_dir).map_err(CliError::Core)
+}
+
+/// Write a sub-orchestrator's result sidecar. Called at the end of
+/// `orchestrate full-plan` when launched by a campaign (DEADRECKON_CAMPAIGN_SUB_RESULT
+/// is set): records the plan id and its merged result run for the meta-coordinator.
+fn record_sub_orchestrator_result(plan_id: &str, launch_dir: &Path, ok: bool) {
+    let paths = DeadreckonPaths::discover();
+    let result_run_id = deadreckon_core::plan::load_plan(&paths, plan_id)
+        .ok()
+        .and_then(|plan| plan.merged_run_id);
+    let sub_id = launch_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sub")
+        .to_string();
+    let result = deadreckon_core::campaign::SubResult {
+        schema_version: 1,
+        sub_id,
+        plan_id: Some(plan_id.to_string()),
+        result_run_id,
+        ok,
+    };
+    let _ = deadreckon_core::campaign::write_sub_result(launch_dir, &result);
+}
+
+#[cfg(test)]
+mod campaign_spawn_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn sub_orchestrator_launch_sets_lineage_env_and_isolated_scope() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        let source = tmp.path().join("src");
+        let launch_dir = tmp.path().join("plans/camp-1/launch/sub-0");
+        let ancestors = vec!["root-key".to_string()];
+        let launch = CampaignSubLaunch {
+            home: &home,
+            source_dir: &source,
+            launch_dir: &launch_dir,
+            campaign_id: "camp-1",
+            sub_goal: "rebuild billing",
+            sub_n: 2,
+            sandbox: "none",
+            max_spend: Some(5.0),
+            plain: true,
+            planner_provider: Some("smoke"),
+            child_provider: Some("smoke"),
+            ancestor_task_keys: &ancestors,
+            ancestor_scopes: &[],
+        };
+        let command = build_sub_orchestrator_command(&launch).expect("command");
+
+        let envs: HashMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get("DEADRECKON_CAMPAIGN_DEPTH"),
+            Some(&Some("1".to_string()))
+        );
+        assert_eq!(
+            envs.get("DEADRECKON_CAMPAIGN_ROOT"),
+            Some(&Some("camp-1".to_string()))
+        );
+        assert_eq!(
+            envs.get("DEADRECKON_SCOPE_ROOT").and_then(|v| v.clone()),
+            Some(launch_dir.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            envs.get("DEADRECKON_CAMPAIGN_SUB_RESULT")
+                .and_then(|v| v.clone()),
+            Some(launch_dir.to_string_lossy().into_owned())
+        );
+
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"orchestrate".to_string()));
+        assert!(args.contains(&"full-plan".to_string()));
+        assert!(args.contains(&"rebuild billing".to_string()));
+        assert!(args.contains(&"--yes".to_string()));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--n" && pair[1] == "2")
+        );
+    }
+
+    #[test]
+    fn sub_orchestrator_result_run_is_discovered_from_launch_sidecar() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let launch_dir = tmp.path().join("plans/camp-1/launch/sub-0");
+        let result = deadreckon_core::campaign::SubResult {
+            schema_version: 1,
+            sub_id: "sub-0".to_string(),
+            plan_id: Some("plan-7".to_string()),
+            result_run_id: Some("run-42".to_string()),
+            ok: true,
+        };
+        deadreckon_core::campaign::write_sub_result(&launch_dir, &result).expect("write sidecar");
+
+        let discovered = discover_sub_result(&launch_dir)
+            .expect("discover")
+            .expect("sidecar present");
+        assert_eq!(discovered.result_run_id.as_deref(), Some("run-42"));
+        assert_eq!(discovered.plan_id.as_deref(), Some("plan-7"));
+    }
 }
 
 fn review_parent_run_id(plan: &Plan, task: &PlanTask) -> Option<String> {
