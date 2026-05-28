@@ -3,6 +3,7 @@
 ## Campaign Orchestration (production release) - 2026-05-28
 
 - P1: Added `deadreckon-core::campaign` module with the nesting `Lineage` record, the `CAMPAIGN_MAX_DEPTH = 2` hard cap, and a `guard` that refuses a campaign at depth >= 1 or a sub-goal that cycles to an ancestor `task_key`/scope.
+- P2: Added the file-backed `Campaign`/`SubGoal` model (`campaign.json`) with `build_sub_goals` decomposition validation (exactly-N planner output, non-empty, distinct sub-goals) and `Campaign::new` reusing `validate_task_count` (2..=6).
 
 ## Tamper-Evident Gate (production release) - 2026-05-28
 
