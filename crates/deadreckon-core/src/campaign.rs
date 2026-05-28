@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::error::{DeadreckonError, Result};
 use crate::plan::{PlanProviders, validate_task_count};
+use crate::tamper::AcceptanceTamperVerdict;
 
 /// The hard cap on orchestration nesting. A campaign sits at depth 0; the
 /// orchestrators it launches sit at depth 1; a depth-1 process is forbidden from
@@ -462,11 +463,299 @@ pub fn unbounded_budget_warning(tree_budget: Option<f64>) -> Option<String> {
     }
 }
 
+const ROLLUP_FILE: &str = "campaign-rollup.json";
+
+/// The aggregate trust verdict of a campaign, worst-of across every leaf run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollupVerdict {
+    Clean,
+    Caveat,
+    Refused,
+}
+
+/// One leaf run's contribution to the roll-up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeafVerdict {
+    pub sub_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_run_id: Option<String>,
+    /// "signed" | "refused" | "missing" — whether the leaf produced a valid gate.
+    pub gate: String,
+    pub tamper_verdict: AcceptanceTamperVerdict,
+    #[serde(default)]
+    pub caveats: Vec<String>,
+}
+
+impl LeafVerdict {
+    /// The leaf's effective trust verdict: a leaf with no valid signed gate counts
+    /// as refused regardless of its tamper verdict.
+    pub fn effective(&self) -> RollupVerdict {
+        if self.gate != "signed" {
+            return RollupVerdict::Refused;
+        }
+        match self.tamper_verdict {
+            AcceptanceTamperVerdict::Clean => RollupVerdict::Clean,
+            AcceptanceTamperVerdict::Caveat => RollupVerdict::Caveat,
+            AcceptanceTamperVerdict::Refuse => RollupVerdict::Refused,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CampaignRollup {
+    pub schema_version: u32,
+    pub campaign_id: String,
+    pub evaluated_at: DateTime<Utc>,
+    pub leaves: Vec<LeafVerdict>,
+    pub rollup_verdict: RollupVerdict,
+    pub refused_subs: Vec<String>,
+    pub caveat_subs: Vec<String>,
+}
+
+/// Worst-of across leaf verdicts: any refused wins, else any caveat, else clean.
+/// An empty leaf set is refused (a campaign with nothing merged is not clean).
+pub fn worst_of(verdicts: &[RollupVerdict]) -> RollupVerdict {
+    if verdicts.is_empty() {
+        return RollupVerdict::Refused;
+    }
+    if verdicts.contains(&RollupVerdict::Refused) {
+        RollupVerdict::Refused
+    } else if verdicts.contains(&RollupVerdict::Caveat) {
+        RollupVerdict::Caveat
+    } else {
+        RollupVerdict::Clean
+    }
+}
+
+/// A campaign may reach clean completion only if no leaf was refused. This is the
+/// no-laundering invariant: nesting cannot turn a refused leaf into a clean result.
+pub fn rollup_permits_completion(verdict: RollupVerdict) -> bool {
+    verdict != RollupVerdict::Refused
+}
+
+/// Build the roll-up from a campaign and a per-leaf lookup that yields each result
+/// run's gate state, tamper verdict, and caveats. A sub with no merged result run
+/// is recorded as a missing (refused) leaf.
+pub fn build_rollup<F>(campaign: &Campaign, mut leaf_lookup: F) -> CampaignRollup
+where
+    F: FnMut(&str) -> (String, AcceptanceTamperVerdict, Vec<String>),
+{
+    let mut leaves = Vec::new();
+    for sub in &campaign.sub_goals {
+        let leaf = match sub.result_run_id.as_deref() {
+            Some(run_id) => {
+                let (gate, tamper_verdict, caveats) = leaf_lookup(run_id);
+                LeafVerdict {
+                    sub_id: sub.sub_id.clone(),
+                    result_run_id: Some(run_id.to_string()),
+                    gate,
+                    tamper_verdict,
+                    caveats,
+                }
+            }
+            None => LeafVerdict {
+                sub_id: sub.sub_id.clone(),
+                result_run_id: None,
+                gate: "missing".to_string(),
+                tamper_verdict: AcceptanceTamperVerdict::Refuse,
+                caveats: Vec::new(),
+            },
+        };
+        leaves.push(leaf);
+    }
+    let effective: Vec<RollupVerdict> = leaves.iter().map(LeafVerdict::effective).collect();
+    let refused_subs = leaves
+        .iter()
+        .filter(|leaf| leaf.effective() == RollupVerdict::Refused)
+        .map(|leaf| leaf.sub_id.clone())
+        .collect();
+    let caveat_subs = leaves
+        .iter()
+        .filter(|leaf| leaf.effective() == RollupVerdict::Caveat)
+        .map(|leaf| leaf.sub_id.clone())
+        .collect();
+    CampaignRollup {
+        schema_version: 1,
+        campaign_id: campaign.campaign_id.clone(),
+        evaluated_at: Utc::now(),
+        leaves,
+        rollup_verdict: worst_of(&effective),
+        refused_subs,
+        caveat_subs,
+    }
+}
+
+pub fn rollup_path_for_plan_dir(plan_dir: &Path) -> PathBuf {
+    plan_dir.join(ROLLUP_FILE)
+}
+
+/// Where a campaign result run carries its bound roll-up (hashed into the run's
+/// acceptance-marker signature by the gate).
+pub fn rollup_path_at_run_root(run_root: &Path) -> PathBuf {
+    run_root.join(ROLLUP_FILE)
+}
+
+pub fn write_campaign_rollup(plan_dir: &Path, rollup: &CampaignRollup) -> Result<()> {
+    crate::state::atomic_write_json(&rollup_path_for_plan_dir(plan_dir), rollup)
+}
+
+pub fn read_campaign_rollup(plan_dir: &Path) -> Result<CampaignRollup> {
+    let path = rollup_path_for_plan_dir(plan_dir);
+    let bytes = std::fs::read(&path).map_err(|source| DeadreckonError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    serde_json::from_slice(&bytes).map_err(|source| DeadreckonError::Json { path, source })
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn lookup_clean(_run_id: &str) -> (String, AcceptanceTamperVerdict, Vec<String>) {
+        (
+            "signed".to_string(),
+            AcceptanceTamperVerdict::Clean,
+            Vec::new(),
+        )
+    }
+
+    fn campaign_with_results() -> Campaign {
+        let mut campaign = Campaign::new(
+            "root",
+            build_sub_goals(vec!["sub a".to_string(), "sub b".to_string()], 2).expect("subs"),
+            PlanProviders::default(),
+            0,
+            Some(10.0),
+            None,
+            "0.1.0",
+        )
+        .expect("campaign");
+        campaign.sub_goals[0].result_run_id = Some("run-0".to_string());
+        campaign.sub_goals[1].result_run_id = Some("run-1".to_string());
+        campaign
+    }
+
+    #[test]
+    fn all_clean_leaves_yield_clean_rollup() {
+        let campaign = campaign_with_results();
+        let rollup = build_rollup(&campaign, lookup_clean);
+        assert_eq!(rollup.rollup_verdict, RollupVerdict::Clean);
+        assert!(rollup_permits_completion(rollup.rollup_verdict));
+        assert!(rollup.refused_subs.is_empty());
+        assert!(rollup.caveat_subs.is_empty());
+    }
+
+    #[test]
+    fn caveat_leaf_surfaces_caveat_but_campaign_completes() {
+        let campaign = campaign_with_results();
+        let rollup = build_rollup(&campaign, |run_id| {
+            if run_id == "run-1" {
+                (
+                    "signed".to_string(),
+                    AcceptanceTamperVerdict::Caveat,
+                    vec!["agent modified tests/auth_test.rs".to_string()],
+                )
+            } else {
+                lookup_clean(run_id)
+            }
+        });
+        assert_eq!(rollup.rollup_verdict, RollupVerdict::Caveat);
+        assert!(rollup_permits_completion(rollup.rollup_verdict));
+        assert_eq!(rollup.caveat_subs, vec!["sub-1"]);
+        assert!(rollup.refused_subs.is_empty());
+    }
+
+    #[test]
+    fn refused_leaf_makes_campaign_fail_and_blocks_clean_completion() {
+        let campaign = campaign_with_results();
+        let rollup = build_rollup(&campaign, |run_id| {
+            if run_id == "run-0" {
+                (
+                    "signed".to_string(),
+                    AcceptanceTamperVerdict::Refuse,
+                    Vec::new(),
+                )
+            } else {
+                lookup_clean(run_id)
+            }
+        });
+        assert_eq!(rollup.rollup_verdict, RollupVerdict::Refused);
+        assert!(!rollup_permits_completion(rollup.rollup_verdict));
+        assert_eq!(rollup.refused_subs, vec!["sub-0"]);
+
+        // A sub that never merged (no result run) is also a refused leaf.
+        let mut missing = campaign_with_results();
+        missing.sub_goals[1].result_run_id = None;
+        let rollup2 = build_rollup(&missing, lookup_clean);
+        assert_eq!(rollup2.rollup_verdict, RollupVerdict::Refused);
+        assert_eq!(rollup2.refused_subs, vec!["sub-1"]);
+    }
+
+    #[test]
+    fn edited_rollup_file_fails_result_marker_signature() {
+        use crate::gate::{validate_acceptance_marker, write_acceptance_marker};
+        use crate::paths::DeadreckonPaths;
+        use crate::state::{RunOptions, create_run};
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "campaign-result".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+
+        // A campaign result run carries its roll-up in the run root; the gate binds
+        // it into the marker signature. Start from a refused roll-up so the later
+        // edit is a real byte change.
+        let refused_campaign = campaign_with_results();
+        let rollup = build_rollup(&refused_campaign, |run_id| {
+            if run_id == "run-0" {
+                (
+                    "signed".to_string(),
+                    AcceptanceTamperVerdict::Refuse,
+                    Vec::new(),
+                )
+            } else {
+                lookup_clean(run_id)
+            }
+        });
+        assert_eq!(rollup.rollup_verdict, RollupVerdict::Refused);
+        crate::state::atomic_write_json(&rollup_path_at_run_root(&state.run_root), &rollup)
+            .expect("write rollup into run root");
+        write_acceptance_marker(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            1,
+        )
+        .expect("sign marker");
+        validate_acceptance_marker(&state).expect("valid before edit");
+
+        // Editing the bound roll-up after signing (to launder the refusal into a
+        // clean pass) invalidates the marker.
+        let mut tampered = rollup;
+        tampered.rollup_verdict = RollupVerdict::Clean;
+        tampered.refused_subs.clear();
+        crate::state::atomic_write_json(&rollup_path_at_run_root(&state.run_root), &tampered)
+            .expect("edit rollup");
+        let err = validate_acceptance_marker(&state).expect_err("signature must reject edit");
+        assert!(err.to_string().contains("signature"));
+    }
 
     #[test]
     fn tree_budget_splits_evenly_with_remainder_to_first() {

@@ -785,6 +785,20 @@ fn marker_signature(run_root: &Path, marker: &AcceptanceMarker) -> Result<String
             });
         }
     }
+    // A campaign result run carries its gate-verdict roll-up; binding it here means
+    // the roll-up cannot be edited after signing to launder a refused leaf into a
+    // clean pass. Absent (the normal, non-campaign case) hashes empty.
+    let rollup_path = crate::campaign::rollup_path_at_run_root(run_root);
+    match std::fs::read(&rollup_path) {
+        Ok(bytes) => bytes.hash(&mut hasher),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => "".hash(&mut hasher),
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: rollup_path,
+                source,
+            });
+        }
+    }
     Ok(format!("{:016x}", hasher.finish()))
 }
 
