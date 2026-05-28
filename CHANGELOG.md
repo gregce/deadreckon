@@ -1,5 +1,9 @@
 # Changelog
 
+## Campaign Orchestration (production release) - 2026-05-28
+
+- P1: Added `deadreckon-core::campaign` module with the nesting `Lineage` record, the `CAMPAIGN_MAX_DEPTH = 2` hard cap, and a `guard` that refuses a campaign at depth >= 1 or a sub-goal that cycles to an ancestor `task_key`/scope.
+
 ## Tamper-Evident Gate (production release) - 2026-05-28
 
 - Refuse to sign when a run edits `acceptance.yaml` or a compiled check carries a suppression pattern; downgrade to a surfaced caveat when a run modifies a check-covered test/target file; bind the tamper record into the marker signature.

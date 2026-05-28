@@ -4,6 +4,7 @@
 //! Core state, locking, and run artifacts for the deadreckon harness.
 
 pub mod artifacts;
+pub mod campaign;
 pub mod cancel;
 pub mod chain;
 pub mod codebase;
