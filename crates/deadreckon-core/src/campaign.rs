@@ -371,6 +371,54 @@ pub fn lineage_from_env() -> Lineage {
     )
 }
 
+const CAMPAIGN_EVENTS_FILE: &str = "campaign-events.jsonl";
+
+/// Append-only campaign timeline, mirroring `plan-events.jsonl`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CampaignEvent {
+    pub schema_version: u32,
+    pub ts: DateTime<Utc>,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub detail: serde_json::Value,
+}
+
+pub fn campaign_events_path(plan_dir: &Path) -> PathBuf {
+    plan_dir.join(CAMPAIGN_EVENTS_FILE)
+}
+
+pub fn append_campaign_event(
+    plan_dir: &Path,
+    kind: impl Into<String>,
+    detail: serde_json::Value,
+) -> Result<()> {
+    let event = CampaignEvent {
+        schema_version: 1,
+        ts: Utc::now(),
+        kind: kind.into(),
+        detail,
+    };
+    crate::state::append_json_line(&campaign_events_path(plan_dir), &event)
+}
+
+pub fn read_campaign_events(plan_dir: &Path) -> Result<Vec<CampaignEvent>> {
+    let path = campaign_events_path(plan_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).map_err(|source| DeadreckonError::Json {
+                    path: path.clone(),
+                    source,
+                })
+            })
+            .collect(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(DeadreckonError::Io { path, source }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
