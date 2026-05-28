@@ -246,7 +246,7 @@ pub fn frontmatter(state: &PipelineState, fields: &FrontmatterFields) -> String 
         "**Last updated:** {}",
         fields.last_updated.to_rfc3339()
     ));
-    lines.push(format!("**Status:** {} (alpha)", state.status));
+    lines.push(format!("**Status:** {}", state.status));
     lines.push(format!("**Run ID:** `{}`", state.run_id));
     lines.push(format!("**Goal:** {}", state.goal));
     if let Some(parent) = fields.parent_run_id.as_deref() {

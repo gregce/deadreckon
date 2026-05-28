@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::narrative::{AttachViewMode, NarrativeVisualMode};
-use deadreckon_core::DocKind;
 
 const TOP_LEVEL_TEMPLATE: &str = "\
 {name} {version}
@@ -1607,6 +1606,7 @@ pub(crate) enum CliDocKind {
     Narrative,
     AsBuilt,
     Decisions,
+    Children,
     Delta,
 }
 
@@ -1858,17 +1858,6 @@ pub(crate) enum ImproveCommand {
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
     },
-}
-
-impl From<CliDocKind> for DocKind {
-    fn from(value: CliDocKind) -> Self {
-        match value {
-            CliDocKind::Narrative => DocKind::Narrative,
-            CliDocKind::AsBuilt => DocKind::AsBuilt,
-            CliDocKind::Decisions => DocKind::Decisions,
-            CliDocKind::Delta => DocKind::Delta,
-        }
-    }
 }
 
 #[derive(Subcommand)]

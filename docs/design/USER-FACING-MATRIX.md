@@ -3,7 +3,7 @@
 **Status:** Refreshed against the local working tree on 2026-05-27.
 **Scope:** The user-visible CLI, prompts, summaries, TUI labels, JSON/plain modes, help text, docs-facing terminology, and orchestration surfaces in `/Users/gdc/deadreckon`.
 **Method:** Source audit of `crates/deadreckon/src/{cli.rs,main.rs,ui.rs,prompt.rs}` and `crates/deadreckon-core/src/{glossary.rs,state.rs,chain.rs,plan.rs}`, plus the current AS-BUILT and goal docs.
-**Read this as:** the alpha coherence closure record. The prior matrix cited commit `455b91a` and listed 108 issues; the closure fixes the accidental user-facing drift and leaves larger template/palette/orchestration redesigns as explicit V1 deferrals.
+**Read this as:** the coherence closure record. The prior matrix cited commit `455b91a` and listed 108 issues; the closure fixes the accidental user-facing drift and leaves larger template/palette/orchestration redesigns as explicit V1 deferrals.
 
 ## Fixed Since The Prior Audit
 
@@ -25,18 +25,18 @@
 | Done-criteria prompt transparency | Existing done criteria are no longer an opaque TTY carry-forward in `start`; users can keep, view, check, update, or cancel before launch. | `crates/deadreckon/src/main.rs`, `crates/deadreckon/src/cli.rs` | Direct `def-done show/check/<text>` remains the explicit command surface. |
 | Plain output flag | All `--plain` help uses one definition: "Plain output without TUI, spinner, or ANSI affordances." | `crates/deadreckon/src/cli.rs:545`, `crates/deadreckon/tests/coherence.rs:207` | Command-specific behavior is still implemented per command; the user-facing flag definition is shared. |
 | Cross-scope flags | Run, chain, history, cleanup, and library cross-project help says "all project scopes"; provider `--all` remains provider inventory. | `crates/deadreckon/src/cli.rs:869`, `crates/deadreckon/tests/coherence.rs:70` | This keeps `--all` for ordinary cross-project listing/search and `--all-scopes` for chain/cleanup compatibility-sensitive surfaces. |
-| Force aliases | Visible help uses intent-specific flags: `--escalate`, `--overwrite`, and `--anyway`; old `--force` spellings stay hidden alpha aliases. | `crates/deadreckon/src/cli.rs:917`, `crates/deadreckon/tests/coherence.rs:70` | `update --anyway` replaces the last visible primary-command `--force`. |
-| Branch target flags | Worktree runs expose `--branch-name`; apply and finish expose `--into`; apply output says work landed `into` the target branch. | `crates/deadreckon/src/cli.rs:532`, `crates/deadreckon/src/main.rs:12911`, `crates/deadreckon/tests/coherence.rs:60` | Hidden `--branch` aliases remain for one alpha, but help and output use the canonical words. |
-| Strategy flag family | `merge --strategy` is plan composition, `apply`/`finish --git-strategy` is git apply behavior, and chain help separates `--apply-mode` from per-step `--apply-strategy`. | `crates/deadreckon/src/cli.rs:735`, `crates/deadreckon/tests/coherence.rs:122` | Hidden `--strategy` aliases for apply/finish remain for one alpha; user-facing help scopes the terms. |
+| Force aliases | Visible help uses intent-specific flags: `--escalate`, `--overwrite`, and `--anyway`; old `--force` spellings stay hidden compatibility aliases. | `crates/deadreckon/src/cli.rs:917`, `crates/deadreckon/tests/coherence.rs:70` | `update --anyway` replaces the last visible primary-command `--force`. |
+| Branch target flags | Worktree runs expose `--branch-name`; apply and finish expose `--into`; apply output says work landed `into` the target branch. | `crates/deadreckon/src/cli.rs:532`, `crates/deadreckon/src/main.rs:12911`, `crates/deadreckon/tests/coherence.rs:60` | Hidden `--branch` aliases remain for one compatibility release, but help and output use the canonical words. |
+| Strategy flag family | `merge --strategy` is plan composition, `apply`/`finish --git-strategy` is git apply behavior, and chain help separates `--apply-mode` from per-step `--apply-strategy`. | `crates/deadreckon/src/cli.rs:735`, `crates/deadreckon/tests/coherence.rs:122` | Hidden `--strategy` aliases for apply/finish remain for one compatibility release; user-facing help scopes the terms. |
 | Prompt-skip flags | `help-all` documents `--yes` as preflight preview acceptance and `--no-confirm` as destructive/follow-up confirmation skipping; command help follows that split. | `crates/deadreckon/src/main.rs:1118`, `crates/deadreckon/src/cli.rs:548`, `crates/deadreckon/tests/coherence.rs:161` | `run` keeps both because it has a preflight plus separate safety confirmations. |
-| Output mode flags | `help-all` documents `--quiet`, `--plain`, `--json`, and `--no-hints` precedence; quiet text is shared and JSON remains inspection/list-only in alpha. | `crates/deadreckon/src/main.rs:1118`, `crates/deadreckon/tests/coherence.rs:161` | `--json` wins over styling/hints where present; `DEADRECKON_HINTS=0` is the process-level hint override. |
+| Output mode flags | `help-all` documents `--quiet`, `--plain`, `--json`, and `--no-hints` precedence; quiet text is shared and JSON remains inspection/list-only for the current release. | `crates/deadreckon/src/main.rs:1118`, `crates/deadreckon/tests/coherence.rs:161` | `--json` wins over styling/hints where present; `DEADRECKON_HINTS=0` is the process-level hint override. |
 | Provider role flags | `help-all` documents provider roles for primary run, planner, child, coder, reviewer, documentation, and repair routes; orchestration/doc help uses provider-route wording. | `crates/deadreckon/src/main.rs:1148`, `crates/deadreckon/src/cli.rs:665`, `crates/deadreckon/tests/coherence.rs:241` | Normal user surfaces say provider route/model/kind; descriptor remains registry vocabulary. |
 | Spend cap glossary | `help-all` defines run cap, per-child cap, aggregate chain cap, and doc polish cap in one place. | `crates/deadreckon/src/main.rs:1158`, `crates/deadreckon/tests/coherence.rs:370` | This keeps `--max-spend` scoped by object instead of relying on local help wording alone. |
 | Copy-out wording | User-facing prompts, docs, help, and refusal text now say `export`; `materialize` remains a hidden compatibility alias/internal marker word. | `crates/deadreckon/src/main.rs:12430`, `crates/deadreckon/src/main.rs:16679`, `crates/deadreckon/tests/coherence.rs:201` | TUI key `m` is preserved while the visible action is `export`. |
 | Lifecycle help parity | Top help, attach, show, kill, merge, apply, and cleanup help use run/chain/plan id language, show `finish` first for completed plans, and document plan-child refs. | `crates/deadreckon/src/main.rs:1246`, `crates/deadreckon/src/cli.rs:330`, `crates/deadreckon/tests/coherence.rs:392` | Direct `apply`/`export` remain visible after `finish` for advanced post-completion flows. |
 | Cleanup boundary wording | Cleanup help names temporary run worktrees and branches as the target and excludes plan state, promoted library artifacts, and exported directories. | `crates/deadreckon/src/cli.rs:304`, `crates/deadreckon/tests/coherence.rs:456` | This keeps cleanup from sounding like it deletes everything deadreckon knows about. |
 | Plan result primacy | Merge/result output names the plan first and labels the synthesized result run and artifact library as secondary implementation details. | `crates/deadreckon/src/main.rs:9586`, `crates/deadreckon/src/main.rs:11849`, `crates/deadreckon/tests/coherence.rs:357` | Plan ids remain the user-facing lifecycle id for `finish`, `apply`, and `export`. |
-| Public docs alias sweep | README, HOWTO, and DEVELOPMENT-README no longer teach stale primary aliases or old flag spellings for the current CLI. | `crates/deadreckon/tests/coherence.rs:336` | Historical goal/rider docs may still mention old spellings as history; AS-BUILT calls them hidden alpha aliases where relevant. |
+| Public docs alias sweep | README, HOWTO, and DEVELOPMENT-README no longer teach stale primary aliases or old flag spellings for the current CLI. | `crates/deadreckon/tests/coherence.rs:336` | Historical goal/rider docs may still mention old spellings as history; AS-BUILT calls them hidden compatibility aliases where relevant. |
 | Plan/orchestrate start output | Plan, fork, merge, and orchestrate now share provider-role, dependency, parallelism, and repair summary helpers. | `crates/deadreckon/src/main.rs`, `crates/deadreckon/src/plan_event_bus.rs` | This closes the V1 live-UX slice without introducing a full output-layout facade. |
 | Run start key/value layout | Fresh, extended, and resumed run start banners share one padded key/value block for provider, model, docs, state, and attach. | `crates/deadreckon/src/main.rs:16988`, `crates/deadreckon/tests/coherence.rs:93` | This closes the most visible run/extend/resume start-summary mismatch without changing durable state. |
 | Plan attach drilldown | `attach <plan-id>` can drill into a child run and return with standardized detach/focus/back/try footer grammar. | `crates/deadreckon/src/main.rs`, `crates/deadreckon/src/plan_event_bus.rs` | Child detail remains the normal run attach renderer. |
@@ -44,7 +44,7 @@
 | Orchestrate finish/apply/export | Completed plans can route through `finish`, `apply`, and `export` by plan id. | `crates/deadreckon/src/main.rs:12232`, `crates/deadreckon/src/main.rs:12499` | Plan id is primary in help; result-run ids are secondary implementation detail. |
 | Chain glyph collision | Chain step `Applied` now uses `◉`; `Running` remains `●`. | `crates/deadreckon/src/main.rs:4824` | Preserve glyph set: `○ ● ◐ ✗ ↷ ◉ ↶`. |
 | Machine output | JSON exists on key inspect/list surfaces plus `plan --json`; representative JSON responses include `kind`, `id`, `status`, `next_actions`, `try_lines`, and `paths` without ANSI or hints. | `crates/deadreckon/src/cli.rs:695`, `crates/deadreckon/src/main.rs:1664`, `crates/deadreckon/src/main.rs:8954`, `crates/deadreckon/tests/coherence.rs:1050` | Existing payload keys such as `runs`, `run`, `plan`, `providers`, and `chains` remain for compatibility. |
-| Style contract docs | AS-BUILT §26 documents glossary, style facade, key/value layout, flag/output policy, provider roles, JSON parity, card policy, and V1 limits. | `docs/AS-BUILT-ARCHITECTURE.md:1670`, `docs/V1-CANDIDATES.md:1` | The docs now distinguish alpha closure from broader V1 refinements. |
+| Style contract docs | AS-BUILT §26 documents glossary, style facade, key/value layout, flag/output policy, provider roles, JSON parity, card policy, and V1 limits. | `docs/AS-BUILT-ARCHITECTURE.md:1670`, `docs/V1-CANDIDATES.md:1` | The docs now distinguish release behavior from broader V1 refinements. |
 | Visual identity | The cyan `deadreckoning` progress label, `* ^ . -` course strip, magenta ids, TUI palette, spend gradient, and step glyphs are present. | `crates/deadreckon/src/main.rs:12044`, `crates/deadreckon/src/ui.rs:25`, `crates/deadreckon/src/main.rs:20384` | Keep these; standardize their construction. |
 
 ## Current Command Catalog
@@ -94,7 +94,7 @@ Source: parser definitions in `crates/deadreckon/src/cli.rs`, default/help-all c
 
 | Concept | Stored/schema word | User-facing word today | Keep/change |
 |---|---|---|---|
-| Active run/phase | `executing` | `running` | Keep user word `running`; keep schema for alpha compatibility. |
+| Active run/phase | `executing` | `running` | Keep user word `running`; keep schema for compatibility. |
 | Active plan | `forked` | `running` | Keep user word `running`; consider a schema migration later only for V1. |
 | Completed plan | `merged` | `completed` | Keep user word `completed`. |
 | Multi-agent object | plan / orchestration / job | mixed | Use `plan` as noun, `orchestrate` as action. Avoid `job` unless referring generically. |
@@ -107,7 +107,7 @@ Source: parser definitions in `crates/deadreckon/src/cli.rs`, default/help-all c
 
 ## Explicit Alpha Deferrals
 
-These are intentionally not alpha-closure blockers. Rows marked fixed below were closed after the initial matrix; remaining rows are captured in `docs/V1-CANDIDATES.md` and should be tackled as follow-up design/implementation work, not as hidden drift in the current CLI.
+These are intentionally not release blockers. Rows marked fixed below were closed after the initial matrix; remaining rows are captured in `docs/V1-CANDIDATES.md` and should be tackled as follow-up design/implementation work, not as hidden drift in the current CLI.
 
 ### Style, Streams, And Text Blocks
 
@@ -154,7 +154,7 @@ These are intentionally not alpha-closure blockers. Rows marked fixed below were
 
 ## V1 Target Model
 
-The alpha closure landed the immediate user-facing vocabulary, help, flag, provider-role, provider/done-criteria setup, JSON, and docs coherence work. A V1 coherence/design pass can still deepen these decisions:
+The closure landed the immediate user-facing vocabulary, help, flag, provider-role, provider/done-criteria setup, JSON, and docs coherence work. A V1 coherence/design pass can still deepen these decisions:
 
 1. One glossary for nouns, verbs, statuses, object kinds, provider roles, and done criteria.
 2. Keep custom top help and help-all on the shared command catalog, with clap coverage tests for row drift.

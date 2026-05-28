@@ -102,6 +102,8 @@ fn frontmatter_contains_required_fields_in_order() {
         assert!(idx >= last, "{field} appeared out of order");
         last = idx;
     }
+    assert!(fm.contains("**Status:** planned"), "{fm}");
+    assert!(!fm.contains("(alpha)"), "{fm}");
 }
 
 #[test]
@@ -1839,7 +1841,7 @@ fn valid_docs_json(state: &deadreckon_core::PipelineState, files: &[&str]) -> St
         .collect::<Vec<_>>()
         .join(", ");
     json!({
-        "narrative": format!("# {}\n\n**Date:** {}\n**Last updated:** {}\n**Status:** completed (alpha)\n**Run ID:** `{}`\n**Goal:** {}\n**Owner:** tester (with deadreckon + docmock)\n**Provider:** docmock\n**Sandbox:** none\n**Spend:** $0.00\n**Doc-writer:** docmock\n\n## Goal\n\n{}\n\n## High-level approach\n\nPolished summary names {} and cites [turn 1](../traces.jsonl).\n\n## What shipped in this run\n\n### Phase 1 - Polish (commit `-`)\n\n- Files: {}\n\n## Open threads\n\n- none\n", state.goal, state.started_at.to_rfc3339(), chrono::Utc::now().to_rfc3339(), state.run_id, state.goal, state.goal, file_lines, file_lines),
+        "narrative": format!("# {}\n\n**Date:** {}\n**Last updated:** {}\n**Status:** completed\n**Run ID:** `{}`\n**Goal:** {}\n**Owner:** tester (with deadreckon + docmock)\n**Provider:** docmock\n**Sandbox:** none\n**Spend:** $0.00\n**Doc-writer:** docmock\n\n## Goal\n\n{}\n\n## High-level approach\n\nPolished summary names {} and cites [turn 1](../traces.jsonl).\n\n## What shipped in this run\n\n### Phase 1 - Polish (commit `-`)\n\n- Files: {}\n\n## Open threads\n\n- none\n", state.goal, state.started_at.to_rfc3339(), chrono::Utc::now().to_rfc3339(), state.run_id, state.goal, state.goal, file_lines, file_lines),
         "as_built": format!("# as built\n\n## System overview\n\n{}", file_lines),
         "decisions": "No multi-alternative decisions detected in this run.\n",
         "delta": ""

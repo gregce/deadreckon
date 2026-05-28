@@ -44,7 +44,7 @@ For a higher-level read while it runs, `deadreckon attach latest --view narrativ
 Everything else (budgets, undo, multi-step chains, provider routing) is optional power you reach for later. No API keys? `deadreckon run "hello" --smoke --sandbox none` exercises the whole harness against a faked provider.
 
 > [!TIP]
-> deadreckon is alpha software. The core lifecycle (isolated runs, signed gates, durable state, undo, docs, and apply) is implemented and tested, but expect rough edges and breaking changes.
+> DeadReckon is on the production-release track. The core lifecycle (isolated runs, signed gates, durable state, undo, docs, orchestration, and apply) is implemented and tested; release notes call out any compatibility migrations.
 
 ## Why it's different
 
@@ -65,4 +65,4 @@ Everything else (budgets, undo, multi-step chains, provider routing) is optional
 | **[Resume Semantics](docs/RESUME-SEMANTICS.md)** · **[Multi-Run](docs/MULTI-RUN.md)** | Crash/resume behavior and concurrency rules |
 | **[V1 Candidates](docs/V1-CANDIDATES.md)** | Deferred features and roadmap |
 
-deadreckon is alpha software. The core lifecycle is implemented and tested, alongside multi-agent orchestration (`plan` / `fork` / `merge`), autonomous chains, the provider flight recorder with `rewind`, and a local self-improvement loop (`learn` / `improve`).
+DeadReckon is maintained as production-release software. The core lifecycle is implemented and tested, alongside multi-agent orchestration (`plan` / `fork` / `merge`), autonomous chains, the provider flight recorder with `rewind`, and a local self-improvement loop (`learn` / `improve`).

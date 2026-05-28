@@ -1,9 +1,9 @@
 # AS-BUILT-ARCHITECTURE.md
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
-**Frame:** Reference specification for the **alpha-tier** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-26 (guided first use, local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure; followed by a 2026-05-26 agent-team code-verification pass that re-checked the module map, file-system layout, CLI surface, provider/sandbox/gate code locations, and the attach event-bus model against source)
-**Maturity:** alpha. Workspace version `0.1.0`. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
+**Frame:** Reference specification for the **production-release** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
+**Last updated:** 2026-05-28 (production-release posture, consolidated plan-result docs, guided first use, local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
+**Maturity:** production-release posture. Workspace version `0.1.0` pending release tagging. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
 
@@ -36,7 +36,7 @@ This document captures the system as built today — what's wired, what's load-b
 23. [Glossary](#23-glossary)
 24. [Codebase Modes](#24-codebase-modes)
 25. [Self-Documenting Runs](#25-self-documenting-runs)
-26. [Coherence Pass (alpha)](#26-coherence-pass-alpha)
+26. [Coherence Pass And Production Command Model](#26-coherence-pass-and-production-command-model)
 27. [Overnight UX](#27-overnight-ux)
 28. [Chains & Autonomous Goal Chaining](#28-chains--autonomous-goal-chaining)
 29. [Workspace Hygiene](#29-workspace-hygiene)
@@ -455,7 +455,7 @@ JSONL files (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) 
 ├── chains/
 │   └── <chain-id>/                # chain.json, chain-events.jsonl, conductor.json
 ├── plans/
-│   └── <plan-id>/                 # plan.json, coordinator.json, messages.jsonl, plan-events.jsonl, worker-specs/, summaries/, docs/PLAN-NARRATIVE.md, merge-proofs/
+│   └── <plan-id>/                 # plan.json, coordinator.json, messages.jsonl, plan-events.jsonl, worker-specs/, summaries/, docs/PLAN-*.md, merge-proofs/
 ├── worktrees/
 │   └── <scope>-<run-id-prefix>/   # git worktree for worktree-mode runs
 ├── learning/                      # episodes/, signals.jsonl, insights.jsonl, proposals/, candidates/, evals/, bundles/, pr-events.jsonl, policy.toml
@@ -1318,9 +1318,9 @@ The launch decision resolves provider setup, done criteria, source mode, history
 
 History-aware `start` scans the current project scope for the newest completed, promoted, non-in-place run. When one exists, the TTY launch picker adds a "Follow up" choice that dispatches through `extend`; preview and JSON output also include exact commands for `deadreckon extend <run-id> "<goal>"`, `deadreckon start "<goal>" --mode review --yes`, and `deadreckon start "<goal>" --mode full-plan --yes`. This keeps scripted `start` deterministic while making it obvious how to continue prior work or launch a new orchestration pass.
 
-Auto mode is deterministic in alpha. It chooses single-run, review orchestration, or full-plan orchestration from local goal text and explicit flags, then reports the override flag (`--mode run`, `--mode review`, or `--mode full-plan`) a user can pass if the heuristic guessed wrong. In a TTY, the recommendation appears first in the mode picker and the user can override it with a selection. The guided command does not ask a provider to classify the goal and does not persist personal preferences.
+Auto mode is deterministic in the current release. It chooses single-run, review orchestration, or full-plan orchestration from local goal text and explicit flags, then reports the override flag (`--mode run`, `--mode review`, or `--mode full-plan`) a user can pass if the heuristic guessed wrong. In a TTY, the recommendation appears first in the mode picker and the user can override it with a selection. The guided command does not ask a provider to classify the goal and does not persist personal preferences.
 
-`start --preview`, `run --preview`, and `orchestrate --preview` share launch-preview rows: path, provider, done criteria, workspace, watch, stop, and finish, with optional base/history rows when a follow-up is selected or available. Orchestrated `start` previews also show the alpha role reuse when one selected provider route is used for coder/reviewer or planner/child roles. Successful guided launches add a `start lifecycle` footer with exact `attach`, `status`, `kill`, and `finish` commands for the created run or plan. Existing `run`, `extend`, and `orchestrate` remain the canonical direct commands for users who already know the path they want.
+`start --preview`, `run --preview`, and `orchestrate --preview` share launch-preview rows: path, provider, done criteria, workspace, watch, stop, and finish, with optional base/history rows when a follow-up is selected or available. Orchestrated `start` previews also show role reuse when one selected provider route is used for coder/reviewer or planner/child roles. Successful guided launches add a `start lifecycle` footer with exact `attach`, `status`, `kill`, and `finish` commands for the created run or plan. Existing `run`, `extend`, and `orchestrate` remain the canonical direct commands for users who already know the path they want.
 
 Prompt eligibility is deliberately narrow: `--json`, `--plain`, `--quiet`, `--yes`, and non-TTY execution never start the picker and never block on stdin. Those paths preserve deterministic JSON/recovery output and scriptable launch behavior. `--preview` may ask TTY users for selections, but it remains state-free; provider config is not written by a provider selection, and done-criteria files are only generated for an actual launch after final confirmation.
 
@@ -1549,7 +1549,7 @@ cargo fmt --check
 
 ## 22. What's Built vs Scaffolding-Thin
 
-The codebase is more complete than a typical first pass, and the 2026-05-11 hardening pass replaced the earlier thin seams with depth-tested implementations where those seams were in alpha scope. Honest accounting per `docs/CHANGELOG.md`, `docs/GAP-ANALYSIS.md`, and `docs/AUDIT-2026-05-11.md`:
+The codebase is more complete than a typical first pass, and the 2026-05-11 hardening pass replaced earlier thin seams with depth-tested implementations where those seams were in scope. Honest accounting per `docs/CHANGELOG.md`, `docs/GAP-ANALYSIS.md`, and `docs/AUDIT-2026-05-11.md`:
 
 ### Built and reliable
 
@@ -1595,6 +1595,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - CLI usability polish: root help includes command groups, `status` includes run health/library/disk blocks, and `DEADRECKON_HINTS=0` suppresses post-completion prompts.
 - Autonomous sequential chains: `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`, and `chain redo`; chains use `latest`/`last` aliases, `chain.json`, `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps, green-policy auto-apply, and a multi-step ratatui timeline with single-run chain context.
 - Plan observability: orchestration plans now write `plan-events.jsonl`; `attach <plan-id>` renders plan events, drills into child run attach, and returns to the plan context; plain attach, `history grep --plan`, and `show --why-failed <plan-id>` include plan event evidence.
+- Consolidated plan-result docs: completed plans write provider-backed or deterministic `PLAN-NARRATIVE.md`, `PLAN-AS-BUILT.md`, `PLAN-DECISIONS.md`, `PLAN-CHILDREN.md`, and `PLAN-DOCS-MANIFEST.json`; merged libraries, apply worktrees, and exports carry those docs, and synthetic plan-result apply runs expose wrapper `RUN-*` docs that point at the consolidated plan story.
 - Semantic merge repair: `merge <plan-id>` now defaults to DAG-aware composition, lets descendant tasks supersede ancestor file edits, writes conflict/repair sidecars under `merge-proofs/`, and automatically invokes a repair provider for true parallel conflicts unless `--no-repair` is set.
 - Provider flight recorder & rewind: CLI-backed provider turns record `flight-manifest.json`, `flight-events.jsonl`, and delta `checkpoints/`; `show --flight` / `--file` inspects them and `rewind --to-turn|--to-provider-event|--to-checkpoint` previews or applies a hash-guarded checkpoint restore.
 - Local self-improvement loop: `learn index|report|propose|export|import-bundle` builds a redacted local experience index and provider-backed proposals; `improve self … --preview|--yes|--pr-dry-run|--open-pr` runs evidence-gated self-run candidates with PR opening held behind an explicit evidence gate.
@@ -1611,7 +1612,7 @@ The previously named thin areas now have code paths and depth tests:
 3. **Cancellation model.** `kill` writes a cancel marker before signals; tests cover cross-process marker semantics, HTTP aborts, and kill storms.
 4. **Wall-clock spend for CLI providers.** CLI providers accumulate wall time and caps; richer subscription-to-budget policy remains a future routing concern.
 5. **Sandbox profiles.** `sandbox.toml` drives per-tool policy; policy blocks disallowed filesystem/network access and records refusals.
-6. **Doctor.** Local setup checks are actionable and exhaustive for alpha; provider network pings are opt-in.
+6. **Doctor.** Local setup checks are actionable and exhaustive for the production CLI; provider network pings are opt-in.
 7. **Import normalization.** JSONL/JSON/SQLite imports now carry source path/line metadata, raw hashes, content-hash manifests, deterministic imported run IDs, and normalized trace/provenance details, with golden-file `show` round trips and descriptor-provider fixtures.
 8. **Acceptance gate.** `acceptance.yaml` supports structured checks and signed per-check results.
 9. **Multi-run coordination.** Scope-qualified locks, stale reclaim, same-scope refusal tests, and sequential chain coordination are in place; parallel/DAG scheduling remains out of scope.
@@ -1708,7 +1709,7 @@ abandoned, stale, or completed worktree runs, with opt-in `--completed`,
 `--stale`, `--all-scopes`, `--escalate`, and `--overwrite` selectors. It does
 not delete plan state, promoted library artifacts, or directories exported with
 `deadreckon export`. The older `--all` and `--force` spellings remain hidden
-alpha aliases.
+compatibility aliases.
 
 ### 24.11 Integration With Existing Verbs
 
@@ -1781,7 +1782,7 @@ When `deadreckon apply` builds the default squash or merge message, it reads `RU
 
 ### 25.9 `deadreckon doc`
 
-`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another artifact, `--export <path>` writes it to disk, and `--overwrite` overwrites exports or a prior polish result. `--kind decisions` prints the converged implementation decision ledger, not only regex-detected choice points. `--polish` prints a preview listing provider route, provider source, subskills, token budget, max spend, and inputs hash before it calls the documentation provider route; `--no-confirm` skips the prompt for scripts. `--doc-provider <route>` overrides the automatic documentation provider route and `--max-spend <usd>` limits the polish pass. The older `--force` and `--budget-cap` spellings remain hidden alpha aliases.
+`deadreckon doc <run-id>` prints the narrative by default. `--kind as-built|decisions|delta` selects another run artifact, `--export <path>` writes it to disk, and `--overwrite` overwrites exports or a prior polish result. `--kind decisions` prints the converged implementation decision ledger, not only regex-detected choice points. For orchestration plans, `deadreckon doc <plan-id>` and `deadreckon doc <plan-result-wrapper-run-id>` resolve to consolidated `PLAN-*` docs; `--kind children` prints the plan child index. `--polish` prints a preview for run docs and refreshes provider-backed plan docs for plans, with deterministic fallback if provider output is unavailable or invalid. `--no-confirm` skips the run-doc prompt for scripts. `--doc-provider <route>` overrides the automatic documentation provider route and `--max-spend <usd>` limits the polish pass. The older `--force` and `--budget-cap` spellings remain hidden compatibility aliases.
 
 ### 25.10 Cost And Idempotency
 
@@ -1809,13 +1810,13 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 ---
 
-## 26. Coherence Pass (alpha)
+## 26. Coherence Pass And Production Command Model
 
-> **Status (2026-05-27):** The May 2026 coherence pass, closure pass, and production command model are alpha-complete. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, provider/done-criteria setup, JSON parity, orchestration commands, plan attach, polymorphic lifecycle ids, default-help command audience, history-aware `start`, and done-criteria review prompts now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md`, `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`, `docs/goals/2026-05-24-1426-deadreckon-provider-done-setup-goal.md`, and `docs/goals/2026-05-27-1152-deadreckon-production-command-model-goal.md`; the closure matrix is `docs/design/USER-FACING-MATRIX.md`, with larger follow-ups explicitly deferred to `docs/V1-CANDIDATES.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs` and runtime setup helpers.
+> **Status (2026-05-28):** The May 2026 coherence pass, closure pass, and production command model are release-complete for the current CLI contract. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, provider/done-criteria setup, JSON parity, orchestration commands, plan attach, polymorphic lifecycle ids, default-help command audience, history-aware `start`, and done-criteria review prompts now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md`, `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`, `docs/goals/2026-05-24-1426-deadreckon-provider-done-setup-goal.md`, and `docs/goals/2026-05-27-1152-deadreckon-production-command-model-goal.md`; the closure matrix is `docs/design/USER-FACING-MATRIX.md`, with larger follow-ups explicitly deferred to `docs/V1-CANDIDATES.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs` and runtime setup helpers.
 
 ### 26.1 Glossary
 
-`crates/deadreckon-core/src/glossary.rs` is the display vocabulary source for statuses and primary nouns. Stored enum variants keep their alpha schema names, including `RunStatus::Executing`, but user-facing run and phase text now renders `running`. Chains, chain steps, plan status, and plan-child status use the same helper family, so `attach <plan-id> --plain`, `merge <plan-id>`, and `status <run-id>` agree on `running`.
+`crates/deadreckon-core/src/glossary.rs` is the display vocabulary source for statuses and primary nouns. Stored enum variants keep their historical schema names, including `RunStatus::Executing`, but user-facing run and phase text now renders `running`. Chains, chain steps, plan status, and plan-child status use the same helper family, so `attach <plan-id> --plain`, `merge <plan-id>`, and `status <run-id>` agree on `running`.
 
 ### 26.2 Style Helpers
 
@@ -1829,7 +1830,7 @@ Custom top-level help and `help-all` command discovery now render from `COMMAND_
 
 ### 26.4 Flag Truth
 
-The alpha CLI names intent before force. Kill paths use `--escalate`; destination overwrites use `--overwrite`; override paths use `--anyway`; chain and cleanup cross-scope commands use `--all-scopes`; status uses `--global`; run branch naming uses `--branch-name`; apply/finish target branches use `--into`, and apply output says work landed `into` the target branch; doc polish uses `--max-spend`; apply and finish git behavior use `--git-strategy`. Strategy words are scoped: `merge --strategy` is plan composition, `apply`/`finish --git-strategy` is git apply behavior, chain `--apply-mode` controls chain policy, and chain `--apply-strategy` controls the per-step git operation. The old spellings stay as hidden aliases for one alpha. Chain branch policy displays `linear-merge` while accepting the old `merge` value. Cross-project help says "all project scopes" on run, chain, history, cleanup, and library surfaces; provider `--all` remains provider inventory rather than project scope.
+The CLI names intent before force. Kill paths use `--escalate`; destination overwrites use `--overwrite`; override paths use `--anyway`; chain and cleanup cross-scope commands use `--all-scopes`; status uses `--global`; run branch naming uses `--branch-name`; apply/finish target branches use `--into`, and apply output says work landed `into` the target branch; doc polish uses `--max-spend`; apply and finish git behavior use `--git-strategy`. Strategy words are scoped: `merge --strategy` is plan composition, `apply`/`finish --git-strategy` is git apply behavior, chain `--apply-mode` controls chain policy, and chain `--apply-strategy` controls the per-step git operation. The old spellings stay as hidden compatibility aliases for one release window. Chain branch policy displays `linear-merge` while accepting the old `merge` value. Cross-project help says "all project scopes" on run, chain, history, cleanup, and library surfaces; provider `--all` remains provider inventory rather than project scope.
 
 Every visible `--plain` flag uses the same help definition: "Plain output without TUI, spinner, or ANSI affordances." Individual commands still implement their own plain-mode effect, such as `attach --plain` choosing the text summary instead of ratatui.
 
@@ -1863,11 +1864,11 @@ Plan merge/result output keeps the plan id as the primary object. The synthesize
 
 ### 26.9 JSON Parity
 
-Inspection surfaces that already read durable state now expose `--json`: `list`, `chain list`, `providers list`, `library list`, `status`, `show`, `detect`, and `doctor`. `plan --json` is also available for the write-plan-only preview surface, returning the saved plan id, status, paths, and next action without human hints. Representative JSON responses are top-level objects with `kind`, `id`, `status`, `next_actions`, `try_lines`, `paths`, and the existing named payload (`run`, `plan`, `runs`, `providers`, `chains`, and so on) for compatibility. JSON mode disables ANSI and optional hints. State-changing start/merge/fork/update actions remain text-first in alpha.
+Inspection surfaces that already read durable state now expose `--json`: `list`, `chain list`, `providers list`, `library list`, `status`, `show`, `detect`, and `doctor`. `plan --json` is also available for the write-plan-only preview surface, returning the saved plan id, status, paths, and next action without human hints. Representative JSON responses are top-level objects with `kind`, `id`, `status`, `next_actions`, `try_lines`, `paths`, and the existing named payload (`run`, `plan`, `runs`, `providers`, `chains`, and so on) for compatibility. JSON mode disables ANSI and optional hints. State-changing start/merge/fork/update actions remain text-first in the current release.
 
 ### 26.10 Deferred V1 Work
 
-Mass renaming stored enum variants, themable palettes, localization hooks, a full output-layout facade, generic lifecycle renderer, command-matrix golden snapshots, and a template engine for status cards stay in `docs/V1-CANDIDATES.md`. Provider and done-criteria setup unification has landed as an alpha runtime layer, so the remaining V1 work is deeper output-layout/golden coverage and richer interactive setup polish rather than another resolver. The orchestration live-UX slice has landed shared role/dependency/repair summaries and the `PlanEventBus` feed; remaining orchestration work is now the broader interactive setup/output-layout polish, not the basic live attach freshness gap.
+Mass renaming stored enum variants, themable palettes, localization hooks, a full output-layout facade, generic lifecycle renderer, command-matrix golden snapshots, and a template engine for status cards stay in `docs/V1-CANDIDATES.md`. Provider and done-criteria setup unification has landed as the production runtime layer, so the remaining V1 work is deeper output-layout/golden coverage and richer interactive setup polish rather than another resolver. The orchestration live-UX slice has landed shared role/dependency/repair summaries and the `PlanEventBus` feed; remaining orchestration work is now the broader interactive setup/output-layout polish, not the basic live attach freshness gap.
 
 ---
 
@@ -1920,7 +1921,7 @@ deadreckon chain plan "build a chess app" --n 6 --yes
 
 ### 28.4 Branch Policy
 
-`stack` bases step N+1 on the SHA applied by step N. `base` bases every step on the original chain base SHA. `linear-merge` follows stack semantics but forces `apply --git-strategy merge`, producing merge commits instead of squash commits. The old `merge` branch-policy value remains accepted as a hidden alpha alias.
+`stack` bases step N+1 on the SHA applied by step N. `base` bases every step on the original chain base SHA. `linear-merge` follows stack semantics but forces `apply --git-strategy merge`, producing merge commits instead of squash commits. The old `merge` branch-policy value remains accepted as a hidden compatibility alias.
 
 ### 28.5 Apply-Mode Green Policy
 
@@ -1960,7 +1961,7 @@ Supported hooks are `pre-step`, `post-step`, `on-promote`, and `on-chain-end`. P
 
 ### 28.12 Not Yet Built
 
-Out of scope for this alpha pass: mid-chain provider replanning, parallel/DAG steps inside one chain, cross-machine handoff, cloud sync, and a richer conflict-resolution UI. Those remain V1 candidates.
+Out of scope for the current release: mid-chain provider replanning, parallel/DAG steps inside one chain, cross-machine handoff, cloud sync, and a richer conflict-resolution UI. Those remain V1 candidates.
 
 ---
 
@@ -2022,6 +2023,12 @@ Two modes are built:
   messages.jsonl
   plan-events.jsonl
   docs/PLAN-NARRATIVE.md
+  docs/PLAN-AS-BUILT.md
+  docs/PLAN-DECISIONS.md
+  docs/PLAN-CHILDREN.md
+  docs/PLAN-DOCS-MANIFEST.json
+  docs/plan-doc-input.json
+  docs/_plan-docs.jsonl
   worker-specs/task-0.md
   summaries/task-0.md
   merge-working/
@@ -2031,7 +2038,9 @@ Two modes are built:
   merge-proofs/repair-run.json
 ```
 
-`messages.jsonl` remains the typed coordinator mailbox. `plan-events.jsonl` is the append-only orchestration timeline: plan created/started, task ready/started/run-discovered/completed/blocked/failed/killed, merge started/conflicted/repair-planned/repair-started/repair-run-discovered/repaired/repair-failed/completed, and plan completed/failed/killed. `docs/PLAN-NARRATIVE.md` is written after a successful merge and aggregates the durable child summaries into one plan-level reading path. The event stream is file-backed like `chain-events.jsonl`; child turn/tool traces stay in each child run's normal `events.jsonl`, `traces.jsonl`, and `spend.jsonl`.
+`messages.jsonl` remains the typed coordinator mailbox. `plan-events.jsonl` is the append-only orchestration timeline: plan created/started, task ready/started/run-discovered/completed/blocked/failed/killed, merge started/conflicted/repair-planned/repair-started/repair-run-discovered/repaired/repair-failed/completed, and plan completed/failed/killed. Plan docs are written after a successful merge or on `deadreckon doc <plan-id> --polish`: the collector reads child run docs, child summaries, worker specs, merge repair evidence, and final result inventory in task-graph order, then writes `PLAN-NARRATIVE.md`, `PLAN-AS-BUILT.md`, `PLAN-DECISIONS.md`, `PLAN-CHILDREN.md`, and `PLAN-DOCS-MANIFEST.json`. A configured doc provider can consolidate the input into cited prose; invalid, missing, or over-thin provider output falls back to deterministic docs rather than blocking merge/apply/export. The event stream is file-backed like `chain-events.jsonl`; child turn/tool traces stay in each child run's normal `events.jsonl`, `traces.jsonl`, and `spend.jsonl`.
+
+Plan-result materialization is allowlisted. Merged libraries, plan apply worktrees, and exported plan artifacts receive `.deadreckon/docs/PLAN-*` plus public `docs/PLAN-*`; broad `.deadreckon` and child `docs/RUN-*` skip rules still prevent copying child internals. Synthetic `deadreckon:orchestrate-apply` runs rewrite their own `RUN-NARRATIVE.md`, `RUN-AS-BUILT.md`, and `RUN-DECISIONS.md` as wrapper docs that identify the plan id/result run and link to consolidated `PLAN-*` docs instead of presenting zero-turn templated docs as the work product. `deadreckon doc`/`docs` resolves plan ids and plan-result wrapper run ids to these plan docs, and `show` reports plan doc status.
 
 Every child run receives an inline copy of its worker spec in the prompt. The spec includes root goal, exact task scope, provider, role, dependency context, capability preview, and hygiene rules such as staying within scope and not spawning subagents. The current worker-spec posture borrows Claude Code's coordinator rules: the spec is the complete brief, children should not inspect sibling transcripts, corrections stay with the worker that has the failure context, and reviewer lanes verify independently rather than inheriting coder assumptions.
 
@@ -2130,7 +2139,7 @@ Plain/off-TTY `attach <plan-id>` prints the latest plan event, merge repair stat
 
 ### 32.4 Current Limits
 
-The plan event stream is durable and replayable, and plan attach now subscribes to a single `PlanEventBus` feed abstraction. The feed is broadcast-capable in-process, but production plan writers still primarily communicate through append-only JSONL so cross-process attach remains reliable. A future embedded attach mode could pass a long-lived broadcaster through every plan writer for lower-latency same-process delivery. A broader attach daemon, shared broadcaster across run/plan/chain surfaces, and diagnostic dashboard for slow tick stages are deliberately out of scope for the alpha responsiveness slice.
+The plan event stream is durable and replayable, and plan attach now subscribes to a single `PlanEventBus` feed abstraction. The feed is broadcast-capable in-process, but production plan writers still primarily communicate through append-only JSONL so cross-process attach remains reliable. A future embedded attach mode could pass a long-lived broadcaster through every plan writer for lower-latency same-process delivery. A broader attach daemon, shared broadcaster across run/plan/chain surfaces, and diagnostic dashboard for slow tick stages are deliberately out of scope for the current release.
 
 ---
 
@@ -2197,8 +2206,8 @@ The gate requires explicit opt-in, isolated worktree evidence, non-empty proposa
 
 ### 34.5 Privacy, Redaction, And Limits
 
-Learning is local-first. No cloud sync, background telemetry, raw provider logs, credentials, or home-directory paths are exported by default. Provider-backed reflection sees redacted episode/signal summaries rather than raw provider-owned logs. Imported-only evidence can produce proposals, but it is not enough by itself to justify live PR opening without local corroborating run evidence. The alpha implementation does not train or fine-tune models, run multi-candidate evolutionary search, automatically change provider routing defaults, auto-merge into `main`, provide a learning TUI dashboard, or make audit logs cryptographically tamper-proof. Those remain V1 candidates.
+Learning is local-first. No cloud sync, background telemetry, raw provider logs, credentials, or home-directory paths are exported by default. Provider-backed reflection sees redacted episode/signal summaries rather than raw provider-owned logs. Imported-only evidence can produce proposals, but it is not enough by itself to justify live PR opening without local corroborating run evidence. The production implementation does not train or fine-tune models, run multi-candidate evolutionary search, automatically change provider routing defaults, auto-merge into `main`, provide a learning TUI dashboard, or make audit logs cryptographically tamper-proof. Those remain V1 candidates.
 
 ---
 
-*This document is canonical for the alpha-tier reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, and 32 in particular. Last verified 2026-05-26 by an agent team auditing each section against the current source. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~31k lines) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, and 32 in particular. Updated 2026-05-28 for release posture and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~31k lines) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

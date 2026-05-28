@@ -53,7 +53,6 @@ use deadreckon_core::learning::{
     read_proposal, record_pr_event, write_candidate, write_eval,
 };
 use deadreckon_core::paths::{sanitize_slug, workspace_scope};
-use deadreckon_core::plan::write_plan_narrative;
 use deadreckon_core::update_cache::{read_cache, write_cache};
 use deadreckon_core::{
     AcceptanceMarker, AcceptanceProgressEntry, ApplyMode, ApplyStrategy, BranchPolicy, Chain,
@@ -120,9 +119,9 @@ mod tui_events;
 mod ui;
 
 use crate::cli::{
-    AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, CliPlanMode, Commands,
-    CompletionCommand, ConfigCommand, ExtendCommandArgs, ForkCommandArgs, HistoryCommand,
-    HistoryKind, ImproveCommand, LearnCommand, LibraryCommand, MergeCommandArgs,
+    AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, CliDocKind,
+    CliPlanMode, Commands, CompletionCommand, ConfigCommand, ExtendCommandArgs, ForkCommandArgs,
+    HistoryCommand, HistoryKind, ImproveCommand, LearnCommand, LibraryCommand, MergeCommandArgs,
     OrchestrateCommand, PlanCommandArgs, ProvidersCommand, RunCommandArgs, StartCommandArgs,
 };
 use crate::narrative::{AttachViewMode, NarrativeVisualMode};
@@ -742,7 +741,7 @@ async fn main_inner() -> Result<()> {
         } => {
             doc_command(DocCommandArgs {
                 run_id,
-                kind: kind.into(),
+                kind,
                 export,
                 polish,
                 no_confirm,
@@ -3376,7 +3375,7 @@ fn resolve_start_source_mode(
                     if !matches!(decision.selected_mode, StartSelectedMode::Run) {
                         set_start_recovery(
                             decision,
-                            "copy source mode is only supported by start --mode run in this alpha",
+                            "copy source mode is only supported by start --mode run",
                             vec![format!(
                                 "deadreckon start \"{}\" --mode run --from .",
                                 shell_display_quote(&decision.goal)
@@ -3390,7 +3389,7 @@ fn resolve_start_source_mode(
                     if !matches!(decision.selected_mode, StartSelectedMode::Run) {
                         set_start_recovery(
                             decision,
-                            "fresh source mode is only supported by start --mode run in this alpha",
+                            "fresh source mode is only supported by start --mode run",
                             vec![format!(
                                 "deadreckon start \"{}\" --mode run --fresh",
                                 shell_display_quote(&decision.goal)
@@ -3464,7 +3463,7 @@ fn resolve_start_source_mode(
                                 if !matches!(decision.selected_mode, StartSelectedMode::Run) {
                                     set_start_recovery(
                                         decision,
-                                        "allow-dirty source mode is only supported by start --mode run in this alpha",
+                                        "allow-dirty source mode is only supported by start --mode run",
                                         vec![format!(
                                             "deadreckon start \"{}\" --mode run --allow-dirty",
                                             shell_display_quote(&decision.goal)
@@ -3894,7 +3893,7 @@ async fn dispatch_start_command(
                 || decision.source_allow_dirty
             {
                 return Err(CliError::Core(deadreckon_core::user_error(
-                    "source mode flags are only supported by start --mode run in this alpha",
+                    "source mode flags are only supported by start --mode run",
                     "omit source flags or use deadreckon run directly",
                 )));
             }
@@ -13430,6 +13429,1576 @@ fn print_plan_result_context(plan: &Plan, state: &deadreckon_core::PipelineState
     );
 }
 
+fn plan_docs_status_line(paths: &DeadreckonPaths, plan: &Plan) -> String {
+    match read_plan_docs_manifest(paths, &plan.plan_id) {
+        Ok(Some(manifest)) => format!(
+            "{}; narrative {}",
+            manifest.status,
+            plan_doc_path(paths, &plan.plan_id, deadreckon_core::plan::PLAN_NARRATIVE).display()
+        ),
+        Ok(None) => "missing; run deadreckon doc <plan-id> --polish".to_string(),
+        Err(err) => format!("unavailable: {err}"),
+    }
+}
+
+const PLAN_AS_BUILT: &str = "PLAN-AS-BUILT.md";
+const PLAN_DECISIONS: &str = "PLAN-DECISIONS.md";
+const PLAN_CHILDREN: &str = "PLAN-CHILDREN.md";
+const PLAN_DOCS_MANIFEST: &str = "PLAN-DOCS-MANIFEST.json";
+const PLAN_DOC_INPUT: &str = "plan-doc-input.json";
+const PLAN_DOC_PROVIDER_RESPONSE: &str = "plan-doc-provider-response.json";
+const PLAN_DOC_PROVIDER_ERROR: &str = "plan-doc-provider-error.json";
+const PLAN_DOC_EVENTS_JSONL: &str = "_plan-docs.jsonl";
+const PLAN_DOC_SOURCE_EXCERPT_BYTES: usize = 30 * 1024;
+
+#[derive(Debug, Clone)]
+struct PlanDocRefreshOptions {
+    provider: Option<String>,
+    provider_source: String,
+    budget_cap_usd: Option<f64>,
+    force: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PlanWrapperDocContext {
+    wrapper_run_id: String,
+    merged_run_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct PlanDocTarget {
+    plan: Plan,
+    wrapper: Option<PlanWrapperDocContext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanDocsManifest {
+    schema_version: u32,
+    plan_id: String,
+    root_goal: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    status: String,
+    input_hash: String,
+    provider: PlanDocsProviderManifest,
+    children: Vec<PlanDocsChildManifest>,
+    outputs: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PlanDocsProviderManifest {
+    route: Option<String>,
+    source: String,
+    calls: u32,
+    cost_usd: f64,
+    duration_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanDocsChildManifest {
+    task_id: String,
+    task_index: u32,
+    depends_on: Vec<String>,
+    child_run_id: Option<String>,
+    status: String,
+    provider: Option<String>,
+    doc_sources: Vec<String>,
+    doc_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanDocInput {
+    schema_version: u32,
+    plan_id: String,
+    root_goal: String,
+    mode: String,
+    status: String,
+    merged_run_id: Option<String>,
+    task_order: Vec<String>,
+    children: Vec<PlanDocChildInput>,
+    result_inventory: Vec<String>,
+    repair_summary: Vec<PlanDocKeyValue>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanDocChildInput {
+    task_id: String,
+    task_index: u32,
+    subject: String,
+    goal: String,
+    role: String,
+    provider: Option<String>,
+    depends_on: Vec<String>,
+    status: String,
+    child_run_id: Option<String>,
+    worker_spec: Option<PlanDocTextSource>,
+    summary: Option<PlanDocTextSource>,
+    docs: Vec<PlanDocTextSource>,
+    doc_status: String,
+    inventory: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanDocTextSource {
+    evidence_id: String,
+    path: String,
+    bytes: usize,
+    redactions: usize,
+    excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanDocKeyValue {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlanProviderDocs {
+    schema_version: u32,
+    title: String,
+    narrative: PlanProviderNarrative,
+    as_built: PlanProviderAsBuilt,
+    decisions: PlanProviderDecisions,
+    children: Vec<PlanProviderChild>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlanProviderNarrative {
+    summary: String,
+    #[serde(default)]
+    task_graph: Vec<PlanProviderItem>,
+    #[serde(default)]
+    phases: Vec<PlanProviderItem>,
+    #[serde(default)]
+    repairs: Vec<PlanProviderItem>,
+    #[serde(default)]
+    acceptance: Vec<PlanProviderItem>,
+    #[serde(default)]
+    open_threads: Vec<PlanProviderItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlanProviderAsBuilt {
+    system_overview: String,
+    #[serde(default)]
+    components: Vec<PlanProviderItem>,
+    #[serde(default)]
+    changed_files: Vec<PlanProviderPathItem>,
+    #[serde(default)]
+    runtime_notes: Vec<PlanProviderItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlanProviderDecisions {
+    #[serde(default)]
+    decisions: Vec<PlanProviderItem>,
+    #[serde(default)]
+    tradeoffs: Vec<PlanProviderItem>,
+    #[serde(default)]
+    deferrals: Vec<PlanProviderItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlanProviderChild {
+    task_id: String,
+    summary: String,
+    #[serde(default)]
+    citations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlanProviderItem {
+    title: Option<String>,
+    text: String,
+    #[serde(default)]
+    citations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlanProviderPathItem {
+    path: String,
+    text: String,
+    #[serde(default)]
+    citations: Vec<String>,
+}
+
+fn plan_docs_dir(paths: &DeadreckonPaths, plan_id: &str) -> PathBuf {
+    paths
+        .plan_dir(plan_id)
+        .join(deadreckon_core::plan::PLAN_DOCS_DIR)
+}
+
+fn plan_doc_path(paths: &DeadreckonPaths, plan_id: &str, file_name: &str) -> PathBuf {
+    plan_docs_dir(paths, plan_id).join(file_name)
+}
+
+fn plan_doc_outputs() -> Vec<String> {
+    [
+        deadreckon_core::plan::PLAN_NARRATIVE,
+        PLAN_AS_BUILT,
+        PLAN_DECISIONS,
+        PLAN_CHILDREN,
+    ]
+    .into_iter()
+    .map(|name| format!("docs/{name}"))
+    .collect()
+}
+
+fn plan_doc_kind_file_name(kind: CliDocKind) -> Option<&'static str> {
+    match kind {
+        CliDocKind::Narrative => Some(deadreckon_core::plan::PLAN_NARRATIVE),
+        CliDocKind::AsBuilt => Some(PLAN_AS_BUILT),
+        CliDocKind::Decisions => Some(PLAN_DECISIONS),
+        CliDocKind::Children => Some(PLAN_CHILDREN),
+        CliDocKind::Delta => None,
+    }
+}
+
+fn run_doc_kind(kind: CliDocKind) -> Result<DocKind> {
+    match kind {
+        CliDocKind::Narrative => Ok(DocKind::Narrative),
+        CliDocKind::AsBuilt => Ok(DocKind::AsBuilt),
+        CliDocKind::Decisions => Ok(DocKind::Decisions),
+        CliDocKind::Delta => Ok(DocKind::Delta),
+        CliDocKind::Children => Err(CliError::Core(deadreckon_core::user_error(
+            "`--kind children` is only available for orchestration plan docs",
+            "deadreckon doc <plan-id> --kind children",
+        ))),
+    }
+}
+
+fn plan_docs_are_complete(paths: &DeadreckonPaths, plan: &Plan) -> bool {
+    [
+        deadreckon_core::plan::PLAN_NARRATIVE,
+        PLAN_AS_BUILT,
+        PLAN_DECISIONS,
+        PLAN_CHILDREN,
+    ]
+    .into_iter()
+    .all(|name| {
+        let path = plan_doc_path(paths, &plan.plan_id, name);
+        path.is_file()
+            && fs::metadata(path)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
+    })
+}
+
+fn resolve_plan_doc_target(
+    paths: &DeadreckonPaths,
+    id: &str,
+    loaded_run: Option<&deadreckon_core::PipelineState>,
+) -> Result<Option<PlanDocTarget>> {
+    if let Some(state) = loaded_run
+        && let Some(wrapper) = plan_wrapper_context_from_run(paths, state)?
+    {
+        let plan = load_plan(paths, &wrapper.plan_id)?;
+        return Ok(Some(PlanDocTarget {
+            plan,
+            wrapper: Some(PlanWrapperDocContext {
+                wrapper_run_id: state.run_id.clone(),
+                merged_run_id: wrapper.merged_run_id,
+            }),
+        }));
+    }
+    if !paths.plans_dir().is_dir() {
+        return Ok(None);
+    }
+    match resolve_plan_id(paths, id) {
+        Ok(plan_id) => Ok(Some(PlanDocTarget {
+            plan: load_plan(paths, &plan_id)?,
+            wrapper: None,
+        })),
+        Err(error) if error.to_string().contains("no plan") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlanApplyTraceContext {
+    plan_id: String,
+    merged_run_id: String,
+}
+
+fn plan_wrapper_context_from_run(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+) -> Result<Option<PlanApplyTraceContext>> {
+    let traces_path = state.run_root.join("traces.jsonl");
+    if !traces_path.exists() {
+        return Ok(None);
+    }
+    let traces = read_jsonl::<TraceRecord>(&traces_path)?;
+    for trace in traces.iter().rev() {
+        if trace.event != "plan_result_apply_prepared" {
+            continue;
+        }
+        let Some(plan_id) = trace.detail.get("plan_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(merged_run_id) = trace.detail.get("merged_run_id").and_then(Value::as_str) else {
+            continue;
+        };
+        // Make sure the plan still exists before claiming this run is a plan wrapper.
+        load_plan(paths, plan_id)?;
+        return Ok(Some(PlanApplyTraceContext {
+            plan_id: plan_id.to_string(),
+            merged_run_id: merged_run_id.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
+fn ensure_plan_docs_deterministic(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+) -> Result<PlanDocsManifest> {
+    if plan_docs_are_complete(paths, plan)
+        && let Some(manifest) = read_plan_docs_manifest(paths, &plan.plan_id)?
+    {
+        return Ok(manifest);
+    }
+    write_plan_docs_deterministic(paths, plan, None, "none", None)
+}
+
+fn read_plan_docs_manifest(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+) -> Result<Option<PlanDocsManifest>> {
+    let path = plan_doc_path(paths, plan_id, PLAN_DOCS_MANIFEST);
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Io(source)),
+    }
+}
+
+fn write_plan_docs_deterministic(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    provider: Option<String>,
+    provider_source: &str,
+    provider_error: Option<String>,
+) -> Result<PlanDocsManifest> {
+    let input = collect_plan_doc_input(paths, plan)?;
+    write_plan_doc_input(paths, plan, &input)?;
+    let input_hash = plan_doc_input_hash(&input)?;
+    let mut warnings = input.warnings.clone();
+    let status = if provider_error.is_some() {
+        "failed_provider_fallback"
+    } else {
+        "deterministic"
+    };
+    if let Some(error) = provider_error {
+        warnings.push(format!("provider fallback: {error}"));
+    }
+    write_plan_docs_from_fallback(paths, plan, &input, &warnings)?;
+    let manifest = manifest_from_plan_doc_input(
+        plan,
+        &input,
+        status,
+        input_hash,
+        PlanDocsProviderManifest {
+            route: provider,
+            source: provider_source.to_string(),
+            calls: 0,
+            cost_usd: 0.0,
+            duration_ms: None,
+        },
+        warnings,
+    );
+    write_plan_docs_manifest(paths, &manifest)?;
+    append_plan_doc_event(
+        paths,
+        plan,
+        "written",
+        &json!({ "status": manifest.status, "input_hash": manifest.input_hash }),
+    )?;
+    Ok(manifest)
+}
+
+async fn refresh_plan_docs(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    options: PlanDocRefreshOptions,
+) -> Result<PlanDocsManifest> {
+    if !options.force
+        && plan_docs_are_complete(paths, plan)
+        && let Some(manifest) = read_plan_docs_manifest(paths, &plan.plan_id)?
+    {
+        return Ok(manifest);
+    }
+    let input = collect_plan_doc_input(paths, plan)?;
+    write_plan_doc_input(paths, plan, &input)?;
+    let input_hash = plan_doc_input_hash(&input)?;
+    append_plan_doc_event(
+        paths,
+        plan,
+        "collected",
+        &json!({ "input_hash": input_hash, "children": input.children.len() }),
+    )?;
+    let Some(provider) = options.provider.clone() else {
+        return write_plan_docs_deterministic(paths, plan, None, "none", None);
+    };
+    let router = match ProviderRouter::from_config_path(&paths.config_path(), Some(&provider)) {
+        Ok(router) => router,
+        Err(err) => {
+            write_plan_provider_error(paths, plan, &provider, &err.to_string())?;
+            return write_plan_docs_deterministic(
+                paths,
+                plan,
+                Some(provider),
+                &options.provider_source,
+                Some(err.to_string()),
+            );
+        }
+    };
+    let estimated_spend =
+        estimate_doc_polish_spend(&router, &provider, DEFAULT_DOC_POLISH_TOKEN_BUDGET, 1)?;
+    if let Some(cap) = options.budget_cap_usd
+        && estimated_spend.cost_usd > cap
+    {
+        let reason = format!(
+            "plan doc polish would cost about ${:.6}, above cap ${cap:.6}",
+            estimated_spend.cost_usd
+        );
+        write_plan_provider_error(paths, plan, &provider, &reason)?;
+        append_plan_doc_event(
+            paths,
+            plan,
+            "provider_skipped",
+            &json!({
+                "provider": provider,
+                "reason": reason,
+                "estimated_cost_usd": estimated_spend.cost_usd,
+                "budget_cap_usd": cap
+            }),
+        )?;
+        return write_plan_docs_deterministic(
+            paths,
+            plan,
+            Some(provider),
+            &options.provider_source,
+            Some(reason),
+        );
+    }
+    let started = Instant::now();
+    append_plan_doc_event(
+        paths,
+        plan,
+        "provider_requested",
+        &json!({ "provider": provider, "input_hash": input_hash }),
+    )?;
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: plan_doc_provider_prompt(&input)?,
+            max_output_tokens: 16_384,
+            cwd: plan.parent_cwd.clone(),
+            output_path: Some(plan_doc_path(paths, &plan.plan_id, "plan-doc-provider.out")),
+            sandbox_backend: Some(SandboxBackend::None),
+            pid_file: None,
+            cancellation_token: None,
+        })
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            write_plan_provider_error(paths, plan, &provider, &err.to_string())?;
+            append_plan_doc_event(
+                paths,
+                plan,
+                "provider_failed",
+                &json!({ "provider": provider, "error": err.to_string() }),
+            )?;
+            return write_plan_docs_deterministic(
+                paths,
+                plan,
+                Some(provider),
+                &options.provider_source,
+                Some(err.to_string()),
+            );
+        }
+    };
+    let duration_ms = started.elapsed().as_millis();
+    write_json_pretty(
+        &plan_doc_path(paths, &plan.plan_id, PLAN_DOC_PROVIDER_RESPONSE),
+        &json!({
+            "provider": response.provider,
+            "model": response.model,
+            "estimated_cost_usd": estimated_spend.cost_usd,
+            "usage": response.usage,
+            "spend": response.spend,
+            "content": response.content,
+        }),
+    )?;
+    append_plan_doc_event(
+        paths,
+        plan,
+        "provider_completed",
+        &json!({ "provider": response.provider, "duration_ms": duration_ms }),
+    )?;
+    let provider_docs = match serde_json::from_str::<PlanProviderDocs>(&response.content) {
+        Ok(docs) => docs,
+        Err(err) => {
+            write_plan_provider_error(paths, plan, &response.provider, &err.to_string())?;
+            return write_plan_docs_deterministic(
+                paths,
+                plan,
+                Some(response.provider),
+                &options.provider_source,
+                Some(format!("provider JSON parse failed: {err}")),
+            );
+        }
+    };
+    if let Err(err) = validate_plan_provider_docs(&input, &provider_docs) {
+        write_plan_provider_error(paths, plan, &response.provider, &err.to_string())?;
+        return write_plan_docs_deterministic(
+            paths,
+            plan,
+            Some(response.provider),
+            &options.provider_source,
+            Some(format!("provider validation failed: {err}")),
+        );
+    }
+    write_plan_docs_from_provider(paths, plan, &input, &provider_docs)?;
+    let manifest = manifest_from_plan_doc_input(
+        plan,
+        &input,
+        "provider",
+        input_hash,
+        PlanDocsProviderManifest {
+            route: Some(response.provider),
+            source: options.provider_source,
+            calls: 1,
+            cost_usd: response.spend.cost_usd,
+            duration_ms: Some(duration_ms),
+        },
+        input.warnings.clone(),
+    );
+    write_plan_docs_manifest(paths, &manifest)?;
+    append_plan_doc_event(
+        paths,
+        plan,
+        "validated",
+        &json!({ "status": manifest.status, "input_hash": manifest.input_hash }),
+    )?;
+    Ok(manifest)
+}
+
+fn manifest_from_plan_doc_input(
+    plan: &Plan,
+    input: &PlanDocInput,
+    status: &str,
+    input_hash: String,
+    provider: PlanDocsProviderManifest,
+    warnings: Vec<String>,
+) -> PlanDocsManifest {
+    let now = Utc::now();
+    PlanDocsManifest {
+        schema_version: 1,
+        plan_id: plan.plan_id.clone(),
+        root_goal: plan.root_goal.clone(),
+        created_at: now,
+        updated_at: now,
+        status: status.to_string(),
+        input_hash,
+        provider,
+        children: input
+            .children
+            .iter()
+            .map(|child| PlanDocsChildManifest {
+                task_id: child.task_id.clone(),
+                task_index: child.task_index,
+                depends_on: child.depends_on.clone(),
+                child_run_id: child.child_run_id.clone(),
+                status: child.status.clone(),
+                provider: child.provider.clone(),
+                doc_sources: child.docs.iter().map(|doc| doc.path.clone()).collect(),
+                doc_status: child.doc_status.clone(),
+            })
+            .collect(),
+        outputs: plan_doc_outputs(),
+        warnings,
+    }
+}
+
+fn collect_plan_doc_input(paths: &DeadreckonPaths, plan: &Plan) -> Result<PlanDocInput> {
+    let ordered_tasks = plan_tasks_in_doc_order(plan);
+    let mut warnings = Vec::new();
+    let children = ordered_tasks
+        .iter()
+        .map(|task| collect_plan_doc_child(paths, plan, task, &mut warnings))
+        .collect::<Result<Vec<_>>>()?;
+    let result_inventory = plan_result_inventory(paths, plan)?;
+    let repair_summary = plan_merge_repair_summary_items(paths, plan)
+        .into_iter()
+        .map(|(key, value)| PlanDocKeyValue { key, value })
+        .collect();
+    Ok(PlanDocInput {
+        schema_version: 1,
+        plan_id: plan.plan_id.clone(),
+        root_goal: plan.root_goal.clone(),
+        mode: plan.mode.as_str().to_string(),
+        status: plan_status_label(plan.status).to_string(),
+        merged_run_id: plan.merged_run_id.clone(),
+        task_order: ordered_tasks
+            .iter()
+            .map(|task| task.task_id.clone())
+            .collect(),
+        children,
+        result_inventory,
+        repair_summary,
+        warnings,
+    })
+}
+
+fn collect_plan_doc_child(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task: &PlanTask,
+    warnings: &mut Vec<String>,
+) -> Result<PlanDocChildInput> {
+    let worker_spec = read_plan_doc_text_source(
+        paths,
+        &plan.plan_id,
+        &paths.worker_spec(&plan.plan_id, &task.task_id),
+        format!("worker:{}", task.task_id),
+    )?;
+    let summary_path = task
+        .summary_path
+        .as_ref()
+        .map(|relative| paths.plan_dir(&plan.plan_id).join(relative))
+        .unwrap_or_else(|| paths.child_summary(&plan.plan_id, &task.task_id));
+    let summary = read_plan_doc_text_source(
+        paths,
+        &plan.plan_id,
+        &summary_path,
+        format!("summary:{}", task.task_id),
+    )?;
+    let mut docs = Vec::new();
+    let mut inventory = Vec::new();
+    if let Some(run_id) = task.child_run_id.as_deref() {
+        match load_run(paths, run_id) {
+            Ok(state) => {
+                let root = child_artifact_root(paths, &state);
+                docs.extend(read_child_doc_sources(paths, plan, task, &root)?);
+                inventory = inventory_strings(&root, 200).unwrap_or_default();
+            }
+            Err(err) => warnings.push(format!(
+                "{} references child run {run_id}, but it could not be loaded: {err}",
+                task.task_id
+            )),
+        }
+    }
+    let doc_status = classify_plan_child_doc_status(&docs, summary.as_ref());
+    if doc_status == "missing" {
+        warnings.push(format!("{} has no child docs or summary", task.task_id));
+    }
+    Ok(PlanDocChildInput {
+        task_id: task.task_id.clone(),
+        task_index: task.index,
+        subject: task.subject.clone(),
+        goal: task.goal.clone(),
+        role: plan_doc_role_label(task.role).to_string(),
+        provider: task.provider.clone(),
+        depends_on: task.depends_on.clone(),
+        status: plan_task_status_label(task.status).to_string(),
+        child_run_id: task.child_run_id.clone(),
+        worker_spec,
+        summary,
+        docs,
+        doc_status,
+        inventory,
+    })
+}
+
+fn plan_doc_role_label(role: PlanRole) -> &'static str {
+    match role {
+        PlanRole::Child => "child",
+        PlanRole::Coder => "coder",
+        PlanRole::Reviewer => "reviewer",
+    }
+}
+
+fn read_child_doc_sources(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task: &PlanTask,
+    root: &Path,
+) -> Result<Vec<PlanDocTextSource>> {
+    let mut sources = Vec::new();
+    for (kind, relative) in [
+        (
+            "narrative",
+            format!(".deadreckon/docs/{}", deadreckon_core::RUN_NARRATIVE),
+        ),
+        (
+            "as-built",
+            format!(".deadreckon/docs/{}", deadreckon_core::RUN_AS_BUILT),
+        ),
+        (
+            "decisions",
+            format!(".deadreckon/docs/{}", deadreckon_core::RUN_DECISIONS),
+        ),
+        (
+            "public-narrative",
+            format!("docs/{}", deadreckon_core::RUN_NARRATIVE),
+        ),
+        (
+            "public-as-built",
+            format!("docs/{}", deadreckon_core::RUN_AS_BUILT),
+        ),
+        (
+            "public-decisions",
+            format!("docs/{}", deadreckon_core::RUN_DECISIONS),
+        ),
+    ] {
+        let path = root.join(&relative);
+        if let Some(source) = read_plan_doc_text_source(
+            paths,
+            &plan.plan_id,
+            &path,
+            format!("doc:{}:{kind}", task.task_id),
+        )? {
+            sources.push(source);
+        }
+    }
+    Ok(sources)
+}
+
+fn read_plan_doc_text_source(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+    path: &Path,
+    evidence_id: String,
+) -> Result<Option<PlanDocTextSource>> {
+    match fs::read_to_string(path) {
+        Ok(raw) => {
+            let (redacted, redactions) = redact_plan_doc_text(&raw);
+            let excerpt = cap_utf8_local(&redacted, PLAN_DOC_SOURCE_EXCERPT_BYTES);
+            Ok(Some(PlanDocTextSource {
+                evidence_id,
+                path: display_plan_doc_source_path(paths, plan_id, path),
+                bytes: raw.len(),
+                redactions,
+                excerpt,
+            }))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Io(source)),
+    }
+}
+
+fn display_plan_doc_source_path(paths: &DeadreckonPaths, plan_id: &str, path: &Path) -> String {
+    path.strip_prefix(paths.plan_dir(plan_id))
+        .or_else(|_| path.strip_prefix(paths.home()))
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn classify_plan_child_doc_status(
+    docs: &[PlanDocTextSource],
+    summary: Option<&PlanDocTextSource>,
+) -> String {
+    let has_useful_doc = docs.iter().any(|doc| {
+        !doc.excerpt.contains("Doc-writer: templated only")
+            && !doc
+                .excerpt
+                .contains("No completed turns have been recorded yet")
+            && doc.excerpt.trim().len() > 40
+    });
+    if has_useful_doc {
+        return "polished".to_string();
+    }
+    if !docs.is_empty() {
+        return "templated".to_string();
+    }
+    if summary.is_some_and(|source| !source.excerpt.trim().is_empty()) {
+        return "summary_only".to_string();
+    }
+    "missing".to_string()
+}
+
+fn plan_tasks_in_doc_order(plan: &Plan) -> Vec<&PlanTask> {
+    fn visit<'a>(
+        task: &'a PlanTask,
+        by_id: &BTreeMap<&'a str, &'a PlanTask>,
+        visiting: &mut BTreeSet<&'a str>,
+        visited: &mut BTreeSet<&'a str>,
+        out: &mut Vec<&'a PlanTask>,
+    ) {
+        if visited.contains(task.task_id.as_str()) || !visiting.insert(task.task_id.as_str()) {
+            return;
+        }
+        let mut deps = task
+            .depends_on
+            .iter()
+            .filter_map(|dep| by_id.get(dep.as_str()).copied())
+            .collect::<Vec<_>>();
+        deps.sort_by_key(|dep| (dep.index, dep.task_id.clone()));
+        for dep in deps {
+            visit(dep, by_id, visiting, visited, out);
+        }
+        visiting.remove(task.task_id.as_str());
+        visited.insert(task.task_id.as_str());
+        out.push(task);
+    }
+
+    let mut tasks = plan.tasks.iter().collect::<Vec<_>>();
+    tasks.sort_by_key(|task| (task.index, task.task_id.clone()));
+    let by_id = tasks
+        .iter()
+        .map(|task| (task.task_id.as_str(), *task))
+        .collect::<BTreeMap<_, _>>();
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut out = Vec::new();
+    for task in tasks {
+        visit(task, &by_id, &mut visiting, &mut visited, &mut out);
+    }
+    out
+}
+
+fn plan_result_inventory(paths: &DeadreckonPaths, plan: &Plan) -> Result<Vec<String>> {
+    if let Some(run_id) = plan.merged_run_id.as_deref()
+        && let Ok(state) = load_run(paths, run_id)
+    {
+        let library = paths.library_dir(&state.scope, &state.run_id);
+        if library.is_dir() {
+            return inventory_strings(&library, 500);
+        }
+    }
+    let merge_working = paths.merge_working(&plan.plan_id);
+    if merge_working.is_dir() {
+        return inventory_strings(&merge_working, 500);
+    }
+    Ok(Vec::new())
+}
+
+fn inventory_strings(root: &Path, max: usize) -> Result<Vec<String>> {
+    let mut files = inventory_files(root)?
+        .into_iter()
+        .filter_map(|path| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        })
+        .filter(|relative| !path_has_component(Path::new(relative), ".git"))
+        .collect::<Vec<_>>();
+    files.sort();
+    files.truncate(max);
+    Ok(files)
+}
+
+fn redact_plan_doc_text(raw: &str) -> (String, usize) {
+    let Ok(secret_like) =
+        Regex::new(r"(?i)(api[_-]?key|token|password|secret|authorization)(\s*[:=]\s*)\S+")
+    else {
+        return (raw.to_string(), 0);
+    };
+    let redactions = secret_like.find_iter(raw).count();
+    let redacted = secret_like.replace_all(raw, "$1$2[REDACTED]").to_string();
+    (redacted, redactions)
+}
+
+fn cap_utf8_local(raw: &str, max_bytes: usize) -> String {
+    if raw.len() <= max_bytes {
+        return raw.to_string();
+    }
+    let mut end = max_bytes;
+    while !raw.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}\n\n[truncated: {} bytes total]", &raw[..end], raw.len())
+}
+
+fn plan_doc_input_hash(input: &PlanDocInput) -> Result<String> {
+    let bytes = serde_json::to_vec(input)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn write_plan_doc_input(paths: &DeadreckonPaths, plan: &Plan, input: &PlanDocInput) -> Result<()> {
+    write_json_pretty(&plan_doc_path(paths, &plan.plan_id, PLAN_DOC_INPUT), input)
+}
+
+fn write_plan_docs_manifest(paths: &DeadreckonPaths, manifest: &PlanDocsManifest) -> Result<()> {
+    write_json_pretty(
+        &plan_doc_path(paths, &manifest.plan_id, PLAN_DOCS_MANIFEST),
+        manifest,
+    )
+}
+
+fn write_plan_provider_error(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    provider: &str,
+    error: &str,
+) -> Result<()> {
+    write_json_pretty(
+        &plan_doc_path(paths, &plan.plan_id, PLAN_DOC_PROVIDER_ERROR),
+        &json!({
+            "schema_version": 1,
+            "provider": provider,
+            "error": error,
+            "recorded_at": Utc::now(),
+        }),
+    )
+}
+
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    Ok(())
+}
+
+fn append_plan_doc_event(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    event: &str,
+    detail: &Value,
+) -> Result<()> {
+    let path = plan_doc_path(paths, &plan.plan_id, PLAN_DOC_EVENTS_JSONL);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    deadreckon_core::state::append_json_line(
+        &path,
+        &json!({
+            "schema_version": 1,
+            "timestamp": Utc::now(),
+            "event": event,
+            "plan_id": plan.plan_id,
+            "detail": detail,
+        }),
+    )?;
+    Ok(())
+}
+
+fn write_plan_docs_from_fallback(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    input: &PlanDocInput,
+    warnings: &[String],
+) -> Result<()> {
+    let docs_dir = plan_docs_dir(paths, &plan.plan_id);
+    fs::create_dir_all(&docs_dir)?;
+    fs::write(
+        docs_dir.join(deadreckon_core::plan::PLAN_NARRATIVE),
+        render_plan_narrative_fallback(plan, input, warnings),
+    )?;
+    fs::write(
+        docs_dir.join(PLAN_AS_BUILT),
+        render_plan_as_built_fallback(plan, input, warnings),
+    )?;
+    fs::write(
+        docs_dir.join(PLAN_DECISIONS),
+        render_plan_decisions_fallback(plan, input, warnings),
+    )?;
+    fs::write(
+        docs_dir.join(PLAN_CHILDREN),
+        render_plan_children(plan, input),
+    )?;
+    Ok(())
+}
+
+fn render_plan_narrative_fallback(
+    plan: &Plan,
+    input: &PlanDocInput,
+    warnings: &[String],
+) -> String {
+    let mut out = plan_doc_header("Plan Narrative", plan, input, "deterministic");
+    out.push_str("## Reading Order\n\n");
+    out.push_str("Start here, then read `PLAN-AS-BUILT.md`, `PLAN-DECISIONS.md`, and `PLAN-CHILDREN.md`. Child run docs and summaries are cited by task id below.\n\n");
+    out.push_str("## Outcome\n\n");
+    out.push_str(&format!(
+        "Plan `{}` is `{}` and produced result run `{}`.\n\n",
+        run_prefix(&plan.plan_id),
+        plan_status_label(plan.status),
+        plan.merged_run_id
+            .as_deref()
+            .map(run_prefix)
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    out.push_str("## Task Graph\n\n");
+    for task_id in &input.task_order {
+        if let Some(child) = input
+            .children
+            .iter()
+            .find(|child| &child.task_id == task_id)
+        {
+            let deps = if child.depends_on.is_empty() {
+                "none".to_string()
+            } else {
+                child.depends_on.join(", ")
+            };
+            out.push_str(&format!(
+                "- `{}` after `{}` -> status `{}`; evidence `task:{}`{}\n",
+                child.task_id,
+                deps,
+                child.status,
+                child.task_id,
+                child
+                    .child_run_id
+                    .as_deref()
+                    .map(|run_id| format!(", `run:{}`", run_prefix(run_id)))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    out.push_str("\n## Child Work\n\n");
+    for child in &input.children {
+        out.push_str(&format!("### {} - {}\n\n", child.task_id, child.subject));
+        out.push_str(&format!(
+            "- Provider: `{}`\n- Status: `{}`\n- Docs: `{}`\n",
+            child.provider.as_deref().unwrap_or("-"),
+            child.status,
+            child.doc_status
+        ));
+        if let Some(run_id) = child.child_run_id.as_deref() {
+            out.push_str(&format!("- Run: `{run_id}`\n"));
+        }
+        out.push('\n');
+        if let Some(summary) = child.summary.as_ref() {
+            out.push_str("Summary evidence: ");
+            out.push_str(&format!("`{}`\n\n", summary.evidence_id));
+            out.push_str(&first_paragraph(&summary.excerpt));
+            out.push_str("\n\n");
+        } else {
+            out.push_str("No child summary was recorded.\n\n");
+        }
+    }
+    if !input.repair_summary.is_empty() {
+        out.push_str("## Merge And Repair\n\n");
+        for item in &input.repair_summary {
+            out.push_str(&format!("- {}: {}\n", item.key, item.value));
+        }
+        out.push('\n');
+    }
+    out.push_str("## Missing Evidence\n\n");
+    if warnings.is_empty() {
+        out.push_str("- No missing evidence was detected during deterministic consolidation.\n");
+    } else {
+        for warning in warnings {
+            out.push_str(&format!("- {warning}\n"));
+        }
+    }
+    out
+}
+
+fn render_plan_as_built_fallback(plan: &Plan, input: &PlanDocInput, warnings: &[String]) -> String {
+    let mut out = plan_doc_header("Plan As Built", plan, input, "deterministic");
+    out.push_str("## System Overview\n\n");
+    out.push_str("This document consolidates the merged plan result from child summaries, child docs, and the final result inventory.\n\n");
+    out.push_str("## Result Inventory\n\n");
+    if input.result_inventory.is_empty() {
+        out.push_str("- No merged result inventory was available.\n");
+    } else {
+        for path in input.result_inventory.iter().take(200) {
+            out.push_str(&format!("- `{path}`\n"));
+        }
+    }
+    out.push_str("\n## Child Contributions\n\n");
+    for child in &input.children {
+        out.push_str(&format!("### {}\n\n", child.task_id));
+        out.push_str(&format!("{}\n\n", child.goal));
+        if child.inventory.is_empty() {
+            out.push_str("- No child artifact inventory was available.\n\n");
+        } else {
+            for path in child.inventory.iter().take(50) {
+                out.push_str(&format!("- `{path}`\n"));
+            }
+            out.push('\n');
+        }
+    }
+    if !warnings.is_empty() {
+        out.push_str("## Gaps\n\n");
+        for warning in warnings {
+            out.push_str(&format!("- {warning}\n"));
+        }
+    }
+    out
+}
+
+fn render_plan_decisions_fallback(
+    plan: &Plan,
+    input: &PlanDocInput,
+    warnings: &[String],
+) -> String {
+    let mut out = plan_doc_header("Plan Decisions", plan, input, "deterministic");
+    out.push_str("## Decisions And Tradeoffs\n\n");
+    let mut wrote_decision = false;
+    for child in &input.children {
+        let decisions = child
+            .docs
+            .iter()
+            .filter(|doc| doc.path.contains("DECISIONS"))
+            .collect::<Vec<_>>();
+        if decisions.is_empty() {
+            out.push_str(&format!(
+                "- `{}`: no explicit child decision doc was available; status `{}`.\n",
+                child.task_id, child.doc_status
+            ));
+            continue;
+        }
+        wrote_decision = true;
+        out.push_str(&format!("### {}\n\n", child.task_id));
+        for decision in decisions {
+            out.push_str(&format!("Evidence `{}`:\n\n", decision.evidence_id));
+            out.push_str(&first_paragraph(&decision.excerpt));
+            out.push_str("\n\n");
+        }
+    }
+    if !wrote_decision {
+        out.push_str("\nNo explicit multi-alternative decisions were found in child docs. Merge and orchestration assumptions are listed below when available.\n");
+    }
+    if !input.repair_summary.is_empty() {
+        out.push_str("\n## Merge Repair Decisions\n\n");
+        for item in &input.repair_summary {
+            out.push_str(&format!("- {}: {}\n", item.key, item.value));
+        }
+    }
+    if !warnings.is_empty() {
+        out.push_str("\n## Deferrals And Missing Evidence\n\n");
+        for warning in warnings {
+            out.push_str(&format!("- {warning}\n"));
+        }
+    }
+    out
+}
+
+fn render_plan_children(plan: &Plan, input: &PlanDocInput) -> String {
+    let mut out = plan_doc_header("Plan Children", plan, input, "deterministic");
+    out.push_str("## Child Index\n\n");
+    out.push_str("| Task | Depends on | Provider | Status | Run | Docs |\n");
+    out.push_str("|---|---|---|---|---|---|\n");
+    for child in &input.children {
+        out.push_str(&format!(
+            "| `{}` | {} | `{}` | `{}` | `{}` | `{}` |\n",
+            child.task_id,
+            if child.depends_on.is_empty() {
+                "none".to_string()
+            } else {
+                child.depends_on.join(", ")
+            },
+            child.provider.as_deref().unwrap_or("-"),
+            child.status,
+            child.child_run_id.as_deref().unwrap_or("-"),
+            child.doc_status
+        ));
+    }
+    out.push_str("\n## Evidence Sources\n\n");
+    for child in &input.children {
+        out.push_str(&format!("### {}\n\n", child.task_id));
+        if let Some(source) = child.worker_spec.as_ref() {
+            out.push_str(&format!(
+                "- Worker spec: `{}` ({})\n",
+                source.path, source.evidence_id
+            ));
+        }
+        if let Some(source) = child.summary.as_ref() {
+            out.push_str(&format!(
+                "- Summary: `{}` ({})\n",
+                source.path, source.evidence_id
+            ));
+        }
+        for source in &child.docs {
+            out.push_str(&format!(
+                "- Doc: `{}` ({})\n",
+                source.path, source.evidence_id
+            ));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn plan_doc_header(title: &str, plan: &Plan, input: &PlanDocInput, writer: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# {title}\n\n"));
+    out.push_str(&format!("**Generated:** {}\n", Utc::now().to_rfc3339()));
+    out.push_str(&format!("**Plan ID:** `{}`\n", plan.plan_id));
+    out.push_str(&format!("**Goal:** {}\n", plan.root_goal));
+    out.push_str(&format!("**Status:** {}\n", plan_status_label(plan.status)));
+    out.push_str(&format!("**Mode:** {}\n", plan.mode.as_str()));
+    if let Some(run_id) = input.merged_run_id.as_deref() {
+        out.push_str(&format!("**Result run:** `{run_id}`\n"));
+    }
+    out.push_str(&format!("**Doc-writer:** plan-docs {writer}\n\n"));
+    out
+}
+
+fn first_paragraph(raw: &str) -> String {
+    raw.split("\n\n")
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or(raw)
+        .trim()
+        .lines()
+        .take(12)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn plan_doc_provider_prompt(input: &PlanDocInput) -> Result<String> {
+    Ok(format!(
+        "You are consolidating DeadReckon orchestration plan documentation.\n\
+Return one strict JSON object with schema_version=1 and this shape:\n\
+{{\"schema_version\":1,\"title\":\"...\",\"narrative\":{{\"summary\":\"...\",\"task_graph\":[],\"phases\":[],\"repairs\":[],\"acceptance\":[],\"open_threads\":[]}},\"as_built\":{{\"system_overview\":\"...\",\"components\":[],\"changed_files\":[],\"runtime_notes\":[]}},\"decisions\":{{\"decisions\":[],\"tradeoffs\":[],\"deferrals\":[]}},\"children\":[{{\"task_id\":\"task-0\",\"summary\":\"...\",\"citations\":[\"task:task-0\"]}}]}}\n\
+Each item in task_graph, phases, repairs, acceptance, open_threads, components, runtime_notes, decisions, tradeoffs, and deferrals must be {{\"title\":null_or_string,\"text\":\"...\",\"citations\":[\"evidence-id\"]}}.\n\
+Each changed_files item must be {{\"path\":\"relative/path\",\"text\":\"...\",\"citations\":[\"evidence-id\"]}}.\n\
+Every concrete claim needs citations from the input evidence ids. Do not invent files; name missing evidence as missing.\n\n\
+INPUT JSON:\n{}",
+        serde_json::to_string_pretty(input)?
+    ))
+}
+
+fn validate_plan_provider_docs(input: &PlanDocInput, docs: &PlanProviderDocs) -> Result<()> {
+    if docs.schema_version != 1 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "plan docs provider response schema_version must be 1".to_string(),
+        )));
+    }
+    if docs.title.trim().is_empty() || docs.narrative.summary.trim().is_empty() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "plan docs provider response was too small".to_string(),
+        )));
+    }
+    let evidence = plan_doc_evidence_ids(input);
+    for citation in provider_doc_citations(docs) {
+        if !evidence.contains(citation.as_str()) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "unknown plan doc citation {citation}"
+            ))));
+        }
+    }
+    let known_paths = input
+        .result_inventory
+        .iter()
+        .cloned()
+        .chain(
+            input
+                .children
+                .iter()
+                .flat_map(|child| child.inventory.iter().cloned()),
+        )
+        .collect::<BTreeSet<_>>();
+    for file in &docs.as_built.changed_files {
+        if !known_paths.contains(&file.path) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "provider invented file path {}",
+                file.path
+            ))));
+        }
+    }
+    let covered_children = docs
+        .children
+        .iter()
+        .map(|child| child.task_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for child in &input.children {
+        if child.status == "completed" && !covered_children.contains(child.task_id.as_str()) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "provider omitted completed child {}",
+                child.task_id
+            ))));
+        }
+    }
+    Ok(())
+}
+
+fn plan_doc_evidence_ids(input: &PlanDocInput) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    ids.insert(format!("plan:{}", input.plan_id));
+    for child in &input.children {
+        ids.insert(format!("task:{}", child.task_id));
+        if let Some(run_id) = child.child_run_id.as_deref() {
+            ids.insert(format!("run:{}", run_prefix(run_id)));
+            ids.insert(format!("run:{run_id}"));
+        }
+        if let Some(source) = child.worker_spec.as_ref() {
+            ids.insert(source.evidence_id.clone());
+        }
+        if let Some(source) = child.summary.as_ref() {
+            ids.insert(source.evidence_id.clone());
+        }
+        for source in &child.docs {
+            ids.insert(source.evidence_id.clone());
+        }
+    }
+    ids
+}
+
+fn provider_doc_citations(docs: &PlanProviderDocs) -> Vec<String> {
+    let mut citations = Vec::new();
+    for item in docs
+        .narrative
+        .task_graph
+        .iter()
+        .chain(docs.narrative.phases.iter())
+        .chain(docs.narrative.repairs.iter())
+        .chain(docs.narrative.acceptance.iter())
+        .chain(docs.narrative.open_threads.iter())
+        .chain(docs.as_built.components.iter())
+        .chain(docs.as_built.runtime_notes.iter())
+        .chain(docs.decisions.decisions.iter())
+        .chain(docs.decisions.tradeoffs.iter())
+        .chain(docs.decisions.deferrals.iter())
+    {
+        citations.extend(item.citations.clone());
+    }
+    for item in &docs.as_built.changed_files {
+        citations.extend(item.citations.clone());
+    }
+    for child in &docs.children {
+        citations.extend(child.citations.clone());
+    }
+    citations
+}
+
+fn write_plan_docs_from_provider(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    input: &PlanDocInput,
+    docs: &PlanProviderDocs,
+) -> Result<()> {
+    let docs_dir = plan_docs_dir(paths, &plan.plan_id);
+    fs::create_dir_all(&docs_dir)?;
+    fs::write(
+        docs_dir.join(deadreckon_core::plan::PLAN_NARRATIVE),
+        render_provider_plan_narrative(plan, input, docs),
+    )?;
+    fs::write(
+        docs_dir.join(PLAN_AS_BUILT),
+        render_provider_plan_as_built(plan, input, docs),
+    )?;
+    fs::write(
+        docs_dir.join(PLAN_DECISIONS),
+        render_provider_plan_decisions(plan, input, docs),
+    )?;
+    fs::write(
+        docs_dir.join(PLAN_CHILDREN),
+        render_plan_children(plan, input),
+    )?;
+    Ok(())
+}
+
+fn render_provider_plan_narrative(
+    plan: &Plan,
+    input: &PlanDocInput,
+    docs: &PlanProviderDocs,
+) -> String {
+    let mut out = plan_doc_header("Plan Narrative", plan, input, "provider");
+    out.push_str(&format!(
+        "## {}\n\n{}\n\n",
+        docs.title, docs.narrative.summary
+    ));
+    render_provider_items(&mut out, "Task Graph", &docs.narrative.task_graph);
+    render_provider_items(&mut out, "Phases", &docs.narrative.phases);
+    render_provider_items(&mut out, "Repairs", &docs.narrative.repairs);
+    render_provider_items(&mut out, "Acceptance", &docs.narrative.acceptance);
+    render_provider_items(&mut out, "Open Threads", &docs.narrative.open_threads);
+    out.push_str("## Children\n\n");
+    for child in &docs.children {
+        out.push_str(&format!(
+            "### {}\n\n{}\n\n{}\n\n",
+            child.task_id,
+            child.summary,
+            citation_suffix(&child.citations)
+        ));
+    }
+    out
+}
+
+fn render_provider_plan_as_built(
+    plan: &Plan,
+    input: &PlanDocInput,
+    docs: &PlanProviderDocs,
+) -> String {
+    let mut out = plan_doc_header("Plan As Built", plan, input, "provider");
+    out.push_str(&format!(
+        "## System Overview\n\n{}\n\n",
+        docs.as_built.system_overview
+    ));
+    render_provider_items(&mut out, "Components", &docs.as_built.components);
+    out.push_str("## Changed Files\n\n");
+    for file in &docs.as_built.changed_files {
+        out.push_str(&format!(
+            "- `{}`: {} {}\n",
+            file.path,
+            file.text,
+            citation_suffix(&file.citations)
+        ));
+    }
+    out.push('\n');
+    render_provider_items(&mut out, "Runtime Notes", &docs.as_built.runtime_notes);
+    out
+}
+
+fn render_provider_plan_decisions(
+    plan: &Plan,
+    input: &PlanDocInput,
+    docs: &PlanProviderDocs,
+) -> String {
+    let mut out = plan_doc_header("Plan Decisions", plan, input, "provider");
+    render_provider_items(&mut out, "Decisions", &docs.decisions.decisions);
+    render_provider_items(&mut out, "Tradeoffs", &docs.decisions.tradeoffs);
+    render_provider_items(&mut out, "Deferrals", &docs.decisions.deferrals);
+    out
+}
+
+fn render_provider_items(out: &mut String, heading: &str, items: &[PlanProviderItem]) {
+    out.push_str(&format!("## {heading}\n\n"));
+    if items.is_empty() {
+        out.push_str("- None recorded.\n\n");
+        return;
+    }
+    for item in items {
+        if let Some(title) = item
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+        {
+            out.push_str(&format!("### {title}\n\n"));
+            out.push_str(&format!(
+                "{} {}\n\n",
+                item.text,
+                citation_suffix(&item.citations)
+            ));
+        } else {
+            out.push_str(&format!(
+                "- {} {}\n",
+                item.text,
+                citation_suffix(&item.citations)
+            ));
+        }
+    }
+    out.push('\n');
+}
+
+fn citation_suffix(citations: &[String]) -> String {
+    if citations.is_empty() {
+        return "[missing citation]".to_string();
+    }
+    format!(
+        "({})",
+        citations
+            .iter()
+            .map(|citation| format!("`{citation}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn select_plan_doc_provider(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    flag: Option<&str>,
+) -> Result<DocProviderSelection> {
+    let defaults = config_defaults(paths)?;
+    let run_provider = plan
+        .providers
+        .default_child
+        .as_deref()
+        .or(plan.providers.planner.as_deref())
+        .or(plan.providers.coder.as_deref())
+        .or(plan.providers.reviewer.as_deref())
+        .or_else(|| plan.tasks.iter().find_map(|task| task.provider.as_deref()));
+    let setup = doc_provider_setup_selection(paths, &defaults, flag, run_provider, false)?;
+    Ok(doc_provider_selection_from_setup(&setup))
+}
+
+fn materialize_plan_docs_to_working(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    dest: &Path,
+    wrapper: Option<&PlanWrapperDocContext>,
+) -> Result<()> {
+    ensure_plan_docs_deterministic(paths, plan)?;
+    let source_dir = plan_docs_dir(paths, &plan.plan_id);
+    let internal = dest.join(".deadreckon/docs");
+    let public = dest.join("docs");
+    fs::create_dir_all(&internal)?;
+    fs::create_dir_all(&public)?;
+    for name in [
+        deadreckon_core::plan::PLAN_NARRATIVE,
+        PLAN_AS_BUILT,
+        PLAN_DECISIONS,
+        PLAN_CHILDREN,
+        PLAN_DOCS_MANIFEST,
+    ] {
+        let source = source_dir.join(name);
+        if source.exists() {
+            fs::copy(&source, internal.join(name))?;
+            if name.starts_with("PLAN-") {
+                fs::copy(&source, public.join(name))?;
+            }
+        }
+    }
+    if let Some(wrapper) = wrapper {
+        write_plan_wrapper_run_docs(dest, plan, wrapper)?;
+    }
+    Ok(())
+}
+
+fn write_plan_wrapper_run_docs(
+    dest: &Path,
+    plan: &Plan,
+    wrapper: &PlanWrapperDocContext,
+) -> Result<()> {
+    let internal = dest.join(".deadreckon/docs");
+    let public = dest.join("docs");
+    fs::create_dir_all(&internal)?;
+    fs::create_dir_all(&public)?;
+    let narrative = format!(
+        "# Plan Result Wrapper\n\n**Run ID:** `{}`\n**Plan ID:** `{}`\n**Merged result run:** `{}`\n**Goal:** {}\n\nThis run materializes a completed plan result. It has no provider turns of its own; read the consolidated plan documentation instead.\n\n- [Plan narrative](./PLAN-NARRATIVE.md)\n- [Plan as built](./PLAN-AS-BUILT.md)\n- [Plan decisions](./PLAN-DECISIONS.md)\n- [Plan children](./PLAN-CHILDREN.md)\n",
+        wrapper.wrapper_run_id, plan.plan_id, wrapper.merged_run_id, plan.root_goal
+    );
+    let as_built = format!(
+        "# Plan Result Wrapper As Built\n\nThis synthetic apply run wraps plan `{}`. See [PLAN-AS-BUILT.md](./PLAN-AS-BUILT.md) for the consolidated as-built documentation.\n",
+        plan.plan_id
+    );
+    let decisions = "# Plan Result Wrapper Decisions\n\nThis synthetic apply run made no implementation decisions. See [PLAN-DECISIONS.md](./PLAN-DECISIONS.md) for plan-level decisions and merge tradeoffs.\n"
+        .to_string();
+    for root in [internal, public] {
+        fs::write(root.join(deadreckon_core::RUN_NARRATIVE), &narrative)?;
+        fs::write(root.join(deadreckon_core::RUN_AS_BUILT), &as_built)?;
+        fs::write(root.join(deadreckon_core::RUN_DECISIONS), &decisions)?;
+    }
+    Ok(())
+}
+
+fn commit_plan_apply_docs_update(
+    worktree_path: &Path,
+    plan: &Plan,
+    merged_state: &deadreckon_core::PipelineState,
+) -> Result<()> {
+    git_status(worktree_path, &["add", "docs"])?;
+    git_status(worktree_path, &["add", "-f", ".deadreckon/docs"])?;
+    let staged = git_stdout(worktree_path, &["diff", "--cached", "--stat"])?;
+    if staged.trim().is_empty() {
+        return Ok(());
+    }
+    git_status(
+        worktree_path,
+        &[
+            "commit",
+            "-m",
+            &format!("docs for deadreckon plan {}", run_prefix(&plan.plan_id)),
+            "-m",
+            &format!(
+                "Plan: {}\nResult run: {}\n\nConsolidated plan docs are included under docs/PLAN-* and .deadreckon/docs/PLAN-*.",
+                plan.plan_id, merged_state.run_id
+            ),
+        ],
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct PlanChildSelection {
     plan_id: String,
@@ -14572,9 +16141,26 @@ async fn merge_command(args: MergeCommandArgs) -> Result<()> {
         },
     )?;
     append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanCompleted)?;
-    let _plan_narrative = write_plan_narrative(&paths, &plan)?;
     let library_dir = paths.library_dir(&merged_run.scope, &merged_run.run_id);
     write_plan_merge_manifest(&paths, &library_dir, &plan, &merge.conflicts)?;
+    let doc_provider = select_plan_doc_provider(&paths, &plan, None)?;
+    let defaults = config_defaults(&paths)?;
+    let _manifest = maybe_with_cli_wait_status(
+        !quiet,
+        "consolidating plan docs",
+        refresh_plan_docs(
+            &paths,
+            &plan,
+            PlanDocRefreshOptions {
+                provider: doc_provider.provider.clone(),
+                provider_source: doc_provider.source.as_str().to_string(),
+                budget_cap_usd: defaults.doc_polish_budget_cap_usd,
+                force: true,
+            },
+        ),
+    )
+    .await?;
+    materialize_plan_docs_to_working(&paths, &plan, &library_dir, None)?;
     if !quiet {
         print_merge_finished(&paths, &plan, &merged_run, &library_dir, no_hints);
     }
@@ -15666,7 +17252,7 @@ fn prepare_plan_result_apply_state(
             "missing plan apply worktree_path".to_string(),
         ))
     })?;
-    seed_plan_result_worktree(plan, merged_state, &merged_source, worktree_path)?;
+    seed_plan_result_worktree(paths, plan, merged_state, &merged_source, worktree_path)?;
 
     let mut state = create_run(
         paths,
@@ -15709,6 +17295,16 @@ fn prepare_plan_result_apply_state(
             }),
         },
     )?;
+    materialize_plan_docs_to_working(
+        paths,
+        plan,
+        &state.working_dir,
+        Some(&PlanWrapperDocContext {
+            wrapper_run_id: state.run_id.clone(),
+            merged_run_id: merged_state.run_id.clone(),
+        }),
+    )?;
+    commit_plan_apply_docs_update(&state.working_dir, plan, merged_state)?;
     save_state(&state)?;
     Ok(state)
 }
@@ -15807,6 +17403,7 @@ fn plan_apply_worktree_path(paths: &DeadreckonPaths, scope: &str, run_id: &str) 
 }
 
 fn seed_plan_result_worktree(
+    paths: &DeadreckonPaths,
     plan: &Plan,
     merged_state: &deadreckon_core::PipelineState,
     merged_source: &Path,
@@ -15830,6 +17427,7 @@ fn seed_plan_result_worktree(
         }
         copy_merge_file(&file, &worktree_path.join(relative))?;
     }
+    materialize_plan_docs_to_working(paths, plan, worktree_path, None)?;
 
     git_status(worktree_path, &["add", "-A"])?;
     let staged = git_stdout(worktree_path, &["diff", "--cached", "--stat"])?;
@@ -15860,6 +17458,7 @@ fn plan_apply_commit_body(plan: &Plan, merged_state: &deadreckon_core::PipelineS
     let mut lines = vec![
         format!("Plan: {}", plan.plan_id),
         format!("Result run: {}", merged_state.run_id),
+        "Docs: consolidated plan docs under docs/PLAN-* and .deadreckon/docs/PLAN-*".to_string(),
         String::new(),
         "Children:".to_string(),
     ];
@@ -16027,6 +17626,7 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
     print_kv_block(&items);
     print_orchestration_role_table(plan, true, None);
     print_orchestration_dependency_summary(plan);
+    println!("docs {}", plan_docs_status_line(paths, plan));
     if let Some(line) = plan_final_gate_line(paths, plan) {
         println!("final gate {line}");
     }
@@ -16870,6 +18470,8 @@ fn materialize_command(
     };
     if let Some(plan) = plan_context.as_ref() {
         print_plan_result_context(plan, &state);
+        let library_dir = paths.library_dir(&state.scope, &state.run_id);
+        materialize_plan_docs_to_working(&paths, plan, &library_dir, None)?;
     }
     let materialized = materialize_completed_run(&paths, &state, dest, force, include_manifest)?;
     print_materialized(&materialized);
@@ -16922,6 +18524,8 @@ fn finish_command(
         .unwrap_or_else(|| run_prefix(&state.run_id));
     if let Some(plan) = plan_context.as_ref() {
         print_plan_result_context(plan, &state);
+        let library_dir = paths.library_dir(&state.scope, &state.run_id);
+        materialize_plan_docs_to_working(&paths, plan, &library_dir, None)?;
     }
     match state.status {
         RunStatus::Completed => {}
@@ -20441,12 +22045,22 @@ fn read_run_codebase_record(
 
 struct DocCommandArgs {
     run_id: String,
-    kind: DocKind,
+    kind: CliDocKind,
     export: Option<PathBuf>,
     polish: bool,
     no_confirm: bool,
     force: bool,
     doc_skill: Option<String>,
+    doc_provider: Option<String>,
+    budget_cap: Option<f64>,
+}
+
+struct DocPlanCommandArgs {
+    target: PlanDocTarget,
+    kind: CliDocKind,
+    export: Option<PathBuf>,
+    polish: bool,
+    force: bool,
     doc_provider: Option<String>,
     budget_cap: Option<f64>,
 }
@@ -20464,7 +22078,27 @@ async fn doc_command(args: DocCommandArgs) -> Result<()> {
         budget_cap,
     } = args;
     let paths = DeadreckonPaths::discover();
-    let mut state = load_cli_run(&paths, &run_id)?;
+    let loaded_state = load_cli_run(&paths, &run_id);
+    if let Some(target) = match loaded_state.as_ref() {
+        Ok(state) => resolve_plan_doc_target(&paths, &run_id, Some(state))?,
+        Err(_) => resolve_plan_doc_target(&paths, &run_id, None)?,
+    } {
+        return doc_plan_command(
+            &paths,
+            DocPlanCommandArgs {
+                target,
+                kind,
+                export,
+                polish,
+                force,
+                doc_provider,
+                budget_cap,
+            },
+        )
+        .await;
+    }
+    let mut state = loaded_state?;
+    let kind = run_doc_kind(kind)?;
     if polish {
         if state.status != RunStatus::Completed {
             return Err(CliError::Core(deadreckon_core::user_error(
@@ -20585,6 +22219,68 @@ async fn doc_command(args: DocCommandArgs) -> Result<()> {
         }
         fs::copy(&path, &dest)?;
         println!("exported {} to {}", kind.file_name(), dest.display());
+    } else {
+        print!("{}", fs::read_to_string(&path)?);
+    }
+    Ok(())
+}
+
+async fn doc_plan_command(paths: &DeadreckonPaths, args: DocPlanCommandArgs) -> Result<()> {
+    let DocPlanCommandArgs {
+        target,
+        kind,
+        export,
+        polish,
+        force,
+        doc_provider,
+        budget_cap,
+    } = args;
+    let Some(file_name) = plan_doc_kind_file_name(kind) else {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "plan docs do not produce AS-BUILT-DELTA.md",
+            "deadreckon doc <plan-id> --kind narrative",
+        )));
+    };
+    if polish {
+        let selection = select_plan_doc_provider(paths, &target.plan, doc_provider.as_deref())?;
+        let defaults = config_defaults(paths)?;
+        refresh_plan_docs(
+            paths,
+            &target.plan,
+            PlanDocRefreshOptions {
+                provider: selection.provider,
+                provider_source: selection.source.as_str().to_string(),
+                budget_cap_usd: budget_cap.or(defaults.doc_polish_budget_cap_usd),
+                force: true,
+            },
+        )
+        .await?;
+    } else {
+        ensure_plan_docs_deterministic(paths, &target.plan)?;
+    }
+    if let Some(wrapper) = target.wrapper.as_ref()
+        && let Ok(state) = load_run(paths, &wrapper.wrapper_run_id)
+    {
+        let _ = materialize_plan_docs_to_working(
+            paths,
+            &target.plan,
+            &state.working_dir,
+            Some(wrapper),
+        );
+    }
+    let path = plan_doc_path(paths, &target.plan.plan_id, file_name);
+    if let Some(dest) = export {
+        if dest.exists() && !force {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("dest {} exists", dest.display()),
+                "--overwrite or pick a fresh path",
+            )));
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&path, &dest)?;
+        println!("exported {file_name} to {}", dest.display());
     } else {
         print!("{}", fs::read_to_string(&path)?);
     }
@@ -22134,6 +23830,13 @@ fn show_command(
                                 "next_actions": plan_next_actions(&plan),
                                 "try_lines": Vec::<String>::new(),
                                 "paths": plan_paths_json(&plan),
+                                "docs": {
+                                    "status": plan_docs_status_line(&paths, &plan),
+                                    "narrative": plan_doc_path(&paths, &plan.plan_id, deadreckon_core::plan::PLAN_NARRATIVE),
+                                    "as_built": plan_doc_path(&paths, &plan.plan_id, PLAN_AS_BUILT),
+                                    "decisions": plan_doc_path(&paths, &plan.plan_id, PLAN_DECISIONS),
+                                    "children": plan_doc_path(&paths, &plan.plan_id, PLAN_CHILDREN),
+                                },
                                 "plan": plan,
                             }))?
                         );
@@ -22154,8 +23857,16 @@ fn show_command(
     if flight || file.is_some() {
         return show_flight(&state, turn, file, json_output);
     }
+    let plan_wrapper_context = plan_wrapper_context_from_run(&paths, &state)?;
     if json_output {
         let status = run_status_label(state.status);
+        let plan_result = plan_wrapper_context.as_ref().map(|context| {
+            json!({
+                "plan_id": &context.plan_id,
+                "merged_run_id": &context.merged_run_id,
+                "docs": plan_doc_path(&paths, &context.plan_id, deadreckon_core::plan::PLAN_NARRATIVE),
+            })
+        });
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -22172,6 +23883,7 @@ fn show_command(
                 },
                 "run": state,
                 "plan_child": child_context,
+                "plan_result": plan_result,
             }))?
         );
         return Ok(());
@@ -22186,6 +23898,16 @@ fn show_command(
             selection.task_id,
             run_prefix(&selection.run_id)
         );
+    }
+    if let Some(context) = plan_wrapper_context.as_ref() {
+        let plan = load_plan(&paths, &context.plan_id)?;
+        println!(
+            "plan result wrapper {} -> plan {} merged {}",
+            run_prefix(&state.run_id),
+            run_prefix(&context.plan_id),
+            run_prefix(&context.merged_run_id)
+        );
+        println!("docs {}", plan_docs_status_line(&paths, &plan));
     }
     print_run_locations(&state);
     if let Some(line) = chain_context_line_for_working(&state.working_dir)? {
@@ -25250,7 +26972,7 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
             Some(CompletionAction::Docs) => {
                 Box::pin(doc_command(DocCommandArgs {
                     run_id: state.run_id.clone(),
-                    kind: DocKind::Narrative,
+                    kind: CliDocKind::Narrative,
                     export: None,
                     polish: false,
                     no_confirm: true,
@@ -26551,7 +28273,7 @@ async fn handle_tui_completion_key(
         CompletionAction::Docs => {
             Box::pin(doc_command(DocCommandArgs {
                 run_id: state.run_id.clone(),
-                kind: DocKind::Narrative,
+                kind: CliDocKind::Narrative,
                 export: None,
                 polish: false,
                 no_confirm: true,
@@ -31111,37 +32833,41 @@ mod tui_tests {
         AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG,
         ChainAttachTuiState, CommandAudience, CommandDiscovery, CommandHelpEntry, CompletionAction,
         ConfigDefaults, HELP_ALL_GROUPS, LiveFile, NarrativeAcceptanceRefreshTracker,
-        NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode,
-        PlanAttachRenderState, PlanFeedEvent, PlanNarrativeRefreshInput, ProviderActivity,
-        ProviderJsonlLogSpec, Result, RunNarrativeRenderInput, StartDoneAction,
-        StartDoneCriteriaSource, StartLaunchInput, StartPromptEligibility, StartPrompter,
-        StartProviderSource, StartSelectedMode, StartSelectionSource, StartSourceMode,
-        TopHelpGroup, acceptance_activity_lines, add_start_history_actions, attach_banner,
-        attach_header_text, attach_live_inventory, attach_loop_stage_work,
-        attach_should_return_to_plan, build_run_narrative_projection,
-        cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job, chain_activity_lines,
-        chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
-        chain_narrative_refusal_text, chain_should_auto_attach, chain_step_dot,
-        chain_timeline_lines, chain_wall_cap_hit, claude_project_name_for_workdir,
-        cli_wait_status_line, collect_jsonl_provider_activity,
-        collect_jsonl_provider_activity_scan, command_discovery, completion_action_from_input,
-        completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text,
-        doc_polish_preview_text, implementation_plan_warnings, kill_banner, launch_preview_rows,
-        live_file_lines, markdown_to_tui_lines, max_panel_scroll, maybe_prompt_start_mode,
-        meter_color, narrative_provider_selection, orchestration_dependency_rows,
+        NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode, PLAN_AS_BUILT,
+        PLAN_CHILDREN, PLAN_DECISIONS, PLAN_DOC_PROVIDER_ERROR, PlanAttachRenderState,
+        PlanDocRefreshOptions, PlanFeedEvent, PlanNarrativeRefreshInput, PlanProviderAsBuilt,
+        PlanProviderChild, PlanProviderDecisions, PlanProviderDocs, PlanProviderItem,
+        PlanProviderNarrative, PlanWrapperDocContext, ProviderActivity, ProviderJsonlLogSpec,
+        Result, RunNarrativeRenderInput, StartDoneAction, StartDoneCriteriaSource,
+        StartLaunchInput, StartPromptEligibility, StartPrompter, StartProviderSource,
+        StartSelectedMode, StartSelectionSource, StartSourceMode, TopHelpGroup,
+        acceptance_activity_lines, add_start_history_actions, attach_banner, attach_header_text,
+        attach_live_inventory, attach_loop_stage_work, attach_should_return_to_plan,
+        build_run_narrative_projection, cancel_plan_narrative_refresh_job,
+        cancel_run_narrative_refresh_job, chain_activity_lines, chain_attach_footer_text,
+        chain_attach_header_text, chain_event_read_hint, chain_narrative_refusal_text,
+        chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
+        claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
+        collect_jsonl_provider_activity_scan, collect_plan_doc_input, command_discovery,
+        completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
+        deadreckoning_status_text, doc_polish_preview_text, implementation_plan_warnings,
+        kill_banner, launch_preview_rows, live_file_lines, markdown_to_tui_lines,
+        materialize_plan_docs_to_working, max_panel_scroll, maybe_prompt_start_mode, meter_color,
+        narrative_provider_selection, orchestration_dependency_rows,
         orchestration_parallelism_lines, orchestration_provider_role_rows,
-        orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer,
+        orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer, plan_doc_path,
         plan_merge_repair_summary_items, plan_narrative_refresh_request,
         plan_narrative_refresh_trigger, poll_plan_narrative_refresh_job,
         poll_run_narrative_refresh_job, prompt_start_done_criteria,
         prompt_start_existing_done_criteria, provider_ingest_base_roots,
         provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
         provider_jsonl_session_matches_run, read_plan_events_lossy, recommend_child_count_for_goal,
-        recommend_orchestration_mode, render_attach, render_plan_attach,
-        resolve_start_orchestration_options, run_narrative_json_text, run_narrative_plain_text,
-        run_narrative_refresh_trigger, start_done_materialization_request, start_launch_decision,
-        start_launch_preview_facts, start_or_coalesce_plan_narrative_refresh_job,
-        start_provider_role_summary, threshold_color,
+        recommend_orchestration_mode, refresh_plan_docs, render_attach, render_plan_attach,
+        resolve_plan_doc_target, resolve_start_orchestration_options, run_narrative_json_text,
+        run_narrative_plain_text, run_narrative_refresh_trigger,
+        start_done_materialization_request, start_launch_decision, start_launch_preview_facts,
+        start_or_coalesce_plan_narrative_refresh_job, start_provider_role_summary, threshold_color,
+        validate_plan_provider_docs, write_plan_docs_deterministic, write_plan_docs_from_provider,
     };
     use crate::cli::{Cli, CliPlanMode, CliStartMode, StartCommandArgs};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -31154,7 +32880,8 @@ mod tui_tests {
         NetworkCapability, OnFail, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
         PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunEvent,
         RunEventKind, RunListEntry, RunOptions, RunStatus, SpendRecord, TraceRecord,
-        append_plan_event, create_run, doc_path_for_kind, save_plan,
+        append_plan_event, append_trace, create_run, doc_path_for_kind, save_plan,
+        write_child_summary, write_worker_spec,
     };
     use deadreckon_providers::SpendEstimate;
     use deadreckon_providers::registry::{
@@ -32465,6 +34192,404 @@ mod tui_tests {
         )
         .expect("plan");
         (temp, paths, plan)
+    }
+
+    fn attach_child_run_with_docs(
+        paths: &DeadreckonPaths,
+        temp: &tempfile::TempDir,
+        plan: &mut Plan,
+        index: usize,
+        narrative: &str,
+    ) -> deadreckon_core::PipelineState {
+        let state = create_run(
+            paths,
+            RunOptions {
+                goal: format!("child {index}"),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("smoke:child".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("child run");
+        let docs = state.working_dir.join(".deadreckon/docs");
+        std::fs::create_dir_all(&docs).expect("docs dir");
+        std::fs::write(docs.join(deadreckon_core::RUN_NARRATIVE), narrative).expect("narrative");
+        std::fs::write(
+            docs.join(deadreckon_core::RUN_AS_BUILT),
+            format!("# Child {index} As Built\n\nBuilt file `child-{index}.txt`."),
+        )
+        .expect("as built");
+        std::fs::write(
+            docs.join(deadreckon_core::RUN_DECISIONS),
+            format!("# Child {index} Decisions\n\nChose child {index} implementation."),
+        )
+        .expect("decisions");
+        std::fs::write(
+            state.working_dir.join(format!("child-{index}.txt")),
+            format!("child {index} artifact"),
+        )
+        .expect("artifact");
+        let task = plan.tasks.get_mut(index).expect("task");
+        task.child_run_id = Some(state.run_id.clone());
+        task.status = PlanTaskStatus::Completed;
+        state
+    }
+
+    fn write_plan_specs_and_summaries(paths: &DeadreckonPaths, plan: &Plan) {
+        for task in &plan.tasks {
+            write_worker_spec(
+                paths,
+                &plan.plan_id,
+                &task.task_id,
+                &format!("# Worker {}\n\nImplement {}.", task.task_id, task.subject),
+            )
+            .expect("worker");
+            write_child_summary(
+                paths,
+                &plan.plan_id,
+                &task.task_id,
+                &format!("Summary for {} with useful plan evidence.", task.task_id),
+            )
+            .expect("summary");
+        }
+    }
+
+    #[test]
+    fn plan_docs_collect_child_run_docs_in_task_graph_order() {
+        let (temp, paths, mut plan) = full_plan_fixture(3);
+        plan.tasks[0].depends_on = vec!["task-1".to_string()];
+        write_plan_specs_and_summaries(&paths, &plan);
+        attach_child_run_with_docs(
+            &paths,
+            &temp,
+            &mut plan,
+            0,
+            "# Child 0 Narrative\n\nImplemented task zero with enough detail to be useful.",
+        );
+        attach_child_run_with_docs(
+            &paths,
+            &temp,
+            &mut plan,
+            1,
+            "# Child 1 Narrative\n\nImplemented dependency task one with enough detail.",
+        );
+
+        let input = collect_plan_doc_input(&paths, &plan).expect("input");
+
+        assert_eq!(input.task_order, vec!["task-1", "task-0", "task-2"]);
+        let task0 = input
+            .children
+            .iter()
+            .find(|child| child.task_id == "task-0")
+            .expect("task0");
+        assert_eq!(task0.doc_status, "polished");
+        assert!(
+            task0
+                .docs
+                .iter()
+                .any(|doc| doc.evidence_id == "doc:task-0:narrative"),
+            "{task0:#?}"
+        );
+    }
+
+    #[test]
+    fn plan_docs_fallback_writes_narrative_as_built_decisions_and_children() {
+        let (temp, paths, mut plan) = full_plan_fixture(2);
+        plan.status = PlanStatus::Merged;
+        plan.merged_run_id = Some("11112222333344445555666677778888".to_string());
+        write_plan_specs_and_summaries(&paths, &plan);
+        attach_child_run_with_docs(
+            &paths,
+            &temp,
+            &mut plan,
+            0,
+            "# Child 0 Narrative\n\nImplemented game levels with enough concrete detail.",
+        );
+        attach_child_run_with_docs(
+            &paths,
+            &temp,
+            &mut plan,
+            1,
+            "# Child 1 Narrative\n\nImplemented scoreboard with enough concrete detail.",
+        );
+        let merge_working = paths.merge_working(&plan.plan_id);
+        std::fs::create_dir_all(&merge_working).expect("merge working");
+        std::fs::write(merge_working.join("index.html"), "<main>game</main>").expect("result");
+
+        let manifest =
+            write_plan_docs_deterministic(&paths, &plan, None, "none", None).expect("docs");
+
+        assert_eq!(manifest.children.len(), 2);
+        for name in [
+            deadreckon_core::plan::PLAN_NARRATIVE,
+            PLAN_AS_BUILT,
+            PLAN_DECISIONS,
+            PLAN_CHILDREN,
+        ] {
+            let path = plan_doc_path(&paths, &plan.plan_id, name);
+            assert!(path.exists(), "missing {}", path.display());
+            let raw = std::fs::read_to_string(path).expect("doc");
+            assert!(raw.contains("task-0"), "{raw}");
+        }
+        let as_built = std::fs::read_to_string(plan_doc_path(&paths, &plan.plan_id, PLAN_AS_BUILT))
+            .expect("as built");
+        assert!(as_built.contains("index.html"), "{as_built}");
+    }
+
+    #[tokio::test]
+    async fn plan_docs_provider_over_budget_falls_back_to_deterministic_docs() {
+        let (temp, paths, mut plan) = full_plan_fixture(2);
+        plan.status = PlanStatus::Merged;
+        plan.merged_run_id = Some("11112222333344445555666677778888".to_string());
+        write_plan_specs_and_summaries(&paths, &plan);
+        attach_child_run_with_docs(
+            &paths,
+            &temp,
+            &mut plan,
+            0,
+            "# Child 0 Narrative\n\nImplemented levels with concrete details.",
+        );
+
+        let manifest = refresh_plan_docs(
+            &paths,
+            &plan,
+            PlanDocRefreshOptions {
+                provider: Some("openai".to_string()),
+                provider_source: "flag".to_string(),
+                budget_cap_usd: Some(0.0),
+                force: true,
+            },
+        )
+        .await
+        .expect("docs");
+
+        assert_eq!(manifest.status, "failed_provider_fallback");
+        assert_eq!(manifest.provider.calls, 0);
+        assert!(
+            manifest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("above cap")),
+            "{manifest:#?}"
+        );
+        assert!(plan_doc_path(&paths, &plan.plan_id, PLAN_DOC_PROVIDER_ERROR).exists());
+        assert!(
+            plan_doc_path(&paths, &plan.plan_id, deadreckon_core::plan::PLAN_NARRATIVE).exists()
+        );
+    }
+
+    #[test]
+    fn plan_result_apply_docs_do_not_replace_plan_rollup_with_empty_run_docs() {
+        let (temp, paths, mut plan) = full_plan_fixture(2);
+        plan.status = PlanStatus::Merged;
+        plan.merged_run_id = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        write_plan_specs_and_summaries(&paths, &plan);
+        attach_child_run_with_docs(
+            &paths,
+            &temp,
+            &mut plan,
+            0,
+            "# Child 0 Narrative\n\nImplemented the whole app.",
+        );
+        write_plan_docs_deterministic(&paths, &plan, None, "none", None).expect("docs");
+        let dest = temp.path().join("apply-worktree");
+        std::fs::create_dir_all(dest.join(".deadreckon/docs")).expect("dest");
+        std::fs::write(
+            dest.join(".deadreckon/docs")
+                .join(deadreckon_core::RUN_NARRATIVE),
+            "# Empty\n\nNo completed turns have been recorded yet.",
+        )
+        .expect("empty");
+
+        materialize_plan_docs_to_working(
+            &paths,
+            &plan,
+            &dest,
+            Some(&PlanWrapperDocContext {
+                wrapper_run_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                merged_run_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            }),
+        )
+        .expect("materialize");
+
+        let wrapper = std::fs::read_to_string(
+            dest.join(".deadreckon/docs")
+                .join(deadreckon_core::RUN_NARRATIVE),
+        )
+        .expect("wrapper");
+        assert!(wrapper.contains("Plan Result Wrapper"), "{wrapper}");
+        assert!(wrapper.contains("PLAN-NARRATIVE.md"), "{wrapper}");
+        assert!(dest.join("docs").join("PLAN-NARRATIVE.md").exists());
+        assert!(
+            dest.join(".deadreckon/docs")
+                .join("PLAN-CHILDREN.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn plan_docs_provider_response_rejects_unknown_citations() {
+        let (temp, paths, mut plan) = full_plan_fixture(2);
+        write_plan_specs_and_summaries(&paths, &plan);
+        attach_child_run_with_docs(
+            &paths,
+            &temp,
+            &mut plan,
+            0,
+            "# Child 0 Narrative\n\nImplemented the app with enough detail.",
+        );
+        let input = collect_plan_doc_input(&paths, &plan).expect("input");
+        let docs = PlanProviderDocs {
+            schema_version: 1,
+            title: "Plan".to_string(),
+            narrative: PlanProviderNarrative {
+                summary: "Summary".to_string(),
+                task_graph: vec![PlanProviderItem {
+                    title: None,
+                    text: "Invented claim".to_string(),
+                    citations: vec!["unknown:evidence".to_string()],
+                }],
+                phases: Vec::new(),
+                repairs: Vec::new(),
+                acceptance: Vec::new(),
+                open_threads: Vec::new(),
+            },
+            as_built: PlanProviderAsBuilt {
+                system_overview: "System".to_string(),
+                components: Vec::new(),
+                changed_files: Vec::new(),
+                runtime_notes: Vec::new(),
+            },
+            decisions: PlanProviderDecisions {
+                decisions: Vec::new(),
+                tradeoffs: Vec::new(),
+                deferrals: Vec::new(),
+            },
+            children: vec![PlanProviderChild {
+                task_id: "task-0".to_string(),
+                summary: "Covered".to_string(),
+                citations: vec!["task:task-0".to_string()],
+            }],
+        };
+
+        let err = validate_plan_provider_docs(&input, &docs).expect_err("validation");
+
+        assert!(err.to_string().contains("unknown plan doc citation"));
+    }
+
+    #[test]
+    fn plan_docs_provider_consolidates_child_docs_with_citations() {
+        let (temp, paths, mut plan) = full_plan_fixture(2);
+        write_plan_specs_and_summaries(&paths, &plan);
+        attach_child_run_with_docs(
+            &paths,
+            &temp,
+            &mut plan,
+            0,
+            "# Child 0 Narrative\n\nImplemented the app with enough detail.",
+        );
+        let input = collect_plan_doc_input(&paths, &plan).expect("input");
+        let docs = PlanProviderDocs {
+            schema_version: 1,
+            title: "Consolidated plan".to_string(),
+            narrative: PlanProviderNarrative {
+                summary: "The plan completed the app.".to_string(),
+                task_graph: vec![PlanProviderItem {
+                    title: Some("Task 0".to_string()),
+                    text: "Task 0 supplied the implementation.".to_string(),
+                    citations: vec!["task:task-0".to_string()],
+                }],
+                phases: Vec::new(),
+                repairs: Vec::new(),
+                acceptance: Vec::new(),
+                open_threads: Vec::new(),
+            },
+            as_built: PlanProviderAsBuilt {
+                system_overview: "One child produced the result.".to_string(),
+                components: Vec::new(),
+                changed_files: Vec::new(),
+                runtime_notes: Vec::new(),
+            },
+            decisions: PlanProviderDecisions {
+                decisions: vec![PlanProviderItem {
+                    title: None,
+                    text: "Kept the deterministic child artifact.".to_string(),
+                    citations: vec!["doc:task-0:decisions".to_string()],
+                }],
+                tradeoffs: Vec::new(),
+                deferrals: Vec::new(),
+            },
+            children: vec![PlanProviderChild {
+                task_id: "task-0".to_string(),
+                summary: "Task 0 is covered.".to_string(),
+                citations: vec!["task:task-0".to_string()],
+            }],
+        };
+
+        validate_plan_provider_docs(&input, &docs).expect("valid");
+        write_plan_docs_from_provider(&paths, &plan, &input, &docs).expect("write");
+
+        let narrative = std::fs::read_to_string(plan_doc_path(
+            &paths,
+            &plan.plan_id,
+            deadreckon_core::plan::PLAN_NARRATIVE,
+        ))
+        .expect("narrative");
+        assert!(narrative.contains("Consolidated plan"), "{narrative}");
+        assert!(narrative.contains("`task:task-0`"), "{narrative}");
+    }
+
+    #[test]
+    fn plan_docs_resolve_apply_wrapper_back_to_plan_and_merged_run() {
+        let (temp, paths, mut plan) = full_plan_fixture(2);
+        plan.status = PlanStatus::Merged;
+        plan.merged_run_id = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        save_plan(&paths, &plan).expect("save plan");
+        let wrapper = create_run(
+            &paths,
+            RunOptions {
+                goal: "wrapper".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("deadreckon:orchestrate-apply".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("wrapper");
+        append_trace(
+            &wrapper,
+            &TraceRecord {
+                timestamp: Utc::now(),
+                run_id: wrapper.run_id.clone(),
+                turn: 0,
+                event: "plan_result_apply_prepared".to_string(),
+                latency_ms: None,
+                detail: serde_json::json!({
+                    "plan_id": plan.plan_id,
+                    "merged_run_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                }),
+            },
+        )
+        .expect("trace");
+
+        let target =
+            resolve_plan_doc_target(&paths, &wrapper.run_id, Some(&wrapper)).expect("target");
+
+        let target = target.expect("plan target");
+        assert_eq!(target.plan.plan_id, plan.plan_id);
+        assert_eq!(
+            target.wrapper.expect("wrapper").merged_run_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     fn render_plan_attach_text(

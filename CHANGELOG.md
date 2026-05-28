@@ -1,5 +1,20 @@
 # Changelog
 
+## Production release posture - 2026-05-28
+
+- Replaced current product docs and generated run-doc front matter that still labeled DeadReckon as alpha with production-release posture language.
+- Kept dated alpha changelog entries and old goal briefs as historical records while moving new user-facing wording to compatibility-release terminology.
+- Removed live CLI and narrative fallback messages that described current behavior as an alpha slice.
+
+## Plan Doc Consolidation (production release) - 2026-05-28
+
+- Added consolidated orchestration plan docs: `PLAN-NARRATIVE.md`, `PLAN-AS-BUILT.md`, `PLAN-DECISIONS.md`, `PLAN-CHILDREN.md`, and `PLAN-DOCS-MANIFEST.json`.
+- Built a plan-doc input collector that reads child run docs, task summaries, worker specs, merge repair evidence, and final result inventory in task-graph order.
+- Added provider-backed plan-doc consolidation with bounded input bundles, citation validation, invented-path checks, and deterministic fallback when provider output is unavailable or invalid.
+- Materialized plan docs into merged libraries, plan apply worktrees, and exported artifacts without copying child internal logs.
+- Rewrote synthetic plan-result apply `RUN-*` docs as wrappers that point to consolidated `PLAN-*` docs instead of showing empty zero-turn run docs.
+- Extended `deadreckon doc`/`docs` and `show` so plan ids and plan-result wrapper runs resolve to plan documentation.
+
 ## Production command model (alpha) - 2026-05-27
 
 - Reframed default help around the production flow: `start`, `attach`, `status`, `list`, `finish`, setup, and control commands.

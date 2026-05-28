@@ -1,6 +1,6 @@
 //! User-facing vocabulary for deadreckon surfaces.
 //!
-//! Stored enum variants keep their historical names for alpha schema
+//! Stored enum variants keep their historical schema names
 //! compatibility. These helpers own the words shown to a person.
 
 use crate::chain::{ChainStatus, ChainStepStatus};

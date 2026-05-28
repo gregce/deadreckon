@@ -648,7 +648,7 @@ pub(crate) fn build_run_projection(input: &RunNarrativeInput<'_>) -> NarrativePr
         ));
     }
     risks.push(claim(
-        "Provider-backed narration has not run in this alpha slice; deterministic fallback facts are shown."
+        "Provider-backed narration has not run yet; deterministic fallback facts are shown."
             .to_string(),
         vec![state_evidence],
         "high",
@@ -901,7 +901,7 @@ pub(crate) fn build_plan_projection(input: &PlanNarrativeInput<'_>) -> Narrative
         ));
     }
     risks.push(claim(
-        "Provider-backed narration has not run in this alpha slice; deterministic fallback facts are shown."
+        "Provider-backed narration has not run yet; deterministic fallback facts are shown."
             .to_string(),
         vec![plan_evidence],
         "high",
