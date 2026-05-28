@@ -16554,6 +16554,76 @@ mod campaign_spawn_tests {
             deadreckon_core::campaign::read_campaign_events(&campaign_dir).expect("events");
         assert!(events.iter().any(|e| e.kind == "budget_exhausted"));
     }
+
+    fn write_file(root: &std::path::Path, relative: &str, body: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, body).expect("write");
+    }
+
+    #[test]
+    fn compose_result_runs_extracted_without_changing_plan_merge() {
+        // The shared enumeration plan merge relies on: lists real files, skips
+        // internal/generated paths (.deadreckon, docs/RUN-*).
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("run-root");
+        write_file(&root, "src/lib.rs", "pub fn a() {}");
+        write_file(&root, ".deadreckon/docs/RUN-NARRATIVE.md", "internal");
+        write_file(&root, "docs/RUN-AS-BUILT.md", "internal");
+        write_file(&root, "docs/guide.md", "kept");
+
+        let files = mergeable_run_files(&root).expect("files");
+        let relatives: Vec<String> = files
+            .iter()
+            .map(|(relative, _, _)| relative.to_string_lossy().into_owned())
+            .collect();
+        assert!(relatives.iter().any(|r| r == "src/lib.rs"));
+        assert!(relatives.iter().any(|r| r == "docs/guide.md"));
+        assert!(!relatives.iter().any(|r| r.contains(".deadreckon")));
+        assert!(!relatives.iter().any(|r| r.contains("RUN-")));
+    }
+
+    #[test]
+    fn campaign_meta_merge_composes_two_clean_sub_results() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root0 = tmp.path().join("sub-0-result");
+        let root1 = tmp.path().join("sub-1-result");
+        write_file(&root0, "src/billing.rs", "billing");
+        write_file(&root1, "src/notify.rs", "notify");
+        let merge_dir = tmp.path().join("merge-working");
+
+        let result = compose_roots(
+            &[("run-0".to_string(), root0), ("run-1".to_string(), root1)],
+            &merge_dir,
+        )
+        .expect("compose");
+
+        assert!(result.conflicts.is_empty());
+        assert!(merge_dir.join("src/billing.rs").is_file());
+        assert!(merge_dir.join("src/notify.rs").is_file());
+    }
+
+    #[test]
+    fn cross_sub_file_conflict_fails_campaign() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root0 = tmp.path().join("sub-0-result");
+        let root1 = tmp.path().join("sub-1-result");
+        write_file(&root0, "src/shared.rs", "version from sub 0");
+        write_file(&root1, "src/shared.rs", "version from sub 1");
+        let merge_dir = tmp.path().join("merge-working");
+
+        let result = compose_roots(
+            &[("run-0".to_string(), root0), ("run-1".to_string(), root1)],
+            &merge_dir,
+        )
+        .expect("compose");
+
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(
+            result.conflicts[0].path,
+            std::path::PathBuf::from("src/shared.rs")
+        );
+    }
 }
 
 fn review_parent_run_id(plan: &Plan, task: &PlanTask) -> Option<String> {
@@ -17128,6 +17198,87 @@ fn parse_merge_repair_mode(mode: &str) -> Result<MergeRepairMode> {
     }
 }
 
+/// Enumerate a run's mergeable artifact files as (relative, absolute, content hash),
+/// skipping internal/generated paths (`.deadreckon`, `docs/RUN-*`, build dirs, ...).
+/// Shared by plan merge and campaign meta-merge so both compose identically.
+fn mergeable_run_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf, u64)>> {
+    let mut files = Vec::new();
+    for file in inventory_files(root)? {
+        let relative = file.strip_prefix(root).map_err(|err| {
+            DeadreckonError::InvalidInput(format!("merge source prefix error: {err}"))
+        })?;
+        if skip_plan_merge_file(relative) {
+            continue;
+        }
+        let hash = file_hash(&file)?;
+        files.push((relative.to_path_buf(), file.clone(), hash));
+    }
+    Ok(files)
+}
+
+/// A same-path collision between two independent campaign sub-results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComposeConflict {
+    path: PathBuf,
+    first_label: String,
+    second_label: String,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // merge_dir consumed by the campaign command in P9
+struct ComposeResult {
+    merge_dir: PathBuf,
+    conflicts: Vec<ComposeConflict>,
+}
+
+/// Compose several already-promoted result trees into one merge dir. Sub-results
+/// are independent (no dependency edges), so this is fail-on-conflict: two roots
+/// touching the same relative path with different content yields a conflict. The
+/// first writer wins on disk; conflicts are reported so the campaign can fail.
+fn compose_roots(roots: &[(String, PathBuf)], merge_dir: &Path) -> Result<ComposeResult> {
+    remove_if_exists(merge_dir)?;
+    fs::create_dir_all(merge_dir)?;
+    let mut seen: BTreeMap<PathBuf, (String, u64)> = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for (label, root) in roots {
+        for (relative, absolute, hash) in mergeable_run_files(root)? {
+            match seen.get(&relative) {
+                Some((previous_label, previous_hash)) if *previous_hash != hash => {
+                    conflicts.push(ComposeConflict {
+                        path: relative.clone(),
+                        first_label: previous_label.clone(),
+                        second_label: label.clone(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    copy_merge_file(&absolute, &merge_dir.join(&relative))?;
+                    seen.insert(relative, (label.clone(), hash));
+                }
+            }
+        }
+    }
+    Ok(ComposeResult {
+        merge_dir: merge_dir.to_path_buf(),
+        conflicts,
+    })
+}
+
+/// Resolve campaign sub-result run ids to their artifact roots and compose them.
+#[allow(dead_code)] // wired by the campaign command in P9
+fn compose_result_runs(
+    paths: &DeadreckonPaths,
+    run_ids: &[String],
+    merge_dir: &Path,
+) -> Result<ComposeResult> {
+    let mut roots = Vec::new();
+    for run_id in run_ids {
+        let state = load_run(paths, run_id)?;
+        roots.push((run_id.clone(), child_artifact_root(paths, &state)));
+    }
+    compose_roots(&roots, merge_dir)
+}
+
 fn compose_plan_merge_working(
     paths: &DeadreckonPaths,
     plan: &Plan,
@@ -17151,14 +17302,8 @@ fn compose_plan_merge_working(
         })?;
         let state = load_run(paths, run_id)?;
         let child_root = child_artifact_root(paths, &state);
-        for file in inventory_files(&child_root)? {
-            let relative = file.strip_prefix(&child_root).map_err(|err| {
-                DeadreckonError::InvalidInput(format!("merge source prefix error: {err}"))
-            })?;
-            if skip_plan_merge_file(relative) {
-                continue;
-            }
-            let hash = file_hash(&file)?;
+        for (relative, file, hash) in mergeable_run_files(&child_root)? {
+            let relative = relative.as_path();
             let current = PlanMergeSeenFile {
                 task_id: task.task_id.clone(),
                 task_index: task.index,

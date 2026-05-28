@@ -7,6 +7,7 @@
 - P3: Added the sub-orchestrator spawn (`build_sub_orchestrator_command`, lineage env transport + `sub-result.json` sidecar) reusing the plan-child isolation idiom, and wired `orchestrate full-plan` to report its merged result when launched by a campaign.
 - P4: Added `run_campaign_fork`, a sequential sub-orchestrator driver that records `campaign-events.jsonl` (`campaign_started`/`sub_launched`/`sub_merged`/`sub_failed`) and marks a failed sub without aborting its siblings.
 - P5: Added the tree-budget allocator (`allocate_budget`, even split with remainder-to-first), aggregate-spend exhaustion enforcement that refuses the next sub launch (`tree_budget_exhausted` + `budget_exhausted` event), and the unbounded-budget warning.
+- P6: Extracted the shared `mergeable_run_files` enumeration (used by plan merge unchanged) and added `compose_roots`/`compose_result_runs` for independent sub-results; a cross-sub file conflict is reported so the campaign fails rather than silently overwriting.
 
 ## Tamper-Evident Gate (production release) - 2026-05-28
 
