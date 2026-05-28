@@ -34,7 +34,7 @@ use deadreckon::cards::exit_summary::{
 };
 use deadreckon::sleep::{self, SleepPrefs, SleepPrevention};
 use deadreckon::ui_card::{
-    Card, CardOptions, HintLine, Section, TitleGlyph, TitleLine, render_card,
+    Card, CardOptions, HintLine, Section, TitleGlyph, TitleLine, Tone, render_card,
 };
 use deadreckon_core::flight::{
     CheckpointManifest, FLIGHT_EVENTS_JSONL, FlightEvent, FlightEventKind, FlightSessionStatus,
@@ -9162,6 +9162,8 @@ fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> 
     ));
     fs::create_dir_all(&temp_root)?;
     if let Some(spec_path) = spec_path.as_ref() {
+        let raw = fs::read_to_string(spec_path)?;
+        validate_acceptance_yaml_integrity(&raw)?;
         fs::copy(spec_path, acceptance_spec_path_for_run_root(&temp_root))?;
     }
     let result = evaluate_acceptance_checks(&temp_root, &working_dir);
@@ -9728,6 +9730,8 @@ fn write_project_acceptance(
     force: bool,
     allow_existing: bool,
 ) -> Result<()> {
+    acceptance_check_count(&draft.yaml)?;
+    validate_acceptance_yaml_integrity(&draft.yaml)?;
     let dir = cwd.join(PROJECT_ACCEPTANCE_DIR);
     let yaml_path = project_acceptance_yaml(cwd);
     let md_path = project_acceptance_md(cwd);
@@ -10200,6 +10204,21 @@ fn acceptance_check_count(raw: &str) -> Result<usize> {
     Ok(count)
 }
 
+fn validate_acceptance_yaml_integrity(raw: &str) -> Result<()> {
+    let checks = deadreckon_core::acceptance_checks_from_yaml(raw)?;
+    let findings = deadreckon_core::tamper::lint_checks(&checks);
+    if let Some(finding) = findings.first() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done criteria rejected: suppression pattern '{}' in {} check",
+                finding.pattern, finding.check_kind
+            ),
+            "deadreckon def-done \"what should count as done\" and remove the suppression; checks must fail honestly",
+        )));
+    }
+    Ok(())
+}
+
 fn acceptance_yaml_value(raw: &str) -> Result<serde_yaml::Value> {
     serde_yaml::from_str(raw).map_err(|source| {
         CliError::Core(deadreckon_core::user_error(
@@ -10223,6 +10242,250 @@ fn yaml_items(value: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
     }
 }
 
+#[cfg(test)]
+mod acceptance_integrity_tests {
+    use std::collections::BTreeMap;
+
+    use tempfile::TempDir;
+
+    use super::{AcceptanceDraft, write_project_acceptance};
+
+    fn suppressed_draft(command: &str) -> AcceptanceDraft {
+        AcceptanceDraft {
+            yaml: format!(
+                "name: suppressed\nchecks:\n  - kind: shell\n    command: \"{command}\"\n"
+            ),
+            markdown: "# Done Criteria\n".to_string(),
+            files: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn def_done_compile_rejects_or_true_suppression() {
+        let temp = TempDir::new().expect("tempdir");
+        let draft = suppressed_draft("cargo test || true");
+
+        let err = write_project_acceptance(temp.path(), &draft, false, false).expect_err("reject");
+
+        assert!(err.to_string().contains("suppression pattern '|| true'"));
+        assert!(
+            !temp.path().join(".deadreckon/acceptance.yaml").exists(),
+            "rejected done criteria must not be written"
+        );
+    }
+
+    #[test]
+    fn def_done_compile_rejects_no_verify_and_exit_zero() {
+        let temp = TempDir::new().expect("tempdir");
+        let no_verify = suppressed_draft("git commit --no-verify");
+        let exit_zero = suppressed_draft("pytest --exit-zero");
+
+        let no_verify_err =
+            write_project_acceptance(temp.path(), &no_verify, false, false).expect_err("reject");
+        let exit_zero_err =
+            write_project_acceptance(temp.path(), &exit_zero, false, false).expect_err("reject");
+
+        assert!(
+            no_verify_err
+                .to_string()
+                .contains("suppression pattern '--no-verify'")
+        );
+        assert!(
+            exit_zero_err
+                .to_string()
+                .contains("suppression pattern '--exit-zero'")
+        );
+    }
+}
+
+#[cfg(test)]
+mod acceptance_render_tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn fixture_state(goal: &str) -> (TempDir, deadreckon_core::PipelineState) {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: goal.to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        (temp, state)
+    }
+
+    fn failed_cargo_progress(state: &deadreckon_core::PipelineState) {
+        let path = acceptance_progress_path_for_run_root(&state.run_root);
+        std::fs::create_dir_all(path.parent().expect("proofs")).expect("proofs");
+        let entry = AcceptanceProgressEntry {
+            checked_at: Utc::now(),
+            status: "failed".to_string(),
+            index: 1,
+            total: 1,
+            result: Some(deadreckon_core::AcceptanceCheckResult {
+                kind: "cargo_test".to_string(),
+                passed: false,
+                must_pass: true,
+                detail: "auth::tests::expired_token".to_string(),
+                command: Some("cargo test".to_string()),
+                cwd: Some(state.working_dir.clone()),
+                duration_ms: Some(10),
+                stdout: None,
+                stderr: None,
+            }),
+        };
+        std::fs::write(
+            path,
+            format!("{}\n", serde_json::to_string(&entry).expect("json")),
+        )
+        .expect("progress");
+    }
+
+    fn write_caveat_proof(state: &deadreckon_core::PipelineState) {
+        let tamper = deadreckon_core::tamper::AcceptanceTamper {
+            schema_version: 1,
+            run_id: state.run_id.clone(),
+            evaluated_at: Utc::now(),
+            verdict: deadreckon_core::tamper::AcceptanceTamperVerdict::Caveat,
+            spec_modified: false,
+            lint_findings: Vec::new(),
+            covered_files_touched: vec![deadreckon_core::tamper::CoveredFileTouch {
+                path: "tests/auth_test.rs".to_string(),
+                change: deadreckon_core::tamper::TouchedChange::Modified,
+                by_check: "cargo_test".to_string(),
+                classification: deadreckon_core::tamper::CoverageClassification::Test,
+            }],
+            caveats: vec!["agent modified test file tests/auth_test.rs this run".to_string()],
+            refusal_reasons: Vec::new(),
+        };
+        deadreckon_core::tamper::write_acceptance_tamper(&state.run_root, &tamper).expect("tamper");
+        deadreckon_core::write_acceptance_marker_with_results(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            vec![deadreckon_core::AcceptanceCheckResult {
+                kind: "cargo_test".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "cargo test exited with exit status: 0".to_string(),
+                command: Some("cargo test".to_string()),
+                cwd: Some(state.working_dir.clone()),
+                duration_ms: Some(10),
+                stdout: None,
+                stderr: None,
+            }],
+        )
+        .expect("marker");
+    }
+
+    fn write_refusal_proof(state: &deadreckon_core::PipelineState) {
+        let tamper = deadreckon_core::tamper::AcceptanceTamper {
+            schema_version: 1,
+            run_id: state.run_id.clone(),
+            evaluated_at: Utc::now(),
+            verdict: deadreckon_core::tamper::AcceptanceTamperVerdict::Refuse,
+            spec_modified: false,
+            lint_findings: vec![deadreckon_core::tamper::SuppressionFinding {
+                check_kind: "shell".to_string(),
+                command: "cargo test || true".to_string(),
+                pattern: "|| true".to_string(),
+            }],
+            covered_files_touched: Vec::new(),
+            caveats: Vec::new(),
+            refusal_reasons: vec!["suppression pattern '|| true' in shell check".to_string()],
+        };
+        deadreckon_core::tamper::write_acceptance_tamper(&state.run_root, &tamper).expect("tamper");
+    }
+
+    #[test]
+    fn exit_card_shows_per_check_verdict_and_failing_detail() {
+        let (_temp, state) = fixture_state("failed gate render");
+        failed_cargo_progress(&state);
+
+        let rendered = render_exit_summary_card(&state, &RunLoopOutcome::Failed, true);
+
+        assert!(rendered.contains("gate: FAILED 0/1"), "{rendered}");
+        assert!(
+            rendered.contains("cargo_test x auth::tests::expired_token"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn caveat_run_renders_warn_tone_caveat_line() {
+        let (_temp, state) = fixture_state("caveat gate render");
+        write_caveat_proof(&state);
+
+        let input = exit_summary_input(&state, &RunLoopOutcome::Done);
+        let rendered = render_card(
+            &build_exit_summary_card(&input),
+            &card_options(ui::Stream::Stdout, true),
+        );
+
+        assert_eq!(input.gate_tone, Tone::Warn);
+        assert!(rendered.contains("caveat"), "{rendered}");
+        assert!(rendered.contains("tests/auth_test.rs"), "{rendered}");
+    }
+
+    #[test]
+    fn status_shows_tests_modified_flag() {
+        let (_temp, state) = fixture_state("status test modified");
+        write_caveat_proof(&state);
+
+        let status = acceptance_status_line(&state);
+
+        assert!(status.contains("tests modified this run: yes"), "{status}");
+    }
+
+    #[test]
+    fn status_prefers_refusal_reason_over_passing_progress() {
+        let (_temp, state) = fixture_state("status refusal");
+        let path = acceptance_progress_path_for_run_root(&state.run_root);
+        std::fs::create_dir_all(path.parent().expect("proofs")).expect("proofs");
+        let entry = AcceptanceProgressEntry {
+            checked_at: Utc::now(),
+            status: "passed".to_string(),
+            index: 1,
+            total: 1,
+            result: Some(deadreckon_core::AcceptanceCheckResult {
+                kind: "shell".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "shell exited with exit status: 0".to_string(),
+                command: Some("cargo test || true".to_string()),
+                cwd: Some(state.working_dir.clone()),
+                duration_ms: Some(10),
+                stdout: None,
+                stderr: None,
+            }),
+        };
+        std::fs::write(
+            path,
+            format!("{}\n", serde_json::to_string(&entry).expect("json")),
+        )
+        .expect("progress");
+        write_refusal_proof(&state);
+
+        let status = acceptance_status_line(&state);
+        let evidence = acceptance_failure_evidence_lines(&state).join("\n");
+
+        assert!(status.contains("gate: REFUSED"), "{status}");
+        assert!(status.contains("suppression pattern '|| true'"), "{status}");
+        assert!(evidence.contains("acceptance refused"), "{evidence}");
+    }
+}
+
 fn read_optional_text(path: &Path) -> Result<Option<String>> {
     match fs::read_to_string(path) {
         Ok(value) => Ok(Some(value)),
@@ -10237,22 +10500,155 @@ fn ensure_trailing_newline(value: &str) -> String {
     value
 }
 
+#[derive(Debug, Clone)]
+struct AcceptanceDisplay {
+    gate: String,
+    gate_tone: Tone,
+    tests_modified: Option<bool>,
+    caveats: Vec<String>,
+}
+
+impl AcceptanceDisplay {
+    fn status_line(&self) -> String {
+        let mut parts = vec![self.gate.clone()];
+        if let Some(tests_modified) = self.tests_modified {
+            parts.push(format!(
+                "tests modified this run: {}",
+                if tests_modified { "yes" } else { "no" }
+            ));
+        }
+        parts.extend(
+            self.caveats
+                .iter()
+                .map(|caveat| format!("accepted (caveat: {caveat})")),
+        );
+        parts.join("; ")
+    }
+}
+
 fn acceptance_status_line(state: &deadreckon_core::PipelineState) -> String {
+    acceptance_display(state).status_line()
+}
+
+fn acceptance_display(state: &deadreckon_core::PipelineState) -> AcceptanceDisplay {
+    let tamper = deadreckon_core::tamper::read_acceptance_tamper_for_run_root(&state.run_root)
+        .ok()
+        .flatten();
     let marker_path = marker_path_for_run_root(&state.run_root);
     if marker_path.exists()
         && let Ok(bytes) = fs::read(&marker_path)
         && let Ok(marker) = serde_json::from_slice::<AcceptanceMarker>(&bytes)
     {
-        return format!("passed by dr-gate ({} checks)", marker.check_count);
+        return acceptance_display_from_gate_line(marker_gate_line(&marker), tamper);
+    }
+    let progress_path = acceptance_progress_path_for_run_root(&state.run_root);
+    if progress_path.exists()
+        && let Ok(entries) = read_jsonl::<AcceptanceProgressEntry>(&progress_path)
+        && !entries.is_empty()
+    {
+        return acceptance_display_from_gate_line(progress_gate_line(&entries), tamper);
     }
     let spec_path = acceptance_spec_path_for_run_root(&state.run_root);
     if spec_path.exists()
         && let Ok(raw) = fs::read_to_string(&spec_path)
         && let Ok(count) = acceptance_check_count(&raw)
     {
-        return format!("configured ({count} checks)");
+        return acceptance_configured_display(format!("configured ({count} checks)"));
     }
-    "default dr-gate behavior".to_string()
+    acceptance_configured_display("default dr-gate behavior".to_string())
+}
+
+fn acceptance_display_from_gate_line(
+    mut gate: String,
+    tamper: Option<deadreckon_core::tamper::AcceptanceTamper>,
+) -> AcceptanceDisplay {
+    if let Some(refusal) = tamper
+        .as_ref()
+        .filter(|tamper| tamper.verdict == deadreckon_core::tamper::AcceptanceTamperVerdict::Refuse)
+    {
+        gate = format!("gate: REFUSED - {}", refusal.refusal_reasons.join("; "));
+    }
+    let tests_modified = tamper.as_ref().map(tamper_tests_modified);
+    let caveats = tamper
+        .as_ref()
+        .filter(|tamper| tamper.verdict == deadreckon_core::tamper::AcceptanceTamperVerdict::Caveat)
+        .map(|tamper| tamper.caveats.clone())
+        .unwrap_or_default();
+    let gate_tone = if !caveats.is_empty() {
+        Tone::Warn
+    } else if gate.contains("FAILED") || gate.contains("REFUSED") {
+        Tone::Bad
+    } else {
+        Tone::Neutral
+    };
+    AcceptanceDisplay {
+        gate,
+        gate_tone,
+        tests_modified,
+        caveats,
+    }
+}
+
+fn acceptance_configured_display(gate: String) -> AcceptanceDisplay {
+    AcceptanceDisplay {
+        gate,
+        gate_tone: Tone::Neutral,
+        tests_modified: None,
+        caveats: Vec::new(),
+    }
+}
+
+fn tamper_tests_modified(tamper: &deadreckon_core::tamper::AcceptanceTamper) -> bool {
+    tamper
+        .covered_files_touched
+        .iter()
+        .any(|touch| touch.classification == deadreckon_core::tamper::CoverageClassification::Test)
+}
+
+fn marker_gate_line(marker: &AcceptanceMarker) -> String {
+    let total = marker.checks.len().max(marker.check_count);
+    let passed = if marker.checks.is_empty() {
+        marker.check_count
+    } else {
+        marker.checks.iter().filter(|result| result.passed).count()
+    };
+    gate_line_from_results(total, passed, &marker.checks, marker.check_count > 0)
+}
+
+fn progress_gate_line(entries: &[AcceptanceProgressEntry]) -> String {
+    let total = entries.iter().map(|entry| entry.total).max().unwrap_or(0);
+    let results = entries
+        .iter()
+        .filter_map(|entry| entry.result.as_ref())
+        .cloned()
+        .collect::<Vec<_>>();
+    let passed = results.iter().filter(|result| result.passed).count();
+    gate_line_from_results(total, passed, &results, false)
+}
+
+fn gate_line_from_results(
+    total: usize,
+    passed: usize,
+    results: &[deadreckon_core::AcceptanceCheckResult],
+    assume_passed_when_empty: bool,
+) -> String {
+    if let Some(failed) = results
+        .iter()
+        .find(|result| result.must_pass && !result.passed)
+        .or_else(|| results.iter().find(|result| !result.passed))
+    {
+        return format!(
+            "gate: FAILED {}/{} - {} x {}",
+            passed,
+            total.max(results.len()),
+            failed.kind,
+            one_line(&failed.detail, 96)
+        );
+    }
+    if results.is_empty() && !assume_passed_when_empty {
+        return format!("gate: PENDING 0/{total}");
+    }
+    format!("gate: PASSED {}/{}", passed, total.max(passed))
 }
 
 #[derive(Debug, Default)]
@@ -18129,6 +18525,7 @@ fn exit_summary_input(
         RunLoopOutcome::Failed => OutcomeKind::Failed,
     };
     let hints = exit_summary_hints(state, outcome_kind, codebase.as_ref(), &prefix);
+    let acceptance = acceptance_display(state);
     ExitSummaryInput {
         run_id: state.run_id.clone(),
         goal: state.goal.clone(),
@@ -18142,16 +18539,62 @@ fn exit_summary_input(
         input_tokens: spend.input_tokens,
         output_tokens: spend.output_tokens,
         spend_usd: spend.total_usd,
-        approximate_spend: spend.any_subscription_turn || spend.any_estimated_turn,
+        approximate_spend: spend.any_estimated_turn,
+        spend_label: spend_summary_label(state, &spend, false),
         wall_seconds: spend.wall_seconds,
         diff: codebase
             .as_ref()
             .and_then(|record| branch_diff_summary(state, record).ok().flatten()),
-        gate: acceptance_status_line(state),
+        gate: acceptance.gate,
+        gate_tone: acceptance.gate_tone,
+        tests_modified: acceptance.tests_modified,
+        gate_caveats: acceptance.caveats,
         working_dir: state.working_dir.clone(),
         proof_path: marker_path_for_run_root(&state.run_root),
         hints,
     }
+}
+
+fn spend_summary_label(
+    state: &deadreckon_core::PipelineState,
+    summary: &deadreckon_core::state::SpendSummary,
+    include_metered_cap: bool,
+) -> String {
+    let turns = summary.turns.max(state.turn as usize);
+    let wall_seconds = if summary.wall_seconds > 0.0 {
+        summary.wall_seconds
+    } else {
+        state.total_wall_seconds
+    };
+    let subscription_only = turns > 0
+        && summary.subscription_turns == summary.turns
+        && summary.total_usd == 0.0
+        && (summary.any_subscription_turn || !provider_is_metered(state));
+    if subscription_only {
+        return format!(
+            "not metered (subscription) · wall {:.1}s · {} turns",
+            wall_seconds, turns
+        );
+    }
+    let mut label = format!(
+        "{}${:.6}",
+        if summary.any_estimated_turn { "~" } else { "" },
+        summary.total_usd
+    );
+    if summary.any_subscription_turn {
+        label.push_str(" + subscription turns");
+    }
+    label.push_str(&format!(" · wall {:.1}s · {} turns", wall_seconds, turns));
+    if include_metered_cap {
+        label.push_str(" / ");
+        label.push_str(
+            &state
+                .max_spend_usd
+                .map(|cap| format!("${cap:.6}"))
+                .unwrap_or_else(|| "uncapped".to_string()),
+        );
+    }
+    label
 }
 
 fn exit_summary_hints(
@@ -23579,25 +24022,28 @@ fn show_run_why_failed(state: &deadreckon_core::PipelineState) -> Result<()> {
         return Ok(());
     }
     let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
-    let evidence = traces
-        .iter()
-        .rev()
-        .filter(|trace| {
-            trace.event.contains("error")
-                || trace.event.contains("failed")
-                || trace.detail.get("exit_code").is_some()
-                || trace.detail.get("stderr").is_some()
-        })
-        .take(3)
-        .map(|trace| {
-            format!(
-                "turn {} {} {}",
-                trace.turn,
-                trace.event,
-                one_line(&trace.detail.to_string(), 200)
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut evidence = acceptance_failure_evidence_lines(state);
+    evidence.extend(
+        traces
+            .iter()
+            .rev()
+            .filter(|trace| {
+                trace.event.contains("error")
+                    || trace.event.contains("failed")
+                    || trace.detail.get("exit_code").is_some()
+                    || trace.detail.get("stderr").is_some()
+            })
+            .take(3)
+            .map(|trace| {
+                format!(
+                    "turn {} {} {}",
+                    trace.turn,
+                    trace.event,
+                    one_line(&trace.detail.to_string(), 200)
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
     render_why_failed(WhyFailedReport {
         kind: "run",
         id: run_prefix(&state.run_id),
@@ -23607,6 +24053,30 @@ fn show_run_why_failed(state: &deadreckon_core::PipelineState) -> Result<()> {
         try_lines: Vec::new(),
     });
     Ok(())
+}
+
+fn acceptance_failure_evidence_lines(state: &deadreckon_core::PipelineState) -> Vec<String> {
+    let acceptance = acceptance_display(state);
+    let mut lines = Vec::new();
+    if acceptance.gate.contains("FAILED")
+        || acceptance.gate.contains("PASSED")
+        || acceptance.tests_modified.is_some()
+    {
+        lines.push(acceptance.status_line());
+    }
+    if let Some(tamper) =
+        deadreckon_core::tamper::read_acceptance_tamper_for_run_root(&state.run_root)
+            .ok()
+            .flatten()
+    {
+        lines.extend(
+            tamper
+                .refusal_reasons
+                .iter()
+                .map(|reason| format!("acceptance refused: {reason}")),
+        );
+    }
+    lines
 }
 
 fn show_flight(
@@ -26521,22 +26991,19 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
     let state_line = format!("{} -> {next_action}", run_status_label(state.status));
     let updated = format!("{} ago", relative_age(state.updated_at));
     let spend_summary = deadreckon_core::state::spend_summary(state).ok();
-    let total_spend = spend_summary
+    let spend = spend_summary
         .as_ref()
-        .map(|summary| summary.total_usd)
-        .unwrap_or(state.total_spend_usd);
-    let approximate_spend = spend_summary
-        .as_ref()
-        .is_some_and(|summary| summary.any_subscription_turn || summary.any_estimated_turn);
-    let spend = format!(
-        "{}${:.6} / {}",
-        if approximate_spend { "~" } else { "" },
-        total_spend,
-        state
-            .max_spend_usd
-            .map(|cap| format!("${cap:.6}"))
-            .unwrap_or_else(|| "uncapped".to_string())
-    );
+        .map(|summary| spend_summary_label(state, summary, true))
+        .unwrap_or_else(|| {
+            format!(
+                "${:.6} / {}",
+                state.total_spend_usd,
+                state
+                    .max_spend_usd
+                    .map(|cap| format!("${cap:.6}"))
+                    .unwrap_or_else(|| "uncapped".to_string())
+            )
+        });
     let wall = format!(
         "{:.1}s / {}",
         state.total_wall_seconds,
@@ -26663,18 +27130,10 @@ fn print_run_summary(state: &deadreckon_core::PipelineState) {
     println!("run {} ({})", run_prefix(&state.run_id), state.run_id);
     let status = run_status_label(state.status);
     let spend_summary = deadreckon_core::state::spend_summary(state).ok();
-    let total_spend = spend_summary
+    let spend = spend_summary
         .as_ref()
-        .map(|summary| summary.total_usd)
-        .unwrap_or(state.total_spend_usd);
-    let approximate_spend = spend_summary
-        .as_ref()
-        .is_some_and(|summary| summary.any_subscription_turn || summary.any_estimated_turn);
-    let spend = format!(
-        "{}${:.6}",
-        if approximate_spend { "~" } else { "" },
-        total_spend
-    );
+        .map(|summary| spend_summary_label(state, summary, false))
+        .unwrap_or_else(|| format!("${:.6}", state.total_spend_usd));
     let mut items = vec![
         ("status".to_string(), status.to_string()),
         ("goal".to_string(), state.goal.clone()),
@@ -30958,6 +31417,12 @@ fn render_spend(
 }
 
 fn spend_meter_label(state: &deadreckon_core::PipelineState, cap: f64, spend_ratio: f64) -> String {
+    if !provider_is_metered(state) && state.total_spend_usd == 0.0 {
+        return format!(
+            "not metered (subscription)  wall {:.0}s",
+            state.total_wall_seconds.max(0.0)
+        );
+    }
     let base = format!("${:.6} / ${:.6}", state.total_spend_usd, cap);
     if spend_ratio >= 0.6 {
         format!("{base}  ({:.0}% of budget)", spend_ratio * 100.0)

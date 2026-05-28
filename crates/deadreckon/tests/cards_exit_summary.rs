@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use deadreckon::cards::exit_summary::{
     BranchDiffSummary, ExitSummaryInput, OutcomeKind, build_exit_summary_card,
 };
-use deadreckon::ui_card::{CardOptions, render_card};
+use deadreckon::ui_card::{CardOptions, Tone, render_card};
 
 fn input(outcome: OutcomeKind) -> ExitSummaryInput {
     ExitSummaryInput {
@@ -19,6 +19,7 @@ fn input(outcome: OutcomeKind) -> ExitSummaryInput {
         output_tokens: 50,
         spend_usd: 0.0,
         approximate_spend: true,
+        spend_label: "not metered (subscription) · wall 12.5s · 3 turns".to_string(),
         wall_seconds: 12.5,
         diff: Some(BranchDiffSummary {
             lines_added: 42,
@@ -28,6 +29,9 @@ fn input(outcome: OutcomeKind) -> ExitSummaryInput {
             files_deleted: 0,
         }),
         gate: "passed by dr-gate (2 checks)".to_string(),
+        gate_tone: Tone::Neutral,
+        tests_modified: Some(false),
+        gate_caveats: Vec::new(),
         working_dir: PathBuf::from("/tmp/work"),
         proof_path: PathBuf::from("/tmp/run/proofs/turn-acceptance.json"),
         hints: vec![
@@ -54,7 +58,10 @@ fn exit_summary_completed_run_includes_attach_show_apply_hints() {
         },
     );
     assert!(rendered.contains("* completed run"), "{rendered}");
-    assert!(rendered.contains("~$0.000000"), "{rendered}");
+    assert!(
+        rendered.contains("not metered (subscription)"),
+        "{rendered}"
+    );
     assert!(
         rendered.contains("deadreckon attach abc12345"),
         "{rendered}"
@@ -127,7 +134,7 @@ fn exit_summary_killed_run_uses_stopped_glyph_and_reason() {
 }
 
 #[test]
-fn exit_summary_subscription_turn_marks_spend_with_tilde() {
+fn subscription_only_run_renders_not_metered() {
     let rendered = render_card(
         &build_exit_summary_card(&input(OutcomeKind::Completed)),
         &CardOptions {
@@ -137,7 +144,34 @@ fn exit_summary_subscription_turn_marks_spend_with_tilde() {
             no_color_env: false,
         },
     );
-    assert!(rendered.contains("~$0.000000"), "{rendered}");
+    assert!(
+        rendered.contains("not metered (subscription) · wall 12.5s · 3 turns"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("~$0.000000"), "{rendered}");
+}
+
+#[test]
+fn mixed_route_run_renders_metered_total_plus_subscription_note() {
+    let mut input = input(OutcomeKind::Completed);
+    input.spend_usd = 0.25;
+    input.approximate_spend = false;
+    input.spend_label = "$0.250000 + subscription turns · wall 18.0s · 4 turns".to_string();
+
+    let rendered = render_card(
+        &build_exit_summary_card(&input),
+        &CardOptions {
+            color: false,
+            plain: true,
+            terminal_columns: Some(96),
+            no_color_env: false,
+        },
+    );
+
+    assert!(
+        rendered.contains("$0.250000 + subscription turns"),
+        "{rendered}"
+    );
 }
 
 #[test]

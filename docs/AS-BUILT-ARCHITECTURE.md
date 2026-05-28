@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **production-release** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-28 (production-release posture, consolidated plan-result docs, guided first use, local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
+**Last updated:** 2026-05-28 (tamper-evident gate, production-release posture, consolidated plan-result docs, guided first use, local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
 **Maturity:** production-release posture. Workspace version `0.1.0` pending release tagging. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -45,6 +45,7 @@ This document captures the system as built today — what's wired, what's load-b
 32. [Plan Observability](#32-plan-observability)
 33. [Provider Flight Recorder & Rewind](#33-provider-flight-recorder--rewind)
 34. [Local Self-Improvement Loop](#34-local-self-improvement-loop)
+35. [Tamper-Evident Gate](#35-tamper-evident-gate)
 
 ---
 
@@ -1056,14 +1057,14 @@ pub struct AcceptanceMarker {
     pub produced_by: String,      // must be "dr-gate"
     pub checked_at: DateTime<Utc>,
     pub working_dir: PathBuf,
-    pub signature: String,        // hash over fields + nonce + checks
+    pub signature: String,        // hash over fields + nonce + checks + tamper file bytes
     pub check_count: usize,
     #[serde(default)]
     pub checks: Vec<AcceptanceCheckResult>,  // per-check evidence, also covered by the signature
 }
 ```
 
-Marker location: `<run_root>/proofs/turn-acceptance.json`.
+Marker location: `<run_root>/proofs/turn-acceptance.json`. The marker remains schema 1; tamper evidence is an external proof file, not a marker field.
 
 ### 13.3 `dr-gate` binary
 
@@ -1071,10 +1072,12 @@ Marker location: `<run_root>/proofs/turn-acceptance.json`.
 
 1. Reads `--run <id>` and `--working-dir <path>`.
 2. Loads `acceptance.yaml` (if present) from the run root.
-3. Runs each check (cargo test, file-exists, content-match, build-success).
-4. If all required checks pass, writes a signed `AcceptanceMarker` to `proofs/turn-acceptance.json`.
+3. Runs each check (cargo test, file-exists, content-match, build-success, shell).
+4. Evaluates `tamper.rs` against the compiled checks, provenance, and the first snapshot diff, then writes `proofs/acceptance-tamper.json` for clean, caveat, and refuse verdicts.
+5. If the tamper verdict is `refuse`, prints the refusal reasons and exits nonzero without writing a marker.
+6. If all required checks pass and the tamper verdict is `clean` or `caveat`, writes a signed `AcceptanceMarker` to `proofs/turn-acceptance.json`.
 
-The marker's `signature` is computed from `gate/nonce` (a UUID written at run-init time by the deadreckon binary at `state.rs:188`). Only `dr-gate` reads the nonce; the agent never has access.
+The marker's `signature` is computed from `gate/nonce` (a UUID written at run-init time by the deadreckon binary at `state.rs:188`), marker fields, check results, and the raw bytes of `proofs/acceptance-tamper.json` (empty bytes if absent for backward tolerance). Only `dr-gate` reads the nonce; the agent never has access. Editing the tamper proof after signing invalidates marker validation.
 
 ### 13.4 Validation
 
@@ -1118,6 +1121,10 @@ pub struct AcceptanceProgressEntry {
 
 The progress file is truncated at the start of each evaluation so resumed/extended runs do not mix with prior attempts. The attach TUI tails this file (§18) so operators can see acceptance advance from "running 2/5" → "passed 2/5" while `dr-gate` works. The signed `AcceptanceMarker` is still the load-bearing artifact; progress is observational telemetry only.
 
+### 13.7 Tamper evidence
+
+The gate is tamper-evident, not tamper-proof. `crates/deadreckon-core/src/tamper.rs` builds a touched-file set from `provenance.jsonl` plus the earliest `snapshots/turn-*` inventory, maps compiled checks to covered paths, lints shell/cargo command strings for suppression patterns, and classifies the run as `clean`, `caveat`, or `refuse`. The durable proof is `proofs/acceptance-tamper.json`; it is signed indirectly because the marker signature hashes the proof bytes. See §35 for the full policy and limits.
+
 ### 13.6 Where the gate is invoked
 
 When the turn loop emits `Action::Done` — either through a CLI sub-agent finishing or a JSON-action provider returning `Done` — it routes through `acceptance_gate_passed_or_record_failure` (`crates/deadreckon-runtime/src/turn_loop.rs:1442`). Both call sites (`turn_loop.rs:405` for CLI sub-agent Done, `turn_loop.rs:672` for JSON Done) use this helper.
@@ -1133,7 +1140,7 @@ The agent sees the failure inside the next turn doc and can revise the working t
 
 ## 14. Telemetry: Spend, Traces, Provenance, Events
 
-Five append-only JSONL files capture every run's history. Four (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) live under `<run_root>/` directly; the fifth (`proofs/acceptance-progress.jsonl`, see §13.5) is gate-scoped and truncated per evaluation. All are written via `append_json_line` (`state.rs:375-388`), which opens in append mode and `sync_all`s after each line.
+Five append-only JSONL files capture every run's history. Four (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) live under `<run_root>/` directly; the fifth (`proofs/acceptance-progress.jsonl`, see §13.5) is gate-scoped and truncated per evaluation. The gate also writes `proofs/acceptance-tamper.json`, a single proof object bound into the signed marker (§35.5). JSONL files are written via `append_json_line` (`state.rs:375-388`), which opens in append mode and `sync_all`s after each line.
 
 ### 14.1 `spend.jsonl`
 
@@ -1154,7 +1161,7 @@ Schema:
 }
 ```
 
-One line per LLM call. HTTP providers fill in token counts and USD; CLI providers fill in `subscription: true` + `wall_time_seconds`.
+One line per LLM call. HTTP providers fill in token counts and USD; CLI providers fill in `subscription: true` + `wall_time_seconds`. User-facing spend render is honest by route: subscription-only runs show `not metered (subscription) · wall <s>s · <n> turns` instead of a fake `~$0.000000`, while mixed routes show the metered total plus a `+ subscription turns` note.
 
 ### 14.2 `traces.jsonl`
 
@@ -1566,7 +1573,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Turn loop with action parsing (Bash / WriteFile / Done) and CLI sub-agent path.
 - Overnight UX: `run --prevent-sleep <auto|on|off>` previews sleep posture and arms macOS `caffeinate` or Linux `systemd-inhibit` around the run loop, with run-local `working/.deadreckon/sleep-prevention.json`; run previews, run exit summaries, and completed attach footers use the shared `ui_card` renderer with `--plain` and `NO_COLOR` support, while read-only inspection commands stay in quieter table/report layouts.
 - Unattended git hardening: production git invocations route through `deadreckon-core::git`, export `GIT_TERMINAL_PROMPT=0`, and disable commit/tag GPG signing for commit-family verbs so global signing cannot hang on pinentry.
-- Honest spend summaries: `spend.jsonl` replay marks totals with `~` when any turn is subscription-priced or estimated while preserving the numeric total.
+- Honest spend summaries: `spend.jsonl` replay renders subscription-only CLI routes as not metered with wall time and turns, and renders mixed routes as metered total plus `+ subscription turns` rather than pretending a subscription turn cost `$0.000000`.
 - Distribution and self-update: install receipts and update-check caches live under `~/.deadreckon/`; `deadreckon update --check` and `deadreckon update` honor npm, Homebrew, shell, cargo, and source channels; shell installs preview the target/archive/checksum/backup path, require confirmation or `--yes`, keep the latest three backups, and print a post-update `deadreckon doctor` hint.
 - Release packaging: `cargo-dist` configuration covers five OS/architecture targets, shell and PowerShell installers, Linux glibc 2.28 metadata, guarded macOS signing/notarization, a no-network npm wrapper with five platform packages, and Homebrew tap publishing through `gdc/homebrew-tap`.
 - Codebase-default running: worktree mode, copy mode, in-place mode, fresh-mode preservation, preflight + preview UX, and `codebase.json` files-not-fields metadata.
@@ -1575,7 +1582,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - UX consolidation: project-scoped `list`, `latest` run aliases, `status`/`next`, `cleanup`/`prune`, `export`/`discard` aliases, and TTY-aware formatted output.
 - Self-documenting run artifacts in stoa shape: `RUN-NARRATIVE.md`, `RUN-AS-BUILT.md`, `RUN-DECISIONS.md`, optional `AS-BUILT-DELTA.md`, per-turn `_incremental.jsonl`, explicit `docs_checkpoint` run events, and `polish.json` schema v2.
 - `deadreckon doc`, `list` DOCS status, doc-aware `apply` commit bodies, extend-parent narrative updates, diff coverage retry, the legacy repo/user/project `run-narrator` skill mechanism, and default split polish skills (`narrator-overview`, `narrator-phases`, `narrator-as-built`, `narrator-decisions`).
-- Acceptance gate with signed marker; anti-self-attestation actually enforced.
+- Acceptance gate with signed marker; anti-self-attestation and tamper-evident hollow-pass detection are enforced without adding `PipelineState`, `Plan`, marker, or check-result fields.
 - `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `rewind`, `show`, `import`, `cleanup`/`prune`, `completion`, `learn`, and `improve` verbs.
 - Shell tab-completion via `completion install` / `completion {bash,zsh,fish,elvish,powershell}` driven from the live clap command tree; `init` opt-out installs completions and (for zsh) appends a managed `.zshrc` block.
 - `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer. Run, plan, and chain attach now share an explicit responsiveness contract: render paths are provider-free and write-free, JSONL streams are tailed or cached, provider narrative refreshes run in cancellable/coalesced background jobs, stale narrative snapshots survive redraw, and long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
@@ -1588,7 +1595,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Cross-process cancellation: `kill` writes a durable cancel marker before signaling; the run loop observes it while provider calls are in flight and reports killed status through events.
 - Partial-trace resume: resume reconstructs only completed tool boundaries and `resume --from-turn` truncates traces, spend records, and future snapshots together.
 - Durable per-run `sandbox.toml` plus per-tool sandbox policy: bash/write-file paths get specific filesystem and network permissions; refusals include `try:` and are recorded in traces and provenance.
-- YAML done-criteria files (`acceptance.yaml`): `dr-gate` evaluates required/optional tests, file existence, content matches, shell commands, and build checks, then signs check-level proof results.
+- YAML done-criteria files (`acceptance.yaml`): `dr-gate` evaluates required/optional tests, file existence, content matches, shell commands, and build checks, writes `acceptance-tamper.json`, refuses suppression-pattern/spec edits, caveats check-covered test/target edits, then signs check-level proof results and the tamper proof bytes.
 - Exhaustive local doctor: OS, sandbox binaries, provider binaries, config, runstate permissions, disk, and opt-in provider pings all produce actionable `try:` hints.
 - Promoted library query surface: `deadreckon library list|search|show` reads library manifests and reverse materialization markers, filters by goal/date, and searches promoted run docs.
 - Import parity hardening: descriptor-backed CLI imports and Cursor SQLite imports preserve source metadata, deterministic session run IDs, stable row ordering, manifests, content hashes, and provenance paths; committed goldens and fixtures cover normalized `show` output plus provider-specific discovery.
@@ -2210,4 +2217,64 @@ Learning is local-first. No cloud sync, background telemetry, raw provider logs,
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, and 32 in particular. Updated 2026-05-28 for release posture and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~31k lines) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+## 35. Tamper-Evident Gate
+
+### 35.1 The hollow-pass attack
+
+The original gate signature proved that `dr-gate` wrote a marker for the check results it observed. It did not prove the checks were still meaningful. A run could delete a failing Rust test before default `cargo test`, edit the done-criteria file, or turn a shell check into `pytest || true`; the resulting checks would honestly pass and the marker signature would remain valid. The tamper-evident gate closes that release-blocking gap by refusing unambiguous contract subversion and surfacing ambiguous check-covered edits as caveats.
+
+### 35.2 Touched-file set
+
+`tamper::touched_files(run_root, working_dir)` uses two inputs. Modified and created files come from the union of `ProvenanceRecord.files` in `provenance.jsonl`, normalized relative to the run working directory. Deleted files come from the earliest `snapshots/turn-*` inventory diffed against the final working tree, because provenance rows do not reliably record deletions. The `.deadreckon/` subtree is ignored so run-owned docs and helper state do not count as tampering.
+
+### 35.3 Check coverage and classification
+
+`tamper::check_coverage` maps compiled `AcceptanceCheck` values to working-tree-relative paths:
+
+- `file_exists` and `content_match` cover their rendered target path with `target` classification.
+- `build_success` covers its rendered cwd as `build`, which is recorded but does not trigger a caveat by itself.
+- `cargo_test` covers Rust test files under `tests/`, `*_test.rs`, and `.rs` files containing `#[test]` or `#[cfg(test)]`; first-snapshot test files are included so deleted tests are still covered.
+- `shell` checks are linted for suppression patterns and best-effort scanned for existing working-tree path tokens; matching Rust test files classify as `test`, other paths as `unknown`.
+
+### 35.4 Verdict policy
+
+The verdict is intentionally heuristic:
+
+- `refuse`: the run modified `acceptance.yaml`, a compiled check contains a suppression pattern such as `|| true`, `--no-verify`, or `--exit-zero`, or a covered test/target file was deleted. Refusal writes no marker and reuses the existing non-terminal gate-failure loop.
+- `caveat`: a covered test or literal check target was modified or created. The marker is signed, but the caveat is visible in status and exit summaries.
+- `clean`: no spec edits, no suppression lint findings, and no caveat-worthy covered-file touches. Production code edits exercised by tests stay clean; editing production code is the point of a run.
+
+### 35.5 `acceptance-tamper.json` and signature binding
+
+The proof file lives at `<run-root>/proofs/acceptance-tamper.json`:
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "...",
+  "verdict": "clean",
+  "spec_modified": false,
+  "lint_findings": [],
+  "covered_files_touched": [],
+  "caveats": [],
+  "refusal_reasons": []
+}
+```
+
+The `AcceptanceMarker` schema stays at version 1 and receives no new fields. `gate.rs::marker_signature` hashes the tamper file bytes alongside the nonce, marker fields, and check results. Missing tamper files hash as empty bytes for backward tolerance. A forged or edited tamper file invalidates marker validation, so an agent cannot erase a caveat after signing.
+
+### 35.6 Surfacing
+
+`status`, exit cards, `show --why-failed`, and attach activity derive a per-check gate line from marker/progress rows, for example `gate: PASSED 4/4` or `gate: FAILED 0/1 - cargo_test x auth::tests::expired_token`. Tamper proof data adds `tests modified this run: yes/no` and caveat text such as `accepted (caveat: agent modified test file tests/auth_test.rs this run)`. Exit cards render caveat gates with `Warn` tone.
+
+### 35.7 Honest subscription spend
+
+The same result surfaces no longer render subscription-only CLI routes as `~$0.000000`. Subscription-only spend reads `not metered (subscription) · wall <s>s · <n> turns`. Mixed routes show the metered total and append `+ subscription turns`.
+
+### 35.8 Limits
+
+This is tamper-evidence, not a causal soundness proof. It does not prove that a covered-file edit caused a pass, does not understand every language's test conventions, and does not sandbox the checks' own writes. Those larger designs are tracked in `docs/V1-CANDIDATES.md`.
+
+---
+
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, and 32 in particular. Updated 2026-05-28 for tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~31k lines) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

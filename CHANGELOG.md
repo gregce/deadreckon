@@ -1,5 +1,11 @@
 # Changelog
 
+## Tamper-Evident Gate (production release) - 2026-05-28
+
+- Refuse to sign when a run edits `acceptance.yaml` or a compiled check carries a suppression pattern; downgrade to a surfaced caveat when a run modifies a check-covered test/target file; bind the tamper record into the marker signature.
+- Surface per-check verdicts and a tests-modified flag on the exit card, status, and `--why-failed`.
+- Render honest subscription spend with `not metered (subscription)` for subscription-only routes and a subscription note for mixed routes.
+
 ## Production release posture - 2026-05-28
 
 - Replaced current product docs and generated run-doc front matter that still labeled DeadReckon as alpha with production-release posture language.

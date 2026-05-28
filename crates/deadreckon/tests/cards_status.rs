@@ -125,7 +125,7 @@ fn list_full_keeps_old_layout_for_scripts() {
 }
 
 #[test]
-fn status_report_marks_subscription_spend_with_tilde() {
+fn status_report_marks_subscription_spend_not_metered() {
     let temp = repo_tempdir();
     let (paths, state) = state(&temp, "subscription spend");
     append_spend(
@@ -156,7 +156,62 @@ fn status_report_marks_subscription_spend_with_tilde() {
 
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("~$0.000000"), "{out}");
+    assert!(out.contains("not metered (subscription)"), "{out}");
+    assert!(!out.contains("~$0.000000"), "{out}");
+}
+
+#[test]
+fn status_report_marks_mixed_route_spend_with_subscription_note() {
+    let temp = repo_tempdir();
+    let (paths, state) = state(&temp, "mixed spend");
+    append_spend(
+        &state,
+        &SpendRecord {
+            timestamp: Utc::now(),
+            turn: 1,
+            provider: "cli".to_string(),
+            model: "subscription".to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_usd: 0.0,
+            total_cost_usd: 0.0,
+            cap_usd: Some(10.0),
+            subscription: true,
+            estimated: false,
+            wall_time_seconds: Some(1.0),
+            wall_time_cap_seconds: None,
+        },
+    )
+    .expect("spend");
+    append_spend(
+        &state,
+        &SpendRecord {
+            timestamp: Utc::now(),
+            turn: 2,
+            provider: "http".to_string(),
+            model: "metered".to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_usd: 0.25,
+            total_cost_usd: 0.25,
+            cap_usd: Some(10.0),
+            subscription: false,
+            estimated: false,
+            wall_time_seconds: Some(2.0),
+            wall_time_cap_seconds: None,
+        },
+    )
+    .expect("spend");
+
+    let output = deadreckon(&paths)
+        .current_dir(&state.cwd)
+        .args(["status", &state.run_id, "--global", "--plain"])
+        .output()
+        .expect("status");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("$0.250000 + subscription turns"), "{out}");
 }
 
 #[test]

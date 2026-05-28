@@ -10,6 +10,7 @@ use serde_yaml::Value as YamlValue;
 
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::state::{PipelineState, append_json_line};
+use crate::tamper::AcceptanceTamperVerdict;
 
 pub const ACCEPTANCE_MARKER: &str = "turn-acceptance.json";
 pub const ACCEPTANCE_PROGRESS_JSONL: &str = "acceptance-progress.jsonl";
@@ -206,6 +207,38 @@ pub fn write_acceptance_marker_with_results(
     Ok(marker)
 }
 
+pub fn run_acceptance_gate_and_write_marker(
+    run_root: &Path,
+    run_id: &str,
+    working_dir: &Path,
+) -> Result<AcceptanceMarker> {
+    let results = evaluate_acceptance_checks_with_progress(run_root, working_dir)?;
+    let checks = compiled_acceptance_checks(run_root, working_dir)?;
+    let tamper = crate::tamper::evaluate(run_id, run_root, working_dir, &checks)?;
+    crate::tamper::write_acceptance_tamper(run_root, &tamper)?;
+    if tamper.verdict == AcceptanceTamperVerdict::Refuse {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "acceptance refused: {}",
+            tamper.refusal_reasons.join("; ")
+        )));
+    }
+    if let Some(failed) = results
+        .iter()
+        .find(|result| result.must_pass && !result.passed)
+    {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "acceptance check failed: {}",
+            failed.detail
+        )));
+    }
+    write_acceptance_marker_with_results(
+        run_root,
+        run_id.to_string(),
+        working_dir.to_path_buf(),
+        results,
+    )
+}
+
 pub fn evaluate_acceptance(
     run_root: &Path,
     working_dir: &Path,
@@ -246,6 +279,31 @@ pub fn evaluate_acceptance_checks_with_progress(
         }
     }
     evaluate_acceptance_checks_inner(run_root, working_dir, Some(&progress_path))
+}
+
+pub fn compiled_acceptance_checks(
+    run_root: &Path,
+    working_dir: &Path,
+) -> Result<Vec<AcceptanceCheck>> {
+    let spec_path = acceptance_spec_path_for_run_root(run_root);
+    if spec_path.exists() {
+        let raw = std::fs::read_to_string(&spec_path).with_path(&spec_path)?;
+        return parse_acceptance_checks(&raw);
+    }
+    if working_dir.join("Cargo.toml").exists() {
+        return Ok(vec![AcceptanceCheck::CargoTest {
+            args: Vec::new(),
+            must_pass: true,
+        }]);
+    }
+    Ok(vec![AcceptanceCheck::FileExists {
+        path: "{working_dir}".to_string(),
+        must_pass: true,
+    }])
+}
+
+pub fn acceptance_checks_from_yaml(raw: &str) -> Result<Vec<AcceptanceCheck>> {
+    parse_acceptance_checks(raw)
 }
 
 fn evaluate_acceptance_checks_inner(
@@ -716,6 +774,17 @@ fn marker_signature(run_root: &Path, marker: &AcceptanceMarker) -> Result<String
     for check in &marker.checks {
         check.hash(&mut hasher);
     }
+    let tamper_path = crate::tamper::acceptance_tamper_path_for_run_root(run_root);
+    match std::fs::read(&tamper_path) {
+        Ok(bytes) => bytes.hash(&mut hasher),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => "".hash(&mut hasher),
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: tamper_path,
+                source,
+            });
+        }
+    }
     Ok(format!("{:016x}", hasher.finish()))
 }
 
@@ -728,8 +797,10 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
 
+    use crate::artifacts::{ProvenanceRecord, append_provenance, snapshot_working};
     use crate::paths::DeadreckonPaths;
     use crate::state::{RunOptions, create_run};
+    use crate::tamper::{AcceptanceTamperVerdict, read_acceptance_tamper_for_run_root};
 
     use super::{
         ACCEPTANCE_MARKER, AcceptanceCheckResult, AcceptanceMarker, validate_acceptance_marker,
@@ -1107,6 +1178,207 @@ checks:
     }
 
     #[test]
+    fn gate_refuse_writes_tamper_file_and_no_marker() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "gate refuse tamper".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "checks:\n  - kind: shell\n    command: \"cargo test || true\"\n",
+        )
+        .expect("spec");
+
+        let err = super::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect_err("refuse");
+        let tamper = read_acceptance_tamper_for_run_root(&state.run_root)
+            .expect("tamper")
+            .expect("tamper record");
+
+        assert!(err.to_string().contains("acceptance refused"));
+        assert_eq!(tamper.verdict, AcceptanceTamperVerdict::Refuse);
+        assert!(
+            !super::marker_path(&state).exists(),
+            "refused gate must not write marker"
+        );
+    }
+
+    #[test]
+    fn gate_caveat_writes_signed_marker_and_caveat_record() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "gate caveat tamper".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(state.working_dir.join("README.md"), "before\n").expect("readme");
+        snapshot_working(&state, 0).expect("snapshot");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "checks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("spec");
+        std::fs::write(state.working_dir.join("README.md"), "after\n").expect("edit readme");
+        append_provenance(
+            &state,
+            &ProvenanceRecord {
+                timestamp: Utc::now(),
+                prompt_id: "p1".to_string(),
+                model: "fixture".to_string(),
+                tool_call_id: "tool".to_string(),
+                session_id: "session".to_string(),
+                files: vec![state.working_dir.join("README.md")],
+            },
+        )
+        .expect("provenance");
+
+        super::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect("caveat signs");
+        let tamper = read_acceptance_tamper_for_run_root(&state.run_root)
+            .expect("tamper")
+            .expect("tamper record");
+
+        assert_eq!(tamper.verdict, AcceptanceTamperVerdict::Caveat);
+        assert!(
+            tamper
+                .caveats
+                .iter()
+                .any(|caveat| caveat.contains("README.md")),
+            "{tamper:?}"
+        );
+        validate_acceptance_marker(&state).expect("signed caveat validates");
+    }
+
+    #[test]
+    fn forged_tamper_file_fails_marker_signature_validation() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "forged tamper".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(state.working_dir.join("README.md"), "before\n").expect("readme");
+        snapshot_working(&state, 0).expect("snapshot");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "checks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("spec");
+        std::fs::write(state.working_dir.join("README.md"), "after\n").expect("edit readme");
+        append_provenance(
+            &state,
+            &ProvenanceRecord {
+                timestamp: Utc::now(),
+                prompt_id: "p1".to_string(),
+                model: "fixture".to_string(),
+                tool_call_id: "tool".to_string(),
+                session_id: "session".to_string(),
+                files: vec![state.working_dir.join("README.md")],
+            },
+        )
+        .expect("provenance");
+        super::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect("caveat signs");
+        let tamper_path = crate::tamper::acceptance_tamper_path_for_run_root(&state.run_root);
+        std::fs::write(
+            tamper_path,
+            r#"{"schema_version":1,"run_id":"forged","verdict":"clean"}"#,
+        )
+        .expect("forge");
+
+        let err = validate_acceptance_marker(&state).expect_err("tamper rejected");
+
+        assert!(err.to_string().contains("signature"));
+    }
+
+    #[test]
+    fn clean_run_signs_and_validates_unchanged() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "clean gate".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(state.working_dir.join("README.md"), "ok\n").expect("readme");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "checks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("spec");
+
+        super::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect("clean signs");
+        let tamper = read_acceptance_tamper_for_run_root(&state.run_root)
+            .expect("tamper")
+            .expect("tamper record");
+
+        assert_eq!(tamper.verdict, AcceptanceTamperVerdict::Clean);
+        validate_acceptance_marker(&state).expect("clean marker validates");
+    }
+
+    #[test]
     fn self_attest_attempt_fails() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1145,5 +1417,150 @@ checks:
         .expect("write marker");
         let err = validate_acceptance_marker(&state).expect_err("reject forged");
         assert!(err.to_string().contains("signature"));
+    }
+
+    #[test]
+    fn deleting_a_covered_test_file_must_not_yield_a_signed_marker() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "deleted test hollow pass".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::create_dir_all(state.working_dir.join("src")).expect("src");
+        std::fs::create_dir_all(state.working_dir.join("tests")).expect("tests");
+        std::fs::write(
+            state.working_dir.join("Cargo.toml"),
+            "[package]\nname = \"gate_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+        )
+        .expect("cargo");
+        std::fs::write(
+            state.working_dir.join("src/lib.rs"),
+            "pub fn ok() -> bool { true }\n",
+        )
+        .expect("lib");
+        std::fs::write(
+            state.working_dir.join("tests/auth_test.rs"),
+            "#[test]\nfn expired_token_is_rejected() { assert!(!gate_fixture::ok()); }\n",
+        )
+        .expect("test");
+        snapshot_working(&state, 0).expect("snapshot");
+
+        std::fs::remove_file(state.working_dir.join("tests/auth_test.rs")).expect("delete test");
+
+        let err = super::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect_err("deleted covered test refused");
+
+        assert!(err.to_string().contains("acceptance refused"), "{err}");
+        assert!(
+            !super::marker_path(&state).exists(),
+            "deleted covered test must not produce a signed marker"
+        );
+    }
+
+    #[test]
+    fn editing_acceptance_yaml_during_run_must_not_yield_a_signed_marker() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "edited acceptance hollow pass".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(state.working_dir.join("README.md"), "ok\n").expect("readme");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "name: edited\nchecks:\n  - kind: shell\n    command: \"true\"\n    cwd: \"{working_dir}\"\n",
+        )
+        .expect("acceptance");
+        append_provenance(
+            &state,
+            &ProvenanceRecord {
+                timestamp: Utc::now(),
+                prompt_id: "p1".to_string(),
+                model: "fixture".to_string(),
+                tool_call_id: "tool".to_string(),
+                session_id: "session".to_string(),
+                files: vec![state.run_root.join("acceptance.yaml")],
+            },
+        )
+        .expect("provenance");
+
+        let err = super::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect_err("edited acceptance refused");
+
+        assert!(err.to_string().contains("acceptance refused"), "{err}");
+        assert!(
+            !super::marker_path(&state).exists(),
+            "edited acceptance.yaml must not produce a signed marker"
+        );
+    }
+
+    #[test]
+    fn suppression_pattern_in_shell_check_must_not_yield_a_signed_marker() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "suppressed shell hollow pass".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "name: suppressed\nchecks:\n  - kind: shell\n    command: \"cargo test || true\"\n    cwd: \"{working_dir}\"\n",
+        )
+        .expect("acceptance");
+
+        let err = super::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect_err("suppression refused");
+
+        assert!(err.to_string().contains("acceptance refused"), "{err}");
+        assert!(
+            !super::marker_path(&state).exists(),
+            "suppression-pattern check must not produce a signed marker"
+        );
     }
 }

@@ -31,9 +31,13 @@ pub struct ExitSummaryInput {
     pub output_tokens: u64,
     pub spend_usd: f64,
     pub approximate_spend: bool,
+    pub spend_label: String,
     pub wall_seconds: f64,
     pub diff: Option<BranchDiffSummary>,
     pub gate: String,
+    pub gate_tone: Tone,
+    pub tests_modified: Option<bool>,
+    pub gate_caveats: Vec<String>,
     pub working_dir: PathBuf,
     pub proof_path: PathBuf,
     pub hints: Vec<(String, String)>,
@@ -69,20 +73,10 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
         },
         Section::Metric {
             label: "spend".to_string(),
-            columns: vec![
-                MetricColumn {
-                    value: format!(
-                        "{}${:.6}",
-                        if input.approximate_spend { "~" } else { "" },
-                        input.spend_usd
-                    ),
-                    tone: Tone::Neutral,
-                },
-                MetricColumn {
-                    value: format!("wall {:.1}s", input.wall_seconds),
-                    tone: Tone::Neutral,
-                },
-            ],
+            columns: vec![MetricColumn {
+                value: input.spend_label.clone(),
+                tone: Tone::Neutral,
+            }],
         },
     ];
     if let Some(diff) = input.diff.as_ref() {
@@ -124,16 +118,34 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
             ],
         });
     }
-    sections.push(Section::KeyValue {
-        rows: vec![
-            ("gate".to_string(), input.gate.clone()),
-            (
-                "working".to_string(),
-                input.working_dir.display().to_string(),
-            ),
-            ("proof".to_string(), input.proof_path.display().to_string()),
-        ],
+    sections.push(Section::Metric {
+        label: "gate".to_string(),
+        columns: vec![MetricColumn {
+            value: input.gate.clone(),
+            tone: input.gate_tone,
+        }],
     });
+    let mut rows = Vec::new();
+    if let Some(tests_modified) = input.tests_modified {
+        rows.push((
+            "tests modified this run".to_string(),
+            if tests_modified { "yes" } else { "no" }.to_string(),
+        ));
+    }
+    rows.extend(
+        input
+            .gate_caveats
+            .iter()
+            .map(|caveat| ("caveat".to_string(), caveat.clone())),
+    );
+    rows.extend([
+        (
+            "working".to_string(),
+            input.working_dir.display().to_string(),
+        ),
+        ("proof".to_string(), input.proof_path.display().to_string()),
+    ]);
+    sections.push(Section::KeyValue { rows });
 
     Card {
         title: TitleLine {

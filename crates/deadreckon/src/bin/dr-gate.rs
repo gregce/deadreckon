@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use deadreckon_core::gate::{
-    evaluate_acceptance_checks_with_progress, write_acceptance_marker_with_results,
+    compiled_acceptance_checks, evaluate_acceptance_checks_with_progress,
+    write_acceptance_marker_with_results,
 };
+use deadreckon_core::tamper::{self, AcceptanceTamperVerdict};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut run_id = None;
@@ -24,6 +26,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => infer_run_root(&working_dir)?,
     };
     let results = evaluate_acceptance_checks_with_progress(&run_root, &working_dir)?;
+    let checks = compiled_acceptance_checks(&run_root, &working_dir)?;
+    let tamper = tamper::evaluate(&run_id, &run_root, &working_dir, &checks)?;
+    tamper::write_acceptance_tamper(&run_root, &tamper)?;
+    if tamper.verdict == AcceptanceTamperVerdict::Refuse {
+        eprintln!("acceptance refused");
+        for reason in &tamper.refusal_reasons {
+            eprintln!("refuse: {reason}");
+        }
+        return Err(format!("acceptance refused: {}", tamper.refusal_reasons.join("; ")).into());
+    }
     if let Some(failed) = results
         .iter()
         .find(|result| result.must_pass && !result.passed)

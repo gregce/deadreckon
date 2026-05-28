@@ -138,6 +138,8 @@ pub struct SpendSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub wall_seconds: f64,
+    pub turns: usize,
+    pub subscription_turns: usize,
     pub any_subscription_turn: bool,
     pub any_estimated_turn: bool,
 }
@@ -307,6 +309,10 @@ pub fn spend_summary(state: &PipelineState) -> Result<SpendSummary> {
         summary.input_tokens = summary.input_tokens.saturating_add(record.input_tokens);
         summary.output_tokens = summary.output_tokens.saturating_add(record.output_tokens);
         summary.wall_seconds += record.wall_time_seconds.unwrap_or(0.0);
+        summary.turns = summary.turns.saturating_add(1);
+        if record.subscription {
+            summary.subscription_turns = summary.subscription_turns.saturating_add(1);
+        }
         summary.any_subscription_turn |= record.subscription;
         summary.any_estimated_turn |= record.estimated;
     }
