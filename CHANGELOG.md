@@ -11,6 +11,7 @@
 - P7 (`0bef0f4`): Added opt-in `[notify]` parsing, bounded native/command/webhook channels, redacted notification context, and `notify.jsonl` attempt records.
 - P8 (`823945b`): Fired enabled notifications on accepted, paused-at-cap, and failed lifecycle outcomes while disabled configs stay silent.
 - P9 (`10dd47b`): Added bounded provider-backed goal-shape recommendations for `start`, preview-scoped classifier records, optional campaign `--n`, and editable campaign preflight controls.
+- P10 (`7425883`): Unified the verified-run glossary, changed completed exit cards to the `VERIFIED` verdict, expanded refusal `try:` footer coverage, and added command-notification failure recovery hints.
 
 ## Campaign Orchestration (production release) - 2026-05-28
 
