@@ -32,6 +32,9 @@ use crossterm::terminal::{
 use deadreckon::cards::exit_summary::{
     BranchDiffSummary, ExitSummaryInput, OutcomeKind, build_exit_summary_card,
 };
+use deadreckon::notify::{
+    NotifyContext, NotifyTransition, channels_for_config, load_notify_config, notify_run,
+};
 use deadreckon::proof_block::ProofBlock;
 use deadreckon::sleep::{self, SleepPrefs, SleepPrevention};
 use deadreckon::ui_card::{
@@ -8942,6 +8945,7 @@ async fn run_command(args: RunCommandArgs) -> Result<()> {
     if !quiet {
         print_exit_summary_card(&state, &outcome, plain);
     }
+    fire_lifecycle_notification(&paths, &state, &outcome).await;
     if completed && completion_hints_enabled(effective_no_hints) {
         complete_run_actions(&state, !auto_confirm).await?;
     }
@@ -21611,6 +21615,7 @@ async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     if completed {
         append_parent_narrative_update(&parent, &state)?;
     }
+    fire_lifecycle_notification(&paths, &state, &outcome).await;
     if completed && post_actions {
         Box::pin(complete_run_actions(&state, true)).await?;
     }
@@ -21796,6 +21801,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     if completed {
         append_parent_narrative_update(&parent, &state)?;
     }
+    fire_lifecycle_notification(&paths, &state, &outcome).await;
     if completed && post_actions {
         Box::pin(complete_run_actions(&state, true)).await?;
     }
@@ -21808,6 +21814,55 @@ fn run_loop_outcome_status(outcome: &RunLoopOutcome) -> &'static str {
         RunLoopOutcome::PausedAtCap => "paused",
         RunLoopOutcome::Killed => "killed",
         RunLoopOutcome::Failed => "failed",
+    }
+}
+
+fn notify_transition_for_outcome(outcome: &RunLoopOutcome) -> Option<NotifyTransition> {
+    match outcome {
+        RunLoopOutcome::Done => Some(NotifyTransition::Accepted),
+        RunLoopOutcome::PausedAtCap => Some(NotifyTransition::Paused),
+        RunLoopOutcome::Failed => Some(NotifyTransition::Failed),
+        RunLoopOutcome::Killed => None,
+    }
+}
+
+async fn fire_lifecycle_notification(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    outcome: &RunLoopOutcome,
+) {
+    let Some(transition) = notify_transition_for_outcome(outcome) else {
+        return;
+    };
+    let Ok(config) = load_notify_config(paths) else {
+        return;
+    };
+    if !config.enabled_for(transition) {
+        return;
+    }
+    let channels = channels_for_config(&config);
+    if channels.is_empty() {
+        return;
+    }
+    let context = NotifyContext {
+        transition,
+        run_id: state.run_id.clone(),
+        verdict: notification_verdict(state, outcome),
+        spend: run_spend_label(state, false),
+        narrative_path: doc_path_for_kind(&state.working_dir, DocKind::Narrative),
+    };
+    let _attempts = notify_run(state, &config, &context, &channels).await;
+}
+
+fn notification_verdict(
+    state: &deadreckon_core::PipelineState,
+    outcome: &RunLoopOutcome,
+) -> String {
+    match outcome {
+        RunLoopOutcome::Done => format!("verified run ({})", acceptance_status_value(state)),
+        RunLoopOutcome::PausedAtCap => "paused at cap".to_string(),
+        RunLoopOutcome::Failed => format!("failed run ({})", acceptance_status_value(state)),
+        RunLoopOutcome::Killed => "killed run".to_string(),
     }
 }
 
@@ -25121,6 +25176,7 @@ async fn resume_command(
     save_state(&state)?;
     lock.release()?;
     print_exit_summary_card(&state, &outcome, plain);
+    fire_lifecycle_notification(&paths, &state, &outcome).await;
     Ok(())
 }
 

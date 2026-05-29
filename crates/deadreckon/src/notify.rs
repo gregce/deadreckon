@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -221,6 +221,7 @@ impl NotifyChannel for CommandNotifyChannel {
             tokio::task::spawn_blocking(move || {
                 let mut child = Command::new("sh");
                 child.arg("-c").arg(command);
+                child.stdout(Stdio::null()).stderr(Stdio::null());
                 child.env_clear();
                 if let Some(path) = std::env::var_os("PATH") {
                     child.env("PATH", path);
