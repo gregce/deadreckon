@@ -111,6 +111,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 mod cli;
+mod friendliness_contract;
 mod narrative;
 mod plan_event_bus;
 mod product;
