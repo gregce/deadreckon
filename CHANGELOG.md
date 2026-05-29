@@ -5,7 +5,7 @@
 - P1 (`c81b617`): Added the whole-surface friendliness contract table and `docs/FRIENDLINESS-AUDIT.md`, with depth tests proving every canonical top-level verb has one row per six-clause contract item.
 - P2 (`bacf76f`): Added `deadreckon try`, a keyless local smoke run that uses the real turn loop and signed `dr-gate` proof, then prints the proof/story/lineage block and one next command.
 - P3 (`bbf1e73`): Factored the proof-block renderer and surfaced the signed proof/story/lineage block on completed run exit cards.
-- P4: Made `deadreckon start` adopt a single detected subscription CLI inline, keep the provider picker for multiple detected CLIs, and refuse with `deadreckon try`/provider setup recovery when none are available.
+- P4 (`e20cf54`): Made `deadreckon start` adopt a single detected subscription CLI inline, keep the provider picker for multiple detected CLIs, and refuse with `deadreckon try`/provider setup recovery when none are available.
 
 ## Campaign Orchestration (production release) - 2026-05-28
 
