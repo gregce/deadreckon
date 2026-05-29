@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **production-release** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-28 (tamper-evident gate, production-release posture, consolidated plan-result docs, guided first use, local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
+**Last updated:** 2026-05-28 (Effortless friendliness contract, tamper-evident gate, production-release posture, consolidated plan-result docs, guided first use, local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
 **Maturity:** production-release posture. Workspace version `0.1.0` pending release tagging. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -46,6 +46,8 @@ This document captures the system as built today — what's wired, what's load-b
 33. [Provider Flight Recorder & Rewind](#33-provider-flight-recorder--rewind)
 34. [Local Self-Improvement Loop](#34-local-self-improvement-loop)
 35. [Tamper-Evident Gate](#35-tamper-evident-gate)
+36. [Campaign Orchestration (one task, N orchestrators)](#36-campaign-orchestration-one-task-n-orchestrators)
+37. [Effortless: the friendliness contract](#37-effortless-the-friendliness-contract)
 
 ---
 
@@ -179,7 +181,7 @@ Why this shape works:
 | `doctor.rs` | backend availability checks |
 | `process.rs` | `run(SandboxSpec) -> SandboxRunOutput`, PID files, cancellation, SIGTERM/SIGKILL escalation |
 
-**`deadreckon` (binary crate, `crates/deadreckon/src/`).** Clap parser definitions (`cli.rs`), command handlers and the ratatui TUIs for run/chain/plan `attach` (`main.rs`, ~31k lines), and `dr-gate` as a standalone acceptance-marker writer (`bin/dr-gate.rs`). Supporting modules: `narrative.rs` (deterministic + provider-backed narrative projection), `plan_event_bus.rs` (`PlanEventBus`/`PlanEventFeed`), `tui_events.rs` (`TuiEventFeed`), `ui.rs` + `ui_card.rs` + `cards/` (CLI/TUI rendering vocabulary and cards), `setup.rs` (provider/done-criteria resolution), `prompt.rs` (confirmation prompts), and `sleep.rs` (sleep-prevention).
+**`deadreckon` (binary crate, `crates/deadreckon/src/`).** Clap parser definitions (`cli.rs`), command handlers and the ratatui TUIs for run/chain/plan `attach` (`main.rs`, ~40k lines), and `dr-gate` as a standalone acceptance-marker writer (`bin/dr-gate.rs`). Supporting modules: `narrative.rs` (deterministic + provider-backed narrative projection), `plan_event_bus.rs` (`PlanEventBus`/`PlanEventFeed`), `tui_events.rs` (`TuiEventFeed`), `ui.rs` + `ui_card.rs` + `cards/` (CLI/TUI rendering vocabulary and cards), `setup.rs` (provider/done-contract resolution), `prompt.rs` (confirmation prompts), and `sleep.rs` (sleep-prevention).
 
 ### 2.3 Top-level documentation
 
@@ -1304,8 +1306,8 @@ first screen.
 | `plan` | Advanced building block that writes an orchestration plan (worker specs + `plan.json`) without starting child runs |
 | `fork` | Advanced building block that spawns ready child runs for a plan and supervises them through completion |
 | `merge` | Advanced building block that composes completed child library artifacts into a new promoted run (with semantic merge repair) |
-| `def-done` | Write, add, show, or check the project's English done criteria |
-| `acceptance` | Hidden compatibility surface for creating, explaining, or checking done criteria |
+| `def-done` | Write, add, show, or check the project's English done contract |
+| `acceptance` | Hidden compatibility surface for creating, explaining, or checking the done contract |
 | `doc` | Print run narrative, as-built, implementation decision ledger, or delta; with optional polish pass |
 | `history` | Search durable run traces and provenance (regex/scope/plan filters) |
 | `library` | Query promoted run artifacts by goal/date/scope |
@@ -1319,17 +1321,17 @@ first screen.
 
 ### 17.1 Guided first use
 
-`deadreckon start "<goal>"` is the guided production command. It is intentionally a thin CLI-layer decision helper, not a new runtime state machine: each invocation builds an ephemeral launch decision, prints the selected path and reason, and either previews or dispatches to the existing `run`, `extend`, and `orchestrate` handlers. In an interactive TTY, `start` uses normal terminal selection prompts for launch mode, provider route, done criteria, source mode, and final confirmation when flags have not already made those choices explicit. No `PipelineState` schema changes were introduced for this path, and previews remain state-free.
+`deadreckon start "<goal>"` is the guided production command. It is intentionally a thin CLI-layer decision helper, not a new runtime state machine: each invocation builds an ephemeral launch decision, prints the selected path and reason, and either previews or dispatches to the existing `run`, `extend`, and `orchestrate` handlers. In an interactive TTY, `start` uses normal terminal selection prompts for launch mode, provider route, done contract, source mode, and final confirmation when flags have not already made those choices explicit. No `PipelineState` schema changes were introduced for this path, and previews remain state-free.
 
-The launch decision resolves provider setup, done criteria, source mode, history, and run-vs-orchestrate mode before any provider work begins. Provider resolution uses configured defaults first and only probes installed subscription CLIs when no default route is configured; TTY users can select a detected route ephemerally for that launch without writing config, while non-TTY or scripted users still get concrete `try:` lines for `init`, `detect`, `config provider`, or `providers list --all`. Done-criteria resolution uses the same `def-done` and `.deadreckon/acceptance.yaml` contract as direct runs: existing project criteria trigger a TTY keep/view/check/update/cancel prompt so users can inspect or change the contract before launch, missing criteria can be generated or defaulted, and non-TTY callers get deterministic recovery lines. Source-mode resolution follows the existing run safety posture: git worktree by default in repositories, TTY selection for init-git/copy/fresh in non-git directories, and explicit stash or `--allow-dirty` choices for dirty worktrees.
+The launch decision resolves provider setup, done contract, source mode, history, and run-vs-orchestrate/campaign mode before any provider work begins. Provider resolution uses configured defaults first and only probes installed subscription CLIs when no default route is configured; TTY users can select a detected route ephemerally for that launch without writing config, while non-TTY or scripted users still get concrete `try:` lines for `init`, `detect`, `config provider`, or `providers list --all`. Done-contract resolution uses the same `def-done` and `.deadreckon/acceptance.yaml` contract as direct runs: existing project criteria trigger a TTY keep/view/check/update/cancel prompt so users can inspect or change the contract before launch, missing criteria can be generated or defaulted, and non-TTY callers get deterministic recovery lines. Source-mode resolution follows the existing run safety posture: git worktree by default in repositories, TTY selection for init-git/copy/fresh in non-git directories, and explicit stash or `--allow-dirty` choices for dirty worktrees.
 
 History-aware `start` scans the current project scope for the newest completed, promoted, non-in-place run. When one exists, the TTY launch picker adds a "Follow up" choice that dispatches through `extend`; preview and JSON output also include exact commands for `deadreckon extend <run-id> "<goal>"`, `deadreckon start "<goal>" --mode review --yes`, and `deadreckon start "<goal>" --mode full-plan --yes`. This keeps scripted `start` deterministic while making it obvious how to continue prior work or launch a new orchestration pass.
 
-Auto mode is deterministic in the current release. It chooses single-run, review orchestration, or full-plan orchestration from local goal text and explicit flags, then reports the override flag (`--mode run`, `--mode review`, or `--mode full-plan`) a user can pass if the heuristic guessed wrong. In a TTY, the recommendation appears first in the mode picker and the user can override it with a selection. The guided command does not ask a provider to classify the goal and does not persist personal preferences.
+Auto mode is advisory. When a usable provider exists, `start` makes one bounded read-only classifier call through the existing provider router to recommend a single verified run, review/full-plan orchestration, or campaign with a count and rationale. The validated recommendation is preview-scoped and state-free; no personal preference is persisted. Smoke/no-provider paths use deterministic fallback heuristics. In a TTY, the recommendation appears first in the picker and the user can override it with an explicit selection or flag.
 
-`start --preview`, `run --preview`, and `orchestrate --preview` share launch-preview rows: path, provider, done criteria, workspace, watch, stop, and finish, with optional base/history rows when a follow-up is selected or available. Orchestrated `start` previews also show role reuse when one selected provider route is used for coder/reviewer or planner/child roles. Successful guided launches add a `start lifecycle` footer with exact `attach`, `status`, `kill`, and `finish` commands for the created run or plan. Existing `run`, `extend`, and `orchestrate` remain the canonical direct commands for users who already know the path they want.
+`start --preview`, `run --preview`, and `orchestrate --preview` share launch-preview rows: path, provider, done contract, workspace, watch, stop, and finish, with optional base/history rows when a follow-up is selected or available. Orchestrated `start` previews also show role reuse when one selected provider route is used for coder/reviewer or planner/child roles. Successful guided launches add a `start lifecycle` footer with exact `attach`, `status`, `kill`, and `finish` commands for the created run or plan. Existing `run`, `extend`, `orchestrate`, and `campaign` remain the canonical direct commands for users who already know the path they want.
 
-Prompt eligibility is deliberately narrow: `--json`, `--plain`, `--quiet`, `--yes`, and non-TTY execution never start the picker and never block on stdin. Those paths preserve deterministic JSON/recovery output and scriptable launch behavior. `--preview` may ask TTY users for selections, but it remains state-free; provider config is not written by a provider selection, and done-criteria files are only generated for an actual launch after final confirmation.
+Prompt eligibility is deliberately narrow: `--json`, `--plain`, `--quiet`, `--yes`, and non-TTY execution never start the picker and never block on stdin. Those paths preserve deterministic JSON/recovery output and scriptable launch behavior. `--preview` may ask TTY users for selections, but it remains state-free; provider config is not written by a provider selection, and done-contract files are only generated for an actual launch after final confirmation.
 
 The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defaults to `$10` (with a confirmation gate above `$50`), `--provider` defaults to the highest-credentialed entry per the fallback chain, `--skill` defaults to `default-coding`.
 
@@ -1595,11 +1597,18 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Cross-process cancellation: `kill` writes a durable cancel marker before signaling; the run loop observes it while provider calls are in flight and reports killed status through events.
 - Partial-trace resume: resume reconstructs only completed tool boundaries and `resume --from-turn` truncates traces, spend records, and future snapshots together.
 - Durable per-run `sandbox.toml` plus per-tool sandbox policy: bash/write-file paths get specific filesystem and network permissions; refusals include `try:` and are recorded in traces and provenance.
-- YAML done-criteria files (`acceptance.yaml`): `dr-gate` evaluates required/optional tests, file existence, content matches, shell commands, and build checks, writes `acceptance-tamper.json`, refuses suppression-pattern/spec edits, caveats check-covered test/target edits, then signs check-level proof results and the tamper proof bytes.
+- YAML done-contract files (`acceptance.yaml`): `dr-gate` evaluates required/optional tests, file existence, content matches, shell commands, and build checks, writes `acceptance-tamper.json`, refuses suppression-pattern/spec edits, caveats check-covered test/target edits, then signs check-level proof results and the tamper proof bytes.
 - Exhaustive local doctor: OS, sandbox binaries, provider binaries, config, runstate permissions, disk, and opt-in provider pings all produce actionable `try:` hints.
 - Promoted library query surface: `deadreckon library list|search|show` reads library manifests and reverse materialization markers, filters by goal/date, and searches promoted run docs.
 - Import parity hardening: descriptor-backed CLI imports and Cursor SQLite imports preserve source metadata, deterministic session run IDs, stable row ordering, manifests, content hashes, and provenance paths; committed goldens and fixtures cover normalized `show` output plus provider-specific discovery.
 - CLI usability polish: root help includes command groups, `status` includes run health/library/disk blocks, and `DEADRECKON_HINTS=0` suppresses post-completion prompts.
+- Effortless friendliness contract: `docs/FRIENDLINESS-AUDIT.md` codifies six clauses for every canonical top-level verb (auto-detect don't ask, preview before mutation, refusal `try:`, rollback, one primary action, lifecycle hints), and `friendliness_contract.rs` plus focused tests keep that checklist executable.
+- Keyless first-ten-seconds path: `deadreckon try` runs the normal turn loop with the deterministic smoke provider, signs the real `dr-gate` marker, and prints the proof/story/lineage block plus one next command without requiring credentials.
+- Guided production front door: `deadreckon start` reuses the existing run/orchestrate/campaign mechanisms, self-bootstraps a single detected subscription CLI provider inline, keeps preview/JSON/plain paths state-free, and refuses with specific recovery commands when provider, done contract, or source mode is incomplete.
+- One-verdict lifecycle surfaces: completed exit cards now lead with `VERIFIED`; exit cards, `status`, and `finish` expose one primary action while demoting secondary actions to quieter rows.
+- Opt-in lifecycle notifications: `[notify]` supports native, command, and webhook channels for accepted, paused-at-cap, and failed outcomes; records append to run-local `notify.jsonl`; command notification failures include a recovery `try:` detail.
+- Goal-shape recommendations: `start` performs one bounded provider-backed classifier call through existing provider routing (with deterministic fallback) to suggest single run, orchestration, or campaign + count; campaign `--n` is optional and editable before launch.
+- Vocabulary and error-footers: user-facing copy treats a passed run as a "verified run" (verified by `dr-gate`) and groups `def-done` / `acceptance.yaml` wording under the "done contract"; P10 coverage asserts the shared glossary and a parameterized refusal table with final `try:` footers.
 - Autonomous sequential chains: `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`, and `chain redo`; chains use `latest`/`last` aliases, `chain.json`, `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps, green-policy auto-apply, and a multi-step ratatui timeline with single-run chain context.
 - Plan observability: orchestration plans now write `plan-events.jsonl`; `attach <plan-id>` renders plan events, drills into child run attach, and returns to the plan context; plain attach, `history grep --plan`, and `show --why-failed <plan-id>` include plan event evidence.
 - Consolidated plan-result docs: completed plans write provider-backed or deterministic `PLAN-NARRATIVE.md`, `PLAN-AS-BUILT.md`, `PLAN-DECISIONS.md`, `PLAN-CHILDREN.md`, and `PLAN-DOCS-MANIFEST.json`; merged libraries, apply worktrees, and exports carry those docs, and synthetic plan-result apply runs expose wrapper `RUN-*` docs that point at the consolidated plan story.
@@ -1636,6 +1645,8 @@ The previously named thin areas now have code paths and depth tests:
 - Real-time multi-cursor TUI presence.
 
 The codebase-mode rider adds capability; it does not close the robust-rider thin items above.
+
+The Effortless pass is presentation and advisory orchestration only. It did not add durable fields to `PipelineState`, `Plan`, `Campaign`, or provider schemas, and it did not change the gate, sandbox, promotion, provider, plan merge, or campaign core mechanisms. Bigger product bets such as palettes, localization, card templates, notifier daemons, and richer classification stay in `docs/V1-CANDIDATES.md`.
 
 ---
 
@@ -1819,7 +1830,7 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 ## 26. Coherence Pass And Production Command Model
 
-> **Status (2026-05-28):** The May 2026 coherence pass, closure pass, and production command model are release-complete for the current CLI contract. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, provider/done-criteria setup, JSON parity, orchestration commands, plan attach, polymorphic lifecycle ids, default-help command audience, history-aware `start`, and done-criteria review prompts now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md`, `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`, `docs/goals/2026-05-24-1426-deadreckon-provider-done-setup-goal.md`, and `docs/goals/2026-05-27-1152-deadreckon-production-command-model-goal.md`; the closure matrix is `docs/design/USER-FACING-MATRIX.md`, with larger follow-ups explicitly deferred to `docs/V1-CANDIDATES.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs` and runtime setup helpers.
+> **Status (2026-05-28):** The May 2026 coherence pass, closure pass, production command model, and Effortless pass are release-complete for the current CLI contract. Glossary labels, style helpers, `print_kv_block`, flag-truth, prompt builder, attach/kill parity, shared TUI palette, provider-route wording, provider/done-contract setup, JSON parity, orchestration commands, plan attach, polymorphic lifecycle ids, default-help command audience, history-aware `start`, verified-run wording, and done-contract review prompts now share the same user-facing model. The closure briefs are at `docs/goals/2026-05-13-1900-deadreckon-coherence-goal.md`, `docs/goals/2026-05-17-1403-deadreckon-coherence-closure-goal.md`, `docs/goals/2026-05-24-1426-deadreckon-provider-done-setup-goal.md`, and `docs/goals/2026-05-27-1152-deadreckon-production-command-model-goal.md`; the closure matrix is `docs/design/USER-FACING-MATRIX.md`, with larger follow-ups explicitly deferred to `docs/V1-CANDIDATES.md`. The pass is intentionally schema-preserving: no `RunStatus`/`ChainStatus`/`PlanTaskStatus` variant names changed, only display strings changed via `glossary.rs` and runtime setup helpers.
 
 ### 26.1 Glossary
 
@@ -1865,7 +1876,7 @@ Provider displays use the provider/route/model/kind vocabulary consistently. Hum
 
 `deadreckon help-all` includes the provider-role glossary. `--provider` is the primary run provider route and the default child route in full-plan orchestration. `--planner-provider` writes the full-plan child graph. `--child-provider IDX=PROVIDER` overrides a specific child. `--coder-provider` performs the review-mode implementation pass. `--reviewer-provider` independently reviews or fixes the coder result. `--doc-provider` handles documentation polish, resolving through explicit flag, config, subscription CLI, then run provider. `--repair-provider` handles merge repair planning and repair-child runs. Normal user surfaces say provider route/model/kind; descriptor remains registry documentation vocabulary.
 
-Done-criteria setup also resolves through `setup.rs`. Explicit `--acceptance <path>`, project `.deadreckon/acceptance.yaml`, generated criteria from `def-done`/pre-run drafting, and default `dr-gate` behavior all produce one `DoneCriteriaSelection`. User-facing previews and orchestration preflights say `done criteria`; technical files, gate proofs, and hidden compatibility commands may still say `acceptance.yaml` or `gate`.
+Done-contract setup also resolves through `setup.rs`. Explicit `--acceptance <path>`, project `.deadreckon/acceptance.yaml`, generated criteria from `def-done`/pre-run drafting, and default `dr-gate` behavior all produce one `DoneCriteriaSelection`. User-facing previews and orchestration preflights say `done contract`; technical files, gate proofs, and hidden compatibility commands may still say `acceptance.yaml` or `gate`.
 
 Plan merge/result output keeps the plan id as the primary object. The synthesized run id is labeled as a secondary result run, and the promoted path is labeled as the artifact library so users can still inspect implementation details without mistaking them for the main lifecycle id.
 
@@ -1875,7 +1886,7 @@ Inspection surfaces that already read durable state now expose `--json`: `list`,
 
 ### 26.10 Deferred V1 Work
 
-Mass renaming stored enum variants, themable palettes, localization hooks, a full output-layout facade, generic lifecycle renderer, command-matrix golden snapshots, and a template engine for status cards stay in `docs/V1-CANDIDATES.md`. Provider and done-criteria setup unification has landed as the production runtime layer, so the remaining V1 work is deeper output-layout/golden coverage and richer interactive setup polish rather than another resolver. The orchestration live-UX slice has landed shared role/dependency/repair summaries and the `PlanEventBus` feed; remaining orchestration work is now the broader interactive setup/output-layout polish, not the basic live attach freshness gap.
+Mass renaming stored enum variants, themable palettes, localization hooks, a full output-layout facade, generic lifecycle renderer, command-matrix golden snapshots, and a template engine for status cards stay in `docs/V1-CANDIDATES.md`. Provider and done-contract setup unification has landed as the production runtime layer, so the remaining V1 work is deeper output-layout/golden coverage and richer interactive setup polish rather than another resolver. The orchestration live-UX slice has landed shared role/dependency/repair summaries and the `PlanEventBus` feed; remaining orchestration work is now the broader interactive setup/output-layout polish, not the basic live attach freshness gap.
 
 ---
 
@@ -2370,4 +2381,103 @@ a recursive event tree. These are tracked in `docs/V1-CANDIDATES.md`.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, and 32 in particular. Updated 2026-05-28 for tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~31k lines) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+## 37. Effortless: the friendliness contract
+
+Effortless is the production-release friendliness layer over the existing engine.
+It makes the friendly path the default for first use, return-after-walking-away,
+and vocabulary while keeping the core mechanisms unchanged: `dr-gate`, sandboxing,
+promotion, providers, plan merge, and the campaign engine stay as built. The pass
+adds no durable fields to `PipelineState`, `Plan`, `Campaign`, or provider schemas;
+its durable outputs are existing files, new sidecar records where already
+appropriate, and documentation.
+
+### 37.1 The six-clause contract and the audit (`FRIENDLINESS-AUDIT.md`)
+
+`docs/FRIENDLINESS-AUDIT.md` is the curated surface audit. It scores canonical
+verbs against six clauses: auto-detect don't ask, preview before any state change,
+refuse with a specific `try:` line, one-command rollback, one verdict plus one
+primary action, and lifecycle hints. `crates/deadreckon/src/friendliness_contract.rs`
+keeps the table close to code, and `cards_friendliness`/`coherence` tests make the
+contract executable instead of a prose-only promise.
+
+### 37.2 `deadreckon try` and the proof block
+
+`deadreckon try` is the keyless smoke path. It uses the normal run creation,
+runtime loop, smoke provider, promotion, and acceptance gate, then prints a proof
+block: `gate: SIGNED by dr-gate`, the run narrative path, one provenance/lineage
+line, and one next command. This path demonstrates the harness in roughly the
+first ten seconds without asking for provider credentials.
+
+### 37.3 Self-bootstrapping `start`
+
+`deadreckon start` now resolves provider setup through the shared setup layer. If
+exactly one subscription CLI is detected, the launch uses it ephemerally and tells
+the operator how to make it permanent; no `deadreckon init` detour is required.
+If none are usable, the refusal points first to `deadreckon try` and then to a
+concrete provider config command. Preview, JSON, plain, quiet, and non-TTY flows
+remain deterministic and state-free until launch confirmation.
+
+### 37.4 One verdict + one primary action
+
+Exit cards, `status`, and `finish` no longer show several equal-weight next steps.
+The shared card/action helpers choose one primary action (`next`) and render
+secondary actions below it. Completed exit cards lead with `VERIFIED` and include
+the proof block; paused and failed variants point first at resume or failure
+inspection.
+
+### 37.5 Spend + gate-verdict consistency
+
+The consistency sweep made honest spend and per-check gate status visible on the
+surfaces people inspect after a run: exit card, `status`, `finish`, plan child
+detail, and campaign child summaries. Subscription-only routes render as not
+metered with wall time/turns; mixed HTTP + subscription routes render the metered
+total plus a subscription note. Gate text comes from the tamper-evident marker or
+acceptance progress rather than a loose success word.
+
+### 37.6 Opt-in notifications (`[notify]`, channels, `notify.jsonl`)
+
+Notifications are config-driven and opt-in. `[notify]` can enable native desktop,
+command, or webhook channels for accepted, paused-at-cap, and failed transitions.
+Notification context is intentionally small and redacted: transition, run id,
+verdict, spend, and narrative path. Each attempt appends to run-local
+`notify.jsonl`, and command-channel failures include a `try:` recovery detail.
+There is no daemon or background service.
+
+### 37.7 Provider-backed goal-shape routing
+
+`start` performs one bounded read-only classifier call through the existing
+provider router when a provider is available. The classifier may recommend one
+verified run, an orchestration, or a campaign with count and rationale. Its result
+is preview-scoped, validated, clamped, and advisory; deterministic fallback handles
+no-provider and smoke-provider paths. Campaign-shaped recommendations are shown
+as suggestions rather than silently launching a campaign.
+
+### 37.8 Campaign friendliness
+
+`deadreckon campaign` can omit `--n`; DeadReckon recommends a count from the same
+goal-shape machinery and still lets the operator inspect before launch. The
+preflight supports launch, edit a sub-goal, drop a sub-goal, change count, and
+cancel with a concrete preview retry command. This changes presentation and
+preflight ergonomics only; the depth cap, sub-orchestrator spawn, roll-up, and
+meta-merge rules remain §36's campaign engine.
+
+### 37.9 Vocabulary ("verified run") + error-footer coverage
+
+`deadreckon-core::glossary` owns the guarantee noun: a completed accepted result
+is a "verified run", verified by `dr-gate` ("the process that verifies the run").
+The `def-done` command and `.deadreckon/acceptance.yaml` file are presented under
+the umbrella "done contract" on primary user-facing surfaces. Completed cards
+use the verdict word `VERIFIED`. Error footer coverage now includes a
+parameterized refusal table that checks the final stderr line carries `try:`.
+
+### 37.10 Limits
+
+Effortless intentionally avoids durable schema churn and background effects. There
+is one bounded classifier call, not an LLM control loop. Notifications are opt-in
+and run only at lifecycle transitions, not through a daemon. Palettes,
+localization, a card template engine, richer guided onboarding, a long-lived
+notifier, and deeper multi-piece classification are V1 candidates.
+
+---
+
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, and 37 in particular. Updated 2026-05-28 for Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~40k lines) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
