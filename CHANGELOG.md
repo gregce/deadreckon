@@ -12,6 +12,7 @@
 - P8 (`823945b`): Fired enabled notifications on accepted, paused-at-cap, and failed lifecycle outcomes while disabled configs stay silent.
 - P9 (`10dd47b`): Added bounded provider-backed goal-shape recommendations for `start`, preview-scoped classifier records, optional campaign `--n`, and editable campaign preflight controls.
 - P10 (`7425883`): Unified the verified-run glossary, changed completed exit cards to the `VERIFIED` verdict, expanded refusal `try:` footer coverage, and added command-notification failure recovery hints.
+- P11 (`c37ca2b`): Documented AS-BUILT §37 for the Effortless contract, updated shipped-vs-thin accounting, and logged the palette/localization/template/notifier/classification/onboarding deferrals in V1-CANDIDATES.
 
 ## Campaign Orchestration (production release) - 2026-05-28
 
