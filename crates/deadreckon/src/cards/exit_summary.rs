@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::proof_block::ProofBlock;
 use crate::ui_card::{Card, HintLine, MetricColumn, Section, TitleGlyph, TitleLine, Tone};
+use deadreckon_core::{NOUN_VERIFIED_RUN, PHRASE_VERIFIED_BY_DR_GATE, VERDICT_VERIFIED};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutcomeKind {
@@ -47,7 +48,7 @@ pub struct ExitSummaryInput {
 
 pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
     let (glyph, label, tone) = match input.outcome {
-        OutcomeKind::Completed => (TitleGlyph::Success, "completed run", Tone::Good),
+        OutcomeKind::Completed => (TitleGlyph::Success, VERDICT_VERIFIED, Tone::Good),
         OutcomeKind::Paused => (TitleGlyph::Paused, "paused run", Tone::Warn),
         OutcomeKind::Killed => (TitleGlyph::Stopped, "killed run", Tone::Bad),
         OutcomeKind::Failed => (TitleGlyph::Failed, "failed run", Tone::Bad),
@@ -165,15 +166,7 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
             glyph,
             label: label.to_string(),
         },
-        subtitle: Some(format!(
-            "{} worked on {}",
-            input.provider,
-            input
-                .branch
-                .as_deref()
-                .map(|branch| format!("branch {branch}"))
-                .unwrap_or_else(|| "this run".to_string())
-        )),
+        subtitle: Some(exit_summary_subtitle(input)),
         sections,
         primary_action,
         hints: input
@@ -186,6 +179,21 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
             })
             .collect(),
     }
+}
+
+fn exit_summary_subtitle(input: &ExitSummaryInput) -> String {
+    let target = input
+        .branch
+        .as_deref()
+        .map(|branch| format!("branch {branch}"))
+        .unwrap_or_else(|| "this run".to_string());
+    if input.outcome == OutcomeKind::Completed {
+        return format!(
+            "{NOUN_VERIFIED_RUN}, {PHRASE_VERIFIED_BY_DR_GATE}; completed run by {} on {target}",
+            input.provider
+        );
+    }
+    format!("{} worked on {target}", input.provider)
 }
 
 fn exit_summary_primary_action(input: &ExitSummaryInput) -> Option<HintLine> {

@@ -388,17 +388,29 @@ pub async fn notify_run(
     let mut attempts = Vec::new();
     for channel in channels {
         let result = channel.send(context).await;
+        let ok = result.is_ok();
+        let detail = result
+            .err()
+            .map(|detail| notify_failure_detail(channel.name(), detail));
         let attempt = NotifyAttempt {
             ts: Utc::now(),
             transition: context.transition,
             channel: channel.name().to_string(),
-            ok: result.is_ok(),
-            detail: result.err(),
+            ok,
+            detail,
         };
         let _ = append_notify_attempt(state, &attempt);
         attempts.push(attempt);
     }
     attempts
+}
+
+fn notify_failure_detail(channel: &str, detail: String) -> String {
+    if channel == "command" {
+        format!("{detail}; try: deadreckon config notify.command \"<cmd>\" and re-run")
+    } else {
+        detail
+    }
 }
 
 pub fn append_notify_attempt(

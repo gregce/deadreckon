@@ -7,7 +7,7 @@ use deadreckon::notify::{
     CommandNotifyChannel, NotifyAttempt, NotifyChannel, NotifyConfig, NotifyContext, NotifyFuture,
     NotifyTransition, notify_jsonl_path, notify_run,
 };
-use deadreckon_core::{DeadreckonPaths, RunOptions, create_run};
+use deadreckon_core::{DeadreckonPaths, NOUN_VERIFIED_RUN, RunOptions, create_run};
 use tempfile::TempDir;
 
 #[test]
@@ -67,7 +67,7 @@ async fn command_channel_receives_redacted_context() {
     );
     assert!(env.contains("DEADRECKON_NOTIFY_RUN_ID=run-abc123"), "{env}");
     assert!(
-        env.contains("DEADRECKON_NOTIFY_VERDICT=verified run"),
+        env.contains(&format!("DEADRECKON_NOTIFY_VERDICT={NOUN_VERIFIED_RUN}")),
         "{env}"
     );
     assert!(
@@ -114,6 +114,30 @@ async fn notify_records_attempt_to_jsonl() {
     assert!(attempts.is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_command_notification_records_try_footer() {
+    let temp = TempDir::new().expect("tempdir");
+    let state = state(&temp);
+    let config = NotifyConfig {
+        enabled: true,
+        native: false,
+        command: Some("exit 2".to_string()),
+        webhook: None,
+        on: NotifyTransition::all(),
+    };
+    let channels: Vec<Box<dyn NotifyChannel>> = vec![Box::new(CommandNotifyChannel::new("exit 2"))];
+
+    let attempts = notify_run(&state, &config, &context(), &channels).await;
+
+    assert_eq!(attempts.len(), 1);
+    assert!(!attempts[0].ok, "{attempts:?}");
+    let detail = attempts[0].detail.as_deref().expect("detail");
+    assert!(
+        detail.contains("try: deadreckon config notify.command \"<cmd>\" and re-run"),
+        "{detail}"
+    );
+}
+
 struct FakeChannel;
 
 impl NotifyChannel for FakeChannel {
@@ -130,7 +154,7 @@ fn context() -> NotifyContext {
     NotifyContext {
         transition: NotifyTransition::Accepted,
         run_id: "run-abc123".to_string(),
-        verdict: "verified run".to_string(),
+        verdict: NOUN_VERIFIED_RUN.to_string(),
         spend: "not metered (subscription)".to_string(),
         narrative_path: Some("/tmp/RUN-NARRATIVE.md".into()),
     }

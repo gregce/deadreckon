@@ -8,11 +8,11 @@ use std::process::{Command, Stdio};
 use chrono::Utc;
 use deadreckon_core::lock::lock_path;
 use deadreckon_core::{
-    CHAIN_EVENTS_JSONL, CoordinatorState, DeadreckonPaths, PLAN_EVENTS_JSONL, Plan, PlanEvent,
-    PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanRole, PlanStatus, PlanTaskStatus,
-    RUN_EVENTS_JSONL, RunOptions, RunStatus, TraceRecord, append_plan_event, append_plan_message,
-    append_trace, create_run, list_runs, load_plan, load_run, pid_is_alive, read_codebase_record,
-    read_plan_events, read_plan_messages, save_plan, save_state,
+    CHAIN_EVENTS_JSONL, CoordinatorState, DeadreckonPaths, NOUN_DONE_CONTRACT, PLAN_EVENTS_JSONL,
+    Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanRole, PlanStatus,
+    PlanTaskStatus, RUN_EVENTS_JSONL, RunOptions, RunStatus, TraceRecord, append_plan_event,
+    append_plan_message, append_trace, create_run, list_runs, load_plan, load_run, pid_is_alive,
+    read_codebase_record, read_plan_events, read_plan_messages, save_plan, save_state,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -300,10 +300,10 @@ fn run_and_orchestrate_preview_share_done_criteria_source_label() {
     let orchestrate_preview = stdout(&orchestrate);
 
     let shared_label = "project (1 checks) from";
-    assert!(run_preview.contains("done criteria"), "{run_preview}");
+    assert!(run_preview.contains(NOUN_DONE_CONTRACT), "{run_preview}");
     assert!(run_preview.contains(shared_label), "{run_preview}");
     assert!(
-        orchestrate_preview.contains("done criteria"),
+        orchestrate_preview.contains(NOUN_DONE_CONTRACT),
         "{orchestrate_preview}"
     );
     assert!(
@@ -531,7 +531,7 @@ fn start_missing_done_criteria_suggests_def_done_in_non_tty() {
 
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
-    assert!(err.contains("done criteria"), "{err}");
+    assert!(err.contains(NOUN_DONE_CONTRACT), "{err}");
     assert!(err.contains("try: deadreckon def-done"), "{err}");
     assert!(err.contains("deadreckon start \"build the app\""), "{err}");
 }

@@ -7,6 +7,7 @@ use deadreckon::cards::exit_summary::{
 };
 use deadreckon::proof_block::ProofBlock;
 use deadreckon::ui_card::{CardOptions, Tone, render_card};
+use deadreckon_core::VERDICT_VERIFIED;
 
 fn input(outcome: OutcomeKind) -> ExitSummaryInput {
     ExitSummaryInput {
@@ -64,7 +65,10 @@ fn exit_card_leads_with_one_verdict_and_one_primary_action() {
         },
     );
 
-    assert!(rendered.contains("* completed run"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("* {VERDICT_VERIFIED}")),
+        "{rendered}"
+    );
     assert_eq!(primary_action_count(&rendered), 1, "{rendered}");
     let primary = line_index(&rendered, "next", "deadreckon apply abc12345");
     let attach = line_index(&rendered, "attach", "deadreckon attach abc12345");
@@ -208,7 +212,10 @@ fn exit_summary_completed_run_includes_attach_show_apply_hints() {
             no_color_env: false,
         },
     );
-    assert!(rendered.contains("* completed run"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("* {VERDICT_VERIFIED}")),
+        "{rendered}"
+    );
     assert!(
         rendered.contains("not metered (subscription)"),
         "{rendered}"

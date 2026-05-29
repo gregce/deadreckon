@@ -11,6 +11,11 @@ pub const NOUN_RUN: &str = "run";
 pub const NOUN_CHAIN: &str = "chain";
 pub const NOUN_PLAN: &str = "plan";
 pub const NOUN_CHILD: &str = "child";
+pub const NOUN_VERIFIED_RUN: &str = "verified run";
+pub const PHRASE_VERIFIED_BY_DR_GATE: &str = "verified by dr-gate";
+pub const DR_GATE_DESCRIPTION: &str = "the process that verifies the run";
+pub const NOUN_DONE_CONTRACT: &str = "done contract";
+pub const VERDICT_VERIFIED: &str = "VERIFIED";
 
 pub trait StatusLabel {
     fn status_label(self) -> &'static str;

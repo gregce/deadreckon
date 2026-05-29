@@ -63,14 +63,14 @@ use deadreckon_core::{
     ChainEvent, ChainEventKind, ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus,
     CodebaseMode, CodebaseRecord, ConductorState, CoordinatorChild, CoordinatorState,
     DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DeadreckonError, DeadreckonPaths,
-    DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId,
-    PhaseStatus, Plan, PlanChildMarker, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
-    PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest,
-    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunEventKind, RunListEntry,
-    RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions,
-    acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root, acquire_lock,
-    append_chain_event, append_parent_narrative_update, append_plan_event, append_plan_message,
-    append_provenance, append_trace, apply_commit_body, cancel_marker_present,
+    DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, NOUN_DONE_CONTRACT,
+    NOUN_VERIFIED_RUN, OnFail, PhaseId, PhaseStatus, Plan, PlanChildMarker, PlanEvent,
+    PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanProviders, PlanRole, PlanStatus,
+    PlanTask, PlanTaskStatus, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode,
+    RunEvent, RunEventKind, RunListEntry, RunOptions, RunStatus, SpendRecord, TraceRecord,
+    WorktreeOptions, acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root,
+    acquire_lock, append_chain_event, append_parent_narrative_update, append_plan_event,
+    append_plan_message, append_provenance, append_trace, apply_commit_body, cancel_marker_present,
     chain_status_label as glossary_chain_status_label,
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
@@ -177,12 +177,11 @@ impl CliError {
 }
 
 fn error_hint(err: &CliError) -> String {
-    match err {
+    let hint = match err {
         CliError::Exit { hint, .. } => hint.clone(),
         CliError::Provider(deadreckon_providers::ProviderError::MissingCredential(_))
         | CliError::Provider(deadreckon_providers::ProviderError::NoRoute(_)) => {
-            "run `deadreckon init` or `deadreckon config set providers.anthropic.api_key <KEY>`"
-                .to_string()
+            "deadreckon try; then deadreckon config provider cli:codex".to_string()
         }
         CliError::Core(DeadreckonError::InvalidInput(message))
             if message.contains("max spend above $50") =>
@@ -210,7 +209,17 @@ fn error_hint(err: &CliError) -> String {
         ),
         CliError::Io(_) => "check that the referenced path exists and is writable".to_string(),
         CliError::Json(_) => "inspect the referenced JSON file for invalid syntax".to_string(),
-        CliError::Core(_) | CliError::Provider(_) => "run `deadreckon doctor`".to_string(),
+        CliError::Core(_) | CliError::Provider(_) => "deadreckon doctor".to_string(),
+    };
+    try_footer(hint)
+}
+
+fn try_footer(hint: impl AsRef<str>) -> String {
+    let hint = hint.as_ref().trim();
+    if hint.starts_with("try:") {
+        hint.to_string()
+    } else {
+        format!("try: {hint}")
     }
 }
 
@@ -2333,7 +2342,7 @@ fn fallback_goal_shape_recommendation(goal: &str) -> GoalShapeRecommendation {
             (
                 GoalShape::Single,
                 None,
-                "goal looks focused enough for one verified run".to_string(),
+                format!("goal looks focused enough for one {NOUN_VERIFIED_RUN}"),
             )
         }
     };
@@ -3162,8 +3171,8 @@ fn prompt_start_done_criteria(
     prompter: &mut dyn StartPrompter,
 ) -> Result<()> {
     let choice = prompter.select_one(prompt::SelectPrompt {
-        title: "Choose done criteria".to_string(),
-        help: Some("No project done criteria were found.".to_string()),
+        title: format!("Choose {NOUN_DONE_CONTRACT}"),
+        help: Some(format!("No project {NOUN_DONE_CONTRACT} was found.")),
         choices: vec![
             start_prompt_choice(
                 "default",
@@ -3200,7 +3209,7 @@ fn prompt_start_done_criteria(
             if text.trim().is_empty() {
                 set_start_recovery(
                     decision,
-                    "empty done criteria were not saved",
+                    format!("empty {NOUN_DONE_CONTRACT} was not saved"),
                     vec![format!(
                         "deadreckon def-done \"what should count as done\" && deadreckon start \"{}\"",
                         shell_display_quote(&decision.goal)
@@ -3217,7 +3226,7 @@ fn prompt_start_done_criteria(
         }
         _ => set_start_recovery(
             decision,
-            "done criteria are missing for this repo",
+            format!("{NOUN_DONE_CONTRACT} is missing for this repo"),
             vec![format!(
                 "deadreckon def-done \"what should count as done\" && deadreckon start \"{}\"",
                 shell_display_quote(&decision.goal)
@@ -3260,7 +3269,7 @@ fn done_criteria_prompt_detail(selection: &setup::DoneCriteriaSelection) -> Stri
 }
 
 fn print_start_done_criteria_summary(selection: &setup::DoneCriteriaSelection) {
-    println!("{}", ui_heading("done criteria"));
+    println!("{}", ui_heading(NOUN_DONE_CONTRACT));
     print_kv_block(&[
         ("source", selection.source.as_str()),
         ("summary", &done_criteria_prompt_detail(selection)),
@@ -3284,23 +3293,23 @@ fn check_start_done_criteria(cwd: &Path, selection: &setup::DoneCriteriaSelectio
     }
     let result = evaluate_acceptance_checks(&temp_root, cwd);
     let _ = fs::remove_dir_all(&temp_root);
-    println!("{}", ui_heading("done criteria check"));
+    println!("{}", ui_heading(format!("{NOUN_DONE_CONTRACT} check")));
     match result {
         Ok(results) => {
             let failed_required = results
                 .iter()
                 .any(|result| result.must_pass && !result.passed);
             if failed_required {
-                println!("{}", ui_status("done criteria failed"));
+                println!("{}", ui_status(format!("{NOUN_DONE_CONTRACT} failed")));
             } else {
-                println!("{}", ui_ok("done criteria passed"));
+                println!("{}", ui_ok(format!("{NOUN_DONE_CONTRACT} passed")));
             }
             print_acceptance_results(&results);
         }
         Err(err) => {
             println!(
                 "{}",
-                ui_warn(format!("done criteria check could not run: {err}"))
+                ui_warn(format!("{NOUN_DONE_CONTRACT} check could not run: {err}"))
             );
         }
     }
@@ -3315,33 +3324,36 @@ fn prompt_start_existing_done_criteria(
 ) -> Result<()> {
     loop {
         let choice = prompter.select_one(prompt::SelectPrompt {
-            title: "Review done criteria".to_string(),
+            title: format!("Review {NOUN_DONE_CONTRACT}"),
             help: Some(format!(
-                "Current criteria: {}. You can view, check, update, keep, or cancel before launch.",
+                "Current {NOUN_DONE_CONTRACT}: {}. You can view, check, update, keep, or cancel before launch.",
                 done_criteria_prompt_detail(selection)
             )),
             choices: vec![
                 start_prompt_choice(
                     "keep",
-                    "Keep current done criteria",
+                    format!("Keep current {NOUN_DONE_CONTRACT}"),
                     done_criteria_prompt_detail(selection),
                 ),
                 start_prompt_choice(
                     "view",
-                    "View current criteria summary",
+                    "View current contract summary",
                     "prints source, path/check count, and manual commands",
                 ),
                 start_prompt_choice(
                     "check",
-                    "Check current criteria now",
+                    "Check current contract now",
                     "dry-runs the configured checks against this working tree",
                 ),
                 start_prompt_choice(
                     "update",
-                    "Update criteria before launch",
+                    "Update contract before launch",
                     "writes new plain-English criteria through the def-done flow",
                 ),
-                prompt::SelectChoice::new("cancel", "Cancel and show done-criteria commands"),
+                prompt::SelectChoice::new(
+                    "cancel",
+                    format!("Cancel and show {NOUN_DONE_CONTRACT} commands"),
+                ),
             ],
             default_index: 0,
         })?;
@@ -3360,7 +3372,7 @@ fn prompt_start_existing_done_criteria(
                 if text.trim().is_empty() {
                     set_start_recovery(
                         decision,
-                        "empty done criteria were not saved",
+                        format!("empty {NOUN_DONE_CONTRACT} was not saved"),
                         done_criteria_inspection_try_lines(selection),
                     );
                     return Ok(());
@@ -3370,13 +3382,13 @@ fn prompt_start_existing_done_criteria(
                     text: text.trim().to_string(),
                     overwrite_existing: true,
                 };
-                decision.done_criteria_label = "update done criteria before launch".to_string();
+                decision.done_criteria_label = format!("update {NOUN_DONE_CONTRACT} before launch");
                 return Ok(());
             }
             _ => {
                 set_start_recovery(
                     decision,
-                    "guided start cancelled before accepting done criteria",
+                    format!("guided start cancelled before accepting the {NOUN_DONE_CONTRACT}"),
                     done_criteria_inspection_try_lines(selection),
                 );
                 return Ok(());
@@ -3754,10 +3766,10 @@ fn resolve_start_done_criteria(
     }
 
     decision.done_criteria_source = StartDoneCriteriaSource::Missing;
-    decision.done_criteria_label = "missing done criteria".to_string();
+    decision.done_criteria_label = format!("missing {NOUN_DONE_CONTRACT}");
     set_start_recovery(
         decision,
-        "done criteria are missing for this repo",
+        format!("{NOUN_DONE_CONTRACT} is missing for this repo"),
         vec![format!(
             "deadreckon def-done \"what should count as done\" && deadreckon start \"{}\"",
             shell_display_quote(&decision.goal)
@@ -12120,7 +12132,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
                 .map(|(_, value)| value.clone())
                 .unwrap_or_else(|| done_label.clone()),
         ),
-        ("done criteria".to_string(), done_label),
+        (NOUN_DONE_CONTRACT.to_string(), done_label),
     ]);
     if max_spend.is_some_and(|cap| cap > 50.0) {
         rows.push((
@@ -13566,7 +13578,7 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
         ("children", children.as_str()),
         ("providers", providers.as_str()),
         ("source", source.as_str()),
-        ("done criteria", gate.as_str()),
+        (NOUN_DONE_CONTRACT, gate.as_str()),
         ("capabilities", capabilities.as_str()),
     ];
     print_kv_block(&items);
@@ -13663,7 +13675,7 @@ fn print_orchestrate_preflight(
         ("provider".to_string(), providers),
         ("source".to_string(), source.clone()),
         ("workspace".to_string(), source),
-        ("done criteria".to_string(), gate.clone()),
+        (NOUN_DONE_CONTRACT.to_string(), gate.clone()),
         ("done".to_string(), gate),
         ("merge repair".to_string(), repair),
         ("sandbox".to_string(), sandbox),
@@ -13760,7 +13772,7 @@ fn print_orchestrate_started(
         ("children", children.as_str()),
         ("providers", providers.as_str()),
         ("source", source.as_str()),
-        ("done criteria", gate.as_str()),
+        (NOUN_DONE_CONTRACT, gate.as_str()),
         ("merge repair", repair.as_str()),
         ("sandbox", sandbox.as_str()),
         ("spend", spend.as_str()),
@@ -16965,8 +16977,13 @@ fn confirm_campaign_start(campaign: &deadreckon_core::campaign::Campaign, yes: b
     if prompt::confirm(&prompt, false)? {
         Ok(())
     } else {
-        Err(CliError::Core(DeadreckonError::InvalidInput(
-            "campaign cancelled".to_string(),
+        Err(CliError::Core(deadreckon_core::user_error(
+            "campaign preflight cancelled",
+            &format!(
+                "deadreckon campaign \"{}\" --n {} --preview",
+                shell_display_quote(&campaign.root_goal),
+                campaign.n.clamp(2, 6)
+            ),
         )))
     }
 }
@@ -17096,8 +17113,13 @@ fn prompt_campaign_preflight_actions(
                 return Ok(CampaignPreflightAction::ChangeCount(count));
             }
             _ => {
-                return Err(CliError::Core(DeadreckonError::InvalidInput(
-                    "campaign cancelled".to_string(),
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "campaign preflight cancelled",
+                    &format!(
+                        "deadreckon campaign \"{}\" --n {} --preview",
+                        shell_display_quote(&campaign.root_goal),
+                        campaign.n.clamp(2, 6)
+                    ),
                 )));
             }
         }
@@ -22611,7 +22633,7 @@ fn notification_verdict(
     outcome: &RunLoopOutcome,
 ) -> String {
     match outcome {
-        RunLoopOutcome::Done => format!("verified run ({})", acceptance_status_value(state)),
+        RunLoopOutcome::Done => format!("{NOUN_VERIFIED_RUN} ({})", acceptance_status_value(state)),
         RunLoopOutcome::PausedAtCap => "paused at cap".to_string(),
         RunLoopOutcome::Failed => format!("failed run ({})", acceptance_status_value(state)),
         RunLoopOutcome::Killed => "killed run".to_string(),
@@ -35822,17 +35844,18 @@ mod tui_tests {
         AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG,
         ChainAttachTuiState, CommandAudience, CommandDiscovery, CommandHelpEntry, CompletionAction,
         ConfigDefaults, GoalShape, GoalShapeRecommendation, GoalShapeSource, HELP_ALL_GROUPS,
-        LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
-        NarrativeRefreshKind, NarrativeVisualMode, PLAN_AS_BUILT, PLAN_CHILDREN, PLAN_DECISIONS,
-        PLAN_DOC_PROVIDER_ERROR, PlanAttachRenderState, PlanDocRefreshOptions, PlanFeedEvent,
-        PlanNarrativeRefreshInput, PlanProviderAsBuilt, PlanProviderChild, PlanProviderDecisions,
-        PlanProviderDocs, PlanProviderItem, PlanProviderNarrative, PlanWrapperDocContext,
-        ProviderActivity, ProviderJsonlLogSpec, Result, RunNarrativeRenderInput, StartDoneAction,
-        StartDoneCriteriaSource, StartLaunchInput, StartPromptEligibility, StartPrompter,
-        StartProviderSource, StartSelectedMode, StartSelectionSource, StartSourceMode,
-        TopHelpGroup, acceptance_activity_lines, add_start_history_actions,
-        apply_goal_shape_recommendation, attach_banner, attach_header_text, attach_live_inventory,
-        attach_loop_stage_work, attach_should_return_to_plan, build_run_narrative_projection,
+        LiveFile, NOUN_DONE_CONTRACT, NOUN_VERIFIED_RUN, NarrativeAcceptanceRefreshTracker,
+        NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode, PLAN_AS_BUILT,
+        PLAN_CHILDREN, PLAN_DECISIONS, PLAN_DOC_PROVIDER_ERROR, PlanAttachRenderState,
+        PlanDocRefreshOptions, PlanFeedEvent, PlanNarrativeRefreshInput, PlanProviderAsBuilt,
+        PlanProviderChild, PlanProviderDecisions, PlanProviderDocs, PlanProviderItem,
+        PlanProviderNarrative, PlanWrapperDocContext, ProviderActivity, ProviderJsonlLogSpec,
+        Result, RunNarrativeRenderInput, StartDoneAction, StartDoneCriteriaSource,
+        StartLaunchInput, StartPromptEligibility, StartPrompter, StartProviderSource,
+        StartSelectedMode, StartSelectionSource, StartSourceMode, TopHelpGroup,
+        acceptance_activity_lines, add_start_history_actions, apply_goal_shape_recommendation,
+        attach_banner, attach_header_text, attach_live_inventory, attach_loop_stage_work,
+        attach_should_return_to_plan, build_run_narrative_projection,
         campaign_drop_subgoal_before_launch, campaign_edit_subgoal_before_launch,
         campaign_replace_sub_goals_before_launch, cancel_plan_narrative_refresh_job,
         cancel_run_narrative_refresh_job, chain_activity_lines, chain_attach_footer_text,
@@ -37874,7 +37897,11 @@ mod tui_tests {
 
         assert_eq!(recommendation.shape, GoalShape::Single);
         assert_eq!(recommendation.n, None);
-        assert!(recommendation.rationale.contains("one verified run"));
+        assert!(
+            recommendation
+                .rationale
+                .contains(&format!("one {NOUN_VERIFIED_RUN}"))
+        );
     }
 
     #[test]
@@ -38313,7 +38340,7 @@ mod tui_tests {
         );
         assert_eq!(
             decision.done_criteria_label,
-            "update done criteria before launch"
+            format!("update {NOUN_DONE_CONTRACT} before launch")
         );
     }
 
@@ -38352,9 +38379,9 @@ mod tui_tests {
         assert_eq!(
             prompter.prompt_titles,
             vec![
-                "Review done criteria",
-                "Review done criteria",
-                "updated definition of done: "
+                format!("Review {NOUN_DONE_CONTRACT}"),
+                format!("Review {NOUN_DONE_CONTRACT}"),
+                "updated definition of done: ".to_string()
             ]
         );
     }

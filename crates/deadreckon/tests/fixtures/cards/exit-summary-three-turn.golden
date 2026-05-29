@@ -1,22 +1,22 @@
-+-------------------------------------------------------------------+
-| * completed run                                                   |
-|   cli:codex worked on branch dr/ship-it-abc12345                  |
-|   turns         3                                                 |
-|   tokens        in 100  out 50                                    |
-|   spend         not metered (subscription) · wall 12.5s · 3 turns |
-|   branch diff   +42  -3  3 files                                  |
-|   files         added 1  updated 2  deleted 0                     |
-|   gate          passed by dr-gate (2 checks)                      |
-|   tests modified this run  no                                     |
-|   working                  /tmp/work                              |
-|                                                                   |
-|   gate: SIGNED by dr-gate — the agent could not have written this |
-|   proof:  /tmp/run/proofs/turn-acceptance.json                    |
-|   story:  /tmp/library/docs/RUN-NARRATIVE.md                      |
-|   lineage: src/main.rs ← turn 2 · cli:codex · tool-write-2        |
-|   → deadreckon apply abc12345                                     |
-|                                                                   |
-|   next          deadreckon apply abc12345                         |
-|   attach        deadreckon attach abc12345                        |
-|   show          deadreckon show abc12345                          |
-+-------------------------------------------------------------------+
++--------------------------------------------------------------------------------------+
+| * VERIFIED                                                                           |
+|   verified run, verified by dr-gate; completed run by cli:codex on branch dr/ship... |
+|   turns         3                                                                    |
+|   tokens        in 100  out 50                                                       |
+|   spend         not metered (subscription) · wall 12.5s · 3 turns                    |
+|   branch diff   +42  -3  3 files                                                     |
+|   files         added 1  updated 2  deleted 0                                        |
+|   gate          passed by dr-gate (2 checks)                                         |
+|   tests modified this run  no                                                        |
+|   working                  /tmp/work                                                 |
+|                                                                                      |
+|   gate: SIGNED by dr-gate — the agent could not have written this                    |
+|   proof:  /tmp/run/proofs/turn-acceptance.json                                       |
+|   story:  /tmp/library/docs/RUN-NARRATIVE.md                                         |
+|   lineage: src/main.rs ← turn 2 · cli:codex · tool-write-2                           |
+|   → deadreckon apply abc12345                                                        |
+|                                                                                      |
+|   next          deadreckon apply abc12345                                            |
+|   attach        deadreckon attach abc12345                                           |
+|   show          deadreckon show abc12345                                             |
++--------------------------------------------------------------------------------------+

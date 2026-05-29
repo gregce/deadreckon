@@ -74,9 +74,10 @@ pub use gate::{
     write_acceptance_marker_with_results,
 };
 pub use glossary::{
-    NOUN_CHAIN, NOUN_CHILD, NOUN_PLAN, NOUN_RUN, StatusLabel, chain_status_label,
-    chain_step_status_label, phase_status_label, plan_status_label, plan_task_status_label,
-    run_status_label, status_label,
+    DR_GATE_DESCRIPTION, NOUN_CHAIN, NOUN_CHILD, NOUN_DONE_CONTRACT, NOUN_PLAN, NOUN_RUN,
+    NOUN_VERIFIED_RUN, PHRASE_VERIFIED_BY_DR_GATE, StatusLabel, VERDICT_VERIFIED,
+    chain_status_label, chain_step_status_label, phase_status_label, plan_status_label,
+    plan_task_status_label, run_status_label, status_label,
 };
 pub use lock::{
     LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,
