@@ -4520,6 +4520,7 @@ fn merge_manifest_records_child_provider_roles() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_smoke_role_aliases(&paths);
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
@@ -6073,6 +6074,24 @@ fn deadreckon(paths: &DeadreckonPaths) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
     command.env("DEADRECKON_HOME", paths.home());
     command
+}
+
+fn write_smoke_role_aliases(paths: &DeadreckonPaths) {
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(
+        paths.config_path(),
+        r#"
+[providers."smoke:planner"]
+kind = "smoke"
+
+[providers."smoke:default"]
+kind = "smoke"
+
+[providers."smoke:reviewer"]
+kind = "smoke"
+"#,
+    )
+    .expect("config");
 }
 
 fn assert_success(output: &std::process::Output) {
