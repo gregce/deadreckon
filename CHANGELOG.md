@@ -2,7 +2,7 @@
 
 ## Effortless (production release) - 2026-05-28
 
-- P1 (`af09c29`): Added the whole-surface friendliness contract table and `docs/FRIENDLINESS-AUDIT.md`, with depth tests proving every canonical top-level verb has one row per six-clause contract item.
+- P1 (`c81b617`): Added the whole-surface friendliness contract table and `docs/FRIENDLINESS-AUDIT.md`, with depth tests proving every canonical top-level verb has one row per six-clause contract item.
 
 ## Campaign Orchestration (production release) - 2026-05-28
 
