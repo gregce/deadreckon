@@ -10,6 +10,7 @@
 - P6 (`85f1d31`): Swept spend and gate verdict rendering so exit cards, status, finish, plan child details, and campaign child summaries show honest subscription spend and per-check gate results.
 - P7 (`0bef0f4`): Added opt-in `[notify]` parsing, bounded native/command/webhook channels, redacted notification context, and `notify.jsonl` attempt records.
 - P8 (`823945b`): Fired enabled notifications on accepted, paused-at-cap, and failed lifecycle outcomes while disabled configs stay silent.
+- P9 (`10dd47b`): Added bounded provider-backed goal-shape recommendations for `start`, preview-scoped classifier records, optional campaign `--n`, and editable campaign preflight controls.
 
 ## Campaign Orchestration (production release) - 2026-05-28
 
