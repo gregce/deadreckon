@@ -585,7 +585,7 @@ fn start_as_built_documents_guided_front_door() {
         "`deadreckon start \"<goal>\"`",
         "ephemeral launch decision",
         "No `PipelineState` schema",
-        "provider setup, done criteria, source mode, history, and run-vs-orchestrate",
+        "provider setup, done contract, source mode, history, and run-vs-orchestrate/campaign mode",
         "dispatches to the existing `run`, `extend`, and `orchestrate` handlers",
         "History-aware `start`",
         "keep/view/check/update/cancel",
@@ -606,7 +606,8 @@ fn start_v1_candidates_track_guided_deferrals() {
 
     for required in [
         "Durable launch profiles",
-        "LLM mode classification",
+        "Richer multi-piece goal classification",
+        "provider-backed goal-shape recommendation",
         "Personalized onboarding",
         "Provider-specific setup wizards",
     ] {
