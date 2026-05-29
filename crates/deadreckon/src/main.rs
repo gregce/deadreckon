@@ -3312,8 +3312,8 @@ fn resolve_start_provider(
             decision,
             "provider setup is incomplete",
             vec![
-                "deadreckon init".to_string(),
-                "deadreckon detect".to_string(),
+                "deadreckon try".to_string(),
+                "deadreckon config provider cli:codex".to_string(),
             ],
         );
         return Ok(());
@@ -3328,22 +3328,19 @@ fn resolve_start_provider(
         | setup::SetupProviderSource::None => StartProviderSource::Configured,
     };
     decision.provider_route = Some(provider.clone());
-    decision.provider_label = format!("{provider} ({})", decision.provider_source.label());
     if matches!(decision.provider_source, StartProviderSource::Detected) {
-        if let Some(prompter) = prompter.as_mut() {
-            prompt_start_provider(decision, paths, defaults, &mut **prompter)?;
-            return Ok(());
-        }
-        set_start_recovery(
-            decision,
-            format!("detected {provider}, but no default provider is configured"),
-            vec![format!("deadreckon config provider {provider}")],
-        );
+        decision.provider_label = detected_start_provider_label(provider);
+        return Ok(());
     }
+    decision.provider_label = format!("{provider} ({})", decision.provider_source.label());
     if let Some(prompter) = prompter.as_mut() {
         prompt_start_provider(decision, paths, defaults, &mut **prompter)?;
     }
     Ok(())
+}
+
+fn detected_start_provider_label(provider: &str) -> String {
+    format!("{provider} (detected) - run deadreckon config provider {provider} to make permanent")
 }
 
 fn resolve_start_done_criteria(

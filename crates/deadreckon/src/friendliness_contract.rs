@@ -88,7 +88,7 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
     },
     VerbFriendliness {
         verb: "start",
-        marks: [F, P, P, P, F, P],
+        marks: [P, P, P, P, F, P],
     },
     VerbFriendliness {
         verb: "run",

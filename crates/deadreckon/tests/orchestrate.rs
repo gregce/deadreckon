@@ -341,7 +341,7 @@ fn start_preview_names_path_provider_done_workspace_and_finish() {
 }
 
 #[test]
-fn start_missing_provider_refuses_with_init_and_detect_try_lines() {
+fn start_with_no_provider_refuses_with_try_line() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -358,31 +358,95 @@ fn start_missing_provider_refuses_with_init_and_detect_try_lines() {
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
     assert!(err.contains("provider"), "{err}");
-    assert!(err.contains("try: deadreckon init"), "{err}");
-    assert!(err.contains("try: deadreckon detect"), "{err}");
-}
-
-#[test]
-fn start_detected_unconfigured_provider_suggests_config_provider() {
-    let temp = repo_tempdir();
-    let repo = clean_git_repo(&temp);
-    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
-    let bin = temp.path().join("bin");
-    write_fake_path_binary(&bin, "codex", "printf 'codex-cli 9.9.9\\n'\n");
-
-    let output = deadreckon(&paths)
-        .current_dir(&repo)
-        .env("PATH", &bin)
-        .args(["start", "build the app", "--plain"])
-        .output()
-        .expect("start detected provider");
-
-    assert!(!output.status.success(), "{}", stdout(&output));
-    let err = stderr(&output);
-    assert!(err.contains("cli:codex"), "{err}");
+    assert!(err.contains("try: deadreckon try"), "{err}");
     assert!(
         err.contains("try: deadreckon config provider cli:codex"),
         "{err}"
+    );
+}
+
+#[test]
+fn start_adopts_single_detected_subscription_provider_inline() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(repo.join(".deadreckon")).expect("acceptance dir");
+    fs::write(
+        repo.join(".deadreckon/acceptance.yaml"),
+        "name: start ready\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("acceptance");
+    git(&repo, &["add", ".deadreckon/acceptance.yaml"]).expect("add acceptance");
+    git(&repo, &["commit", "-m", "add acceptance"]).expect("commit acceptance");
+    let bin = temp.path().join("bin");
+    write_fake_path_binary(&bin, "codex", "printf 'codex-cli 9.9.9\\n'\n");
+    let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display());
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .env("PATH", &path)
+        .args([
+            "start",
+            "build the app",
+            "--mode",
+            "run",
+            "--preview",
+            "--plain",
+        ])
+        .output()
+        .expect("start detected provider");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("provider"), "{out}");
+    assert!(out.contains("cli:codex (detected)"), "{out}");
+    assert!(
+        out.contains("deadreckon config provider cli:codex"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("Choose provider"),
+        "single detected provider should be adopted inline:\n{out}"
+    );
+    assert!(
+        !paths.config_path().exists(),
+        "inline detected provider adoption must not write config"
+    );
+}
+
+#[test]
+fn start_with_two_detected_providers_still_prompts() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(repo.join(".deadreckon")).expect("acceptance dir");
+    fs::write(
+        repo.join(".deadreckon/acceptance.yaml"),
+        "name: start ready\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("acceptance");
+    git(&repo, &["add", ".deadreckon/acceptance.yaml"]).expect("add acceptance");
+    git(&repo, &["commit", "-m", "add acceptance"]).expect("commit acceptance");
+    let bin = temp.path().join("bin");
+    write_fake_path_binary(&bin, "codex", "printf 'codex-cli 9.9.9\\n'\n");
+    write_fake_path_binary(&bin, "claude", "printf 'claude-code 9.9.9\\n'\n");
+
+    let output = deadreckon_pty(
+        &paths,
+        &repo,
+        &["1", "1"],
+        &["start", "build the app", "--mode", "run", "--preview"],
+        "provider[[:space:]]*:",
+        Some(&bin),
+    );
+
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(text.contains("Choose provider"), "{text}");
+    assert!(text.contains("cli:codex"), "{text}");
+    assert!(text.contains("cli:claude-code"), "{text}");
+    assert!(
+        !paths.config_path().exists(),
+        "interactive provider choice should not write config"
     );
 }
 
@@ -494,7 +558,7 @@ fn pty_start_picker_choose_full_plan_preview() {
 }
 
 #[test]
-fn pty_start_picker_choose_detected_provider_preview_without_config_write() {
+fn pty_start_single_detected_provider_preview_without_config_write() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -512,18 +576,22 @@ fn pty_start_picker_choose_detected_provider_preview_without_config_write() {
     let output = deadreckon_pty(
         &paths,
         &repo,
-        &["1", "1"],
+        &["1"],
         &["start", "build the app", "--mode", "run", "--preview"],
         "provider[[:space:]]*: cli:codex",
         Some(&bin),
     );
 
     let text = format!("{}{}", stdout(&output), stderr(&output));
-    assert!(text.contains("Choose provider"), "{text}");
-    assert!(text.contains("cli:codex (interactive)"), "{text}");
+    assert!(!text.contains("Choose provider"), "{text}");
+    assert!(text.contains("cli:codex (detected)"), "{text}");
+    assert!(
+        text.contains("deadreckon config provider cli:codex"),
+        "{text}"
+    );
     assert!(
         !paths.config_path().exists(),
-        "interactive provider choice should not write config"
+        "inline detected provider adoption should not write config"
     );
 }
 
@@ -682,8 +750,8 @@ fn start_preview_json_has_next_actions_and_try_lines_without_ansi() {
     let value: Value = serde_json::from_str(&out).expect("json");
     assert_eq!(value["kind"], "start");
     assert_eq!(value["will_start"], false);
-    assert_eq!(value["try_lines"][0], "deadreckon init");
-    assert_eq!(value["next_actions"][0], "deadreckon init");
+    assert_eq!(value["try_lines"][0], "deadreckon try");
+    assert_eq!(value["next_actions"][0], "deadreckon try");
 }
 
 #[test]

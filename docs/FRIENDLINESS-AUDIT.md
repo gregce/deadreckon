@@ -52,7 +52,7 @@ verb.
 | `try` | One-command rollback | n-a | It does not change the caller checkout. |
 | `try` | One verdict + ONE primary action | pass | The proof block leads with a signed gate and one start command. |
 | `try` | Lifecycle hint | pass | It ends with `deadreckon start "build the real thing"`. |
-| `start` | Auto-detect, don't ask | fail | Single detected subscription providers still need inline adoption. |
+| `start` | Auto-detect, don't ask | pass | A single detected subscription provider is adopted inline; multiple detections keep the picker. |
 | `start` | Preview before mutate | pass | Guided launch previews and confirms before creating run/plan state. |
 | `start` | Refuse with try: | pass | Non-TTY missing provider/done/source refusals include recovery lines. |
 | `start` | One-command rollback | pass | Launched worktree runs point at cleanup/abandon paths. |

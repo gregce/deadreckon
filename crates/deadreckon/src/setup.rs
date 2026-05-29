@@ -165,7 +165,7 @@ impl SetupRefusal {
 }
 
 pub(crate) fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String> {
-    registry
+    let providers = registry
         .iter()
         .filter(|descriptor| {
             descriptor.kind == DescriptorKind::Cli
@@ -176,7 +176,12 @@ pub(crate) fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Opt
                     .is_some_and(command_exists)
         })
         .map(|descriptor| descriptor.id.clone())
-        .next()
+        .collect::<Vec<_>>();
+    if providers.len() == 1 {
+        providers.into_iter().next()
+    } else {
+        None
+    }
 }
 
 pub(crate) fn select_provider_setup(
