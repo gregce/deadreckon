@@ -241,10 +241,10 @@ pub fn check_coverage(
             AcceptanceCheck::Shell { command, cwd, .. } => {
                 let cwd_path = cwd
                     .as_deref()
-                    .and_then(|cwd| rendered_path(working_dir, working_dir, cwd))
+                    .map(|cwd| rendered_path(working_dir, working_dir, cwd))
                     .unwrap_or_else(|| working_dir.to_path_buf());
                 for path in command_existing_paths(command, working_dir, &cwd_path) {
-                    let classification = if is_rust_test_file(working_dir, &path)? {
+                    let classification = if is_rust_test_file(working_dir, &path) {
                         CoverageClassification::Test
                     } else {
                         CoverageClassification::Unknown
@@ -485,7 +485,7 @@ fn rust_test_files(working_dir: &Path) -> Result<Vec<PathBuf>> {
         if ignored_relative(&relative) {
             continue;
         }
-        if is_rust_test_file(working_dir, &relative)? {
+        if is_rust_test_file(working_dir, &relative) {
             files.push(relative);
         }
     }
@@ -493,26 +493,26 @@ fn rust_test_files(working_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn is_rust_test_file(working_dir: &Path, relative: &Path) -> Result<bool> {
+fn is_rust_test_file(working_dir: &Path, relative: &Path) -> bool {
     if relative.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-        return Ok(false);
+        return false;
     }
     if relative
         .components()
         .any(|component| component.as_os_str() == "tests")
     {
-        return Ok(true);
+        return true;
     }
     if relative
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with("_test.rs"))
     {
-        return Ok(true);
+        return true;
     }
     let path = working_dir.join(relative);
     let body = fs::read_to_string(&path).unwrap_or_default();
-    Ok(body.contains("#[test]") || body.contains("#[cfg(test)]"))
+    body.contains("#[test]") || body.contains("#[cfg(test)]")
 }
 
 fn command_existing_paths(command: &str, working_dir: &Path, cwd: &Path) -> Vec<PathBuf> {
@@ -527,9 +527,7 @@ fn command_existing_paths(command: &str, working_dir: &Path, cwd: &Path) -> Vec<
         if token.is_empty() || token.starts_with('-') {
             continue;
         }
-        let Some(candidate) = rendered_path(working_dir, cwd, token) else {
-            continue;
-        };
+        let candidate = rendered_path(working_dir, cwd, token);
         if candidate.exists()
             && let Some(relative) = working_relative_path(working_dir, &candidate)
             && !ignored_relative(&relative)
@@ -541,11 +539,10 @@ fn command_existing_paths(command: &str, working_dir: &Path, cwd: &Path) -> Vec<
 }
 
 fn rendered_relative(working_dir: &Path, base: &Path, value: &str) -> Option<PathBuf> {
-    rendered_path(working_dir, base, value)
-        .and_then(|path| working_relative_path(working_dir, &path))
+    working_relative_path(working_dir, &rendered_path(working_dir, base, value))
 }
 
-fn rendered_path(working_dir: &Path, base: &Path, value: &str) -> Option<PathBuf> {
+fn rendered_path(working_dir: &Path, base: &Path, value: &str) -> PathBuf {
     let rendered = value.replace("{working_dir}", &working_dir.to_string_lossy());
     let path = PathBuf::from(rendered);
     let absolute = if path.is_absolute() {
@@ -553,7 +550,7 @@ fn rendered_path(working_dir: &Path, base: &Path, value: &str) -> Option<PathBuf
     } else {
         base.join(path)
     };
-    Some(lexical_normalize(&absolute))
+    lexical_normalize(&absolute)
 }
 
 fn working_relative_path(working_dir: &Path, path: &Path) -> Option<PathBuf> {

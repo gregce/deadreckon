@@ -10236,7 +10236,7 @@ fn acceptance_check_count(raw: &str) -> Result<usize> {
 }
 
 fn validate_acceptance_yaml_integrity(raw: &str) -> Result<()> {
-    let checks = deadreckon_core::acceptance_checks_from_yaml(raw)?;
+    let checks = deadreckon_core::gate::acceptance_checks_from_yaml(raw)?;
     let findings = deadreckon_core::tamper::lint_checks(&checks);
     if let Some(finding) = findings.first() {
         return Err(CliError::Core(deadreckon_core::user_error(
@@ -10570,14 +10570,14 @@ fn acceptance_display(state: &deadreckon_core::PipelineState) -> AcceptanceDispl
         && let Ok(bytes) = fs::read(&marker_path)
         && let Ok(marker) = serde_json::from_slice::<AcceptanceMarker>(&bytes)
     {
-        return acceptance_display_from_gate_line(marker_gate_line(&marker), tamper);
+        return acceptance_display_from_gate_line(marker_gate_line(&marker), tamper.as_ref());
     }
     let progress_path = acceptance_progress_path_for_run_root(&state.run_root);
     if progress_path.exists()
         && let Ok(entries) = read_jsonl::<AcceptanceProgressEntry>(&progress_path)
         && !entries.is_empty()
     {
-        return acceptance_display_from_gate_line(progress_gate_line(&entries), tamper);
+        return acceptance_display_from_gate_line(progress_gate_line(&entries), tamper.as_ref());
     }
     let spec_path = acceptance_spec_path_for_run_root(&state.run_root);
     if spec_path.exists()
@@ -10591,17 +10591,15 @@ fn acceptance_display(state: &deadreckon_core::PipelineState) -> AcceptanceDispl
 
 fn acceptance_display_from_gate_line(
     mut gate: String,
-    tamper: Option<deadreckon_core::tamper::AcceptanceTamper>,
+    tamper: Option<&deadreckon_core::tamper::AcceptanceTamper>,
 ) -> AcceptanceDisplay {
     if let Some(refusal) = tamper
-        .as_ref()
         .filter(|tamper| tamper.verdict == deadreckon_core::tamper::AcceptanceTamperVerdict::Refuse)
     {
         gate = format!("gate: REFUSED - {}", refusal.refusal_reasons.join("; "));
     }
-    let tests_modified = tamper.as_ref().map(tamper_tests_modified);
+    let tests_modified = tamper.map(tamper_tests_modified);
     let caveats = tamper
-        .as_ref()
         .filter(|tamper| tamper.verdict == deadreckon_core::tamper::AcceptanceTamperVerdict::Caveat)
         .map(|tamper| tamper.caveats.clone())
         .unwrap_or_default();
@@ -25281,8 +25279,7 @@ fn show_run_why_failed(state: &deadreckon_core::PipelineState) -> Result<()> {
                     trace.event,
                     one_line(&trace.detail.to_string(), 200)
                 )
-            })
-            .collect::<Vec<_>>(),
+            }),
     );
     render_why_failed(WhyFailedReport {
         kind: "run",

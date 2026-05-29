@@ -67,12 +67,11 @@ pub use events::{
 };
 pub use gate::{
     ACCEPTANCE_PROGRESS_JSONL, AcceptanceCheck, AcceptanceCheckResult, AcceptanceMarker,
-    AcceptanceProgressEntry, AcceptanceSpec, acceptance_checks_from_yaml,
-    acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root,
-    compiled_acceptance_checks, evaluate_acceptance, evaluate_acceptance_checks,
+    AcceptanceProgressEntry, AcceptanceSpec, acceptance_progress_path_for_run_root,
+    acceptance_spec_path_for_run_root, evaluate_acceptance, evaluate_acceptance_checks,
     evaluate_acceptance_checks_with_progress, gate_nonce_path_for_run_root,
-    marker_path_for_run_root, run_acceptance_gate_and_write_marker, validate_acceptance_marker,
-    write_acceptance_marker, write_acceptance_marker_with_results,
+    marker_path_for_run_root, validate_acceptance_marker, write_acceptance_marker,
+    write_acceptance_marker_with_results,
 };
 pub use glossary::{
     NOUN_CHAIN, NOUN_CHILD, NOUN_PLAN, NOUN_RUN, StatusLabel, chain_status_label,
