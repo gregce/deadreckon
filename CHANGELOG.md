@@ -3,7 +3,7 @@
 ## Effortless (production release) - 2026-05-28
 
 - P1 (`c81b617`): Added the whole-surface friendliness contract table and `docs/FRIENDLINESS-AUDIT.md`, with depth tests proving every canonical top-level verb has one row per six-clause contract item.
-- P2: Added `deadreckon try`, a keyless local smoke run that uses the real turn loop and signed `dr-gate` proof, then prints the proof/story/lineage block and one next command.
+- P2 (`bacf76f`): Added `deadreckon try`, a keyless local smoke run that uses the real turn loop and signed `dr-gate` proof, then prints the proof/story/lineage block and one next command.
 
 ## Campaign Orchestration (production release) - 2026-05-28
 
