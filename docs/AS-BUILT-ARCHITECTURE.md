@@ -2277,4 +2277,97 @@ This is tamper-evidence, not a causal soundness proof. It does not prove that a 
 
 ---
 
+## 36. Campaign Orchestration (one task, N orchestrators)
+
+A **campaign** runs one large goal as N independent, separately-coordinated
+workstreams and composes their results into a single promoted run. The verb is
+the top-level `deadreckon campaign <goal> --n <2..=6>`, a peer of `run`,
+`orchestrate`, and `chain` (not a subcommand of `orchestrate`). Campaign logic
+lives in `crates/deadreckon-core/src/campaign.rs`; the command handler and spawn
+glue are in `crates/deadreckon/src/main.rs`.
+
+### 36.1 Mental model: fork→merge lifted one level
+
+`orchestrate` splits a goal into parallel *runs* under one coordinator and merges
+them. A campaign splits a goal into parallel *orchestrations*: each sub-goal is
+launched as a full `orchestrate full-plan` subprocess (a depth-1
+sub-orchestrator), and because a plan's merge output is itself a normal promoted
+run (§30.4), the meta-merge composes those result runs with the same primitives
+as plan merge. Nothing in spawn/isolation/merge is reinvented — only the meta
+layer and its guardrails.
+
+### 36.2 Files (no new struct fields)
+
+A campaign adds no fields to `Plan`, `PlanTask`, or `PipelineState`. Its state is
+file-backed under `~/.deadreckon/plans/<campaign-id>/`: `campaign.json` (the
+`Campaign` + `SubGoal` model), `lineage.json` (nesting depth and ancestors),
+`campaign-rollup.json` (the gate-verdict roll-up), `campaign-events.jsonl` (the
+timeline), `launch/<sub-id>/sub-result.json` (each sub's reported result), and
+`merge-working/` (the composed tree). The promoted result run carries a
+`deadreckon-campaign-manifest.json`.
+
+### 36.3 Depth cap and cycle guard (`CAMPAIGN_MAX_DEPTH = 2`)
+
+A campaign sits at depth 0; its sub-orchestrators at depth 1. A depth-1 process
+invoking `campaign` is refused (`campaign::guard`) — sub-orchestrators run plain
+`orchestrate full-plan`, never another campaign. The cap is a hard constant. The
+guard also refuses a sub-goal whose `task_key`/scope matches an ancestor (cycle).
+
+### 36.4 Lineage env transport across the spawn boundary
+
+A freshly spawned sub-orchestrator learns its depth before it has a plan dir via
+`DEADRECKON_CAMPAIGN_DEPTH`/`_ROOT`/`_ANCESTOR_TASK_KEYS`/`_ANCESTOR_SCOPES`
+(`campaign::parse_lineage`/`lineage_from_env`); the durable record is
+`lineage.json`.
+
+### 36.5 Tree budget allocation and aggregate enforcement
+
+`--max-spend` is a *tree* ceiling. `campaign::allocate_budget` splits it evenly
+(remainder-to-first) into per-sub `--max-spend` shares. The fork driver
+(`run_campaign_fork`) is sequential precisely so it can sum leaf spend and refuse
+the next launch once the aggregate reaches the ceiling
+(`tree_budget_exhausted` → `budget_exhausted` event). A null budget is logged, not
+treated as unbounded.
+
+### 36.6 Sub-orchestrator spawn and result-run discovery
+
+`build_sub_orchestrator_command` reuses the plan-child isolation idiom
+(`DEADRECKON_SCOPE_ROOT` per launch dir) and runs `orchestrate full-plan … --yes`.
+On completion the sub writes `sub-result.json` (plan id + merged run id), which the
+coordinator reads (`discover_sub_result`).
+
+### 36.7 Meta-merge via shared `compose_result_runs`
+
+`mergeable_run_files` is the per-run file enumeration shared with plan merge
+(behavior unchanged). `compose_result_runs` composes the sub-result trees:
+first-writer-wins, and a cross-sub same-path collision is reported as a conflict
+that fails the campaign (no auto-repair across levels in this milestone).
+
+### 36.8 Gate-verdict roll-up and the no-laundering invariant
+
+`build_rollup` reads each leaf run's tamper verdict (§35) and marker, computing a
+worst-of `RollupVerdict`. A campaign reaches clean completion only when every sub
+merged *and* no leaf was refused (`campaign_can_complete`); a refused leaf fails
+the campaign and blocks promotion. The roll-up is written into the result run's
+root and hashed into its acceptance-marker signature (§35 binding extended in
+`gate::marker_signature`), so editing `campaign-rollup.json` after signing
+invalidates the marker — nesting cannot launder a refused leaf into a clean pass.
+
+### 36.9 attach / show --why-failed / kill for campaigns
+
+`resolve_campaign` matches a campaign id prefix. `attach <campaign-id>` prints a
+plain summary of sub rows + roll-up with a breadcrumb (full TUI drill-in into a
+selected sub-plan is a V1 candidate — use `attach <sub-plan-id>`).
+`show <campaign-id> --why-failed` reports refused/caveat subs. `kill <campaign-id>`
+cascades into each sub-plan via the existing plan-kill path, then marks the
+campaign killed.
+
+### 36.10 Current limits
+
+Depth is capped at 2; sub-goals are independent (no cross-sub dependency edges);
+cross-sub conflicts fail rather than auto-repair; attach is a one-hop summary, not
+a recursive event tree. These are tracked in `docs/V1-CANDIDATES.md`.
+
+---
+
 *This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, and 32 in particular. Updated 2026-05-28 for tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~31k lines) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
