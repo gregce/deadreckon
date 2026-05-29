@@ -8,6 +8,7 @@
 - P4 (`e20cf54`): Made `deadreckon start` adopt a single detected subscription CLI inline, keep the provider picker for multiple detected CLIs, and refuse with `deadreckon try`/provider setup recovery when none are available.
 - P5 (`663843f`): Added a shared primary-action slot to cards and made exit cards, status, and finish lead with one primary action while demoting secondary lifecycle actions.
 - P6 (`85f1d31`): Swept spend and gate verdict rendering so exit cards, status, finish, plan child details, and campaign child summaries show honest subscription spend and per-check gate results.
+- P7 (`0bef0f4`): Added opt-in `[notify]` parsing, bounded native/command/webhook channels, redacted notification context, and `notify.jsonl` attempt records.
 
 ## Campaign Orchestration (production release) - 2026-05-28
 
