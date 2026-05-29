@@ -56,7 +56,7 @@ use deadreckon_core::learning::{
     load_learning_policy, persist_reflection, prepare_pr_dry_run, read_learning_bundle,
     read_proposal, record_pr_event, write_candidate, write_eval,
 };
-use deadreckon_core::paths::{sanitize_slug, workspace_scope};
+use deadreckon_core::paths::{sanitize_slug, task_key, workspace_scope};
 use deadreckon_core::update_cache::{read_cache, write_cache};
 use deadreckon_core::{
     AcceptanceMarker, AcceptanceProgressEntry, ApplyMode, ApplyStrategy, BranchPolicy, Chain,
@@ -1810,6 +1810,7 @@ enum StartSelectedMode {
     Run,
     Review,
     FullPlan,
+    Campaign,
 }
 
 impl StartSelectedMode {
@@ -1819,6 +1820,7 @@ impl StartSelectedMode {
             Self::Run => "run",
             Self::Review => "review",
             Self::FullPlan => "full-plan",
+            Self::Campaign => "campaign",
         }
     }
 
@@ -1828,6 +1830,7 @@ impl StartSelectedMode {
             Self::Run => "run",
             Self::Review => "review orchestration",
             Self::FullPlan => "full-plan orchestration",
+            Self::Campaign => "campaign orchestration",
         }
     }
 }
@@ -1835,6 +1838,7 @@ impl StartSelectedMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartSelectionSource {
     ExplicitFlag,
+    GoalShape,
     Heuristic,
     InteractiveChoice,
     Default,
@@ -1844,11 +1848,59 @@ impl StartSelectionSource {
     fn label(self) -> &'static str {
         match self {
             Self::ExplicitFlag => "explicit_flag",
+            Self::GoalShape => "goal_shape",
             Self::Heuristic => "heuristic",
             Self::InteractiveChoice => "interactive_choice",
             Self::Default => "default",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GoalShape {
+    Single,
+    Orchestrate,
+    Campaign,
+}
+
+impl GoalShape {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Orchestrate => "orchestrate",
+            Self::Campaign => "campaign",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GoalShapeSource {
+    Provider,
+    Fallback,
+}
+
+impl GoalShapeSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GoalShapeRecommendation {
+    schema_version: u8,
+    goal: String,
+    shape: GoalShape,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    n: Option<u8>,
+    rationale: String,
+    source: GoalShapeSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2011,6 +2063,7 @@ struct StartLaunchDecision {
     base_run_label: Option<String>,
     history_action_label: Option<String>,
     history_next_actions: Vec<String>,
+    goal_shape: Option<GoalShapeRecommendation>,
     requires_confirmation: bool,
     confirmed_by_start_picker: bool,
     try_lines: Vec<String>,
@@ -2070,6 +2123,7 @@ fn start_launch_decision(input: StartLaunchInput<'_>) -> StartLaunchDecision {
         base_run_label: None,
         history_action_label: None,
         history_next_actions: Vec::new(),
+        goal_shape: None,
         requires_confirmation: false,
         confirmed_by_start_picker: false,
         try_lines: Vec::new(),
@@ -2109,6 +2163,273 @@ fn start_auto_mode_decision(
         StartSelectionSource::Default,
         "goal looks focused enough for a single supervised run".to_string(),
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderGoalShapeDraft {
+    shape: String,
+    #[serde(default)]
+    n: Option<u8>,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+fn start_goal_shape_should_classify(
+    args: &StartCommandArgs,
+    eligibility: StartPromptEligibility,
+) -> bool {
+    matches!(args.mode, crate::cli::CliStartMode::Auto)
+        && (eligibility.allows_prompts() || args.preview || args.json)
+}
+
+fn start_goal_shape_provider_route(
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+    args: &StartCommandArgs,
+) -> Option<String> {
+    goal_shape_provider_route(paths, defaults, args.provider.as_deref())
+}
+
+fn goal_shape_provider_route(
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+    explicit_provider: Option<&str>,
+) -> Option<String> {
+    if let Some(provider) = explicit_provider {
+        return Some(provider.to_string());
+    }
+    provider_setup_selection(
+        paths,
+        setup::ProviderSetupRequest {
+            role: setup::SetupProviderRoleRef::Planner,
+            explicit_provider: None,
+            explicit_model: None,
+            config_default_provider: defaults.provider.as_deref(),
+            config_doc_provider: defaults.doc_provider.as_deref(),
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: false,
+            allow_auto_subscription: true,
+            require_usable_route: true,
+        },
+    )
+    .ok()
+    .and_then(|selection| selection.provider)
+}
+
+async fn classify_goal_shape_for_start(
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+    goal: &str,
+    provider: Option<&str>,
+    plain: bool,
+) -> GoalShapeRecommendation {
+    if let Some(provider) = provider
+        && provider != "smoke"
+        && !provider.starts_with("smoke:")
+        && let Some(recommendation) =
+            provider_goal_shape_recommendation(paths, cwd, goal, provider, plain).await
+    {
+        return recommendation;
+    }
+    fallback_goal_shape_recommendation(goal)
+}
+
+async fn provider_goal_shape_recommendation(
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+    goal: &str,
+    provider: &str,
+    plain: bool,
+) -> Option<GoalShapeRecommendation> {
+    let router = ProviderRouter::from_config_path(&paths.config_path(), Some(provider)).ok()?;
+    let request = ProviderRequest {
+        prompt: goal_shape_prompt(goal),
+        max_output_tokens: 512,
+        cwd: Some(cwd.to_path_buf()),
+        output_path: None,
+        sandbox_backend: None,
+        pid_file: None,
+        cancellation_token: None,
+    };
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        maybe_with_cli_wait_status(!plain, "classifying goal shape", router.complete(&request)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    parse_provider_goal_shape(goal, &response.provider, &response.content)
+}
+
+fn goal_shape_prompt(goal: &str) -> String {
+    format!(
+        "You are a read-only goal-shape classifier for deadreckon. Do not write files, create temporary files, install packages, commit, delete, move, or mutate state.\n\nReturn JSON only: {{\"shape\":\"single|orchestrate|campaign\",\"n\":2,\"rationale\":\"one short line\"}}.\n\nRubric:\n- single: one cohesive change a single supervised run handles.\n- orchestrate: one project with parallelizable subtasks.\n- campaign: several independent projects, each warranting its own coordination.\n\nIf shape is orchestrate or campaign, include n from 2 through 6. Keep rationale short. Goal: {goal}"
+    )
+}
+
+fn parse_provider_goal_shape(
+    goal: &str,
+    provider: &str,
+    content: &str,
+) -> Option<GoalShapeRecommendation> {
+    let parsed = serde_json::from_str::<ProviderGoalShapeDraft>(content)
+        .ok()
+        .or_else(|| {
+            json_slice(content, '{', '}')
+                .and_then(|slice| serde_json::from_str::<ProviderGoalShapeDraft>(slice).ok())
+        })?;
+    let shape = parse_goal_shape(&parsed.shape)?;
+    let rationale = parsed.rationale.unwrap_or_default().trim().to_string();
+    if rationale.is_empty() {
+        return None;
+    }
+    let n = goal_shape_count(shape, parsed.n);
+    Some(GoalShapeRecommendation {
+        schema_version: 1,
+        goal: goal.to_string(),
+        shape,
+        n,
+        rationale,
+        source: GoalShapeSource::Provider,
+        provider: Some(provider.to_string()),
+    })
+}
+
+fn parse_goal_shape(value: &str) -> Option<GoalShape> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "single" | "run" => Some(GoalShape::Single),
+        "orchestrate" | "orchestration" | "full-plan" | "full_plan" => Some(GoalShape::Orchestrate),
+        "campaign" => Some(GoalShape::Campaign),
+        _ => None,
+    }
+}
+
+fn goal_shape_count(shape: GoalShape, n: Option<u8>) -> Option<u8> {
+    match shape {
+        GoalShape::Single => None,
+        GoalShape::Orchestrate | GoalShape::Campaign => Some(n.unwrap_or(3).clamp(2, 6)),
+    }
+}
+
+fn fallback_goal_shape_recommendation(goal: &str) -> GoalShapeRecommendation {
+    let lower = goal.to_ascii_lowercase();
+    let (shape, n, rationale) = if start_goal_recommends_full_plan(&lower) {
+        (
+            GoalShape::Orchestrate,
+            Some(recommend_child_count_for_goal(goal, CliPlanMode::FullPlan)),
+            "goal names parallel or separable workstreams".to_string(),
+        )
+    } else {
+        let clauses = deterministic_campaign_clause_count(goal);
+        if clauses >= 2 {
+            (
+                GoalShape::Campaign,
+                Some((clauses as u8).clamp(2, 6)),
+                format!("goal reads as {clauses} independent clauses"),
+            )
+        } else {
+            (
+                GoalShape::Single,
+                None,
+                "goal looks focused enough for one verified run".to_string(),
+            )
+        }
+    };
+    GoalShapeRecommendation {
+        schema_version: 1,
+        goal: goal.to_string(),
+        shape,
+        n,
+        rationale,
+        source: GoalShapeSource::Fallback,
+        provider: None,
+    }
+}
+
+fn deterministic_campaign_clause_count(goal: &str) -> usize {
+    let lower = goal.to_ascii_lowercase();
+    let normalized = lower
+        .replace(", and ", "|")
+        .replace(" and ", "|")
+        .replace(" then ", "|")
+        .replace([';', ','], "|");
+    normalized
+        .split('|')
+        .map(str::trim)
+        .filter(|clause| goal_shape_clause_is_nounish(clause))
+        .count()
+}
+
+fn goal_shape_clause_is_nounish(clause: &str) -> bool {
+    const STOP: &[&str] = &[
+        "a", "an", "and", "as", "build", "create", "do", "fix", "for", "make", "the", "then", "to",
+        "with",
+    ];
+    clause
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| word.len() >= 3)
+        .any(|word| !STOP.contains(&word))
+}
+
+fn goal_shape_to_start_mode(shape: GoalShape) -> StartSelectedMode {
+    match shape {
+        GoalShape::Single => StartSelectedMode::Run,
+        GoalShape::Orchestrate => StartSelectedMode::FullPlan,
+        GoalShape::Campaign => StartSelectedMode::Campaign,
+    }
+}
+
+fn apply_goal_shape_recommendation(
+    decision: &mut StartLaunchDecision,
+    recommendation: GoalShapeRecommendation,
+) {
+    if matches!(decision.selected_mode, StartSelectedMode::Review) {
+        decision.goal_shape = Some(recommendation);
+        return;
+    }
+    decision.selected_mode = goal_shape_to_start_mode(recommendation.shape);
+    decision.selection_source = StartSelectionSource::GoalShape;
+    decision.reason = format!(
+        "{} suggested {}: {}",
+        recommendation.source.label(),
+        recommendation.shape.label(),
+        recommendation.rationale
+    );
+    if matches!(
+        recommendation.shape,
+        GoalShape::Orchestrate | GoalShape::Campaign
+    ) {
+        decision.child_count = recommendation.n;
+    }
+    decision.goal_shape = Some(recommendation);
+}
+
+fn goal_shape_preview_path(paths: &DeadreckonPaths, scope: &str, goal: &str) -> PathBuf {
+    paths
+        .scope_root(scope)
+        .join("preview")
+        .join(format!("{}.json", task_key(goal)))
+}
+
+fn write_goal_shape_preview_record(
+    paths: &DeadreckonPaths,
+    scope: &str,
+    recommendation: &GoalShapeRecommendation,
+) -> Result<()> {
+    let path = goal_shape_preview_path(paths, scope, &recommendation.goal);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(recommendation).map_err(|source| DeadreckonError::Json {
+            path: path.clone(),
+            source,
+        })?,
+    )?;
+    Ok(())
 }
 
 fn start_goal_recommends_review(lower_goal: &str) -> bool {
@@ -2198,6 +2519,11 @@ fn maybe_prompt_start_mode(
             "New full-plan pass",
             "equivalent to --mode full-plan",
         ),
+        prompt::SelectChoice::with_detail(
+            "campaign",
+            "New campaign pass",
+            "split independent projects into sub-orchestrators",
+        ),
         prompt::SelectChoice::new("cancel", "Cancel"),
     ]);
     let choice = prompter.select_one(prompt::SelectPrompt {
@@ -2236,6 +2562,11 @@ fn maybe_prompt_start_mode(
             decision.selected_mode = StartSelectedMode::FullPlan;
             decision.selection_source = StartSelectionSource::InteractiveChoice;
             decision.reason = "interactive picker selected full-plan orchestration".to_string();
+        }
+        "campaign" => {
+            decision.selected_mode = StartSelectedMode::Campaign;
+            decision.selection_source = StartSelectionSource::InteractiveChoice;
+            decision.reason = "interactive picker selected campaign orchestration".to_string();
         }
         _ => set_start_recovery(
             decision,
@@ -2676,20 +3007,22 @@ fn resolve_start_orchestration_options(
     }
 
     match decision.selected_mode {
-        StartSelectedMode::FullPlan => {
+        StartSelectedMode::FullPlan | StartSelectedMode::Campaign => {
             if let Some(n) = args.children {
                 validate_task_count(usize::from(n)).map_err(CliError::Core)?;
                 decision.child_count = Some(n);
-            } else if let Some(prompter) = prompter.as_mut() {
-                prompt_start_child_count(decision, &mut **prompter)?;
-                if decision.recovery.is_some() {
-                    return Ok(());
+            } else if decision.child_count.is_none() {
+                if let Some(prompter) = prompter.as_mut() {
+                    prompt_start_child_count(decision, &mut **prompter)?;
+                    if decision.recovery.is_some() {
+                        return Ok(());
+                    }
+                } else {
+                    decision.child_count = Some(recommend_child_count_for_goal(
+                        &decision.goal,
+                        CliPlanMode::FullPlan,
+                    ));
                 }
-            } else {
-                decision.child_count = Some(recommend_child_count_for_goal(
-                    &decision.goal,
-                    CliPlanMode::FullPlan,
-                ));
             }
 
             if let Some(route) = args.planner_provider.as_deref() {
@@ -2731,13 +3064,31 @@ fn resolve_start_orchestration_options(
                 }
             }
 
-            if !args.child_provider.is_empty() {
+            if matches!(decision.selected_mode, StartSelectedMode::Campaign)
+                && !args.child_provider.is_empty()
+            {
+                set_start_recovery(
+                    decision,
+                    "per-child provider overrides are only supported by start --mode full-plan",
+                    vec![format!(
+                        "deadreckon campaign \"{}\" --provider <provider>",
+                        shell_display_quote(&decision.goal)
+                    )],
+                );
+                return Ok(());
+            }
+
+            if matches!(decision.selected_mode, StartSelectedMode::FullPlan)
+                && !args.child_provider.is_empty()
+            {
                 let n = decision.child_count.unwrap_or_else(|| {
                     recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan)
                 });
                 parse_child_provider_overrides(&args.child_provider, n)?;
                 decision.child_provider_overrides = args.child_provider.clone();
-            } else if let Some(prompter) = prompter.as_mut() {
+            } else if matches!(decision.selected_mode, StartSelectedMode::FullPlan)
+                && let Some(prompter) = prompter.as_mut()
+            {
                 let n = decision.child_count.unwrap_or_else(|| {
                     recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan)
                 });
@@ -3095,6 +3446,7 @@ fn prompt_start_dirty_worktree(prompter: &mut dyn StartPrompter) -> Result<Start
 struct LaunchPreviewFacts<'a> {
     goal: &'a str,
     path: &'a str,
+    suggestion: Option<String>,
     provider: &'a str,
     roles: Option<String>,
     base: Option<String>,
@@ -3111,8 +3463,11 @@ fn launch_preview_rows(facts: &LaunchPreviewFacts<'_>) -> Vec<(String, String)> 
     let mut rows = vec![
         ("goal".to_string(), facts.goal.to_string()),
         ("path".to_string(), facts.path.to_string()),
-        ("provider".to_string(), facts.provider.to_string()),
     ];
+    if let Some(suggestion) = facts.suggestion.as_ref() {
+        rows.push(("suggestion".to_string(), suggestion.clone()));
+    }
+    rows.push(("provider".to_string(), facts.provider.to_string()));
     if let Some(roles) = facts.roles.as_ref() {
         rows.push(("roles".to_string(), roles.clone()));
     }
@@ -3147,13 +3502,27 @@ fn start_launch_preview_facts(decision: &StartLaunchDecision) -> LaunchPreviewFa
     let override_command = match decision.selected_mode {
         StartSelectedMode::Run => Some("deadreckon start <goal> --mode review".to_string()),
         StartSelectedMode::Extend => Some("deadreckon start <goal> --mode run".to_string()),
-        StartSelectedMode::Review | StartSelectedMode::FullPlan => {
+        StartSelectedMode::Review | StartSelectedMode::FullPlan | StartSelectedMode::Campaign => {
             Some("deadreckon start <goal> --mode run".to_string())
         }
     };
+    let suggestion = decision.goal_shape.as_ref().map(|recommendation| {
+        let count = recommendation
+            .n
+            .map(|n| format!(" n={n}"))
+            .unwrap_or_default();
+        format!(
+            "{}{} via {}: {}",
+            recommendation.shape.label(),
+            count,
+            recommendation.source.label(),
+            recommendation.rationale
+        )
+    });
     LaunchPreviewFacts {
         goal: &decision.goal,
         path: decision.selected_mode.path_label(),
+        suggestion,
         provider: &decision.provider_label,
         roles: start_provider_role_summary(decision),
         base: decision.base_run_label.clone(),
@@ -3190,6 +3559,15 @@ fn start_provider_role_summary(decision: &StartLaunchDecision) -> Option<String>
             }
             Some(summary)
         }
+        StartSelectedMode::Campaign => {
+            let route = decision.provider_route.as_deref()?;
+            let planner = decision.planner_provider_route.as_deref().unwrap_or(route);
+            let child = decision.child_provider_route.as_deref().unwrap_or(route);
+            let n = decision.child_count.unwrap_or_else(|| {
+                recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan)
+            });
+            Some(format!("subs={n}, planner={planner}, child={child}"))
+        }
     }
 }
 
@@ -3219,7 +3597,10 @@ fn resolve_start_setup(
         let cwd = std::env::current_dir()?;
         resolve_start_done_criteria(decision, &cwd, Some(&mut *prompter))?;
         if decision.recovery.is_none()
-            && !matches!(decision.selected_mode, StartSelectedMode::Extend)
+            && !matches!(
+                decision.selected_mode,
+                StartSelectedMode::Extend | StartSelectedMode::Campaign
+            )
         {
             resolve_start_source_mode(
                 decision,
@@ -3247,7 +3628,10 @@ fn resolve_start_setup(
         let cwd = std::env::current_dir()?;
         resolve_start_done_criteria(decision, &cwd, None)?;
         if decision.recovery.is_none()
-            && !matches!(decision.selected_mode, StartSelectedMode::Extend)
+            && !matches!(
+                decision.selected_mode,
+                StartSelectedMode::Extend | StartSelectedMode::Campaign
+            )
         {
             resolve_start_source_mode(
                 decision,
@@ -3719,6 +4103,21 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
     });
     add_start_history_actions(&mut decision, latest_extendable_run.as_ref());
     let eligibility = StartPromptEligibility::from_args(&args, stdin_is_tty);
+    if start_goal_shape_should_classify(&args, eligibility) {
+        let defaults = config_defaults(&paths)?;
+        let provider = start_goal_shape_provider_route(&paths, &defaults, &args);
+        let recommendation = classify_goal_shape_for_start(
+            &paths,
+            &cwd,
+            &args.goal,
+            provider.as_deref(),
+            args.plain,
+        )
+        .await;
+        let scope = workspace_scope(&cwd)?;
+        write_goal_shape_preview_record(&paths, &scope, &recommendation)?;
+        apply_goal_shape_recommendation(&mut decision, recommendation);
+    }
     let mut terminal_prompter = TerminalStartPrompter;
     if eligibility.allows_prompts() {
         maybe_prompt_start_mode(
@@ -3754,11 +4153,18 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
                 })
                 .unwrap_or_else(|| vec!["deadreckon list".to_string()])
         } else {
-            vec![format!(
-                "deadreckon start \"{}\" --mode {} --yes",
-                shell_display_quote(&decision.goal),
-                decision.selected_mode.label()
-            )]
+            match decision.selected_mode {
+                StartSelectedMode::Campaign => vec![format!(
+                    "deadreckon campaign \"{}\" --n {} --yes",
+                    shell_display_quote(&decision.goal),
+                    decision.child_count.unwrap_or(3)
+                )],
+                _ => vec![format!(
+                    "deadreckon start \"{}\" --mode {} --yes",
+                    shell_display_quote(&decision.goal),
+                    decision.selected_mode.label()
+                )],
+            }
         };
         if decision.recovery.is_none()
             && !matches!(decision.selected_mode, StartSelectedMode::Extend)
@@ -3780,6 +4186,7 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
             "done_criteria": decision.done_criteria_label,
             "done_criteria_source": decision.done_criteria_source.label(),
             "source_mode": decision.source_mode.label(),
+            "goal_shape": &decision.goal_shape,
             "requires_confirmation": decision.requires_confirmation,
             "will_start": false,
             "history_actions": decision.history_next_actions,
@@ -3803,14 +4210,27 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
     if !args.quiet {
         println!("{}", ui_heading("guided start"));
         let mode = decision.selected_mode.label();
-        print_kv_block(&[
-            ("goal", &decision.goal),
+        let suggestion = decision.goal_shape.as_ref().map(|recommendation| {
+            format!(
+                "{} via {}: {}",
+                recommendation.shape.label(),
+                recommendation.source.label(),
+                recommendation.rationale
+            )
+        });
+        let mut rows: Vec<(&str, &str)> = vec![
+            ("goal", decision.goal.as_str()),
             ("mode", mode),
             ("selection", decision.selection_source.label()),
-            ("reason", &decision.reason),
-            ("provider", &decision.provider_label),
-            ("done", &decision.done_criteria_label),
-            ("workspace", &decision.source_mode_label),
+            ("reason", decision.reason.as_str()),
+        ];
+        if let Some(suggestion) = suggestion.as_ref() {
+            rows.push(("suggestion", suggestion.as_str()));
+        }
+        rows.extend([
+            ("provider", decision.provider_label.as_str()),
+            ("done", decision.done_criteria_label.as_str()),
+            ("workspace", decision.source_mode_label.as_str()),
             (
                 "confirmation",
                 if decision.requires_confirmation {
@@ -3830,6 +4250,7 @@ async fn start_command(args: StartCommandArgs) -> Result<()> {
             ),
             ("plain", if args.plain { "yes" } else { "no" }),
         ]);
+        print_kv_block(&rows);
     }
     if let Some(recovery) = decision.recovery.as_ref() {
         return Err(start_recovery_error(recovery));
@@ -3931,6 +4352,53 @@ async fn dispatch_start_command(
             }
             result
         }
+        StartSelectedMode::Campaign => {
+            if start_source_flags_present(&args)
+                || decision.source_fresh
+                || decision.source_from.is_some()
+                || decision.source_allow_dirty
+            {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "source mode flags are only supported by start --mode run",
+                    "omit source flags or use deadreckon campaign directly",
+                )));
+            }
+            let paths = DeadreckonPaths::discover();
+            let before = start_plan_ids(&paths)?;
+            let goal = args.goal.clone();
+            let quiet = args.quiet;
+            let provider_route = decision.provider_route.clone();
+            let planner_provider = decision
+                .planner_provider_route
+                .clone()
+                .or_else(|| provider_route.clone());
+            let child_provider = decision
+                .child_provider_route
+                .clone()
+                .or_else(|| provider_route.clone());
+            let result = campaign_command(CampaignArgs {
+                goal: args.goal,
+                n: decision.child_count,
+                planner_provider,
+                provider: child_provider,
+                max_spend: None,
+                max_wall_seconds: None,
+                sandbox: None,
+                preview: false,
+                yes: args.yes || args.quiet || decision.confirmed_by_start_picker,
+                no_hints: args.quiet,
+                quiet: args.quiet,
+                plain: args.plain,
+            })
+            .await;
+            if result.is_ok()
+                && !quiet
+                && let Some(plan) = newest_start_plan(&paths, &before, &goal)?
+            {
+                print_start_lifecycle_footer("campaign", &plan.plan_id);
+            }
+            result
+        }
         StartSelectedMode::Review | StartSelectedMode::FullPlan => {
             if start_source_flags_present(&args)
                 || decision.source_fresh
@@ -3947,8 +4415,10 @@ async fn dispatch_start_command(
             let goal = args.goal.clone();
             let quiet = args.quiet;
             let mode = match decision.selected_mode {
-                StartSelectedMode::Extend | StartSelectedMode::Run => {
-                    unreachable!("run and extend handled above")
+                StartSelectedMode::Extend
+                | StartSelectedMode::Run
+                | StartSelectedMode::Campaign => {
+                    unreachable!("run, extend, and campaign handled above")
                 }
                 StartSelectedMode::Review => CliPlanMode::Review,
                 StartSelectedMode::FullPlan => CliPlanMode::FullPlan,
@@ -11560,6 +12030,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
     let launch_rows = launch_preview_rows(&LaunchPreviewFacts {
         goal,
         path: "run",
+        suggestion: None,
         provider: agent,
         roles: None,
         base: None,
@@ -13171,6 +13642,7 @@ fn print_orchestrate_preflight(
     let launch_rows = launch_preview_rows(&LaunchPreviewFacts {
         goal: &plan.root_goal,
         path,
+        suggestion: None,
         provider: &providers,
         roles: None,
         base: None,
@@ -16434,7 +16906,7 @@ fn record_sub_orchestrator_result(plan_id: &str, launch_dir: &Path, ok: bool) {
 
 struct CampaignArgs {
     goal: String,
-    n: u8,
+    n: Option<u8>,
     planner_provider: Option<String>,
     provider: Option<String>,
     max_spend: Option<f64>,
@@ -16497,6 +16969,218 @@ fn confirm_campaign_start(campaign: &deadreckon_core::campaign::Campaign, yes: b
             "campaign cancelled".to_string(),
         )))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CampaignPreflightAction {
+    Launch,
+    NeedsConfirmation,
+    ChangeCount(u8),
+}
+
+fn prompt_campaign_preflight_actions(
+    campaign: &mut deadreckon_core::campaign::Campaign,
+    sandbox: Option<&str>,
+    yes: bool,
+    quiet: bool,
+) -> Result<CampaignPreflightAction> {
+    if yes {
+        return Ok(CampaignPreflightAction::Launch);
+    }
+    if quiet || !io::stdin().is_terminal() {
+        return Ok(CampaignPreflightAction::NeedsConfirmation);
+    }
+    loop {
+        let mut choices = vec![start_prompt_choice(
+            "launch",
+            "Launch campaign",
+            "starts the sub-orchestrators",
+        )];
+        choices.push(start_prompt_choice(
+            "edit",
+            "Edit a sub-goal",
+            "updates one pending sub-goal before launch",
+        ));
+        if campaign.sub_goals.len() > 2 {
+            choices.push(start_prompt_choice(
+                "drop",
+                "Drop a sub-goal",
+                "removes one pending sub-goal before launch",
+            ));
+        }
+        choices.push(start_prompt_choice(
+            "count",
+            "Change count",
+            "regenerates the proposed sub-goals",
+        ));
+        choices.push(prompt::SelectChoice::new("cancel", "Cancel"));
+        let choice = prompt::select_one(&prompt::SelectPrompt {
+            title: "Review campaign preflight".to_string(),
+            help: Some("Launch, edit/drop a sub-goal, change count, or cancel.".to_string()),
+            choices,
+            default_index: 0,
+        })?;
+        match choice.id.as_str() {
+            "launch" => return Ok(CampaignPreflightAction::Launch),
+            "edit" => {
+                let edit_choices = campaign
+                    .sub_goals
+                    .iter()
+                    .map(|sub| {
+                        start_prompt_choice(
+                            sub.sub_id.clone(),
+                            sub.sub_id.clone(),
+                            sub.goal.clone(),
+                        )
+                    })
+                    .chain(std::iter::once(prompt::SelectChoice::new(
+                        "cancel", "Cancel",
+                    )))
+                    .collect::<Vec<_>>();
+                let edit = prompt::select_one(&prompt::SelectPrompt {
+                    title: "Edit sub-goal".to_string(),
+                    help: Some("Choose the sub-goal to update before launch.".to_string()),
+                    choices: edit_choices,
+                    default_index: 0,
+                })?;
+                if edit.id == "cancel" {
+                    continue;
+                }
+                let current = campaign
+                    .sub_goals
+                    .iter()
+                    .find(|sub| sub.sub_id == edit.id)
+                    .map(|sub| sub.goal.clone())
+                    .unwrap_or_default();
+                let updated = prompt::open("sub-goal: ", Some(&current))?;
+                campaign_edit_subgoal_before_launch(campaign, &edit.id, &updated)?;
+                print_campaign_preflight(campaign, sandbox);
+            }
+            "drop" => {
+                let drop_choices = campaign
+                    .sub_goals
+                    .iter()
+                    .map(|sub| {
+                        start_prompt_choice(
+                            sub.sub_id.clone(),
+                            sub.sub_id.clone(),
+                            sub.goal.clone(),
+                        )
+                    })
+                    .chain(std::iter::once(prompt::SelectChoice::new(
+                        "cancel", "Cancel",
+                    )))
+                    .collect::<Vec<_>>();
+                let drop = prompt::select_one(&prompt::SelectPrompt {
+                    title: "Drop sub-goal".to_string(),
+                    help: Some("Choose the sub-goal to remove before launch.".to_string()),
+                    choices: drop_choices,
+                    default_index: 0,
+                })?;
+                if drop.id == "cancel" {
+                    continue;
+                }
+                campaign_drop_subgoal_before_launch(campaign, &drop.id)?;
+                print_campaign_preflight(campaign, sandbox);
+            }
+            "count" => {
+                let answer =
+                    prompt::open("sub-orchestrator count: ", Some(&campaign.n.to_string()))?;
+                let count = answer.trim().parse::<u8>().map_err(|_| {
+                    CliError::Core(deadreckon_core::user_error(
+                        &format!("campaign count is not a number: {answer}"),
+                        "enter a value from 2 through 6",
+                    ))
+                })?;
+                validate_task_count(usize::from(count)).map_err(CliError::Core)?;
+                return Ok(CampaignPreflightAction::ChangeCount(count));
+            }
+            _ => {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "campaign cancelled".to_string(),
+                )));
+            }
+        }
+    }
+}
+
+fn campaign_replace_sub_goals_before_launch(
+    campaign: &mut deadreckon_core::campaign::Campaign,
+    sub_goals: Vec<deadreckon_core::campaign::SubGoal>,
+) -> Result<()> {
+    if campaign.status != deadreckon_core::campaign::CampaignStatus::Pending {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "campaign sub-goals can only be edited before launch",
+            "deadreckon campaign <goal> --preview",
+        )));
+    }
+    validate_task_count(sub_goals.len()).map_err(CliError::Core)?;
+    campaign.n = sub_goals.len() as u32;
+    campaign.sub_goals = sub_goals;
+    Ok(())
+}
+
+fn campaign_edit_subgoal_before_launch(
+    campaign: &mut deadreckon_core::campaign::Campaign,
+    sub_id: &str,
+    updated_goal: &str,
+) -> Result<()> {
+    let Some(index) = campaign
+        .sub_goals
+        .iter()
+        .position(|sub| sub.sub_id == sub_id)
+    else {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown campaign sub-goal {sub_id}"),
+            "choose one of the sub ids shown in the campaign preflight",
+        )));
+    };
+    let mut goals = campaign
+        .sub_goals
+        .iter()
+        .map(|sub| sub.goal.clone())
+        .collect::<Vec<_>>();
+    goals[index] = updated_goal.trim().to_string();
+    let sub_goals = deadreckon_core::campaign::build_sub_goals(goals, campaign.sub_goals.len())
+        .map_err(CliError::Core)?;
+    campaign_replace_sub_goals_before_launch(campaign, sub_goals)
+}
+
+fn campaign_drop_subgoal_before_launch(
+    campaign: &mut deadreckon_core::campaign::Campaign,
+    sub_id: &str,
+) -> Result<()> {
+    if campaign.status != deadreckon_core::campaign::CampaignStatus::Pending {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "campaign sub-goals can only be dropped before launch",
+            "deadreckon campaign <goal> --preview",
+        )));
+    }
+    if campaign.sub_goals.len() <= 2 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "campaign must keep at least 2 sub-goals",
+            "drop a different sub-goal or cancel",
+        )));
+    }
+    let Some(index) = campaign
+        .sub_goals
+        .iter()
+        .position(|sub| sub.sub_id == sub_id)
+    else {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown campaign sub-goal {sub_id}"),
+            "choose one of the sub ids shown in the campaign preflight",
+        )));
+    };
+    let mut goals = campaign
+        .sub_goals
+        .iter()
+        .map(|sub| sub.goal.clone())
+        .collect::<Vec<_>>();
+    goals.remove(index);
+    let sub_goals = deadreckon_core::campaign::build_sub_goals(goals, campaign.sub_goals.len() - 1)
+        .map_err(CliError::Core)?;
+    campaign_replace_sub_goals_before_launch(campaign, sub_goals)
 }
 
 /// Create a promoted result run from the composed campaign tree, binding the
@@ -16583,7 +17267,28 @@ async fn campaign_command(args: CampaignArgs) -> Result<()> {
             "deadreckon campaign \"your goal\"",
         )));
     }
-    deadreckon_core::plan::validate_task_count(usize::from(args.n)).map_err(CliError::Core)?;
+    let paths = DeadreckonPaths::discover();
+    let defaults = config_defaults(&paths)?;
+    let cwd = std::env::current_dir()?;
+    let scope = workspace_scope(&cwd)?;
+    let mut n = if let Some(n) = args.n {
+        n
+    } else {
+        let provider = args
+            .planner_provider
+            .as_deref()
+            .or(args.provider.as_deref())
+            .map(ToString::to_string)
+            .or_else(|| goal_shape_provider_route(&paths, &defaults, None));
+        let recommendation =
+            classify_goal_shape_for_start(&paths, &cwd, &goal, provider.as_deref(), args.plain)
+                .await;
+        write_goal_shape_preview_record(&paths, &scope, &recommendation)?;
+        recommendation
+            .n
+            .unwrap_or_else(|| recommend_child_count_for_goal(&goal, CliPlanMode::FullPlan))
+    };
+    deadreckon_core::plan::validate_task_count(usize::from(n)).map_err(CliError::Core)?;
 
     let lineage = campaign::lineage_from_env();
     if lineage.depth + 1 >= campaign::CAMPAIGN_MAX_DEPTH {
@@ -16594,10 +17299,6 @@ async fn campaign_command(args: CampaignArgs) -> Result<()> {
         )));
     }
 
-    let paths = DeadreckonPaths::discover();
-    let defaults = config_defaults(&paths)?;
-    let cwd = std::env::current_dir()?;
-    let scope = workspace_scope(&cwd)?;
     let providers = resolve_plan_providers(
         &paths,
         &defaults,
@@ -16608,13 +17309,11 @@ async fn campaign_command(args: CampaignArgs) -> Result<()> {
         None,
     )?;
     let overrides = BTreeMap::new();
-    let tasks = build_full_plan_tasks(
-        &paths, &goal, args.n, &providers, &overrides, &cwd, args.plain,
-    )
-    .await?;
+    let tasks =
+        build_full_plan_tasks(&paths, &goal, n, &providers, &overrides, &cwd, args.plain).await?;
     let sub_goal_strings: Vec<String> = tasks.iter().map(|task| task.goal.clone()).collect();
     let sub_goals =
-        campaign::build_sub_goals(sub_goal_strings, usize::from(args.n)).map_err(CliError::Core)?;
+        campaign::build_sub_goals(sub_goal_strings, usize::from(n)).map_err(CliError::Core)?;
     let sub_keys: Vec<String> = sub_goals.iter().map(|sub| sub.task_key.clone()).collect();
     campaign::guard(
         lineage.depth,
@@ -16625,7 +17324,7 @@ async fn campaign_command(args: CampaignArgs) -> Result<()> {
     )?;
 
     let mut campaign_obj = campaign::Campaign::new(
-        goal,
+        goal.clone(),
         sub_goals,
         providers.clone(),
         lineage.depth,
@@ -16656,24 +17355,77 @@ async fn campaign_command(args: CampaignArgs) -> Result<()> {
         serde_json::json!({ "n": campaign_obj.n, "root_goal": campaign_obj.root_goal }),
     )?;
 
+    if args.preview {
+        if !args.quiet {
+            print_campaign_preflight(&campaign_obj, args.sandbox.as_deref());
+        }
+        campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+        return Ok(());
+    }
     if !args.quiet {
         print_campaign_preflight(&campaign_obj, args.sandbox.as_deref());
     }
-    if args.preview {
-        return Ok(());
+    loop {
+        match prompt_campaign_preflight_actions(
+            &mut campaign_obj,
+            args.sandbox.as_deref(),
+            args.yes,
+            args.quiet,
+        )? {
+            CampaignPreflightAction::Launch => break,
+            CampaignPreflightAction::NeedsConfirmation => {
+                confirm_campaign_start(&campaign_obj, args.yes)?;
+                break;
+            }
+            CampaignPreflightAction::ChangeCount(new_n) => {
+                n = new_n;
+                let tasks = build_full_plan_tasks(
+                    &paths, &goal, n, &providers, &overrides, &cwd, args.plain,
+                )
+                .await?;
+                let sub_goal_strings: Vec<String> =
+                    tasks.iter().map(|task| task.goal.clone()).collect();
+                let sub_goals = campaign::build_sub_goals(sub_goal_strings, usize::from(n))
+                    .map_err(CliError::Core)?;
+                let sub_keys: Vec<String> =
+                    sub_goals.iter().map(|sub| sub.task_key.clone()).collect();
+                campaign::guard(
+                    lineage.depth,
+                    &lineage.ancestor_task_keys,
+                    &lineage.ancestor_scopes,
+                    &sub_keys,
+                    &[],
+                )?;
+                campaign_replace_sub_goals_before_launch(&mut campaign_obj, sub_goals)?;
+                campaign::append_campaign_event(
+                    &campaign_dir,
+                    "campaign_count_changed",
+                    serde_json::json!({ "n": campaign_obj.n }),
+                )?;
+                campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+                if !args.quiet {
+                    print_campaign_preflight(&campaign_obj, args.sandbox.as_deref());
+                }
+            }
+        }
     }
-    confirm_campaign_start(&campaign_obj, args.yes)?;
+    campaign::write_campaign(&campaign_dir, &campaign_obj)?;
 
     let sandbox = args.sandbox.clone().unwrap_or_else(|| "auto".to_string());
     let per_sub = campaign_obj
         .tree_budget_usd
-        .map(|budget| campaign::allocate_budget(budget, usize::from(args.n)));
+        .map(|budget| campaign::allocate_budget(budget, campaign_obj.sub_goals.len()));
     let home = paths.home().to_path_buf();
     let planner = providers.planner.clone();
     let child_provider = providers.default_child.clone();
     let plain = args.plain;
+    let final_sub_keys: Vec<String> = campaign_obj
+        .sub_goals
+        .iter()
+        .map(|sub| sub.task_key.clone())
+        .collect();
     let mut ancestor_task_keys = lineage.ancestor_task_keys.clone();
-    ancestor_task_keys.extend(sub_keys.iter().cloned());
+    ancestor_task_keys.extend(final_sub_keys.iter().cloned());
     let mut ancestor_scopes = lineage.ancestor_scopes.clone();
     ancestor_scopes.push(scope.clone());
     let launch_paths = &paths;
@@ -35069,30 +35821,33 @@ mod tui_tests {
         AttachProviderLogScanCache, AttachRunNarrativeRefreshJob, AttachSurface, AttachTickBudget,
         AttachTickTiming, AttachTuiState, AttachViewMode, AttachWorkMode, COMMAND_HELP_CATALOG,
         ChainAttachTuiState, CommandAudience, CommandDiscovery, CommandHelpEntry, CompletionAction,
-        ConfigDefaults, HELP_ALL_GROUPS, LiveFile, NarrativeAcceptanceRefreshTracker,
-        NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode, PLAN_AS_BUILT,
-        PLAN_CHILDREN, PLAN_DECISIONS, PLAN_DOC_PROVIDER_ERROR, PlanAttachRenderState,
-        PlanDocRefreshOptions, PlanFeedEvent, PlanNarrativeRefreshInput, PlanProviderAsBuilt,
-        PlanProviderChild, PlanProviderDecisions, PlanProviderDocs, PlanProviderItem,
-        PlanProviderNarrative, PlanWrapperDocContext, ProviderActivity, ProviderJsonlLogSpec,
-        Result, RunNarrativeRenderInput, StartDoneAction, StartDoneCriteriaSource,
-        StartLaunchInput, StartPromptEligibility, StartPrompter, StartProviderSource,
-        StartSelectedMode, StartSelectionSource, StartSourceMode, TopHelpGroup,
-        acceptance_activity_lines, add_start_history_actions, attach_banner, attach_header_text,
-        attach_live_inventory, attach_loop_stage_work, attach_should_return_to_plan,
-        build_run_narrative_projection, cancel_plan_narrative_refresh_job,
+        ConfigDefaults, GoalShape, GoalShapeRecommendation, GoalShapeSource, HELP_ALL_GROUPS,
+        LiveFile, NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker,
+        NarrativeRefreshKind, NarrativeVisualMode, PLAN_AS_BUILT, PLAN_CHILDREN, PLAN_DECISIONS,
+        PLAN_DOC_PROVIDER_ERROR, PlanAttachRenderState, PlanDocRefreshOptions, PlanFeedEvent,
+        PlanNarrativeRefreshInput, PlanProviderAsBuilt, PlanProviderChild, PlanProviderDecisions,
+        PlanProviderDocs, PlanProviderItem, PlanProviderNarrative, PlanWrapperDocContext,
+        ProviderActivity, ProviderJsonlLogSpec, Result, RunNarrativeRenderInput, StartDoneAction,
+        StartDoneCriteriaSource, StartLaunchInput, StartPromptEligibility, StartPrompter,
+        StartProviderSource, StartSelectedMode, StartSelectionSource, StartSourceMode,
+        TopHelpGroup, acceptance_activity_lines, add_start_history_actions,
+        apply_goal_shape_recommendation, attach_banner, attach_header_text, attach_live_inventory,
+        attach_loop_stage_work, attach_should_return_to_plan, build_run_narrative_projection,
+        campaign_drop_subgoal_before_launch, campaign_edit_subgoal_before_launch,
+        campaign_replace_sub_goals_before_launch, cancel_plan_narrative_refresh_job,
         cancel_run_narrative_refresh_job, chain_activity_lines, chain_attach_footer_text,
         chain_attach_header_text, chain_event_read_hint, chain_narrative_refusal_text,
         chain_should_auto_attach, chain_step_dot, chain_timeline_lines, chain_wall_cap_hit,
         claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
         collect_jsonl_provider_activity_scan, collect_plan_doc_input, command_discovery,
         completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
-        deadreckoning_status_text, doc_polish_preview_text, implementation_plan_warnings,
-        kill_banner, launch_preview_rows, live_file_lines, markdown_to_tui_lines,
-        materialize_plan_docs_to_working, max_panel_scroll, maybe_prompt_start_mode, meter_color,
-        narrative_provider_selection, orchestration_dependency_rows,
-        orchestration_parallelism_lines, orchestration_provider_role_rows,
-        orchestration_role_table_lines, per_step_wall_cap, plan_attach_footer, plan_doc_path,
+        deadreckoning_status_text, doc_polish_preview_text, fallback_goal_shape_recommendation,
+        implementation_plan_warnings, kill_banner, launch_preview_rows, live_file_lines,
+        markdown_to_tui_lines, materialize_plan_docs_to_working, max_panel_scroll,
+        maybe_prompt_start_mode, meter_color, narrative_provider_selection,
+        orchestration_dependency_rows, orchestration_parallelism_lines,
+        orchestration_provider_role_rows, orchestration_role_table_lines,
+        parse_provider_goal_shape, per_step_wall_cap, plan_attach_footer, plan_doc_path,
         plan_merge_repair_summary_items, plan_narrative_refresh_request,
         plan_narrative_refresh_trigger, poll_plan_narrative_refresh_job,
         poll_run_narrative_refresh_job, prompt_start_done_criteria,
@@ -37077,6 +37832,158 @@ mod tui_tests {
         assert_eq!(decision.selected_mode, StartSelectedMode::FullPlan);
         assert_eq!(decision.selection_source, StartSelectionSource::Heuristic);
         assert!(decision.reason.contains("parallel"));
+    }
+
+    #[test]
+    fn goal_shape_classifier_validates_and_clamps_provider_output() {
+        let recommendation = parse_provider_goal_shape(
+            "rebuild billing, notifications, and admin",
+            "cli:planner",
+            r#"{"shape":"campaign","n":9,"rationale":"three independent services"}"#,
+        )
+        .expect("recommendation");
+
+        assert_eq!(recommendation.shape, GoalShape::Campaign);
+        assert_eq!(recommendation.n, Some(6));
+        assert_eq!(recommendation.source, GoalShapeSource::Provider);
+        assert_eq!(recommendation.provider.as_deref(), Some("cli:planner"));
+        assert!(
+            parse_provider_goal_shape(
+                "bad",
+                "cli:planner",
+                r#"{"shape":"surprise","n":3,"rationale":"bad"}"#,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn goal_shape_falls_back_to_deterministic_when_provider_unavailable() {
+        let recommendation =
+            fallback_goal_shape_recommendation("rebuild billing, notifications, and admin");
+
+        assert_eq!(recommendation.shape, GoalShape::Campaign);
+        assert_eq!(recommendation.n, Some(3));
+        assert_eq!(recommendation.source, GoalShapeSource::Fallback);
+        assert!(recommendation.rationale.contains("independent clauses"));
+    }
+
+    #[test]
+    fn single_change_goal_classifies_as_single() {
+        let recommendation = fallback_goal_shape_recommendation("fix the login button spacing");
+
+        assert_eq!(recommendation.shape, GoalShape::Single);
+        assert_eq!(recommendation.n, None);
+        assert!(recommendation.rationale.contains("one verified run"));
+    }
+
+    #[test]
+    fn classified_campaign_shape_is_suggested_not_auto_launched() {
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "rebuild billing, notifications, and admin",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+        let recommendation = GoalShapeRecommendation {
+            schema_version: 1,
+            goal: decision.goal.clone(),
+            shape: GoalShape::Campaign,
+            n: Some(3),
+            rationale: "three independent surfaces".to_string(),
+            source: GoalShapeSource::Provider,
+            provider: Some("cli:planner".to_string()),
+        };
+
+        apply_goal_shape_recommendation(&mut decision, recommendation);
+
+        assert_eq!(decision.selected_mode, StartSelectedMode::Campaign);
+        assert_eq!(decision.selection_source, StartSelectionSource::GoalShape);
+        assert_eq!(decision.child_count, Some(3));
+        assert!(!decision.confirmed_by_start_picker);
+        assert!(!decision.requires_confirmation);
+        let rows = launch_preview_rows(&start_launch_preview_facts(&decision));
+        assert!(
+            rows.iter()
+                .any(|(key, value)| key == "suggestion"
+                    && value.contains("campaign n=3 via provider")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn campaign_preflight_can_drop_a_subgoal_before_launch() {
+        let sub_goals = deadreckon_core::campaign::build_sub_goals(
+            vec![
+                "rebuild billing".to_string(),
+                "rebuild notifications".to_string(),
+                "rebuild admin".to_string(),
+            ],
+            3,
+        )
+        .expect("sub goals");
+        let mut campaign = deadreckon_core::campaign::Campaign::new(
+            "rebuild product surfaces",
+            sub_goals,
+            PlanProviders::default(),
+            0,
+            None,
+            None,
+            "0.1.0",
+        )
+        .expect("campaign");
+
+        campaign_drop_subgoal_before_launch(&mut campaign, "sub-1").expect("drop");
+
+        assert_eq!(campaign.n, 2);
+        assert_eq!(campaign.sub_goals.len(), 2);
+        assert_eq!(campaign.sub_goals[0].sub_id, "sub-0");
+        assert_eq!(campaign.sub_goals[1].sub_id, "sub-1");
+        assert_eq!(campaign.sub_goals[1].goal, "rebuild admin");
+    }
+
+    #[test]
+    fn campaign_preflight_can_edit_and_change_count_before_launch() {
+        let sub_goals = deadreckon_core::campaign::build_sub_goals(
+            vec![
+                "rebuild billing".to_string(),
+                "rebuild notifications".to_string(),
+                "rebuild admin".to_string(),
+            ],
+            3,
+        )
+        .expect("sub goals");
+        let mut campaign = deadreckon_core::campaign::Campaign::new(
+            "rebuild product surfaces",
+            sub_goals,
+            PlanProviders::default(),
+            0,
+            None,
+            None,
+            "0.1.0",
+        )
+        .expect("campaign");
+
+        campaign_edit_subgoal_before_launch(&mut campaign, "sub-0", "rebuild billing and plans")
+            .expect("edit");
+        assert_eq!(campaign.n, 3);
+        assert_eq!(campaign.sub_goals[0].goal, "rebuild billing and plans");
+        assert_eq!(campaign.sub_goals[0].sub_id, "sub-0");
+
+        let replacement = deadreckon_core::campaign::build_sub_goals(
+            vec![
+                "rebuild billing".to_string(),
+                "rebuild notifications".to_string(),
+                "rebuild admin".to_string(),
+                "rebuild docs".to_string(),
+            ],
+            4,
+        )
+        .expect("replacement");
+        campaign_replace_sub_goals_before_launch(&mut campaign, replacement).expect("replace");
+        assert_eq!(campaign.n, 4);
+        assert_eq!(campaign.sub_goals.len(), 4);
+        assert_eq!(campaign.sub_goals[3].sub_id, "sub-3");
+        assert_eq!(campaign.sub_goals[3].goal, "rebuild docs");
     }
 
     #[test]

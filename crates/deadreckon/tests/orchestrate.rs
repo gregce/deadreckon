@@ -341,6 +341,67 @@ fn start_preview_names_path_provider_done_workspace_and_finish() {
 }
 
 #[test]
+fn start_preview_uses_provider_goal_shape_suggestion() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let goal = "rebuild billing, notifications, admin, and docs";
+    fs::create_dir_all(repo.join(".deadreckon")).expect("acceptance dir");
+    fs::write(
+        repo.join(".deadreckon/acceptance.yaml"),
+        "name: start ready\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("acceptance");
+    git(&repo, &["add", ".deadreckon/acceptance.yaml"]).expect("add acceptance");
+    git(&repo, &["commit", "-m", "add acceptance"]).expect("commit acceptance");
+    let provider_root = temp.path().join("provider");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "cli:shape",
+        r#"case "$1" in
+  *"goal-shape classifier"*)
+    printf '{"shape":"campaign","n":4,"rationale":"four independent apps"}'
+    ;;
+  *)
+    printf 'unexpected provider prompt\n' >&2
+    exit 45
+    ;;
+esac
+"#,
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["start", goal, "--preview", "--plain"])
+        .output()
+        .expect("start preview");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("path"), "{out}");
+    assert!(out.contains("campaign orchestration"), "{out}");
+    assert!(out.contains("suggestion"), "{out}");
+    assert!(out.contains("campaign n=4 via provider"), "{out}");
+    assert!(
+        !plans_contain_campaign_json(&paths),
+        "start preview should not launch or create campaign state"
+    );
+    let scope = deadreckon_core::paths::workspace_scope(&repo).expect("scope");
+    let record_path = paths
+        .scope_root(&scope)
+        .join("preview")
+        .join(format!("{}.json", deadreckon_core::paths::task_key(goal)));
+    let record: Value =
+        serde_json::from_str(&fs::read_to_string(record_path).expect("shape record"))
+            .expect("shape json");
+    assert_eq!(record["shape"], "campaign");
+    assert_eq!(record["n"], 4);
+    assert_eq!(record["source"], "provider");
+    assert_eq!(record["provider"], "cli:shape");
+}
+
+#[test]
 fn start_with_no_provider_refuses_with_try_line() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -5734,7 +5795,7 @@ HTML
 }}
 {script_body}
 case "$1" in
-  *"read-only planning agent"*|*"read-only merge repair planner"*) ;;
+  *"read-only planning agent"*|*"read-only merge repair planner"*|*"read-only goal-shape classifier"*) ;;
   *) write_deadreckon_notes ;;
 esac
 "#
@@ -5996,6 +6057,15 @@ fn saved_plan_count(paths: &DeadreckonPaths) -> usize {
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => 0,
         Err(source) => panic!("plans dir: {source}"),
     }
+}
+
+fn plans_contain_campaign_json(paths: &DeadreckonPaths) -> bool {
+    fs::read_dir(paths.plans_dir())
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .any(|entry| entry.path().join("campaign.json").is_file())
 }
 
 fn deadreckon(paths: &DeadreckonPaths) -> Command {

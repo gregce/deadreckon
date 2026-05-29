@@ -837,17 +837,16 @@ pub(crate) enum Commands {
     },
     #[command(
         about = "Run one goal as N independent orchestrators, then compose their results (depth-capped at 2)",
-        after_help = "Example:\n  deadreckon campaign \"rebuild billing, notifications, and admin\" --n 3 --yes"
+        after_help = "Example:\n  deadreckon campaign \"rebuild billing, notifications, and admin\" --yes"
     )]
     Campaign {
         #[arg(help = "Natural-language coding goal to split into N sub-orchestrators")]
         goal: String,
         #[arg(
             long,
-            default_value_t = 3,
-            help = "Number of sub-orchestrators, 2 through 6"
+            help = "Number of sub-orchestrators, 2 through 6; omitted lets DeadReckon recommend"
         )]
-        n: u8,
+        n: Option<u8>,
         #[arg(long, help = "Planner provider route for sub-goal decomposition")]
         planner_provider: Option<String>,
         #[arg(long, help = "Default child provider route for the sub-orchestrators")]

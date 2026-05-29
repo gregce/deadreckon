@@ -105,6 +105,44 @@ fn campaign_preflight_shows_depth_cap_and_tree_budget() {
 }
 
 #[test]
+fn campaign_without_n_uses_recommended_count() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let work = workdir(&temp);
+
+    let output = deadreckon(&paths)
+        .current_dir(&work)
+        .args([
+            "campaign",
+            "rebuild billing, notifications, and admin",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--preview",
+        ])
+        .output()
+        .expect("run campaign --preview");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let plans = paths.home().join("plans");
+    let campaign_json = std::fs::read_dir(&plans)
+        .expect("plans dir")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path().join("campaign.json"))
+        .find(|path| path.is_file())
+        .expect("campaign.json");
+    let body = std::fs::read_to_string(campaign_json).expect("read campaign.json");
+    assert!(body.contains("\"n\": 3"), "{body}");
+    assert!(stdout(&output).contains("campaign: 3 sub-orchestrators"));
+}
+
+#[test]
 fn campaign_rejects_n_outside_range_at_cli() {
     let temp = TempDir::new().expect("tempdir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
