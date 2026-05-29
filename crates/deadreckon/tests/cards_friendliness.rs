@@ -242,9 +242,7 @@ fn exit_input() -> ExitSummaryInput {
 }
 
 fn repo_tempdir() -> TempDir {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
+    TempDir::new().expect("tempdir")
 }
 
 fn clean_git_repo(temp: &TempDir) -> PathBuf {
