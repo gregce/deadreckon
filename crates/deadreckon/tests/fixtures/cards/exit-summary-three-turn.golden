@@ -9,7 +9,12 @@
 |   gate          passed by dr-gate (2 checks)                      |
 |   tests modified this run  no                                     |
 |   working                  /tmp/work                              |
-|   proof                    /tmp/run/proofs/turn-acceptance.json   |
+|                                                                   |
+|   gate: SIGNED by dr-gate — the agent could not have written this |
+|   proof:  /tmp/run/proofs/turn-acceptance.json                    |
+|   story:  /tmp/library/docs/RUN-NARRATIVE.md                      |
+|   lineage: src/main.rs ← turn 2 · cli:codex · tool-write-2        |
+|   → deadreckon apply abc12345                                     |
 |                                                                   |
 |   attach        deadreckon attach abc12345                        |
 |   show          deadreckon show abc12345                          |

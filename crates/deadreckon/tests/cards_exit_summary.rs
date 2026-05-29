@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use deadreckon::cards::exit_summary::{
     BranchDiffSummary, ExitSummaryInput, OutcomeKind, build_exit_summary_card,
 };
+use deadreckon::proof_block::ProofBlock;
 use deadreckon::ui_card::{CardOptions, Tone, render_card};
 
 fn input(outcome: OutcomeKind) -> ExitSummaryInput {
@@ -34,6 +35,12 @@ fn input(outcome: OutcomeKind) -> ExitSummaryInput {
         gate_caveats: Vec::new(),
         working_dir: PathBuf::from("/tmp/work"),
         proof_path: PathBuf::from("/tmp/run/proofs/turn-acceptance.json"),
+        proof_block: Some(ProofBlock {
+            proof_path: PathBuf::from("/tmp/run/proofs/turn-acceptance.json"),
+            story_path: PathBuf::from("/tmp/library/docs/RUN-NARRATIVE.md"),
+            lineage: "src/main.rs ← turn 2 · cli:codex · tool-write-2".to_string(),
+            next_command: "deadreckon apply abc12345".to_string(),
+        }),
         hints: vec![
             (
                 "attach".to_string(),
@@ -43,6 +50,56 @@ fn input(outcome: OutcomeKind) -> ExitSummaryInput {
             ("apply".to_string(), "deadreckon apply abc12345".to_string()),
         ],
     }
+}
+
+#[test]
+fn accepted_exit_card_shows_proof_block() {
+    let rendered = render_card(
+        &build_exit_summary_card(&input(OutcomeKind::Completed)),
+        &CardOptions {
+            color: false,
+            plain: true,
+            terminal_columns: Some(140),
+            no_color_env: false,
+        },
+    );
+
+    assert!(rendered.contains("gate: SIGNED by dr-gate"), "{rendered}");
+    assert!(
+        rendered.contains("the agent could not have written this"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("proof:  /tmp/run/proofs/turn-acceptance.json"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("story:  /tmp/library/docs/RUN-NARRATIVE.md"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("lineage: src/main.rs ← turn 2 · cli:codex · tool-write-2"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("→ deadreckon apply abc12345"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn proof_block_shape_is_stable() {
+    let block = ProofBlock {
+        proof_path: PathBuf::from("/tmp/run/proofs/turn-acceptance.json"),
+        story_path: PathBuf::from("/tmp/library/docs/RUN-NARRATIVE.md"),
+        lineage: "src/main.rs ← turn 2 · cli:codex · tool-write-2".to_string(),
+        next_command: "deadreckon apply abc12345".to_string(),
+    };
+
+    assert_eq!(
+        block.render_text(),
+        "gate: SIGNED by dr-gate — the agent could not have written this\nproof:  /tmp/run/proofs/turn-acceptance.json\nstory:  /tmp/library/docs/RUN-NARRATIVE.md\nlineage: src/main.rs ← turn 2 · cli:codex · tool-write-2\n→ deadreckon apply abc12345\n"
+    );
 }
 
 #[test]

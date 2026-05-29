@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::proof_block::ProofBlock;
 use crate::ui_card::{Card, HintLine, MetricColumn, Section, TitleGlyph, TitleLine, Tone};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +41,7 @@ pub struct ExitSummaryInput {
     pub gate_caveats: Vec<String>,
     pub working_dir: PathBuf,
     pub proof_path: PathBuf,
+    pub proof_block: Option<ProofBlock>,
     pub hints: Vec<(String, String)>,
 }
 
@@ -138,14 +140,22 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
             .iter()
             .map(|caveat| ("caveat".to_string(), caveat.clone())),
     );
-    rows.extend([
-        (
-            "working".to_string(),
-            input.working_dir.display().to_string(),
-        ),
-        ("proof".to_string(), input.proof_path.display().to_string()),
-    ]);
+    rows.push((
+        "working".to_string(),
+        input.working_dir.display().to_string(),
+    ));
+    if input.proof_block.is_none() {
+        rows.push(("proof".to_string(), input.proof_path.display().to_string()));
+    }
     sections.push(Section::KeyValue { rows });
+    if input.outcome == OutcomeKind::Completed
+        && let Some(proof_block) = input.proof_block.as_ref()
+    {
+        sections.push(Section::Blank);
+        sections.push(Section::Lines {
+            lines: proof_block.render_lines(),
+        });
+    }
 
     Card {
         title: TitleLine {

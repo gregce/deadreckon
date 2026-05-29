@@ -32,6 +32,7 @@ use crossterm::terminal::{
 use deadreckon::cards::exit_summary::{
     BranchDiffSummary, ExitSummaryInput, OutcomeKind, build_exit_summary_card,
 };
+use deadreckon::proof_block::ProofBlock;
 use deadreckon::sleep::{self, SleepPrefs, SleepPrevention};
 use deadreckon::ui_card::{
     Card, CardOptions, HintLine, Section, TitleGlyph, TitleLine, Tone, render_card,
@@ -8484,7 +8485,11 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
             "deadreckon show latest --why-failed",
         )));
     }
-    let proof = try_proof(&paths, &state)?;
+    let proof = proof_block_for_state(
+        &paths,
+        &state,
+        "deadreckon start \"build the real thing\"".to_string(),
+    )?;
     if json_output {
         println!(
             "{}",
@@ -8498,29 +8503,16 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
             }))?
         );
     } else {
-        print!("{}", proof.render_for_try());
+        print!("{}", proof.render_text());
     }
     Ok(())
 }
 
-struct TryProof {
-    proof_path: PathBuf,
-    story_path: PathBuf,
-    lineage: String,
-}
-
-impl TryProof {
-    fn render_for_try(&self) -> String {
-        format!(
-            "gate: SIGNED by dr-gate — the agent could not have written this\nproof:  {}\nstory:  {}\nlineage: {}\n→ deadreckon start \"build the real thing\"\n",
-            self.proof_path.display(),
-            self.story_path.display(),
-            self.lineage
-        )
-    }
-}
-
-fn try_proof(paths: &DeadreckonPaths, state: &deadreckon_core::PipelineState) -> Result<TryProof> {
+fn proof_block_for_state(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    next_command: String,
+) -> Result<ProofBlock> {
     let proof_path = marker_path_for_run_root(&state.run_root);
     if !proof_path.is_file() {
         return Err(CliError::Core(DeadreckonError::NotFound(format!(
@@ -8536,20 +8528,26 @@ fn try_proof(paths: &DeadreckonPaths, state: &deadreckon_core::PipelineState) ->
         .join("docs")
         .join(deadreckon_core::RUN_NARRATIVE);
     let lineage = try_lineage_line(state)?;
-    Ok(TryProof {
+    Ok(ProofBlock {
         proof_path,
         story_path,
         lineage,
+        next_command,
     })
 }
 
 fn try_lineage_line(state: &deadreckon_core::PipelineState) -> Result<String> {
     let records = read_jsonl::<ProvenanceRecord>(&state.run_root.join("provenance.jsonl"))?;
+    let original_working_dir = state.run_root.join("working");
     for record in records.iter().rev() {
         if let Some(file) = record
             .files
             .iter()
-            .filter_map(|path| path.strip_prefix(&state.working_dir).ok())
+            .filter_map(|path| {
+                path.strip_prefix(&original_working_dir)
+                    .or_else(|_| path.strip_prefix(&state.working_dir))
+                    .ok()
+            })
             .find(|path| !path.starts_with("target") && !path.starts_with(".deadreckon"))
         {
             let turn = record
@@ -19903,6 +19901,11 @@ fn exit_summary_input(
         RunLoopOutcome::Failed => OutcomeKind::Failed,
     };
     let hints = exit_summary_hints(state, outcome_kind, codebase.as_ref(), &prefix);
+    let proof_block = if outcome_kind == OutcomeKind::Completed {
+        completed_proof_block(state, &hints).ok()
+    } else {
+        None
+    };
     let acceptance = acceptance_display(state);
     ExitSummaryInput {
         run_id: state.run_id.clone(),
@@ -19929,8 +19932,23 @@ fn exit_summary_input(
         gate_caveats: acceptance.caveats,
         working_dir: state.working_dir.clone(),
         proof_path: marker_path_for_run_root(&state.run_root),
+        proof_block,
         hints,
     }
+}
+
+fn completed_proof_block(
+    state: &deadreckon_core::PipelineState,
+    hints: &[(String, String)],
+) -> Result<ProofBlock> {
+    let paths = DeadreckonPaths::discover();
+    let next_command = hints
+        .iter()
+        .find(|(label, _)| matches!(label.as_str(), "apply" | "export" | "undo" | "finish"))
+        .or_else(|| hints.first())
+        .map(|(_, command)| command.clone())
+        .unwrap_or_else(|| format!("deadreckon show {}", run_prefix(&state.run_id)));
+    proof_block_for_state(&paths, state, next_command)
 }
 
 fn spend_summary_label(

@@ -35,6 +35,9 @@ pub enum Section {
     KeyValue {
         rows: Vec<(String, String)>,
     },
+    Lines {
+        lines: Vec<String>,
+    },
     Command {
         label: String,
         command: String,
@@ -160,6 +163,13 @@ fn body_lines(card: &Card, plain: bool, color: bool) -> Vec<String> {
                         pad_visible(&style_tone(key, Tone::Dim, color), key_width),
                         value
                     ));
+                }
+            }
+            Section::Lines {
+                lines: section_lines,
+            } => {
+                for line in section_lines {
+                    lines.push(format!("  {line}"));
                 }
             }
             Section::Command { label, command } => {
