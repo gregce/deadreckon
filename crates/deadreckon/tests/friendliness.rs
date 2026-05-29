@@ -3,6 +3,14 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+use deadreckon_core::DeadreckonPaths;
+use deadreckon_core::RunStatus;
+use deadreckon_core::list_runs;
+use deadreckon_core::load_run;
+use tempfile::TempDir;
 
 #[path = "../src/friendliness_contract.rs"]
 mod friendliness_contract;
@@ -53,6 +61,66 @@ fn audit_doc_lists_a_row_per_verb_and_clause() {
     );
 }
 
+#[test]
+fn try_runs_keyless_and_signs_a_gate() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let workspace = temp.path().join("caller-checkout");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(workspace.join("untouched.txt"), "do not touch").expect("sentinel");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .arg("try")
+        .output()
+        .expect("try");
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(workspace.join("untouched.txt")).expect("sentinel"),
+        "do not touch"
+    );
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.status, RunStatus::Completed);
+    assert_eq!(state.provider.as_deref(), Some("smoke"));
+    assert!(state.run_root.join("proofs/turn-acceptance.json").is_file());
+    assert!(state.cwd.starts_with(paths.home().join("try")));
+}
+
+#[test]
+fn try_prints_proof_block_with_narrative_and_lineage() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .arg("try")
+        .output()
+        .expect("try");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("gate: SIGNED by dr-gate"), "{stdout}");
+    assert!(stdout.contains("proof:  "), "{stdout}");
+    assert!(stdout.contains("/proofs/turn-acceptance.json"), "{stdout}");
+    assert!(stdout.contains("story:  "), "{stdout}");
+    assert!(stdout.contains("/docs/RUN-NARRATIVE.md"), "{stdout}");
+    assert!(stdout.contains("lineage: "), "{stdout}");
+    assert!(stdout.contains("turn "), "{stdout}");
+    assert!(stdout.contains("smoke"), "{stdout}");
+    assert!(
+        stdout.contains("deadreckon start \"build the real thing\""),
+        "{stdout}"
+    );
+}
+
 fn parse_audit_rows(audit: &str) -> BTreeMap<(String, String), String> {
     let mut rows = BTreeMap::new();
     for line in audit.lines() {
@@ -77,6 +145,35 @@ fn parse_audit_rows(audit: &str) -> BTreeMap<(String, String), String> {
         );
     }
     rows
+}
+
+fn repo_tempdir() -> TempDir {
+    let root = workspace_root().join(".test-tmp");
+    fs::create_dir_all(&root).expect("test tmp root");
+    TempDir::new_in(root).expect("tempdir")
+}
+
+fn deadreckon(paths: &DeadreckonPaths) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
+    command.env("DEADRECKON_HOME", paths.home());
+    command
+}
+
+fn assert_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(output),
+        stderr(output)
+    );
+}
+
+fn stdout(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
 }
 
 fn top_level_cli_verbs() -> BTreeSet<String> {
@@ -152,7 +249,7 @@ fn kebab_case(value: &str) -> String {
 }
 
 fn workspace_root() -> std::path::PathBuf {
-    let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     while !dir.join("Cargo.toml").is_file() || !dir.join("crates").is_dir() {
         assert!(dir.pop(), "workspace root not found");
     }

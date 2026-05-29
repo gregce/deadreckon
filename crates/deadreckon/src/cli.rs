@@ -112,6 +112,15 @@ Modes:
   In a git repo, the default is an isolated worktree.
   Use `--fresh`, `--from <dir>`, `--worktree`, or `--in-place --i-know-its-a-lot` to force a mode.";
 
+const TRY_HELP: &str = "\
+Lifecycle:
+  deadreckon try
+  deadreckon start \"build the real thing\"
+
+Runs a keyless local smoke run in an isolated throwaway workspace, signs the
+real dr-gate proof, and prints the proof, story, and lineage paths. It does not
+need provider credentials and does not edit your current checkout.";
+
 const START_HELP: &str = "\
 Lifecycle:
   deadreckon start \"build the app\"
@@ -618,6 +627,17 @@ pub(crate) enum Commands {
             help = "Working directory to check; defaults to current directory"
         )]
         against: Option<PathBuf>,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Run a keyless local smoke proof",
+        after_help = TRY_HELP
+    )]
+    Try {
+        #[arg(long, help = "Plain output without ANSI affordances")]
+        plain: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",

@@ -288,6 +288,10 @@ async fn main_inner() -> Result<()> {
             spec,
             against,
         } => done_command(args, provider, model, force, spec, against).await,
+        Commands::Try { plain, json } => {
+            ui::set_plain_output(plain || json);
+            try_command(plain, json).await
+        }
         Commands::Start {
             goal,
             mode,
@@ -1092,6 +1096,14 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         audience: CommandAudience::SetupSupport,
         top_group: Some(TopHelpGroup::SetupHealth),
         all_group: Some(HelpAllGroup::SetupProviders),
+    },
+    CommandHelpEntry {
+        display: "try",
+        clap_name: Some("try"),
+        purpose: "run a keyless local proof",
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::StartWatchKeep),
+        all_group: Some(HelpAllGroup::ProductionFlow),
     },
     CommandHelpEntry {
         display: "start",
@@ -8407,6 +8419,159 @@ fn print_chain_paused_footer(chain: &Chain) {
         "  try: deadreckon chain undo {}",
         chain_prefix(&chain.chain_id)
     );
+}
+
+const TRY_GOAL: &str = "create a tiny Rust hello-world smoke project and verify it";
+
+async fn try_command(plain: bool, json_output: bool) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let try_dir = paths
+        .home()
+        .join("try")
+        .join(Uuid::new_v4().simple().to_string());
+    fs::create_dir_all(&try_dir)?;
+    let scope = workspace_scope(&try_dir)?;
+    let original_dir = std::env::current_dir()?;
+    std::env::set_current_dir(&try_dir)?;
+    let run_result = run_command(RunCommandArgs {
+        goal: TRY_GOAL.to_string(),
+        fresh: true,
+        worktree: false,
+        from: None,
+        in_place: false,
+        base: None,
+        branch: None,
+        allow_dirty: false,
+        init_git: false,
+        yes: true,
+        preview: false,
+        brief: false,
+        plain,
+        prevent_sleep: Some("off".to_string()),
+        quiet: true,
+        max_spend: Some(1.0),
+        max_wall_seconds: Some(60.0),
+        sandbox: Some("none".to_string()),
+        provider: None,
+        model: None,
+        doc_provider: None,
+        acceptance: None,
+        skill: "default-coding".to_string(),
+        smoke: true,
+        i_know_its_a_lot: false,
+        no_confirm: true,
+        no_hints: true,
+        no_docs: false,
+        doc_skill: None,
+    })
+    .await;
+    let restore_result = std::env::set_current_dir(&original_dir);
+    run_result?;
+    restore_result?;
+
+    let run = list_runs(&paths, Some(&scope))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::NotFound(
+                "try run state after smoke execution".to_string(),
+            ))
+        })?;
+    let state = load_run(&paths, &run.run_id)?;
+    if state.status != RunStatus::Completed {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("try run did not complete: {}", state.status),
+            "deadreckon show latest --why-failed",
+        )));
+    }
+    let proof = try_proof(&paths, &state)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "run_id": state.run_id,
+                "gate": "SIGNED by dr-gate",
+                "proof": proof.proof_path,
+                "story": proof.story_path,
+                "lineage": proof.lineage,
+                "next": "deadreckon start \"build the real thing\"",
+            }))?
+        );
+    } else {
+        print!("{}", proof.render_for_try());
+    }
+    Ok(())
+}
+
+struct TryProof {
+    proof_path: PathBuf,
+    story_path: PathBuf,
+    lineage: String,
+}
+
+impl TryProof {
+    fn render_for_try(&self) -> String {
+        format!(
+            "gate: SIGNED by dr-gate — the agent could not have written this\nproof:  {}\nstory:  {}\nlineage: {}\n→ deadreckon start \"build the real thing\"\n",
+            self.proof_path.display(),
+            self.story_path.display(),
+            self.lineage
+        )
+    }
+}
+
+fn try_proof(paths: &DeadreckonPaths, state: &deadreckon_core::PipelineState) -> Result<TryProof> {
+    let proof_path = marker_path_for_run_root(&state.run_root);
+    if !proof_path.is_file() {
+        return Err(CliError::Core(DeadreckonError::NotFound(format!(
+            "signed proof {}",
+            proof_path.display()
+        ))));
+    }
+    let library_dir = state
+        .promoted_library_dir
+        .clone()
+        .unwrap_or_else(|| paths.library_dir(&state.scope, &state.run_id));
+    let story_path = library_dir
+        .join("docs")
+        .join(deadreckon_core::RUN_NARRATIVE);
+    let lineage = try_lineage_line(state)?;
+    Ok(TryProof {
+        proof_path,
+        story_path,
+        lineage,
+    })
+}
+
+fn try_lineage_line(state: &deadreckon_core::PipelineState) -> Result<String> {
+    let records = read_jsonl::<ProvenanceRecord>(&state.run_root.join("provenance.jsonl"))?;
+    for record in records.iter().rev() {
+        if let Some(file) = record
+            .files
+            .iter()
+            .filter_map(|path| path.strip_prefix(&state.working_dir).ok())
+            .find(|path| !path.starts_with("target") && !path.starts_with(".deadreckon"))
+        {
+            let turn = record
+                .prompt_id
+                .strip_prefix("turn-")
+                .map(|number| format!("turn {number}"))
+                .unwrap_or_else(|| record.prompt_id.clone());
+            let provider = state.provider.as_deref().unwrap_or("provider");
+            return Ok(format!(
+                "{} ← {} · {} · {}",
+                file.display(),
+                turn,
+                provider,
+                record.tool_call_id
+            ));
+        }
+    }
+    Ok(format!(
+        "working tree ← turn {} · {} · provenance",
+        state.turn,
+        state.provider.as_deref().unwrap_or("provider")
+    ))
 }
 
 async fn run_command(args: RunCommandArgs) -> Result<()> {

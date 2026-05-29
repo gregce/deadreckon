@@ -46,6 +46,12 @@ verb.
 | `def-done` | One-command rollback | pass | Re-running `def-done` or `def-done add` changes the contract directly. |
 | `def-done` | One verdict + ONE primary action | fail | Output still needs the one-verdict card treatment. |
 | `def-done` | Lifecycle hint | pass | Help points to `start` after criteria are defined. |
+| `try` | Auto-detect, don't ask | pass | It always uses the local smoke provider and throwaway workspace. |
+| `try` | Preview before mutate | n-a | It mutates only isolated demo runstate under `DEADRECKON_HOME`. |
+| `try` | Refuse with try: | pass | Any failed smoke proof points at inspection and normal `start`. |
+| `try` | One-command rollback | n-a | It does not change the caller checkout. |
+| `try` | One verdict + ONE primary action | pass | The proof block leads with a signed gate and one start command. |
+| `try` | Lifecycle hint | pass | It ends with `deadreckon start "build the real thing"`. |
 | `start` | Auto-detect, don't ask | fail | Single detected subscription providers still need inline adoption. |
 | `start` | Preview before mutate | pass | Guided launch previews and confirms before creating run/plan state. |
 | `start` | Refuse with try: | pass | Non-TTY missing provider/done/source refusals include recovery lines. |
