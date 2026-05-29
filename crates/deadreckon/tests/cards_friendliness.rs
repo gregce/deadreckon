@@ -9,7 +9,7 @@ use deadreckon::cards::exit_summary::{
 };
 use deadreckon::ui_card::{CardOptions, Tone, render_card};
 use deadreckon_core::DeadreckonPaths;
-use deadreckon_core::{
+use deadreckon_core::glossary::{
     DR_GATE_DESCRIPTION, NOUN_DONE_CONTRACT, NOUN_VERIFIED_RUN, PHRASE_VERIFIED_BY_DR_GATE,
     VERDICT_VERIFIED,
 };

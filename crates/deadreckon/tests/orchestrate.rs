@@ -6,13 +6,14 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use chrono::Utc;
+use deadreckon_core::glossary::NOUN_DONE_CONTRACT;
 use deadreckon_core::lock::lock_path;
 use deadreckon_core::{
-    CHAIN_EVENTS_JSONL, CoordinatorState, DeadreckonPaths, NOUN_DONE_CONTRACT, PLAN_EVENTS_JSONL,
-    Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanRole, PlanStatus,
-    PlanTaskStatus, RUN_EVENTS_JSONL, RunOptions, RunStatus, TraceRecord, append_plan_event,
-    append_plan_message, append_trace, create_run, list_runs, load_plan, load_run, pid_is_alive,
-    read_codebase_record, read_plan_events, read_plan_messages, save_plan, save_state,
+    CHAIN_EVENTS_JSONL, CoordinatorState, DeadreckonPaths, PLAN_EVENTS_JSONL, Plan, PlanEvent,
+    PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanRole, PlanStatus, PlanTaskStatus,
+    RUN_EVENTS_JSONL, RunOptions, RunStatus, TraceRecord, append_plan_event, append_plan_message,
+    append_trace, create_run, list_runs, load_plan, load_run, pid_is_alive, read_codebase_record,
+    read_plan_events, read_plan_messages, save_plan, save_state,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;

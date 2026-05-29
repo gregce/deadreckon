@@ -46,6 +46,7 @@ use deadreckon_core::flight::{
     build_working_file_index, list_checkpoint_manifests, materialize_checkpoint,
     read_flight_events, read_flight_manifest,
 };
+use deadreckon_core::glossary::{NOUN_DONE_CONTRACT, NOUN_VERIFIED_RUN};
 use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt, write_receipt};
 use deadreckon_core::learning::{
     LearningAutoPrStatus, LearningCandidate, LearningCandidateDiff, LearningEval,
@@ -63,14 +64,14 @@ use deadreckon_core::{
     ChainEvent, ChainEventKind, ChainNewOptions, ChainStatus, ChainStepMarker, ChainStepStatus,
     CodebaseMode, CodebaseRecord, ConductorState, CoordinatorChild, CoordinatorState,
     DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DeadreckonError, DeadreckonPaths,
-    DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, NOUN_DONE_CONTRACT,
-    NOUN_VERIFIED_RUN, OnFail, PhaseId, PhaseStatus, Plan, PlanChildMarker, PlanEvent,
-    PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanProviders, PlanRole, PlanStatus,
-    PlanTask, PlanTaskStatus, PromotionManifest, ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode,
-    RunEvent, RunEventKind, RunListEntry, RunOptions, RunStatus, SpendRecord, TraceRecord,
-    WorktreeOptions, acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root,
-    acquire_lock, append_chain_event, append_parent_narrative_update, append_plan_event,
-    append_plan_message, append_provenance, append_trace, apply_commit_body, cancel_marker_present,
+    DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId,
+    PhaseStatus, Plan, PlanChildMarker, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
+    PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest,
+    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunEventKind, RunListEntry,
+    RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions,
+    acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root, acquire_lock,
+    append_chain_event, append_parent_narrative_update, append_plan_event, append_plan_message,
+    append_provenance, append_trace, apply_commit_body, cancel_marker_present,
     chain_status_label as glossary_chain_status_label,
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,

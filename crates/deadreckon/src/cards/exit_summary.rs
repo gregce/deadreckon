@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::proof_block::ProofBlock;
 use crate::ui_card::{Card, HintLine, MetricColumn, Section, TitleGlyph, TitleLine, Tone};
-use deadreckon_core::{NOUN_VERIFIED_RUN, PHRASE_VERIFIED_BY_DR_GATE, VERDICT_VERIFIED};
+use deadreckon_core::glossary::{NOUN_VERIFIED_RUN, PHRASE_VERIFIED_BY_DR_GATE, VERDICT_VERIFIED};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutcomeKind {

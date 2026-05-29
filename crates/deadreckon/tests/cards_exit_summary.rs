@@ -7,7 +7,7 @@ use deadreckon::cards::exit_summary::{
 };
 use deadreckon::proof_block::ProofBlock;
 use deadreckon::ui_card::{CardOptions, Tone, render_card};
-use deadreckon_core::VERDICT_VERIFIED;
+use deadreckon_core::glossary::VERDICT_VERIFIED;
 
 fn input(outcome: OutcomeKind) -> ExitSummaryInput {
     ExitSummaryInput {

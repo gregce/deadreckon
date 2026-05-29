@@ -7,7 +7,8 @@ use deadreckon::notify::{
     CommandNotifyChannel, NotifyAttempt, NotifyChannel, NotifyConfig, NotifyContext, NotifyFuture,
     NotifyTransition, notify_jsonl_path, notify_run,
 };
-use deadreckon_core::{DeadreckonPaths, NOUN_VERIFIED_RUN, RunOptions, create_run};
+use deadreckon_core::glossary::NOUN_VERIFIED_RUN;
+use deadreckon_core::{DeadreckonPaths, RunOptions, create_run};
 use tempfile::TempDir;
 
 #[test]
