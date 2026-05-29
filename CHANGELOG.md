@@ -11,6 +11,7 @@
 - P7: Added the gate-verdict roll-up (`CampaignRollup`, `worst_of`, `rollup_permits_completion`, `build_rollup`): any refused or unmerged leaf makes the whole campaign refused (the no-laundering invariant). The roll-up is bound into the result run's marker signature, so editing `campaign-rollup.json` after signing invalidates the marker.
 - P8: Added `campaign_can_complete`: a campaign reaches completion only when every sub merged and the roll-up permits it; a refused sub never reaches a clean completed state.
 - P9: Added the top-level `deadreckon campaign <goal> --n <2..=6>` verb (peer to run/orchestrate/chain): decomposes via the planner, guards depth/cycles, previews (`--preview`), forks N sub-orchestrators, rolls up verdicts, composes one promoted result run with a `deadreckon-campaign-manifest.json`, and refuses to promote on any refused leaf or cross-sub conflict.
+- P10: Surfaced campaigns in `attach <campaign-id>` (sub rows + roll-up + breadcrumb), `show <campaign-id> --why-failed` (refused/caveat subs), and `kill <campaign-id>` (cascades into each sub-plan, then marks the campaign killed) via `resolve_campaign`.
 
 ## Tamper-Evident Gate (production release) - 2026-05-28
 
