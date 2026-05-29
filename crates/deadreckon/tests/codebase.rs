@@ -458,7 +458,7 @@ fn preview_block_contains_required_fields_in_order() {
         "sandbox",
         "caps",
         "sleep",
-        "done criteria",
+        "done contract",
         "on success",
         "on fail",
     ];
@@ -1951,7 +1951,8 @@ fn latest_alias_resolves_to_current_scope_for_show_and_status() {
     let status_stdout = stdout(&status);
     assert!(status_stdout.contains("deadreckon status"));
     assert!(status_stdout.contains(&run_a[..8]), "{status_stdout}");
-    assert!(status_stdout.contains("next actions:"));
+    assert!(status_stdout.contains("run health"));
+    assert!(status_stdout.contains("action:"));
 }
 
 #[test]
@@ -2030,8 +2031,12 @@ fn post_run_hint_lists_apply_and_abandon_lines() {
         .expect("run");
     let short = &run.run_id[..8];
     let stdout = stdout(&output);
-    assert!(stdout.contains("next actions:"));
-    assert!(stdout.contains(&format!("apply:   deadreckon apply {short}")));
+    assert!(stdout.contains("primary action:"));
+    assert!(stdout.contains(&format!(
+        "next: deadreckon finish {short} --autostash --cleanup"
+    )));
+    assert!(stdout.contains("secondary actions:"));
+    assert!(stdout.contains(&format!("apply: deadreckon apply {short}")));
     assert!(stdout.contains(&format!(
         "cleanup: deadreckon apply {short} --autostash --cleanup"
     )));
