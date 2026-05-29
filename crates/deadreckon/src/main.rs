@@ -10722,6 +10722,11 @@ fn acceptance_status_line(state: &deadreckon_core::PipelineState) -> String {
     acceptance_display(state).status_line()
 }
 
+fn acceptance_status_value(state: &deadreckon_core::PipelineState) -> String {
+    let line = acceptance_status_line(state);
+    line.strip_prefix("gate: ").unwrap_or(&line).to_string()
+}
+
 fn acceptance_display(state: &deadreckon_core::PipelineState) -> AcceptanceDisplay {
     let tamper = deadreckon_core::tamper::read_acceptance_tamper_for_run_root(&state.run_root)
         .ok()
@@ -16851,6 +16856,7 @@ fn rollup_verdict_text(verdict: deadreckon_core::campaign::RollupVerdict) -> &'s
 /// Full TUI drill-in into a selected sub-plan is a V1 candidate; this is the plain
 /// summary that works on and off TTY.
 fn campaign_attach_summary(
+    paths: Option<&DeadreckonPaths>,
     campaign: &deadreckon_core::campaign::Campaign,
     rollup: Option<&deadreckon_core::campaign::CampaignRollup>,
 ) -> String {
@@ -16883,6 +16889,13 @@ fn campaign_attach_summary(
             result,
             sub.goal
         );
+        if let Some(paths) = paths
+            && let Some(run_id) = sub.result_run_id.as_deref()
+            && let Ok(state) = load_run(paths, run_id)
+        {
+            let _ = writeln!(out, "    spend {}", run_spend_label(&state, false));
+            let _ = writeln!(out, "    gate: {}", acceptance_status_value(&state));
+        }
     }
     let _ = writeln!(
         out,
@@ -17407,7 +17420,7 @@ mod campaign_spawn_tests {
     #[test]
     fn campaign_attach_lists_subs_with_rollup_and_breadcrumb() {
         let (campaign, rollup) = campaign_with_rollup();
-        let summary = campaign_attach_summary(&campaign, Some(&rollup));
+        let summary = campaign_attach_summary(None, &campaign, Some(&rollup));
         assert!(summary.contains("campaign:"), "{summary}");
         assert!(summary.contains("sub-0"), "{summary}");
         assert!(summary.contains("sub-1"), "{summary}");
@@ -17419,6 +17432,198 @@ mod campaign_spawn_tests {
         let (campaign, _rollup) = campaign_with_rollup();
         let targets = campaign_kill_targets(&campaign);
         assert_eq!(targets, vec!["plan-0", "plan-1"]);
+    }
+}
+
+#[cfg(test)]
+mod effortless_consistency_tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn subscription_state(temp: &TempDir) -> (DeadreckonPaths, deadreckon_core::PipelineState) {
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("repo");
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "ship effortless consistency".to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(10.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        state.turn = 2;
+        state
+            .set_phase_status(PhaseId(60), PhaseStatus::Completed)
+            .expect("complete");
+        save_state(&state).expect("save");
+        deadreckon_core::append_spend(
+            &state,
+            &SpendRecord {
+                timestamp: Utc::now(),
+                turn: 1,
+                provider: "cli:test".to_string(),
+                model: "subscription".to_string(),
+                input_tokens: 10,
+                output_tokens: 14,
+                cost_usd: 0.0,
+                total_cost_usd: 0.0,
+                cap_usd: Some(10.0),
+                subscription: true,
+                estimated: false,
+                wall_time_seconds: Some(3.0),
+                wall_time_cap_seconds: None,
+            },
+        )
+        .expect("spend");
+        deadreckon_core::write_acceptance_marker_with_results(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            vec![
+                deadreckon_core::AcceptanceCheckResult {
+                    kind: "file_exists".to_string(),
+                    passed: true,
+                    must_pass: true,
+                    detail: "app.txt exists".to_string(),
+                    command: None,
+                    cwd: Some(state.working_dir.clone()),
+                    duration_ms: Some(1),
+                    stdout: None,
+                    stderr: None,
+                },
+                deadreckon_core::AcceptanceCheckResult {
+                    kind: "shell".to_string(),
+                    passed: true,
+                    must_pass: true,
+                    detail: "cargo test exited with exit status: 0".to_string(),
+                    command: Some("cargo test".to_string()),
+                    cwd: Some(state.working_dir.clone()),
+                    duration_ms: Some(2),
+                    stdout: None,
+                    stderr: None,
+                },
+            ],
+        )
+        .expect("acceptance marker");
+        (paths, state)
+    }
+
+    fn plan_for_state(state: &deadreckon_core::PipelineState) -> Plan {
+        let mut task = PlanTask::new(
+            0,
+            "polish result surface",
+            "polish result surface",
+            PlanRole::Child,
+            state.provider.clone(),
+        );
+        task.status = PlanTaskStatus::Completed;
+        task.child_run_id = Some(state.run_id.clone());
+        let second = PlanTask::new(
+            1,
+            "verify companion surface",
+            "verify companion surface",
+            PlanRole::Child,
+            state.provider.clone(),
+        );
+        Plan::new(
+            "ship effortless consistency",
+            PlanMode::FullPlan,
+            vec![task, second],
+            PlanProviders::default(),
+            Some(state.scope.clone()),
+            "0.1.0",
+        )
+        .expect("plan")
+    }
+
+    fn campaign_for_state(
+        state: &deadreckon_core::PipelineState,
+    ) -> deadreckon_core::campaign::Campaign {
+        let subs = deadreckon_core::campaign::build_sub_goals(
+            vec![
+                "polish result surface".to_string(),
+                "verify companion surface".to_string(),
+            ],
+            2,
+        )
+        .expect("subs");
+        let mut campaign = deadreckon_core::campaign::Campaign::new(
+            "ship effortless consistency",
+            subs,
+            PlanProviders::default(),
+            0,
+            None,
+            None,
+            "0.1.0",
+        )
+        .expect("campaign");
+        campaign.status = deadreckon_core::campaign::CampaignStatus::Merged;
+        campaign.sub_goals[0].status = deadreckon_core::campaign::SubGoalStatus::Merged;
+        campaign.sub_goals[0].result_run_id = Some(state.run_id.clone());
+        campaign
+    }
+
+    #[test]
+    fn no_surface_renders_zero_dollar_subscription_spend() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state) = subscription_state(&temp);
+        let exit = render_exit_summary_card(&state, &RunLoopOutcome::Done, true);
+        let plan = plan_for_state(&state);
+        let plan_detail = plan_task_detail_lines(&paths, &plan, &plan.tasks[0], 120).join("\n");
+        let campaign = campaign_for_state(&state);
+        let campaign_summary = campaign_attach_summary(Some(&paths), &campaign, None);
+
+        for (surface, rendered) in [
+            ("exit", exit),
+            ("plan", plan_detail),
+            ("campaign", campaign_summary),
+        ] {
+            assert!(
+                rendered.contains("not metered (subscription)"),
+                "{surface} did not render honest subscription spend:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("~$0.000000") && !rendered.contains("spend $0.000000"),
+                "{surface} rendered zero-dollar metered spend:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_verdict_is_per_check_on_every_outcome_surface() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state) = subscription_state(&temp);
+        let exit = render_exit_summary_card(&state, &RunLoopOutcome::Done, true);
+        let status = acceptance_status_line(&state);
+        let plan = plan_for_state(&state);
+        let plan_detail = plan_task_detail_lines(&paths, &plan, &plan.tasks[0], 120).join("\n");
+        let campaign = campaign_for_state(&state);
+        let campaign_summary = campaign_attach_summary(Some(&paths), &campaign, None);
+
+        for (surface, rendered) in [
+            ("exit", exit),
+            ("status", status),
+            ("plan", plan_detail),
+            ("campaign", campaign_summary),
+        ] {
+            assert!(
+                rendered.contains("gate: PASSED 2/2"),
+                "{surface} did not render per-check gate verdict:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("gate gate:"),
+                "{surface} duplicated the gate label:\n{rendered}"
+            );
+        }
     }
 }
 
@@ -19949,6 +20154,17 @@ fn completed_proof_block(
     proof_block_for_state(&paths, state, next_command)
 }
 
+fn run_spend_label(state: &deadreckon_core::PipelineState, include_metered_cap: bool) -> String {
+    let summary = deadreckon_core::state::spend_summary(state).unwrap_or_else(|_| {
+        deadreckon_core::state::SpendSummary {
+            total_usd: state.total_spend_usd,
+            wall_seconds: state.total_wall_seconds,
+            ..deadreckon_core::state::SpendSummary::default()
+        }
+    });
+    spend_summary_label(state, &summary, include_metered_cap)
+}
+
 fn spend_summary_label(
     state: &deadreckon_core::PipelineState,
     summary: &deadreckon_core::state::SpendSummary,
@@ -20380,6 +20596,8 @@ fn finish_command(
         }
     }
 
+    print_finish_consistency_summary(&state);
+
     let mode = read_codebase_record(&state.working_dir)
         .map(|record| record.mode)
         .unwrap_or(CodebaseMode::Fresh);
@@ -20437,6 +20655,12 @@ fn finish_command(
             Ok(())
         }
     }
+}
+
+fn print_finish_consistency_summary(state: &deadreckon_core::PipelineState) {
+    println!("{}", ui_heading("run summary"));
+    println!("  spend: {}", run_spend_label(state, false));
+    println!("  gate: {}", acceptance_status_value(state));
 }
 
 #[derive(Debug)]
@@ -24290,7 +24514,10 @@ async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     let run_ref = args.run_id.clone();
     if let Some((campaign_dir, campaign)) = resolve_campaign(&paths, &run_ref)? {
         let rollup = deadreckon_core::campaign::read_campaign_rollup(&campaign_dir).ok();
-        print!("{}", campaign_attach_summary(&campaign, rollup.as_ref()));
+        print!(
+            "{}",
+            campaign_attach_summary(Some(&paths), &campaign, rollup.as_ref())
+        );
         return Ok(());
     }
     let state = if let Some(selection) = resolve_plan_child_ref(&paths, &run_ref)? {
@@ -25702,7 +25929,7 @@ fn show_command(
         let report = if why_failed {
             campaign_why_failed_report(&campaign, rollup.as_ref())
         } else {
-            campaign_attach_summary(&campaign, rollup.as_ref())
+            campaign_attach_summary(Some(&paths), &campaign, rollup.as_ref())
         };
         if json_output {
             println!(
@@ -28432,20 +28659,7 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
     let run = format!("{short} ({})", state.run_id);
     let state_line = format!("{} -> {next_action}", run_status_label(state.status));
     let updated = format!("{} ago", relative_age(state.updated_at));
-    let spend_summary = deadreckon_core::state::spend_summary(state).ok();
-    let spend = spend_summary
-        .as_ref()
-        .map(|summary| spend_summary_label(state, summary, true))
-        .unwrap_or_else(|| {
-            format!(
-                "${:.6} / {}",
-                state.total_spend_usd,
-                state
-                    .max_spend_usd
-                    .map(|cap| format!("${cap:.6}"))
-                    .unwrap_or_else(|| "uncapped".to_string())
-            )
-        });
+    let spend = run_spend_label(state, true);
     let wall = format!(
         "{:.1}s / {}",
         state.total_wall_seconds,
@@ -28497,7 +28711,7 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
     if let Some(reason) = state.failure_reason.as_deref() {
         println!("  failure:  {}", one_line(reason, 100));
     }
-    println!("  gate:     {}", acceptance_status_line(state));
+    println!("  gate: {}", acceptance_status_value(state));
     let docs_status = docs_status_for_state(state);
     println!("  docs:     {docs_status}");
     if docs_status == DocsStatus::Failed
@@ -28571,11 +28785,7 @@ fn sleep_status_for_working(working_dir: &Path) -> Option<String> {
 fn print_run_summary(state: &deadreckon_core::PipelineState) {
     println!("run {} ({})", run_prefix(&state.run_id), state.run_id);
     let status = run_status_label(state.status);
-    let spend_summary = deadreckon_core::state::spend_summary(state).ok();
-    let spend = spend_summary
-        .as_ref()
-        .map(|summary| spend_summary_label(state, summary, false))
-        .unwrap_or_else(|| format!("${:.6}", state.total_spend_usd));
+    let spend = run_spend_label(state, false);
     let mut items = vec![
         ("status".to_string(), status.to_string()),
         ("goal".to_string(), state.goal.clone()),
@@ -29858,7 +30068,7 @@ fn plan_event_summary(event: &PlanEventKind) -> String {
 fn plan_final_gate_line(paths: &DeadreckonPaths, plan: &Plan) -> Option<String> {
     let run_id = plan.merged_run_id.as_deref()?;
     let state = load_run(paths, run_id).ok()?;
-    Some(acceptance_status_line(&state))
+    Some(format!("gate: {}", acceptance_status_value(&state)))
 }
 
 fn plan_task_detail_lines(
@@ -29899,7 +30109,7 @@ fn plan_task_detail_lines(
         if let Some(trace) = latest_trace_line(&state) {
             lines.push(trace);
         }
-        lines.push(format!("gate {}", acceptance_status_line(&state)));
+        lines.push(format!("gate: {}", acceptance_status_value(&state)));
     } else if let Some(run_id) = task.child_run_id.as_deref() {
         lines.push(format!("child detail unavailable {}", run_prefix(run_id)));
     }
@@ -29915,37 +30125,28 @@ fn plan_task_detail_lines(
 fn plan_child_accounting_lines(state: &deadreckon_core::PipelineState) -> Vec<String> {
     let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl")).unwrap_or_default();
     if spend.is_empty() {
+        if !provider_is_metered(state) && state.total_spend_usd == 0.0 {
+            return vec!["spend not metered (subscription)  context waiting".to_string()];
+        }
         return vec![format!(
             "spend ${:.6}  context waiting",
             state.total_spend_usd
         )];
     }
-    let total_cost = spend
-        .last()
-        .map(|record| record.total_cost_usd)
-        .unwrap_or(state.total_spend_usd);
     let total_tokens = spend
         .iter()
         .map(|record| record.input_tokens + record.output_tokens)
         .sum::<u64>();
-    let wall = spend
-        .last()
-        .and_then(|record| record.wall_time_seconds)
-        .map(|seconds| format!("  wall {seconds:.0}s"))
-        .unwrap_or_default();
-    if spend.iter().any(|record| record.subscription)
-        || state
-            .provider
-            .as_deref()
-            .is_some_and(|provider| provider.starts_with("cli:"))
-    {
-        vec![format!("tokens {}{wall}", format_count(total_tokens))]
+    let token_suffix = if total_tokens > 0 {
+        format!("  tokens {}", format_count(total_tokens))
     } else {
-        vec![format!(
-            "spend ${total_cost:.6}  tokens {}{wall}",
-            format_count(total_tokens)
-        )]
-    }
+        String::new()
+    };
+    vec![format!(
+        "spend {}{}",
+        run_spend_label(state, false),
+        token_suffix
+    )]
 }
 
 fn latest_trace_line(state: &deadreckon_core::PipelineState) -> Option<String> {

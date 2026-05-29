@@ -1337,6 +1337,55 @@ fn finish_exports_completed_fresh_run() {
     let temp = repo_tempdir();
     let (paths, parent) = completed_parent(&temp, "finish export parent");
     let dest = temp.path().join("finished-export");
+    deadreckon_core::append_spend(
+        &parent,
+        &deadreckon_core::SpendRecord {
+            timestamp: chrono::Utc::now(),
+            turn: 1,
+            provider: "cli:test".to_string(),
+            model: "subscription".to_string(),
+            input_tokens: 8,
+            output_tokens: 13,
+            cost_usd: 0.0,
+            total_cost_usd: 0.0,
+            cap_usd: Some(1.0),
+            subscription: true,
+            estimated: false,
+            wall_time_seconds: Some(4.0),
+            wall_time_cap_seconds: None,
+        },
+    )
+    .expect("spend");
+    deadreckon_core::write_acceptance_marker_with_results(
+        &parent.run_root,
+        parent.run_id.clone(),
+        parent.working_dir.clone(),
+        vec![
+            deadreckon_core::AcceptanceCheckResult {
+                kind: "file_exists".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "app.txt exists".to_string(),
+                command: None,
+                cwd: Some(parent.working_dir.clone()),
+                duration_ms: Some(1),
+                stdout: None,
+                stderr: None,
+            },
+            deadreckon_core::AcceptanceCheckResult {
+                kind: "shell".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "cargo test exited with exit status: 0".to_string(),
+                command: Some("cargo test".to_string()),
+                cwd: Some(parent.working_dir.clone()),
+                duration_ms: Some(2),
+                stdout: None,
+                stderr: None,
+            },
+        ],
+    )
+    .expect("acceptance marker");
 
     let output = deadreckon(&paths)
         .arg("finish")
@@ -1349,6 +1398,9 @@ fn finish_exports_completed_fresh_run() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("finish:"));
+    assert!(stdout.contains("not metered (subscription)"), "{stdout}");
+    assert!(stdout.contains("gate: PASSED 2/2"), "{stdout}");
+    assert!(!stdout.contains("~$0.000000"), "{stdout}");
     assert!(stdout.contains("exported run"));
     assert_eq!(
         fs::read_to_string(dest.join("app.txt")).expect("app"),
