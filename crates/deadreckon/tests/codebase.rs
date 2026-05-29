@@ -6,7 +6,9 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use deadreckon_core::{
     CodebaseMode, CodebaseRecord, DeadreckonPaths, ModeFlags, ResolvedMode, RunOptions, RunStatus,
@@ -2096,27 +2098,54 @@ fn deadreckon_pty(
     cwd: &std::path::Path,
     input: &str,
     args: &[&str],
-) -> std::process::Output {
+) -> Output {
     let command = std::iter::once(env!("CARGO_BIN_EXE_deadreckon").to_string())
         .chain(args.iter().map(|arg| arg.to_string()))
         .map(|part| tcl_brace_quote(&part))
         .collect::<Vec<_>>()
         .join(" ");
     let answer = input.trim_end_matches('\n').to_string() + "\r";
+    let log_dir = TempDir::new().expect("expect log dir");
+    let log_path = log_dir.path().join("expect.log");
     let script = format!(
-        "set timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\nspawn {}\nexpect \"choose \\[1\\]:\"\nsend -- \"{}\"\nexpect {{\n  \"completed run\" {{ exit 0 }}\n  \"cancelled\" {{ exit 0 }}\n  eof {{ exit 125 }}\n  timeout {{ exit 124 }}\n}}\n",
+        "log_user 0\nlog_file -a {}\nset timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\nspawn {}\nexpect \"choose \\[1\\]:\"\nsend -- \"{}\"\nexpect {{\n  \"completed run\" {{ exit 0 }}\n  \"cancelled\" {{ exit 0 }}\n  eof {{ exit 125 }}\n  timeout {{ exit 124 }}\n}}\n",
+        tcl_brace_quote(&log_path.display().to_string()),
         tcl_brace_quote(&cwd.display().to_string()),
         tcl_brace_quote(&paths.home().display().to_string()),
         command,
         tcl_string_escape(&answer)
     );
-    Command::new("expect")
+    let mut child = Command::new("expect")
         .arg("-c")
         .arg(script)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("expect")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("expect");
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("expect status") {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(45) {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().expect("expect wait after kill");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = fs::read(&log_path).unwrap_or_default();
+    let stderr = if timed_out {
+        b"expect helper timed out\n".to_vec()
+    } else {
+        Vec::new()
+    };
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 fn tcl_brace_quote(value: &str) -> String {
