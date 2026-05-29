@@ -144,6 +144,9 @@ args_template = ["run", "{prompt}"]
     let output = deadreckon(temp.path())
         .args(["init", "--no-confirm", "--no-completion"])
         .env("PATH", &bin)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_COMPATIBLE_API_KEY")
         .output()
         .expect("init");
 
@@ -178,6 +181,9 @@ fn init_yes_can_autoselect_copilot_descriptor_when_available() {
     let output = deadreckon(temp.path())
         .args(["init", "--no-confirm", "--no-completion"])
         .env("PATH", &bin)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_COMPATIBLE_API_KEY")
         .output()
         .expect("init");
 
@@ -206,6 +212,9 @@ fn init_yes_can_autoselect_pi_descriptor_when_available() {
     let output = deadreckon(temp.path())
         .args(["init", "--no-confirm", "--no-completion"])
         .env("PATH", &bin)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_COMPATIBLE_API_KEY")
         .output()
         .expect("init");
 

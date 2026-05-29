@@ -1744,9 +1744,8 @@ async fn init_command(
     let registry = ProviderRegistry::with_overrides(paths.home())?;
     let provider = match provider {
         Some(provider) => provider,
-        None if no_confirm => {
-            auto_subscription_cli_provider(&registry).unwrap_or_else(|| "anthropic".to_string())
-        }
+        None if no_confirm => preferred_init_subscription_cli_provider(&registry)
+            .unwrap_or_else(|| "anthropic".to_string()),
         None => prompt_provider()?,
     };
     provider_setup_selection(
@@ -1812,6 +1811,21 @@ async fn init_command(
 
 fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String> {
     setup::auto_subscription_cli_provider(registry)
+}
+
+fn preferred_init_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String> {
+    registry
+        .iter()
+        .filter(|descriptor| {
+            descriptor.kind == DescriptorKind::Cli
+                && descriptor.subscription
+                && descriptor
+                    .default_binary
+                    .as_deref()
+                    .is_some_and(start_command_exists)
+        })
+        .map(|descriptor| descriptor.id.clone())
+        .next()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
