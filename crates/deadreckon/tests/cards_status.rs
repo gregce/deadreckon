@@ -267,6 +267,29 @@ fn status_latest_uses_same_kv_layout_for_completed_failed_running() {
     );
 }
 
+#[test]
+fn status_report_has_one_primary_action_and_demoted_secondary_actions() {
+    let temp = repo_tempdir();
+    let (paths, state) = state(&temp, "status primary action");
+
+    let output = deadreckon(&paths)
+        .current_dir(&state.cwd)
+        .args(["status", &state.run_id, "--global", "--plain"])
+        .output()
+        .expect("status");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("primary action:"), "{out}");
+    assert_eq!(count_action_label(&out, "next"), 1, "{out}");
+    assert!(
+        out.contains(&format!("deadreckon finish {}", &state.run_id[..8])),
+        "{out}"
+    );
+    assert!(out.contains("secondary actions:"), "{out}");
+    assert_eq!(out.matches("secondary actions:").count(), 1, "{out}");
+}
+
 fn state(temp: &TempDir, goal: &str) -> (DeadreckonPaths, deadreckon_core::PipelineState) {
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let cwd = temp.path().join("repo");
@@ -289,6 +312,12 @@ fn state(temp: &TempDir, goal: &str) -> (DeadreckonPaths, deadreckon_core::Pipel
     state.status = RunStatus::Completed;
     save_state(&state).expect("save");
     (paths, state)
+}
+
+fn count_action_label(out: &str, label: &str) -> usize {
+    out.lines()
+        .filter(|line| line.trim_start().starts_with(&format!("{label}:")))
+        .count()
 }
 
 fn status_layout_keys(out: &str) -> Vec<String> {

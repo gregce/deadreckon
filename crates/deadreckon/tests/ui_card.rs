@@ -44,6 +44,7 @@ fn known_card() -> Card {
                 command: "deadreckon show abc12345".to_string(),
             },
         ],
+        primary_action: None,
         hints: vec![HintLine {
             label: "next".to_string(),
             command: "deadreckon run \"builds\" --yes".to_string(),

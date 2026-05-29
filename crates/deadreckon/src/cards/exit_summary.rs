@@ -157,6 +157,9 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
         });
     }
 
+    let primary_action = exit_summary_primary_action(input);
+    let primary_command = primary_action.as_ref().map(|hint| hint.command.clone());
+
     Card {
         title: TitleLine {
             glyph,
@@ -172,13 +175,37 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
                 .unwrap_or_else(|| "this run".to_string())
         )),
         sections,
+        primary_action,
         hints: input
             .hints
             .iter()
+            .filter(|(_, command)| Some(command.as_str()) != primary_command.as_deref())
             .map(|(label, command)| HintLine {
                 label: label.clone(),
                 command: command.clone(),
             })
             .collect(),
     }
+}
+
+fn exit_summary_primary_action(input: &ExitSummaryInput) -> Option<HintLine> {
+    let priorities: &[&str] = match input.outcome {
+        OutcomeKind::Completed => &["apply", "export", "undo", "finish"],
+        OutcomeKind::Paused => &["resume"],
+        OutcomeKind::Failed | OutcomeKind::Killed => &["why", "logs"],
+    };
+    let selected = input
+        .hints
+        .iter()
+        .find(|(label, command)| {
+            priorities.iter().any(|priority| priority == label)
+                || (matches!(input.outcome, OutcomeKind::Failed | OutcomeKind::Killed)
+                    && command.contains("--why-failed"))
+                || (matches!(input.outcome, OutcomeKind::Paused) && command.contains(" resume "))
+        })
+        .or_else(|| input.hints.first())?;
+    Some(HintLine {
+        label: "next".to_string(),
+        command: selected.1.clone(),
+    })
 }

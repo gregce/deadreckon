@@ -62,7 +62,7 @@ verb.
 | `run` | Preview before mutate | pass | Worktree/in-place/high-spend paths preview or require confirmation. |
 | `run` | Refuse with try: | pass | Common provider/source/safety refusals end with `try:` guidance. |
 | `run` | One-command rollback | pass | Worktree runs can be abandoned and in-place runs have undo snapshots. |
-| `run` | One verdict + ONE primary action | fail | Exit cards still need the distinguished primary action. |
+| `run` | One verdict + ONE primary action | pass | Exit cards now distinguish one primary next action and demote the rest. |
 | `run` | Lifecycle hint | pass | Completion hints point to attach/show/apply/finish/cleanup. |
 | `orchestrate` | Auto-detect, don't ask | pass | Explicit mode/provider flags avoid extra prompts; auto chooses a conservative path. |
 | `orchestrate` | Preview before mutate | pass | Preview and final confirmation precede plan creation/forking. |
@@ -140,7 +140,7 @@ verb.
 | `finish` | Preview before mutate | pass | Destructive apply/export paths respect confirmations. |
 | `finish` | Refuse with try: | pass | Incomplete/dirty/conflict paths include recovery commands. |
 | `finish` | One-command rollback | pass | Apply/export paths expose cleanup or git recovery. |
-| `finish` | One verdict + ONE primary action | fail | Finish still needs the shared one-primary-action slot. |
+| `finish` | One verdict + ONE primary action | pass | Finish output now leads in-place completions with one primary action and secondary actions. |
 | `finish` | Lifecycle hint | pass | Output points at the chosen keep action. |
 | `materialize` | Auto-detect, don't ask | pass | Completed artifact mode is resolved from the run/plan. |
 | `materialize` | Preview before mutate | pass | Existing destination and overwrite behavior is explicit. |
@@ -224,7 +224,7 @@ verb.
 | `status` | Preview before mutate | n-a | Read-only orientation. |
 | `status` | Refuse with try: | pass | Missing state points at start/list. |
 | `status` | One-command rollback | n-a | Read-only orientation. |
-| `status` | One verdict + ONE primary action | fail | Status still needs one verdict plus one primary action. |
+| `status` | One verdict + ONE primary action | pass | Status now prints one primary action before secondary lifecycle actions. |
 | `status` | Lifecycle hint | pass | Status includes natural next commands. |
 | `import` | Auto-detect, don't ask | pass | Descriptor sessions auto-discover by cwd/source when unambiguous. |
 | `import` | Preview before mutate | pass | Preview/list modes show candidates before creating a run. |

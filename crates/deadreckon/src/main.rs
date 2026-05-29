@@ -11701,6 +11701,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
             },
             subtitle: Some(goal.to_string()),
             sections,
+            primary_action: None,
             hints: vec![HintLine {
                 label: "run".to_string(),
                 command: "rerun with --yes to skip this confirmation".to_string(),
@@ -20410,29 +20411,28 @@ fn finish_command(
                 .map(|materialized| print_materialized(&materialized))
         }
         CodebaseMode::InPlace => {
+            let prefix = run_prefix(&state.run_id);
             println!(
                 "{} {}",
                 ui_ok("finished in-place run"),
                 ui_id(&state.run_id)
             );
             println!("  working: {}", state.working_dir.display());
-            println!(
-                "  review:  {}",
-                ui_command(format!("deadreckon show {}", run_prefix(&state.run_id)))
-            );
-            println!(
-                "  docs:    {}",
-                ui_command(format!(
-                    "deadreckon doc {} --kind decisions",
-                    run_prefix(&state.run_id)
-                ))
-            );
-            println!(
-                "  undo:    {}",
-                ui_command(format!(
-                    "deadreckon undo --run {}",
-                    run_prefix(&state.run_id)
-                ))
+            print_action_block(
+                &HintLine {
+                    label: "next".to_string(),
+                    command: format!("deadreckon show {prefix}"),
+                },
+                &[
+                    HintLine {
+                        label: "docs".to_string(),
+                        command: format!("deadreckon doc {prefix} --kind decisions"),
+                    },
+                    HintLine {
+                        label: "undo".to_string(),
+                        command: format!("deadreckon undo --run {prefix}"),
+                    },
+                ],
             );
             Ok(())
         }
@@ -28488,7 +28488,7 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
     }
     println!();
     println!("{}", ui_heading("run health"));
-    println!("  next:     {next_action}");
+    println!("  action:   {next_action}");
     println!("  stale:    {}", if stale { "yes" } else { "no" });
     println!("  pids:     {}", supervised.len());
     if let Some(reason) = state.pause_reason.as_deref() {
@@ -28748,80 +28748,153 @@ fn print_run_started_with_label(
 }
 
 fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
+    let (primary, secondary) = lifecycle_actions(state);
+    print_action_block(&primary, &secondary);
+}
+
+fn lifecycle_actions(state: &deadreckon_core::PipelineState) -> (HintLine, Vec<HintLine>) {
+    let prefix = run_prefix(&state.run_id);
+    match state.status {
+        RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => {
+            return (
+                HintLine {
+                    label: "next".to_string(),
+                    command: format!("deadreckon attach {prefix}"),
+                },
+                vec![
+                    HintLine {
+                        label: "status".to_string(),
+                        command: format!("deadreckon status {prefix}"),
+                    },
+                    HintLine {
+                        label: "stop".to_string(),
+                        command: format!("deadreckon kill {prefix}"),
+                    },
+                ],
+            );
+        }
+        RunStatus::Failed | RunStatus::Killed => {
+            return (
+                HintLine {
+                    label: "next".to_string(),
+                    command: format!("deadreckon show {prefix} --why-failed"),
+                },
+                vec![
+                    HintLine {
+                        label: "resume".to_string(),
+                        command: format!("deadreckon resume {prefix}"),
+                    },
+                    HintLine {
+                        label: "state".to_string(),
+                        command: state.state_path().display().to_string(),
+                    },
+                ],
+            );
+        }
+        RunStatus::Completed => {}
+    }
+
     if let Ok(record) = read_codebase_record(&state.working_dir)
         && record.mode == CodebaseMode::Worktree
     {
-        println!("{}", ui_heading("next actions:"));
-        println!(
-            "  finish:  {}",
-            ui_command(format!(
-                "deadreckon finish {} --autostash --cleanup",
-                run_prefix(&state.run_id)
-            ))
-        );
+        let mut secondary = Vec::new();
         if let Some(worktree) = record.worktree_path.as_ref() {
-            println!("  inspect: cd {} && git status", worktree.display());
+            secondary.push(HintLine {
+                label: "inspect".to_string(),
+                command: format!("cd {} && git status", worktree.display()),
+            });
         }
-        println!(
-            "  apply:   {}",
-            ui_command(format!("deadreckon apply {}", run_prefix(&state.run_id)))
+        secondary.extend([
+            HintLine {
+                label: "apply".to_string(),
+                command: format!("deadreckon apply {prefix}"),
+            },
+            HintLine {
+                label: "cleanup".to_string(),
+                command: format!("deadreckon apply {prefix} --autostash --cleanup"),
+            },
+            HintLine {
+                label: "cleanup".to_string(),
+                command: format!("deadreckon cleanup {prefix}"),
+            },
+            HintLine {
+                label: "docs".to_string(),
+                command: format!("deadreckon doc {prefix} --kind decisions"),
+            },
+        ]);
+        return (
+            HintLine {
+                label: "next".to_string(),
+                command: format!("deadreckon finish {prefix} --autostash --cleanup"),
+            },
+            secondary,
         );
-        println!(
-            "  cleanup: {}",
-            ui_command(format!(
-                "deadreckon apply {} --autostash --cleanup",
-                run_prefix(&state.run_id)
-            ))
+    }
+
+    if let Ok(record) = read_codebase_record(&state.working_dir)
+        && record.mode == CodebaseMode::InPlace
+    {
+        return (
+            HintLine {
+                label: "next".to_string(),
+                command: format!("deadreckon finish {prefix}"),
+            },
+            vec![
+                HintLine {
+                    label: "show".to_string(),
+                    command: format!("deadreckon show {prefix}"),
+                },
+                HintLine {
+                    label: "docs".to_string(),
+                    command: format!("deadreckon doc {prefix} --kind decisions"),
+                },
+                HintLine {
+                    label: "undo".to_string(),
+                    command: format!("deadreckon undo --run {prefix}"),
+                },
+            ],
         );
-        println!(
-            "  cleanup: {}",
-            ui_command(format!("deadreckon cleanup {}", run_prefix(&state.run_id)))
-        );
-        println!(
-            "  docs:    {}",
-            ui_command(format!(
-                "deadreckon doc {} --kind decisions",
-                run_prefix(&state.run_id)
-            ))
-        );
-        return;
     }
     let task_prefix = state.task_key.chars().take(24).collect::<String>();
-    println!("{}", ui_heading("next actions:"));
-    println!(
-        "  finish: {}",
-        ui_command(format!(
-            "deadreckon finish {} --dest ./{}",
-            run_prefix(&state.run_id),
-            task_prefix
-        ))
-    );
-    println!(
-        "  export: {}",
-        ui_command(format!(
-            "deadreckon export {} --dest ./{}",
-            run_prefix(&state.run_id),
-            task_prefix
-        ))
-    );
-    println!(
-        "  extend: {}",
-        ui_command(format!(
-            "deadreckon extend {} '<your follow-up goal>'",
-            run_prefix(&state.run_id)
-        ))
-    );
-    println!(
-        "  show:   {}",
-        ui_command(format!("deadreckon show {}", run_prefix(&state.run_id)))
-    );
-    println!(
-        "  docs:   {}",
-        ui_command(format!(
-            "deadreckon doc {} --kind decisions",
-            run_prefix(&state.run_id)
-        ))
-    );
+    (
+        HintLine {
+            label: "next".to_string(),
+            command: format!("deadreckon finish {prefix} --dest ./{task_prefix}"),
+        },
+        vec![
+            HintLine {
+                label: "export".to_string(),
+                command: format!("deadreckon export {prefix} --dest ./{task_prefix}"),
+            },
+            HintLine {
+                label: "extend".to_string(),
+                command: format!("deadreckon extend {prefix} '<your follow-up goal>'"),
+            },
+            HintLine {
+                label: "show".to_string(),
+                command: format!("deadreckon show {prefix}"),
+            },
+            HintLine {
+                label: "docs".to_string(),
+                command: format!("deadreckon doc {prefix} --kind decisions"),
+            },
+        ],
+    )
+}
+
+fn print_action_block(primary: &HintLine, secondary: &[HintLine]) {
+    println!("{}", ui_heading("primary action:"));
+    print_action_line(primary);
+    if !secondary.is_empty() {
+        println!("{}", ui_heading("secondary actions:"));
+        for action in secondary {
+            print_action_line(action);
+        }
+    }
+}
+
+fn print_action_line(action: &HintLine) {
+    println!("  {}: {}", action.label, ui_command(&action.command));
 }
 
 async fn complete_run_actions(

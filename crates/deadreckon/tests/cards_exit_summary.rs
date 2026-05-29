@@ -53,6 +53,86 @@ fn input(outcome: OutcomeKind) -> ExitSummaryInput {
 }
 
 #[test]
+fn exit_card_leads_with_one_verdict_and_one_primary_action() {
+    let rendered = render_card(
+        &build_exit_summary_card(&input(OutcomeKind::Completed)),
+        &CardOptions {
+            color: false,
+            plain: true,
+            terminal_columns: Some(140),
+            no_color_env: false,
+        },
+    );
+
+    assert!(rendered.contains("* completed run"), "{rendered}");
+    assert_eq!(primary_action_count(&rendered), 1, "{rendered}");
+    let primary = line_index(&rendered, "next", "deadreckon apply abc12345");
+    let attach = line_index(&rendered, "attach", "deadreckon attach abc12345");
+    let show = line_index(&rendered, "show", "deadreckon show abc12345");
+    assert!(primary < attach, "{rendered}");
+    assert!(primary < show, "{rendered}");
+}
+
+#[test]
+fn paused_and_failed_cards_each_have_one_primary_action() {
+    let mut paused = input(OutcomeKind::Paused);
+    paused.hints = vec![
+        (
+            "attach".to_string(),
+            "deadreckon attach abc12345".to_string(),
+        ),
+        (
+            "resume".to_string(),
+            "deadreckon resume abc12345".to_string(),
+        ),
+        ("show".to_string(), "deadreckon show abc12345".to_string()),
+    ];
+    let paused = render_card(
+        &build_exit_summary_card(&paused),
+        &CardOptions {
+            color: false,
+            plain: true,
+            terminal_columns: Some(120),
+            no_color_env: false,
+        },
+    );
+    assert_eq!(primary_action_count(&paused), 1, "{paused}");
+    assert!(
+        line_index(&paused, "next", "deadreckon resume abc12345")
+            < line_index(&paused, "attach", "deadreckon attach abc12345"),
+        "{paused}"
+    );
+
+    let mut failed = input(OutcomeKind::Failed);
+    failed.hints = vec![
+        (
+            "why".to_string(),
+            "deadreckon show abc12345 --why-failed".to_string(),
+        ),
+        (
+            "resume".to_string(),
+            "deadreckon resume abc12345".to_string(),
+        ),
+        ("state".to_string(), "/tmp/run/state.json".to_string()),
+    ];
+    let failed = render_card(
+        &build_exit_summary_card(&failed),
+        &CardOptions {
+            color: false,
+            plain: true,
+            terminal_columns: Some(120),
+            no_color_env: false,
+        },
+    );
+    assert_eq!(primary_action_count(&failed), 1, "{failed}");
+    assert!(
+        line_index(&failed, "next", "deadreckon show abc12345 --why-failed")
+            < line_index(&failed, "resume", "deadreckon resume abc12345"),
+        "{failed}"
+    );
+}
+
+#[test]
 fn accepted_exit_card_shows_proof_block() {
     let rendered = render_card(
         &build_exit_summary_card(&input(OutcomeKind::Completed)),
@@ -85,6 +165,20 @@ fn accepted_exit_card_shows_proof_block() {
         rendered.contains("→ deadreckon apply abc12345"),
         "{rendered}"
     );
+}
+
+fn primary_action_count(rendered: &str) -> usize {
+    rendered
+        .lines()
+        .filter(|line| line.contains(" next") && line.contains("deadreckon "))
+        .count()
+}
+
+fn line_index(rendered: &str, label: &str, command: &str) -> usize {
+    rendered
+        .lines()
+        .position(|line| line.contains(label) && line.contains(command))
+        .unwrap_or_else(|| panic!("missing {label} / {command}\n{rendered}"))
 }
 
 #[test]

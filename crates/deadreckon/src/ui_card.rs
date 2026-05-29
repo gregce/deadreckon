@@ -8,6 +8,7 @@ pub struct Card {
     pub title: TitleLine,
     pub subtitle: Option<String>,
     pub sections: Vec<Section>,
+    pub primary_action: Option<HintLine>,
     pub hints: Vec<HintLine>,
 }
 
@@ -181,8 +182,17 @@ fn body_lines(card: &Card, plain: bool, color: bool) -> Vec<String> {
             }
         }
     }
-    if !card.hints.is_empty() {
+    if card.primary_action.is_some() || !card.hints.is_empty() {
         lines.push(String::new());
+    }
+    if let Some(primary) = card.primary_action.as_ref() {
+        lines.push(format!(
+            "  {}{}",
+            pad_visible(&style_tone(&primary.label, Tone::Good, color), LABEL_WIDTH),
+            style_tone(&primary.command, Tone::Good, color)
+        ));
+    }
+    if !card.hints.is_empty() {
         for hint in &card.hints {
             lines.push(format!(
                 "  {}{}",

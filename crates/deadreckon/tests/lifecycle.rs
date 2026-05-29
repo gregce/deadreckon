@@ -15,9 +15,10 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use deadreckon_core::{
-    CodebaseMode, DeadreckonPaths, PhaseId, PhaseStatus, PipelineState, RunOptions, RunStatus,
-    TraceRecord, acquire_lock, append_trace, create_run, list_runs, load_run,
+    CodebaseMode, CodebaseRecord, DeadreckonPaths, PhaseId, PhaseStatus, PipelineState, RunOptions,
+    RunStatus, TraceRecord, acquire_lock, append_trace, create_run, list_runs, load_run,
     promote_completed_run, read_codebase_record, save_state, write_acceptance_marker,
+    write_codebase_record,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1356,6 +1357,34 @@ fn finish_exports_completed_fresh_run() {
 }
 
 #[test]
+fn finish_in_place_run_has_one_primary_action_and_demoted_secondary_actions() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "finish in-place parent");
+    let mut record = CodebaseRecord::fresh();
+    record.mode = CodebaseMode::InPlace;
+    write_codebase_record(&parent.working_dir, &record).expect("codebase record");
+
+    let output = deadreckon(&paths)
+        .arg("finish")
+        .arg(&parent.run_id)
+        .output()
+        .expect("finish");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("finished in-place run"), "{stdout}");
+    assert!(stdout.contains("primary action:"), "{stdout}");
+    assert_eq!(count_action_label(&stdout, "next"), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!("deadreckon show {}", &parent.run_id[..8])),
+        "{stdout}"
+    );
+    assert!(stdout.contains("secondary actions:"), "{stdout}");
+    assert!(stdout.contains("deadreckon doc"), "{stdout}");
+    assert!(stdout.contains("deadreckon undo"), "{stdout}");
+}
+
+#[test]
 fn status_includes_library_count_and_disk_usage() {
     let temp = repo_tempdir();
     let (paths, parent) = completed_parent(&temp, "status library disk");
@@ -1647,6 +1676,12 @@ fn stdout(output: &std::process::Output) -> String {
 
 fn stderr(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+fn count_action_label(out: &str, label: &str) -> usize {
+    out.lines()
+        .filter(|line| line.trim_start().starts_with(&format!("{label}:")))
+        .count()
 }
 
 #[derive(Clone)]

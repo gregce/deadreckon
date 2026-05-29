@@ -92,7 +92,7 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
     },
     VerbFriendliness {
         verb: "run",
-        marks: [P, P, P, P, F, P],
+        marks: [P, P, P, P, P, P],
     },
     VerbFriendliness {
         verb: "orchestrate",
@@ -144,7 +144,7 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
     },
     VerbFriendliness {
         verb: "finish",
-        marks: [P, P, P, P, F, P],
+        marks: [P, P, P, P, P, P],
     },
     VerbFriendliness {
         verb: "materialize",
@@ -200,7 +200,7 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
     },
     VerbFriendliness {
         verb: "status",
-        marks: [P, N, P, N, F, P],
+        marks: [P, N, P, N, P, P],
     },
     VerbFriendliness {
         verb: "import",
