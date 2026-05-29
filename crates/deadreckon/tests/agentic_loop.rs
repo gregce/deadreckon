@@ -16,6 +16,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
+use deadreckon::notify::{NotifyAttempt, NotifyTransition};
 use deadreckon_core::{
     DeadreckonPaths, RUN_EVENTS_JSONL, RunStatus, cancel_marker_path, list_runs, load_run,
     write_cancel_marker,
@@ -75,6 +76,133 @@ async fn mock_provider_records_three_turns_and_artifacts_match() {
     assert!(state.working_dir.join("turn1.txt").exists());
     assert!(state.working_dir.join("notes.md").exists());
     assert_provenance_ids_match_traces(&state.run_root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_run_fires_notification_when_enabled() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let server = MockServer::start(three_turn_script()).await;
+    let notify_out = temp.path().join("notify-env.txt");
+    let notify_command = format!(
+        "env | sort | grep '^DEADRECKON_NOTIFY_' > {}",
+        shell_quote(&notify_out)
+    );
+    write_config_with_extra(
+        temp.path(),
+        &server.base_url(),
+        &format!(
+            r#"
+[notify]
+enabled = true
+on = ["accepted", "paused", "failed"]
+native = false
+command = "{}"
+"#,
+            toml_string(&notify_command)
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
+        .arg("mock notify accepted")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--no-docs")
+        .env("DEADRECKON_HOME", temp.path().join("home"))
+        .output()
+        .expect("run deadreckon");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("completed run"));
+
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.status, RunStatus::Completed);
+
+    let env_dump = fs::read_to_string(&notify_out).expect("notify env");
+    assert!(env_dump.contains("DEADRECKON_NOTIFY_TRANSITION=accepted"));
+    assert!(env_dump.contains(&format!("DEADRECKON_NOTIFY_RUN_ID={}", state.run_id)));
+    assert!(env_dump.contains("DEADRECKON_NOTIFY_VERDICT=verified run"));
+    assert!(env_dump.contains("DEADRECKON_NOTIFY_SPEND="));
+
+    let attempts = jsonl_values(&state.run_root.join("notify.jsonl"));
+    assert_eq!(attempts.len(), 1);
+    let attempt: NotifyAttempt =
+        serde_json::from_value(attempts[0].clone()).expect("notify attempt");
+    assert_eq!(attempt.transition, NotifyTransition::Accepted);
+    assert_eq!(attempt.channel, "command");
+    assert!(attempt.ok, "{attempt:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_notify_fires_nothing() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let server = MockServer::start(three_turn_script()).await;
+    let notify_out = temp.path().join("notify-disabled-env.txt");
+    let notify_command = format!("env > {}", shell_quote(&notify_out));
+    write_config_with_extra(
+        temp.path(),
+        &server.base_url(),
+        &format!(
+            r#"
+[notify]
+enabled = false
+native = false
+command = "{}"
+"#,
+            toml_string(&notify_command)
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
+        .arg("mock notify disabled")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--no-docs")
+        .env("DEADRECKON_HOME", temp.path().join("home"))
+        .output()
+        .expect("run deadreckon");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.status, RunStatus::Completed);
+    assert!(!notify_out.exists());
+    assert!(!state.run_root.join("notify.jsonl").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1586,6 +1714,10 @@ fn repo_tempdir() -> TempDir {
 }
 
 fn write_config(temp: &std::path::Path, base_url: &str) {
+    write_config_with_extra(temp, base_url, "");
+}
+
+fn write_config_with_extra(temp: &std::path::Path, base_url: &str, extra: &str) {
     let home = temp.join("home");
     fs::create_dir_all(&home).expect("home");
     fs::write(
@@ -1601,10 +1733,18 @@ model = "mock-agent"
 api_key = "test"
 input_cost_per_million = 1.0
 output_cost_per_million = 1.0
-"#
-        ),
+"#,
+        ) + extra,
     )
     .expect("config");
+}
+
+fn toml_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r#"'\''"#))
 }
 
 fn write_cli_config(temp: &std::path::Path, binary: &std::path::Path) {

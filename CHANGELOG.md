@@ -9,6 +9,7 @@
 - P5 (`663843f`): Added a shared primary-action slot to cards and made exit cards, status, and finish lead with one primary action while demoting secondary lifecycle actions.
 - P6 (`85f1d31`): Swept spend and gate verdict rendering so exit cards, status, finish, plan child details, and campaign child summaries show honest subscription spend and per-check gate results.
 - P7 (`0bef0f4`): Added opt-in `[notify]` parsing, bounded native/command/webhook channels, redacted notification context, and `notify.jsonl` attempt records.
+- P8 (`823945b`): Fired enabled notifications on accepted, paused-at-cap, and failed lifecycle outcomes while disabled configs stay silent.
 
 ## Campaign Orchestration (production release) - 2026-05-28
 
