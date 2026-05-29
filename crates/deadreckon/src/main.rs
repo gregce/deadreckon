@@ -429,6 +429,37 @@ async fn main_inner() -> Result<()> {
             ui::set_plain_output(request.plan.plain);
             orchestrate_command(request).await
         }
+        Commands::Campaign {
+            goal,
+            n,
+            planner_provider,
+            provider,
+            max_spend,
+            max_wall_seconds,
+            sandbox,
+            preview,
+            yes,
+            no_hints,
+            quiet,
+            plain,
+        } => {
+            ui::set_plain_output(plain);
+            campaign_command(CampaignArgs {
+                goal,
+                n,
+                planner_provider,
+                provider,
+                max_spend,
+                max_wall_seconds,
+                sandbox,
+                preview,
+                yes,
+                no_hints,
+                quiet,
+                plain,
+            })
+            .await
+        }
         Commands::Plan {
             goal,
             n,
@@ -16230,6 +16261,399 @@ fn record_sub_orchestrator_result(plan_id: &str, launch_dir: &Path, ok: bool) {
         ok,
     };
     let _ = deadreckon_core::campaign::write_sub_result(launch_dir, &result);
+}
+
+struct CampaignArgs {
+    goal: String,
+    n: u8,
+    planner_provider: Option<String>,
+    provider: Option<String>,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    sandbox: Option<String>,
+    preview: bool,
+    yes: bool,
+    no_hints: bool,
+    quiet: bool,
+    plain: bool,
+}
+
+fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sandbox: Option<&str>) {
+    let per_sub = campaign
+        .tree_budget_usd
+        .map(|budget| deadreckon_core::campaign::allocate_budget(budget, campaign.sub_goals.len()));
+    println!("campaign: {} sub-orchestrators", campaign.n);
+    println!(
+        "  depth cap {} (sub-orchestrators cannot campaign again)",
+        deadreckon_core::campaign::CAMPAIGN_MAX_DEPTH
+    );
+    match (
+        campaign.tree_budget_usd,
+        per_sub.as_ref().and_then(|s| s.first()),
+    ) {
+        (Some(total), Some(share)) => {
+            println!("  tree budget ${total:.2} (~${share:.2}/sub)");
+        }
+        _ => {
+            if let Some(warning) =
+                deadreckon_core::campaign::unbounded_budget_warning(campaign.tree_budget_usd)
+            {
+                println!("  tree budget: {warning}");
+            }
+        }
+    }
+    if let Some(sandbox) = sandbox {
+        println!("  sandbox {sandbox}");
+    }
+    if let Some(planner) = campaign.providers.planner.as_deref() {
+        println!("  planner {planner}");
+    }
+    for sub in &campaign.sub_goals {
+        println!("  {} {}", sub.sub_id, sub.goal);
+    }
+}
+
+fn confirm_campaign_start(campaign: &deadreckon_core::campaign::Campaign, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    let prompt = format!(
+        "launch {} sub-orchestrators for \"{}\"?",
+        campaign.n, campaign.root_goal
+    );
+    if prompt::confirm(&prompt, false)? {
+        Ok(())
+    } else {
+        Err(CliError::Core(DeadreckonError::InvalidInput(
+            "campaign cancelled".to_string(),
+        )))
+    }
+}
+
+/// Create a promoted result run from the composed campaign tree, binding the
+/// roll-up into the marker signature. Mirrors `create_merged_plan_run`.
+fn promote_campaign_result(
+    paths: &DeadreckonPaths,
+    campaign_id: &str,
+    merge_dir: &Path,
+    rollup: &deadreckon_core::campaign::CampaignRollup,
+) -> Result<deadreckon_core::PipelineState> {
+    let cwd = std::env::current_dir()?;
+    let mut state = create_run(
+        paths,
+        RunOptions {
+            goal: format!("campaign {}", run_prefix(campaign_id)),
+            cwd,
+            sandbox: "none".to_string(),
+            provider: Some("deadreckon:campaign".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: None,
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )?;
+    remove_if_exists(&state.working_dir)?;
+    copy_tree(merge_dir, &state.working_dir)?;
+    deadreckon_core::campaign::write_campaign_rollup_at_run_root(&state.run_root, rollup)?;
+    write_acceptance_marker(
+        &state.run_root,
+        state.run_id.clone(),
+        state.working_dir.clone(),
+        1,
+    )?;
+    state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
+    save_state(&state)?;
+    promote_completed_run(paths, &mut state)?;
+    Ok(state)
+}
+
+fn write_campaign_manifest(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+    result_state: &deadreckon_core::PipelineState,
+    rollup: &deadreckon_core::campaign::CampaignRollup,
+) -> Result<()> {
+    let library_dir = paths.library_dir(&result_state.scope, &result_state.run_id);
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "campaign_id": campaign.campaign_id,
+        "root_goal": campaign.root_goal,
+        "n": campaign.n,
+        "depth": campaign.depth,
+        "subs": campaign.sub_goals.iter().map(|sub| serde_json::json!({
+            "sub_id": sub.sub_id,
+            "goal": sub.goal,
+            "sub_plan_id": sub.sub_plan_id,
+            "result_run_id": sub.result_run_id,
+        })).collect::<Vec<_>>(),
+        "result_run_id": result_state.run_id,
+        "rollup_verdict": rollup.rollup_verdict,
+        "refused_subs": rollup.refused_subs,
+        "caveat_subs": rollup.caveat_subs,
+    });
+    let path = library_dir.join("deadreckon-campaign-manifest.json");
+    fs::create_dir_all(&library_dir)?;
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&manifest).map_err(|source| DeadreckonError::Json {
+            path: path.clone(),
+            source,
+        })?,
+    )?;
+    Ok(())
+}
+
+async fn campaign_command(args: CampaignArgs) -> Result<()> {
+    use deadreckon_core::campaign;
+
+    let goal = args.goal.trim().to_string();
+    if goal.is_empty() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "campaign goal must be non-empty",
+            "deadreckon campaign \"your goal\"",
+        )));
+    }
+    deadreckon_core::plan::validate_task_count(usize::from(args.n)).map_err(CliError::Core)?;
+
+    let lineage = campaign::lineage_from_env();
+    if lineage.depth + 1 >= campaign::CAMPAIGN_MAX_DEPTH {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "campaign refused: depth cap 2 reached\n\
+             try: run `orchestrate full-plan` (not campaign) inside a sub-orchestrator"
+                .to_string(),
+        )));
+    }
+
+    let paths = DeadreckonPaths::discover();
+    let defaults = config_defaults(&paths)?;
+    let cwd = std::env::current_dir()?;
+    let scope = workspace_scope(&cwd)?;
+    let providers = resolve_plan_providers(
+        &paths,
+        &defaults,
+        PlanMode::FullPlan,
+        args.planner_provider.clone(),
+        args.provider.clone(),
+        None,
+        None,
+    )?;
+    let overrides = BTreeMap::new();
+    let tasks = build_full_plan_tasks(
+        &paths, &goal, args.n, &providers, &overrides, &cwd, args.plain,
+    )
+    .await?;
+    let sub_goal_strings: Vec<String> = tasks.iter().map(|task| task.goal.clone()).collect();
+    let sub_goals =
+        campaign::build_sub_goals(sub_goal_strings, usize::from(args.n)).map_err(CliError::Core)?;
+    let sub_keys: Vec<String> = sub_goals.iter().map(|sub| sub.task_key.clone()).collect();
+    campaign::guard(
+        lineage.depth,
+        &lineage.ancestor_task_keys,
+        &lineage.ancestor_scopes,
+        &sub_keys,
+        &[],
+    )?;
+
+    let mut campaign_obj = campaign::Campaign::new(
+        goal,
+        sub_goals,
+        providers.clone(),
+        lineage.depth,
+        args.max_spend,
+        args.max_wall_seconds,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .map_err(CliError::Core)?;
+    let campaign_id = campaign_obj.campaign_id.clone();
+    let campaign_dir = paths.plan_dir(&campaign_id);
+    fs::create_dir_all(&campaign_dir)?;
+    campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+    let mut lineage_scopes = lineage.ancestor_scopes.clone();
+    lineage_scopes.push(scope.clone());
+    campaign::write_lineage(
+        &campaign_dir,
+        &campaign::Lineage {
+            schema_version: 1,
+            depth: lineage.depth,
+            campaign_root_id: Some(campaign_id.clone()),
+            ancestor_task_keys: lineage.ancestor_task_keys.clone(),
+            ancestor_scopes: lineage_scopes,
+        },
+    )?;
+    campaign::append_campaign_event(
+        &campaign_dir,
+        "campaign_created",
+        serde_json::json!({ "n": campaign_obj.n, "root_goal": campaign_obj.root_goal }),
+    )?;
+
+    if !args.quiet {
+        print_campaign_preflight(&campaign_obj, args.sandbox.as_deref());
+    }
+    if args.preview {
+        return Ok(());
+    }
+    confirm_campaign_start(&campaign_obj, args.yes)?;
+
+    let sandbox = args.sandbox.clone().unwrap_or_else(|| "auto".to_string());
+    let per_sub = campaign_obj
+        .tree_budget_usd
+        .map(|budget| campaign::allocate_budget(budget, usize::from(args.n)));
+    let home = paths.home().to_path_buf();
+    let planner = providers.planner.clone();
+    let child_provider = providers.default_child.clone();
+    let plain = args.plain;
+    let mut ancestor_task_keys = lineage.ancestor_task_keys.clone();
+    ancestor_task_keys.extend(sub_keys.iter().cloned());
+    let mut ancestor_scopes = lineage.ancestor_scopes.clone();
+    ancestor_scopes.push(scope.clone());
+    let launch_paths = &paths;
+    let mut sub_index = 0usize;
+
+    run_campaign_fork(
+        &campaign_dir,
+        &mut campaign_obj,
+        |sub, launch_dir| {
+            let share = per_sub
+                .as_ref()
+                .and_then(|shares| shares.get(sub_index).copied());
+            sub_index += 1;
+            let mut command = build_sub_orchestrator_command(&CampaignSubLaunch {
+                home: &home,
+                source_dir: &cwd,
+                launch_dir,
+                campaign_id: &campaign_id,
+                sub_goal: &sub.goal,
+                sub_n: 2,
+                sandbox: &sandbox,
+                max_spend: share,
+                plain,
+                planner_provider: planner.as_deref(),
+                child_provider: child_provider.as_deref(),
+                ancestor_task_keys: &ancestor_task_keys,
+                ancestor_scopes: &ancestor_scopes,
+            })?;
+            let status = command.status()?;
+            if !status.success() {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "sub-orchestrator {} exited with {status}",
+                    sub.sub_id
+                ))));
+            }
+            discover_sub_result(launch_dir)?.ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "sub-orchestrator {} produced no result",
+                    sub.sub_id
+                )))
+            })
+        },
+        |result| {
+            result
+                .result_run_id
+                .as_deref()
+                .and_then(|run_id| load_run(launch_paths, run_id).ok())
+                .map(|state| state.total_spend_usd)
+                .unwrap_or(0.0)
+        },
+    )?;
+
+    let rollup = campaign::build_rollup(&campaign_obj, |run_id| match load_run(&paths, run_id) {
+        Ok(state) => {
+            let tamper =
+                deadreckon_core::tamper::read_acceptance_tamper_for_run_root(&state.run_root)
+                    .ok()
+                    .flatten();
+            let verdict = tamper
+                .as_ref()
+                .map(|tamper| tamper.verdict)
+                .unwrap_or(deadreckon_core::tamper::AcceptanceTamperVerdict::Clean);
+            let caveats = tamper.map(|tamper| tamper.caveats).unwrap_or_default();
+            let gate = if deadreckon_core::gate::validate_acceptance_marker(&state).is_ok() {
+                "signed".to_string()
+            } else {
+                "refused".to_string()
+            };
+            (gate, verdict, caveats)
+        }
+        Err(_) => (
+            "missing".to_string(),
+            deadreckon_core::tamper::AcceptanceTamperVerdict::Refuse,
+            Vec::new(),
+        ),
+    });
+    campaign::write_campaign_rollup(&campaign_dir, &rollup)?;
+
+    let result_run_ids: Vec<String> = campaign_obj
+        .sub_goals
+        .iter()
+        .filter_map(|sub| sub.result_run_id.clone())
+        .collect();
+    let merge_dir = campaign_dir.join("merge-working");
+    let compose = compose_result_runs(&paths, &result_run_ids, &merge_dir)?;
+    if !compose.conflicts.is_empty() {
+        campaign_obj.status = campaign::CampaignStatus::Failed;
+        campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+        campaign::append_campaign_event(
+            &campaign_dir,
+            "campaign_failed",
+            serde_json::json!({ "reason": "cross-sub file conflict", "conflicts": compose.conflicts.len() }),
+        )?;
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "campaign failed: cross-sub file conflict",
+            "narrow sub-goals so they touch disjoint files (cross-level repair is a V1 candidate)",
+        )));
+    }
+
+    if !campaign::campaign_can_complete(&campaign_obj, &rollup) {
+        campaign_obj.status = campaign::CampaignStatus::Failed;
+        campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+        campaign::append_campaign_event(
+            &campaign_dir,
+            "rollup_refused",
+            serde_json::json!({ "refused_subs": rollup.refused_subs }),
+        )?;
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "campaign failed: refused sub(s) {}",
+                rollup.refused_subs.join(", ")
+            ),
+            "deadreckon show <campaign-id> --why-failed",
+        )));
+    }
+
+    let result_state = promote_campaign_result(&paths, &campaign_id, &merge_dir, &rollup)?;
+    campaign_obj.merged_run_id = Some(result_state.run_id.clone());
+    campaign_obj.merged_at = Some(chrono::Utc::now());
+    campaign_obj.status = campaign::CampaignStatus::Merged;
+    campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+    write_campaign_manifest(&paths, &campaign_obj, &result_state, &rollup)?;
+    campaign::append_campaign_event(
+        &campaign_dir,
+        "campaign_completed",
+        serde_json::json!({ "merged_run_id": result_state.run_id }),
+    )?;
+    if !args.quiet {
+        let verdict = match rollup.rollup_verdict {
+            campaign::RollupVerdict::Clean => "clean",
+            campaign::RollupVerdict::Caveat => "caveat",
+            campaign::RollupVerdict::Refused => "refused",
+        };
+        println!(
+            "campaign {} complete: {}/{} subs · roll-up {verdict} · result {}",
+            run_prefix(&campaign_id),
+            campaign_obj
+                .sub_goals
+                .iter()
+                .filter(|sub| sub.status == campaign::SubGoalStatus::Merged)
+                .count(),
+            campaign_obj.n,
+            run_prefix(&result_state.run_id)
+        );
+        if !args.no_hints {
+            println!("try: deadreckon apply {}", run_prefix(&result_state.run_id));
+        }
+    }
+    Ok(())
 }
 
 /// Drive a campaign's sub-orchestrators sequentially, recording events and status

@@ -816,6 +816,49 @@ pub(crate) enum Commands {
         plain: bool,
     },
     #[command(
+        about = "Run one goal as N independent orchestrators, then compose their results (depth-capped at 2)",
+        after_help = "Example:\n  deadreckon campaign \"rebuild billing, notifications, and admin\" --n 3 --yes"
+    )]
+    Campaign {
+        #[arg(help = "Natural-language coding goal to split into N sub-orchestrators")]
+        goal: String,
+        #[arg(
+            long,
+            default_value_t = 3,
+            help = "Number of sub-orchestrators, 2 through 6"
+        )]
+        n: u8,
+        #[arg(long, help = "Planner provider route for sub-goal decomposition")]
+        planner_provider: Option<String>,
+        #[arg(long, help = "Default child provider route for the sub-orchestrators")]
+        provider: Option<String>,
+        #[arg(
+            long,
+            help = "Tree-wide spend cap in USD, split across sub-orchestrators"
+        )]
+        max_spend: Option<f64>,
+        #[arg(long, help = "Per-leaf wall-clock cap for CLI-backed turns")]
+        max_wall_seconds: Option<f64>,
+        #[arg(
+            long,
+            help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
+        )]
+        sandbox: Option<String>,
+        #[arg(
+            long,
+            help = "Show the resolved campaign preflight without starting work"
+        )]
+        preview: bool,
+        #[arg(long, help = "Confirm the campaign preflight without prompting")]
+        yes: bool,
+        #[arg(long, help = "Suppress post-action hints")]
+        no_hints: bool,
+        #[arg(long, help = "Suppress success chatter and post-action hints")]
+        quiet: bool,
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
+        plain: bool,
+    },
+    #[command(
         next_help_heading = "Run Lifecycle",
         about = "Write an orchestration plan without starting child runs",
         after_help = PLAN_HELP

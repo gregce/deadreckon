@@ -611,6 +611,12 @@ pub fn write_campaign_rollup(plan_dir: &Path, rollup: &CampaignRollup) -> Result
     crate::state::atomic_write_json(&rollup_path_for_plan_dir(plan_dir), rollup)
 }
 
+/// Write the roll-up into a result run's root so the gate binds it into the
+/// acceptance-marker signature (the no-laundering guarantee).
+pub fn write_campaign_rollup_at_run_root(run_root: &Path, rollup: &CampaignRollup) -> Result<()> {
+    crate::state::atomic_write_json(&rollup_path_at_run_root(run_root), rollup)
+}
+
 pub fn read_campaign_rollup(plan_dir: &Path) -> Result<CampaignRollup> {
     let path = rollup_path_for_plan_dir(plan_dir);
     let bytes = std::fs::read(&path).map_err(|source| DeadreckonError::Io {
