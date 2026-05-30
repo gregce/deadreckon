@@ -28,6 +28,9 @@
 - P3f (`8e0f276`): Lifted `self_improve_pr_tests` out of `main.rs` into a
   sibling `src` test module while preserving self-improvement PR adapter
   coverage and private-helper access.
+- P3g (`pending`): Lifted `tui_tests` out of `main.rs` into a sibling `src`
+  test module while preserving attach, plan, narrative, provider-log, and
+  guided-start TUI coverage plus private-helper access.
 
 ## Effortless (production release) - 2026-05-28
 
