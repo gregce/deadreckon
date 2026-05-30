@@ -10,7 +10,7 @@
   `crates/deadreckon/tests/common/` and migrated duplicated tempdir,
   command-construction, stdout/stderr, and success-assertion helpers without
   changing test assertions.
-- P3a (`pending`): Lifted `acceptance_integrity_tests` out of `main.rs` into a
+- P3a (`a601ae3`): Lifted `acceptance_integrity_tests` out of `main.rs` into a
   sibling `src` test module without changing test names or widening runtime
   visibility.
 
