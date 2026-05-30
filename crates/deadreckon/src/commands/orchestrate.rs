@@ -120,7 +120,7 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
-    let default_provider = resolve_provider_name(
+    let default_provider = commands::plan::resolve_provider_name(
         &paths,
         setup::SetupProviderRoleRef::DefaultChild,
         defaults.provider,
@@ -354,13 +354,13 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     let max_spend = args.plan.max_spend;
     let max_wall_seconds = args.plan.max_wall_seconds;
     let sandbox = args.plan.sandbox.clone();
-    if !prepare_orchestration_source(args.plan.init_git, quiet)? {
+    if !commands::plan::prepare_orchestration_source(args.plan.init_git, quiet)? {
         return Ok(());
     }
-    let plan = create_orchestration_plan(args.plan).await?;
+    let plan = commands::plan::create_orchestration_plan(args.plan).await?;
     let plan_id = plan.plan_id.clone();
     if !quiet {
-        print_orchestrate_preflight(
+        commands::plan::print_orchestrate_preflight(
             &plan,
             max_spend,
             max_wall_seconds,
@@ -371,9 +371,9 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     if args.preview {
         return Ok(());
     }
-    confirm_orchestration_start(&plan, args.yes)?;
+    commands::plan::confirm_orchestration_start(&plan, args.yes)?;
     if !quiet {
-        print_orchestrate_started(
+        commands::plan::print_orchestrate_started(
             &plan,
             max_spend,
             max_wall_seconds,
@@ -381,7 +381,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
             args.no_repair,
         );
     }
-    fork_command(ForkCommandArgs {
+    commands::plan::fork_command(ForkCommandArgs {
         plan_id: plan_id.clone(),
         max_spend,
         max_wall_seconds,

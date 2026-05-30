@@ -16,6 +16,10 @@ use super::commands::chain::{
     chain_wall_cap_hit, per_step_wall_cap,
 };
 use super::commands::orchestrate::{recommend_child_count_for_goal, recommend_orchestration_mode};
+use super::commands::plan::{
+    implementation_plan_warnings, orchestration_dependency_rows, orchestration_parallelism_lines,
+    orchestration_provider_role_rows, orchestration_role_table_lines,
+};
 use super::{
     ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachActionNotice,
     AttachJsonlTail, AttachLive, AttachLoopStage, AttachNarrativeProjectionCache,
@@ -40,11 +44,9 @@ use super::{
     collect_jsonl_provider_activity, collect_jsonl_provider_activity_scan, collect_plan_doc_input,
     command_discovery, completion_action_from_input, completion_hints_enabled,
     deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
-    fallback_goal_shape_recommendation, implementation_plan_warnings, kill_banner,
-    launch_preview_rows, live_file_lines, markdown_to_tui_lines, materialize_plan_docs_to_working,
-    max_panel_scroll, maybe_prompt_start_mode, meter_color, narrative_provider_selection,
-    orchestration_dependency_rows, orchestration_parallelism_lines,
-    orchestration_provider_role_rows, orchestration_role_table_lines, parse_provider_goal_shape,
+    fallback_goal_shape_recommendation, kill_banner, launch_preview_rows, live_file_lines,
+    markdown_to_tui_lines, materialize_plan_docs_to_working, max_panel_scroll,
+    maybe_prompt_start_mode, meter_color, narrative_provider_selection, parse_provider_goal_shape,
     plan_attach_footer, plan_doc_path, plan_merge_repair_summary_items,
     plan_narrative_refresh_request, plan_narrative_refresh_trigger,
     poll_plan_narrative_refresh_job, poll_run_narrative_refresh_job, prompt_start_done_criteria,
