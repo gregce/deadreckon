@@ -31,6 +31,10 @@
 - P3g (`bf64b50`): Lifted `tui_tests` out of `main.rs` into a sibling `src`
   test module while preserving attach, plan, narrative, provider-log, and
   guided-start TUI coverage plus private-helper access.
+- P4a (`pending`): Created the private `commands/` facade, moved the chain
+  command family into `src/commands/chain/`, and routed the `main_inner` chain
+  branch through `commands::chain` while keeping shared attach infrastructure in
+  the crate root.
 
 ## Effortless (production release) - 2026-05-28
 
