@@ -429,9 +429,9 @@ async fn main_inner() -> Result<()> {
             plain,
         } => {
             ui::set_plain_output(plain);
-            let request = orchestrate_request_from_cli(
+            let request = commands::orchestrate::orchestrate_request_from_cli(
                 command,
-                BareOrchestrateArgs {
+                commands::orchestrate::BareOrchestrateArgs {
                     goal,
                     max_spend,
                     max_wall_seconds,
@@ -447,7 +447,7 @@ async fn main_inner() -> Result<()> {
                 },
             )?;
             ui::set_plain_output(request.plan.plain);
-            orchestrate_command(request).await
+            commands::orchestrate::orchestrate_command(request).await
         }
         Commands::Campaign {
             goal,
@@ -2249,7 +2249,10 @@ fn fallback_goal_shape_recommendation(goal: &str) -> GoalShapeRecommendation {
     let (shape, n, rationale) = if start_goal_recommends_full_plan(&lower) {
         (
             GoalShape::Orchestrate,
-            Some(recommend_child_count_for_goal(goal, CliPlanMode::FullPlan)),
+            Some(commands::orchestrate::recommend_child_count_for_goal(
+                goal,
+                CliPlanMode::FullPlan,
+            )),
             "goal names parallel or separable workstreams".to_string(),
         )
     } else {
@@ -2811,7 +2814,10 @@ fn prompt_start_child_count(
     decision: &mut StartLaunchDecision,
     prompter: &mut dyn StartPrompter,
 ) -> Result<()> {
-    let recommended = recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan);
+    let recommended = commands::orchestrate::recommend_child_count_for_goal(
+        &decision.goal,
+        CliPlanMode::FullPlan,
+    );
     let mut choices = vec![start_prompt_choice(
         format!("n:{recommended}"),
         format!("Recommended: {recommended} children"),
@@ -2949,10 +2955,11 @@ fn resolve_start_orchestration_options(
                         return Ok(());
                     }
                 } else {
-                    decision.child_count = Some(recommend_child_count_for_goal(
-                        &decision.goal,
-                        CliPlanMode::FullPlan,
-                    ));
+                    decision.child_count =
+                        Some(commands::orchestrate::recommend_child_count_for_goal(
+                            &decision.goal,
+                            CliPlanMode::FullPlan,
+                        ));
                 }
             }
 
@@ -3013,7 +3020,10 @@ fn resolve_start_orchestration_options(
                 && !args.child_provider.is_empty()
             {
                 let n = decision.child_count.unwrap_or_else(|| {
-                    recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan)
+                    commands::orchestrate::recommend_child_count_for_goal(
+                        &decision.goal,
+                        CliPlanMode::FullPlan,
+                    )
                 });
                 parse_child_provider_overrides(&args.child_provider, n)?;
                 decision.child_provider_overrides = args.child_provider.clone();
@@ -3021,7 +3031,10 @@ fn resolve_start_orchestration_options(
                 && let Some(prompter) = prompter.as_mut()
             {
                 let n = decision.child_count.unwrap_or_else(|| {
-                    recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan)
+                    commands::orchestrate::recommend_child_count_for_goal(
+                        &decision.goal,
+                        CliPlanMode::FullPlan,
+                    )
                 });
                 prompt_start_child_provider_overrides(decision, n, &mut **prompter)?;
             }
@@ -3484,7 +3497,10 @@ fn start_provider_role_summary(decision: &StartLaunchDecision) -> Option<String>
             let planner = decision.planner_provider_route.as_deref().unwrap_or(route);
             let child = decision.child_provider_route.as_deref().unwrap_or(route);
             let n = decision.child_count.unwrap_or_else(|| {
-                recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan)
+                commands::orchestrate::recommend_child_count_for_goal(
+                    &decision.goal,
+                    CliPlanMode::FullPlan,
+                )
             });
             let mut summary = format!("children={n}, planner={planner}, child={child}");
             if !decision.child_provider_overrides.is_empty() {
@@ -3498,7 +3514,10 @@ fn start_provider_role_summary(decision: &StartLaunchDecision) -> Option<String>
             let planner = decision.planner_provider_route.as_deref().unwrap_or(route);
             let child = decision.child_provider_route.as_deref().unwrap_or(route);
             let n = decision.child_count.unwrap_or_else(|| {
-                recommend_child_count_for_goal(&decision.goal, CliPlanMode::FullPlan)
+                commands::orchestrate::recommend_child_count_for_goal(
+                    &decision.goal,
+                    CliPlanMode::FullPlan,
+                )
             });
             Some(format!("subs={n}, planner={planner}, child={child}"))
         }
@@ -4374,50 +4393,55 @@ async fn dispatch_start_command(
                 .clone()
                 .or_else(|| provider_route.clone());
             let reviewer_provider = decision.reviewer_provider_route.clone().or(provider_route);
-            let result = orchestrate_command(OrchestrateRunArgs {
-                plan: PlanCommandArgs {
-                    goal: args.goal,
-                    n: decision
-                        .child_count
-                        .unwrap_or_else(|| recommend_child_count_for_goal(&decision.goal, mode)),
-                    mode,
-                    max_spend: None,
-                    max_wall_seconds: None,
-                    sandbox: None,
-                    planner_provider: if mode == CliPlanMode::FullPlan {
-                        planner_provider
-                    } else {
-                        None
+            let result = commands::orchestrate::orchestrate_command(
+                commands::orchestrate::OrchestrateRunArgs {
+                    plan: PlanCommandArgs {
+                        goal: args.goal,
+                        n: decision.child_count.unwrap_or_else(|| {
+                            commands::orchestrate::recommend_child_count_for_goal(
+                                &decision.goal,
+                                mode,
+                            )
+                        }),
+                        mode,
+                        max_spend: None,
+                        max_wall_seconds: None,
+                        sandbox: None,
+                        planner_provider: if mode == CliPlanMode::FullPlan {
+                            planner_provider
+                        } else {
+                            None
+                        },
+                        provider: if mode == CliPlanMode::FullPlan {
+                            child_provider
+                        } else {
+                            None
+                        },
+                        child_provider: decision.child_provider_overrides.clone(),
+                        coder_provider: if mode == CliPlanMode::Review {
+                            coder_provider
+                        } else {
+                            None
+                        },
+                        reviewer_provider: if mode == CliPlanMode::Review {
+                            reviewer_provider
+                        } else {
+                            None
+                        },
+                        init_git: decision.source_init_git,
+                        acceptance: None,
+                        skip_acceptance_prompt: auto_confirm
+                            || matches!(decision.done_action, StartDoneAction::DefaultGate),
+                        no_hints: args.quiet,
+                        quiet: args.quiet,
+                        json: false,
+                        plain: args.plain,
                     },
-                    provider: if mode == CliPlanMode::FullPlan {
-                        child_provider
-                    } else {
-                        None
-                    },
-                    child_provider: decision.child_provider_overrides.clone(),
-                    coder_provider: if mode == CliPlanMode::Review {
-                        coder_provider
-                    } else {
-                        None
-                    },
-                    reviewer_provider: if mode == CliPlanMode::Review {
-                        reviewer_provider
-                    } else {
-                        None
-                    },
-                    init_git: decision.source_init_git,
-                    acceptance: None,
-                    skip_acceptance_prompt: auto_confirm
-                        || matches!(decision.done_action, StartDoneAction::DefaultGate),
-                    no_hints: args.quiet,
-                    quiet: args.quiet,
-                    json: false,
-                    plain: args.plain,
+                    preview: false,
+                    yes: auto_confirm,
+                    no_repair: false,
                 },
-                preview: false,
-                yes: auto_confirm,
-                no_repair: false,
-            })
+            )
             .await;
             if result.is_ok()
                 && !quiet
@@ -7195,429 +7219,6 @@ fn sleep_try_line(reason: sleep::SkipReason) -> Option<&'static str> {
         | sleep::SkipReason::UserDisabled
         | sleep::SkipReason::UnavailableBinary => None,
     }
-}
-
-struct OrchestrateRunArgs {
-    plan: PlanCommandArgs,
-    preview: bool,
-    yes: bool,
-    no_repair: bool,
-}
-
-struct BareOrchestrateArgs {
-    goal: Option<String>,
-    max_spend: Option<f64>,
-    max_wall_seconds: Option<f64>,
-    sandbox: Option<String>,
-    preview: bool,
-    init_git: bool,
-    acceptance: Option<PathBuf>,
-    yes: bool,
-    no_repair: bool,
-    no_hints: bool,
-    quiet: bool,
-    plain: bool,
-}
-
-fn orchestrate_request_from_cli(
-    command: Option<OrchestrateCommand>,
-    bare: BareOrchestrateArgs,
-) -> Result<OrchestrateRunArgs> {
-    match command {
-        Some(OrchestrateCommand::Review(args)) => Ok(OrchestrateRunArgs {
-            plan: PlanCommandArgs {
-                goal: args.goal,
-                n: 2,
-                mode: CliPlanMode::Review,
-                max_spend: args.max_spend.or(bare.max_spend),
-                max_wall_seconds: args.max_wall_seconds.or(bare.max_wall_seconds),
-                sandbox: args.sandbox.or(bare.sandbox),
-                planner_provider: None,
-                provider: None,
-                child_provider: Vec::new(),
-                coder_provider: args.coder_provider,
-                reviewer_provider: args.reviewer_provider,
-                init_git: args.init_git || bare.init_git,
-                acceptance: args.acceptance.or(bare.acceptance),
-                skip_acceptance_prompt: args.yes
-                    || args.preview
-                    || args.quiet
-                    || bare.yes
-                    || bare.preview
-                    || bare.quiet,
-                no_hints: args.no_hints || bare.no_hints,
-                quiet: args.quiet || bare.quiet,
-                json: false,
-                plain: args.plain || bare.plain,
-            },
-            preview: args.preview || bare.preview,
-            yes: args.yes || bare.yes,
-            no_repair: args.no_repair || bare.no_repair,
-        }),
-        Some(OrchestrateCommand::FullPlan(args)) => Ok(OrchestrateRunArgs {
-            plan: PlanCommandArgs {
-                goal: args.goal,
-                n: args.n,
-                mode: CliPlanMode::FullPlan,
-                max_spend: args.max_spend.or(bare.max_spend),
-                max_wall_seconds: args.max_wall_seconds.or(bare.max_wall_seconds),
-                sandbox: args.sandbox.or(bare.sandbox),
-                planner_provider: args.planner_provider,
-                provider: args.provider,
-                child_provider: args.child_provider,
-                coder_provider: None,
-                reviewer_provider: None,
-                init_git: args.init_git || bare.init_git,
-                acceptance: args.acceptance.or(bare.acceptance),
-                skip_acceptance_prompt: args.yes
-                    || args.preview
-                    || args.quiet
-                    || bare.yes
-                    || bare.preview
-                    || bare.quiet,
-                no_hints: args.no_hints || bare.no_hints,
-                quiet: args.quiet || bare.quiet,
-                json: false,
-                plain: args.plain || bare.plain,
-            },
-            preview: args.preview || bare.preview,
-            yes: args.yes || bare.yes,
-            no_repair: args.no_repair || bare.no_repair,
-        }),
-        None => interactive_orchestrate_request(bare),
-    }
-}
-
-fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<OrchestrateRunArgs> {
-    let BareOrchestrateArgs {
-        goal,
-        max_spend,
-        max_wall_seconds,
-        sandbox,
-        preview,
-        init_git,
-        acceptance,
-        yes,
-        no_repair,
-        no_hints,
-        quiet,
-        plain,
-    } = bare;
-    let Some(goal) = goal else {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "orchestrate requires a mode or goal",
-            "deadreckon orchestrate review \"goal\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes",
-        )));
-    };
-    if !io::stdin().is_terminal() {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "non-interactive orchestrate requires an explicit mode",
-            "deadreckon orchestrate review \"goal\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes",
-        )));
-    }
-    let paths = DeadreckonPaths::discover();
-    let defaults = config_defaults(&paths)?;
-    let default_provider = resolve_provider_name(
-        &paths,
-        setup::SetupProviderRoleRef::DefaultChild,
-        defaults.provider,
-    )?;
-    let recommended_mode = recommend_orchestration_mode(&goal);
-    println!("{}", ui_heading("Orchestration mode"));
-    println!(
-        "  recommendation: {} - {}",
-        ui_command(plan_mode_label(match recommended_mode {
-            CliPlanMode::FullPlan => PlanMode::FullPlan,
-            CliPlanMode::Review => PlanMode::Review,
-        })),
-        orchestration_mode_recommendation_reason(&goal, recommended_mode)
-    );
-    println!(
-        "  {} focused implementation with one coder provider, then a fresh reviewer/fixer",
-        ui_command("review")
-    );
-    println!(
-        "  {} planner provider decomposes broad product work into child implementation agents before fork and merge",
-        ui_command("full-plan")
-    );
-    let mode = prompt_orchestration_mode(recommended_mode)?;
-    print_orchestrate_provider_choices(&paths, default_provider.as_deref())?;
-    let mut plan = PlanCommandArgs {
-        goal,
-        n: recommend_child_count_for_goal("", mode),
-        mode,
-        max_spend,
-        max_wall_seconds,
-        sandbox,
-        planner_provider: None,
-        provider: None,
-        child_provider: Vec::new(),
-        coder_provider: None,
-        reviewer_provider: None,
-        init_git,
-        acceptance,
-        skip_acceptance_prompt: yes || preview || quiet,
-        no_hints,
-        quiet,
-        json: false,
-        plain,
-    };
-    match mode {
-        CliPlanMode::FullPlan => {
-            plan.n = prompt_child_count(recommend_child_count_for_goal(&plan.goal, mode))?;
-            plan.planner_provider = prompt_provider_role("planner", default_provider.as_deref())?;
-            plan.provider = prompt_provider_role("default child", default_provider.as_deref())?;
-            plan.child_provider = prompt_child_provider_overrides(plan.n)?;
-        }
-        CliPlanMode::Review => {
-            plan.coder_provider = prompt_provider_role("coder", default_provider.as_deref())?;
-            plan.reviewer_provider = prompt_provider_role("reviewer", default_provider.as_deref())?;
-        }
-    }
-    Ok(OrchestrateRunArgs {
-        plan,
-        preview,
-        yes,
-        no_repair,
-    })
-}
-
-fn recommend_orchestration_mode(goal: &str) -> CliPlanMode {
-    let lower = goal.to_ascii_lowercase();
-    let broad_product = [
-        "make a full",
-        "build a full",
-        "create a full",
-        "fully",
-        "from scratch",
-        "app",
-        "game",
-        "site",
-        "multiplayer",
-        "realtime",
-        "real-time",
-        "live",
-        "server",
-        "client",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    let focused_change = [
-        "fix ", "bug", "change ", "refactor", "review", "audit", "explain", "docs", "rename",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    if broad_product && !focused_change {
-        CliPlanMode::FullPlan
-    } else {
-        CliPlanMode::Review
-    }
-}
-
-fn orchestration_mode_recommendation_reason(goal: &str, mode: CliPlanMode) -> &'static str {
-    match mode {
-        CliPlanMode::FullPlan => {
-            if goal.to_ascii_lowercase().contains("multiplayer") {
-                "goal looks like broad product work with separable implementation slices"
-            } else {
-                "goal looks broad enough to decompose before execution"
-            }
-        }
-        CliPlanMode::Review => "goal looks focused enough for coder plus reviewer",
-    }
-}
-
-fn recommend_child_count_for_goal(goal: &str, mode: CliPlanMode) -> u8 {
-    if mode == CliPlanMode::Review {
-        return 2;
-    }
-    let lower = goal.to_ascii_lowercase();
-    let complexity = [
-        "multiplayer",
-        "realtime",
-        "real-time",
-        "live",
-        "physics",
-        "terrain",
-        "server",
-        "database",
-        "auth",
-        "deploy",
-        "mobile",
-        "game",
-    ]
-    .iter()
-    .filter(|needle| lower.contains(*needle))
-    .count();
-    match complexity {
-        0 | 1 => 3,
-        2 | 3 => 4,
-        _ => 5,
-    }
-}
-
-fn prompt_orchestration_mode(default: CliPlanMode) -> Result<CliPlanMode> {
-    let default_label = match default {
-        CliPlanMode::Review => "review",
-        CliPlanMode::FullPlan => "full-plan",
-    };
-    let answer = prompt::open(&format!("mode [{default_label}]: "), None)?;
-    match answer.trim().to_ascii_lowercase().as_str() {
-        "" => Ok(default),
-        "r" | "review" => Ok(CliPlanMode::Review),
-        "f" | "full" | "full-plan" | "full_plan" | "plan" => Ok(CliPlanMode::FullPlan),
-        other => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("unknown orchestration mode {other}"),
-            "choose review or full-plan",
-        ))),
-    }
-}
-
-fn prompt_child_count(default: u8) -> Result<u8> {
-    let answer = prompt::open(&format!("children [{default}]: "), None)?;
-    if answer.trim().is_empty() {
-        return Ok(default);
-    }
-    let n = answer.trim().parse::<u8>().map_err(|_| {
-        CliError::Core(deadreckon_core::user_error(
-            &format!("child count is not a number: {answer}"),
-            "enter a value from 2 through 6",
-        ))
-    })?;
-    validate_task_count(usize::from(n)).map_err(CliError::Core)?;
-    Ok(n)
-}
-
-fn prompt_child_provider_overrides(n: u8) -> Result<Vec<String>> {
-    println!(
-        "  optional: route specific child indices 0..{} to another provider, e.g. 1=cli:codex",
-        n.saturating_sub(1)
-    );
-    let answer = prompt::open("child provider overrides []: ", None)?;
-    if answer.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(answer
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect())
-}
-
-fn prompt_provider_role(role: &str, default: Option<&str>) -> Result<Option<String>> {
-    let prompt_text = match default {
-        Some(default) => format!("{role} provider [{default}]: "),
-        None => format!("{role} provider: "),
-    };
-    let answer = prompt::open(&prompt_text, None)?;
-    let provider = answer.trim();
-    if provider.is_empty() {
-        return Ok(default.map(ToString::to_string));
-    }
-    Ok(Some(provider.to_string()))
-}
-
-fn print_orchestrate_provider_choices(
-    paths: &DeadreckonPaths,
-    default_provider: Option<&str>,
-) -> Result<()> {
-    let configured = configured_provider_ids(paths)?;
-    println!("{}", ui_heading("Providers"));
-    println!(
-        "  default: {}",
-        default_provider
-            .map(ui_command)
-            .unwrap_or_else(|| ui_muted("none configured"))
-    );
-    if configured.is_empty() {
-        println!("  configured: none");
-        println!(
-            "  {} {}",
-            ui_command("try:"),
-            ui_command("deadreckon providers list --all")
-        );
-    } else {
-        println!("  configured: {}", configured.join(", "));
-    }
-    println!("  planner creates the child graph; child/coder/reviewer providers execute work.");
-    Ok(())
-}
-
-async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
-    let quiet = args.plan.quiet;
-    let plain = args.plan.plain;
-    let no_hints = args.plan.no_hints;
-    let max_spend = args.plan.max_spend;
-    let max_wall_seconds = args.plan.max_wall_seconds;
-    let sandbox = args.plan.sandbox.clone();
-    if !prepare_orchestration_source(args.plan.init_git, quiet)? {
-        return Ok(());
-    }
-    let plan = create_orchestration_plan(args.plan).await?;
-    let plan_id = plan.plan_id.clone();
-    if !quiet {
-        print_orchestrate_preflight(
-            &plan,
-            max_spend,
-            max_wall_seconds,
-            sandbox.as_deref(),
-            args.no_repair,
-        );
-    }
-    if args.preview {
-        return Ok(());
-    }
-    confirm_orchestration_start(&plan, args.yes)?;
-    if !quiet {
-        print_orchestrate_started(
-            &plan,
-            max_spend,
-            max_wall_seconds,
-            sandbox.as_deref(),
-            args.no_repair,
-        );
-    }
-    fork_command(ForkCommandArgs {
-        plan_id: plan_id.clone(),
-        max_spend,
-        max_wall_seconds,
-        sandbox,
-        provider: None,
-        child_provider: Vec::new(),
-        coder_provider: None,
-        reviewer_provider: None,
-        no_repair: args.no_repair,
-        repair_provider: None,
-        no_hints,
-        quiet,
-        plain,
-    })
-    .await?;
-    let sub_result_launch_dir = std::env::var(deadreckon_core::campaign::ENV_SUB_RESULT).ok();
-    let merge_result = commands::merge::merge_command(MergeCommandArgs {
-        plan_id: plan_id.clone(),
-        strategy: "dag-aware".to_string(),
-        prefer_child: None,
-        no_repair: args.no_repair,
-        repair_provider: None,
-        repair_mode: "auto".to_string(),
-        repair_attempts: 1,
-        yes: true,
-        no_gate: false,
-        no_hints,
-        quiet,
-        plain,
-    })
-    .await;
-    if let Some(launch_dir) = sub_result_launch_dir {
-        commands::campaign::record_sub_orchestrator_result(
-            &plan_id,
-            std::path::Path::new(&launch_dir),
-            merge_result.is_ok(),
-        );
-    }
-    merge_result
 }
 
 async fn plan_command(args: PlanCommandArgs) -> Result<()> {

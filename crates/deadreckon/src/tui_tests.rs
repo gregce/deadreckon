@@ -15,6 +15,7 @@ use super::commands::chain::{
     chain_event_read_hint, chain_should_auto_attach, chain_step_dot, chain_timeline_lines,
     chain_wall_cap_hit, per_step_wall_cap,
 };
+use super::commands::orchestrate::{recommend_child_count_for_goal, recommend_orchestration_mode};
 use super::{
     ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachActionNotice,
     AttachJsonlTail, AttachLive, AttachLoopStage, AttachNarrativeProjectionCache,
@@ -49,9 +50,8 @@ use super::{
     poll_plan_narrative_refresh_job, poll_run_narrative_refresh_job, prompt_start_done_criteria,
     prompt_start_existing_done_criteria, provider_ingest_base_roots, provider_jsonl_activity_lines,
     provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
-    read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
-    refresh_plan_docs, render_attach, render_plan_attach, resolve_plan_doc_target,
-    resolve_start_orchestration_options, run_narrative_refresh_trigger,
+    read_plan_events_lossy, refresh_plan_docs, render_attach, render_plan_attach,
+    resolve_plan_doc_target, resolve_start_orchestration_options, run_narrative_refresh_trigger,
     start_done_materialization_request, start_launch_decision, start_launch_preview_facts,
     start_or_coalesce_plan_narrative_refresh_job, start_provider_role_summary, threshold_color,
     validate_plan_provider_docs, write_plan_docs_deterministic, write_plan_docs_from_provider,
