@@ -19,6 +19,9 @@
 - P3c (`098b1cf`): Lifted `campaign_spawn_tests` out of `main.rs` into a
   sibling `src` test module while preserving its campaign orchestration helper
   coverage and private-helper access.
+- P3d (`pending`): Lifted `effortless_consistency_tests` out of `main.rs` into a
+  sibling `src` test module while preserving its cross-surface consistency
+  assertions and private-helper access.
 
 ## Effortless (production release) - 2026-05-28
 
