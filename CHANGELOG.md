@@ -55,6 +55,10 @@
 - P5f (`5ec29f0`): Moved the merge command entrypoint and CLI repair-strategy
   parsing into `src/commands/merge.rs`, keeping shared merge/repair helpers in
   the crate root for plan dependency composition and the later plan split.
+- P5g (`7416c0b`): Moved the orchestrate front-door and interactive
+  mode/provider selection helpers into `src/commands/orchestrate.rs`, keeping
+  plan creation, fork, and shared render helpers in the crate root for the
+  remaining plan split.
 
 ## Effortless (production release) - 2026-05-28
 
