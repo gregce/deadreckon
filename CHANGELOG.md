@@ -52,6 +52,9 @@
 - P5e (`d1e66f2`): Moved the attach command dispatch and terminal event loops
   into `src/commands/attach.rs`, leaving pure render/state helpers in the crate
   root for the P6 TUI extraction.
+- P5f (`5ec29f0`): Moved the merge command entrypoint and CLI repair-strategy
+  parsing into `src/commands/merge.rs`, keeping shared merge/repair helpers in
+  the crate root for plan dependency composition and the later plan split.
 
 ## Effortless (production release) - 2026-05-28
 
