@@ -35,7 +35,7 @@
   command family into `src/commands/chain/`, and routed the `main_inner` chain
   branch through `commands::chain` while keeping shared attach infrastructure in
   the crate root.
-- P5a (`pending`): Moved the acceptance and def-done command family into
+- P5a (`58cfbd4`): Moved the acceptance and def-done command family into
   `src/commands/acceptance.rs`, preserving the existing `main_inner` dispatch
   and keeping acceptance render helpers in the crate root for the later TUI
   split.
