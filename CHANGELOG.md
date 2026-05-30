@@ -39,6 +39,10 @@
   `src/commands/acceptance.rs`, preserving the existing `main_inner` dispatch
   and keeping acceptance render helpers in the crate root for the later TUI
   split.
+- P5b (`pending`): Moved the supervised `run` command body into
+  `src/commands/run.rs`, with `main_inner`, `start`, and `try` now calling the
+  private command module while shared preview/render helpers remain in the crate
+  root.
 
 ## Effortless (production release) - 2026-05-28
 
