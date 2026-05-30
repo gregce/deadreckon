@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::commands::acceptance::ensure_acceptance_before_start;
 
 fn print_chain_help(topic: Option<&str>) {
     let topic = topic.unwrap_or("overview");

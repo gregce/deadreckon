@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use tempfile::TempDir;
 
-use super::{AcceptanceDraft, write_project_acceptance};
+use super::commands::acceptance::{AcceptanceDraft, write_project_acceptance};
 
 fn suppressed_draft(command: &str) -> AcceptanceDraft {
     AcceptanceDraft {
