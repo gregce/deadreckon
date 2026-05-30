@@ -2,6 +2,10 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
+use super::commands::campaign::{
+    campaign_drop_subgoal_before_launch, campaign_edit_subgoal_before_launch,
+    campaign_replace_sub_goals_before_launch,
+};
 use super::commands::chain::{
     ChainAttachTuiState, chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
     chain_event_read_hint, chain_should_auto_attach, chain_step_dot, chain_timeline_lines,
@@ -27,16 +31,14 @@ use super::{
     acceptance_activity_lines, add_start_history_actions, apply_goal_shape_recommendation,
     attach_banner, attach_header_text, attach_live_inventory, attach_loop_stage_work,
     attach_should_return_to_plan, build_run_narrative_projection,
-    campaign_drop_subgoal_before_launch, campaign_edit_subgoal_before_launch,
-    campaign_replace_sub_goals_before_launch, cancel_plan_narrative_refresh_job,
-    cancel_run_narrative_refresh_job, chain_narrative_refusal_text,
-    claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
-    collect_jsonl_provider_activity_scan, collect_plan_doc_input, command_discovery,
-    completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
-    deadreckoning_status_text, doc_polish_preview_text, fallback_goal_shape_recommendation,
-    implementation_plan_warnings, kill_banner, launch_preview_rows, live_file_lines,
-    markdown_to_tui_lines, materialize_plan_docs_to_working, max_panel_scroll,
-    maybe_prompt_start_mode, meter_color, narrative_provider_selection,
+    cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job,
+    chain_narrative_refusal_text, claude_project_name_for_workdir, cli_wait_status_line,
+    collect_jsonl_provider_activity, collect_jsonl_provider_activity_scan, collect_plan_doc_input,
+    command_discovery, completion_action_from_input, completion_hints_enabled,
+    deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
+    fallback_goal_shape_recommendation, implementation_plan_warnings, kill_banner,
+    launch_preview_rows, live_file_lines, markdown_to_tui_lines, materialize_plan_docs_to_working,
+    max_panel_scroll, maybe_prompt_start_mode, meter_color, narrative_provider_selection,
     orchestration_dependency_rows, orchestration_parallelism_lines,
     orchestration_provider_role_rows, orchestration_role_table_lines, parse_provider_goal_shape,
     plan_attach_footer, plan_doc_path, plan_merge_repair_summary_items,

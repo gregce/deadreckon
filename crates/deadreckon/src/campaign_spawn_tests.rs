@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::commands::campaign::*;
 use super::*;
 
 #[test]

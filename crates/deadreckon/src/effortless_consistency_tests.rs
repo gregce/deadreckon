@@ -1,5 +1,6 @@
 use tempfile::TempDir;
 
+use super::commands::campaign::campaign_attach_summary;
 use super::*;
 
 fn subscription_state(temp: &TempDir) -> (DeadreckonPaths, deadreckon_core::PipelineState) {
