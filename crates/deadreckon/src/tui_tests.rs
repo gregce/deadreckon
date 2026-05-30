@@ -2,6 +2,10 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
+use super::commands::attach::{
+    attach_should_quit, attach_should_return_to_plan, chain_narrative_refusal_text,
+    run_narrative_json_text, run_narrative_plain_text,
+};
 use super::commands::campaign::{
     campaign_drop_subgoal_before_launch, campaign_edit_subgoal_before_launch,
     campaign_replace_sub_goals_before_launch,
@@ -30,9 +34,8 @@ use super::{
     StartProviderSource, StartSelectedMode, StartSelectionSource, StartSourceMode, TopHelpGroup,
     acceptance_activity_lines, add_start_history_actions, apply_goal_shape_recommendation,
     attach_banner, attach_header_text, attach_live_inventory, attach_loop_stage_work,
-    attach_should_return_to_plan, build_run_narrative_projection,
-    cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job,
-    chain_narrative_refusal_text, claude_project_name_for_workdir, cli_wait_status_line,
+    build_run_narrative_projection, cancel_plan_narrative_refresh_job,
+    cancel_run_narrative_refresh_job, claude_project_name_for_workdir, cli_wait_status_line,
     collect_jsonl_provider_activity, collect_jsonl_provider_activity_scan, collect_plan_doc_input,
     command_discovery, completion_action_from_input, completion_hints_enabled,
     deadreckoning_course_ascii, deadreckoning_status_text, doc_polish_preview_text,
@@ -48,11 +51,10 @@ use super::{
     provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
     read_plan_events_lossy, recommend_child_count_for_goal, recommend_orchestration_mode,
     refresh_plan_docs, render_attach, render_plan_attach, resolve_plan_doc_target,
-    resolve_start_orchestration_options, run_narrative_json_text, run_narrative_plain_text,
-    run_narrative_refresh_trigger, start_done_materialization_request, start_launch_decision,
-    start_launch_preview_facts, start_or_coalesce_plan_narrative_refresh_job,
-    start_provider_role_summary, threshold_color, validate_plan_provider_docs,
-    write_plan_docs_deterministic, write_plan_docs_from_provider,
+    resolve_start_orchestration_options, run_narrative_refresh_trigger,
+    start_done_materialization_request, start_launch_decision, start_launch_preview_facts,
+    start_or_coalesce_plan_narrative_refresh_job, start_provider_role_summary, threshold_color,
+    validate_plan_provider_docs, write_plan_docs_deterministic, write_plan_docs_from_provider,
 };
 use crate::cli::{Cli, CliPlanMode, CliStartMode, StartCommandArgs};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -197,7 +199,7 @@ async fn slow_run_narrator_still_allows_quit() {
     .expect("poll should return without waiting for slow narrator");
 
     assert!(poll.is_none());
-    assert!(super::attach_should_quit(KeyEvent::new(
+    assert!(attach_should_quit(KeyEvent::new(
         KeyCode::Char('q'),
         KeyModifiers::empty()
     )));
@@ -3540,14 +3542,14 @@ fn plan_attach_child_footer_includes_back_hint() {
 fn attach_plan_ctrl_d_detaches_does_not_kill() {
     let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
 
-    assert!(super::attach_should_quit(key));
+    assert!(attach_should_quit(key));
 }
 
 #[test]
 fn attach_plan_q_detaches_from_child_without_killing() {
     let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
 
-    assert!(super::attach_should_quit(key));
+    assert!(attach_should_quit(key));
 }
 
 #[test]
@@ -4489,7 +4491,7 @@ fn chain_attach_tab_pages_focus_between_steps() {
 fn chain_attach_ctrl_d_detaches_does_not_kill_conductor() {
     let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
 
-    assert!(super::attach_should_quit(key));
+    assert!(attach_should_quit(key));
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use super::super::*;
 use crate::commands::acceptance::ensure_acceptance_before_start;
+use crate::commands::attach::{attach_should_quit, resume_tui, suspend_tui};
 
 fn print_chain_help(topic: Option<&str>) {
     let topic = topic.unwrap_or("overview");
