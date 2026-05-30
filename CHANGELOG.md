@@ -2,7 +2,7 @@
 
 ## Decompose (maintainability refactor) - 2026-05-30
 
-- P1 (`pending`): Added a full-binary CLI characterization net for plan creation,
+- P1 (`7ef2d5c`): Added a full-binary CLI characterization net for plan creation,
   quiet plan creation, start full-plan preview JSON, chain status, off-TTY attach,
   and canonical `try:` refusal footers, with normalized goldens under
   `crates/deadreckon/tests/goldens/characterization/`.
