@@ -22,6 +22,9 @@
 - P3d (`e15eb86`): Lifted `effortless_consistency_tests` out of `main.rs` into a
   sibling `src` test module while preserving its cross-surface consistency
   assertions and private-helper access.
+- P3e (`pending`): Lifted `flight_cli_tests` out of `main.rs` into a sibling
+  `src` test module while preserving CLI flight/log fixture coverage and
+  private-helper access.
 
 ## Effortless (production release) - 2026-05-28
 
