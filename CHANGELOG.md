@@ -59,6 +59,9 @@
   mode/provider selection helpers into `src/commands/orchestrate.rs`, keeping
   plan creation, fork, and shared render helpers in the crate root for the
   remaining plan split.
+- P5h (`9c2a8cf`): Moved the plan/fork command family and child-launch
+  orchestration helpers into `src/commands/plan.rs`, leaving plan result docs
+  and shared TUI render helpers in the crate root for later phases.
 
 ## Effortless (production release) - 2026-05-28
 
