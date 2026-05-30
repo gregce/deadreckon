@@ -1,0 +1,16 @@
+case: campaign-depth
+status: 1
+--- stdout ---
+--- stderr ---
+error: invalid input: campaign refused: depth cap 2 reached
+try: run `orchestrate full-plan` (not campaign) inside a sub-orchestrator
+  hint: try: deadreckon doctor
+
+case: non-git-worktree
+status: 1
+--- stdout ---
+using default --max-spend $10 (override with --max-spend or in config defaults.max_spend)
+--- stderr ---
+error: invalid input: <TMP>/plain is not a git repo
+try: git init or pass --from .
+  hint: try: deadreckon doctor

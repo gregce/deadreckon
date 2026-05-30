@@ -1,0 +1,29 @@
+status: 0
+--- stdout ---
+plan <ID8> (<ID32>)
+status       : pending
+mode         : full-plan
+children     : 3 (3 ready / 0 blocked)
+providers    : planner=smoke default-child=smoke
+source       : <TMP>/repo (git branch=main @ <SHA7>)
+done contract: default dr-gate behavior
+capabilities : network=Deny deploy=false install=false
+provider roles
+  role           route                  model    source       notes
+  planner        smoke                  -        plan         writes child graph
+  default child  smoke                  -        plan         runs ready children
+  repair         smoke                  -        derived      merge repair planning
+parallelism
+  starts now: task-0, task-1, task-2
+  waits: -
+dependencies
+  child      status     starts             waits_for          unblocks
+  task-0     pending    now                -                  -
+  task-1     pending    now                -                  -
+  task-2     pending    now                -                  -
+  task-0 Create foundation [child] provider=smoke deps=-
+  task-1 Add behavior [child] provider=smoke deps=-
+  task-2 Complete slice 3 [child] provider=smoke deps=-
+edit: <TMP>/home/plans/<ID32>/plan.json
+fork: deadreckon fork <ID8>
+--- stderr ---

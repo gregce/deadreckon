@@ -1,5 +1,12 @@
 # Changelog
 
+## Decompose (maintainability refactor) - 2026-05-30
+
+- P1 (`pending`): Added a full-binary CLI characterization net for plan creation,
+  quiet plan creation, start full-plan preview JSON, chain status, off-TTY attach,
+  and canonical `try:` refusal footers, with normalized goldens under
+  `crates/deadreckon/tests/goldens/characterization/`.
+
 ## Effortless (production release) - 2026-05-28
 
 - P1 (`c81b617`): Added the whole-surface friendliness contract table and `docs/FRIENDLINESS-AUDIT.md`, with depth tests proving every canonical top-level verb has one row per six-clause contract item.

@@ -1,0 +1,365 @@
+#![allow(clippy::expect_used, clippy::panic)]
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use deadreckon_core::DeadreckonPaths;
+use regex::Regex;
+use tempfile::TempDir;
+
+#[test]
+fn plan_draft_stdout_matches_golden() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "characterize plan output",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--plain",
+        ])
+        .output()
+        .expect("plan");
+
+    assert_success(&output);
+    assert_capture_matches_golden("plan-draft.golden", &temp, &output);
+}
+
+#[test]
+fn plan_quiet_stdout_matches_golden() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "characterize quiet plan",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--quiet",
+            "--plain",
+        ])
+        .output()
+        .expect("plan quiet");
+
+    assert_success(&output);
+    assert_capture_matches_golden("plan-quiet.golden", &temp, &output);
+}
+
+#[test]
+fn orchestrate_preview_json_matches_golden() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "characterize orchestration",
+            "--mode",
+            "full-plan",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--preview",
+            "--json",
+            "--plain",
+        ])
+        .output()
+        .expect("start preview json");
+
+    assert_success(&output);
+    assert_capture_matches_golden("orchestrate-preview-json.golden", &temp, &output);
+}
+
+#[test]
+fn chain_status_table_matches_golden() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let draft = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--draft",
+            "first step",
+            "second step",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--plain",
+        ])
+        .output()
+        .expect("chain draft");
+    assert_success(&draft);
+
+    let status = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "status", "--plain"])
+        .output()
+        .expect("chain status");
+
+    assert_success(&status);
+    assert_capture_matches_golden("chain-status-table.golden", &temp, &status);
+}
+
+#[test]
+fn attach_off_tty_frame_matches_golden() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let run = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "run",
+            "attach characterize",
+            "--smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "1",
+            "--yes",
+            "--fresh",
+            "--no-docs",
+            "--plain",
+        ])
+        .output()
+        .expect("smoke run");
+    assert_success(&run);
+    let run_prefix = started_run_prefix(&stdout(&run));
+
+    let attach = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["attach", &run_prefix, "--plain"])
+        .output()
+        .expect("attach");
+
+    assert_success(&attach);
+    assert_capture_matches_golden("attach-off-tty-frame.golden", &temp, &attach);
+}
+
+#[test]
+fn error_footers_match_canonical_goldens() {
+    let temp = TempDir::new().expect("tempdir");
+    let plain = temp.path().join("plain");
+    fs::create_dir_all(&plain).expect("plain dir");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let depth = deadreckon(&paths)
+        .current_dir(&plain)
+        .env("DEADRECKON_CAMPAIGN_DEPTH", "1")
+        .args([
+            "campaign",
+            "nested campaign",
+            "--n",
+            "2",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--preview",
+            "--plain",
+        ])
+        .output()
+        .expect("campaign depth refusal");
+    assert_status_code(&depth, 1);
+
+    let worktree = deadreckon(&paths)
+        .current_dir(&plain)
+        .args([
+            "run",
+            "plain dir refusal",
+            "--provider",
+            "smoke",
+            "--preview",
+            "--plain",
+            "--worktree",
+        ])
+        .output()
+        .expect("plain worktree refusal");
+    assert_status_code(&worktree, 1);
+
+    let actual = format!(
+        "case: campaign-depth\n{}\ncase: non-git-worktree\n{}",
+        normalized_capture(&temp, &depth),
+        normalized_capture(&temp, &worktree)
+    );
+    assert_text_matches_golden("error-footers.golden", &actual);
+}
+
+fn deadreckon(paths: &DeadreckonPaths) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
+    command
+        .env("DEADRECKON_HOME", paths.home())
+        .env("NO_COLOR", "1")
+        .env("COLUMNS", "120")
+        .env("RUST_BACKTRACE", "0")
+        .env_remove("DEADRECKON_CAMPAIGN_DEPTH")
+        .env_remove("DEADRECKON_CAMPAIGN_ROOT")
+        .env_remove("DEADRECKON_CAMPAIGN_ANCESTOR_TASK_KEYS")
+        .env_remove("DEADRECKON_CAMPAIGN_ANCESTOR_SCOPES")
+        .env_remove("DEADRECKON_CAMPAIGN_SUB_RESULT");
+    command
+}
+
+fn clean_git_repo(temp: &TempDir) -> PathBuf {
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    run_git(&repo, ["init", "--initial-branch", "main"]);
+    run_git(
+        &repo,
+        ["config", "user.email", "deadreckon@example.invalid"],
+    );
+    run_git(&repo, ["config", "user.name", "deadreckon"]);
+    fs::write(repo.join("README.md"), "hello\n").expect("readme");
+    run_git(&repo, ["add", "README.md"]);
+    run_git(&repo, ["commit", "-m", "initial"]);
+    repo
+}
+
+fn run_git<const N: usize>(repo: &Path, args: [&str; N]) {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .expect("git");
+    assert_success(&output);
+}
+
+fn assert_capture_matches_golden(name: &str, temp: &TempDir, output: &Output) {
+    let actual = normalized_capture(temp, output);
+    assert_text_matches_golden(name, &actual);
+}
+
+fn assert_text_matches_golden(name: &str, actual: &str) {
+    let path = golden_path(name);
+    let expected = fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "missing golden {}: {err}\n--- actual ---\n{}",
+            path.display(),
+            actual
+        )
+    });
+    assert_eq!(
+        expected,
+        actual,
+        "golden mismatch for {}\n--- actual ---\n{}",
+        path.display(),
+        actual
+    );
+}
+
+fn golden_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/goldens/characterization")
+        .join(name)
+}
+
+fn normalized_capture(temp: &TempDir, output: &Output) -> String {
+    format!(
+        "status: {}\n--- stdout ---\n{}--- stderr ---\n{}",
+        output.status.code().unwrap_or(-1),
+        normalize_text(temp, &stdout(output)),
+        normalize_text(temp, &stderr(output))
+    )
+}
+
+fn normalize_text(temp: &TempDir, text: &str) -> String {
+    let mut normalized = text.to_string();
+    for path in temp_path_variants(temp.path()) {
+        normalized = normalized.replace(&path, "<TMP>");
+    }
+    for (pattern, replacement) in [
+        (r"([0-9a-f]{8,})(\.\.\.)", "<HEX>$2"),
+        (r"\b[0-9a-f]{32}\b", "<ID32>"),
+        (r"\b[0-9a-f]{12,40}\b", "<HEX>"),
+        (r"\b[0-9a-f]{8}\b", "<ID8>"),
+        (r"\b[0-9a-f]{7}\b", "<SHA7>"),
+        (
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ UTC",
+            "<TIMESTAMP>",
+        ),
+        (r"wall [0-9]+(?:\.[0-9]+)?s", "wall <DURATION>"),
+        (
+            r"attach-characterize-[0-9a-f]{4}",
+            "attach-characterize-<SLUG>",
+        ),
+    ] {
+        normalized = Regex::new(pattern)
+            .expect("BUG: characterization regex must compile")
+            .replace_all(&normalized, replacement)
+            .into_owned();
+    }
+    normalized
+}
+
+fn temp_path_variants(path: &Path) -> Vec<String> {
+    let mut variants = vec![path.display().to_string()];
+    if let Ok(canonical) = path.canonicalize() {
+        variants.push(canonical.display().to_string());
+    }
+    let mut private_variants = Vec::new();
+    for variant in &variants {
+        if let Some(stripped) = variant.strip_prefix("/private") {
+            private_variants.push(stripped.to_string());
+        } else if variant.starts_with("/var/") || variant.starts_with("/tmp/") {
+            private_variants.push(format!("/private{variant}"));
+        }
+    }
+    variants.extend(private_variants);
+    variants.sort_by_key(|variant| std::cmp::Reverse(variant.len()));
+    variants.dedup();
+    variants
+}
+
+fn started_run_prefix(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("started run "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("missing started run line:\n{stdout}"))
+        .to_string()
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(output),
+        stderr(output)
+    );
+}
+
+fn assert_status_code(output: &Output, code: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "{}{}",
+        stdout(output),
+        stderr(output)
+    );
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}

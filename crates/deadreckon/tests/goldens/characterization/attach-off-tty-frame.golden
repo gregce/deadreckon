@@ -1,0 +1,30 @@
+status: 0
+--- stdout ---
++----------------------------------------------------------------------------------------------------------------------+
+| * VERIFIED                                                                                                           |
+|   verified run, verified by dr-gate; completed run by smoke on this run                                              |
+|   turns         3                                                                                                    |
+|   tokens        in 1628  out 429                                                                                     |
+|   spend         $0.000000 · wall <DURATION> · 3 turns                                                                      |
+|   gate          gate: PASSED 1/1                                                                                     |
+|   tests modified this run  no                                                                                        |
+|   working                  <TMP>/home/library/repo-<HEX>... |
+|                                                                                                                      |
+|   gate: SIGNED by dr-gate — the agent could not have written this                                                    |
+|   proof:  <TMP>/home/runstate/repo-<ID8>/runs/<HEX>... |
+|   story:  <TMP>/home/library/repo-<ID8>/<HEX>... |
+|   lineage: README.md ← turn 2 · smoke · smoke-bash-2                                                                 |
+|   → deadreckon export <ID8> --dest <path>                                                                         |
+|                                                                                                                      |
+|   next          deadreckon export <ID8> --dest <path>                                                             |
+|   attach        deadreckon attach <ID8>                                                                           |
+|   show          deadreckon show <ID8>                                                                             |
++----------------------------------------------------------------------------------------------------------------------+
+primary action:
+  next: deadreckon finish <ID8> --dest ./attach-characterize-<SLUG>
+secondary actions:
+  export: deadreckon export <ID8> --dest ./attach-characterize-<SLUG>
+  extend: deadreckon extend <ID8> '<your follow-up goal>'
+  show: deadreckon show <ID8>
+  docs: deadreckon doc <ID8> --kind decisions
+--- stderr ---

@@ -1,0 +1,25 @@
+status: 0
+--- stdout ---
+{
+  "done_criteria": "missing done contract",
+  "done_criteria_source": "missing",
+  "goal": "characterize orchestration",
+  "goal_shape": null,
+  "history_actions": [],
+  "kind": "start",
+  "next_actions": [
+    "deadreckon def-done \"what should count as done\" && deadreckon start \"characterize orchestration\""
+  ],
+  "provider": "smoke (explicit_flag)",
+  "provider_source": "explicit_flag",
+  "reason": "explicit --mode full-plan selected multi-agent planning",
+  "requires_confirmation": false,
+  "selected_mode": "full-plan",
+  "selection_source": "explicit_flag",
+  "source_mode": "missing",
+  "try_lines": [
+    "deadreckon def-done \"what should count as done\" && deadreckon start \"characterize orchestration\""
+  ],
+  "will_start": false
+}
+--- stderr ---
