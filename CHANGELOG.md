@@ -6,7 +6,7 @@
   quiet plan creation, start full-plan preview JSON, chain status, off-TTY attach,
   and canonical `try:` refusal footers, with normalized goldens under
   `crates/deadreckon/tests/goldens/characterization/`.
-- P2 (`pending`): Added shared integration-test helpers under
+- P2 (`a6f8d57`): Added shared integration-test helpers under
   `crates/deadreckon/tests/common/` and migrated duplicated tempdir,
   command-construction, stdout/stderr, and success-assertion helpers without
   changing test assertions.
