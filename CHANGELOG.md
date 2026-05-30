@@ -43,6 +43,9 @@
   `src/commands/run.rs`, with `main_inner`, `start`, and `try` now calling the
   private command module while shared preview/render helpers remain in the crate
   root.
+- P5c (`pending`): Moved the `init` command body into `src/commands/init.rs`,
+  keeping shared completion, config rendering, and provider-detection helpers in
+  the crate root for later cleanup phases.
 
 ## Effortless (production release) - 2026-05-28
 
