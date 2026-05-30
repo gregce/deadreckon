@@ -11,7 +11,13 @@ use deadreckon_core::learning::{
 };
 use deadreckon_core::{DeadreckonPaths, RunOptions, RunStatus, create_run, save_state};
 use serde_json::Value;
-use tempfile::TempDir;
+
+mod common;
+
+use common::{
+    assert_success_with_labels as assert_success, deadreckon_home_no_color as deadreckon,
+    repo_tempdir,
+};
 
 #[test]
 fn learn_index_writes_episode_and_signals_for_completed_run() {
@@ -422,18 +428,6 @@ fn changelog_has_self_improvement_loop_alpha_entry() {
     assert!(changelog.contains("redacted bundles"));
 }
 
-fn repo_tempdir() -> TempDir {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(&root).expect("tempdir")
-}
-
-fn deadreckon(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", home).env("NO_COLOR", "1");
-    command
-}
-
 fn run_git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(cwd)
@@ -441,15 +435,6 @@ fn run_git(cwd: &Path, args: &[&str]) {
         .output()
         .expect("git");
     assert_success(&output);
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn assert_failure(output: &std::process::Output) {

@@ -4,19 +4,21 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 use deadreckon_core::DeadreckonPaths;
 use deadreckon_core::RunStatus;
 use deadreckon_core::list_runs;
 use deadreckon_core::load_run;
-use tempfile::TempDir;
 
 #[path = "../src/friendliness_contract.rs"]
 mod friendliness_contract;
 
 use friendliness_contract::FRIENDLINESS_CLAUSES;
 use friendliness_contract::FRIENDLINESS_CONTRACT;
+
+mod common;
+
+use common::{assert_success, deadreckon, stdout, workspace_tempdir as repo_tempdir};
 
 #[test]
 fn friendliness_contract_table_covers_every_top_level_verb() {
@@ -145,35 +147,6 @@ fn parse_audit_rows(audit: &str) -> BTreeMap<(String, String), String> {
         );
     }
     rows
-}
-
-fn repo_tempdir() -> TempDir {
-    let root = workspace_root().join(".test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
-}
-
-fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", paths.home());
-    command
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "{}{}",
-        stdout(output),
-        stderr(output)
-    );
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
 }
 
 fn top_level_cli_verbs() -> BTreeSet<String> {

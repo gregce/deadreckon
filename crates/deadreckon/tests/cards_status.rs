@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 use chrono::Utc;
 use deadreckon::sleep::{SleepMetadata, SleepMode, metadata_path};
@@ -11,6 +10,10 @@ use deadreckon_core::{
 };
 use serde_json::json;
 use tempfile::TempDir;
+
+mod common;
+
+use common::{assert_success, deadreckon, repo_tempdir, stdout};
 
 #[test]
 fn status_report_shows_sleep_mode_when_active() {
@@ -327,33 +330,4 @@ fn status_layout_keys(out: &str) -> Vec<String> {
         .take_while(|line| !line.trim().is_empty())
         .filter_map(|line| line.split_once(':').map(|(key, _)| key.trim().to_string()))
         .collect()
-}
-
-fn repo_tempdir() -> TempDir {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
-}
-
-fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", paths.home());
-    command
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "{}{}",
-        stdout(output),
-        stderr(output)
-    );
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
 }

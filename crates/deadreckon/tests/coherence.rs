@@ -12,7 +12,10 @@ use deadreckon_core::{
     save_chain, save_plan, save_state,
 };
 use serde_json::{Value, json};
-use tempfile::TempDir;
+
+mod common;
+
+use common::{deadreckon, repo_tempdir, stderr, stdout};
 
 #[test]
 fn runstatus_executing_renders_running_through_glossary() {
@@ -1548,24 +1551,4 @@ fn section_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str>
             .split_once(end)
             .map_or(after_start, |(section, _)| section),
     )
-}
-
-fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", paths.home());
-    command
-}
-
-fn repo_tempdir() -> TempDir {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }

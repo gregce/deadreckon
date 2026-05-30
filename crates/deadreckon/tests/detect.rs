@@ -6,10 +6,15 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
-use tempfile::TempDir;
+
+mod common;
+
+use common::{
+    assert_success_with_labels as assert_success, deadreckon_home_no_color as deadreckon,
+    repo_tempdir_with_empty_bin as repo_tempdir,
+};
 
 #[test]
 fn detect_lists_every_registered_provider() {
@@ -364,20 +369,6 @@ try_lines = ["start the local test server"]
     assert_eq!(provider["error_kind"], "endpoint_unreachable");
 }
 
-fn repo_tempdir() -> TempDir {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    let temp = TempDir::new_in(&root).expect("tempdir");
-    fs::create_dir_all(temp.path().join("empty-bin")).expect("empty bin");
-    temp
-}
-
-fn deadreckon(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", home).env("NO_COLOR", "1");
-    command
-}
-
 fn write_provider_override(home: &Path, name: &str, body: &str) {
     let dir = home.join("providers.d");
     fs::create_dir_all(&dir).expect("providers.d");
@@ -402,13 +393,4 @@ fn write_fake_binary(dir: &Path, name: &str, version: &str) {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).expect("chmod");
     }
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }

@@ -14,6 +14,10 @@ use deadreckon_core::{
 };
 use tempfile::TempDir;
 
+mod common;
+
+use common::repo_tempdir;
+
 #[test]
 fn incremental_jsonl_carries_full_response_up_to_50kb() {
     let long = "a".repeat(70 * 1024);
@@ -738,12 +742,6 @@ fn repo_file(path: &str) -> String {
             .join(path),
     )
     .expect(path)
-}
-
-fn repo_tempdir() -> TempDir {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
 }
 
 fn fresh_state(goal: &str) -> (TempDir, deadreckon_core::PipelineState) {

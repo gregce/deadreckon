@@ -27,6 +27,10 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
+mod common;
+
+use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
+
 fn sample_chain(temp: &TempDir) -> Chain {
     Chain::new(ChainNewOptions {
         root_goal: "manual: 2 steps".to_string(),
@@ -2995,12 +2999,6 @@ fn read_run_events(state: &deadreckon_core::PipelineState) -> Vec<RunEvent> {
         .collect()
 }
 
-fn repo_tempdir() -> TempDir {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
-}
-
 fn clean_git_repo(temp: &TempDir) -> PathBuf {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
@@ -3135,29 +3133,6 @@ fn newest_chain(paths: &DeadreckonPaths) -> Chain {
         .collect::<Vec<_>>();
     chains.sort_by(|left, right| right.created_at.cmp(&left.created_at));
     chains.into_iter().next().expect("chain")
-}
-
-fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", paths.home());
-    command
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "{}{}",
-        stdout(output),
-        stderr(output)
-    );
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
 }
 
 fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {

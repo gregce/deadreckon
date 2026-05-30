@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{Duration, Utc};
@@ -12,6 +11,10 @@ use deadreckon_core::install_receipt::{
 };
 use deadreckon_core::update_cache::{Cache, read_cache, write_cache};
 use tempfile::TempDir;
+
+mod common;
+
+use common::{assert_success, deadreckon, stderr, stdout};
 
 #[test]
 fn update_check_prints_channel_from_receipt() {
@@ -567,27 +570,4 @@ fn backup_dirs(paths: &DeadreckonPaths) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     backups.sort();
     backups
-}
-
-fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", paths.home());
-    command
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "{}{}",
-        stdout(output),
-        stderr(output)
-    );
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
 }

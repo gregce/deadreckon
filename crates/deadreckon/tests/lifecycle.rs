@@ -25,6 +25,10 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
+mod common;
+
+use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
+
 #[test]
 fn materialize_copies_library_to_dest() {
     let temp = repo_tempdir();
@@ -1553,12 +1557,6 @@ fn parent_json(dest: &std::path::Path) -> Value {
         .expect("parent json")
 }
 
-fn repo_tempdir() -> TempDir {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
-}
-
 fn clean_git_repo(temp: &TempDir) -> std::path::PathBuf {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
@@ -1598,12 +1596,6 @@ fn git_ref_exists(cwd: &std::path::Path, reference: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
-}
-
-fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", paths.home());
-    command
 }
 
 fn extend_command(paths: &DeadreckonPaths, parent: &PipelineState, goal: &str) -> Command {
@@ -1711,23 +1703,6 @@ fn run_id_from_stdout(output: &std::process::Output) -> String {
                 })
         })
         .expect("run id")
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "{}{}",
-        stdout(output),
-        stderr(output)
-    );
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
 }
 
 fn count_action_label(out: &str, label: &str) -> usize {

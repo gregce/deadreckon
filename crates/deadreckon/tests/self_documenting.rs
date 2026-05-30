@@ -37,6 +37,10 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
+mod common;
+
+use common::{assert_success, deadreckon_home as deadreckon, repo_tempdir, stderr, stdout};
+
 #[test]
 fn docs_dir_created_at_run_start() {
     let (_temp, _paths, state) = fresh_state("write docs at start");
@@ -1604,12 +1608,6 @@ fn status_explains_failed_polish_when_fallback_docs_exist() {
     );
 }
 
-fn repo_tempdir() -> TempDir {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
-}
-
 fn fresh_state(goal: &str) -> (TempDir, DeadreckonPaths, deadreckon_core::PipelineState) {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -2106,12 +2104,6 @@ printf '%s' "$n" > "$count_file"
     }
 }
 
-fn deadreckon(home: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    cmd.env("DEADRECKON_HOME", home);
-    cmd
-}
-
 fn git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -2141,23 +2133,6 @@ fn git_out(cwd: &Path, args: &[&str]) -> String {
         stderr(&output)
     );
     stdout(&output).trim().to_string()
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "{}{}",
-        stdout(output),
-        stderr(output)
-    );
 }
 
 #[derive(Clone)]

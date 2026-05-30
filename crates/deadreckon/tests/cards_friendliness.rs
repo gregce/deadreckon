@@ -15,6 +15,10 @@ use deadreckon_core::glossary::{
 };
 use tempfile::TempDir;
 
+mod common;
+
+use common::{assert_success, deadreckon, isolated_tempdir as repo_tempdir, stderr, stdout};
+
 #[test]
 fn plain_flag_strips_color_and_box_drawing_globally() {
     let temp = repo_tempdir();
@@ -241,10 +245,6 @@ fn exit_input() -> ExitSummaryInput {
     }
 }
 
-fn repo_tempdir() -> TempDir {
-    TempDir::new().expect("tempdir")
-}
-
 fn clean_git_repo(temp: &TempDir) -> PathBuf {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
@@ -261,12 +261,6 @@ fn clean_git_repo(temp: &TempDir) -> PathBuf {
     repo
 }
 
-fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", paths.home());
-    command
-}
-
 fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
     let output = Command::new("git").arg("-C").arg(cwd).args(args).output()?;
     assert!(
@@ -277,21 +271,4 @@ fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "{}{}",
-        stdout(output),
-        stderr(output)
-    );
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
 }

@@ -1,21 +1,9 @@
-use std::process::Command;
-
 use deadreckon_core::DeadreckonPaths;
 use tempfile::TempDir;
 
-fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", paths.home());
-    command
-}
+mod common;
 
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
-}
+use common::{deadreckon, stderr, stdout};
 
 fn workdir(temp: &TempDir) -> std::path::PathBuf {
     let work = temp.path().join("work");

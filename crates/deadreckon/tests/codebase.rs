@@ -18,6 +18,10 @@ use deadreckon_core::{
 };
 use tempfile::TempDir;
 
+mod common;
+
+use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
+
 #[test]
 fn mode_resolution_in_git_repo_defaults_to_worktree() {
     let temp = repo_tempdir();
@@ -2045,12 +2049,6 @@ fn post_run_hint_lists_apply_and_abandon_lines() {
     assert!(stdout.contains(&format!("cleanup: deadreckon cleanup {short}")));
 }
 
-fn repo_tempdir() -> TempDir {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
-}
-
 fn run_worktree_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> String {
     let output = deadreckon(paths)
         .current_dir(repo)
@@ -2085,12 +2083,6 @@ fn clean_git_repo_in(temp: &TempDir, name: &str) -> PathBuf {
     git(&repo, &["add", "-A"]).expect("add");
     git(&repo, &["commit", "-m", "initial"]).expect("commit");
     repo
-}
-
-fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", paths.home());
-    command
 }
 
 fn deadreckon_pty(
@@ -2157,23 +2149,6 @@ fn tcl_string_escape(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\r', "\\r")
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "{}{}",
-        stdout(output),
-        stderr(output)
-    );
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
 }
 
 fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {

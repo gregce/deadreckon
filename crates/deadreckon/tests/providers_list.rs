@@ -6,9 +6,13 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
-use tempfile::TempDir;
+mod common;
+
+use common::{
+    assert_success_with_labels as assert_success, deadreckon_home_no_color as deadreckon,
+    repo_tempdir_with_empty_bin as repo_tempdir,
+};
 
 #[test]
 fn providers_list_default_shows_configured_only() {
@@ -147,20 +151,6 @@ default_binary = "{exact_path}"
     assert!(stdout.contains(exact_path), "{stdout}");
 }
 
-fn repo_tempdir() -> TempDir {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    let temp = TempDir::new_in(&root).expect("tempdir");
-    fs::create_dir_all(temp.path().join("empty-bin")).expect("empty bin");
-    temp
-}
-
-fn deadreckon(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", home).env("NO_COLOR", "1");
-    command
-}
-
 fn write_config(home: &Path, body: &str) {
     fs::create_dir_all(home).expect("home");
     fs::write(home.join("config.toml"), body).expect("write config");
@@ -170,13 +160,4 @@ fn write_provider_override(home: &Path, name: &str, body: &str) {
     let dir = home.join("providers.d");
     fs::create_dir_all(&dir).expect("providers.d");
     fs::write(dir.join(name), body).expect("write provider override");
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }

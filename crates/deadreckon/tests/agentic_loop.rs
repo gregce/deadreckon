@@ -26,6 +26,10 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
+mod common;
+
+use common::repo_tempdir;
+
 const IMPORT_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/import");
 const IMPORT_GOLDENS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/goldens/import");
 
@@ -1705,12 +1709,6 @@ printf 'done\n'
         .flat_map(|entries| entries.filter_map(std::result::Result::ok))
         .count();
     assert_eq!(lock_count, 0);
-}
-
-fn repo_tempdir() -> TempDir {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
 }
 
 fn write_config(temp: &std::path::Path, base_url: &str) {

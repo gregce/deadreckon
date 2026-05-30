@@ -1,11 +1,13 @@
 #![allow(clippy::expect_used)]
 
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
 
 use deadreckon_core::{DeadreckonPaths, RunOptions, RunStatus, create_run, save_state};
 use tempfile::TempDir;
+
+mod common;
+
+use common::{assert_success, deadreckon, repo_tempdir, stdout};
 
 #[test]
 fn attach_exit_renders_completion_card_on_run_completed_event() {
@@ -63,33 +65,4 @@ fn state(temp: &TempDir, status: RunStatus) -> (DeadreckonPaths, deadreckon_core
     state.status = status;
     save_state(&state).expect("save");
     (paths, state)
-}
-
-fn repo_tempdir() -> TempDir {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
-    fs::create_dir_all(&root).expect("test tmp root");
-    TempDir::new_in(root).expect("tempdir")
-}
-
-fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command.env("DEADRECKON_HOME", paths.home());
-    command
-}
-
-fn assert_success(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "{}{}",
-        stdout(output),
-        stderr(output)
-    );
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).to_string()
 }
