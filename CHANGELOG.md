@@ -46,6 +46,9 @@
 - P5c (`d72bc9d`): Moved the `init` command body into `src/commands/init.rs`,
   keeping shared completion, config rendering, and provider-detection helpers in
   the crate root for later cleanup phases.
+- P5d (`05e96ba`): Moved the campaign command family into
+  `src/commands/campaign.rs`, keeping root/start/orchestrate/attach/show/kill
+  call sites routed through the private command module.
 
 ## Effortless (production release) - 2026-05-28
 
