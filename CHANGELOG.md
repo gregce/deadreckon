@@ -49,6 +49,9 @@
 - P5d (`05e96ba`): Moved the campaign command family into
   `src/commands/campaign.rs`, keeping root/start/orchestrate/attach/show/kill
   call sites routed through the private command module.
+- P5e (`d1e66f2`): Moved the attach command dispatch and terminal event loops
+  into `src/commands/attach.rs`, leaving pure render/state helpers in the crate
+  root for the P6 TUI extraction.
 
 ## Effortless (production release) - 2026-05-28
 
