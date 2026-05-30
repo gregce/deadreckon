@@ -13,6 +13,9 @@
 - P3a (`a601ae3`): Lifted `acceptance_integrity_tests` out of `main.rs` into a
   sibling `src` test module without changing test names or widening runtime
   visibility.
+- P3b (`pending`): Lifted `acceptance_render_tests` out of `main.rs` into a
+  sibling `src` test module while preserving its four render-focused unit test
+  names and private-helper access.
 
 ## Effortless (production release) - 2026-05-28
 
