@@ -3,4 +3,5 @@ pub(crate) mod attach;
 pub(crate) mod campaign;
 pub(crate) mod chain;
 pub(crate) mod init;
+pub(crate) mod merge;
 pub(crate) mod run;
