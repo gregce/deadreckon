@@ -25,6 +25,9 @@
 - P3e (`02d8396`): Lifted `flight_cli_tests` out of `main.rs` into a sibling
   `src` test module while preserving CLI flight/log fixture coverage and
   private-helper access.
+- P3f (`pending`): Lifted `self_improve_pr_tests` out of `main.rs` into a
+  sibling `src` test module while preserving self-improvement PR adapter
+  coverage and private-helper access.
 
 ## Effortless (production release) - 2026-05-28
 
