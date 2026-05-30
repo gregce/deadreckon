@@ -16,7 +16,7 @@
 - P3b (`9a9892d`): Lifted `acceptance_render_tests` out of `main.rs` into a
   sibling `src` test module while preserving its four render-focused unit test
   names and private-helper access.
-- P3c (`pending`): Lifted `campaign_spawn_tests` out of `main.rs` into a
+- P3c (`098b1cf`): Lifted `campaign_spawn_tests` out of `main.rs` into a
   sibling `src` test module while preserving its campaign orchestration helper
   coverage and private-helper access.
 
