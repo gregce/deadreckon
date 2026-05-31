@@ -1,6 +1,9 @@
 use super::super::*;
 use crate::commands::orchestrate::recommend_child_count_for_goal;
 use crate::commands::plan::{build_full_plan_tasks, resolve_plan_providers};
+use crate::commands::start::{
+    classify_goal_shape_for_start, goal_shape_provider_route, write_goal_shape_preview_record,
+};
 
 // --- Campaign: sub-orchestrator spawn (P3) ---------------------------------
 // A campaign launches each sub-goal as a full `orchestrate full-plan`

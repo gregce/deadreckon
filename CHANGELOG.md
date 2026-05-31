@@ -116,6 +116,9 @@
 - Post-P11b: Moved `deadreckon learn` and `deadreckon improve` command handling
   into `src/commands/learning.rs`, preserving the crate-private self-improvement
   PR adapter seam and reducing `main.rs` to roughly 19.4k lines.
+- Post-P11c: Moved the guided `deadreckon start` flow into
+  `src/commands/start.rs`, keeping shared launch-preview and command-existence
+  helpers at the root and reducing `main.rs` to roughly 16.7k lines.
 
 ## Effortless (production release) - 2026-05-28
 

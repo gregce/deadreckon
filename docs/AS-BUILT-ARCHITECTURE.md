@@ -2507,8 +2507,8 @@ After the pass, the binary source is split across private modules. `main.rs` sti
 owns the Tokio entrypoint, tracing setup, the `main_inner` command match, shared
 root-level lifecycle/inspection/update helpers, and private glue used by multiple
 command families. It is no longer the single home for the core command families,
-descriptor-backed import handling, learning/self-improvement command handling, TUI
-render layer, or lifted unit-test modules.
+guided start flow, descriptor-backed import handling, learning/self-improvement
+command handling, TUI render layer, or lifted unit-test modules.
 
 ### 38.2 Characterization net
 
@@ -2550,6 +2550,10 @@ explicit guard that the decompose work did not change CLI output shape.
 - `commands/learning.rs` owns `learn` and `improve` command handling, including
   local evidence indexing, provider-backed reflection, self-run launch, and the
   evidence-gated self-improvement PR adapter seam.
+- `commands/start.rs` owns the guided `start` flow: goal-shape classification,
+  interactive launch-path/source/provider/done-criteria prompts, start preview
+  materialization, history-based follow-up suggestions, and dispatch to run,
+  campaign, review, or full-plan execution.
 
 `main_inner` remains the dispatcher. It parses the unchanged `cli.rs` command enum,
 sets plain-output policy where needed, and delegates to the command family module
@@ -2615,4 +2619,4 @@ Those are recorded in `docs/V1-CANDIDATES.md` as explicit "not now" pointers.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~19.4k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~16.7k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
