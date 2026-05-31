@@ -71,6 +71,10 @@
 - P6c (`f4dc268`): Moved pure run-attach activity, live-file, process, narrative
   item, panel title, and context-count render helpers into `src/tui/render.rs`
   while keeping the terminal draw loop and file/doc lookup wrappers in place.
+- P6d (`e2481ae`): Moved the run-attach widget shell, header/footer/status,
+  spend/context/acceptance panels, and live-files/process panels into
+  `src/tui/render.rs`, leaving provider refresh, narrative projection caching,
+  and docs file lookup wrappers in the crate root.
 
 ## Effortless (production release) - 2026-05-28
 
