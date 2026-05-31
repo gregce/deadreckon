@@ -11,9 +11,7 @@ use super::commands::campaign::{
     campaign_replace_sub_goals_before_launch,
 };
 use super::commands::chain::{
-    ChainAttachTuiState, chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-    chain_event_read_hint, chain_should_auto_attach, chain_step_dot, chain_timeline_lines,
-    chain_wall_cap_hit, per_step_wall_cap,
+    chain_should_auto_attach, chain_step_dot, chain_wall_cap_hit, per_step_wall_cap,
 };
 use super::commands::orchestrate::{recommend_child_count_for_goal, recommend_orchestration_mode};
 use super::commands::plan::{
@@ -22,7 +20,8 @@ use super::commands::plan::{
 };
 use super::tui::{
     AttachActionNotice, AttachPanel, AttachPanelCounts, AttachPanelRows, AttachParentPlan,
-    AttachTuiState, max_panel_scroll,
+    AttachTuiState, ChainAttachTuiState, chain_activity_lines, chain_attach_footer_text,
+    chain_attach_header_text, chain_event_read_hint, chain_timeline_lines, max_panel_scroll,
 };
 use super::{
     ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachJsonlTail,

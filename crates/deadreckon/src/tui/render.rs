@@ -1,4 +1,8 @@
 use super::super::*;
+use crate::commands::chain::{
+    apply_mode_label, apply_strategy_label, branch_policy_label, chain_apply_strategy,
+    chain_attach_summary_line, chain_step_dot, chain_step_status_label, on_fail_label, short_sha,
+};
 use pulldown_cmark::{
     CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions,
     Parser as MarkdownParser, Tag, TagEnd,
@@ -7,6 +11,257 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
+
+#[derive(Debug, Default)]
+pub(crate) struct ChainAttachTuiState {
+    pub(crate) selected_step: usize,
+    events_scroll: u16,
+    pub(crate) event_status_hint: Option<String>,
+}
+
+impl ChainAttachTuiState {
+    pub(crate) fn clamp(&mut self, chain: &Chain) {
+        if chain.steps.is_empty() {
+            self.selected_step = 0;
+            self.events_scroll = 0;
+            return;
+        }
+        self.selected_step = self.selected_step.min(chain.steps.len() - 1);
+    }
+
+    pub(crate) fn handle_key(&mut self, key: KeyEvent, chain: &Chain) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.scroll(-1, chain),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.scroll(1, chain),
+            KeyCode::PageUp => {
+                self.events_scroll = self.events_scroll.saturating_sub(8);
+            }
+            KeyCode::PageDown => {
+                self.events_scroll = self.events_scroll.saturating_add(8);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.selected_step = 0;
+                self.events_scroll = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.selected_step = chain.steps.len().saturating_sub(1);
+            }
+            _ => {}
+        }
+        self.clamp(chain);
+    }
+
+    pub(crate) fn scroll(&mut self, delta: isize, chain: &Chain) {
+        if chain.steps.is_empty() {
+            return;
+        }
+        let next = (self.selected_step as isize + delta)
+            .clamp(0, chain.steps.len().saturating_sub(1) as isize);
+        self.selected_step = next as usize;
+    }
+}
+
+pub(crate) fn chain_event_read_hint(
+    event_count: usize,
+    appended_rows: usize,
+    partial_bytes: usize,
+    elapsed: Duration,
+    budget: AttachTickBudget,
+    error: Option<&CliError>,
+) -> Option<String> {
+    if let Some(error) = error {
+        return Some(format!(
+            "activity read delayed: {}",
+            one_line(&error.to_string(), 72)
+        ));
+    }
+    if elapsed > Duration::from_millis(budget.max_sync_io_ms) {
+        return Some(format!(
+            "activity catch-up: {event_count} events, +{appended_rows}, {}ms",
+            elapsed.as_millis()
+        ));
+    }
+    if partial_bytes > 0 {
+        return Some(format!(
+            "activity waiting for complete event line ({partial_bytes} bytes)"
+        ));
+    }
+    None
+}
+
+fn chain_activity_title(tui_state: &ChainAttachTuiState) -> String {
+    tui_state
+        .event_status_hint
+        .as_deref()
+        .map(|hint| format!("chain activity - {}", one_line(hint, 72)))
+        .unwrap_or_else(|| "chain activity".to_string())
+}
+
+pub(crate) fn render_chain_attach(
+    frame: &mut ratatui::Frame<'_>,
+    chain: &Chain,
+    events: &[ChainEvent],
+    tui_state: &ChainAttachTuiState,
+) {
+    let area = frame.area();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[1]);
+
+    frame.render_widget(
+        Paragraph::new(chain_attach_header_text(chain)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("deadreckon chain"),
+        ),
+        rows[0],
+    );
+    let timeline = chain_timeline_lines(chain, tui_state)
+        .into_iter()
+        .map(ListItem::new)
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(timeline).block(Block::default().borders(Borders::ALL).title("steps")),
+        body[0],
+    );
+    let event_lines = chain_activity_lines(events, tui_state)
+        .into_iter()
+        .map(ListItem::new)
+        .collect::<Vec<_>>();
+    let activity_title = chain_activity_title(tui_state);
+    frame.render_widget(
+        List::new(event_lines).block(Block::default().borders(Borders::ALL).title(activity_title)),
+        body[1],
+    );
+    frame.render_widget(Paragraph::new(chain_attach_footer_text(chain)), rows[2]);
+}
+
+pub(crate) fn chain_attach_header_text(chain: &Chain) -> String {
+    format!(
+        "{}\npolicy branch={} apply={} strategy={} on-fail={}\nbase {}@{}  cwd {}",
+        chain_attach_summary_line(chain),
+        branch_policy_label(chain.branch_policy),
+        apply_mode_label(chain.apply_mode),
+        apply_strategy_label(chain_apply_strategy(chain)),
+        on_fail_label(chain.on_fail),
+        chain.base_branch,
+        short_sha(&chain.base_sha),
+        one_line(&chain.cwd.display().to_string(), 96)
+    )
+}
+
+pub(crate) fn chain_timeline_lines(
+    chain: &Chain,
+    tui_state: &ChainAttachTuiState,
+) -> Vec<Line<'static>> {
+    chain
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let marker = if index == tui_state.selected_step {
+                ">"
+            } else {
+                " "
+            };
+            let run = step
+                .run_id
+                .as_deref()
+                .map(|run_id| format!(" run {}", run_prefix(run_id)))
+                .unwrap_or_default();
+            let mut spans = vec![
+                Span::styled(marker.to_string(), Style::default().fg(Color::Cyan)),
+                Span::raw(format!(
+                    " {} step {:>2} {:<8} {}{}",
+                    chain_step_dot(step.status),
+                    step.index + 1,
+                    chain_step_status_label(step.status),
+                    one_line(&step.goal, 54),
+                    run
+                )),
+            ];
+            if let Some(reason) = step.fail_reason.as_deref() {
+                spans.push(Span::styled(
+                    format!("  {}", one_line(reason, 32)),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+pub(crate) fn chain_activity_lines(
+    events: &[ChainEvent],
+    tui_state: &ChainAttachTuiState,
+) -> Vec<Line<'static>> {
+    let start = usize::from(tui_state.events_scroll).min(events.len());
+    events
+        .iter()
+        .rev()
+        .skip(start)
+        .take(240)
+        .map(|event| {
+            let step = event
+                .step_index
+                .map(|index| format!(" step {}", index + 1))
+                .unwrap_or_default();
+            let detail = if event.detail.is_null() {
+                String::new()
+            } else {
+                format!(" {}", one_line(&event.detail.to_string(), 120))
+            };
+            Line::from(format!(
+                "{} {}{}{}",
+                event.timestamp.format("%H:%M:%S"),
+                chain_event_label(&event.event),
+                step,
+                detail
+            ))
+        })
+        .collect()
+}
+
+pub(crate) fn chain_attach_footer_text(chain: &Chain) -> String {
+    if chain.status == ChainStatus::Paused {
+        format!(
+            "paused: {} | try: show --why-failed | try: resume | try: resume --apply-mode preview | try: undo | q detach",
+            chain.paused_reason.as_deref().unwrap_or("paused")
+        )
+    } else {
+        "[Enter] drill  [r] redo  [e] extend  [p] pause  [k] kill  [Ctrl-D/q/Esc] detach  j/k move  PgUp/PgDn activity".to_string()
+    }
+}
+
+fn chain_event_label(event: &ChainEventKind) -> &'static str {
+    match event {
+        ChainEventKind::ChainCreated => "created",
+        ChainEventKind::ChainStepStarted => "step started",
+        ChainEventKind::ChainRunCompleted => "run completed",
+        ChainEventKind::ChainApplyStarted => "apply started",
+        ChainEventKind::ChainApplied => "applied",
+        ChainEventKind::ChainApplyRefused => "apply refused",
+        ChainEventKind::ChainStepFailed => "step failed",
+        ChainEventKind::ChainPaused => "paused",
+        ChainEventKind::ChainResumed => "resumed",
+        ChainEventKind::ChainKilled => "killed",
+        ChainEventKind::ChainCompleted => "completed",
+        ChainEventKind::ChainUndoStarted => "undo started",
+        ChainEventKind::ChainUndoneStep => "undone step",
+        ChainEventKind::ChainHookInvoked => "hook",
+        ChainEventKind::ChainStepExtended => "extended",
+        ChainEventKind::ChainStepRedone => "redone",
+    }
+}
 
 pub(crate) struct PlanAttachRenderState<'a> {
     pub(crate) messages: &'a [PlanMessage],
