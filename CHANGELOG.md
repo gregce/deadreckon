@@ -91,6 +91,10 @@
 - P6h (`efda723`): Added the pure-render unit snapshots for run attach and
   chain attach frames, using the extracted `src/tui` render seams to lock the
   terminal frame shape before leaving the TUI extraction phase.
+- P7 (`76600a8`): Added merge-conflict-path characterization and extracted the
+  shared merge composition loop used by campaign result composition, final plan
+  merge working trees, and full-plan dependency source assembly without changing
+  conflict semantics or repair behavior.
 
 ## Effortless (production release) - 2026-05-28
 
