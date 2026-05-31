@@ -83,6 +83,11 @@
   hinting, header/footer text, timeline rows, and activity rows into
   `src/tui/render.rs`, leaving the chain command event loop and actions in
   `src/commands/chain/`.
+- P6g (`c4fe1e7`): Moved the run narrative/docs widget rendering,
+  `RunNarrativeRenderInput`, deterministic run narrative projection helpers,
+  markdown-doc line rendering, and narrative line/count helpers into
+  `src/tui/render.rs`, leaving provider refresh jobs and attach event loops in
+  the command/root orchestration layer.
 
 ## Effortless (production release) - 2026-05-28
 
