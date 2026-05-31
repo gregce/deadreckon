@@ -4,6 +4,7 @@ pub(crate) mod campaign;
 pub(crate) mod chain;
 pub(crate) mod import;
 pub(crate) mod init;
+pub(crate) mod learning;
 pub(crate) mod merge;
 pub(crate) mod orchestrate;
 pub(crate) mod plan;

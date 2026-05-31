@@ -113,6 +113,9 @@
 - Post-P11a: Moved descriptor-backed `deadreckon import` handling into
   `src/commands/import.rs`, keeping `main_inner` as the only call boundary and
   reducing `main.rs` to roughly 20.2k lines.
+- Post-P11b: Moved `deadreckon learn` and `deadreckon improve` command handling
+  into `src/commands/learning.rs`, preserving the crate-private self-improvement
+  PR adapter seam and reducing `main.rs` to roughly 19.4k lines.
 
 ## Effortless (production release) - 2026-05-28
 

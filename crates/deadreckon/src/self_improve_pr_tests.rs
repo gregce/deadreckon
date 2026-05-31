@@ -1,8 +1,10 @@
 use std::cell::Cell;
 
-use super::*;
+use crate::commands::learning::{SelfImprovePrAdapter, open_self_improve_pr_if_eligible};
 use deadreckon_core::learning::{AutoPrDecision, LearningRisk};
 use tempfile::TempDir;
+
+use super::*;
 
 struct FakePrAdapter {
     called: Cell<bool>,
