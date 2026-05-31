@@ -21,7 +21,7 @@ pub use config::{DEFAULT_CONFIG_PATH, read_config};
 pub use error::{ProviderError, Result};
 pub use http::ProviderAdapter;
 pub use registry::{ModelCatalogOverride, ModelEntry};
-pub use router::ProviderRouter;
+pub use router::{ModelContextWindowSource, ProviderRouter};
 pub use types::{
     Provider, ProviderConfigFile, ProviderEntry, ProviderFuture, ProviderKind, ProviderRequest,
     ProviderResponse, ProviderRouteInfo, ProviderUsage, SpendEstimate,
@@ -288,6 +288,12 @@ api_key = "anthropic-key"
             router.context_window_for_route(Some("openai")),
             Some(123_456)
         );
+        assert_eq!(
+            router
+                .context_window_for_route_with_source(Some("openai"))
+                .map(|(_, source)| source.as_str()),
+            Some("seam")
+        );
         let spend = router
             .estimate_for_route(
                 Some("openai"),
@@ -324,6 +330,12 @@ api_key = "anthropic-key"
         assert_eq!(
             router.context_window_for_route(Some("openai")),
             Some(400_000)
+        );
+        assert_eq!(
+            router
+                .context_window_for_route_with_source(Some("openai"))
+                .map(|(_, source)| source.as_str()),
+            Some("catalog")
         );
         let spend = router
             .estimate_for_route(

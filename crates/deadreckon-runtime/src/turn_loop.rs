@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use chrono::Utc;
-use deadreckon_providers::{ProviderRequest, ProviderResponse, ProviderRouter};
+use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderResponse, ProviderRouter};
 use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as run_sandbox};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::compaction::{append_compaction_record, compact_history, read_compaction_config};
 use crate::error::IoContext;
 use crate::flight::{ProviderFlightRecorder, ProviderFlightRecorderHandle};
 use crate::polish::{PolishConfig, polish_run_docs};
@@ -124,6 +125,7 @@ pub async fn run_turn_loop(
         .clone()
         .unwrap_or(paths_for_state(state)?.config_path());
     let seams = read_seams_config(&seam_config_path, config.no_seams)?;
+    let compaction = read_compaction_config(&seam_config_path)?;
     write_seams_audit(&state.run_root, &state.run_id, &seams)?;
     let seam_ctx = SeamRunCtx {
         run_root: state.run_root.clone(),
@@ -174,17 +176,34 @@ pub async fn run_turn_loop(
             RunEventKind::TurnStarted { turn },
         )?;
         snapshot_working(state, turn.saturating_sub(1))?;
+        let selected_route = router.selected_route_info();
         let selected_provider = config
             .provider
             .clone()
-            .or_else(|| router.selected_route_info().map(|route| route.name));
+            .or_else(|| selected_route.as_ref().map(|route| route.name.clone()));
+        let mut prompt_history = history.clone();
+        if selected_route
+            .as_ref()
+            .is_some_and(|route| is_direct_api_provider_kind(&route.kind))
+        {
+            let (context_window, source) = router
+                .context_window_for_route_with_source(selected_provider.as_deref())
+                .map(|(window, source)| (window, source.as_str().to_string()))
+                .unwrap_or((compaction.fallback_context_window, "fallback".to_string()));
+            let (compacted, record) =
+                compact_history(&history, context_window, compaction, turn, &source);
+            if let Some(record) = record {
+                append_compaction_record(&state.run_root, &record)?;
+            }
+            prompt_history = compacted;
+        }
         let prompt = if selected_provider
             .as_deref()
             .is_some_and(is_cli_provider_name)
         {
             build_cli_subagent_prompt(state, &history)
         } else {
-            build_prompt(state, &history)
+            build_prompt(state, &prompt_history)
         };
         let turn_dir = state.run_root.join("turns").join(format!("turn-{turn}"));
         let stdout_name = selected_provider
@@ -936,6 +955,13 @@ fn acceptance_prompt_text(state: &PipelineState) -> String {
 
 fn is_cli_provider_name(provider: &str) -> bool {
     provider.starts_with("cli:") || provider.starts_with("cli-")
+}
+
+fn is_direct_api_provider_kind(kind: &ProviderKind) -> bool {
+    matches!(
+        kind,
+        ProviderKind::Anthropic | ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+    )
 }
 
 fn parse_action(response: &ProviderResponse) -> Result<Action> {
@@ -1705,7 +1731,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use deadreckon_providers::ProviderRouter;
+    use deadreckon_providers::{ProviderKind, ProviderRouter};
     use deadreckon_sandbox::SandboxBackend;
     use serde_json::Value;
     use tempfile::TempDir;
@@ -1724,9 +1750,10 @@ mod tests {
     use super::{
         RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, append_tool_refusal, bash_policy_refusal,
         build_cli_subagent_prompt, build_prompt, ensure_sandbox_toml,
-        implementation_notes_ready_or_request_followup, load_or_reconstruct_history,
-        load_tool_policy_from_sandbox_toml, policy_seam_refusal, provider_output_name,
-        run_turn_loop, safe_working_path, safe_working_path_with_policy,
+        implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
+        load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, policy_seam_refusal,
+        provider_output_name, run_turn_loop, safe_working_path, safe_working_path_with_policy,
+        save_history,
     };
 
     fn create_smoke_run(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {
@@ -1753,6 +1780,8 @@ mod tests {
 
     fn write_seams_config(paths: &DeadreckonPaths, raw: &str) -> PathBuf {
         let config_path = paths.config_path();
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("config parent");
         std::fs::write(&config_path, raw).expect("config");
         config_path
     }
@@ -2114,6 +2143,96 @@ timeout_ms = 1000
             read_seams_json(&state)["kinds"]["event_sink"]["source"].as_str(),
             Some("builtin")
         );
+    }
+
+    #[tokio::test]
+    async fn direct_api_history_compacts_to_jsonl_with_fallback_window() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let config_path = write_seams_config(
+            &paths,
+            r#"
+default_provider = "openai-compatible"
+
+[compaction]
+fraction = 0.5
+keep_recent_turns = 2
+fallback_context_window = 80
+"#,
+        );
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "keep compacted direct api prompt".to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: Some("openai-compatible".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "checks:\n  - kind: file_exists\n    path: README.md\n",
+        )
+        .expect("acceptance");
+        let history = (0..8)
+            .map(|idx| format!("old-turn-{idx}: {}", "x".repeat(180)))
+            .collect::<Vec<_>>();
+        save_history(&state, &history).expect("history");
+        let router = ProviderRouter::from_config_path(&config_path, Some("openai-compatible"))
+            .expect("router");
+
+        let err = run_turn_loop(
+            &mut state,
+            &router,
+            RunLoopConfig {
+                provider: Some("openai-compatible".to_string()),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                sandbox_backend: SandboxBackend::None,
+                no_seams: false,
+                max_turns: 1,
+                from_turn: None,
+                event_sender: None,
+                cancellation_token: None,
+                docs: RunLoopDocsConfig {
+                    home: paths.home().to_path_buf(),
+                    config_path: Some(config_path),
+                    doc_provider: None,
+                    doc_provider_source: None,
+                    doc_subskills: Vec::new(),
+                    token_budget: 0,
+                    budget_cap_usd: None,
+                    doc_skill: "run-narrator".to_string(),
+                    no_docs: true,
+                },
+            },
+        )
+        .await
+        .expect_err("missing credential after compaction");
+
+        assert!(err.to_string().contains("missing credential"));
+        let compaction =
+            std::fs::read_to_string(state.run_root.join("compaction.jsonl")).expect("compaction");
+        assert!(compaction.contains(r#""context_window":80"#));
+        assert!(compaction.contains(r#""context_window_source":"fallback""#));
+        let full_history =
+            std::fs::read_to_string(state.run_root.join("history.json")).expect("history");
+        assert!(full_history.contains("old-turn-0"));
+    }
+
+    #[test]
+    fn cli_provider_path_is_never_compacted() {
+        assert!(!is_direct_api_provider_kind(&ProviderKind::CliCodex));
+        assert!(!is_direct_api_provider_kind(&ProviderKind::CliClaudeCode));
+        assert!(is_direct_api_provider_kind(&ProviderKind::OpenAi));
     }
 
     #[test]

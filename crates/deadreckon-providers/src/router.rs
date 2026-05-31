@@ -5,7 +5,7 @@ use crate::cli_claude_code::CliClaudeCodeProvider;
 use crate::cli_codex::CliCodexProvider;
 use crate::cli_generic::GenericCliProvider;
 use crate::config::{
-    apply_catalog_to_provider_entry, kind_from_name, merge_provider_entry,
+    CatalogEntrySource, apply_catalog_to_provider_entry, kind_from_name, merge_provider_entry,
     provider_entries_from_registry, read_config,
 };
 use crate::http::ProviderAdapter;
@@ -19,6 +19,22 @@ use crate::{
 pub struct ProviderRouter {
     routes: Vec<Box<dyn Provider>>,
     context_windows: BTreeMap<String, Option<u32>>,
+    context_window_sources: BTreeMap<String, Option<ModelContextWindowSource>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelContextWindowSource {
+    Catalog,
+    Seam,
+}
+
+impl ModelContextWindowSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Catalog => "catalog",
+            Self::Seam => "seam",
+        }
+    }
 }
 
 impl ProviderRouter {
@@ -26,6 +42,7 @@ impl ProviderRouter {
         Self {
             routes: vec![Box::new(ScriptedSmokeProvider::new())],
             context_windows: BTreeMap::new(),
+            context_window_sources: BTreeMap::new(),
         }
     }
 
@@ -129,6 +146,7 @@ impl ProviderRouter {
 
         let mut routes = Vec::new();
         let mut context_windows = BTreeMap::new();
+        let mut context_window_sources = BTreeMap::new();
         for name in route_names {
             let Some(mut entry) = providers.remove(&name) else {
                 return Err(ProviderError::InvalidConfig(format!(
@@ -138,17 +156,26 @@ impl ProviderRouter {
             if let Some(model) = override_model {
                 entry.model = Some(model.to_string());
             }
-            let context_window =
+            let catalog_entry =
                 apply_catalog_to_provider_entry(&name, &mut entry, registry, catalog_override);
+            let context_window = catalog_entry.and_then(|entry| entry.context_window);
+            let context_window_source = catalog_entry.and_then(|entry| {
+                entry.context_window.map(|_| match entry.source {
+                    CatalogEntrySource::Catalog => ModelContextWindowSource::Catalog,
+                    CatalogEntrySource::Seam => ModelContextWindowSource::Seam,
+                })
+            });
             let kind = entry.kind.unwrap_or_else(|| kind_from_name(&name));
             entry.kind = Some(kind.clone());
             routes.push(build_provider(name.clone(), kind, entry, registry)?);
-            context_windows.insert(name, context_window);
+            context_windows.insert(name.clone(), context_window);
+            context_window_sources.insert(name, context_window_source);
         }
 
         Ok(Self {
             routes,
             context_windows,
+            context_window_sources,
         })
     }
 
@@ -183,6 +210,23 @@ impl ProviderRouter {
             .or_else(|| self.routes.first())
             .map(|route| route.name())?;
         self.context_windows.get(route_name).copied().flatten()
+    }
+
+    pub fn context_window_for_route_with_source(
+        &self,
+        provider_name: Option<&str>,
+    ) -> Option<(u32, ModelContextWindowSource)> {
+        let route_name = provider_name
+            .and_then(|name| self.routes.iter().find(|route| route.name() == name))
+            .or_else(|| self.routes.first())
+            .map(|route| route.name())?;
+        let window = self.context_windows.get(route_name).copied().flatten()?;
+        let source = self
+            .context_window_sources
+            .get(route_name)
+            .copied()
+            .flatten()?;
+        Some((window, source))
     }
 
     pub async fn complete(&self, request: &ProviderRequest) -> Result<ProviderResponse> {

@@ -137,24 +137,37 @@ pub(crate) fn apply_catalog_to_provider_entry(
     entry: &mut ProviderEntry,
     registry: &ProviderRegistry,
     catalog_override: Option<&ModelCatalogOverride>,
-) -> Option<u32> {
+) -> Option<ResolvedCatalogEntry> {
     let model = entry.model.as_deref()?;
     let descriptor_entry = descriptor_for_entry(provider_name, entry, registry)
         .and_then(|descriptor| model_entry_for_model(&descriptor.model_catalog, model));
     let selected = catalog_override
         .and_then(|catalog| catalog.entry_for_model(model))
-        .or(descriptor_entry);
-    if let Some(model_entry) = selected {
-        if let Some(input) = model_entry.input_per_million {
-            entry.input_cost_per_million = Some(input);
-        }
-        if let Some(output) = model_entry.output_per_million {
-            entry.output_cost_per_million = Some(output);
-        }
-        model_entry.context_window
-    } else {
-        None
+        .map(|entry| (entry, CatalogEntrySource::Seam))
+        .or_else(|| descriptor_entry.map(|entry| (entry, CatalogEntrySource::Catalog)))?;
+    let (model_entry, source) = selected;
+    if let Some(input) = model_entry.input_per_million {
+        entry.input_cost_per_million = Some(input);
     }
+    if let Some(output) = model_entry.output_per_million {
+        entry.output_cost_per_million = Some(output);
+    }
+    Some(ResolvedCatalogEntry {
+        context_window: model_entry.context_window,
+        source,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedCatalogEntry {
+    pub(crate) context_window: Option<u32>,
+    pub(crate) source: CatalogEntrySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogEntrySource {
+    Catalog,
+    Seam,
 }
 
 fn descriptor_for_entry<'a>(

@@ -17,6 +17,9 @@
   denial.
 - P5: Added the event-sink seam as an additive `RunEvent` broadcast mirror while
   keeping `events.jsonl` as the source of truth for attach and failure recovery.
+- P6: Added deterministic direct-API history compaction with `[compaction]`
+  config, `compaction.jsonl` audit records, catalog/seam/fallback context-window
+  sources, and full `history.json` retention.
 
 ## Navigable campaign attach (production release) - 2026-05-31
 
