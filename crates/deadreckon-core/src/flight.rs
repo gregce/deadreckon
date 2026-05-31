@@ -382,11 +382,29 @@ pub fn build_working_file_index(root: &Path) -> Result<WorkingFileIndex> {
         let relative = path.strip_prefix(root).map_err(|err| {
             DeadreckonError::InvalidInput(format!("working path prefix error: {err}"))
         })?;
-        let metadata = fs::metadata(path).with_path(path)?;
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(DeadreckonError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        let hash = match sha256_file(path) {
+            Ok(hash) => hash,
+            Err(DeadreckonError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         files.insert(
             relative.to_path_buf(),
             FileFingerprint {
-                hash: sha256_file(path)?,
+                hash,
                 size: metadata.len(),
             },
         );
