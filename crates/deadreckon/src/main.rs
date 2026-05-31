@@ -7648,6 +7648,7 @@ async fn resume_command(
                 max_spend_usd,
                 max_wall_seconds,
                 sandbox_backend: backend,
+                no_seams: false,
                 max_turns: 12,
                 from_turn,
                 event_sender: None,

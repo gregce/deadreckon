@@ -6,6 +6,9 @@
   hard non-swappable gate guard, sandboxed JSON-over-stdio dispatch with fixed
   per-kind fail policies, stdin/denylist support in the sandbox runner, and
   per-run `seams.json` audit writing.
+- P2: Wired the policy seam into bash/write_file dispatch after the
+  `sandbox.toml` floor, reusing the existing tool-refusal provenance path for
+  denials while preserving builtin behavior when no policy seam is configured.
 
 ## Navigable campaign attach (production release) - 2026-05-31
 

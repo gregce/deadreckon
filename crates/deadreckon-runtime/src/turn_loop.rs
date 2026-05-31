@@ -35,12 +35,18 @@ use deadreckon_core::state::{
     PhaseId, PhaseStatus, PipelineState, RunStatus, append_json_line, save_state,
 };
 
+use crate::seam::{
+    SeamKind, SeamOutcome, SeamRunCtx, SeamsConfig, dispatch_seam, read_seams_config,
+    write_seams_audit,
+};
+
 #[derive(Debug, Clone)]
 pub struct RunLoopConfig {
     pub provider: Option<String>,
     pub max_spend_usd: Option<f64>,
     pub max_wall_seconds: Option<f64>,
     pub sandbox_backend: SandboxBackend,
+    pub no_seams: bool,
     pub max_turns: u32,
     pub from_turn: Option<u32>,
     pub event_sender: Option<broadcast::Sender<RunEvent>>,
@@ -111,6 +117,18 @@ pub async fn run_turn_loop(
     // and writes state after every turn boundary.
     let mut history = load_or_reconstruct_history(state, config.from_turn)?;
     ensure_sandbox_toml(state)?;
+    let seam_config_path = config
+        .docs
+        .config_path
+        .clone()
+        .unwrap_or(paths_for_state(state)?.config_path());
+    let seams = read_seams_config(&seam_config_path, config.no_seams)?;
+    write_seams_audit(&state.run_root, &state.run_id, &seams)?;
+    let seam_ctx = SeamRunCtx {
+        run_root: state.run_root.clone(),
+        working_dir: state.working_dir.clone(),
+        sandbox_backend: config.sandbox_backend,
+    };
     let run_token = config.cancellation_token.clone().unwrap_or_default();
     let _cancel_marker_guard = CancelMarkerGuard::spawn(&state.run_root, run_token.clone());
     if should_cancel_run(state, &run_token) {
@@ -453,6 +471,25 @@ pub async fn run_turn_loop(
                     save_state(state)?;
                     continue;
                 }
+                if let Some(reason) =
+                    policy_seam_refusal(&seams, &seam_ctx, "bash", &command, &state.working_dir)
+                        .await
+                {
+                    append_tool_refusal(
+                        state,
+                        turn,
+                        &tool_call_id,
+                        "bash",
+                        &response.model,
+                        &reason,
+                        config.event_sender.as_ref(),
+                    )?;
+                    history.push(format!("tool {tool_call_id} refused: {reason}"));
+                    state.turn = turn;
+                    save_history(state, &history)?;
+                    save_state(state)?;
+                    continue;
+                }
                 let output = match run_sandbox(SandboxSpec {
                     backend: config.sandbox_backend,
                     cwd: state.working_dir.clone(),
@@ -587,6 +624,31 @@ pub async fn run_turn_loop(
                             continue;
                         }
                     };
+                let target_label = target.display().to_string();
+                if let Some(reason) = policy_seam_refusal(
+                    &seams,
+                    &seam_ctx,
+                    "write_file",
+                    &target_label,
+                    &state.working_dir,
+                )
+                .await
+                {
+                    append_tool_refusal(
+                        state,
+                        turn,
+                        &tool_call_id,
+                        "write_file",
+                        &response.model,
+                        &reason,
+                        config.event_sender.as_ref(),
+                    )?;
+                    history.push(format!("tool {tool_call_id} refused: {reason}"));
+                    state.turn = turn;
+                    save_history(state, &history)?;
+                    save_state(state)?;
+                    continue;
+                }
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent).with_path(parent)?;
                 }
@@ -971,6 +1033,34 @@ fn bash_policy_refusal(
         ));
     }
     None
+}
+
+async fn policy_seam_refusal(
+    seams: &SeamsConfig,
+    ctx: &SeamRunCtx,
+    function_id: &str,
+    command: &str,
+    working_dir: &Path,
+) -> Option<String> {
+    match dispatch_seam(
+        SeamKind::Policy,
+        &json!({
+            "function_id": function_id,
+            "command": command,
+            "working_dir": working_dir,
+        }),
+        seams,
+        ctx,
+    )
+    .await
+    {
+        SeamOutcome::Deny(reason) => Some(format!("seam 'policy' denied {function_id}: {reason}")),
+        SeamOutcome::Ok(_) | SeamOutcome::Unconfigured => None,
+        SeamOutcome::Fallback => None,
+        SeamOutcome::Skipped(reason) => Some(format!(
+            "seam 'policy' denied {function_id}: unexpected skipped outcome: {reason}"
+        )),
+    }
 }
 
 fn changed_files_since_snapshot(state: &PipelineState, snapshot_turn: u32) -> Result<Vec<PathBuf>> {
@@ -1545,7 +1635,10 @@ mod tests {
 
     use deadreckon_providers::ProviderRouter;
     use deadreckon_sandbox::SandboxBackend;
+    use serde_json::Value;
     use tempfile::TempDir;
+
+    use crate::seam::{SeamRunCtx, read_seams_config};
 
     use deadreckon_core::events::{RunEventBus, RunEventKind};
     use deadreckon_core::flight::{
@@ -1553,16 +1646,86 @@ mod tests {
         read_flight_manifest,
     };
     use deadreckon_core::paths::DeadreckonPaths;
-    use deadreckon_core::state::{RunOptions, RunStatus, create_run};
+    use deadreckon_core::state::{PipelineState, RunOptions, RunStatus, create_run};
     use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
 
     use super::{
-        RunLoopConfig, RunLoopDocsConfig, append_tool_refusal, bash_policy_refusal,
+        RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, append_tool_refusal, bash_policy_refusal,
         build_cli_subagent_prompt, build_prompt, ensure_sandbox_toml,
         implementation_notes_ready_or_request_followup, load_or_reconstruct_history,
-        load_tool_policy_from_sandbox_toml, provider_output_name, run_turn_loop, safe_working_path,
-        safe_working_path_with_policy,
+        load_tool_policy_from_sandbox_toml, policy_seam_refusal, provider_output_name,
+        run_turn_loop, safe_working_path, safe_working_path_with_policy,
     };
+
+    fn create_smoke_run(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: goal.to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        (paths, state)
+    }
+
+    fn write_policy_config(paths: &DeadreckonPaths, raw: &str) -> PathBuf {
+        let config_path = paths.config_path();
+        std::fs::write(&config_path, raw).expect("config");
+        config_path
+    }
+
+    async fn run_smoke_turn(
+        state: &mut PipelineState,
+        paths: &DeadreckonPaths,
+        config_path: Option<PathBuf>,
+        no_seams: bool,
+    ) -> RunLoopOutcome {
+        let router = ProviderRouter::smoke();
+        run_turn_loop(
+            state,
+            &router,
+            RunLoopConfig {
+                provider: Some("smoke".to_string()),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                sandbox_backend: SandboxBackend::None,
+                no_seams,
+                max_turns: 1,
+                from_turn: None,
+                event_sender: None,
+                cancellation_token: None,
+                docs: RunLoopDocsConfig {
+                    home: paths.home().to_path_buf(),
+                    config_path,
+                    doc_provider: None,
+                    doc_provider_source: None,
+                    doc_subskills: Vec::new(),
+                    token_budget: 0,
+                    budget_cap_usd: None,
+                    doc_skill: "run-narrator".to_string(),
+                    no_docs: true,
+                },
+            },
+        )
+        .await
+        .expect("loop")
+    }
+
+    fn read_seams_json(state: &PipelineState) -> Value {
+        let raw = std::fs::read_to_string(state.run_root.join("seams.json")).expect("seams.json");
+        serde_json::from_str(&raw).expect("seams json")
+    }
 
     #[test]
     fn provider_output_name_slugifies_cli_descriptor_id() {
@@ -1574,6 +1737,133 @@ mod tests {
         assert_eq!(provider_output_name("cli:pi"), "pi.out");
         assert_eq!(provider_output_name("cli:local/test"), "local-test.out");
         assert_eq!(provider_output_name("anthropic"), "provider.out");
+    }
+
+    #[tokio::test]
+    async fn policy_seam_deny_blocks_tool_call_and_records_denial() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "policy seam deny");
+        let config_path = write_policy_config(
+            &paths,
+            r#"
+[seams.policy]
+command = ["/bin/sh", "-c", "cat >/dev/null; echo '{\"decision\":\"deny\",\"reason\":\"blocked by test\"}'"]
+timeout_ms = 1000
+"#,
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), false).await;
+
+        assert!(!state.working_dir.join("Cargo.toml").exists());
+        let traces = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
+        let provenance =
+            std::fs::read_to_string(state.run_root.join("provenance.jsonl")).expect("provenance");
+        assert!(traces.contains(r#""event":"tool.refused""#));
+        assert!(provenance.contains(r#""event":"tool.refused""#));
+        assert!(traces.contains("blocked by test"));
+        assert_eq!(
+            read_seams_json(&state)["kinds"]["policy"]["source"].as_str(),
+            Some("external")
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_seam_allow_proceeds() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "policy seam allow");
+        let config_path = write_policy_config(
+            &paths,
+            r#"
+[seams.policy]
+command = ["/bin/sh", "-c", "cat >/dev/null; echo '{\"decision\":\"allow\"}'"]
+timeout_ms = 1000
+"#,
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), false).await;
+
+        assert!(state.working_dir.join("Cargo.toml").exists());
+        let traces = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
+        assert!(!traces.contains(r#""event":"tool.refused""#));
+        assert_eq!(
+            read_seams_json(&state)["kinds"]["policy"]["source"].as_str(),
+            Some("external")
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_seam_timeout_denies_fail_closed() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "policy seam timeout");
+        let config_path = write_policy_config(
+            &paths,
+            r#"
+[seams.policy]
+command = ["/bin/sh", "-c", "sleep 2"]
+timeout_ms = 10
+"#,
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), false).await;
+
+        assert!(!state.working_dir.join("Cargo.toml").exists());
+        let traces = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
+        assert!(traces.contains(r#""event":"tool.refused""#));
+        assert!(traces.contains("failed closed: timeout"));
+    }
+
+    #[tokio::test]
+    async fn policy_seam_cannot_widen_sandbox_floor() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state) = create_smoke_run(&temp, "policy seam floor");
+        let config_path = write_policy_config(
+            &paths,
+            r#"
+[seams.policy]
+command = ["/bin/sh", "-c", "cat >/dev/null; echo '{\"decision\":\"allow\"}'"]
+timeout_ms = 1000
+"#,
+        );
+        let seams = read_seams_config(&config_path, false).expect("seams");
+        let seam_ctx = SeamRunCtx {
+            run_root: state.run_root.clone(),
+            working_dir: state.working_dir.clone(),
+            sandbox_backend: SandboxBackend::None,
+        };
+
+        let seam_refusal = policy_seam_refusal(
+            &seams,
+            &seam_ctx,
+            "write_file",
+            "../outside.txt",
+            &state.working_dir,
+        )
+        .await;
+        assert!(seam_refusal.is_none());
+
+        ensure_sandbox_toml(&state).expect("sandbox.toml");
+        let policy =
+            load_tool_policy_from_sandbox_toml(&state, "write_file").expect("write policy");
+        let err =
+            safe_working_path_with_policy(&state.working_dir, Path::new("../outside.txt"), &policy)
+                .expect_err("sandbox floor blocks parent path");
+        assert!(err.to_string().contains("unsafe write path"));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_policy_seam_is_identical_to_today() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "policy seam unconfigured");
+
+        let _ = run_smoke_turn(&mut state, &paths, None, false).await;
+
+        assert!(state.working_dir.join("Cargo.toml").exists());
+        let traces = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
+        assert!(!traces.contains(r#""event":"tool.refused""#));
+        assert_eq!(
+            read_seams_json(&state)["kinds"]["policy"]["source"].as_str(),
+            Some("builtin")
+        );
     }
 
     #[test]
@@ -1778,6 +2068,7 @@ mod tests {
                     max_spend_usd: Some(1.0),
                     max_wall_seconds: None,
                     sandbox_backend: SandboxBackend::None,
+                    no_seams: false,
                     max_turns: 1,
                     from_turn: None,
                     event_sender: Some(bus.sender()),
@@ -1845,6 +2136,7 @@ mod tests {
                     max_spend_usd: Some(1.0),
                     max_wall_seconds: None,
                     sandbox_backend: SandboxBackend::None,
+                    no_seams: false,
                     max_turns: 1,
                     from_turn: None,
                     event_sender: Some(bus.sender()),
@@ -1901,6 +2193,7 @@ mod tests {
                 max_spend_usd: Some(1.0),
                 max_wall_seconds: None,
                 sandbox_backend: SandboxBackend::None,
+                no_seams: false,
                 max_turns: 1,
                 from_turn: None,
                 event_sender: Some(bus.sender()),
@@ -2003,6 +2296,7 @@ storage = "jsonl"
                 max_spend_usd: Some(1.0),
                 max_wall_seconds: None,
                 sandbox_backend: SandboxBackend::None,
+                no_seams: false,
                 max_turns: 1,
                 from_turn: None,
                 event_sender: None,
