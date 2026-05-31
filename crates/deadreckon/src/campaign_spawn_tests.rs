@@ -256,6 +256,66 @@ fn compose_result_runs_extracted_without_changing_plan_merge() {
 }
 
 #[test]
+fn compose_helper_extracted_without_changing_merge_outcomes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root0 = tmp.path().join("sub-0-result");
+    let root1 = tmp.path().join("sub-1-result");
+    let root2 = tmp.path().join("sub-2-result");
+    write_file(&root0, "src/shared.rs", "version from sub 0");
+    write_file(&root0, "src/same.rs", "same content");
+    write_file(&root1, "src/same.rs", "same content");
+    write_file(&root1, "src/notify.rs", "notify");
+    write_file(&root2, "src/shared.rs", "version from sub 2");
+    let merge_dir = tmp.path().join("merge-working");
+    let sources = vec![
+        ComposeFileSource {
+            root: root0,
+            data: "run-0".to_string(),
+            prefix_error: "merge source prefix error",
+        },
+        ComposeFileSource {
+            root: root1,
+            data: "run-1".to_string(),
+            prefix_error: "merge source prefix error",
+        },
+        ComposeFileSource {
+            root: root2,
+            data: "run-2".to_string(),
+            prefix_error: "merge source prefix error",
+        },
+    ];
+
+    let conflicts = compose_merge_sources(
+        &merge_dir,
+        &sources,
+        |label, _relative, _file, _hash| label.clone(),
+        |relative, previous, current| ComposeMergeDecision::RecordConflict {
+            conflict: ComposeConflict {
+                path: relative.to_path_buf(),
+                first_label: previous.clone(),
+                second_label: current.clone(),
+            },
+            use_current: false,
+        },
+    )
+    .expect("compose");
+
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].path, std::path::PathBuf::from("src/shared.rs"));
+    assert_eq!(conflicts[0].first_label, "run-0");
+    assert_eq!(conflicts[0].second_label, "run-2");
+    assert_eq!(
+        fs::read_to_string(merge_dir.join("src/shared.rs")).expect("shared"),
+        "version from sub 0"
+    );
+    assert_eq!(
+        fs::read_to_string(merge_dir.join("src/same.rs")).expect("same"),
+        "same content"
+    );
+    assert!(merge_dir.join("src/notify.rs").is_file());
+}
+
+#[test]
 fn campaign_meta_merge_composes_two_clean_sub_results() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let root0 = tmp.path().join("sub-0-result");

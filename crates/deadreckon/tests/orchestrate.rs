@@ -3343,6 +3343,41 @@ fn merge_fails_on_conflict_default() {
 }
 
 #[test]
+fn merge_conflict_path_characterization() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_with_readme_conflict(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--no-repair", "--quiet"])
+        .output()
+        .expect("merge");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let conflicts_path = paths.merge_proofs(&plan.plan_id).join("conflicts.json");
+    let err = stderr(&output);
+    assert!(
+        err.contains("merge conflict at README.md; automatic repair disabled"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("inspect {}", conflicts_path.display())),
+        "{err}"
+    );
+
+    let bundle: Value =
+        serde_json::from_str(&fs::read_to_string(conflicts_path).expect("conflicts"))
+            .expect("conflicts json");
+    assert_eq!(bundle["schema_version"], 2);
+    assert_eq!(bundle["strategy"], "dag-aware");
+    assert_eq!(bundle["conflicts"][0]["path"], "README.md");
+    assert_eq!(bundle["conflicts"][0]["children"][0]["task_id"], "task-0");
+    assert_eq!(bundle["conflicts"][0]["children"][1]["task_id"], "task-1");
+}
+
+#[test]
 fn merge_conflict_emits_conflict_event_before_refusal() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

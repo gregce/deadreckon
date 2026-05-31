@@ -1951,50 +1951,38 @@ async fn compose_dependency_source_dir(
         .join("launch")
         .join(&task.task_id)
         .join("source");
-    remove_if_exists(&source_dir)?;
-    fs::create_dir_all(&source_dir)?;
-
-    let mut seen = BTreeMap::<PathBuf, PlanMergeSeenFile>::new();
-    let mut conflicts = Vec::new();
-    for dependency in dependencies {
-        for file in inventory_files(&dependency.root)? {
-            let relative = file.strip_prefix(&dependency.root).map_err(|err| {
-                DeadreckonError::InvalidInput(format!("dependency source prefix error: {err}"))
-            })?;
-            if skip_plan_merge_file(relative) {
-                continue;
-            }
-            let hash = file_hash(&file)?;
-            let current = PlanMergeSeenFile {
-                task_id: dependency.task_id.clone(),
-                task_index: dependency.index,
-                run_id: dependency.run_id.clone(),
-                artifact_root: dependency.root.clone(),
-                artifact_path: file.clone(),
-                hash,
-            };
-            match seen.get(relative).cloned() {
-                Some(previous) if previous.hash == hash => {}
-                Some(previous)
-                    if plan_task_depends_on(plan, &current.task_id, &previous.task_id) =>
-                {
-                    copy_merge_file(&file, &source_dir.join(relative))?;
-                    seen.insert(relative.to_path_buf(), current);
-                }
-                Some(previous)
-                    if plan_task_depends_on(plan, &previous.task_id, &current.task_id) => {}
-                Some(previous) => {
-                    conflicts.push(plan_merge_conflict(
-                        plan, relative, &previous, &current, None,
-                    ));
-                }
-                None => {
-                    copy_merge_file(&file, &source_dir.join(relative))?;
-                    seen.insert(relative.to_path_buf(), current);
+    let sources = dependencies
+        .iter()
+        .map(|dependency| ComposeFileSource {
+            root: dependency.root.clone(),
+            data: dependency.clone(),
+            prefix_error: "dependency source prefix error",
+        })
+        .collect::<Vec<_>>();
+    let conflicts = compose_merge_sources(
+        &source_dir,
+        &sources,
+        |dependency, _relative, file, hash| PlanMergeSeenFile {
+            task_id: dependency.task_id.clone(),
+            task_index: dependency.index,
+            run_id: dependency.run_id.clone(),
+            artifact_root: dependency.root.clone(),
+            artifact_path: file.to_path_buf(),
+            hash,
+        },
+        |relative, previous, current| {
+            if plan_task_depends_on(plan, &current.task_id, &previous.task_id) {
+                ComposeMergeDecision::UseCurrent
+            } else if plan_task_depends_on(plan, &previous.task_id, &current.task_id) {
+                ComposeMergeDecision::KeepExisting
+            } else {
+                ComposeMergeDecision::RecordConflict {
+                    conflict: plan_merge_conflict(plan, relative, previous, current, None),
+                    use_current: false,
                 }
             }
-        }
-    }
+        },
+    )?;
     if !conflicts.is_empty() {
         repair_dependency_source_conflicts(
             paths,

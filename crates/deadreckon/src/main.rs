@@ -9102,6 +9102,14 @@ struct PlanMergeSeenFile {
 }
 
 #[derive(Debug, Clone)]
+struct PlanMergeSource {
+    task_id: String,
+    task_index: u32,
+    run_id: String,
+    artifact_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 struct PlanMergeOutcome {
     working_dir: PathBuf,
     conflicts: Vec<PlanMergeConflict>,
@@ -9117,12 +9125,15 @@ impl PlanMergeOutcome {
     }
 }
 
-fn mergeable_run_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf, u64)>> {
+fn mergeable_run_files_with_prefix_error(
+    root: &Path,
+    prefix_error: &str,
+) -> Result<Vec<(PathBuf, PathBuf, u64)>> {
     let mut files = Vec::new();
     for file in inventory_files(root)? {
-        let relative = file.strip_prefix(root).map_err(|err| {
-            DeadreckonError::InvalidInput(format!("merge source prefix error: {err}"))
-        })?;
+        let relative = file
+            .strip_prefix(root)
+            .map_err(|err| DeadreckonError::InvalidInput(format!("{prefix_error}: {err}")))?;
         if skip_plan_merge_file(relative) {
             continue;
         }
@@ -9130,6 +9141,11 @@ fn mergeable_run_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf, u64)>> {
         files.push((relative.to_path_buf(), file.clone(), hash));
     }
     Ok(files)
+}
+
+#[cfg(test)]
+fn mergeable_run_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf, u64)>> {
+    mergeable_run_files_with_prefix_error(root, "merge source prefix error")
 }
 
 /// A same-path collision between two independent campaign sub-results.
@@ -9147,33 +9163,90 @@ struct ComposeResult {
     conflicts: Vec<ComposeConflict>,
 }
 
+struct ComposeFileSource<T> {
+    root: PathBuf,
+    data: T,
+    prefix_error: &'static str,
+}
+
+enum ComposeMergeDecision<C> {
+    KeepExisting,
+    UseCurrent,
+    RecordConflict { conflict: C, use_current: bool },
+}
+
+fn compose_merge_sources<T, S, C>(
+    merge_dir: &Path,
+    sources: &[ComposeFileSource<T>],
+    mut make_seen: impl FnMut(&T, &Path, &Path, u64) -> S,
+    mut decide_conflict: impl FnMut(&Path, &S, &S) -> ComposeMergeDecision<C>,
+) -> Result<Vec<C>> {
+    remove_if_exists(merge_dir)?;
+    fs::create_dir_all(merge_dir)?;
+    let mut seen: BTreeMap<PathBuf, (S, u64)> = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for source in sources {
+        for (relative, file, hash) in
+            mergeable_run_files_with_prefix_error(&source.root, source.prefix_error)?
+        {
+            let current = make_seen(&source.data, &relative, &file, hash);
+            let decision = match seen.get(&relative) {
+                Some((_, previous_hash)) if *previous_hash == hash => continue,
+                Some((previous, _)) => decide_conflict(&relative, previous, &current),
+                None => {
+                    copy_merge_file(&file, &merge_dir.join(&relative))?;
+                    seen.insert(relative, (current, hash));
+                    continue;
+                }
+            };
+            match decision {
+                ComposeMergeDecision::KeepExisting => {}
+                ComposeMergeDecision::UseCurrent => {
+                    copy_merge_file(&file, &merge_dir.join(&relative))?;
+                    seen.insert(relative, (current, hash));
+                }
+                ComposeMergeDecision::RecordConflict {
+                    conflict,
+                    use_current,
+                } => {
+                    conflicts.push(conflict);
+                    if use_current {
+                        copy_merge_file(&file, &merge_dir.join(&relative))?;
+                        seen.insert(relative, (current, hash));
+                    }
+                }
+            }
+        }
+    }
+    Ok(conflicts)
+}
+
 /// Compose several already-promoted result trees into one merge dir. Sub-results
 /// are independent (no dependency edges), so this is fail-on-conflict: two roots
 /// touching the same relative path with different content yields a conflict. The
 /// first writer wins on disk; conflicts are reported so the campaign can fail.
 fn compose_roots(roots: &[(String, PathBuf)], merge_dir: &Path) -> Result<ComposeResult> {
-    remove_if_exists(merge_dir)?;
-    fs::create_dir_all(merge_dir)?;
-    let mut seen: BTreeMap<PathBuf, (String, u64)> = BTreeMap::new();
-    let mut conflicts = Vec::new();
-    for (label, root) in roots {
-        for (relative, absolute, hash) in mergeable_run_files(root)? {
-            match seen.get(&relative) {
-                Some((previous_label, previous_hash)) if *previous_hash != hash => {
-                    conflicts.push(ComposeConflict {
-                        path: relative.clone(),
-                        first_label: previous_label.clone(),
-                        second_label: label.clone(),
-                    });
-                }
-                Some(_) => {}
-                None => {
-                    copy_merge_file(&absolute, &merge_dir.join(&relative))?;
-                    seen.insert(relative, (label.clone(), hash));
-                }
-            }
-        }
-    }
+    let sources = roots
+        .iter()
+        .map(|(label, root)| ComposeFileSource {
+            root: root.clone(),
+            data: label.clone(),
+            prefix_error: "merge source prefix error",
+        })
+        .collect::<Vec<_>>();
+    let conflicts = compose_merge_sources(
+        merge_dir,
+        &sources,
+        |label, _relative, _file, _hash| label.clone(),
+        |relative, previous, current| ComposeMergeDecision::RecordConflict {
+            conflict: ComposeConflict {
+                path: relative.to_path_buf(),
+                first_label: previous.clone(),
+                second_label: current.clone(),
+            },
+            use_current: false,
+        },
+    )?;
     Ok(ComposeResult {
         merge_dir: merge_dir.to_path_buf(),
         conflicts,
@@ -9201,10 +9274,7 @@ fn compose_plan_merge_working(
     strategy: PlanMergeStrategy,
 ) -> Result<PlanMergeOutcome> {
     let merge_working = paths.merge_working(&plan.plan_id);
-    remove_if_exists(&merge_working)?;
-    fs::create_dir_all(&merge_working)?;
-    let mut seen: BTreeMap<PathBuf, PlanMergeSeenFile> = BTreeMap::new();
-    let mut conflicts = Vec::new();
+    let mut sources = Vec::new();
     for task in plan
         .tasks
         .iter()
@@ -9218,66 +9288,61 @@ fn compose_plan_merge_working(
         })?;
         let state = load_run(paths, run_id)?;
         let child_root = child_artifact_root(paths, &state);
-        for (relative, file, hash) in mergeable_run_files(&child_root)? {
-            let relative = relative.as_path();
-            let current = PlanMergeSeenFile {
+        sources.push(ComposeFileSource {
+            root: child_root.clone(),
+            data: PlanMergeSource {
                 task_id: task.task_id.clone(),
                 task_index: task.index,
                 run_id: run_id.to_string(),
-                artifact_root: child_root.clone(),
-                artifact_path: file.clone(),
-                hash,
-            };
-            match seen.get(relative).cloned() {
-                Some(previous) if previous.hash != hash => match strategy {
-                    PlanMergeStrategy::FailOnConflict => {
-                        conflicts.push(plan_merge_conflict(
-                            plan, relative, &previous, &current, None,
-                        ));
-                    }
-                    PlanMergeStrategy::PreferChild(chosen) => {
-                        conflicts.push(plan_merge_conflict(
-                            plan,
-                            relative,
-                            &previous,
-                            &current,
-                            Some(chosen),
-                        ));
-                        if chosen == task.index {
-                            copy_merge_file(&file, &merge_working.join(relative))?;
-                            seen.insert(relative.to_path_buf(), current);
-                        }
-                    }
-                    PlanMergeStrategy::DagAware
-                        if commands::plan::plan_task_depends_on(
-                            plan,
-                            &current.task_id,
-                            &previous.task_id,
-                        ) =>
-                    {
-                        copy_merge_file(&file, &merge_working.join(relative))?;
-                        seen.insert(relative.to_path_buf(), current);
-                    }
-                    PlanMergeStrategy::DagAware
-                        if commands::plan::plan_task_depends_on(
-                            plan,
-                            &previous.task_id,
-                            &current.task_id,
-                        ) => {}
-                    PlanMergeStrategy::DagAware => {
-                        conflicts.push(plan_merge_conflict(
-                            plan, relative, &previous, &current, None,
-                        ));
-                    }
-                },
-                Some(_) => {}
-                None => {
-                    copy_merge_file(&file, &merge_working.join(relative))?;
-                    seen.insert(relative.to_path_buf(), current);
-                }
-            }
-        }
+                artifact_root: child_root,
+            },
+            prefix_error: "merge source prefix error",
+        });
     }
+    let conflicts = compose_merge_sources(
+        &merge_working,
+        &sources,
+        |source, _relative, file, hash| PlanMergeSeenFile {
+            task_id: source.task_id.clone(),
+            task_index: source.task_index,
+            run_id: source.run_id.clone(),
+            artifact_root: source.artifact_root.clone(),
+            artifact_path: file.to_path_buf(),
+            hash,
+        },
+        |relative, previous, current| match strategy {
+            PlanMergeStrategy::FailOnConflict => ComposeMergeDecision::RecordConflict {
+                conflict: plan_merge_conflict(plan, relative, previous, current, None),
+                use_current: false,
+            },
+            PlanMergeStrategy::PreferChild(chosen) => ComposeMergeDecision::RecordConflict {
+                conflict: plan_merge_conflict(plan, relative, previous, current, Some(chosen)),
+                use_current: chosen == current.task_index,
+            },
+            PlanMergeStrategy::DagAware
+                if commands::plan::plan_task_depends_on(
+                    plan,
+                    &current.task_id,
+                    &previous.task_id,
+                ) =>
+            {
+                ComposeMergeDecision::UseCurrent
+            }
+            PlanMergeStrategy::DagAware
+                if commands::plan::plan_task_depends_on(
+                    plan,
+                    &previous.task_id,
+                    &current.task_id,
+                ) =>
+            {
+                ComposeMergeDecision::KeepExisting
+            }
+            PlanMergeStrategy::DagAware => ComposeMergeDecision::RecordConflict {
+                conflict: plan_merge_conflict(plan, relative, previous, current, None),
+                use_current: false,
+            },
+        },
+    )?;
     write_plan_merge_conflicts(paths, plan, strategy, &conflicts)?;
     Ok(PlanMergeOutcome {
         working_dir: merge_working,
