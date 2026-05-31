@@ -95,6 +95,10 @@
   shared merge composition loop used by campaign result composition, final plan
   merge working trees, and full-plan dependency source assembly without changing
   conflict semantics or repair behavior.
+- P8 (`3390ad8`): Added command-existence characterization for bare PATH lookup
+  and explicit-path handling, then unified the start/setup/doctor command
+  lookup call sites through one private helper without changing provider
+  detection behavior.
 
 ## Effortless (production release) - 2026-05-28
 
