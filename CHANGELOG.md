@@ -119,6 +119,9 @@
 - Post-P11c: Moved the guided `deadreckon start` flow into
   `src/commands/start.rs`, keeping shared launch-preview and command-existence
   helpers at the root and reducing `main.rs` to roughly 16.7k lines.
+- Post-P11d: Moved `deadreckon detect`, `deadreckon providers list`, and
+  `deadreckon update` handling into `src/commands/providers.rs`, leaving shared
+  provider-id helpers at the root and reducing `main.rs` to roughly 16.0k lines.
 
 ## Effortless (production release) - 2026-05-28
 

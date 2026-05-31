@@ -8,5 +8,6 @@ pub(crate) mod learning;
 pub(crate) mod merge;
 pub(crate) mod orchestrate;
 pub(crate) mod plan;
+pub(crate) mod providers;
 pub(crate) mod run;
 pub(crate) mod start;
