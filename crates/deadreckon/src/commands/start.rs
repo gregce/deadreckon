@@ -2666,7 +2666,7 @@ fn start_run_ids(paths: &DeadreckonPaths) -> Result<BTreeSet<String>> {
 }
 
 fn start_plan_ids(paths: &DeadreckonPaths) -> Result<BTreeSet<String>> {
-    Ok(list_plan_entries(paths, None)?
+    Ok(super::inspection::list_plan_entries(paths, None)?
         .into_iter()
         .map(|plan| plan.plan_id)
         .collect())
@@ -2689,8 +2689,8 @@ fn newest_start_plan(
     paths: &DeadreckonPaths,
     before: &BTreeSet<String>,
     goal: &str,
-) -> Result<Option<PlanListEntry>> {
-    let mut plans = list_plan_entries(paths, None)?
+) -> Result<Option<super::inspection::PlanListEntry>> {
+    let mut plans = super::inspection::list_plan_entries(paths, None)?
         .into_iter()
         .filter(|plan| plan.goal == goal && !before.contains(&plan.plan_id))
         .collect::<Vec<_>>();

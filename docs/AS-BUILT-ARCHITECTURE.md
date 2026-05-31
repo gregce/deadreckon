@@ -2562,6 +2562,9 @@ explicit guard that the decompose work did not change CLI output shape.
   the init-time best-effort completion installer.
 - `commands/doctor.rs` owns the `doctor` inspection surface, provider/sandbox
   diagnostics, and subscription-CLI version probes.
+- `commands/inspection.rs` owns inventory and durable-history surfaces:
+  `list`, `history grep`, and `library` list/search/show, plus crate-private
+  plan/library list seams used by start/status.
 
 `main_inner` remains the dispatcher. It parses the unchanged `cli.rs` command enum,
 sets plain-output policy where needed, and delegates to the command family module
@@ -2627,4 +2630,4 @@ Those are recorded in `docs/V1-CANDIDATES.md` as explicit "not now" pointers.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~15.4k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~14.3k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

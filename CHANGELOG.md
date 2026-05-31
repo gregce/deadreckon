@@ -126,6 +126,10 @@
   `src/commands/completion.rs` and `src/commands/doctor.rs`, leaving shared
   command-existence lookup at the root and reducing `main.rs` to roughly 15.4k
   lines.
+- Post-P11f: Moved `deadreckon list`, `deadreckon history grep`, and
+  `deadreckon library` handling into `src/commands/inspection.rs`, keeping only
+  crate-private plan/library list seams for start/status and reducing `main.rs`
+  to roughly 14.3k lines.
 
 ## Effortless (production release) - 2026-05-28
 

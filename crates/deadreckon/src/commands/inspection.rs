@@ -1,0 +1,1019 @@
+use super::super::*;
+
+pub(crate) fn list_command(
+    scope: Option<String>,
+    all: bool,
+    _full: bool,
+    _plain: bool,
+    json_output: bool,
+) -> Result<()> {
+    // REPORT.md: Workspace Inventory & Run Queue is a local scan over durable
+    // runstate, not a live daemon query.
+    let paths = DeadreckonPaths::discover();
+    let effective_scope = if all {
+        None
+    } else {
+        Some(scope.unwrap_or(current_scope()?))
+    };
+    let runs = list_runs(&paths, effective_scope.as_deref())?;
+    let plans = list_plan_entries(&paths, effective_scope.as_deref())?;
+    if json_output {
+        let runs = runs
+            .iter()
+            .map(|run| {
+                json!({
+                    "run_id": &run.run_id,
+                    "scope": &run.scope,
+                    "goal": &run.goal,
+                    "status": run_status_label(run.status),
+                    "updated_at": run.updated_at,
+                    "state_path": &run.state_path,
+                })
+            })
+            .collect::<Vec<_>>();
+        let plans = plans
+            .iter()
+            .map(|plan| {
+                json!({
+                    "plan_id": &plan.plan_id,
+                    "scope": &plan.scope,
+                    "goal": &plan.goal,
+                    "status": plan_status_label(plan.status),
+                    "mode": plan_mode_label(plan.mode),
+                    "updated_at": plan.updated_at,
+                    "plan_path": &plan.plan_path,
+                    "children": {
+                        "completed": plan.completed_children,
+                        "total": plan.total_children,
+                    },
+                    "result_run_id": &plan.merged_run_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "list",
+                "id": effective_scope.as_deref().unwrap_or("all-scopes"),
+                "status": "ok",
+                "next_actions": [
+                    "deadreckon status latest",
+                    "deadreckon attach <id>",
+                    "deadreckon show <id>",
+                ],
+                "try_lines": Vec::<String>::new(),
+                "paths": {
+                    "home": paths.home(),
+                },
+                "runs": runs,
+                "plans": plans,
+            }))?
+        );
+        return Ok(());
+    }
+    let mut entries = runs
+        .into_iter()
+        .map(ListEntry::Run)
+        .chain(plans.into_iter().map(ListEntry::Plan))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| Reverse(entry.updated_at()));
+    if entries.is_empty() {
+        match effective_scope.as_deref() {
+            Some(scope) => {
+                println!("no runs for current project ({scope})");
+                let _ = ui::hint(
+                    ui::Stream::Stderr,
+                    "use `deadreckon list --all` to see every project",
+                );
+            }
+            None => println!("no runs"),
+        }
+        return Ok(());
+    }
+    let header = list_header();
+    println!("{}", ui_heading(header));
+    let goal_width = list_goal_width();
+    for entry in entries {
+        match entry {
+            ListEntry::Run(run) => {
+                print_list_row(&ListRow {
+                    id: run_prefix(&run.run_id),
+                    status: run_status_label(run.status).to_string(),
+                    age: relative_age(run.updated_at),
+                    scope: run.scope.clone(),
+                    kind: "run".to_string(),
+                    mode: codebase_mode_status(&paths, &run),
+                    action: next_action_label_for_entry(&paths, &run),
+                    goal: run.goal.clone(),
+                    goal_width,
+                    orchestration: false,
+                });
+            }
+            ListEntry::Plan(plan) => {
+                print_list_row(&ListRow {
+                    id: run_prefix(&plan.plan_id),
+                    status: plan_status_label(plan.status).to_string(),
+                    age: relative_age(plan.updated_at),
+                    scope: plan.scope.clone(),
+                    kind: "orchestrate".to_string(),
+                    mode: plan_mode_label(plan.mode).to_string(),
+                    action: plan_action_label(&plan),
+                    goal: plan.goal.clone(),
+                    goal_width,
+                    orchestration: true,
+                });
+            }
+        }
+    }
+    println!("{} run and plan ids accept prefixes", ui_muted("hint:"));
+    println!(
+        "      use `{}`, `{}`, `{}`, or `{}`",
+        ui_command("deadreckon status latest"),
+        ui_command("deadreckon list --all"),
+        ui_command("deadreckon attach <id>"),
+        ui_command("deadreckon show <id>")
+    );
+    Ok(())
+}
+
+const LIST_ID_WIDTH: usize = 8;
+const LIST_STATUS_WIDTH: usize = 10;
+const LIST_AGE_WIDTH: usize = 7;
+const LIST_SCOPE_WIDTH: usize = 24;
+const LIST_KIND_WIDTH: usize = 13;
+const LIST_MODE_WIDTH: usize = 10;
+const LIST_ACTION_WIDTH: usize = 16;
+const LIST_GOAL_MAX_LINES: usize = 4;
+
+struct ListRow {
+    id: String,
+    status: String,
+    age: String,
+    pub(crate) scope: String,
+    kind: String,
+    mode: String,
+    action: String,
+    pub(crate) goal: String,
+    goal_width: usize,
+    orchestration: bool,
+}
+
+fn list_header() -> String {
+    format!(
+        "{}  {}  {}  {}  {}  {}  {}  GOAL",
+        pad_plain("ID", LIST_ID_WIDTH),
+        pad_plain("STATUS", LIST_STATUS_WIDTH),
+        pad_plain("AGE", LIST_AGE_WIDTH),
+        pad_plain("SCOPE", LIST_SCOPE_WIDTH),
+        pad_plain("KIND", LIST_KIND_WIDTH),
+        pad_plain("MODE", LIST_MODE_WIDTH),
+        pad_plain("ACTION", LIST_ACTION_WIDTH)
+    )
+}
+
+fn print_list_row(row: &ListRow) {
+    let first_prefix = format!(
+        "{}  {}  {}  {}  {}  {}  {}  ",
+        pad_rendered(&row.id, LIST_ID_WIDTH, Some(ui_id)),
+        pad_plain(&row.status, LIST_STATUS_WIDTH),
+        pad_plain(&row.age, LIST_AGE_WIDTH),
+        pad_plain(&row.scope, LIST_SCOPE_WIDTH),
+        pad_rendered(
+            &row.kind,
+            LIST_KIND_WIDTH,
+            row.orchestration.then_some(ui_warn),
+        ),
+        pad_plain(&row.mode, LIST_MODE_WIDTH),
+        pad_plain(&row.action, LIST_ACTION_WIDTH)
+    );
+    let continuation_prefix = " ".repeat(list_prefix_width());
+    let goal_lines = wrap_list_goal(&row.goal, row.goal_width);
+    for (index, line) in goal_lines.iter().enumerate() {
+        if index == 0 {
+            println!("{first_prefix}{line}");
+        } else {
+            println!("{continuation_prefix}{line}");
+        }
+    }
+}
+
+fn list_prefix_width() -> usize {
+    LIST_ID_WIDTH
+        + LIST_STATUS_WIDTH
+        + LIST_AGE_WIDTH
+        + LIST_SCOPE_WIDTH
+        + LIST_KIND_WIDTH
+        + LIST_MODE_WIDTH
+        + LIST_ACTION_WIDTH
+        + 14
+}
+
+fn list_goal_width() -> usize {
+    if !io::stdout().is_terminal() {
+        return 72;
+    }
+    let terminal_width = crossterm::terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(180);
+    terminal_width.saturating_sub(list_prefix_width()).max(24)
+}
+
+fn pad_plain(value: &str, width: usize) -> String {
+    let plain = truncate_text(value, width);
+    let padding = width.saturating_sub(plain.chars().count());
+    format!("{plain}{}", " ".repeat(padding))
+}
+
+fn pad_rendered(value: &str, width: usize, render: Option<fn(String) -> String>) -> String {
+    let plain = truncate_text(value, width);
+    let padding = width.saturating_sub(plain.chars().count());
+    let rendered = render.map_or_else(|| plain.clone(), |render| render(plain.clone()));
+    format!("{rendered}{}", " ".repeat(padding))
+}
+
+fn wrap_list_goal(value: &str, width: usize) -> Vec<String> {
+    let compact = compact_whitespace(value);
+    if compact.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = wrap_words(&compact, width.max(8));
+    let truncated = lines.len() > LIST_GOAL_MAX_LINES;
+    if truncated {
+        lines.truncate(LIST_GOAL_MAX_LINES);
+        if let Some(last) = lines.last_mut() {
+            *last = ellipsize_goal_line(last, width);
+        }
+    }
+    lines
+}
+
+fn ellipsize_goal_line(value: &str, width: usize) -> String {
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let prefix = width - 3;
+    format!("{}...", value.chars().take(prefix).collect::<String>())
+}
+
+fn wrap_words(value: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split(' ') {
+        let word_len = word.chars().count();
+        if word_len > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            lines.extend(split_long_word(word, width));
+            continue;
+        }
+        let next_len = if current.is_empty() {
+            word_len
+        } else {
+            current.chars().count() + 1 + word_len
+        };
+        if next_len <= width {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn split_long_word(word: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in word.chars() {
+        if current.chars().count() >= width {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+#[derive(Debug)]
+enum ListEntry {
+    Run(RunListEntry),
+    Plan(PlanListEntry),
+}
+
+impl ListEntry {
+    fn updated_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Run(run) => run.updated_at,
+            Self::Plan(plan) => plan.updated_at,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PlanListEntry {
+    pub(crate) plan_id: String,
+    pub(crate) merged_run_id: Option<String>,
+    pub(crate) scope: String,
+    pub(crate) goal: String,
+    pub(crate) status: PlanStatus,
+    pub(crate) mode: PlanMode,
+    pub(crate) updated_at: DateTime<Utc>,
+    pub(crate) plan_path: PathBuf,
+    pub(crate) completed_children: usize,
+    pub(crate) total_children: usize,
+}
+
+pub(crate) fn list_plan_entries(
+    paths: &DeadreckonPaths,
+    scope_filter: Option<&str>,
+) -> Result<Vec<PlanListEntry>> {
+    let root = paths.plans_dir();
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut plans = Vec::new();
+    for entry in fs::read_dir(&root).map_err(|source| DeadreckonError::Io {
+        path: root.clone(),
+        source,
+    })? {
+        let entry = entry?;
+        let plan_path = entry.path().join("plan.json");
+        if !plan_path.is_file() {
+            continue;
+        }
+        let Some(plan_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let plan = load_plan(paths, &plan_id)?;
+        if scope_filter.is_some_and(|scope| plan.parent_scope.as_deref() != Some(scope)) {
+            continue;
+        }
+        let updated_at = fs::metadata(&plan_path)
+            .and_then(|metadata| metadata.modified())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(|_| plan.merged_at.or(plan.forked_at).unwrap_or(plan.created_at));
+        let completed_children = plan
+            .tasks
+            .iter()
+            .filter(|task| task.status == PlanTaskStatus::Completed)
+            .count();
+        let total_children = plan.tasks.len();
+        plans.push(PlanListEntry {
+            plan_id: plan.plan_id,
+            merged_run_id: plan.merged_run_id,
+            scope: plan.parent_scope.unwrap_or_else(|| "global".to_string()),
+            goal: plan.root_goal,
+            status: plan.status,
+            mode: plan.mode,
+            updated_at,
+            plan_path,
+            completed_children,
+            total_children,
+        });
+    }
+    plans.sort_by_key(|plan| Reverse(plan.updated_at));
+    Ok(plans)
+}
+
+fn plan_action_label(plan: &PlanListEntry) -> String {
+    match plan.status {
+        PlanStatus::Pending => "fork".to_string(),
+        PlanStatus::Forked if plan.completed_children == plan.total_children => {
+            format!("merge {}/{}", plan.completed_children, plan.total_children)
+        }
+        PlanStatus::Forked => format!("attach {}/{}", plan.completed_children, plan.total_children),
+        PlanStatus::Merged if plan.merged_run_id.is_some() => "finish".to_string(),
+        PlanStatus::Merged => "show".to_string(),
+        PlanStatus::Failed => "show failure".to_string(),
+    }
+}
+
+enum HistoryMatcher {
+    Substring(String),
+    Regex(Regex),
+}
+
+impl HistoryMatcher {
+    fn new(pattern: String, regex: bool) -> Result<Self> {
+        if regex {
+            let compiled = Regex::new(&pattern).map_err(|err| {
+                CliError::Core(deadreckon_core::user_error(
+                    &format!("invalid regex: {err}"),
+                    "re-quote or escape the pattern",
+                ))
+            })?;
+            Ok(Self::Regex(compiled))
+        } else {
+            Ok(Self::Substring(pattern))
+        }
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Substring(pattern) => line.contains(pattern),
+            Self::Regex(pattern) => pattern.is_match(line),
+        }
+    }
+}
+
+pub(crate) fn history_command(command: HistoryCommand) -> Result<()> {
+    match command {
+        HistoryCommand::Grep {
+            pattern,
+            plan,
+            scope,
+            all,
+            since,
+            kind,
+            limit,
+            regex,
+        } => history_grep_command(HistoryGrepRequest {
+            pattern,
+            plan,
+            scope,
+            all,
+            since,
+            kind,
+            limit,
+            regex,
+        }),
+    }
+}
+
+struct HistoryGrepRequest {
+    pattern: String,
+    plan: Option<String>,
+    scope: Option<String>,
+    all: bool,
+    since: Option<String>,
+    kind: HistoryKind,
+    limit: usize,
+    regex: bool,
+}
+
+fn history_grep_command(args: HistoryGrepRequest) -> Result<()> {
+    let HistoryGrepRequest {
+        pattern,
+        plan,
+        scope,
+        all,
+        since,
+        kind,
+        limit,
+        regex,
+    } = args;
+    if limit == 0 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "--limit must be at least 1",
+            "deadreckon history grep \"pattern\" --limit 20",
+        )));
+    }
+    let paths = DeadreckonPaths::discover();
+    let matcher = HistoryMatcher::new(pattern.clone(), regex)?;
+    let cutoff = parse_history_since(since)?;
+    let plan_children = plan
+        .as_deref()
+        .map(|plan_id| history_plan_children(&paths, plan_id))
+        .transpose()?;
+    let effective_scope = if plan_children.is_some() || all {
+        scope
+    } else {
+        Some(scope.unwrap_or(current_scope()?))
+    };
+    let runs = list_runs(&paths, effective_scope.as_deref())?;
+    let mut printed = 0usize;
+    let mut total_matches = 0usize;
+    println!(
+        "{} {} {}",
+        ui_heading("history grep"),
+        ui_muted(history_kind_label(kind)),
+        ui_muted(if regex { "regex" } else { "substring" })
+    );
+    if let Some(plan_id) = plan.as_deref() {
+        let plan_id = resolve_plan_id(&paths, plan_id)?;
+        for event in read_plan_events_lossy(&paths, &plan_id) {
+            if let Some(cutoff) = cutoff
+                && event.timestamp < cutoff
+            {
+                continue;
+            }
+            let line = plan_event_line(&event);
+            if !matcher.is_match(&line) {
+                continue;
+            }
+            total_matches += 1;
+            if printed >= limit {
+                continue;
+            }
+            println!(
+                "{} {} plan-events | {}",
+                ui_id(run_prefix(&plan_id)),
+                event.timestamp.to_rfc3339(),
+                one_line(&line, 220)
+            );
+            printed += 1;
+        }
+    }
+    for run in runs {
+        if let Some(children) = plan_children.as_ref()
+            && !children.contains(&run.run_id)
+        {
+            continue;
+        }
+        let state = load_run(&paths, &run.run_id)?;
+        let path = state.run_root.join(history_kind_file(kind));
+        if !path.exists() || !history_file_within_cutoff(&path, cutoff)? {
+            continue;
+        }
+        let fallback_timestamp = history_file_timestamp(&path)?;
+        for line in fs::read_to_string(&path)?.lines() {
+            if !matcher.is_match(line) {
+                continue;
+            }
+            total_matches += 1;
+            if printed >= limit {
+                continue;
+            }
+            let timestamp = history_line_timestamp(kind, line).unwrap_or(fallback_timestamp);
+            println!(
+                "{} {} {} | {}",
+                ui_id(run_prefix(&run.run_id)),
+                timestamp.to_rfc3339(),
+                run.scope,
+                one_line(line.trim(), 220)
+            );
+            printed += 1;
+        }
+    }
+    if total_matches == 0 {
+        println!("no matches for {pattern:?}");
+        println!(
+            "{} try `{}` or `{}`",
+            ui_muted("hint:"),
+            ui_command("deadreckon history grep <pattern> --all"),
+            ui_command("deadreckon show <run-id>")
+        );
+    } else if total_matches > printed {
+        println!("... ({} more)", total_matches - printed);
+    }
+    Ok(())
+}
+
+fn history_plan_children(paths: &DeadreckonPaths, plan_id: &str) -> Result<BTreeSet<String>> {
+    let plan_id = resolve_plan_id(paths, plan_id)?;
+    let plan = load_plan(paths, &plan_id)?;
+    Ok(plan
+        .tasks
+        .iter()
+        .filter_map(|task| task.child_run_id.clone())
+        .collect())
+}
+
+fn history_kind_file(kind: HistoryKind) -> &'static str {
+    match kind {
+        HistoryKind::Trace => "traces.jsonl",
+        HistoryKind::Provenance => "provenance.jsonl",
+    }
+}
+
+fn history_kind_label(kind: HistoryKind) -> &'static str {
+    match kind {
+        HistoryKind::Trace => "trace",
+        HistoryKind::Provenance => "provenance",
+    }
+}
+
+fn parse_history_since(value: Option<String>) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.len() < 2 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "invalid --since duration",
+            "use a duration like 7d, 24h, or 30m",
+        )));
+    }
+    let (amount, unit) = value.split_at(value.len() - 1);
+    let amount = amount.parse::<i64>().map_err(|_| {
+        CliError::Core(deadreckon_core::user_error(
+            "invalid --since duration",
+            "use a duration like 7d, 24h, or 30m",
+        ))
+    })?;
+    if amount < 0 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "invalid --since duration",
+            "use a positive duration like 7d, 24h, or 30m",
+        )));
+    }
+    let duration = match unit {
+        "d" => ChronoDuration::days(amount),
+        "h" => ChronoDuration::hours(amount),
+        "m" => ChronoDuration::minutes(amount),
+        _ => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "invalid --since duration unit",
+                "use d, h, or m, for example 7d",
+            )));
+        }
+    };
+    Ok(Some(Utc::now() - duration))
+}
+
+fn history_file_within_cutoff(path: &Path, cutoff: Option<DateTime<Utc>>) -> Result<bool> {
+    let Some(cutoff) = cutoff else {
+        return Ok(true);
+    };
+    Ok(history_file_timestamp(path)? >= cutoff)
+}
+
+fn history_file_timestamp(path: &Path) -> Result<DateTime<Utc>> {
+    let modified = fs::metadata(path)?.modified()?;
+    Ok(DateTime::<Utc>::from(modified))
+}
+
+fn history_line_timestamp(kind: HistoryKind, line: &str) -> Option<DateTime<Utc>> {
+    match kind {
+        HistoryKind::Trace => serde_json::from_str::<TraceRecord>(line)
+            .ok()
+            .map(|record| record.timestamp),
+        HistoryKind::Provenance => serde_json::from_str::<ProvenanceRecord>(line)
+            .ok()
+            .map(|record| record.timestamp),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LibraryEntry {
+    pub(crate) manifest: PromotionManifest,
+    pub(crate) path: PathBuf,
+    pub(crate) materialized_count: usize,
+}
+
+pub(crate) fn library_command(command: LibraryCommand) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    match command {
+        LibraryCommand::List {
+            scope,
+            all,
+            goal,
+            since,
+            until,
+            full,
+            json,
+        } => {
+            let filter = LibraryFilter::new(goal, since, until)?;
+            let entries =
+                filter_library_entries(library_entries(&paths, scope.clone(), all)?, &filter);
+            if json {
+                let artifacts = entries
+                    .iter()
+                    .map(|entry| {
+                        json!({
+                            "manifest": &entry.manifest,
+                            "path": &entry.path,
+                            "materialized_count": entry.materialized_count,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "kind": "library_list",
+                        "id": scope.as_deref().unwrap_or(if all { "all-scopes" } else { "current-scope" }),
+                        "status": "ok",
+                        "next_actions": ["deadreckon finish <id>", "deadreckon export <id>"],
+                        "try_lines": Vec::<String>::new(),
+                        "paths": {
+                            "home": paths.home(),
+                        },
+                        "artifacts": artifacts,
+                    }))?
+                );
+                return Ok(());
+            }
+            if entries.is_empty() {
+                print_empty_library_hint(scope.as_deref(), all);
+                return Ok(());
+            }
+            print_library_table(&entries, full);
+        }
+        LibraryCommand::Search {
+            query,
+            scope,
+            all,
+            since,
+            until,
+        } => {
+            let filter = LibraryFilter::new(None, since, until)?;
+            let needle = query.to_lowercase();
+            let entries = filter_library_entries(library_entries(&paths, scope, all)?, &filter)
+                .into_iter()
+                .filter(|entry| library_entry_matches_query(entry, &needle))
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                println!("no library artifacts matched {query:?}");
+                println!(
+                    "{} try `{}`",
+                    ui_muted("hint:"),
+                    ui_command("deadreckon library list --all")
+                );
+                return Ok(());
+            }
+            print_library_table(&entries, false);
+        }
+        LibraryCommand::Show { run_id, scope } => {
+            let entry = resolve_library_entry(&paths, &run_id, scope)?;
+            print_library_entry(&entry);
+        }
+    }
+    Ok(())
+}
+
+struct LibraryFilter {
+    goal: Option<String>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+}
+
+impl LibraryFilter {
+    fn new(goal: Option<String>, since: Option<String>, until: Option<String>) -> Result<Self> {
+        Ok(Self {
+            goal: goal.map(|goal| goal.to_lowercase()),
+            since: parse_library_date_filter("--since", since)?,
+            until: parse_library_date_filter("--until", until)?,
+        })
+    }
+}
+
+fn filter_library_entries(entries: Vec<LibraryEntry>, filter: &LibraryFilter) -> Vec<LibraryEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let manifest = &entry.manifest;
+            filter
+                .goal
+                .as_ref()
+                .is_none_or(|goal| manifest.goal.to_lowercase().contains(goal))
+                && filter
+                    .since
+                    .is_none_or(|since| manifest.promoted_at >= since)
+                && filter
+                    .until
+                    .is_none_or(|until| manifest.promoted_at <= until)
+        })
+        .collect()
+}
+
+fn library_entry_matches_query(entry: &LibraryEntry, needle: &str) -> bool {
+    let manifest = &entry.manifest;
+    manifest.run_id.to_lowercase().contains(needle)
+        || manifest.scope.to_lowercase().contains(needle)
+        || manifest.goal.to_lowercase().contains(needle)
+        || library_docs_contain(&entry.path, needle)
+}
+
+fn library_docs_contain(path: &Path, needle: &str) -> bool {
+    inventory_files(path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|file| {
+            matches!(
+                file.extension().and_then(|ext| ext.to_str()),
+                Some("md" | "txt" | "json" | "jsonl" | "toml")
+            )
+        })
+        .any(|file| {
+            fs::read_to_string(file)
+                .ok()
+                .is_some_and(|raw| raw.to_lowercase().contains(needle))
+        })
+}
+
+fn parse_library_date_filter(label: &str, value: Option<String>) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if let Ok(date_time) = DateTime::parse_from_rfc3339(&value) {
+        return Ok(Some(date_time.with_timezone(&Utc)));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d") {
+        let date_time = if label == "--until" {
+            date.and_hms_nano_opt(23, 59, 59, 999_999_999)
+        } else {
+            date.and_hms_opt(0, 0, 0)
+        };
+        let Some(date_time) = date_time else {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "invalid {label} date {value:?}\ntry: deadreckon library list {label} 2026-05-11"
+            ))));
+        };
+        return Ok(Some(date_time.and_utc()));
+    }
+    Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+        "invalid {label} date {value:?}\ntry: deadreckon library list {label} 2026-05-11"
+    ))))
+}
+
+pub(crate) fn library_entries(
+    paths: &DeadreckonPaths,
+    scope: Option<String>,
+    all: bool,
+) -> Result<Vec<LibraryEntry>> {
+    let mut entries = Vec::new();
+    let library_root = paths.home().join("library");
+    if let Some(scope) = scope {
+        scan_library_scope(paths, &scope, &mut entries)?;
+    } else if all {
+        if library_root.exists() {
+            for scope_entry in fs::read_dir(&library_root)? {
+                let scope_entry = scope_entry?;
+                if !scope_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let scope_name = scope_entry.file_name().to_string_lossy().to_string();
+                if scope_name.starts_with('.') {
+                    continue;
+                }
+                scan_library_scope(paths, &scope_name, &mut entries)?;
+            }
+        }
+    } else {
+        scan_library_scope(paths, &current_scope()?, &mut entries)?;
+    }
+    entries.sort_by(|left, right| {
+        right
+            .manifest
+            .promoted_at
+            .cmp(&left.manifest.promoted_at)
+            .then_with(|| left.manifest.run_id.cmp(&right.manifest.run_id))
+    });
+    Ok(entries)
+}
+
+fn scan_library_scope(
+    paths: &DeadreckonPaths,
+    scope: &str,
+    entries: &mut Vec<LibraryEntry>,
+) -> Result<()> {
+    let scope_dir = paths.home().join("library").join(scope);
+    if !scope_dir.exists() {
+        return Ok(());
+    }
+    for run_entry in fs::read_dir(scope_dir)? {
+        let run_entry = run_entry?;
+        if !run_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = run_entry.path();
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+        let manifest: PromotionManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        entries.push(LibraryEntry {
+            materialized_count: materialized_marker_count(&path),
+            manifest,
+            path,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn materialized_marker_count(library_dir: &Path) -> usize {
+    fs::read_to_string(library_dir.join(".materialized-to"))
+        .ok()
+        .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn resolve_library_entry(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+    scope: Option<String>,
+) -> Result<LibraryEntry> {
+    let entries = library_entries(paths, scope, false)?;
+    if matches!(run_id, "latest" | "last") {
+        return entries.into_iter().next().ok_or_else(|| {
+            CliError::Core(DeadreckonError::NotFound(
+                "no library artifacts for this project".to_string(),
+            ))
+        });
+    }
+    let matches = entries
+        .into_iter()
+        .filter(|entry| entry.manifest.run_id.starts_with(run_id))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err(CliError::Core(DeadreckonError::NotFound(format!(
+            "library artifact {run_id}"
+        )))),
+        [entry] => Ok(entry.clone()),
+        many => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "run id prefix {run_id:?} matched {} library artifacts; use more characters",
+            many.len()
+        )))),
+    }
+}
+
+fn print_empty_library_hint(scope: Option<&str>, all: bool) {
+    match scope {
+        Some(scope) => println!("no library artifacts for scope {scope}"),
+        None if all => println!("no library artifacts"),
+        None => println!("no library artifacts for current project"),
+    }
+    println!(
+        "{} completed fresh/copy runs are promoted automatically; use `{}` to inspect all scopes",
+        ui_muted("hint:"),
+        ui_command("deadreckon library list --all")
+    );
+}
+
+fn print_library_table(entries: &[LibraryEntry], full: bool) {
+    if full {
+        println!(
+            "{}",
+            ui_heading("RUN\tSCOPE\tPROMOTED\tMATERIALIZED\tPATH\tGOAL")
+        );
+        for entry in entries {
+            let manifest = &entry.manifest;
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                manifest.run_id,
+                manifest.scope,
+                manifest.promoted_at,
+                entry.materialized_count,
+                entry.path.display(),
+                manifest.goal
+            );
+        }
+        return;
+    }
+
+    println!(
+        "{}",
+        ui_heading(format!(
+            "{:<8}  {:<7}  {:<26}  {:<12}  GOAL",
+            "RUN", "AGE", "SCOPE", "EXPORTED"
+        ))
+    );
+    for entry in entries {
+        let manifest = &entry.manifest;
+        println!(
+            "{:<8}  {:<7}  {:<26}  {:<12}  {}",
+            ui_id(run_prefix(&manifest.run_id)),
+            relative_age(manifest.promoted_at),
+            truncate_text(&manifest.scope, 26),
+            materialized_count_label(entry.materialized_count),
+            truncate_text(&one_line(&manifest.goal, 88), 88)
+        );
+    }
+    println!(
+        "{} use `{}` or `{}`",
+        ui_muted("hint:"),
+        ui_command("deadreckon library show <run-id>"),
+        ui_command("deadreckon export <run-id> --dest <path>")
+    );
+}
+
+pub(crate) fn materialized_count_label(count: usize) -> String {
+    match count {
+        0 => "no".to_string(),
+        1 => "yes (1)".to_string(),
+        count => format!("yes ({count})"),
+    }
+}
+
+fn print_library_entry(entry: &LibraryEntry) {
+    let manifest = &entry.manifest;
+    println!("{}", ui_heading("library artifact"));
+    println!("run:        {}", ui_id(&manifest.run_id));
+    println!("scope:      {}", manifest.scope);
+    println!("promoted:   {}", manifest.promoted_at);
+    println!(
+        "exported:   {}",
+        materialized_count_label(entry.materialized_count)
+    );
+    println!("path:       {}", entry.path.display());
+    println!("source:     {}", manifest.source_working_dir.display());
+    println!("provenance: {}", manifest.provenance_hash);
+    println!("goal:       {}", manifest.goal);
+    println!();
+    println!(
+        "next:       {}",
+        ui_command(format!(
+            "deadreckon export {}",
+            run_prefix(&manifest.run_id)
+        ))
+    );
+}

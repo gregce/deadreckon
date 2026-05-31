@@ -6,6 +6,7 @@ pub(crate) mod completion;
 pub(crate) mod doctor;
 pub(crate) mod import;
 pub(crate) mod init;
+pub(crate) mod inspection;
 pub(crate) mod learning;
 pub(crate) mod merge;
 pub(crate) mod orchestrate;
