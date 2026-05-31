@@ -468,6 +468,51 @@ timeout_ms = 1
         assert!(err.to_string().contains("the gate is not swappable"));
     }
 
+    #[test]
+    fn seams_config_rejects_unknown_kind() {
+        let err = parse_seams_config(
+            r#"[seams.approval]
+command = ["approve"]
+timeout_ms = 1
+"#,
+        )
+        .expect_err("unknown seam refused");
+
+        assert!(
+            err.to_string()
+                .contains("[seams.approval] unknown seam kind")
+        );
+    }
+
+    #[test]
+    fn seams_config_rejects_empty_command_or_bad_timeout() {
+        let empty = parse_seams_config(
+            r#"[seams.policy]
+command = []
+timeout_ms = 1
+"#,
+        )
+        .expect_err("empty command refused");
+        assert!(
+            empty
+                .to_string()
+                .contains("[seams.policy].command must not be empty")
+        );
+
+        let bad_timeout = parse_seams_config(
+            r#"[seams.hooks]
+command = ["hook"]
+timeout_ms = 0
+"#,
+        )
+        .expect_err("zero timeout refused");
+        assert!(
+            bad_timeout
+                .to_string()
+                .contains("[seams.hooks].timeout_ms must be greater than 0")
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_unconfigured_kind_returns_unconfigured() {
         let temp = TempDir::new().expect("temp");

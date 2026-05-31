@@ -24,6 +24,9 @@
   doctor output, and policy-seam refusal footers with recovery commands.
 - P8: Added adversarial trust-boundary tests proving seam workers cannot write
   markers/proofs, cannot read `gate/nonce`, and cannot affect gate signatures.
+- P9: Added explicit seam config validation tests for unknown kinds, empty
+  commands, and bad timeouts, plus an all-seams smoke run that writes
+  `seams.json` and validates a gate marker.
 
 ## Navigable campaign attach (production release) - 2026-05-31
 

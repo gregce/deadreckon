@@ -1761,6 +1761,7 @@ mod tests {
         FlightEventKind, FlightSessionStatus, list_checkpoint_manifests, read_flight_events,
         read_flight_manifest,
     };
+    use deadreckon_core::gate::{run_acceptance_gate_and_write_marker, validate_acceptance_marker};
     use deadreckon_core::paths::DeadreckonPaths;
     use deadreckon_core::state::{PipelineState, RunOptions, RunStatus, create_run};
     use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
@@ -2205,6 +2206,61 @@ timeout_ms = 1000
             read_seams_json(&state)["kinds"]["event_sink"]["source"].as_str(),
             Some("builtin")
         );
+    }
+
+    #[tokio::test]
+    async fn full_stack_seam_run_produces_gated_result_and_seams_json() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "full stack seams");
+        let hooks_capture = temp.path().join("hooks.jsonl");
+        let sink_capture = temp.path().join("sink.jsonl");
+        let config_path = write_seams_config(
+            &paths,
+            &format!(
+                r#"
+[seams.policy]
+command = ["/bin/sh", "-c", "cat >/dev/null; printf '{{\"decision\":\"allow\"}}\n'"]
+timeout_ms = 1000
+
+[seams.catalog]
+command = ["/bin/sh", "-c", "cat >/dev/null; printf '{{\"models\":[{{\"id\":\"local-scripted-smoke\",\"context_window\":4000}}]}}\n'"]
+timeout_ms = 1000
+
+[seams.hooks]
+command = ["/bin/sh", "-c", "cat >> {}; printf '{{\"ok\":true}}\n'"]
+timeout_ms = 1000
+
+[seams.event_sink]
+command = ["/bin/sh", "-c", "cat >> {}; printf '{{\"ok\":true}}\n'"]
+timeout_ms = 1000
+
+[compaction]
+fraction = 0.5
+keep_recent_turns = 2
+fallback_context_window = 4000
+"#,
+                sh_quote(&hooks_capture),
+                sh_quote(&sink_capture)
+            ),
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), false).await;
+
+        assert!(state.working_dir.join("Cargo.toml").exists());
+        let audit = read_seams_json(&state);
+        for kind in ["policy", "catalog", "hooks", "event_sink"] {
+            assert_eq!(audit["kinds"][kind]["source"].as_str(), Some("external"));
+        }
+        let hooks = read_until_contains(&hooks_capture, r#""kind":"tool_call_result""#).await;
+        assert!(hooks.contains(r#""tool_name":"bash""#));
+        let sink = read_until_contains(&sink_capture, r#""kind":"tool_call_result""#).await;
+        assert!(sink.contains(r#""event":{"kind":"tool_call_result""#));
+
+        run_acceptance_gate_and_write_marker(&state.run_root, &state.run_id, &state.working_dir)
+            .expect("gate marker");
+        let marker = validate_acceptance_marker(&state).expect("validated marker");
+        assert_eq!(marker.status, "pass");
+        assert_eq!(marker.produced_by, "dr-gate");
     }
 
     #[tokio::test]
