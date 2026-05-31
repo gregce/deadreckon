@@ -2294,9 +2294,11 @@ This is tamper-evidence, not a causal soundness proof. It does not prove that a 
 ## 36. Campaign Orchestration (one task, N orchestrators)
 
 A **campaign** runs one large goal as N independent, separately-coordinated
-workstreams and composes their results into a single promoted run. The verb is
-the top-level `deadreckon campaign <goal> --n <2..=6>`, a peer of `run`,
-`orchestrate`, and `chain` (not a subcommand of `orchestrate`). Campaign logic
+workstreams and composes their results into a single promoted run. The launch
+verb is the top-level `deadreckon campaign <goal> --n <2..=6>`, with
+`deadreckon campaign repair <campaign-id>` as the manual recovery path for a
+failed meta-merge. Campaign is a peer of `run`, `orchestrate`, and `chain` (not a
+subcommand of `orchestrate`). Campaign logic
 lives in `crates/deadreckon-core/src/campaign.rs`; the command handler and spawn
 glue are in `crates/deadreckon/src/commands/campaign.rs`.
 
@@ -2317,7 +2319,8 @@ file-backed under `~/.deadreckon/plans/<campaign-id>/`: `campaign.json` (the
 `Campaign` + `SubGoal` model), `lineage.json` (nesting depth and ancestors),
 `campaign-rollup.json` (the gate-verdict roll-up), `campaign-events.jsonl` (the
 timeline), `launch/<sub-id>/sub-result.json` (each sub's reported result), and
-`merge-working/` (the composed tree). The promoted result run carries a
+`merge-working/` (the composed tree). Meta-merge conflicts and repair sidecars
+live in `merge-proofs/`. The promoted result run carries a
 `deadreckon-campaign-manifest.json`.
 
 ### 36.3 Depth cap and cycle guard (`CAMPAIGN_MAX_DEPTH = 2`)
@@ -2359,7 +2362,10 @@ the same DAG-aware merge path used by normal plan merges, and invokes the
 semantic merge repair provider for true cross-sub same-path conflicts. Repair
 sidecars are written under the campaign's `merge-proofs/`, and campaign events
 record conflict, repair-planned, repair-started, repaired, or repair-failed
-milestones before promotion.
+milestones before promotion. `deadreckon campaign repair <campaign-id>` reloads a
+failed campaign with completed sub-results and a completed roll-up, then reruns
+this same synthetic-plan merge/repair/promote path; it accepts `--repair-provider`,
+`--repair-mode`, and `--repair-attempts`.
 
 ### 36.8 Gate-verdict roll-up and the no-laundering invariant
 
@@ -2371,14 +2377,17 @@ root and hashed into its acceptance-marker signature (§35 binding extended in
 `gate::marker_signature`), so editing `campaign-rollup.json` after signing
 invalidates the marker — nesting cannot launder a refused leaf into a clean pass.
 
-### 36.9 attach / show --why-failed / kill for campaigns
+### 36.9 attach / show --why-failed / repair / kill for campaigns
 
 `resolve_campaign` matches a campaign id prefix. `attach <campaign-id>` prints a
 plain summary of sub rows + roll-up with a breadcrumb (full TUI drill-in into a
 selected sub-plan is a V1 candidate — use `attach <sub-plan-id>`).
-`show <campaign-id> --why-failed` reports refused/caveat subs. `kill <campaign-id>`
-cascades into each sub-plan via the existing plan-kill path, then marks the
-campaign killed.
+`show <campaign-id> --why-failed` reports refused/caveat subs.
+`campaign repair <campaign-id>` is state-changing and only accepts failed
+campaigns; successful repair writes a new promoted campaign result run and marks
+the campaign merged.
+`kill <campaign-id>` cascades into each sub-plan via the existing plan-kill path,
+then marks the campaign killed.
 
 ### 36.10 Current limits
 
@@ -2543,7 +2552,7 @@ explicit guard that the decompose work did not change CLI output shape.
 - `commands/run.rs` owns the supervised `run` command body.
 - `commands/init.rs` owns `init` setup wiring.
 - `commands/campaign.rs` owns campaign creation, preflight, fork/roll-up helpers,
-  attach summaries, and campaign failure reports.
+  meta-merge repair, attach summaries, and campaign failure reports.
 - `commands/attach.rs` owns attach command dispatch and terminal event loops.
 - `commands/attach_runtime.rs` owns attach-loop tick timing and asynchronous
   narrative-refresh job/request plumbing shared by run, plan, and chain attach.

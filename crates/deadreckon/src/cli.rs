@@ -837,11 +837,13 @@ pub(crate) enum Commands {
     },
     #[command(
         about = "Run one goal as N independent orchestrators, then compose their results (depth-capped at 2)",
-        after_help = "Example:\n  deadreckon campaign \"rebuild billing, notifications, and admin\" --yes"
+        after_help = "Examples:\n  deadreckon campaign \"rebuild billing, notifications, and admin\" --yes\n  deadreckon campaign repair <campaign-id>"
     )]
     Campaign {
+        #[command(subcommand)]
+        command: Option<CampaignCommand>,
         #[arg(help = "Natural-language coding goal to split into N sub-orchestrators")]
-        goal: String,
+        goal: Option<String>,
         #[arg(
             long,
             help = "Number of sub-orchestrators, 2 through 6; omitted lets DeadReckon recommend"
@@ -1699,6 +1701,37 @@ pub(crate) enum OrchestrateCommand {
         after_help = "Example:\n  deadreckon orchestrate full-plan \"build the thing\" --planner-provider cli:codex --provider cli:claude-code --n 4 --yes"
     )]
     FullPlan(OrchestrateFullPlanArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CampaignCommand {
+    #[command(
+        about = "Repair and promote a failed campaign merge",
+        after_help = "Example:\n  deadreckon campaign repair <campaign-id> --repair-provider cli:codex"
+    )]
+    Repair(CampaignRepairCliArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct CampaignRepairCliArgs {
+    #[arg(help = "Campaign id or unique prefix")]
+    pub(crate) campaign_id: String,
+    #[arg(long, help = "Repair provider route for campaign merge repair")]
+    pub(crate) repair_provider: Option<String>,
+    #[arg(
+        long,
+        default_value = "auto",
+        help = "Repair mode: auto, prefer, synthesize, or child"
+    )]
+    pub(crate) repair_mode: String,
+    #[arg(long, default_value_t = 1, help = "Maximum automatic repair attempts")]
+    pub(crate) repair_attempts: u32,
+    #[arg(long, help = "Suppress post-action hints")]
+    pub(crate) no_hints: bool,
+    #[arg(long, help = "Suppress success chatter and post-action hints")]
+    pub(crate) quiet: bool,
+    #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
+    pub(crate) plain: bool,
 }
 
 #[derive(Args)]

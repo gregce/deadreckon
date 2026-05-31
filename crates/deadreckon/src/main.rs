@@ -120,10 +120,11 @@ mod tui_events;
 mod ui;
 
 use crate::cli::{
-    AcceptanceCommand, AcceptancePreset, CHAIN_HELP, ChainCommandArgs, Cli, CliDocKind,
-    CliPlanMode, Commands, CompletionCommand, ConfigCommand, ExtendCommandArgs, ForkCommandArgs,
-    HistoryCommand, HistoryKind, ImproveCommand, LearnCommand, LibraryCommand, MergeCommandArgs,
-    OrchestrateCommand, PlanCommandArgs, ProvidersCommand, RunCommandArgs, StartCommandArgs,
+    AcceptanceCommand, AcceptancePreset, CHAIN_HELP, CampaignCommand, ChainCommandArgs, Cli,
+    CliDocKind, CliPlanMode, Commands, CompletionCommand, ConfigCommand, ExtendCommandArgs,
+    ForkCommandArgs, HistoryCommand, HistoryKind, ImproveCommand, LearnCommand, LibraryCommand,
+    MergeCommandArgs, OrchestrateCommand, PlanCommandArgs, ProvidersCommand, RunCommandArgs,
+    StartCommandArgs,
 };
 use crate::narrative::{AttachViewMode, NarrativeVisualMode};
 use crate::plan_event_bus::{PlanEventBus, PlanFeedEvent};
@@ -481,6 +482,7 @@ async fn main_inner() -> Result<()> {
             commands::orchestrate::orchestrate_command(request).await
         }
         Commands::Campaign {
+            command,
             goal,
             n,
             planner_provider,
@@ -495,6 +497,30 @@ async fn main_inner() -> Result<()> {
             plain,
         } => {
             ui::set_plain_output(plain);
+            if let Some(command) = command {
+                match command {
+                    CampaignCommand::Repair(repair) => {
+                        ui::set_plain_output(repair.plain);
+                        return commands::campaign::campaign_repair_command(
+                            commands::campaign::CampaignRepairArgs {
+                                campaign_id: repair.campaign_id,
+                                repair_provider: repair.repair_provider,
+                                repair_mode: repair.repair_mode,
+                                repair_attempts: repair.repair_attempts,
+                                no_hints: repair.no_hints,
+                                quiet: repair.quiet,
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            let Some(goal) = goal else {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "campaign goal required",
+                    "deadreckon campaign \"your goal\" --yes, or deadreckon campaign repair <campaign-id>",
+                )));
+            };
             commands::campaign::campaign_command(commands::campaign::CampaignArgs {
                 goal,
                 n,

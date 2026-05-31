@@ -124,6 +124,15 @@ pub(crate) struct CampaignArgs {
     pub(crate) plain: bool,
 }
 
+pub(crate) struct CampaignRepairArgs {
+    pub(crate) campaign_id: String,
+    pub(crate) repair_provider: Option<String>,
+    pub(crate) repair_mode: String,
+    pub(crate) repair_attempts: u32,
+    pub(crate) no_hints: bool,
+    pub(crate) quiet: bool,
+}
+
 fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sandbox: Option<&str>) {
     let per_sub = campaign
         .tree_budget_usd
@@ -550,6 +559,209 @@ fn campaign_as_merge_repair_plan(
     Ok(plan)
 }
 
+fn parse_campaign_repair_mode(mode: &str) -> Result<MergeRepairMode> {
+    match mode {
+        "auto" => Ok(MergeRepairMode::Auto),
+        "prefer" => Ok(MergeRepairMode::Prefer),
+        "synthesize" => Ok(MergeRepairMode::Synthesize),
+        "child" => Ok(MergeRepairMode::Child),
+        other => Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown repair mode {other}"),
+            "use --repair-mode auto|prefer|synthesize|child",
+        ))),
+    }
+}
+
+fn campaign_rollup_refusal_message(rollup: &deadreckon_core::campaign::CampaignRollup) -> String {
+    if rollup.refused_subs.is_empty() {
+        "campaign failed: one or more sub-orchestrators did not merge".to_string()
+    } else {
+        format!(
+            "campaign failed: refused sub(s) {}",
+            rollup.refused_subs.join(", ")
+        )
+    }
+}
+
+struct CampaignRepairExecution<'a> {
+    paths: &'a DeadreckonPaths,
+    campaign_dir: &'a Path,
+    campaign_obj: &'a mut deadreckon_core::campaign::Campaign,
+    rollup: &'a deadreckon_core::campaign::CampaignRollup,
+    parent_cwd: &'a Path,
+    repair_provider: Option<&'a str>,
+    repair_mode: MergeRepairMode,
+    repair_attempts: u32,
+    quiet: bool,
+}
+
+async fn repair_and_promote_campaign_result(
+    request: CampaignRepairExecution<'_>,
+) -> Result<deadreckon_core::PipelineState> {
+    use deadreckon_core::campaign;
+
+    let CampaignRepairExecution {
+        paths,
+        campaign_dir,
+        campaign_obj,
+        rollup,
+        parent_cwd,
+        repair_provider,
+        repair_mode,
+        repair_attempts,
+        quiet,
+    } = request;
+
+    if !campaign::campaign_can_complete(campaign_obj, rollup) {
+        campaign_obj.status = campaign::CampaignStatus::Failed;
+        campaign::write_campaign(campaign_dir, campaign_obj)?;
+        campaign::append_campaign_event(
+            campaign_dir,
+            "rollup_refused",
+            serde_json::json!({ "refused_subs": rollup.refused_subs }),
+        )?;
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &campaign_rollup_refusal_message(rollup),
+            "deadreckon show <campaign-id> --why-failed",
+        )));
+    }
+
+    let campaign_id = campaign_obj.campaign_id.clone();
+    let merge_plan = campaign_as_merge_repair_plan(paths, campaign_dir, campaign_obj, parent_cwd)?;
+    let mut merge = compose_plan_merge_working(paths, &merge_plan, PlanMergeStrategy::DagAware)?;
+    let unresolved_conflicts = merge.unresolved_conflicts();
+    if !unresolved_conflicts.is_empty() {
+        let repair_context = MergeRepairContext::final_merge(paths, &merge_plan);
+        let provider = resolve_merge_repair_provider(paths, &merge_plan, repair_provider)?;
+        campaign::append_campaign_event(
+            campaign_dir,
+            "campaign_merge_conflict",
+            serde_json::json!({
+                "conflicts": unresolved_conflicts.len(),
+                "provider": provider,
+            }),
+        )?;
+        write_merge_repair_request(
+            paths,
+            &merge_plan,
+            &repair_context,
+            provider.as_deref(),
+            &unresolved_conflicts,
+        )?;
+        campaign::append_campaign_event(
+            campaign_dir,
+            "campaign_repair_planned",
+            serde_json::json!({
+                "conflicts": unresolved_conflicts.len(),
+                "provider": provider,
+            }),
+        )?;
+        let Some(provider) = provider else {
+            campaign_obj.status = campaign::CampaignStatus::Failed;
+            campaign::write_campaign(campaign_dir, campaign_obj)?;
+            campaign::append_campaign_event(
+                campaign_dir,
+                "campaign_repair_failed",
+                serde_json::json!({ "reason": "campaign merge repair needs a configured provider" }),
+            )?;
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "campaign failed: cross-sub file conflict; repair needs a configured provider",
+                "deadreckon providers list --all",
+            )));
+        };
+        campaign::append_campaign_event(
+            campaign_dir,
+            "campaign_repair_started",
+            serde_json::json!({ "mode": repair_mode.as_str(), "provider": provider }),
+        )?;
+        match run_merge_repair(
+            paths,
+            &merge_plan,
+            &repair_context,
+            &MergeRepairOptions {
+                provider: &provider,
+                mode: repair_mode,
+                attempts: repair_attempts,
+                quiet,
+            },
+            &mut merge,
+        )
+        .await
+        {
+            Ok(repaired) => {
+                campaign::append_campaign_event(
+                    campaign_dir,
+                    "campaign_repaired",
+                    serde_json::json!({
+                        "strategy": repaired.strategy,
+                        "repair_run_id": repaired.repair_run_id,
+                    }),
+                )?;
+                write_plan_merge_conflicts(
+                    paths,
+                    &merge_plan,
+                    PlanMergeStrategy::DagAware,
+                    &merge.conflicts,
+                )?;
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                campaign_obj.status = campaign::CampaignStatus::Failed;
+                campaign::write_campaign(campaign_dir, campaign_obj)?;
+                campaign::append_campaign_event(
+                    campaign_dir,
+                    "campaign_repair_failed",
+                    serde_json::json!({ "reason": reason }),
+                )?;
+                return Err(error);
+            }
+        }
+    }
+
+    let merge_dir = paths.merge_working(&campaign_id);
+    let result_state = promote_campaign_result(paths, &campaign_id, &merge_dir, rollup)?;
+    campaign_obj.merged_run_id = Some(result_state.run_id.clone());
+    campaign_obj.merged_at = Some(chrono::Utc::now());
+    campaign_obj.status = campaign::CampaignStatus::Merged;
+    campaign::write_campaign(campaign_dir, campaign_obj)?;
+    write_campaign_manifest(paths, campaign_obj, &result_state, rollup)?;
+    campaign::append_campaign_event(
+        campaign_dir,
+        "campaign_completed",
+        serde_json::json!({ "merged_run_id": result_state.run_id }),
+    )?;
+    Ok(result_state)
+}
+
+fn print_campaign_completion(
+    campaign: &deadreckon_core::campaign::Campaign,
+    rollup: &deadreckon_core::campaign::CampaignRollup,
+    result_state: &deadreckon_core::PipelineState,
+    no_hints: bool,
+) {
+    use deadreckon_core::campaign;
+
+    let verdict = match rollup.rollup_verdict {
+        campaign::RollupVerdict::Clean => "clean",
+        campaign::RollupVerdict::Caveat => "caveat",
+        campaign::RollupVerdict::Refused => "refused",
+    };
+    println!(
+        "campaign {} complete: {}/{} subs · roll-up {verdict} · result {}",
+        run_prefix(&campaign.campaign_id),
+        campaign
+            .sub_goals
+            .iter()
+            .filter(|sub| sub.status == campaign::SubGoalStatus::Merged)
+            .count(),
+        campaign.n,
+        run_prefix(&result_state.run_id)
+    );
+    if !no_hints {
+        println!("try: deadreckon apply {}", run_prefix(&result_state.run_id));
+    }
+}
+
 pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     use deadreckon_core::campaign;
 
@@ -797,144 +1009,97 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     });
     campaign::write_campaign_rollup(&campaign_dir, &rollup)?;
 
-    if !campaign::campaign_can_complete(&campaign_obj, &rollup) {
-        campaign_obj.status = campaign::CampaignStatus::Failed;
-        campaign::write_campaign(&campaign_dir, &campaign_obj)?;
-        campaign::append_campaign_event(
-            &campaign_dir,
-            "rollup_refused",
-            serde_json::json!({ "refused_subs": rollup.refused_subs }),
-        )?;
+    let result_state = repair_and_promote_campaign_result(CampaignRepairExecution {
+        paths: &paths,
+        campaign_dir: &campaign_dir,
+        campaign_obj: &mut campaign_obj,
+        rollup: &rollup,
+        parent_cwd: &cwd,
+        repair_provider: None,
+        repair_mode: MergeRepairMode::Auto,
+        repair_attempts: 1,
+        quiet: args.quiet,
+    })
+    .await?;
+    if !args.quiet {
+        print_campaign_completion(&campaign_obj, &rollup, &result_state, args.no_hints);
+    }
+    Ok(())
+}
+
+pub(crate) async fn campaign_repair_command(args: CampaignRepairArgs) -> Result<()> {
+    use deadreckon_core::campaign;
+
+    let reference = args.campaign_id.trim();
+    if reference.is_empty() {
         return Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "campaign failed: refused sub(s) {}",
-                rollup.refused_subs.join(", ")
-            ),
-            "deadreckon show <campaign-id> --why-failed",
+            "campaign id required",
+            "deadreckon campaign repair <campaign-id>",
         )));
     }
-
-    let merge_plan = campaign_as_merge_repair_plan(&paths, &campaign_dir, &campaign_obj, &cwd)?;
-    let mut merge = compose_plan_merge_working(&paths, &merge_plan, PlanMergeStrategy::DagAware)?;
-    let unresolved_conflicts = merge.unresolved_conflicts();
-    if !unresolved_conflicts.is_empty() {
-        let repair_context = MergeRepairContext::final_merge(&paths, &merge_plan);
-        let provider = resolve_merge_repair_provider(&paths, &merge_plan, None)?;
-        campaign::append_campaign_event(
-            &campaign_dir,
-            "campaign_merge_conflict",
-            serde_json::json!({
-                "conflicts": unresolved_conflicts.len(),
-                "provider": provider,
-            }),
-        )?;
-        write_merge_repair_request(
-            &paths,
-            &merge_plan,
-            &repair_context,
-            provider.as_deref(),
-            &unresolved_conflicts,
-        )?;
-        campaign::append_campaign_event(
-            &campaign_dir,
-            "campaign_repair_planned",
-            serde_json::json!({
-                "conflicts": unresolved_conflicts.len(),
-                "provider": provider,
-            }),
-        )?;
-        let Some(provider) = provider else {
-            campaign_obj.status = campaign::CampaignStatus::Failed;
-            campaign::write_campaign(&campaign_dir, &campaign_obj)?;
-            campaign::append_campaign_event(
-                &campaign_dir,
-                "campaign_repair_failed",
-                serde_json::json!({ "reason": "campaign merge repair needs a configured provider" }),
-            )?;
+    let paths = DeadreckonPaths::discover();
+    let Some((campaign_dir, mut campaign_obj)) = resolve_campaign(&paths, reference)? else {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("unknown campaign {reference}"),
+            "deadreckon list --all",
+        )));
+    };
+    match campaign_obj.status {
+        campaign::CampaignStatus::Failed => {}
+        campaign::CampaignStatus::Merged => {
+            let hint = campaign_obj
+                .merged_run_id
+                .as_deref()
+                .map(|run_id| format!("deadreckon apply {}", run_prefix(run_id)))
+                .unwrap_or_else(|| "deadreckon show <campaign-id>".to_string());
             return Err(CliError::Core(deadreckon_core::user_error(
-                "campaign failed: cross-sub file conflict; repair needs a configured provider",
-                "deadreckon providers list --all",
+                &format!(
+                    "campaign {} is already merged",
+                    run_prefix(&campaign_obj.campaign_id)
+                ),
+                &hint,
             )));
-        };
-        campaign::append_campaign_event(
-            &campaign_dir,
-            "campaign_repair_started",
-            serde_json::json!({ "mode": MergeRepairMode::Auto.as_str(), "provider": provider }),
-        )?;
-        match run_merge_repair(
-            &paths,
-            &merge_plan,
-            &repair_context,
-            &MergeRepairOptions {
-                provider: &provider,
-                mode: MergeRepairMode::Auto,
-                attempts: 1,
-                quiet: args.quiet,
-            },
-            &mut merge,
-        )
-        .await
-        {
-            Ok(repaired) => {
-                campaign::append_campaign_event(
-                    &campaign_dir,
-                    "campaign_repaired",
-                    serde_json::json!({
-                        "strategy": repaired.strategy,
-                        "repair_run_id": repaired.repair_run_id,
-                    }),
-                )?;
-                write_plan_merge_conflicts(
-                    &paths,
-                    &merge_plan,
-                    PlanMergeStrategy::DagAware,
-                    &merge.conflicts,
-                )?;
-            }
-            Err(error) => {
-                let reason = error.to_string();
-                campaign_obj.status = campaign::CampaignStatus::Failed;
-                campaign::write_campaign(&campaign_dir, &campaign_obj)?;
-                campaign::append_campaign_event(
-                    &campaign_dir,
-                    "campaign_repair_failed",
-                    serde_json::json!({ "reason": reason }),
-                )?;
-                return Err(error);
-            }
+        }
+        status => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "campaign {} is {}",
+                    run_prefix(&campaign_obj.campaign_id),
+                    campaign_status_text(status)
+                ),
+                "deadreckon attach <campaign-id>",
+            )));
         }
     }
-    let merge_dir = paths.merge_working(&campaign_obj.campaign_id);
-    let result_state = promote_campaign_result(&paths, &campaign_id, &merge_dir, &rollup)?;
-    campaign_obj.merged_run_id = Some(result_state.run_id.clone());
-    campaign_obj.merged_at = Some(chrono::Utc::now());
-    campaign_obj.status = campaign::CampaignStatus::Merged;
-    campaign::write_campaign(&campaign_dir, &campaign_obj)?;
-    write_campaign_manifest(&paths, &campaign_obj, &result_state, &rollup)?;
-    campaign::append_campaign_event(
-        &campaign_dir,
-        "campaign_completed",
-        serde_json::json!({ "merged_run_id": result_state.run_id }),
-    )?;
+
+    let rollup = campaign::read_campaign_rollup(&campaign_dir).map_err(|_| {
+        CliError::Core(deadreckon_core::user_error(
+            "campaign repair needs a completed roll-up",
+            "deadreckon attach <campaign-id> and wait for sub-orchestrators to finish",
+        ))
+    })?;
+    let repair_mode = parse_campaign_repair_mode(&args.repair_mode)?;
+    let cwd = std::env::current_dir()?;
+    let result_state = repair_and_promote_campaign_result(CampaignRepairExecution {
+        paths: &paths,
+        campaign_dir: &campaign_dir,
+        campaign_obj: &mut campaign_obj,
+        rollup: &rollup,
+        parent_cwd: &cwd,
+        repair_provider: args.repair_provider.as_deref(),
+        repair_mode,
+        repair_attempts: args.repair_attempts,
+        quiet: args.quiet,
+    })
+    .await?;
+
     if !args.quiet {
-        let verdict = match rollup.rollup_verdict {
-            campaign::RollupVerdict::Clean => "clean",
-            campaign::RollupVerdict::Caveat => "caveat",
-            campaign::RollupVerdict::Refused => "refused",
-        };
-        println!(
-            "campaign {} complete: {}/{} subs · roll-up {verdict} · result {}",
-            run_prefix(&campaign_id),
-            campaign_obj
-                .sub_goals
-                .iter()
-                .filter(|sub| sub.status == campaign::SubGoalStatus::Merged)
-                .count(),
-            campaign_obj.n,
-            run_prefix(&result_state.run_id)
-        );
+        print_campaign_completion(&campaign_obj, &rollup, &result_state, args.no_hints);
         if !args.no_hints {
-            println!("try: deadreckon apply {}", run_prefix(&result_state.run_id));
+            println!(
+                "try: deadreckon attach {}",
+                run_prefix(&campaign_obj.campaign_id)
+            );
         }
     }
     Ok(())

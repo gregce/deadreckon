@@ -1,4 +1,8 @@
-use deadreckon_core::DeadreckonPaths;
+use chrono::Utc;
+use deadreckon_core::{
+    DeadreckonPaths, PhaseId, PhaseStatus, RunOptions, create_run, load_run, promote_completed_run,
+    save_state, write_acceptance_marker,
+};
 use tempfile::TempDir;
 
 mod common;
@@ -156,4 +160,118 @@ fn campaign_rejects_n_outside_range_at_cli() {
             stdout(&output)
         );
     }
+}
+
+fn promoted_run_with_file(
+    paths: &DeadreckonPaths,
+    cwd: &std::path::Path,
+    goal: &str,
+    relative: &str,
+    body: &str,
+) -> deadreckon_core::PipelineState {
+    let mut state = create_run(
+        paths,
+        RunOptions {
+            goal: goal.to_string(),
+            cwd: cwd.to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: None,
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("create run");
+    let file = state.working_dir.join(relative);
+    std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&file, body).expect("write file");
+    write_acceptance_marker(
+        &state.run_root,
+        state.run_id.clone(),
+        state.working_dir.clone(),
+        1,
+    )
+    .expect("marker");
+    state
+        .set_phase_status(PhaseId(60), PhaseStatus::Completed)
+        .expect("complete");
+    save_state(&state).expect("save");
+    promote_completed_run(paths, &mut state).expect("promote");
+    state
+}
+
+#[test]
+fn campaign_repair_promotes_failed_campaign_without_conflicts() {
+    use deadreckon_core::campaign::{
+        Campaign, CampaignStatus, SubGoalStatus, build_rollup, build_sub_goals, read_campaign,
+        write_campaign, write_campaign_rollup,
+    };
+    use deadreckon_core::plan::PlanProviders;
+
+    let temp = TempDir::new().expect("tempdir");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let work = workdir(&temp);
+    let run0 = promoted_run_with_file(&paths, &work, "billing", "src/billing.rs", "billing");
+    let run1 = promoted_run_with_file(&paths, &work, "notify", "src/notify.rs", "notify");
+    let mut campaign = Campaign::new(
+        "ship billing and notifications",
+        build_sub_goals(
+            vec!["ship billing".to_string(), "ship notifications".to_string()],
+            2,
+        )
+        .expect("subs"),
+        PlanProviders::default(),
+        0,
+        None,
+        None,
+        "test",
+    )
+    .expect("campaign");
+    campaign.status = CampaignStatus::Failed;
+    campaign.forked_at = Some(Utc::now());
+    campaign.sub_goals[0].status = SubGoalStatus::Merged;
+    campaign.sub_goals[0].result_run_id = Some(run0.run_id.clone());
+    campaign.sub_goals[0].scope = Some(run0.scope.clone());
+    campaign.sub_goals[1].status = SubGoalStatus::Merged;
+    campaign.sub_goals[1].result_run_id = Some(run1.run_id.clone());
+    campaign.sub_goals[1].scope = Some(run1.scope.clone());
+    let campaign_dir = paths.plan_dir(&campaign.campaign_id);
+    std::fs::create_dir_all(&campaign_dir).expect("campaign dir");
+    write_campaign(&campaign_dir, &campaign).expect("write campaign");
+    let rollup = build_rollup(&campaign, |_| {
+        (
+            "signed".to_string(),
+            deadreckon_core::tamper::AcceptanceTamperVerdict::Clean,
+            Vec::new(),
+        )
+    });
+    write_campaign_rollup(&campaign_dir, &rollup).expect("write rollup");
+
+    let output = deadreckon(&paths)
+        .current_dir(&work)
+        .args(["campaign", "repair", &campaign.campaign_id, "--quiet"])
+        .output()
+        .expect("repair campaign");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let repaired = read_campaign(&campaign_dir).expect("read repaired campaign");
+    assert_eq!(repaired.status, CampaignStatus::Merged);
+    let result_run_id = repaired.merged_run_id.expect("merged run id");
+    let result = load_run(&paths, &result_run_id).expect("load result");
+    let library = paths.library_dir(&result.scope, &result.run_id);
+    assert_eq!(
+        std::fs::read_to_string(library.join("src/billing.rs")).expect("billing"),
+        "billing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(library.join("src/notify.rs")).expect("notify"),
+        "notify"
+    );
 }
