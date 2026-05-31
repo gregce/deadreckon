@@ -103,6 +103,10 @@
   `deadreckon_core::error::is_retryable_io_kind` as the single shared helper,
   reused it from providers and sandbox, and recorded the one justified public
   surface rebaseline for that new core path.
+- P10 (`8b80969`): Pruned unused `tracing`/`chrono` dependencies, deleted
+  confirmed dead helpers, hardened docs regex initialization with BUG-tagged
+  `expect` calls plus compile coverage, and applied targeted allocation nits
+  while keeping characterization goldens unchanged.
 
 ## Effortless (production release) - 2026-05-28
 
