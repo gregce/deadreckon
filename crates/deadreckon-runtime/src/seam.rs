@@ -297,6 +297,7 @@ fn seam_sandbox_spec(
     cancellation_token: CancellationToken,
 ) -> SandboxSpec {
     let policy = ToolSandboxPolicy::bash(ctx.working_dir.clone());
+    let denied = seam_denied_paths(&ctx.run_root);
     let mut env = BTreeMap::new();
     if let Some(path) = std::env::var_os("PATH") {
         env.insert("PATH".to_string(), path.to_string_lossy().to_string());
@@ -314,10 +315,22 @@ fn seam_sandbox_spec(
         profile_dir: Some(ctx.run_root.join("sandbox").join("seams")),
         read_allowlist: policy.read_allowlist,
         write_allowlist: policy.write_allowlist,
-        read_denylist: vec![ctx.run_root.join("gate"), ctx.run_root.join("proofs")],
-        write_denylist: vec![ctx.run_root.join("gate"), ctx.run_root.join("proofs")],
+        read_denylist: denied.clone(),
+        write_denylist: denied,
         network_allowlist: Vec::new(),
     }
+}
+
+fn seam_denied_paths(run_root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![run_root.join("gate"), run_root.join("proofs")];
+    let canonical = paths
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect::<Vec<_>>();
+    paths.extend(canonical);
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn map_success(kind: SeamKind, value: Value) -> SeamOutcome {
@@ -396,6 +409,9 @@ fn command_basename(command: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use deadreckon_sandbox::resolve_backend;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -412,6 +428,10 @@ mod tests {
             working_dir,
             sandbox_backend: SandboxBackend::None,
         }
+    }
+
+    fn sh_quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
 
     #[test]
@@ -526,6 +546,34 @@ timeout_ms = 1
         let catalog = resolve_catalog_override(&seams, &ctx(&temp)).await;
 
         assert!(catalog.is_none());
+    }
+
+    #[tokio::test]
+    async fn hook_seam_cannot_write_proofs_or_marker() {
+        if resolve_backend(SandboxBackend::SandboxExec).is_err() {
+            return;
+        }
+        let temp = TempDir::new().expect("temp");
+        let mut ctx = ctx(&temp);
+        ctx.sandbox_backend = SandboxBackend::SandboxExec;
+        let marker = ctx.run_root.join("proofs").join("marker");
+        let seams = SeamsConfig::with_command(
+            SeamKind::Hooks,
+            SeamCommandConfig {
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("cat >/dev/null; printf forged > {}", sh_quote(&marker)),
+                ],
+                timeout_ms: 1_000,
+            },
+        )
+        .expect("seams");
+
+        let outcome = dispatch_seam(SeamKind::Hooks, &json!({"kind":"test"}), &seams, &ctx).await;
+
+        assert!(matches!(outcome, SeamOutcome::Skipped(_)));
+        assert!(!marker.exists());
     }
 
     #[test]

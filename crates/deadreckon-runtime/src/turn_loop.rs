@@ -322,16 +322,19 @@ pub async fn run_turn_loop(
 
         if is_cli_subagent(&response) {
             let tool_call_id = format!("cli-subagent-turn-{turn}");
-            emit_event(
+            emit_tool_event_with_hook(
                 state,
                 config.event_sender.as_ref(),
+                &seams,
+                &seam_ctx,
                 RunEventKind::ToolCallStarted {
                     turn,
                     tool_call_id: tool_call_id.clone(),
                     tool_name: "cli_subagent".to_string(),
                     args: response.trace.clone(),
                 },
-            )?;
+            )
+            .await?;
             let changed = changed_files_since_snapshot(state, turn.saturating_sub(1))?;
             if changed.is_empty() {
                 state.failure_reason =
@@ -395,16 +398,19 @@ pub async fn run_turn_loop(
                         .map(ToString::to_string),
                 },
             )?;
-            emit_event(
+            emit_tool_event_with_hook(
                 state,
                 config.event_sender.as_ref(),
+                &seams,
+                &seam_ctx,
                 RunEventKind::ToolCallResult {
                     turn,
                     tool_call_id,
                     status: "ok".to_string(),
                     preview: event_preview(&response.content),
                 },
-            )?;
+            )
+            .await?;
             if !implementation_notes_ready_or_request_followup(
                 state,
                 config.event_sender.as_ref(),
@@ -443,16 +449,19 @@ pub async fn run_turn_loop(
                 command,
             } => {
                 let tool_token = turn_token.child_token();
-                emit_event(
+                emit_tool_event_with_hook(
                     state,
                     config.event_sender.as_ref(),
+                    &seams,
+                    &seam_ctx,
                     RunEventKind::ToolCallStarted {
                         turn,
                         tool_call_id: tool_call_id.clone(),
                         tool_name: "bash".to_string(),
                         args: tool_args_json(&command),
                     },
-                )?;
+                )
+                .await?;
                 let started = Instant::now();
                 let policy = load_tool_policy_from_sandbox_toml(state, "bash")?;
                 if let Some(reason) = bash_policy_refusal(state, &command, &policy) {
@@ -572,16 +581,19 @@ pub async fn run_turn_loop(
                         tool_stderr: Some(output.stderr.clone()),
                     },
                 )?;
-                emit_event(
+                emit_tool_event_with_hook(
                     state,
                     config.event_sender.as_ref(),
+                    &seams,
+                    &seam_ctx,
                     RunEventKind::ToolCallResult {
                         turn,
                         tool_call_id: tool_call_id.clone(),
                         status: format!("{:?}", output.status_code),
                         preview: event_preview(format!("{}{}", output.stdout, output.stderr)),
                     },
-                )?;
+                )
+                .await?;
                 history.push(format!(
                     "tool {tool_call_id} result: status={:?}",
                     output.status_code
@@ -592,16 +604,19 @@ pub async fn run_turn_loop(
                 path,
                 content,
             } => {
-                emit_event(
+                emit_tool_event_with_hook(
                     state,
                     config.event_sender.as_ref(),
+                    &seams,
+                    &seam_ctx,
                     RunEventKind::ToolCallStarted {
                         turn,
                         tool_call_id: tool_call_id.clone(),
                         tool_name: "write_file".to_string(),
                         args: tool_args_json(path.display().to_string()),
                     },
-                )?;
+                )
+                .await?;
                 let write_policy = load_tool_policy_from_sandbox_toml(state, "write_file")?;
                 let target =
                     match safe_working_path_with_policy(&state.working_dir, &path, &write_policy) {
@@ -691,16 +706,19 @@ pub async fn run_turn_loop(
                         tool_stderr: None,
                     },
                 )?;
-                emit_event(
+                emit_tool_event_with_hook(
                     state,
                     config.event_sender.as_ref(),
+                    &seams,
+                    &seam_ctx,
                     RunEventKind::ToolCallResult {
                         turn,
                         tool_call_id: tool_call_id.clone(),
                         status: "ok".to_string(),
                         preview: "wrote file".to_string(),
                     },
-                )?;
+                )
+                .await?;
                 history.push(format!("tool {tool_call_id} result: wrote file"));
             }
             Action::Done { summary } => {
@@ -1061,6 +1079,25 @@ async fn policy_seam_refusal(
             "seam 'policy' denied {function_id}: unexpected skipped outcome: {reason}"
         )),
     }
+}
+
+async fn emit_tool_event_with_hook(
+    state: &PipelineState,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+    seams: &SeamsConfig,
+    ctx: &SeamRunCtx,
+    event: RunEventKind,
+) -> Result<()> {
+    emit_event(state, sender, event.clone())?;
+    dispatch_hook_event(seams, ctx, &event).await;
+    Ok(())
+}
+
+async fn dispatch_hook_event(seams: &SeamsConfig, ctx: &SeamRunCtx, event: &RunEventKind) {
+    let Ok(req) = serde_json::to_value(event) else {
+        return;
+    };
+    let _ = dispatch_seam(SeamKind::Hooks, &req, seams, ctx).await;
 }
 
 fn changed_files_since_snapshot(state: &PipelineState, snapshot_turn: u32) -> Result<Vec<PathBuf>> {
@@ -1679,10 +1716,14 @@ mod tests {
         (paths, state)
     }
 
-    fn write_policy_config(paths: &DeadreckonPaths, raw: &str) -> PathBuf {
+    fn write_seams_config(paths: &DeadreckonPaths, raw: &str) -> PathBuf {
         let config_path = paths.config_path();
         std::fs::write(&config_path, raw).expect("config");
         config_path
+    }
+
+    fn sh_quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
 
     async fn run_smoke_turn(
@@ -1743,7 +1784,7 @@ mod tests {
     async fn policy_seam_deny_blocks_tool_call_and_records_denial() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, mut state) = create_smoke_run(&temp, "policy seam deny");
-        let config_path = write_policy_config(
+        let config_path = write_seams_config(
             &paths,
             r#"
 [seams.policy]
@@ -1771,7 +1812,7 @@ timeout_ms = 1000
     async fn policy_seam_allow_proceeds() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, mut state) = create_smoke_run(&temp, "policy seam allow");
-        let config_path = write_policy_config(
+        let config_path = write_seams_config(
             &paths,
             r#"
 [seams.policy]
@@ -1795,7 +1836,7 @@ timeout_ms = 1000
     async fn policy_seam_timeout_denies_fail_closed() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, mut state) = create_smoke_run(&temp, "policy seam timeout");
-        let config_path = write_policy_config(
+        let config_path = write_seams_config(
             &paths,
             r#"
 [seams.policy]
@@ -1816,7 +1857,7 @@ timeout_ms = 10
     async fn policy_seam_cannot_widen_sandbox_floor() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, state) = create_smoke_run(&temp, "policy seam floor");
-        let config_path = write_policy_config(
+        let config_path = write_seams_config(
             &paths,
             r#"
 [seams.policy]
@@ -1864,6 +1905,72 @@ timeout_ms = 1000
             read_seams_json(&state)["kinds"]["policy"]["source"].as_str(),
             Some("builtin")
         );
+    }
+
+    #[tokio::test]
+    async fn hook_seam_receives_started_and_result_events() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "hook seam capture");
+        let capture = temp.path().join("hook-events.jsonl");
+        let config_path = write_seams_config(
+            &paths,
+            &format!(
+                r#"
+[seams.hooks]
+command = ["/bin/sh", "-c", "cat >> {}; printf '{{\"ok\":true}}\n'"]
+timeout_ms = 1000
+"#,
+                sh_quote(&capture)
+            ),
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), false).await;
+
+        let captured = std::fs::read_to_string(capture).expect("hook capture");
+        assert!(captured.contains(r#""kind":"tool_call_started""#));
+        assert!(captured.contains(r#""kind":"tool_call_result""#));
+        assert!(captured.contains(r#""tool_name":"bash""#));
+        assert!(state.working_dir.join("Cargo.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn hook_seam_failure_is_non_fatal() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "hook seam failure");
+        let config_path = write_seams_config(
+            &paths,
+            r#"
+[seams.hooks]
+command = ["/bin/sh", "-c", "cat >/dev/null; exit 42"]
+timeout_ms = 1000
+"#,
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), false).await;
+
+        assert!(state.working_dir.join("Cargo.toml").exists());
+        let traces = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
+        assert!(!traces.contains(r#""event":"tool.refused""#));
+    }
+
+    #[tokio::test]
+    async fn hook_seam_cannot_alter_dispatch_decision() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "hook seam cannot deny");
+        let config_path = write_seams_config(
+            &paths,
+            r#"
+[seams.hooks]
+command = ["/bin/sh", "-c", "cat >/dev/null; printf '{\"decision\":\"deny\",\"reason\":\"ignored\"}\n'"]
+timeout_ms = 1000
+"#,
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), false).await;
+
+        assert!(state.working_dir.join("Cargo.toml").exists());
+        let traces = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
+        assert!(!traces.contains(r#""event":"tool.refused""#));
     }
 
     #[test]

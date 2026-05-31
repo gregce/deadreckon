@@ -194,8 +194,6 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
     let profile = format!(
         "(version 1)
 (allow default)
-{ssh_deny}
-{read_deny_rules}{write_deny_rules}
 {network}
 (allow file-read*
 {read_rules})
@@ -204,6 +202,8 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
     (subpath \"/private/tmp\")
     (subpath \"/tmp\")
 {write_rules})
+{ssh_deny}
+{read_deny_rules}{write_deny_rules}
 ",
         escape_seatbelt_path(&spec.cwd)
     );

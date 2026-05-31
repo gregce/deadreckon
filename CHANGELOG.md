@@ -12,6 +12,9 @@
 - P3: Added the model-catalog seam path: catalog responses can override route
   context windows and pricing at router construction, while malformed or absent
   catalog seams fall open to the built-in model list.
+- P4: Added hook fanout for tool start/result events with fail-safe dispatch;
+  hook outputs are observe-only, non-fatal, and covered by proof-subtree sandbox
+  denial.
 
 ## Navigable campaign attach (production release) - 2026-05-31
 
