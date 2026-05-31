@@ -2215,13 +2215,14 @@ async fn materialize_start_done_criteria(decision: &mut StartLaunchDecision) -> 
 fn prompt_start_launch_confirmation(
     decision: &mut StartLaunchDecision,
     args: &StartCommandArgs,
+    paths: &DeadreckonPaths,
     prompter: &mut dyn StartPrompter,
 ) -> Result<()> {
     if args.preview || args.yes || args.quiet {
         return Ok(());
     }
     println!("{}", ui_heading("deadreckon start preview"));
-    let rows = launch_preview_rows(&start_launch_preview_facts(decision));
+    let rows = start_launch_preview_rows(decision, args, paths)?;
     print_launch_preview_rows(&rows);
     decision.requires_confirmation = true;
     if prompter.confirm("start this launch?", true)? {
@@ -2236,6 +2237,17 @@ fn prompt_start_launch_confirmation(
             )],
         }))
     }
+}
+
+fn start_launch_preview_rows(
+    decision: &StartLaunchDecision,
+    args: &StartCommandArgs,
+    paths: &DeadreckonPaths,
+) -> Result<Vec<(String, String)>> {
+    let mut rows = launch_preview_rows(&start_launch_preview_facts(decision));
+    let seams = read_seams_config(&paths.config_path(), args.no_seams)?;
+    rows.push(("seams".to_string(), seam_preview_label(&seams)));
+    Ok(rows)
 }
 
 pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
@@ -2346,16 +2358,18 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     if args.preview {
         if !args.quiet {
             println!("{}", ui_heading("deadreckon start preview"));
-            let rows = launch_preview_rows(&start_launch_preview_facts(&decision));
+            let rows = start_launch_preview_rows(&decision, &args, &paths)?;
             print_launch_preview_rows(&rows);
         }
         return Ok(());
     }
     if decision.recovery.is_none() && eligibility.allows_prompts() {
-        prompt_start_launch_confirmation(&mut decision, &args, &mut terminal_prompter)?;
+        prompt_start_launch_confirmation(&mut decision, &args, &paths, &mut terminal_prompter)?;
     }
     if !args.quiet {
         println!("{}", ui_heading("guided start"));
+        let seam_label =
+            seam_preview_label(&read_seams_config(&paths.config_path(), args.no_seams)?);
         let mode = decision.selected_mode.label();
         let suggestion = decision.goal_shape.as_ref().map(|recommendation| {
             format!(
@@ -2378,6 +2392,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             ("provider", decision.provider_label.as_str()),
             ("done", decision.done_criteria_label.as_str()),
             ("workspace", decision.source_mode_label.as_str()),
+            ("seams", seam_label.as_str()),
             (
                 "confirmation",
                 if decision.requires_confirmation {
@@ -2430,6 +2445,7 @@ async fn dispatch_start_command(
                 yes: auto_confirm,
                 preview: false,
                 brief: false,
+                no_seams: args.no_seams,
                 plain: args.plain,
                 prevent_sleep: None,
                 quiet: args.quiet,

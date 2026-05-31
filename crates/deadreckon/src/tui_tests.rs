@@ -1999,6 +1999,7 @@ fn start_args_for_test(goal: &str) -> StartCommandArgs {
         reviewer_provider: None,
         preview: true,
         yes: false,
+        no_seams: false,
         fresh: false,
         worktree: false,
         from: None,

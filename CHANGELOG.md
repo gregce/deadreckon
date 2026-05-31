@@ -20,6 +20,8 @@
 - P6: Added deterministic direct-API history compaction with `[compaction]`
   config, `compaction.jsonl` audit records, catalog/seam/fallback context-window
   sources, and full `history.json` retention.
+- P7: Added `--no-seams` run/start controls, seam resolution in preview and
+  doctor output, and policy-seam refusal footers with recovery commands.
 
 ## Navigable campaign attach (production release) - 2026-05-31
 

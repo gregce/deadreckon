@@ -94,8 +94,8 @@ use deadreckon_providers::{
     read_config,
 };
 use deadreckon_runtime::{
-    PolishConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, SeamRunCtx, polish_run_docs,
-    read_seams_config, resolve_catalog_override, run_turn_loop,
+    PolishConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, SeamKind, SeamRunCtx,
+    SeamsConfig, polish_run_docs, read_seams_config, resolve_catalog_override, run_turn_loop,
 };
 use deadreckon_sandbox::SandboxBackend;
 use ratatui::Terminal;
@@ -204,6 +204,20 @@ fn error_hint(err: &CliError) -> String {
         {
             "try: cargo install --path crates/deadreckon".to_string()
         }
+        CliError::Core(DeadreckonError::InvalidInput(message))
+            if message.contains("[seams.gate]") =>
+        {
+            "remove [seams.gate]; the acceptance gate is the trust root".to_string()
+        }
+        CliError::Core(DeadreckonError::InvalidInput(message))
+            if message.contains("unknown seam kind") =>
+        {
+            "use policy / catalog / hooks / event_sink; see `deadreckon doctor`".to_string()
+        }
+        CliError::Core(DeadreckonError::InvalidInput(message)) if message.contains("[seams.") => {
+            "check the named [seams] command and timeout in config.toml; see `deadreckon doctor`"
+                .to_string()
+        }
         CliError::Core(DeadreckonError::NotFound(_)) => {
             "run `deadreckon list` to find valid run ids or config keys".to_string()
         }
@@ -231,6 +245,30 @@ fn try_footer(hint: impl AsRef<str>) -> String {
         hint.to_string()
     } else {
         format!("try: {hint}")
+    }
+}
+
+fn seam_fail_policy_label(kind: SeamKind) -> &'static str {
+    match kind.fail_policy() {
+        deadreckon_runtime::FailPolicy::Closed => "closed",
+        deadreckon_runtime::FailPolicy::Open => "open",
+        deadreckon_runtime::FailPolicy::Safe => "safe",
+    }
+}
+
+fn seam_preview_label(seams: &SeamsConfig) -> String {
+    if seams.no_seams {
+        return "builtin (--no-seams)".to_string();
+    }
+    let external = SeamKind::all()
+        .into_iter()
+        .filter(|kind| seams.command_for(*kind).is_some())
+        .map(SeamKind::config_key)
+        .collect::<Vec<_>>();
+    if external.is_empty() {
+        "builtin".to_string()
+    } else {
+        format!("external: {}", external.join(", "))
     }
 }
 
@@ -351,6 +389,7 @@ async fn main_inner() -> Result<()> {
             reviewer_provider,
             preview,
             yes,
+            no_seams,
             fresh,
             worktree,
             from,
@@ -371,6 +410,7 @@ async fn main_inner() -> Result<()> {
                 reviewer_provider,
                 preview,
                 yes,
+                no_seams,
                 fresh,
                 worktree,
                 from,
@@ -394,6 +434,7 @@ async fn main_inner() -> Result<()> {
             yes,
             preview,
             brief,
+            no_seams,
             plain,
             prevent_sleep,
             quiet,
@@ -426,6 +467,7 @@ async fn main_inner() -> Result<()> {
                 yes,
                 preview,
                 brief,
+                no_seams,
                 plain,
                 prevent_sleep,
                 quiet,
@@ -2119,6 +2161,7 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
         yes: true,
         preview: false,
         brief: false,
+        no_seams: false,
         plain,
         prevent_sleep: Some("off".to_string()),
         quiet: true,
@@ -2613,6 +2656,7 @@ struct RunPreview<'a> {
     max_wall_seconds: Option<f64>,
     acceptance: &'a setup::DoneCriteriaSelection,
     sleep: &'a sleep::SleepPreview,
+    seams: &'a str,
     brief: bool,
     plain: bool,
     run_id: &'a str,
@@ -2633,6 +2677,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         max_wall_seconds,
         acceptance,
         sleep,
+        seams,
         brief,
         plain,
         run_id,
@@ -2652,7 +2697,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
     );
     if brief {
         return format!(
-            "mode={} branch={} base={} wt={} provider={} model={} docs={} cap={}/{} done_criteria={}",
+            "mode={} branch={} base={} wt={} provider={} model={} docs={} seams={} cap={}/{} done_criteria={}",
             mode,
             codebase.branch_name.as_deref().unwrap_or("-"),
             codebase.base_ref.as_deref().unwrap_or("-"),
@@ -2664,6 +2709,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
             agent,
             model,
             doc_provider.unwrap_or("templated"),
+            seams,
             max_spend
                 .map(|cap| format!("${cap:.0}"))
                 .unwrap_or_else(|| "uncapped".to_string()),
@@ -2761,6 +2807,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
             ),
         ),
         ("sandbox".to_string(), sandbox.to_string()),
+        ("seams".to_string(), seams.to_string()),
         ("caps".to_string(), caps),
         ("sleep".to_string(), sleep.label()),
         (
@@ -2840,6 +2887,46 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         },
         &card_options(ui::Stream::Stderr, plain),
     )
+}
+
+#[cfg(test)]
+mod seam_surface_tests {
+    use super::*;
+
+    #[test]
+    fn preview_lists_active_external_seams() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let codebase = CodebaseRecord::fresh();
+        let acceptance = setup::DoneCriteriaSelection::default_gate();
+        let sleep = sleep::SleepPreview {
+            mode: sleep::SleepMode::None,
+            binary: None,
+            skip_reason: None,
+        };
+
+        let preview = run_preview(&RunPreview {
+            goal: "ship seams",
+            cwd: temp.path(),
+            codebase: &codebase,
+            provider: Some("smoke"),
+            provider_source: "flag",
+            route: None,
+            sandbox: "none",
+            doc_provider: None,
+            doc_provider_source: "none",
+            max_spend: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            acceptance: &acceptance,
+            sleep: &sleep,
+            seams: "external: policy, event_sink",
+            brief: false,
+            plain: true,
+            run_id: "run123",
+        });
+
+        assert!(preview.contains("seams"));
+        assert!(preview.contains("external: policy, event_sink"));
+    }
 }
 
 fn card_options(stream: ui::Stream, plain: bool) -> CardOptions {

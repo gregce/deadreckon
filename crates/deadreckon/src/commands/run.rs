@@ -14,6 +14,7 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         yes,
         preview,
         brief,
+        no_seams,
         plain,
         prevent_sleep,
         quiet,
@@ -153,6 +154,8 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         .or(defaults.sandbox.clone())
         .unwrap_or_else(|| "auto".to_string());
     let backend: SandboxBackend = sandbox.parse()?;
+    let seams = read_seams_config(&paths.config_path(), no_seams)?;
+    let seams_label = seam_preview_label(&seams);
     if init_git {
         init_git_repo(&cwd)?;
     }
@@ -214,6 +217,7 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         max_wall_seconds: effective_max_wall_seconds,
         acceptance: &acceptance_preview,
         sleep: &sleep_preview,
+        seams: &seams_label,
         brief,
         plain,
         run_id: &run_id,
@@ -328,7 +332,7 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             backend,
             provider_override.as_deref(),
             model.as_deref(),
-            false,
+            no_seams,
         )
         .await?
     };
@@ -355,7 +359,7 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             max_spend_usd: effective_max_spend,
             max_wall_seconds: effective_max_wall_seconds,
             sandbox_backend: backend,
-            no_seams: false,
+            no_seams,
             max_turns: 12,
             from_turn: None,
             event_sender: None,

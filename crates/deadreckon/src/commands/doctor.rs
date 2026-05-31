@@ -1,4 +1,5 @@
 use super::super::*;
+use std::path::Path;
 
 pub(crate) async fn doctor_command(json_output: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
@@ -15,6 +16,16 @@ pub(crate) async fn doctor_command(json_output: bool) -> Result<()> {
                 })
             })
             .collect::<Vec<_>>();
+        let seams = match doctor_seam_resolution(&paths, false) {
+            Ok(lines) => json!({
+                "status": "ok",
+                "resolution": lines,
+            }),
+            Err(err) => json!({
+                "status": "invalid",
+                "error": err.to_string(),
+            }),
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -32,6 +43,7 @@ pub(crate) async fn doctor_command(json_output: bool) -> Result<()> {
                 "config_path": paths.config_path(),
                 "config_present": paths.config_path().exists(),
                 "sandboxes": sandbox_checks,
+                "seams": seams,
             }))?
         );
         return Ok(());
@@ -125,12 +137,62 @@ pub(crate) async fn doctor_command(json_output: bool) -> Result<()> {
             ui_command("fix:")
         );
     }
+    doctor_seams(&paths);
     doctor_disk_and_permissions(&paths);
     doctor_os();
     doctor_sleep_prevention();
     doctor_subscription_binary("claude");
     doctor_subscription_binary("codex");
     Ok(())
+}
+
+fn doctor_seams(paths: &DeadreckonPaths) {
+    println!("seams");
+    match doctor_seam_resolution(paths, false) {
+        Ok(lines) => {
+            println!(
+                "{} seams resolved | {} deadreckon run \"goal\" --no-seams",
+                ui_ok("✓"),
+                ui_command("try:")
+            );
+            for line in lines {
+                println!("    {line}");
+            }
+        }
+        Err(err) => {
+            println!("{} seams config invalid", ui_warn("✗"));
+            println!("    {} {err}", ui_command("fix:"));
+            println!("    {} deadreckon doctor", ui_command("try:"));
+        }
+    }
+}
+
+fn doctor_seam_resolution(paths: &DeadreckonPaths, no_seams: bool) -> Result<Vec<String>> {
+    let seams = read_seams_config(&paths.config_path(), no_seams)?;
+    Ok(SeamKind::all()
+        .into_iter()
+        .map(|kind| {
+            let fail = seam_fail_policy_label(kind);
+            match seams.command_for(kind) {
+                Some(command) => format!(
+                    "{}: external command={} timeout_ms={} fail={fail}",
+                    kind.config_key(),
+                    seam_command_basename(&command.command),
+                    command.timeout_ms
+                ),
+                None => format!("{}: builtin fail={fail}", kind.config_key()),
+            }
+        })
+        .collect())
+}
+
+fn seam_command_basename(command: &[String]) -> String {
+    command
+        .first()
+        .and_then(|argv0| Path::new(argv0).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("-")
+        .to_string()
 }
 
 fn doctor_sleep_prevention() {
@@ -448,4 +510,45 @@ fn command_version(path: &std::path::Path) -> Option<String> {
             text.lines().next().unwrap_or_default().trim().to_string()
         })
         .filter(|line| !line.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doctor_lists_seam_resolution() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        std::fs::create_dir_all(paths.home()).expect("home");
+        std::fs::write(
+            paths.config_path(),
+            r#"
+[seams.policy]
+command = ["/bin/sh", "-c", "cat >/dev/null; echo '{\"decision\":\"allow\"}'"]
+timeout_ms = 1234
+"#,
+        )
+        .expect("config");
+
+        let lines = doctor_seam_resolution(&paths, false).expect("seams");
+
+        assert!(lines.iter().any(|line| {
+            line.contains("policy: external")
+                && line.contains("command=sh")
+                && line.contains("timeout_ms=1234")
+                && line.contains("fail=closed")
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "catalog: builtin fail=open")
+        );
+        assert!(lines.iter().any(|line| line == "hooks: builtin fail=safe"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "event_sink: builtin fail=safe")
+        );
+    }
 }

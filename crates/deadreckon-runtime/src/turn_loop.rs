@@ -512,9 +512,15 @@ pub async fn run_turn_loop(
                     save_state(state)?;
                     continue;
                 }
-                if let Some(reason) =
-                    policy_seam_refusal(&seams, &seam_ctx, "bash", &command, &state.working_dir)
-                        .await
+                if let Some(reason) = policy_seam_refusal(
+                    &seams,
+                    &seam_ctx,
+                    &state.run_id,
+                    "bash",
+                    &command,
+                    &state.working_dir,
+                )
+                .await
                 {
                     append_tool_refusal(
                         state,
@@ -675,6 +681,7 @@ pub async fn run_turn_loop(
                 if let Some(reason) = policy_seam_refusal(
                     &seams,
                     &seam_ctx,
+                    &state.run_id,
                     "write_file",
                     &target_label,
                     &state.working_dir,
@@ -1095,6 +1102,7 @@ fn bash_policy_refusal(
 async fn policy_seam_refusal(
     seams: &SeamsConfig,
     ctx: &SeamRunCtx,
+    run_id: &str,
     function_id: &str,
     command: &str,
     working_dir: &Path,
@@ -1111,13 +1119,23 @@ async fn policy_seam_refusal(
     )
     .await
     {
-        SeamOutcome::Deny(reason) => Some(format!("seam 'policy' denied {function_id}: {reason}")),
+        SeamOutcome::Deny(reason) => {
+            Some(policy_seam_refusal_message(run_id, function_id, &reason))
+        }
         SeamOutcome::Ok(_) | SeamOutcome::Unconfigured => None,
         SeamOutcome::Fallback => None,
-        SeamOutcome::Skipped(reason) => Some(format!(
-            "seam 'policy' denied {function_id}: unexpected skipped outcome: {reason}"
+        SeamOutcome::Skipped(reason) => Some(policy_seam_refusal_message(
+            run_id,
+            function_id,
+            &format!("unexpected skipped outcome: {reason}"),
         )),
     }
+}
+
+fn policy_seam_refusal_message(run_id: &str, function_id: &str, reason: &str) -> String {
+    format!(
+        "seam 'policy' denied {function_id}: {reason}\ntry: deadreckon show {run_id} to review, adjust the policy worker, or re-run with --no-seams"
+    )
 }
 
 async fn emit_tool_event_with_hook(
@@ -1752,8 +1770,8 @@ mod tests {
         build_cli_subagent_prompt, build_prompt, ensure_sandbox_toml,
         implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
         load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, policy_seam_refusal,
-        provider_output_name, run_turn_loop, safe_working_path, safe_working_path_with_policy,
-        save_history,
+        policy_seam_refusal_message, provider_output_name, run_turn_loop, safe_working_path,
+        safe_working_path_with_policy, save_history,
     };
 
     fn create_smoke_run(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {
@@ -1890,6 +1908,49 @@ timeout_ms = 1000
     }
 
     #[tokio::test]
+    async fn no_seams_flag_forces_builtin_for_all_kinds() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "no seams forces builtin");
+        let config_path = write_seams_config(
+            &paths,
+            r#"
+[seams.policy]
+command = ["/bin/sh", "-c", "cat >/dev/null; echo '{\"decision\":\"deny\",\"reason\":\"should be ignored\"}'"]
+timeout_ms = 1000
+
+[seams.hooks]
+command = ["/bin/sh", "-c", "exit 99"]
+timeout_ms = 1000
+
+[seams.event_sink]
+command = ["/bin/sh", "-c", "exit 99"]
+timeout_ms = 1000
+"#,
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), true).await;
+
+        assert!(state.working_dir.join("Cargo.toml").exists());
+        let audit = read_seams_json(&state);
+        assert_eq!(audit["no_seams"].as_bool(), Some(true));
+        for kind in ["policy", "catalog", "hooks", "event_sink"] {
+            assert_eq!(audit["kinds"][kind]["source"].as_str(), Some("builtin"));
+        }
+    }
+
+    #[test]
+    fn seam_failure_renders_error_footer() {
+        let message = policy_seam_refusal_message("run123", "bash", "blocked by test");
+
+        assert!(message.contains("seam 'policy' denied bash: blocked by test"));
+        assert!(
+            message.contains(
+                "try: deadreckon show run123 to review, adjust the policy worker, or re-run with --no-seams"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn policy_seam_allow_proceeds() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, mut state) = create_smoke_run(&temp, "policy seam allow");
@@ -1956,6 +2017,7 @@ timeout_ms = 1000
         let seam_refusal = policy_seam_refusal(
             &seams,
             &seam_ctx,
+            &state.run_id,
             "write_file",
             "../outside.txt",
             &state.working_dir,

@@ -674,6 +674,8 @@ pub(crate) enum Commands {
         preview: bool,
         #[arg(long, help = "Confirm the launch preview without prompting")]
         yes: bool,
+        #[arg(long, help = "Force built-in governance seams for this launch")]
+        no_seams: bool,
         #[arg(long, help = "Start from an empty workspace")]
         fresh: bool,
         #[arg(long, help = "Force a git worktree source mode")]
@@ -736,6 +738,8 @@ pub(crate) enum Commands {
         preview: bool,
         #[arg(long, help = "Print a single-line preview")]
         brief: bool,
+        #[arg(long, help = "Force built-in governance seams for this run")]
+        no_seams: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
         #[arg(
@@ -2223,6 +2227,7 @@ pub(crate) struct RunCommandArgs {
     pub(crate) yes: bool,
     pub(crate) preview: bool,
     pub(crate) brief: bool,
+    pub(crate) no_seams: bool,
     pub(crate) plain: bool,
     pub(crate) prevent_sleep: Option<String>,
     pub(crate) quiet: bool,
@@ -2253,6 +2258,7 @@ pub(crate) struct StartCommandArgs {
     pub(crate) reviewer_provider: Option<String>,
     pub(crate) preview: bool,
     pub(crate) yes: bool,
+    pub(crate) no_seams: bool,
     pub(crate) fresh: bool,
     pub(crate) worktree: bool,
     pub(crate) from: Option<PathBuf>,
