@@ -1272,7 +1272,7 @@ Trace `detail` rows use a stable import schema: `import_version`, canonical `sou
 
 ## 17. CLI Surface
 
-The `Commands` enum in `crates/deadreckon/src/cli.rs` defines the CLI surface; `main_inner` in `crates/deadreckon/src/main.rs` dispatches to private command-family modules under `crates/deadreckon/src/commands/` and to root helpers for legacy lifecycle/inspection surfaces. Verbs and roles (line numbers are intentionally omitted — `cli.rs` is the source of truth and grows over time):
+The `Commands` enum in `crates/deadreckon/src/cli.rs` defines the CLI surface; `main_inner` in `crates/deadreckon/src/main.rs` dispatches to private command-family modules under `crates/deadreckon/src/commands/` and to root helpers for the remaining config, try, status/show, and control surfaces. Verbs and roles (line numbers are intentionally omitted — `cli.rs` is the source of truth and grows over time):
 
 Default top-level help presents the production model: `start`, `attach`,
 `status`, `list`, `finish`, `doctor`, `init`, `def-done`, `kill`, `resume`,
@@ -2505,11 +2505,11 @@ to land before moving code.
 
 After the pass, the binary source is split across private modules. `main.rs` still
 owns the Tokio entrypoint, tracing setup, the `main_inner` command match, shared
-root-level lifecycle/inspection helpers, and private glue used by multiple command
-families. It is no longer the single home for the core command families, guided
-start flow, provider detection/update handling, descriptor-backed import handling,
-learning/self-improvement command handling, TUI render layer, or lifted unit-test
-modules.
+root-level config, try, status/show, and control helpers, and private glue used by
+multiple command families. It is no longer the single home for the core command
+families, guided start flow, provider detection/update handling, descriptor-backed
+import handling, learning/self-improvement command handling, TUI render layer, or
+lifted unit-test modules.
 
 ### 38.2 Characterization net
 
