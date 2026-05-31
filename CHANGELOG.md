@@ -1,5 +1,12 @@
 # Changelog
 
+## Composable seams (production release) - 2026-05-31
+
+- P1: Added the runtime `SeamCommand` primitive, `[seams]` config parser with a
+  hard non-swappable gate guard, sandboxed JSON-over-stdio dispatch with fixed
+  per-kind fail policies, stdin/denylist support in the sandbox runner, and
+  per-run `seams.json` audit writing.
+
 ## Navigable campaign attach (production release) - 2026-05-31
 
 - Added campaign attach state/feed plumbing so `attach <campaign-id>` can refresh

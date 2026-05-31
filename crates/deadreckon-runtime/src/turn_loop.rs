@@ -458,6 +458,7 @@ pub async fn run_turn_loop(
                     cwd: state.working_dir.clone(),
                     program: OsString::from("sh"),
                     args: vec![OsString::from("-lc"), OsString::from(command.clone())],
+                    stdin: None,
                     env: BTreeMap::new(),
                     allow_network: policy.allow_network,
                     pid_file: Some(
@@ -470,6 +471,8 @@ pub async fn run_turn_loop(
                     profile_dir: Some(state.run_root.join("sandbox")),
                     read_allowlist: policy.read_allowlist,
                     write_allowlist: policy.write_allowlist,
+                    read_denylist: Vec::new(),
+                    write_denylist: Vec::new(),
                     network_allowlist: policy.network_allowlist,
                 })
                 .await

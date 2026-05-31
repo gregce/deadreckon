@@ -177,10 +177,25 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
             format!("(deny file-read* (subpath \"{ssh}\"))\n(deny file-write* (subpath \"{ssh}\"))")
         })
         .unwrap_or_default();
+    let mut read_deny_rules = String::new();
+    for path in &spec.read_denylist {
+        read_deny_rules.push_str(&format!(
+            "(deny file-read* (subpath \"{}\"))\n",
+            escape_seatbelt_path(path)
+        ));
+    }
+    let mut write_deny_rules = String::new();
+    for path in &spec.write_denylist {
+        write_deny_rules.push_str(&format!(
+            "(deny file-write* (subpath \"{}\"))\n",
+            escape_seatbelt_path(path)
+        ));
+    }
     let profile = format!(
         "(version 1)
 (allow default)
 {ssh_deny}
+{read_deny_rules}{write_deny_rules}
 {network}
 (allow file-read*
 {read_rules})

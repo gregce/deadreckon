@@ -12,6 +12,7 @@ pub struct SandboxSpec {
     pub cwd: PathBuf,
     pub program: OsString,
     pub args: Vec<OsString>,
+    pub stdin: Option<Vec<u8>>,
     pub env: BTreeMap<String, String>,
     pub allow_network: bool,
     pub pid_file: Option<PathBuf>,
@@ -19,5 +20,7 @@ pub struct SandboxSpec {
     pub profile_dir: Option<PathBuf>,
     pub read_allowlist: Vec<PathBuf>,
     pub write_allowlist: Vec<PathBuf>,
+    pub read_denylist: Vec<PathBuf>,
+    pub write_denylist: Vec<PathBuf>,
     pub network_allowlist: Vec<String>,
 }

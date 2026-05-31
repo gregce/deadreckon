@@ -81,6 +81,7 @@ pub(crate) async fn run_cli_with_options(
             cwd,
             program,
             args: args.iter().map(OsString::from).collect(),
+            stdin: None,
             env,
             allow_network: policy.allow_network,
             pid_file: options.pid_file,
@@ -88,6 +89,8 @@ pub(crate) async fn run_cli_with_options(
             profile_dir: None,
             read_allowlist: policy.read_allowlist,
             write_allowlist: policy.write_allowlist,
+            read_denylist: Vec::new(),
+            write_denylist: Vec::new(),
             network_allowlist: policy.network_allowlist,
         })
         .await

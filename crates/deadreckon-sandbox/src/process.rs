@@ -1,7 +1,7 @@
 use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{Duration, sleep};
 
@@ -19,16 +19,29 @@ pub struct SandboxRunOutput {
     pub warning: Option<String>,
 }
 
-pub async fn run(spec: SandboxSpec) -> Result<SandboxRunOutput> {
+pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
     let command = build_command(&spec)?;
     let mut child = Command::new(&command.program)
         .args(&command.args)
         .current_dir(&command.cwd)
         .envs(&command.env)
+        .stdin(if spec.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let pid = child.id();
+    let stdin_task = spec.stdin.take().and_then(|bytes| {
+        child.stdin.take().map(|mut stdin| {
+            tokio::spawn(async move {
+                stdin.write_all(&bytes).await?;
+                stdin.shutdown().await
+            })
+        })
+    });
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_task = tokio::spawn(read_pipe(stdout));
@@ -66,6 +79,11 @@ pub async fn run(spec: SandboxSpec) -> Result<SandboxRunOutput> {
     let stderr = stderr_task
         .await
         .unwrap_or_else(|err| Ok(format!("stderr join error: {err}")))?;
+    if let Some(stdin_task) = stdin_task {
+        stdin_task
+            .await
+            .unwrap_or_else(|err| Err(std::io::Error::other(format!("stdin join error: {err}"))))?;
+    }
     if let Some(pid_file) = spec.pid_file.as_ref() {
         let _ = tokio::fs::remove_file(pid_file).await;
     }

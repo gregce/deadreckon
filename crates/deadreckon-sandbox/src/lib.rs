@@ -39,6 +39,7 @@ mod tests {
             cwd: std::env::current_dir().expect("cwd"),
             program: OsString::from("sh"),
             args: vec![OsString::from("-c"), OsString::from("printf ok")],
+            stdin: None,
             env: BTreeMap::new(),
             allow_network: false,
             pid_file: None,
@@ -46,6 +47,8 @@ mod tests {
             profile_dir: None,
             read_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
+            read_denylist: Vec::new(),
+            write_denylist: Vec::new(),
             network_allowlist: Vec::new(),
         }
     }
@@ -172,6 +175,7 @@ mod tests {
                 OsString::from("-c"),
                 OsString::from(format!("cat {}", home_secret.display())),
             ],
+            stdin: None,
             env: BTreeMap::new(),
             allow_network: false,
             pid_file: None,
@@ -179,6 +183,8 @@ mod tests {
             profile_dir: None,
             read_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
+            read_denylist: Vec::new(),
+            write_denylist: Vec::new(),
             network_allowlist: Vec::new(),
         })
         .await
@@ -204,6 +210,7 @@ mod tests {
                 OsString::from("2"),
                 OsString::from("https://example.com"),
             ],
+            stdin: None,
             env: BTreeMap::new(),
             allow_network: false,
             pid_file: None,
@@ -211,6 +218,8 @@ mod tests {
             profile_dir: None,
             read_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
+            read_denylist: Vec::new(),
+            write_denylist: Vec::new(),
             network_allowlist: Vec::new(),
         })
         .await

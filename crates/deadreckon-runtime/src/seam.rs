@@ -1,0 +1,517 @@
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use chrono::Utc;
+use deadreckon_core::error::{DeadreckonError, Result};
+use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as run_sandbox};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+use crate::error::IoContext;
+
+pub const SEAMS_AUDIT_JSON: &str = "seams.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeamKind {
+    Policy,
+    Catalog,
+    Hooks,
+    EventSink,
+}
+
+impl SeamKind {
+    pub fn all() -> [Self; 4] {
+        [Self::Policy, Self::Catalog, Self::Hooks, Self::EventSink]
+    }
+
+    pub fn config_key(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::Catalog => "catalog",
+            Self::Hooks => "hooks",
+            Self::EventSink => "event_sink",
+        }
+    }
+
+    pub fn from_config_key(key: &str) -> Option<Self> {
+        match key {
+            "policy" => Some(Self::Policy),
+            "catalog" => Some(Self::Catalog),
+            "hooks" => Some(Self::Hooks),
+            "event_sink" => Some(Self::EventSink),
+            _ => None,
+        }
+    }
+
+    pub fn fail_policy(self) -> FailPolicy {
+        match self {
+            Self::Policy => FailPolicy::Closed,
+            Self::Catalog => FailPolicy::Open,
+            Self::Hooks | Self::EventSink => FailPolicy::Safe,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailPolicy {
+    Closed,
+    Open,
+    Safe,
+}
+
+impl FailPolicy {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::Safe => "safe",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeamCommandConfig {
+    pub command: Vec<String>,
+    pub timeout_ms: u64,
+}
+
+impl SeamCommandConfig {
+    fn validate(&self, kind: SeamKind) -> Result<()> {
+        if self.command.is_empty() || self.command[0].trim().is_empty() {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "config error: [seams.{}].command must not be empty",
+                kind.config_key()
+            )));
+        }
+        if self.timeout_ms == 0 {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "config error: [seams.{}].timeout_ms must be greater than 0",
+                kind.config_key()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeamsConfig {
+    commands: BTreeMap<SeamKind, SeamCommandConfig>,
+    pub no_seams: bool,
+}
+
+impl SeamsConfig {
+    pub fn empty(no_seams: bool) -> Self {
+        Self {
+            commands: BTreeMap::new(),
+            no_seams,
+        }
+    }
+
+    pub fn with_command(kind: SeamKind, command: SeamCommandConfig) -> Result<Self> {
+        command.validate(kind)?;
+        let mut commands = BTreeMap::new();
+        commands.insert(kind, command);
+        Ok(Self {
+            commands,
+            no_seams: false,
+        })
+    }
+
+    pub fn command_for(&self, kind: SeamKind) -> Option<&SeamCommandConfig> {
+        self.commands.get(&kind)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SeamRunCtx {
+    pub run_root: PathBuf,
+    pub working_dir: PathBuf,
+    pub sandbox_backend: SandboxBackend,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SeamOutcome {
+    Unconfigured,
+    Ok(Value),
+    Deny(String),
+    Fallback,
+    Skipped(String),
+}
+
+pub fn read_seams_config(config_path: &Path, no_seams: bool) -> Result<SeamsConfig> {
+    if no_seams {
+        return Ok(SeamsConfig::empty(true));
+    }
+    let raw = match std::fs::read_to_string(config_path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SeamsConfig::empty(false));
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: config_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    parse_seams_config(&raw)
+}
+
+pub fn parse_seams_config(raw: &str) -> Result<SeamsConfig> {
+    let value = toml::from_str::<toml::Value>(raw).map_err(|err| {
+        DeadreckonError::InvalidInput(format!("config error: invalid TOML: {err}"))
+    })?;
+    let Some(seams) = value.get("seams") else {
+        return Ok(SeamsConfig::empty(false));
+    };
+    let table = seams.as_table().ok_or_else(|| {
+        DeadreckonError::InvalidInput("config error: [seams] must be a table".to_string())
+    })?;
+    let mut commands = BTreeMap::new();
+    for (key, entry) in table {
+        if key == "gate" {
+            return Err(DeadreckonError::InvalidInput(
+                "config error: [seams.gate] is not allowed (the gate is not swappable)".to_string(),
+            ));
+        }
+        let kind = SeamKind::from_config_key(key).ok_or_else(|| {
+            DeadreckonError::InvalidInput(format!("config error: [seams.{key}] unknown seam kind"))
+        })?;
+        let command: SeamCommandConfig = entry.clone().try_into().map_err(|err| {
+            DeadreckonError::InvalidInput(format!("config error: [seams.{key}]: {err}"))
+        })?;
+        command.validate(kind)?;
+        commands.insert(kind, command);
+    }
+    Ok(SeamsConfig {
+        commands,
+        no_seams: false,
+    })
+}
+
+pub fn write_seams_audit(run_root: &Path, run_id: &str, seams: &SeamsConfig) -> Result<PathBuf> {
+    let path = run_root.join(SEAMS_AUDIT_JSON);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_path(parent)?;
+    }
+    let audit = SeamsAudit {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        resolved_at: Utc::now().to_rfc3339(),
+        no_seams: seams.no_seams,
+        kinds: SeamKind::all()
+            .into_iter()
+            .map(|kind| {
+                (
+                    kind.config_key().to_string(),
+                    SeamAuditEntry::new(kind, seams),
+                )
+            })
+            .collect(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&audit)
+        .map_err(|err| DeadreckonError::InvalidInput(format!("seams audit JSON error: {err}")))?;
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).with_path(&path)?;
+    Ok(path)
+}
+
+pub async fn dispatch_seam(
+    kind: SeamKind,
+    req: &Value,
+    seams: &SeamsConfig,
+    ctx: &SeamRunCtx,
+) -> SeamOutcome {
+    let Some(command) = seams.command_for(kind) else {
+        return SeamOutcome::Unconfigured;
+    };
+    let stdin = match serde_json::to_vec(req) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            bytes
+        }
+        Err(err) => return fail_outcome(kind, format!("request serialization failed: {err}")),
+    };
+    let token = CancellationToken::new();
+    let spec = seam_sandbox_spec(command, ctx, stdin, token.clone());
+    let mut handle = tokio::spawn(async move { run_sandbox(spec).await });
+    let timeout = Duration::from_millis(command.timeout_ms);
+    let output = tokio::select! {
+        output = &mut handle => match output {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => return fail_outcome(kind, format!("sandbox failed: {err}")),
+            Err(err) => return fail_outcome(kind, format!("sandbox task failed: {err}")),
+        },
+        _ = tokio::time::sleep(timeout) => {
+            token.cancel();
+            let _ = handle.await;
+            return fail_outcome(kind, "timeout".to_string());
+        }
+    };
+    if output.status_code != Some(0) {
+        return fail_outcome(
+            kind,
+            format!(
+                "command exited with status {:?}: {}",
+                output.status_code,
+                output.stderr.trim()
+            ),
+        );
+    }
+    let parsed = match serde_json::from_str::<Value>(output.stdout.trim()) {
+        Ok(parsed) => parsed,
+        Err(err) => return fail_outcome(kind, format!("invalid JSON response: {err}")),
+    };
+    map_success(kind, parsed)
+}
+
+fn seam_sandbox_spec(
+    command: &SeamCommandConfig,
+    ctx: &SeamRunCtx,
+    stdin: Vec<u8>,
+    cancellation_token: CancellationToken,
+) -> SandboxSpec {
+    let policy = ToolSandboxPolicy::bash(ctx.working_dir.clone());
+    let mut env = BTreeMap::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        env.insert("PATH".to_string(), path.to_string_lossy().to_string());
+    }
+    SandboxSpec {
+        backend: ctx.sandbox_backend,
+        cwd: ctx.working_dir.clone(),
+        program: OsString::from(&command.command[0]),
+        args: command.command[1..].iter().map(OsString::from).collect(),
+        stdin: Some(stdin),
+        env,
+        allow_network: false,
+        pid_file: None,
+        cancellation_token: Some(cancellation_token),
+        profile_dir: Some(ctx.run_root.join("sandbox").join("seams")),
+        read_allowlist: policy.read_allowlist,
+        write_allowlist: policy.write_allowlist,
+        read_denylist: vec![ctx.run_root.join("gate"), ctx.run_root.join("proofs")],
+        write_denylist: vec![ctx.run_root.join("gate"), ctx.run_root.join("proofs")],
+        network_allowlist: Vec::new(),
+    }
+}
+
+fn map_success(kind: SeamKind, value: Value) -> SeamOutcome {
+    if kind != SeamKind::Policy {
+        return SeamOutcome::Ok(value);
+    }
+    match value.get("decision").and_then(Value::as_str) {
+        Some("allow") => SeamOutcome::Ok(value),
+        Some("deny") => SeamOutcome::Deny(
+            value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("policy denied")
+                .to_string(),
+        ),
+        _ => fail_outcome(
+            kind,
+            "policy response missing allow/deny decision".to_string(),
+        ),
+    }
+}
+
+fn fail_outcome(kind: SeamKind, reason: String) -> SeamOutcome {
+    match kind.fail_policy() {
+        FailPolicy::Closed => SeamOutcome::Deny(format!(
+            "seam '{}' failed closed: {reason}",
+            kind.config_key()
+        )),
+        FailPolicy::Open => SeamOutcome::Fallback,
+        FailPolicy::Safe => SeamOutcome::Skipped(reason),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SeamsAudit {
+    schema_version: u32,
+    run_id: String,
+    resolved_at: String,
+    no_seams: bool,
+    kinds: BTreeMap<String, SeamAuditEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct SeamAuditEntry {
+    source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+    fail_policy: &'static str,
+}
+
+impl SeamAuditEntry {
+    fn new(kind: SeamKind, seams: &SeamsConfig) -> Self {
+        let command = seams.command_for(kind);
+        Self {
+            source: if command.is_some() {
+                "external"
+            } else {
+                "builtin"
+            },
+            command: command.and_then(|command| command_basename(&command.command[0])),
+            timeout_ms: command.map(|command| command.timeout_ms),
+            fail_policy: kind.fail_policy().label(),
+        }
+    }
+}
+
+fn command_basename(command: &str) -> Option<String> {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToString::to_string)
+        .or_else(|| Some(command.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn ctx(temp: &TempDir) -> SeamRunCtx {
+        let run_root = temp.path().join("run");
+        let working_dir = temp.path().join("work");
+        std::fs::create_dir_all(run_root.join("gate")).expect("gate");
+        std::fs::create_dir_all(run_root.join("proofs")).expect("proofs");
+        std::fs::create_dir_all(&working_dir).expect("work");
+        SeamRunCtx {
+            run_root,
+            working_dir,
+            sandbox_backend: SandboxBackend::None,
+        }
+    }
+
+    #[test]
+    fn seam_kind_has_no_gate_variant() {
+        assert!(
+            !SeamKind::all()
+                .iter()
+                .any(|kind| kind.config_key() == "gate")
+        );
+        assert!(SeamKind::from_config_key("gate").is_none());
+    }
+
+    #[test]
+    fn seams_config_rejects_gate_key() {
+        let err = parse_seams_config(
+            r#"[seams.gate]
+command = ["fake-gate"]
+timeout_ms = 1
+"#,
+        )
+        .expect_err("gate seam refused");
+
+        assert!(err.to_string().contains("the gate is not swappable"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_unconfigured_kind_returns_unconfigured() {
+        let temp = TempDir::new().expect("temp");
+        let outcome = dispatch_seam(
+            SeamKind::Policy,
+            &json!({ "command": "printf ok" }),
+            &SeamsConfig::empty(false),
+            &ctx(&temp),
+        )
+        .await;
+
+        assert_eq!(outcome, SeamOutcome::Unconfigured);
+    }
+
+    #[tokio::test]
+    async fn dispatch_round_trips_json_request_and_response() {
+        let temp = TempDir::new().expect("temp");
+        let capture = temp.path().join("request.jsonl");
+        let seams = SeamsConfig::with_command(
+            SeamKind::Hooks,
+            SeamCommandConfig {
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("cat > {}; printf '{{\"seen\":true}}\\n'", capture.display()),
+                ],
+                timeout_ms: 1_000,
+            },
+        )
+        .expect("seams");
+
+        let outcome = dispatch_seam(
+            SeamKind::Hooks,
+            &json!({ "hello": "world" }),
+            &seams,
+            &ctx(&temp),
+        )
+        .await;
+
+        assert_eq!(outcome, SeamOutcome::Ok(json!({ "seen": true })));
+        let captured = std::fs::read_to_string(capture).expect("capture");
+        assert_eq!(captured.trim(), r#"{"hello":"world"}"#);
+    }
+
+    #[tokio::test]
+    async fn dispatch_timeout_applies_kind_fail_policy() {
+        let temp = TempDir::new().expect("temp");
+        let command = SeamCommandConfig {
+            command: vec!["sh".to_string(), "-c".to_string(), "sleep 2".to_string()],
+            timeout_ms: 10,
+        };
+        let policy = SeamsConfig::with_command(SeamKind::Policy, command.clone()).expect("policy");
+        let catalog =
+            SeamsConfig::with_command(SeamKind::Catalog, command.clone()).expect("catalog");
+        let hooks = SeamsConfig::with_command(SeamKind::Hooks, command).expect("hooks");
+
+        assert!(matches!(
+            dispatch_seam(SeamKind::Policy, &json!({}), &policy, &ctx(&temp)).await,
+            SeamOutcome::Deny(_)
+        ));
+        assert_eq!(
+            dispatch_seam(SeamKind::Catalog, &json!({}), &catalog, &ctx(&temp)).await,
+            SeamOutcome::Fallback
+        );
+        assert!(matches!(
+            dispatch_seam(SeamKind::Hooks, &json!({}), &hooks, &ctx(&temp)).await,
+            SeamOutcome::Skipped(_)
+        ));
+    }
+
+    #[test]
+    fn resolution_writes_seams_json_with_sources_and_fail_policies() {
+        let temp = TempDir::new().expect("temp");
+        let seams = parse_seams_config(
+            r#"[seams.policy]
+command = ["/usr/local/bin/my-policy", "--rules", "policy.yaml"]
+timeout_ms = 5000
+"#,
+        )
+        .expect("seams");
+
+        let path = write_seams_audit(temp.path(), "run123", &seams).expect("audit");
+        let audit: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read")).expect("json");
+
+        assert_eq!(audit["schema_version"], 1);
+        assert_eq!(audit["run_id"], "run123");
+        assert_eq!(audit["no_seams"], false);
+        assert_eq!(audit["kinds"]["policy"]["source"], "external");
+        assert_eq!(audit["kinds"]["policy"]["command"], "my-policy");
+        assert_eq!(audit["kinds"]["policy"]["fail_policy"], "closed");
+        assert_eq!(audit["kinds"]["catalog"]["source"], "builtin");
+        assert_eq!(audit["kinds"]["catalog"]["fail_policy"], "open");
+        assert_eq!(audit["kinds"]["hooks"]["fail_policy"], "safe");
+        assert_eq!(audit["kinds"]["event_sink"]["fail_policy"], "safe");
+    }
+}
