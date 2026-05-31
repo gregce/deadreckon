@@ -79,6 +79,10 @@
   task-pane layout, activity feed formatting, and task detail rendering into
   `src/tui/render.rs`, while preserving shared plan summary/event helpers behind
   the private crate facade for existing command output.
+- P6f (`5fd1063`): Moved the chain-attach TUI state, renderer, event-read
+  hinting, header/footer text, timeline rows, and activity rows into
+  `src/tui/render.rs`, leaving the chain command event loop and actions in
+  `src/commands/chain/`.
 
 ## Effortless (production release) - 2026-05-28
 
