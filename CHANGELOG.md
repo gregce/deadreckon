@@ -22,6 +22,8 @@
   sources, and full `history.json` retention.
 - P7: Added `--no-seams` run/start controls, seam resolution in preview and
   doctor output, and policy-seam refusal footers with recovery commands.
+- P8: Added adversarial trust-boundary tests proving seam workers cannot write
+  markers/proofs, cannot read `gate/nonce`, and cannot affect gate signatures.
 
 ## Navigable campaign attach (production release) - 2026-05-31
 

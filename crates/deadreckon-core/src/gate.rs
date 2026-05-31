@@ -1393,6 +1393,66 @@ checks:
     }
 
     #[test]
+    fn gate_signature_unchanged_with_all_seams_active() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "seam sidecars do not bind gate".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(state.working_dir.join("README.md"), "ok\n").expect("readme");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "checks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("spec");
+        std::fs::write(
+            state.run_root.join("seams.json"),
+            r#"{"schema_version":1,"no_seams":false,"kinds":{"policy":{"source":"external"},"catalog":{"source":"external"},"hooks":{"source":"external"},"event_sink":{"source":"external"}}}"#,
+        )
+        .expect("seams");
+        std::fs::write(
+            state.run_root.join("compaction.jsonl"),
+            "{\"schema_version\":1,\"turn\":2,\"context_window\":200000}\n",
+        )
+        .expect("compaction");
+
+        let marker = super::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect("clean signs with seam sidecars");
+        let signature = marker.signature.clone();
+        validate_acceptance_marker(&state).expect("marker validates before sidecar edit");
+
+        std::fs::write(state.run_root.join("seams.json"), "{\"tampered\":true}\n")
+            .expect("edit seams");
+        std::fs::write(
+            state.run_root.join("compaction.jsonl"),
+            "{\"schema_version\":1,\"turn\":99}\n",
+        )
+        .expect("edit compaction");
+        let validated =
+            validate_acceptance_marker(&state).expect("sidecars are not signature inputs");
+        let expected = super::marker_signature(&state.run_root, &validated).expect("signature");
+
+        assert_eq!(validated.signature, signature);
+        assert_eq!(validated.signature, expected);
+    }
+
+    #[test]
     fn self_attest_attempt_fails() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));

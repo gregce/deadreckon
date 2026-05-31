@@ -431,7 +431,18 @@ mod tests {
     }
 
     fn sh_quote(path: &Path) -> String {
-        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+        sh_quote_str(path.to_string_lossy().as_ref())
+    }
+
+    fn sh_quote_str(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    fn seam_success_response(kind: SeamKind) -> &'static str {
+        match kind {
+            SeamKind::Policy => r#"{"decision":"allow"}"#,
+            SeamKind::Catalog | SeamKind::Hooks | SeamKind::EventSink => r#"{"ok":true}"#,
+        }
     }
 
     #[test]
@@ -574,6 +585,115 @@ timeout_ms = 1
 
         assert!(matches!(outcome, SeamOutcome::Skipped(_)));
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn no_seam_can_write_or_redirect_the_acceptance_marker() {
+        if resolve_backend(SandboxBackend::SandboxExec).is_err() {
+            return;
+        }
+        for kind in SeamKind::all() {
+            let temp = TempDir::new().expect("temp");
+            let mut ctx = ctx(&temp);
+            ctx.sandbox_backend = SandboxBackend::SandboxExec;
+            let marker = ctx.run_root.join("proofs").join("turn-acceptance.json");
+            let seams = SeamsConfig::with_command(
+                kind,
+                SeamCommandConfig {
+                    command: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "printf forged > {}; cat >/dev/null; printf '%s\\n' {}",
+                            sh_quote(&marker),
+                            sh_quote_str(seam_success_response(kind))
+                        ),
+                    ],
+                    timeout_ms: 1_000,
+                },
+            )
+            .expect("seams");
+
+            let _ = dispatch_seam(kind, &json!({"kind":"test"}), &seams, &ctx).await;
+
+            assert!(!marker.exists(), "{} wrote marker", kind.config_key());
+        }
+    }
+
+    #[tokio::test]
+    async fn malicious_seam_cannot_read_gate_nonce() {
+        if resolve_backend(SandboxBackend::SandboxExec).is_err() {
+            return;
+        }
+        for kind in SeamKind::all() {
+            let temp = TempDir::new().expect("temp");
+            let mut ctx = ctx(&temp);
+            ctx.sandbox_backend = SandboxBackend::SandboxExec;
+            let nonce = ctx.run_root.join("gate").join("nonce");
+            std::fs::write(&nonce, "secret-nonce").expect("nonce");
+            let capture = ctx
+                .working_dir
+                .join(format!("nonce-copy-{}", kind.config_key()));
+            let seams = SeamsConfig::with_command(
+                kind,
+                SeamCommandConfig {
+                    command: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "cat {} > {}; cat >/dev/null; printf '%s\\n' {}",
+                            sh_quote(&nonce),
+                            sh_quote(&capture),
+                            sh_quote_str(seam_success_response(kind))
+                        ),
+                    ],
+                    timeout_ms: 1_000,
+                },
+            )
+            .expect("seams");
+
+            let _ = dispatch_seam(kind, &json!({"kind":"test"}), &seams, &ctx).await;
+
+            let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+            assert!(
+                !captured.contains("secret-nonce"),
+                "{} read gate nonce",
+                kind.config_key()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn seam_worker_cannot_write_proofs_subtree() {
+        if resolve_backend(SandboxBackend::SandboxExec).is_err() {
+            return;
+        }
+        for kind in SeamKind::all() {
+            let temp = TempDir::new().expect("temp");
+            let mut ctx = ctx(&temp);
+            ctx.sandbox_backend = SandboxBackend::SandboxExec;
+            let proof = ctx.run_root.join("proofs").join("seam-proof.txt");
+            let seams = SeamsConfig::with_command(
+                kind,
+                SeamCommandConfig {
+                    command: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "printf proof > {}; cat >/dev/null; printf '%s\\n' {}",
+                            sh_quote(&proof),
+                            sh_quote_str(seam_success_response(kind))
+                        ),
+                    ],
+                    timeout_ms: 1_000,
+                },
+            )
+            .expect("seams");
+
+            let _ = dispatch_seam(kind, &json!({"kind":"test"}), &seams, &ctx).await;
+
+            assert!(!proof.exists(), "{} wrote proofs", kind.config_key());
+        }
     }
 
     #[test]
