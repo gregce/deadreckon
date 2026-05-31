@@ -113,6 +113,7 @@ pub async fn run_turn_loop(
     router: &ProviderRouter,
     config: RunLoopConfig,
 ) -> Result<RunLoopOutcome> {
+    let mut config = config;
     // AS-BUILT §9: the harness, not the model, owns the bounded mutation loop
     // and writes state after every turn boundary.
     let mut history = load_or_reconstruct_history(state, config.from_turn)?;
@@ -128,6 +129,18 @@ pub async fn run_turn_loop(
         run_root: state.run_root.clone(),
         working_dir: state.working_dir.clone(),
         sandbox_backend: config.sandbox_backend,
+    };
+    let _event_sink_forwarder = if seams.command_for(SeamKind::EventSink).is_some() {
+        if config.event_sender.is_none() {
+            let (sender, _) = broadcast::channel(256);
+            config.event_sender = Some(sender);
+        }
+        config
+            .event_sender
+            .as_ref()
+            .map(|sender| spawn_event_sink_forwarder(seams.clone(), seam_ctx.clone(), sender))
+    } else {
+        None
     };
     let run_token = config.cancellation_token.clone().unwrap_or_default();
     let _cancel_marker_guard = CancelMarkerGuard::spawn(&state.run_root, run_token.clone());
@@ -1100,6 +1113,28 @@ async fn dispatch_hook_event(seams: &SeamsConfig, ctx: &SeamRunCtx, event: &RunE
     let _ = dispatch_seam(SeamKind::Hooks, &req, seams, ctx).await;
 }
 
+fn spawn_event_sink_forwarder(
+    seams: SeamsConfig,
+    ctx: SeamRunCtx,
+    sender: &broadcast::Sender<RunEvent>,
+) -> tokio::task::JoinHandle<()> {
+    let mut receiver = sender.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    let Ok(req) = serde_json::to_value(event) else {
+                        continue;
+                    };
+                    let _ = dispatch_seam(SeamKind::EventSink, &req, &seams, &ctx).await;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
 fn changed_files_since_snapshot(state: &PipelineState, snapshot_turn: u32) -> Result<Vec<PathBuf>> {
     let snapshot_dir = state
         .run_root
@@ -1768,6 +1803,23 @@ mod tests {
         serde_json::from_str(&raw).expect("seams json")
     }
 
+    async fn read_until_contains(path: &Path, needle: &str) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && raw.contains(needle)
+            {
+                return raw;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {needle} in {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[test]
     fn provider_output_name_slugifies_cli_descriptor_id() {
         assert_eq!(provider_output_name("cli:codex"), "codex.out");
@@ -1971,6 +2023,97 @@ timeout_ms = 1000
         assert!(state.working_dir.join("Cargo.toml").exists());
         let traces = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
         assert!(!traces.contains(r#""event":"tool.refused""#));
+    }
+
+    #[tokio::test]
+    async fn event_sink_receives_mirrored_events() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "event sink mirror");
+        let capture = temp.path().join("event-sink.jsonl");
+        let config_path = write_seams_config(
+            &paths,
+            &format!(
+                r#"
+[seams.event_sink]
+command = ["/bin/sh", "-c", "cat >> {}; printf '{{\"ok\":true}}\n'"]
+timeout_ms = 1000
+"#,
+                sh_quote(&capture)
+            ),
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), false).await;
+
+        let captured = read_until_contains(&capture, r#""kind":"tool_call_result""#).await;
+        assert!(captured.contains(r#""run_id":"#));
+        assert!(captured.contains(r#""kind":"turn_started""#));
+        assert!(captured.contains(r#""kind":"tool_call_started""#));
+    }
+
+    #[tokio::test]
+    async fn event_sink_failure_keeps_events_jsonl_complete() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "event sink failure");
+        let config_path = write_seams_config(
+            &paths,
+            r#"
+[seams.event_sink]
+command = ["/bin/sh", "-c", "cat >/dev/null; exit 42"]
+timeout_ms = 1000
+"#,
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), false).await;
+
+        let events = std::fs::read_to_string(state.run_root.join("events.jsonl")).expect("events");
+        assert!(events.contains(r#""kind":"turn_started""#));
+        assert!(events.contains(r#""kind":"tool_call_started""#));
+        assert!(events.contains(r#""kind":"tool_call_result""#));
+    }
+
+    #[tokio::test]
+    async fn attach_feed_unchanged_with_event_sink() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "event sink attach");
+        let capture = temp.path().join("event-sink-attach.jsonl");
+        let config_path = write_seams_config(
+            &paths,
+            &format!(
+                r#"
+[seams.event_sink]
+command = ["/bin/sh", "-c", "cat >> {}; printf '{{\"ok\":true}}\n'"]
+timeout_ms = 1000
+"#,
+                sh_quote(&capture)
+            ),
+        );
+
+        let _ = run_smoke_turn(&mut state, &paths, Some(config_path), false).await;
+
+        let events = std::fs::read_to_string(state.run_root.join("events.jsonl")).expect("events");
+        assert!(events.contains(r#""kind":"tool_call_started""#));
+        assert!(events.contains(r#""kind":"tool_call_result""#));
+        assert!(
+            read_until_contains(&capture, r#""kind":"tool_call_result""#)
+                .await
+                .contains(r#""event":{"kind":"tool_call_result""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_event_sink_is_identical_to_today() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "event sink unconfigured");
+
+        let _ = run_smoke_turn(&mut state, &paths, None, false).await;
+
+        let events = std::fs::read_to_string(state.run_root.join("events.jsonl")).expect("events");
+        assert!(events.contains(r#""kind":"turn_started""#));
+        assert!(events.contains(r#""kind":"tool_call_started""#));
+        assert_eq!(
+            read_seams_json(&state)["kinds"]["event_sink"]["source"].as_str(),
+            Some("builtin")
+        );
     }
 
     #[test]

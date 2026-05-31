@@ -15,6 +15,8 @@
 - P4: Added hook fanout for tool start/result events with fail-safe dispatch;
   hook outputs are observe-only, non-fatal, and covered by proof-subtree sandbox
   denial.
+- P5: Added the event-sink seam as an additive `RunEvent` broadcast mirror while
+  keeping `events.jsonl` as the source of truth for attach and failure recovery.
 
 ## Navigable campaign attach (production release) - 2026-05-31
 
