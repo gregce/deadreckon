@@ -4755,6 +4755,7 @@ fn mergeable_run_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf, u64)>> {
 }
 
 /// A same-path collision between two independent campaign sub-results.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComposeConflict {
     path: PathBuf,
@@ -4762,6 +4763,7 @@ struct ComposeConflict {
     second_label: String,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ComposeResult {
     conflicts: Vec<ComposeConflict>,
@@ -4829,6 +4831,7 @@ fn compose_merge_sources<T, S, C>(
 /// are independent (no dependency edges), so this is fail-on-conflict: two roots
 /// touching the same relative path with different content yields a conflict. The
 /// first writer wins on disk; conflicts are reported so the campaign can fail.
+#[cfg(test)]
 fn compose_roots(roots: &[(String, PathBuf)], merge_dir: &Path) -> Result<ComposeResult> {
     let sources = roots
         .iter()
@@ -4852,20 +4855,6 @@ fn compose_roots(roots: &[(String, PathBuf)], merge_dir: &Path) -> Result<Compos
         },
     )?;
     Ok(ComposeResult { conflicts })
-}
-
-/// Resolve campaign sub-result run ids to their artifact roots and compose them.
-fn compose_result_runs(
-    paths: &DeadreckonPaths,
-    run_ids: &[String],
-    merge_dir: &Path,
-) -> Result<ComposeResult> {
-    let mut roots = Vec::new();
-    for run_id in run_ids {
-        let state = load_run(paths, run_id)?;
-        roots.push((run_id.clone(), child_artifact_root(paths, &state)));
-    }
-    compose_roots(&roots, merge_dir)
 }
 
 fn compose_plan_merge_working(
@@ -5116,13 +5105,12 @@ fn write_merge_repair_request(
         .tasks
         .iter()
         .map(|task| {
-            (
-                task.task_id.clone(),
-                paths
-                    .worker_spec(&plan.plan_id, &task.task_id)
-                    .display()
-                    .to_string(),
-            )
+            let worker_spec = if task.worker_spec.is_absolute() {
+                task.worker_spec.clone()
+            } else {
+                paths.plan_dir(&plan.plan_id).join(&task.worker_spec)
+            };
+            (task.task_id.clone(), worker_spec.display().to_string())
         })
         .collect::<BTreeMap<_, _>>();
     let summary_paths = plan

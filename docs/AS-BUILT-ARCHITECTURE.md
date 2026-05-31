@@ -2350,12 +2350,16 @@ treated as unbounded.
 On completion the sub writes `sub-result.json` (plan id + merged run id), which the
 coordinator reads (`discover_sub_result`).
 
-### 36.7 Meta-merge via shared `compose_result_runs`
+### 36.7 Meta-merge via semantic repair
 
 `mergeable_run_files` is the per-run file enumeration shared with plan merge
-(behavior unchanged). `compose_result_runs` composes the sub-result trees:
-first-writer-wins, and a cross-sub same-path collision is reported as a conflict
-that fails the campaign (no auto-repair across levels in this milestone).
+(behavior unchanged). Campaign roll-up now maps completed sub-results into a
+synthetic repairable plan keyed by `sub-*`, composes those result trees through
+the same DAG-aware merge path used by normal plan merges, and invokes the
+semantic merge repair provider for true cross-sub same-path conflicts. Repair
+sidecars are written under the campaign's `merge-proofs/`, and campaign events
+record conflict, repair-planned, repair-started, repaired, or repair-failed
+milestones before promotion.
 
 ### 36.8 Gate-verdict roll-up and the no-laundering invariant
 
@@ -2379,8 +2383,8 @@ campaign killed.
 ### 36.10 Current limits
 
 Depth is capped at 2; sub-goals are independent (no cross-sub dependency edges);
-cross-sub conflicts fail rather than auto-repair; attach is a one-hop summary, not
-a recursive event tree. These are tracked in `docs/V1-CANDIDATES.md`.
+attach is a one-hop summary, not a recursive event tree. These are tracked in
+`docs/V1-CANDIDATES.md`.
 
 ---
 

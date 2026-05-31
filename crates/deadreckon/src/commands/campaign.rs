@@ -472,6 +472,84 @@ fn write_campaign_manifest(
     Ok(())
 }
 
+fn campaign_sub_context_path(
+    paths: &DeadreckonPaths,
+    campaign_dir: &Path,
+    sub: &deadreckon_core::campaign::SubGoal,
+) -> PathBuf {
+    sub.sub_plan_id
+        .as_deref()
+        .map(|plan_id| paths.plan_json(plan_id))
+        .unwrap_or_else(|| {
+            campaign_dir
+                .join("launch")
+                .join(&sub.sub_id)
+                .join("sub-result.json")
+        })
+}
+
+fn campaign_sub_summary_path(
+    paths: &DeadreckonPaths,
+    sub: &deadreckon_core::campaign::SubGoal,
+) -> Option<PathBuf> {
+    let plan_id = sub.sub_plan_id.as_deref()?;
+    let docs = paths
+        .plan_dir(plan_id)
+        .join(deadreckon_core::plan::PLAN_DOCS_DIR)
+        .join(deadreckon_core::plan::PLAN_NARRATIVE);
+    if docs.is_file() {
+        Some(docs)
+    } else {
+        Some(paths.plan_json(plan_id))
+    }
+}
+
+fn campaign_as_merge_repair_plan(
+    paths: &DeadreckonPaths,
+    campaign_dir: &Path,
+    campaign: &deadreckon_core::campaign::Campaign,
+    parent_cwd: &Path,
+) -> Result<Plan> {
+    let mut tasks = Vec::new();
+    for (index, sub) in campaign.sub_goals.iter().enumerate() {
+        let Some(run_id) = sub.result_run_id.clone() else {
+            continue;
+        };
+        let mut task = PlanTask::new(
+            index as u32,
+            format!("{} {}", sub.sub_id, sub.goal),
+            sub.goal.clone(),
+            PlanRole::Child,
+            campaign.providers.default_child.clone(),
+        );
+        task.task_id = sub.sub_id.clone();
+        task.active_form = sub.goal.clone();
+        task.worker_spec = campaign_sub_context_path(paths, campaign_dir, sub);
+        task.summary_path = campaign_sub_summary_path(paths, sub);
+        task.child_run_id = Some(run_id.clone());
+        task.child_scope = sub
+            .scope
+            .clone()
+            .or_else(|| load_run(paths, &run_id).ok().map(|state| state.scope));
+        task.status = PlanTaskStatus::Completed;
+        tasks.push(task);
+    }
+    let mut plan = Plan::new(
+        campaign.root_goal.clone(),
+        PlanMode::FullPlan,
+        tasks,
+        campaign.providers.clone(),
+        None,
+        campaign.deadreckon_version.clone(),
+    )
+    .map_err(CliError::Core)?;
+    plan.plan_id = campaign.campaign_id.clone();
+    plan.status = PlanStatus::Forked;
+    plan.forked_at = campaign.forked_at;
+    plan.parent_cwd = Some(parent_cwd.to_path_buf());
+    Ok(plan)
+}
+
 pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     use deadreckon_core::campaign;
 
@@ -719,27 +797,6 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     });
     campaign::write_campaign_rollup(&campaign_dir, &rollup)?;
 
-    let result_run_ids: Vec<String> = campaign_obj
-        .sub_goals
-        .iter()
-        .filter_map(|sub| sub.result_run_id.clone())
-        .collect();
-    let merge_dir = campaign_dir.join("merge-working");
-    let compose = compose_result_runs(&paths, &result_run_ids, &merge_dir)?;
-    if !compose.conflicts.is_empty() {
-        campaign_obj.status = campaign::CampaignStatus::Failed;
-        campaign::write_campaign(&campaign_dir, &campaign_obj)?;
-        campaign::append_campaign_event(
-            &campaign_dir,
-            "campaign_failed",
-            serde_json::json!({ "reason": "cross-sub file conflict", "conflicts": compose.conflicts.len() }),
-        )?;
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "campaign failed: cross-sub file conflict",
-            "narrow sub-goals so they touch disjoint files (cross-level repair is a V1 candidate)",
-        )));
-    }
-
     if !campaign::campaign_can_complete(&campaign_obj, &rollup) {
         campaign_obj.status = campaign::CampaignStatus::Failed;
         campaign::write_campaign(&campaign_dir, &campaign_obj)?;
@@ -757,6 +814,97 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         )));
     }
 
+    let merge_plan = campaign_as_merge_repair_plan(&paths, &campaign_dir, &campaign_obj, &cwd)?;
+    let mut merge = compose_plan_merge_working(&paths, &merge_plan, PlanMergeStrategy::DagAware)?;
+    let unresolved_conflicts = merge.unresolved_conflicts();
+    if !unresolved_conflicts.is_empty() {
+        let repair_context = MergeRepairContext::final_merge(&paths, &merge_plan);
+        let provider = resolve_merge_repair_provider(&paths, &merge_plan, None)?;
+        campaign::append_campaign_event(
+            &campaign_dir,
+            "campaign_merge_conflict",
+            serde_json::json!({
+                "conflicts": unresolved_conflicts.len(),
+                "provider": provider,
+            }),
+        )?;
+        write_merge_repair_request(
+            &paths,
+            &merge_plan,
+            &repair_context,
+            provider.as_deref(),
+            &unresolved_conflicts,
+        )?;
+        campaign::append_campaign_event(
+            &campaign_dir,
+            "campaign_repair_planned",
+            serde_json::json!({
+                "conflicts": unresolved_conflicts.len(),
+                "provider": provider,
+            }),
+        )?;
+        let Some(provider) = provider else {
+            campaign_obj.status = campaign::CampaignStatus::Failed;
+            campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+            campaign::append_campaign_event(
+                &campaign_dir,
+                "campaign_repair_failed",
+                serde_json::json!({ "reason": "campaign merge repair needs a configured provider" }),
+            )?;
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "campaign failed: cross-sub file conflict; repair needs a configured provider",
+                "deadreckon providers list --all",
+            )));
+        };
+        campaign::append_campaign_event(
+            &campaign_dir,
+            "campaign_repair_started",
+            serde_json::json!({ "mode": MergeRepairMode::Auto.as_str(), "provider": provider }),
+        )?;
+        match run_merge_repair(
+            &paths,
+            &merge_plan,
+            &repair_context,
+            &MergeRepairOptions {
+                provider: &provider,
+                mode: MergeRepairMode::Auto,
+                attempts: 1,
+                quiet: args.quiet,
+            },
+            &mut merge,
+        )
+        .await
+        {
+            Ok(repaired) => {
+                campaign::append_campaign_event(
+                    &campaign_dir,
+                    "campaign_repaired",
+                    serde_json::json!({
+                        "strategy": repaired.strategy,
+                        "repair_run_id": repaired.repair_run_id,
+                    }),
+                )?;
+                write_plan_merge_conflicts(
+                    &paths,
+                    &merge_plan,
+                    PlanMergeStrategy::DagAware,
+                    &merge.conflicts,
+                )?;
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                campaign_obj.status = campaign::CampaignStatus::Failed;
+                campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+                campaign::append_campaign_event(
+                    &campaign_dir,
+                    "campaign_repair_failed",
+                    serde_json::json!({ "reason": reason }),
+                )?;
+                return Err(error);
+            }
+        }
+    }
+    let merge_dir = paths.merge_working(&campaign_obj.campaign_id);
     let result_state = promote_campaign_result(&paths, &campaign_id, &merge_dir, &rollup)?;
     campaign_obj.merged_run_id = Some(result_state.run_id.clone());
     campaign_obj.merged_at = Some(chrono::Utc::now());

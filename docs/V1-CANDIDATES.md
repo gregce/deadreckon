@@ -57,7 +57,7 @@
 ## Campaign orchestration (beyond depth-2)
 
 - Depth greater than 2 / cycle-safe arbitrary recursion: the campaign cap is a hard `CAMPAIGN_MAX_DEPTH = 2`. Deeper nesting needs a recursion-safe coordinator, cross-level cycle detection, and a blast-radius story before it earns its complexity.
-- Cross-sub dependency edges and cross-level merge repair: campaign sub-goals are independent islands and a cross-sub file conflict fails the campaign. A V1 could model dependencies between sub-orchestrators and extend semantic merge repair to the meta level.
+- Cross-sub dependency edges: campaign sub-goals are independent islands. A V1 could model dependencies between sub-orchestrators so later sub-goals can intentionally build on earlier campaign work instead of only reconciling at roll-up.
 - Recursive live attach with a true event tree: `attach <campaign-id>` is a one-hop plain summary today; drilling into a sub-plan uses `attach <sub-plan-id>`. A V1 could extend `PlanEventBus` to a hierarchy and stream the whole tree.
 - Planner-chosen per-sub breadth and per-sub provider roles: each sub-orchestrator runs a fixed small `--n` today; the planner could size each front and choose its providers.
 - Tree-budget strategies beyond even split: weighted allocation by sub size, dynamic reallocation from finished subs, and concurrent (non-sequential) sub launch once aggregate-budget accounting stays correct under concurrency.

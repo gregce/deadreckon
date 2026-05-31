@@ -234,7 +234,7 @@ fn write_file(root: &std::path::Path, relative: &str, body: &str) {
 }
 
 #[test]
-fn compose_result_runs_extracted_without_changing_plan_merge() {
+fn mergeable_run_files_shared_without_changing_plan_merge() {
     // The shared enumeration plan merge relies on: lists real files, skips
     // internal/generated paths (.deadreckon, docs/RUN-*).
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -336,7 +336,7 @@ fn campaign_meta_merge_composes_two_clean_sub_results() {
 }
 
 #[test]
-fn cross_sub_file_conflict_fails_campaign() {
+fn cross_sub_file_conflict_is_recorded_for_repair() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let root0 = tmp.path().join("sub-0-result");
     let root1 = tmp.path().join("sub-1-result");
@@ -354,6 +354,112 @@ fn cross_sub_file_conflict_fails_campaign() {
     assert_eq!(
         result.conflicts[0].path,
         std::path::PathBuf::from("src/shared.rs")
+    );
+}
+
+#[test]
+fn cross_sub_file_conflict_accepts_synthesized_repair() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root0 = tmp.path().join("sub-0-result");
+    let root1 = tmp.path().join("sub-1-result");
+    write_file(&root0, "src/shared.rs", "version from sub 0\n");
+    write_file(&root1, "src/shared.rs", "version from sub 1\n");
+    let merge_dir = tmp.path().join("merge-working");
+
+    let mut task0 = PlanTask::new(0, "sub-0 foundation", "foundation", PlanRole::Child, None);
+    task0.task_id = "sub-0".to_string();
+    task0.child_run_id = Some("run-0".to_string());
+    task0.status = PlanTaskStatus::Completed;
+    let mut task1 = PlanTask::new(1, "sub-1 polish", "polish", PlanRole::Child, None);
+    task1.task_id = "sub-1".to_string();
+    task1.child_run_id = Some("run-1".to_string());
+    task1.status = PlanTaskStatus::Completed;
+    let mut plan = Plan::new(
+        "campaign root",
+        PlanMode::FullPlan,
+        vec![task0, task1],
+        PlanProviders::default(),
+        None,
+        "test",
+    )
+    .expect("plan");
+    plan.plan_id = "campaign-1".to_string();
+
+    let sources = vec![
+        ComposeFileSource {
+            root: root0.clone(),
+            data: PlanMergeSource {
+                task_id: "sub-0".to_string(),
+                task_index: 0,
+                run_id: "run-0".to_string(),
+                artifact_root: root0,
+            },
+            prefix_error: "merge source prefix error",
+        },
+        ComposeFileSource {
+            root: root1.clone(),
+            data: PlanMergeSource {
+                task_id: "sub-1".to_string(),
+                task_index: 1,
+                run_id: "run-1".to_string(),
+                artifact_root: root1,
+            },
+            prefix_error: "merge source prefix error",
+        },
+    ];
+    let conflicts = compose_merge_sources(
+        &merge_dir,
+        &sources,
+        |source, _relative, file, hash| PlanMergeSeenFile {
+            task_id: source.task_id.clone(),
+            task_index: source.task_index,
+            run_id: source.run_id.clone(),
+            artifact_root: source.artifact_root.clone(),
+            artifact_path: file.to_path_buf(),
+            hash,
+        },
+        |relative, previous, current| ComposeMergeDecision::RecordConflict {
+            conflict: plan_merge_conflict(&plan, relative, previous, current, None),
+            use_current: false,
+        },
+    )
+    .expect("compose");
+    let mut merge = PlanMergeOutcome {
+        working_dir: merge_dir.clone(),
+        conflicts,
+    };
+    let repair_plan = MergeRepairPlan {
+        schema_version: Some(1),
+        decision: "synthesize".to_string(),
+        rationale: "combine campaign edits".to_string(),
+        actions: vec![MergeRepairAction {
+            path: std::path::PathBuf::from("src/shared.rs"),
+            action: "write_synthesized".to_string(),
+            chosen_task_id: None,
+            content: Some("merged campaign version\n".to_string()),
+            preserve: Vec::new(),
+        }],
+        repair_goal: None,
+    };
+
+    validate_merge_repair_plan(
+        &repair_plan,
+        &merge.unresolved_conflicts(),
+        MergeRepairMode::Auto,
+    )
+    .expect("repair plan valid");
+    apply_synthesized_repair(&repair_plan, &mut merge).expect("repair");
+
+    assert_eq!(
+        fs::read_to_string(merge_dir.join("src/shared.rs")).expect("shared"),
+        "merged campaign version\n"
+    );
+    assert_eq!(
+        merge.conflicts[0]
+            .deterministic_resolution
+            .as_ref()
+            .map(|resolution| resolution.kind.as_str()),
+        Some("planner_synthesize")
     );
 }
 
