@@ -1797,6 +1797,28 @@ mod tests {
         (paths, state)
     }
 
+    fn create_direct_api_run(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: goal.to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: Some("openai-compatible".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        (paths, state)
+    }
+
     fn write_seams_config(paths: &DeadreckonPaths, raw: &str) -> PathBuf {
         let config_path = paths.config_path();
         std::fs::create_dir_all(config_path.parent().expect("config parent"))
@@ -1846,9 +1868,55 @@ mod tests {
         .expect("loop")
     }
 
+    async fn run_direct_api_until_missing_credential(
+        state: &mut PipelineState,
+        paths: &DeadreckonPaths,
+        config_path: PathBuf,
+    ) -> String {
+        let router = ProviderRouter::from_config_path(&config_path, Some("openai-compatible"))
+            .expect("router");
+        run_turn_loop(
+            state,
+            &router,
+            RunLoopConfig {
+                provider: Some("openai-compatible".to_string()),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                sandbox_backend: SandboxBackend::None,
+                no_seams: false,
+                max_turns: 1,
+                from_turn: None,
+                event_sender: None,
+                cancellation_token: None,
+                docs: RunLoopDocsConfig {
+                    home: paths.home().to_path_buf(),
+                    config_path: Some(config_path),
+                    doc_provider: None,
+                    doc_provider_source: None,
+                    doc_subskills: Vec::new(),
+                    token_budget: 0,
+                    budget_cap_usd: None,
+                    doc_skill: "run-narrator".to_string(),
+                    no_docs: true,
+                },
+            },
+        )
+        .await
+        .expect_err("missing credential")
+        .to_string()
+    }
+
     fn read_seams_json(state: &PipelineState) -> Value {
         let raw = std::fs::read_to_string(state.run_root.join("seams.json")).expect("seams.json");
         serde_json::from_str(&raw).expect("seams json")
+    }
+
+    fn read_compaction_lines(state: &PipelineState) -> Vec<String> {
+        std::fs::read_to_string(state.run_root.join("compaction.jsonl"))
+            .expect("compaction")
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     async fn read_until_contains(path: &Path, needle: &str) -> String {
@@ -2344,6 +2412,131 @@ fallback_context_window = 80
         let full_history =
             std::fs::read_to_string(state.run_root.join("history.json")).expect("history");
         assert!(full_history.contains("old-turn-0"));
+    }
+
+    #[tokio::test]
+    async fn resume_re_resolves_seams_and_keeps_audit() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_direct_api_run(&temp, "resume re-resolves seams");
+        let config_path = write_seams_config(
+            &paths,
+            r#"
+default_provider = "openai-compatible"
+
+[seams.policy]
+command = ["/bin/sh", "-c", "cat >/dev/null; printf '{\"decision\":\"allow\"}\n'"]
+timeout_ms = 1000
+"#,
+        );
+
+        let err =
+            run_direct_api_until_missing_credential(&mut state, &paths, config_path.clone()).await;
+        assert!(err.contains("missing credential"));
+        let first_audit = read_seams_json(&state);
+        assert_eq!(
+            first_audit["kinds"]["policy"]["source"].as_str(),
+            Some("external")
+        );
+
+        let config_path = write_seams_config(
+            &paths,
+            r#"
+default_provider = "openai-compatible"
+
+[seams.hooks]
+command = ["/bin/sh", "-c", "cat >/dev/null; printf '{\"ok\":true}\n'"]
+timeout_ms = 1000
+"#,
+        );
+        let err = run_direct_api_until_missing_credential(&mut state, &paths, config_path).await;
+        assert!(err.contains("missing credential"));
+        let second_audit = read_seams_json(&state);
+
+        assert_eq!(
+            second_audit["kinds"]["policy"]["source"].as_str(),
+            Some("builtin")
+        );
+        assert_eq!(
+            second_audit["kinds"]["hooks"]["source"].as_str(),
+            Some("external")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_produces_identical_compaction() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_direct_api_run(&temp, "resume compaction determinism");
+        let config_path = write_seams_config(
+            &paths,
+            r#"
+default_provider = "openai-compatible"
+
+[compaction]
+fraction = 0.5
+keep_recent_turns = 2
+fallback_context_window = 80
+"#,
+        );
+        let history = (0..8)
+            .map(|idx| format!("old-turn-{idx}: {}", "x".repeat(180)))
+            .collect::<Vec<_>>();
+        save_history(&state, &history).expect("history");
+
+        let err =
+            run_direct_api_until_missing_credential(&mut state, &paths, config_path.clone()).await;
+        assert!(err.contains("missing credential"));
+        let err =
+            run_direct_api_until_missing_credential(&mut state, &paths, config_path.clone()).await;
+        assert!(err.contains("missing credential"));
+        let lines = read_compaction_lines(&state);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], lines[1]);
+    }
+
+    #[tokio::test]
+    async fn seams_json_and_compaction_jsonl_survive_resume() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_direct_api_run(&temp, "resume audit files");
+        let config_path = write_seams_config(
+            &paths,
+            r#"
+default_provider = "openai-compatible"
+
+[seams.event_sink]
+command = ["/bin/sh", "-c", "cat >/dev/null; printf '{\"ok\":true}\n'"]
+timeout_ms = 1000
+
+[compaction]
+fraction = 0.5
+keep_recent_turns = 2
+fallback_context_window = 80
+"#,
+        );
+        let history = (0..8)
+            .map(|idx| format!("resume-turn-{idx}: {}", "x".repeat(180)))
+            .collect::<Vec<_>>();
+        save_history(&state, &history).expect("history");
+
+        let _ =
+            run_direct_api_until_missing_credential(&mut state, &paths, config_path.clone()).await;
+        let first_compaction = read_compaction_lines(&state);
+        assert_eq!(first_compaction.len(), 1);
+        assert_eq!(
+            read_seams_json(&state)["kinds"]["event_sink"]["source"].as_str(),
+            Some("external")
+        );
+
+        let _ = run_direct_api_until_missing_credential(&mut state, &paths, config_path).await;
+        let second_compaction = read_compaction_lines(&state);
+
+        assert!(state.run_root.join("seams.json").exists());
+        assert_eq!(second_compaction.len(), 2);
+        assert_eq!(second_compaction[0], first_compaction[0]);
+        assert_eq!(
+            read_seams_json(&state)["kinds"]["event_sink"]["source"].as_str(),
+            Some("external")
+        );
     }
 
     #[test]

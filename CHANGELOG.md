@@ -27,6 +27,8 @@
 - P9: Added explicit seam config validation tests for unknown kinds, empty
   commands, and bad timeouts, plus an all-seams smoke run that writes
   `seams.json` and validates a gate marker.
+- P10: Added resume-sweep coverage for seam re-resolution, deterministic
+  compaction replay, and survival of `seams.json`/`compaction.jsonl`.
 
 ## Navigable campaign attach (production release) - 2026-05-31
 
