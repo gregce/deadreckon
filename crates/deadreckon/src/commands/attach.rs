@@ -811,7 +811,7 @@ async fn handle_tui_completion_key(
         ),
         CompletionAction::Abandon => abandon_command(state.run_id.clone(), false, false),
         CompletionAction::Docs => {
-            Box::pin(doc_command(DocCommandArgs {
+            Box::pin(super::doc::doc_command(super::doc::DocCommandArgs {
                 run_id: state.run_id.clone(),
                 kind: CliDocKind::Narrative,
                 export: None,

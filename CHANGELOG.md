@@ -130,6 +130,9 @@
   `deadreckon library` handling into `src/commands/inspection.rs`, keeping only
   crate-private plan/library list seams for start/status and reducing `main.rs`
   to roughly 14.3k lines.
+- Post-P11g: Moved `deadreckon doc` run/plan dispatch and doc-polish preview
+  helpers into `src/commands/doc.rs`, leaving narrative attach provider
+  selection at the root and reducing `main.rs` to roughly 14.0k lines.
 
 ## Effortless (production release) - 2026-05-28
 

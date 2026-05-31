@@ -13,6 +13,7 @@ use super::commands::campaign::{
 use super::commands::chain::{
     chain_should_auto_attach, chain_step_dot, chain_wall_cap_hit, per_step_wall_cap,
 };
+use super::commands::doc::doc_polish_preview_text;
 use super::commands::orchestrate::{recommend_child_count_for_goal, recommend_orchestration_mode};
 use super::commands::plan::{
     implementation_plan_warnings, orchestration_dependency_rows, orchestration_parallelism_lines,
@@ -52,8 +53,8 @@ use super::{
     claude_project_name_for_workdir, cli_wait_status_line, collect_jsonl_provider_activity,
     collect_jsonl_provider_activity_scan, collect_plan_doc_input, command_discovery,
     completion_action_from_input, completion_hints_enabled, deadreckoning_course_ascii,
-    deadreckoning_status_text, doc_polish_preview_text, kill_banner, launch_preview_rows,
-    live_file_lines, materialize_plan_docs_to_working, meter_color, narrative_provider_selection,
+    deadreckoning_status_text, kill_banner, launch_preview_rows, live_file_lines,
+    materialize_plan_docs_to_working, meter_color, narrative_provider_selection,
     plan_attach_footer, plan_doc_path, plan_merge_repair_summary_items,
     plan_narrative_refresh_request, plan_narrative_refresh_trigger,
     poll_plan_narrative_refresh_job, poll_run_narrative_refresh_job, provider_ingest_base_roots,
