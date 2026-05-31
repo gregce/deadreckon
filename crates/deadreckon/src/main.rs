@@ -94,7 +94,8 @@ use deadreckon_providers::{
     read_config,
 };
 use deadreckon_runtime::{
-    PolishConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, polish_run_docs, run_turn_loop,
+    PolishConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, SeamRunCtx, polish_run_docs,
+    read_seams_config, resolve_catalog_override, run_turn_loop,
 };
 use deadreckon_sandbox::SandboxBackend;
 use ratatui::Terminal;
@@ -1808,6 +1809,30 @@ fn provider_override_from_setup(selection: &setup::ProviderSetupSelection) -> Op
         | setup::SetupProviderSource::AutoSubscription
         | setup::SetupProviderSource::RunProvider => selection.provider.clone(),
     }
+}
+
+async fn provider_router_for_run_with_catalog_seam(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    backend: SandboxBackend,
+    provider_override: Option<&str>,
+    model: Option<&str>,
+    no_seams: bool,
+) -> Result<ProviderRouter> {
+    let seams = read_seams_config(&paths.config_path(), no_seams)?;
+    let seam_ctx = SeamRunCtx {
+        run_root: state.run_root.clone(),
+        working_dir: state.working_dir.clone(),
+        sandbox_backend: backend,
+    };
+    let catalog_override = resolve_catalog_override(&seams, &seam_ctx).await;
+    ProviderRouter::from_config_path_with_model_and_catalog_override(
+        &paths.config_path(),
+        provider_override,
+        model,
+        catalog_override.as_ref(),
+    )
+    .map_err(Into::into)
 }
 
 fn config_command(command: ConfigCommand) -> Result<()> {
@@ -7614,7 +7639,15 @@ async fn resume_command(
     lock.heartbeat("resume-turn-loop")?;
     let provider = state.provider.clone();
     let backend: SandboxBackend = state.sandbox.parse()?;
-    let router = ProviderRouter::from_config_path(&paths.config_path(), provider.as_deref())?;
+    let router = provider_router_for_run_with_catalog_seam(
+        &paths,
+        &state,
+        backend,
+        provider.as_deref(),
+        None,
+        false,
+    )
+    .await?;
     let selected_route = router.selected_route_info();
     let defaults = config_defaults(&paths)?;
     let doc_provider_selection = doc_provider_selection_from_setup(&doc_provider_setup_selection(

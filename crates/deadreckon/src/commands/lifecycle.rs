@@ -997,8 +997,8 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             doc_skill: effective_doc_skill,
             no_docs,
             backend,
-            router,
-            selected_route: selected_route.clone(),
+            provider_override: provider_override.clone(),
+            model: model.clone(),
             provider_source: primary_setup.source.as_str().to_string(),
             post_actions,
             context_turns,
@@ -1081,6 +1081,16 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
+    let router = provider_router_for_run_with_catalog_seam(
+        &paths,
+        &state,
+        backend,
+        provider_override.as_deref(),
+        model.as_deref(),
+        false,
+    )
+    .await?;
+    let selected_route = router.selected_route_info();
     print_run_started(
         &state,
         selected_route.as_ref(),
@@ -1155,8 +1165,8 @@ struct ExtendWorktreeArgs {
     doc_skill: String,
     no_docs: bool,
     backend: SandboxBackend,
-    router: ProviderRouter,
-    selected_route: Option<ProviderRouteInfo>,
+    provider_override: Option<String>,
+    model: Option<String>,
     provider_source: String,
     post_actions: bool,
     context_turns: Option<u32>,
@@ -1179,8 +1189,8 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         doc_skill,
         no_docs,
         backend,
-        router,
-        selected_route,
+        provider_override,
+        model,
         provider_source,
         post_actions,
         context_turns,
@@ -1271,6 +1281,16 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     state.set_phase_status(PhaseId(30), PhaseStatus::Executing)?;
     save_state(&state)?;
     lock.heartbeat("turn-loop")?;
+    let router = provider_router_for_run_with_catalog_seam(
+        &paths,
+        &state,
+        backend,
+        provider_override.as_deref(),
+        model.as_deref(),
+        false,
+    )
+    .await?;
+    let selected_route = router.selected_route_info();
     print_run_started(
         &state,
         selected_route.as_ref(),

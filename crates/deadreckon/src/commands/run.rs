@@ -319,6 +319,20 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             std::process::exit(exit_code);
         }
     };
+    let router = if smoke {
+        router
+    } else {
+        provider_router_for_run_with_catalog_seam(
+            &paths,
+            &state,
+            backend,
+            provider_override.as_deref(),
+            model.as_deref(),
+            false,
+        )
+        .await?
+    };
+    let selected_route = router.selected_route_info();
     if !quiet {
         print_run_started(
             &state,

@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::Path;
 
-use crate::registry::{DescriptorKind, ProviderDescriptor, ProviderRegistry};
+use crate::registry::{
+    DescriptorKind, ModelCatalogOverride, ModelEntry, ProviderDescriptor, ProviderRegistry,
+};
 use crate::{ProviderConfigFile, ProviderEntry, ProviderError, ProviderKind, Result};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/Users/gdc/.deadreckon/config.toml";
@@ -128,6 +130,57 @@ pub(crate) fn merge_provider_entry(base: &mut ProviderEntry, entry: ProviderEntr
     if !entry.extra_args.is_empty() {
         base.extra_args = entry.extra_args;
     }
+}
+
+pub(crate) fn apply_catalog_to_provider_entry(
+    provider_name: &str,
+    entry: &mut ProviderEntry,
+    registry: &ProviderRegistry,
+    catalog_override: Option<&ModelCatalogOverride>,
+) -> Option<u32> {
+    let model = entry.model.as_deref()?;
+    let descriptor_entry = descriptor_for_entry(provider_name, entry, registry)
+        .and_then(|descriptor| model_entry_for_model(&descriptor.model_catalog, model));
+    let selected = catalog_override
+        .and_then(|catalog| catalog.entry_for_model(model))
+        .or(descriptor_entry);
+    if let Some(model_entry) = selected {
+        if let Some(input) = model_entry.input_per_million {
+            entry.input_cost_per_million = Some(input);
+        }
+        if let Some(output) = model_entry.output_per_million {
+            entry.output_cost_per_million = Some(output);
+        }
+        model_entry.context_window
+    } else {
+        None
+    }
+}
+
+fn descriptor_for_entry<'a>(
+    provider_name: &str,
+    entry: &ProviderEntry,
+    registry: &'a ProviderRegistry,
+) -> Option<&'a ProviderDescriptor> {
+    let descriptor_id = match entry.kind.as_ref() {
+        Some(ProviderKind::Anthropic) => Some("anthropic"),
+        Some(ProviderKind::OpenAi) => Some("openai"),
+        Some(ProviderKind::OpenAiCompatible) => Some("openai-compatible"),
+        Some(ProviderKind::CliClaudeCode) => Some("cli:claude-code"),
+        Some(ProviderKind::CliCodex) => Some("cli:codex"),
+        Some(ProviderKind::ScriptedSmoke) => Some("smoke"),
+        Some(ProviderKind::Generic(id)) => Some(id.as_str()),
+        None => None,
+    };
+    descriptor_id
+        .and_then(|id| registry.get(id))
+        .or_else(|| registry.get(provider_name))
+}
+
+fn model_entry_for_model<'a>(catalog: &'a [ModelEntry], model: &str) -> Option<&'a ModelEntry> {
+    catalog
+        .iter()
+        .find(|entry| entry.id == model || entry.aliases.iter().any(|alias| alias == model))
 }
 
 pub(crate) fn kind_from_name(name: &str) -> ProviderKind {

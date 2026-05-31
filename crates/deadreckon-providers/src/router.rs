@@ -1,13 +1,15 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::cli_claude_code::CliClaudeCodeProvider;
 use crate::cli_codex::CliCodexProvider;
 use crate::cli_generic::GenericCliProvider;
 use crate::config::{
-    kind_from_name, merge_provider_entry, provider_entries_from_registry, read_config,
+    apply_catalog_to_provider_entry, kind_from_name, merge_provider_entry,
+    provider_entries_from_registry, read_config,
 };
 use crate::http::ProviderAdapter;
-use crate::registry::{DescriptorKind, ProviderRegistry};
+use crate::registry::{DescriptorKind, ModelCatalogOverride, ProviderRegistry};
 use crate::smoke::ScriptedSmokeProvider;
 use crate::{
     Provider, ProviderConfigFile, ProviderEntry, ProviderError, ProviderKind, ProviderRequest,
@@ -16,12 +18,14 @@ use crate::{
 
 pub struct ProviderRouter {
     routes: Vec<Box<dyn Provider>>,
+    context_windows: BTreeMap<String, Option<u32>>,
 }
 
 impl ProviderRouter {
     pub fn smoke() -> Self {
         Self {
             routes: vec![Box::new(ScriptedSmokeProvider::new())],
+            context_windows: BTreeMap::new(),
         }
     }
 
@@ -33,6 +37,20 @@ impl ProviderRouter {
         path: &Path,
         override_provider: Option<&str>,
         override_model: Option<&str>,
+    ) -> Result<Self> {
+        Self::from_config_path_with_model_and_catalog_override(
+            path,
+            override_provider,
+            override_model,
+            None,
+        )
+    }
+
+    pub fn from_config_path_with_model_and_catalog_override(
+        path: &Path,
+        override_provider: Option<&str>,
+        override_model: Option<&str>,
+        catalog_override: Option<&ModelCatalogOverride>,
     ) -> Result<Self> {
         // REPORT.md: Provider Routing / BYOK keeps credentials in the user's
         // local config/env and tries the configured fallback chain.
@@ -47,6 +65,7 @@ impl ProviderRouter {
             override_provider,
             override_model,
             &registry,
+            catalog_override,
         )
     }
 
@@ -62,12 +81,27 @@ impl ProviderRouter {
         override_provider: Option<&str>,
         override_model: Option<&str>,
     ) -> Result<Self> {
+        Self::from_config_with_model_and_catalog_override(
+            config,
+            override_provider,
+            override_model,
+            None,
+        )
+    }
+
+    pub fn from_config_with_model_and_catalog_override(
+        config: ProviderConfigFile,
+        override_provider: Option<&str>,
+        override_model: Option<&str>,
+        catalog_override: Option<&ModelCatalogOverride>,
+    ) -> Result<Self> {
         let registry = ProviderRegistry::builtin()?;
         Self::from_config_with_model_and_registry(
             config,
             override_provider,
             override_model,
             &registry,
+            catalog_override,
         )
     }
 
@@ -76,6 +110,7 @@ impl ProviderRouter {
         override_provider: Option<&str>,
         override_model: Option<&str>,
         registry: &ProviderRegistry,
+        catalog_override: Option<&ModelCatalogOverride>,
     ) -> Result<Self> {
         let mut providers = provider_entries_from_registry(registry);
         for (name, entry) in config.providers {
@@ -93,6 +128,7 @@ impl ProviderRouter {
         };
 
         let mut routes = Vec::new();
+        let mut context_windows = BTreeMap::new();
         for name in route_names {
             let Some(mut entry) = providers.remove(&name) else {
                 return Err(ProviderError::InvalidConfig(format!(
@@ -102,12 +138,18 @@ impl ProviderRouter {
             if let Some(model) = override_model {
                 entry.model = Some(model.to_string());
             }
+            let context_window =
+                apply_catalog_to_provider_entry(&name, &mut entry, registry, catalog_override);
             let kind = entry.kind.unwrap_or_else(|| kind_from_name(&name));
             entry.kind = Some(kind.clone());
-            routes.push(build_provider(name, kind, entry, registry)?);
+            routes.push(build_provider(name.clone(), kind, entry, registry)?);
+            context_windows.insert(name, context_window);
         }
 
-        Ok(Self { routes })
+        Ok(Self {
+            routes,
+            context_windows,
+        })
     }
 
     pub fn routes(&self) -> &[Box<dyn Provider>] {
@@ -133,6 +175,14 @@ impl ProviderRouter {
             .find(|route| route.has_credential)
             .cloned()
             .or_else(|| routes.into_iter().next())
+    }
+
+    pub fn context_window_for_route(&self, provider_name: Option<&str>) -> Option<u32> {
+        let route_name = provider_name
+            .and_then(|name| self.routes.iter().find(|route| route.name() == name))
+            .or_else(|| self.routes.first())
+            .map(|route| route.name())?;
+        self.context_windows.get(route_name).copied().flatten()
     }
 
     pub async fn complete(&self, request: &ProviderRequest) -> Result<ProviderResponse> {

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use deadreckon_core::error::{DeadreckonError, Result};
+use deadreckon_providers::ModelCatalogOverride;
 use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as run_sandbox};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -271,6 +272,24 @@ pub async fn dispatch_seam(
     map_success(kind, parsed)
 }
 
+pub async fn resolve_catalog_override(
+    seams: &SeamsConfig,
+    ctx: &SeamRunCtx,
+) -> Option<ModelCatalogOverride> {
+    match dispatch_seam(
+        SeamKind::Catalog,
+        &Value::Object(Default::default()),
+        seams,
+        ctx,
+    )
+    .await
+    {
+        SeamOutcome::Ok(value) => ModelCatalogOverride::from_value(value).ok(),
+        SeamOutcome::Unconfigured | SeamOutcome::Fallback | SeamOutcome::Skipped(_) => None,
+        SeamOutcome::Deny(_) => None,
+    }
+}
+
 fn seam_sandbox_spec(
     command: &SeamCommandConfig,
     ctx: &SeamRunCtx,
@@ -486,6 +505,27 @@ timeout_ms = 1
             dispatch_seam(SeamKind::Hooks, &json!({}), &hooks, &ctx(&temp)).await,
             SeamOutcome::Skipped(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn catalog_seam_malformed_falls_back_to_builtin() {
+        let temp = TempDir::new().expect("temp");
+        let seams = SeamsConfig::with_command(
+            SeamKind::Catalog,
+            SeamCommandConfig {
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat >/dev/null; printf '{\"models\":[{\"context_window\":1}]}'\\n".to_string(),
+                ],
+                timeout_ms: 1_000,
+            },
+        )
+        .expect("seams");
+
+        let catalog = resolve_catalog_override(&seams, &ctx(&temp)).await;
+
+        assert!(catalog.is_none());
     }
 
     #[test]

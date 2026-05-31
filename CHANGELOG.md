@@ -9,6 +9,9 @@
 - P2: Wired the policy seam into bash/write_file dispatch after the
   `sandbox.toml` floor, reusing the existing tool-refusal provenance path for
   denials while preserving builtin behavior when no policy seam is configured.
+- P3: Added the model-catalog seam path: catalog responses can override route
+  context windows and pricing at router construction, while malformed or absent
+  catalog seams fall open to the built-in model list.
 
 ## Navigable campaign attach (production release) - 2026-05-31
 

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use toml::Value;
 
 use crate::ProviderError;
@@ -121,6 +122,55 @@ pub struct ModelEntry {
     pub input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
     pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelCatalogOverride {
+    entries: BTreeMap<String, ModelEntry>,
+}
+
+impl ModelCatalogOverride {
+    pub fn from_value(value: JsonValue) -> Result<Self> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CatalogResponse {
+            models: Vec<ModelEntry>,
+        }
+
+        let response: CatalogResponse = serde_json::from_value(value).map_err(|source| {
+            ProviderError::InvalidConfig(format!(
+                "catalog seam response must be {{\"models\": [...]}}: {source}"
+            ))
+        })?;
+        Self::from_models(response.models)
+    }
+
+    pub fn from_models(models: Vec<ModelEntry>) -> Result<Self> {
+        if models.is_empty() {
+            return Err(ProviderError::InvalidConfig(
+                "catalog seam response must include at least one model".to_string(),
+            ));
+        }
+        let mut entries = BTreeMap::new();
+        for model in models {
+            if model.id.trim().is_empty() {
+                return Err(ProviderError::InvalidConfig(
+                    "catalog seam model id must not be empty".to_string(),
+                ));
+            }
+            entries.insert(model.id.clone(), model.clone());
+            for alias in &model.aliases {
+                if !alias.trim().is_empty() {
+                    entries.insert(alias.clone(), model.clone());
+                }
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    pub fn entry_for_model(&self, model: &str) -> Option<&ModelEntry> {
+        self.entries.get(model)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

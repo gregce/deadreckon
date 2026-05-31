@@ -20,6 +20,7 @@ pub mod taxonomy;
 pub use config::{DEFAULT_CONFIG_PATH, read_config};
 pub use error::{ProviderError, Result};
 pub use http::ProviderAdapter;
+pub use registry::{ModelCatalogOverride, ModelEntry};
 pub use router::ProviderRouter;
 pub use types::{
     Provider, ProviderConfigFile, ProviderEntry, ProviderFuture, ProviderKind, ProviderRequest,
@@ -34,8 +35,8 @@ mod tests {
 
     use super::config::builtin_entries;
     use super::{
-        Provider, ProviderAdapter, ProviderConfigFile, ProviderEntry, ProviderKind, ProviderRouter,
-        ProviderUsage, read_config,
+        ModelCatalogOverride, ModelEntry, Provider, ProviderAdapter, ProviderConfigFile,
+        ProviderEntry, ProviderKind, ProviderRouter, ProviderUsage, read_config,
     };
 
     #[test]
@@ -259,6 +260,109 @@ api_key = "anthropic-key"
             output_tokens: 2_000,
         });
         assert_eq!(spend.cost_usd, 0.018);
+    }
+
+    #[test]
+    fn catalog_seam_overrides_context_window_and_pricing() {
+        let catalog = ModelCatalogOverride::from_models(vec![ModelEntry {
+            id: "custom-model".to_string(),
+            context_window: Some(123_456),
+            input_per_million: Some(2.0),
+            output_per_million: Some(3.0),
+            aliases: vec!["custom-alias".to_string()],
+        }])
+        .expect("catalog");
+        let router = ProviderRouter::from_config_with_model_and_catalog_override(
+            ProviderConfigFile {
+                default_provider: Some("openai".to_string()),
+                fallback: None,
+                providers: Default::default(),
+            },
+            None,
+            Some("custom-alias"),
+            Some(&catalog),
+        )
+        .expect("router");
+
+        assert_eq!(
+            router.context_window_for_route(Some("openai")),
+            Some(123_456)
+        );
+        let spend = router
+            .estimate_for_route(
+                Some("openai"),
+                ProviderUsage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                },
+            )
+            .expect("spend");
+        assert_eq!(spend.cost_usd, 5.0);
+    }
+
+    #[test]
+    fn catalog_seam_malformed_falls_back_to_builtin() {
+        let malformed = serde_json::json!({
+            "models": [
+                { "context_window": 1, "input_per_million": 99.0 }
+            ]
+        });
+        assert!(ModelCatalogOverride::from_value(malformed).is_err());
+
+        let router = ProviderRouter::from_config_with_model_and_catalog_override(
+            ProviderConfigFile {
+                default_provider: Some("openai".to_string()),
+                fallback: None,
+                providers: Default::default(),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect("router");
+
+        assert_eq!(
+            router.context_window_for_route(Some("openai")),
+            Some(400_000)
+        );
+        let spend = router
+            .estimate_for_route(
+                Some("openai"),
+                ProviderUsage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                },
+            )
+            .expect("spend");
+        assert_eq!(spend.cost_usd, 11.25);
+    }
+
+    #[test]
+    fn unconfigured_catalog_uses_builtin_model_entry_list() {
+        let router = ProviderRouter::from_config(
+            ProviderConfigFile {
+                default_provider: Some("anthropic".to_string()),
+                fallback: None,
+                providers: Default::default(),
+            },
+            None,
+        )
+        .expect("router");
+
+        assert_eq!(
+            router.context_window_for_route(Some("anthropic")),
+            Some(200_000)
+        );
+        let spend = router
+            .estimate_for_route(
+                Some("anthropic"),
+                ProviderUsage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                },
+            )
+            .expect("spend");
+        assert_eq!(spend.cost_usd, 18.0);
     }
 
     #[tokio::test]
