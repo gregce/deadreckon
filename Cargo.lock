@@ -629,7 +629,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
- "tracing",
  "uuid",
  "walkdir",
 ]
@@ -639,7 +638,6 @@ name = "deadreckon-providers"
 version = "0.1.0"
 dependencies = [
  "axum",
- "chrono",
  "deadreckon-core",
  "deadreckon-sandbox",
  "reqwest 0.12.28",
@@ -650,7 +648,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
- "tracing",
  "which",
 ]
 
@@ -682,7 +679,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
- "tracing",
  "which",
 ]
 

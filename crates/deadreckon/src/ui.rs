@@ -206,21 +206,6 @@ pub(crate) fn ui_error(text: impl AsRef<str>) -> String {
     render(Stream::Stderr, Tone::Negative, text)
 }
 
-#[allow(dead_code)]
-pub(crate) fn write(stream: Stream, tone: Tone, text: impl AsRef<str>) -> io::Result<()> {
-    let rendered = render(stream, tone, text);
-    match stream {
-        Stream::Stdout => {
-            print!("{rendered}");
-            io::stdout().flush()
-        }
-        Stream::Stderr => {
-            eprint!("{rendered}");
-            io::stderr().flush()
-        }
-    }
-}
-
 pub(crate) fn writeln(stream: Stream, tone: Tone, text: impl AsRef<str>) -> io::Result<()> {
     let rendered = render(stream, tone, text);
     match stream {
@@ -241,27 +226,6 @@ pub(crate) fn hint(stream: Stream, text: impl AsRef<str>) -> io::Result<()> {
         Tone::Hint,
         format!("  hint: {}", text.as_ref().trim()),
     )
-}
-
-#[allow(dead_code)]
-pub(crate) fn kv_block<K, V>(stream: Stream, items: &[(K, V)]) -> io::Result<()>
-where
-    K: AsRef<str>,
-    V: AsRef<str>,
-{
-    let width = items
-        .iter()
-        .map(|(key, _)| key.as_ref().chars().count())
-        .max()
-        .unwrap_or(0);
-    for (key, value) in items {
-        writeln(
-            stream,
-            Tone::Plain,
-            format!("{:<width$}: {}", key.as_ref(), value.as_ref()),
-        )?;
-    }
-    Ok(())
 }
 
 pub(crate) fn clear_current_line(stream: Stream) -> io::Result<()> {

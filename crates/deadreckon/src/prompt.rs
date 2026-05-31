@@ -45,7 +45,7 @@ pub(crate) struct SelectPrompt {
 }
 
 pub(crate) fn open(message: &str, _default: Option<&str>) -> Result<String> {
-    ui::write(Stream::Stdout, Tone::Prompt, "?")?;
+    print!("{}", ui::render(Stream::Stdout, Tone::Prompt, "?"));
     print!(" {message}");
     io::stdout().flush()?;
     let mut input = String::new();

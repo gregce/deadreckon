@@ -246,21 +246,24 @@ impl PlanEventFeed {
 
     fn read_child_and_repair_events(&mut self, events: &mut Vec<PlanFeedEvent>) {
         for ((task_id, run_id), tail) in &mut self.child_tails {
-            events.extend(tail.read_new().into_iter().flatten().map(|event| {
-                PlanFeedEvent::ChildRun {
+            let task_id = task_id.clone();
+            let run_id = run_id.clone();
+            for event in tail.read_new().into_iter().flatten() {
+                events.push(PlanFeedEvent::ChildRun {
                     task_id: task_id.clone(),
                     run_id: run_id.clone(),
                     event,
-                }
-            }));
+                });
+            }
         }
         for (run_id, tail) in &mut self.repair_tails {
-            events.extend(tail.read_new().into_iter().flatten().map(|event| {
-                PlanFeedEvent::RepairRun {
+            let run_id = run_id.clone();
+            for event in tail.read_new().into_iter().flatten() {
+                events.push(PlanFeedEvent::RepairRun {
                     run_id: run_id.clone(),
                     event,
-                }
-            }));
+                });
+            }
         }
     }
 
@@ -365,14 +368,14 @@ where
         std::mem::swap(&mut buffer, &mut self.partial);
         buffer.push_str(&raw);
         let complete = buffer.ends_with('\n');
-        let mut lines = buffer.lines().map(str::to_string).collect::<Vec<_>>();
+        let mut lines = buffer.lines().collect::<Vec<_>>();
         if !complete {
-            self.partial = lines.pop().unwrap_or_default();
+            self.partial = lines.pop().unwrap_or_default().to_string();
         }
         Ok(lines
             .into_iter()
             .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str::<T>(&line).ok())
+            .filter_map(|line| serde_json::from_str::<T>(line).ok())
             .collect())
     }
 

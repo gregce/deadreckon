@@ -1612,7 +1612,7 @@ fn chain_header_items(paths: &DeadreckonPaths, chain: &Chain) -> Vec<(&'static s
 fn print_chain_header(paths: &DeadreckonPaths, chain: &Chain) {
     println!("{}", ui_heading("chain"));
     let items = chain_header_items(paths, chain);
-    let _ = ui::kv_block(ui::Stream::Stdout, &items);
+    print_kv_block(&items);
 }
 
 pub(crate) fn chain_attach_command(paths: &DeadreckonPaths, id: &str, plain: bool) -> Result<()> {

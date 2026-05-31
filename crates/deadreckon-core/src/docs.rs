@@ -31,6 +31,13 @@ const IMPLEMENTATION_NOTE_SECTIONS: [(&str, &str); 4] = [
     ("tradeoffs", "Tradeoffs"),
     ("open-questions", "Open questions"),
 ];
+const ILL_REGEX_PATTERN: &str = r"(?i)\bi['’]?ll\s+([a-z][a-z0-9_-]*(?:\s+[a-z0-9_./-]+){0,5})";
+const DECISION_MARKER_PATTERNS: &[&str] = &[
+    r"(?i)\b(let me consider|let me think|i'll go with|i'll choose)\b",
+    r"(?i)\b(option [123]|alternatives?:|either .* or)\b",
+    r"(?i)\b(instead of|rather than|actually,?\s*let)\b",
+    r"(?i)\bdecision\b.*\b(chose|pick|go(?:ing)? with)\b",
+];
 
 #[derive(Debug, Clone)]
 pub struct FrontmatterFields {
@@ -2288,34 +2295,41 @@ fn phase_from_group(index: usize, turns: Vec<TurnRecord>) -> Phase {
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "BUG-tagged static regex invariant; tests compile the patterns explicitly"
+)]
 fn ill_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        match Regex::new(r"(?i)\bi['’]?ll\s+([a-z][a-z0-9_-]*(?:\s+[a-z0-9_./-]+){0,5})") {
-            Ok(regex) => regex,
-            Err(err) => panic!("valid auto-title regex: {err}"),
-        }
+        Regex::new(ill_regex_pattern()).expect("BUG: auto-title regex pattern must compile")
     })
 }
 
+fn ill_regex_pattern() -> &'static str {
+    ILL_REGEX_PATTERN
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "BUG-tagged static regex invariant; tests compile the patterns explicitly"
+)]
 fn decision_markers() -> &'static [Regex] {
     static REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
     REGEXES
         .get_or_init(|| {
-            [
-                r"(?i)\b(let me consider|let me think|i'll go with|i'll choose)\b",
-                r"(?i)\b(option [123]|alternatives?:|either .* or)\b",
-                r"(?i)\b(instead of|rather than|actually,?\s*let)\b",
-                r"(?i)\bdecision\b.*\b(chose|pick|go(?:ing)? with)\b",
-            ]
-            .iter()
-            .map(|pattern| match Regex::new(pattern) {
-                Ok(regex) => regex,
-                Err(err) => panic!("valid decision marker regex: {err}"),
-            })
-            .collect()
+            decision_marker_patterns()
+                .iter()
+                .map(|pattern| {
+                    Regex::new(pattern).expect("BUG: decision marker regex pattern must compile")
+                })
+                .collect()
         })
         .as_slice()
+}
+
+fn decision_marker_patterns() -> &'static [&'static str] {
+    DECISION_MARKER_PATTERNS
 }
 
 fn title_case_words(input: &str, max_words: usize) -> String {
@@ -2492,4 +2506,17 @@ pub fn copy_public_docs_from_internal(working_dir: &Path) -> Result<()> {
         copy_tree(&internal, &public)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use regex::Regex;
+
+    #[test]
+    fn docs_regex_patterns_compile() {
+        Regex::new(super::ill_regex_pattern()).expect("auto-title regex should compile");
+        for pattern in super::decision_marker_patterns() {
+            Regex::new(pattern).expect("decision marker regex should compile");
+        }
+    }
 }

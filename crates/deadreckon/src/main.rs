@@ -232,8 +232,32 @@ fn try_footer(hint: impl AsRef<str>) -> String {
     }
 }
 
-fn print_kv_block(items: &[(&str, &str)]) {
-    let _ = ui::kv_block(ui::Stream::Stdout, items);
+fn print_kv_block<K, V>(items: &[(K, V)])
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let _ = write_kv_block(items);
+}
+
+fn write_kv_block<K, V>(items: &[(K, V)]) -> io::Result<()>
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let width = items
+        .iter()
+        .map(|(key, _)| key.as_ref().chars().count())
+        .max()
+        .unwrap_or(0);
+    for (key, value) in items {
+        ui::writeln(
+            ui::Stream::Stdout,
+            ui::Tone::Plain,
+            format!("{:<width$}: {}", key.as_ref(), value.as_ref()),
+        )?;
+    }
+    Ok(())
 }
 
 fn print_error(err: &CliError) {
@@ -9164,9 +9188,7 @@ struct ComposeConflict {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // merge_dir consumed by the campaign command in P9
 struct ComposeResult {
-    merge_dir: PathBuf,
     conflicts: Vec<ComposeConflict>,
 }
 
@@ -9254,14 +9276,10 @@ fn compose_roots(roots: &[(String, PathBuf)], merge_dir: &Path) -> Result<Compos
             use_current: false,
         },
     )?;
-    Ok(ComposeResult {
-        merge_dir: merge_dir.to_path_buf(),
-        conflicts,
-    })
+    Ok(ComposeResult { conflicts })
 }
 
 /// Resolve campaign sub-result run ids to their artifact roots and compose them.
-#[allow(dead_code)] // wired by the campaign command in P9
 fn compose_result_runs(
     paths: &DeadreckonPaths,
     run_ids: &[String],
@@ -13404,8 +13422,20 @@ fn pad_rendered(value: &str, width: usize, render: Option<fn(String) -> String>)
     format!("{rendered}{}", " ".repeat(padding))
 }
 
+fn compact_whitespace(value: &str) -> String {
+    value
+        .split_whitespace()
+        .fold(String::new(), |mut out, word| {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+            out
+        })
+}
+
 fn wrap_list_goal(value: &str, width: usize) -> Vec<String> {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = compact_whitespace(value);
     if compact.is_empty() {
         return vec![String::new()];
     }
@@ -16301,7 +16331,7 @@ fn render_why_failed(report: WhyFailedReport) {
     if let Some(reason) = report.reason {
         items.push(("reason", reason));
     }
-    let _ = ui::kv_block(ui::Stream::Stdout, &items);
+    print_kv_block(&items);
     if !report.evidence.is_empty() {
         println!("evidence:");
         for line in report.evidence {
@@ -22581,7 +22611,7 @@ fn format_count(value: u64) -> String {
 }
 
 fn one_line(value: &str, max_chars: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = compact_whitespace(value);
     let mut chars = compact.chars();
     let shortened = chars.by_ref().take(max_chars).collect::<String>();
     if chars.next().is_some() {

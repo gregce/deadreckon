@@ -1,4 +1,4 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -82,9 +82,4 @@ fn git_io(source: std::io::Error) -> DeadreckonError {
         path: PathBuf::from("git"),
         source,
     }
-}
-
-#[allow(dead_code)]
-fn _is_git_binary(binary: &OsStr) -> bool {
-    binary == OsStr::new("git")
 }

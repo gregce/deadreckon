@@ -2707,8 +2707,20 @@ fn short_id(value: &str) -> String {
     value.chars().take(8).collect()
 }
 
+fn compact_whitespace(value: &str) -> String {
+    value
+        .split_whitespace()
+        .fold(String::new(), |mut out, word| {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+            out
+        })
+}
+
 fn one_line(value: &str, max_chars: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = compact_whitespace(value);
     let mut chars = compact.chars();
     let shortened = chars.by_ref().take(max_chars).collect::<String>();
     if chars.next().is_some() {

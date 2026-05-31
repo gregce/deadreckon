@@ -8,7 +8,7 @@ use crate::commands::plan::{build_full_plan_tasks, resolve_plan_providers};
 // the campaign lineage env so a depth-1 process refuses to fan out again. The
 // sub reports back through a sub-result.json sidecar in its launch dir.
 
-#[allow(dead_code)] // fields/fn wired by the campaign fork in P4
+#[allow(dead_code)] // reserved campaign-fork launch shape; fields mirror the sub-orchestrator env/CLI contract
 pub(crate) struct CampaignSubLaunch<'a> {
     pub(crate) home: &'a Path,
     pub(crate) source_dir: &'a Path,
@@ -25,7 +25,7 @@ pub(crate) struct CampaignSubLaunch<'a> {
     pub(crate) ancestor_scopes: &'a [String],
 }
 
-#[allow(dead_code)] // wired by the campaign fork in P4
+#[allow(dead_code)] // reserved campaign-fork seam; tests pin the exact sub-orchestrator argv/env
 pub(crate) fn build_sub_orchestrator_command(
     launch: &CampaignSubLaunch<'_>,
 ) -> Result<std::process::Command> {
@@ -76,7 +76,7 @@ pub(crate) fn build_sub_orchestrator_command(
     Ok(command)
 }
 
-#[allow(dead_code)] // wired by the campaign fork in P5
+#[allow(dead_code)] // reserved campaign-fork sidecar seam; kept separate for result-discovery tests
 pub(crate) fn discover_sub_result(
     launch_dir: &Path,
 ) -> Result<Option<deadreckon_core::campaign::SubResult>> {
@@ -964,7 +964,7 @@ pub(crate) fn resolve_campaign(
 /// tree-budget ceiling (P5) must be checked *before* launching the next sub, which
 /// a concurrent batch cannot guarantee. The `launch` closure performs the actual
 /// spawn; tests inject a fake. A failed sub never aborts its siblings.
-#[allow(dead_code)] // wired by the campaign command in P9
+#[allow(dead_code)] // reserved campaign-fork engine; command wiring and tests share this private seam
 pub(crate) fn run_campaign_fork<F, S>(
     campaign_dir: &Path,
     campaign: &mut deadreckon_core::campaign::Campaign,
