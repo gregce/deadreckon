@@ -88,6 +88,9 @@
   markdown-doc line rendering, and narrative line/count helpers into
   `src/tui/render.rs`, leaving provider refresh jobs and attach event loops in
   the command/root orchestration layer.
+- P6h (`efda723`): Added the pure-render unit snapshots for run attach and
+  chain attach frames, using the extracted `src/tui` render seams to lock the
+  terminal frame shape before leaving the TUI extraction phase.
 
 ## Effortless (production release) - 2026-05-28
 
