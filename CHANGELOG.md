@@ -75,6 +75,10 @@
   spend/context/acceptance panels, and live-files/process panels into
   `src/tui/render.rs`, leaving provider refresh, narrative projection caching,
   and docs file lookup wrappers in the crate root.
+- P6e (`3bc3971`): Moved the plan-attach widget shell, narrative panel, footer,
+  task-pane layout, activity feed formatting, and task detail rendering into
+  `src/tui/render.rs`, while preserving shared plan summary/event helpers behind
+  the private crate facade for existing command output.
 
 ## Effortless (production release) - 2026-05-28
 
