@@ -2541,6 +2541,8 @@ explicit guard that the decompose work did not change CLI output shape.
 - `commands/campaign.rs` owns campaign creation, preflight, fork/roll-up helpers,
   attach summaries, and campaign failure reports.
 - `commands/attach.rs` owns attach command dispatch and terminal event loops.
+- `commands/attach_runtime.rs` owns attach-loop tick timing and asynchronous
+  narrative-refresh job/request plumbing shared by run, plan, and chain attach.
 - `commands/merge.rs` owns merge entrypoint and CLI repair-strategy parsing.
 - `commands/orchestrate.rs` owns the orchestrate front door and mode/provider
   selection helpers.
@@ -2635,4 +2637,4 @@ Those are recorded in `docs/V1-CANDIDATES.md` as explicit "not now" pointers.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~12.4k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

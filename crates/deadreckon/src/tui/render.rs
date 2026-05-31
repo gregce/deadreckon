@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::commands::attach_runtime::AttachTickBudget;
 use crate::commands::chain::{
     apply_mode_label, apply_strategy_label, branch_policy_label, chain_apply_strategy,
     chain_attach_summary_line, chain_step_dot, chain_step_status_label, on_fail_label, short_sha,

@@ -1,4 +1,5 @@
 use super::super::*;
+use super::attach_runtime::*;
 use crate::commands::acceptance::ensure_acceptance_before_start;
 use crate::commands::attach::{attach_should_quit, resume_tui, suspend_tui};
 use crate::tui::{ChainAttachTuiState, chain_event_read_hint, render_chain_attach};

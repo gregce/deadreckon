@@ -137,6 +137,9 @@
   `cleanup`, `extend`, parent markers, and lifecycle notification firing into
   `src/commands/lifecycle.rs`, leaving status/resume/control helpers at the
   root and reducing `main.rs` to roughly 12.4k lines.
+- Post-P11i: Moved attach-loop tick timing and async narrative-refresh job
+  plumbing into `src/commands/attach_runtime.rs`, keeping attach/chain event
+  loops as callers and reducing `main.rs` to roughly 11.9k lines.
 
 ## Effortless (production release) - 2026-05-28
 

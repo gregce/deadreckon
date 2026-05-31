@@ -1,4 +1,5 @@
 use super::super::*;
+use super::attach_runtime::*;
 use crate::tui::{
     AttachActionNotice, AttachParentPlan, AttachTuiState, RunNarrativeRenderInput,
     attach_panel_counts, build_run_narrative_projection, run_narrative_projection,

@@ -1,5 +1,6 @@
 pub(crate) mod acceptance;
 pub(crate) mod attach;
+pub(crate) mod attach_runtime;
 pub(crate) mod campaign;
 pub(crate) mod chain;
 pub(crate) mod completion;
