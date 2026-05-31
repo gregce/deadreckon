@@ -2,7 +2,7 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **production-release** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-28 (Effortless friendliness contract, tamper-evident gate, production-release posture, consolidated plan-result docs, guided first use, local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
+**Last updated:** 2026-05-31 (Composable seams, direct-API compaction, Effortless friendliness contract, tamper-evident gate, production-release posture, consolidated plan-result docs, guided first use, local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
 **Maturity:** production-release posture. Workspace version `0.1.0` pending release tagging. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -48,6 +48,8 @@ This document captures the system as built today — what's wired, what's load-b
 35. [Tamper-Evident Gate](#35-tamper-evident-gate)
 36. [Campaign Orchestration (one task, N orchestrators)](#36-campaign-orchestration-one-task-n-orchestrators)
 37. [Effortless: the friendliness contract](#37-effortless-the-friendliness-contract)
+38. [Binary Module Layout (post-decompose)](#38-binary-module-layout-post-decompose)
+39. [Composable Seams (swap a worker, keep the gate)](#39-composable-seams-swap-a-worker-keep-the-gate)
 
 ---
 
@@ -1573,9 +1575,17 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - PID-aware locks + heartbeats + stale reclaim.
 - Atomic working→library promotion with crash recovery.
 - Sandbox dispatch for sandbox-exec / bwrap / docker / none + auto resolution.
+- Composable governance seams: `[seams]` can swap policy, model-catalog,
+  hook-fanout, and event-sink workers through one sandboxed JSON-over-stdio
+  primitive; unconfigured kinds keep built-in behavior and `--no-seams` forces
+  built-ins per run/start. This adds worker-swapping capability without weakening
+  §35: the acceptance gate is deliberately not a seam.
 - HTTP providers (Anthropic / OpenAI / OpenAI-compatible) with token-based spend.
 - CLI providers (`cli:claude-code`, `cli:codex`) with wall-clock subscription spend.
 - Descriptor-backed CLI providers with generic `exec_template` launch, registry-driven detection/init/listing, descriptor sandbox writes, and built-in `cli:gemini`, `cli:opencode`, `cli:copilot`, and `cli:pi` providers.
+- Direct-API history compaction: HTTP/API provider prompts are deterministically
+  elided against catalog `context_window` thresholds, keep the goal/done spec
+  intact, append `compaction.jsonl`, and leave CLI-provider paths untouched.
 - Smoke provider (deterministic) for keyless tests.
 - Turn loop with action parsing (Bash / WriteFile / Done) and CLI sub-agent path.
 - Overnight UX: `run --prevent-sleep <auto|on|off>` previews sleep posture and arms macOS `caffeinate` or Linux `systemd-inhibit` around the run loop, with run-local `working/.deadreckon/sleep-prevention.json`; run previews, run exit summaries, and completed attach footers use the shared `ui_card` renderer with `--plain` and `NO_COLOR` support, while read-only inspection commands stay in quieter table/report layouts.
@@ -1639,11 +1649,12 @@ The previously named thin areas now have code paths and depth tests:
 8. **Acceptance gate.** `acceptance.yaml` supports structured checks and signed per-check results.
 9. **Multi-run coordination.** Scope-qualified locks, stale reclaim, same-scope refusal tests, and sequential chain coordination are in place; parallel/DAG scheduling remains out of scope.
 10. **Promotion / library workflow.** Promotion is atomic and `library list|search|show` makes artifacts discoverable by scope, goal, date, and promoted-doc content.
+11. **Composable seams and API compaction.** Policy, catalog, hook, and event-sink workers are swappable through `[seams]` with fixed fail policies, while direct-API history is bounded by deterministic context-window compaction. The gate remains non-swappable and is protected by adversarial seam sandbox tests.
 
 ### Not yet built (V1+ candidates per `docs/goals/2026-05-11-1400-deadreckon-usability-rider.md` and the V1 list in the robust rider)
 
 - Sub-agent forking as a user-facing CLI verb.
-- Hook system (pre/post tool call).
+- Human-in-the-loop approval seam or long-lived worker bus.
 - MCP client surface.
 - Cost-aware provider routing.
 - Cloud sync of histories.
@@ -2663,6 +2674,103 @@ Chain/Plan field encapsulation, a uniform `CommandHandler` trait, a public
 binary-run facade or new `deadreckon-cli` crate, `#[source]`/sysexits behavior
 changes, splitting `cli.rs`'s command enum, and integration-test submodule churn.
 Those are recorded in `docs/V1-CANDIDATES.md` as explicit "not now" pointers.
+
+---
+
+## 39. Composable Seams (swap a worker, keep the gate)
+
+Composable seams decompose four governance concerns without making the trust root
+pluggable. The implementation lives primarily in
+`crates/deadreckon-runtime/src/seam.rs`, `turn_loop.rs`, and the provider router
+catalog override path.
+
+### 39.1 The monolith critique and deadreckon's answer
+
+Before this pass, changing policy decisions, model-catalog metadata, hook
+side-effects, or event export meant changing Rust. The production answer is a
+single subprocess seam contract for exactly those four workers. This makes the
+harness thinner or thicker by config, not by fork.
+
+The decomposition is intentionally not universal. `dr-gate` remains the fixed
+acceptance root because a swappable trust root can self-attest. Seam workers can
+observe or narrow behavior, but they cannot sign completion.
+
+### 39.2 The one primitive: `SeamCommand`
+
+`SeamCommand` is sandboxed JSON-over-stdio:
+
+1. Resolve `[seams.<kind>]` from `config.toml`; absent means built-in behavior.
+2. Spawn the configured argv through the sandbox layer with a timeout.
+3. Send one JSON request on stdin and parse one JSON response from stdout.
+4. Apply the fixed per-kind fail policy.
+
+The allowed kinds are `policy`, `catalog`, `hooks`, and `event_sink`.
+`[seams.gate]` and unknown kinds are hard config errors. Every run writes
+`<run-root>/seams.json` with source, command basename, timeout, fail policy, and
+`no_seams` resolution.
+
+### 39.3 The four seams
+
+- **policy:** receives `{function_id, command, working_dir}` for bash/write-file
+  calls after the built-in sandbox floor allows the action. It returns
+  `allow|deny` and is fail-closed.
+- **model-catalog:** returns model context-window/pricing metadata. Router
+  lookups prefer seam-provided entries and fall open to the built-in catalog.
+- **hook-fanout:** observes `ToolCallStarted` and `ToolCallResult` events. It is
+  fail-safe and cannot change decisions.
+- **event-sink:** mirrors `RunEvent` values from a broadcast subscriber while
+  `events.jsonl` remains the source of truth for attach and recovery.
+
+### 39.4 The thin-thick slider
+
+No `[seams]` entry means the built-in implementation runs. Adding one command
+swaps exactly that worker. `deadreckon run ... --no-seams` and
+`deadreckon start ... --no-seams` force every kind back to built-in behavior for
+that launch. Run previews and `doctor` report which seams are external.
+
+### 39.5 The non-swappable gate
+
+`SeamKind` has no gate variant, config rejects `[seams.gate]`, and seam
+subprocesses deny `<run-root>/gate/` and `<run-root>/proofs/`. Adversarial tests
+cover marker/proof writes, `gate/nonce` reads, and signature validation with
+seam sidecars present. Seam files do not alter `marker_signature` inputs.
+
+### 39.6 Context-window compaction on the direct-API path
+
+`crates/deadreckon-runtime/src/compaction.rs` bounds direct HTTP/API provider
+history with deterministic elision. The threshold is
+`fraction * context_window`; `context_window` comes from the router catalog
+including catalog seams, or `fallback_context_window` when unknown. The goal and
+done spec remain in the prompt; recent turns stay verbatim; the middle is
+replaced by one deterministic marker. CLI providers are never compacted.
+
+### 39.7 Per-run audit
+
+Two files record the seam decisions without changing durable state schemas:
+
+- `seams.json` records per-kind source/fail policy and whether `--no-seams`
+  forced built-ins.
+- `compaction.jsonl` appends one row per direct-API compaction with token
+  estimates, kept/elided turn counts, context window, and source
+  (`catalog|seam|fallback`).
+
+`PipelineState`, `Plan`, `AcceptanceMarker`, check results, and provider entries
+were not extended for this work.
+
+### 39.8 Sandboxing and fail policies
+
+Seam subprocesses inherit the same sandbox machinery used for provider/tool
+subprocesses, with extra gate/proof deny paths. Fail policies are code-fixed:
+policy fails closed, catalog fails open, and hooks/event-sink fail safe. The
+policy seam can only narrow after `sandbox.toml`; it cannot widen filesystem or
+network permissions.
+
+### 39.9 Limits
+
+This release does not add human approval, a persistent bus, a worker registry,
+capability negotiation, or LLM-backed semantic compaction. Built-in telemetry is
+not routed through hooks; hooks are additive observers. Those extensions are V1
+candidates.
 
 ---
 

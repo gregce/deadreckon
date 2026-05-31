@@ -27,6 +27,15 @@
 - `cli.rs` enum-per-family split: the clap command enum remains centralized to avoid rename churn and help/completion drift while command bodies move behind private modules.
 - Integration-test submodule reorg: the lifted sibling test modules are intentionally boring; reshaping them into a deeper hierarchy can wait until test ownership pressure justifies it.
 
+## Composable seams follow-ups
+
+- Human-in-the-loop approval seam with pause/resume semantics and explicit operator UX.
+- LLM-backed compaction summaries after cost, determinism, and evaluation policy are defined.
+- Bus/WebSocket transport plus a long-lived worker registry for high-frequency seam workers.
+- Seam versioning and capability negotiation.
+- Routing built-in telemetry through the hook seam once durable-audit guarantees are preserved.
+- Richer catalog capabilities beyond context-window and pricing metadata.
+
 ## General candidates
 
 - Tamper-evidence hardening beyond the production gate: causal proof that a covered-file edit caused a pass, language-aware test detection beyond Rust heuristics, a separate signed tamper/audit log distinct from learning logs, fleet/plan-level tamper reporting, and sandboxing acceptance checks' own filesystem writes.

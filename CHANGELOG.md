@@ -29,6 +29,18 @@
   `seams.json` and validates a gate marker.
 - P10: Added resume-sweep coverage for seam re-resolution, deterministic
   compaction replay, and survival of `seams.json`/`compaction.jsonl`.
+- P11: Documented composable seams in AS-BUILT §39, updated the shipped/thin
+  accounting, and logged V1 seam follow-ups.
+- Release summary: one uniform seam contract (sandboxed JSON-over-stdio
+  subprocess, fixed per-kind fail policy) makes policy, model-catalog,
+  hook-fanout, and event-sink swappable via `[seams]`; unconfigured seams keep
+  built-in behavior and `--no-seams` forces all built-ins.
+- Release summary: the acceptance gate stays deliberately non-swappable: no seam
+  can write or redirect the marker, read `gate/nonce`, or alter the signature;
+  seam workers run sandboxed.
+- Release summary: deterministic, resume-safe context-window compaction closes
+  the direct-API history gap in `compaction.jsonl`; CLI-provider paths are
+  untouched.
 
 ## Navigable campaign attach (production release) - 2026-05-31
 
