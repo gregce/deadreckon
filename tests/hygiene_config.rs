@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use deadreckon_core::DeadreckonError;
+use deadreckon_core::{DeadreckonError, is_retryable_io_kind};
 use deadreckon_providers::ProviderError;
 use deadreckon_sandbox::SandboxError;
 use serde_json::Value;
@@ -345,6 +345,46 @@ fn deadreckon_error_io_interrupted_is_retryable() {
     };
     assert!(error.is_retryable());
     assert!(!error.is_fatal());
+}
+
+#[test]
+fn is_retryable_io_kind_behaves_identically_across_crates() {
+    let cases = [
+        (std::io::ErrorKind::Interrupted, true),
+        (std::io::ErrorKind::WouldBlock, true),
+        (std::io::ErrorKind::TimedOut, true),
+        (std::io::ErrorKind::ConnectionReset, true),
+        (std::io::ErrorKind::ConnectionAborted, true),
+        (std::io::ErrorKind::BrokenPipe, true),
+        (std::io::ErrorKind::NotFound, false),
+        (std::io::ErrorKind::PermissionDenied, false),
+        (std::io::ErrorKind::Other, false),
+    ];
+    for (kind, expected) in cases {
+        assert_eq!(is_retryable_io_kind(kind), expected, "{kind:?}");
+
+        let core_error = DeadreckonError::Io {
+            path: "path".into(),
+            source: std::io::Error::new(kind, "core"),
+        };
+        assert_eq!(core_error.is_retryable(), expected, "core {kind:?}");
+        assert_eq!(core_error.is_fatal(), !expected, "core {kind:?}");
+
+        let provider_error = ProviderError::Io {
+            path: "path".to_string(),
+            source: std::io::Error::new(kind, "provider"),
+        };
+        assert_eq!(
+            provider_error.is_retryable(),
+            expected,
+            "provider {kind:?}"
+        );
+        assert_eq!(provider_error.is_fatal(), !expected, "provider {kind:?}");
+
+        let sandbox_error = SandboxError::Io(std::io::Error::new(kind, "sandbox"));
+        assert_eq!(sandbox_error.is_retryable(), expected, "sandbox {kind:?}");
+        assert_eq!(sandbox_error.is_fatal(), !expected, "sandbox {kind:?}");
+    }
 }
 
 #[test]

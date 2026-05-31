@@ -50,7 +50,7 @@ impl DeadreckonError {
     }
 }
 
-pub(crate) fn is_retryable_io_kind(kind: std::io::ErrorKind) -> bool {
+pub fn is_retryable_io_kind(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
         std::io::ErrorKind::Interrupted

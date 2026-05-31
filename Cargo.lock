@@ -640,6 +640,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "deadreckon-core",
  "deadreckon-sandbox",
  "reqwest 0.12.28",
  "serde",
@@ -674,6 +675,7 @@ dependencies = [
 name = "deadreckon-sandbox"
 version = "0.1.0"
 dependencies = [
+ "deadreckon-core",
  "nix",
  "serde",
  "tempfile",

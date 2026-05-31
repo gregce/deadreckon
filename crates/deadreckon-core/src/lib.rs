@@ -61,7 +61,7 @@ pub use docs::{
     polish_path, public_doc_path, public_docs_dir, publish_docs_for_promotion, read_turn_records,
     rewrite_templated_docs, should_emit_delta, source_layout, tool_stdio_markdown,
 };
-pub use error::{DeadreckonError, Result};
+pub use error::{DeadreckonError, Result, is_retryable_io_kind};
 pub use events::{
     RUN_EVENTS_JSONL, RunEvent, RunEventBus, RunEventKind, emit_event, event_preview,
 };

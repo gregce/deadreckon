@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 chrono.workspace = true
+deadreckon-core = { workspace = true }
 deadreckon-sandbox = { workspace = true }
 reqwest.workspace = true
 serde.workspace = true

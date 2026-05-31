@@ -1,6 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use deadreckon_core::is_retryable_io_kind;
 use serde::{Deserialize, Serialize};
 use which::which;
 
@@ -36,18 +37,6 @@ impl SandboxError {
             SandboxError::Cancelled => true,
         }
     }
-}
-
-fn is_retryable_io_kind(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::BrokenPipe
-    )
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;

@@ -1,3 +1,5 @@
+use deadreckon_core::is_retryable_io_kind;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("I/O error at {path}: {source}")]
@@ -50,18 +52,6 @@ impl ProviderError {
             ProviderError::InvalidConfig(_) => true,
         }
     }
-}
-
-fn is_retryable_io_kind(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::BrokenPipe
-    )
 }
 
 pub type Result<T> = std::result::Result<T, ProviderError>;

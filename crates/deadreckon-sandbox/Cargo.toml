@@ -9,6 +9,7 @@ keywords.workspace = true
 workspace = true
 
 [dependencies]
+deadreckon-core = { workspace = true }
 nix.workspace = true
 serde.workspace = true
 thiserror.workspace = true

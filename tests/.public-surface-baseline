@@ -115,6 +115,7 @@ crate: deadreckon-core
   docs::TurnRecord
   error::DeadreckonError
   error::Result
+  error::is_retryable_io_kind
   events::emit_event
   events::event_preview
   events::RUN_EVENTS_JSONL
