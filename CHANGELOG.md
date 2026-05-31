@@ -62,6 +62,9 @@
 - P5h (`9c2a8cf`): Moved the plan/fork command family and child-launch
   orchestration helpers into `src/commands/plan.rs`, leaving plan result docs
   and shared TUI render helpers in the crate root for later phases.
+- P6a (`8d94316`): Created the private `src/tui/` module and moved the
+  run-attach TUI state, key handling, post-action notice, and panel layout
+  helpers into `src/tui/attach_state.rs`.
 
 ## Effortless (production release) - 2026-05-28
 
