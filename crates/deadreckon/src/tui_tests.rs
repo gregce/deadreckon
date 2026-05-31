@@ -22,7 +22,7 @@ use super::tui::{
     AttachActionNotice, AttachPanel, AttachPanelCounts, AttachPanelRows, AttachParentPlan,
     AttachTuiState, ChainAttachTuiState, build_run_narrative_projection, chain_activity_lines,
     chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
-    chain_timeline_lines, markdown_to_tui_lines, max_panel_scroll,
+    chain_timeline_lines, markdown_to_tui_lines, max_panel_scroll, render_chain_attach,
 };
 use super::{
     ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachJsonlTail,
@@ -899,6 +899,24 @@ fn plan_narrative_render_uses_cached_projection_when_feed_unchanged() {
 
     assert_eq!(cache.refresh_count, 1);
     assert_eq!(first.snapshot.snapshot_id, second.snapshot.snapshot_id);
+}
+
+#[test]
+fn render_attach_frame_unit_snapshot() {
+    let (_temp, state) = doc_preview_state();
+    let live = AttachLive {
+        working_dir_exists: true,
+        ..AttachLive::default()
+    };
+
+    let text = render_attach_text_with_size(&state, &[], &live, AttachTuiState::default(), 100, 24);
+
+    assert!(text.contains("deadreckon"), "{text}");
+    assert!(text.contains("provider cli:codex"), "{text}");
+    assert!(text.contains("goal preview docs"), "{text}");
+    assert!(text.contains("tool calls / provider activity"), "{text}");
+    assert!(text.contains("live files"), "{text}");
+    assert!(text.contains("processes"), "{text}");
 }
 
 #[test]
@@ -1883,6 +1901,28 @@ fn render_attach_text_with_size(
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal
         .draw(|frame| render_attach(frame, state, spend, &[], &[], live, &tui_state))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    let mut text = String::new();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            text.push_str(buffer.cell((x, y)).expect("cell").symbol());
+        }
+        text.push('\n');
+    }
+    text
+}
+
+fn render_chain_attach_text(
+    chain: &Chain,
+    events: &[ChainEvent],
+    tui_state: &ChainAttachTuiState,
+) -> String {
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_chain_attach(frame, chain, events, tui_state))
         .expect("draw");
     let buffer = terminal.backend().buffer();
     let area = buffer.area;
@@ -3644,6 +3684,25 @@ fn rows() -> AttachPanelRows {
         files: 4,
         processes: 4,
     }
+}
+
+#[test]
+fn render_chain_attach_unit_snapshot() {
+    let chain = chain_fixture();
+    let events = vec![chain_event_record(&chain.chain_id, 1)];
+
+    let text = render_chain_attach_text(&chain, &events, &ChainAttachTuiState::default());
+
+    assert!(text.contains("deadreckon chain"), "{text}");
+    assert!(
+        text.contains("policy branch=stack apply=auto strategy=squash on-fail=stop"),
+        "{text}"
+    );
+    assert!(text.contains("steps"), "{text}");
+    assert!(text.contains("chain activity"), "{text}");
+    assert!(text.contains("applied"), "{text}");
+    assert!(text.contains("running"), "{text}");
+    assert!(text.contains("step started step 2"), "{text}");
 }
 
 #[test]
