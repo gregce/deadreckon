@@ -122,6 +122,10 @@
 - Post-P11d: Moved `deadreckon detect`, `deadreckon providers list`, and
   `deadreckon update` handling into `src/commands/providers.rs`, leaving shared
   provider-id helpers at the root and reducing `main.rs` to roughly 16.0k lines.
+- Post-P11e: Moved shell completion and `deadreckon doctor` handling into
+  `src/commands/completion.rs` and `src/commands/doctor.rs`, leaving shared
+  command-existence lookup at the root and reducing `main.rs` to roughly 15.4k
+  lines.
 
 ## Effortless (production release) - 2026-05-28
 

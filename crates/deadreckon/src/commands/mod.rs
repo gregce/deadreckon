@@ -2,6 +2,8 @@ pub(crate) mod acceptance;
 pub(crate) mod attach;
 pub(crate) mod campaign;
 pub(crate) mod chain;
+pub(crate) mod completion;
+pub(crate) mod doctor;
 pub(crate) mod import;
 pub(crate) mod init;
 pub(crate) mod learning;

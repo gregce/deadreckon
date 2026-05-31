@@ -67,9 +67,9 @@ pub(crate) async fn init_command(
     )?;
     println!("{} {}", ui_ok("wrote"), paths.config_path().display());
     print_provider_setup_rows(&[provider_setup]);
-    doctor_command(false).await?;
+    super::doctor::doctor_command(false).await?;
     if !no_completion {
-        try_install_completion_after_init();
+        super::completion::try_install_completion_after_init();
     }
     println!(
         "{} {}",
