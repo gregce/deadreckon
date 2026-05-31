@@ -110,6 +110,9 @@
 - P11: Documented the post-decompose binary layout in AS-BUILT §38, updated the
   built-vs-thin accounting, and logged the rejected command/API/test reshaping
   work in `docs/V1-CANDIDATES.md`.
+- Post-P11a: Moved descriptor-backed `deadreckon import` handling into
+  `src/commands/import.rs`, keeping `main_inner` as the only call boundary and
+  reducing `main.rs` to roughly 20.2k lines.
 
 ## Effortless (production release) - 2026-05-28
 
