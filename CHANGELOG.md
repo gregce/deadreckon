@@ -99,6 +99,10 @@
   and explicit-path handling, then unified the start/setup/doctor command
   lookup call sites through one private helper without changing provider
   detection behavior.
+- P9 (`242bfa3`): Added cross-crate retryable-I/O characterization, promoted
+  `deadreckon_core::error::is_retryable_io_kind` as the single shared helper,
+  reused it from providers and sandbox, and recorded the one justified public
+  surface rebaseline for that new core path.
 
 ## Effortless (production release) - 2026-05-28
 
