@@ -1,6 +1,8 @@
 use super::super::*;
 use crate::tui::{
-    AttachActionNotice, AttachParentPlan, AttachTuiState, attach_panel_counts, toggle_attach_view,
+    AttachActionNotice, AttachParentPlan, AttachTuiState, RunNarrativeRenderInput,
+    attach_panel_counts, build_run_narrative_projection, run_narrative_projection,
+    toggle_attach_view,
 };
 
 #[derive(Debug)]

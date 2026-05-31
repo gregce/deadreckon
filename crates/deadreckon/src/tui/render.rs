@@ -263,6 +263,305 @@ fn chain_event_label(event: &ChainEventKind) -> &'static str {
     }
 }
 
+fn render_run_docs(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    state: &deadreckon_core::PipelineState,
+    tui_state: &AttachTuiState,
+) {
+    let lines = render_markdown_doc_lines(state);
+    let rows = area.height.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(lines.clone())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(panel_border_style(
+                        tui_state.focused_panel,
+                        AttachPanel::Activity,
+                    ))
+                    .title(panel_title(
+                        "run docs / narrative",
+                        tui_state.focused_panel == AttachPanel::Activity,
+                        tui_state.docs_scroll,
+                        rows,
+                        lines.len(),
+                    )),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((tui_state.docs_scroll as u16, 0)),
+        area,
+    );
+}
+
+pub(crate) struct RunNarrativeRenderInput<'a> {
+    pub(crate) state: &'a deadreckon_core::PipelineState,
+    pub(crate) spend: &'a [SpendRecord],
+    pub(crate) traces: &'a [TraceRecord],
+    pub(crate) events: &'a [RunEvent],
+    pub(crate) live: &'a AttachLive,
+    pub(crate) tui_state: &'a AttachTuiState,
+}
+
+fn render_run_narrative(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    input: &RunNarrativeRenderInput<'_>,
+) {
+    let tui_state = input.tui_state;
+    let rows = area.height.saturating_sub(2) as usize;
+    let projection = run_narrative_projection_for_render(input);
+    let mut lines = run_narrative_lines_from_projection(&projection, tui_state);
+    if area.width >= 110 && tui_state.visual != NarrativeVisualMode::None {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area);
+        let visual_lines = narrative::graph_ascii_lines(&projection.graph, tui_state.visual);
+        lines.retain(|line| !line.starts_with("Visual:"));
+        let visible = visible_narrative_items(&lines, tui_state.narrative_scroll, rows);
+        frame.render_widget(
+            List::new(visible).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(panel_border_style(
+                        tui_state.focused_panel,
+                        AttachPanel::Activity,
+                    ))
+                    .title(panel_title(
+                        "narrative",
+                        tui_state.focused_panel == AttachPanel::Activity,
+                        tui_state.narrative_scroll,
+                        rows,
+                        lines.len(),
+                    )),
+            ),
+            chunks[0],
+        );
+        frame.render_widget(
+            List::new(visual_lines.into_iter().map(narrative_list_item)).block(
+                Block::default()
+                    .title(format!("visual {}", tui_state.visual.label()))
+                    .borders(Borders::ALL),
+            ),
+            chunks[1],
+        );
+    } else {
+        let visible = visible_narrative_items(&lines, tui_state.narrative_scroll, rows);
+        frame.render_widget(
+            List::new(visible).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(panel_border_style(
+                        tui_state.focused_panel,
+                        AttachPanel::Activity,
+                    ))
+                    .title(panel_title(
+                        &format!("narrative / {}", tui_state.visual.label()),
+                        tui_state.focused_panel == AttachPanel::Activity,
+                        tui_state.narrative_scroll,
+                        rows,
+                        lines.len(),
+                    )),
+            ),
+            area,
+        );
+    }
+}
+
+pub(crate) fn run_narrative_lines(
+    state: &deadreckon_core::PipelineState,
+    spend: &[SpendRecord],
+    traces: &[TraceRecord],
+    events: &[RunEvent],
+    live: &AttachLive,
+    tui_state: &AttachTuiState,
+) -> Vec<String> {
+    let projection = run_narrative_projection_for_render(&RunNarrativeRenderInput {
+        state,
+        spend,
+        traces,
+        events,
+        live,
+        tui_state,
+    });
+    run_narrative_lines_from_projection(&projection, tui_state)
+}
+
+fn run_narrative_lines_from_projection(
+    projection: &narrative::NarrativeProjection,
+    tui_state: &AttachTuiState,
+) -> Vec<String> {
+    let mut lines = narrative::narrative_plain_lines(projection, tui_state.visual);
+    if let Some(notice) = tui_state.narrative_notice.as_ref() {
+        lines.insert(2, format!("[fresh] {notice}"));
+    }
+    lines
+}
+
+pub(crate) fn run_narrative_projection(
+    state: &deadreckon_core::PipelineState,
+    spend: &[SpendRecord],
+    traces: &[TraceRecord],
+    events: &[RunEvent],
+    live: &AttachLive,
+    tui_state: &AttachTuiState,
+) -> Result<narrative::NarrativeProjection> {
+    ensure_run_narrative_projection(&RunNarrativeRenderInput {
+        state,
+        spend,
+        traces,
+        events,
+        live,
+        tui_state,
+    })
+}
+
+fn run_narrative_projection_for_render(
+    input: &RunNarrativeRenderInput<'_>,
+) -> narrative::NarrativeProjection {
+    if let Some(projection) = input.tui_state.narrative_projection.as_ref() {
+        return projection.clone();
+    }
+    build_run_narrative_projection(input)
+}
+
+pub(crate) fn build_run_narrative_projection(
+    input: &RunNarrativeRenderInput<'_>,
+) -> narrative::NarrativeProjection {
+    narrative::build_run_projection(&run_narrative_input(input))
+}
+
+pub(crate) fn ensure_run_narrative_projection(
+    input: &RunNarrativeRenderInput<'_>,
+) -> Result<narrative::NarrativeProjection> {
+    narrative::ensure_run_projection(&run_narrative_input(input))
+}
+
+fn run_narrative_input<'a>(
+    input: &'a RunNarrativeRenderInput<'a>,
+) -> narrative::RunNarrativeInput<'a> {
+    let state = input.state;
+    let live = input.live;
+    let tui_state = input.tui_state;
+    narrative::RunNarrativeInput {
+        state,
+        spend: input.spend,
+        traces: input.traces,
+        events: input.events,
+        live_files: live
+            .files
+            .iter()
+            .map(|file| narrative::LiveFileFact {
+                path: file.path.clone(),
+                bytes: file.bytes,
+                modified_at: file.modified_at,
+            })
+            .collect(),
+        file_count: live.file_count,
+        total_bytes: live.total_bytes,
+        acceptance_summary: acceptance_narrative_summary(&live.acceptance),
+        provider_activity: &live.provider_activity,
+        parent_plan: tui_state
+            .parent_plan
+            .as_ref()
+            .map(|parent| narrative::ParentPlanFact {
+                plan_id: parent.plan_id.clone(),
+                task_id: parent.task_id.clone(),
+            }),
+    }
+}
+
+pub(crate) fn run_narrative_projection_signature(input: &RunNarrativeRenderInput<'_>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    input.state.run_id.hash(&mut hasher);
+    format!("{:?}", input.state.status).hash(&mut hasher);
+    input.state.turn.hash(&mut hasher);
+    input
+        .state
+        .active_phase()
+        .map(|phase| &phase.name)
+        .hash(&mut hasher);
+    input.spend.len().hash(&mut hasher);
+    input
+        .spend
+        .last()
+        .map(|record| record.total_cost_usd.to_bits())
+        .hash(&mut hasher);
+    input.traces.len().hash(&mut hasher);
+    input
+        .traces
+        .last()
+        .map(|record| (&record.turn, &record.event))
+        .hash(&mut hasher);
+    input.events.len().hash(&mut hasher);
+    input.live.file_count.hash(&mut hasher);
+    input.live.total_bytes.hash(&mut hasher);
+    input
+        .live
+        .files
+        .first()
+        .map(|file| {
+            (
+                &file.path,
+                file.bytes,
+                file.modified_at.map(|date| date.timestamp_millis()),
+            )
+        })
+        .hash(&mut hasher);
+    input.live.provider_activity.len().hash(&mut hasher);
+    input.live.provider_activity.last().hash(&mut hasher);
+    format!("{:?}", input.live.acceptance.status).hash(&mut hasher);
+    input.live.acceptance.completed.hash(&mut hasher);
+    input.live.acceptance.failed.hash(&mut hasher);
+    input.live.acceptance.latest_detail.hash(&mut hasher);
+    input
+        .tui_state
+        .parent_plan
+        .as_ref()
+        .map(|parent| (&parent.plan_id, &parent.task_id))
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn acceptance_narrative_summary(acceptance: &AcceptanceLive) -> String {
+    match acceptance.status {
+        AcceptanceUiStatus::DefaultGate => "default gate".to_string(),
+        AcceptanceUiStatus::Configured => format!("configured {} check(s)", acceptance.total),
+        AcceptanceUiStatus::Running => {
+            format!(
+                "running {}/{} check(s)",
+                acceptance.completed, acceptance.total
+            )
+        }
+        AcceptanceUiStatus::Passed => {
+            format!("passed {}/{} check(s)", acceptance.passed, acceptance.total)
+        }
+        AcceptanceUiStatus::Failed => format!(
+            "failed {} required, {} passed of {}",
+            acceptance.required_failed, acceptance.passed, acceptance.total
+        ),
+    }
+}
+
+pub(crate) fn render_markdown_doc_lines(
+    state: &deadreckon_core::PipelineState,
+) -> Vec<Line<'static>> {
+    let Some(path) = doc_path_for_kind(&state.working_dir, DocKind::Narrative) else {
+        return vec![Line::styled(
+            "No narrative docs found for this run.",
+            Style::default().fg(Color::Yellow),
+        )];
+    };
+    match fs::read_to_string(&path) {
+        Ok(raw) => markdown_to_tui_lines(&raw),
+        Err(err) => vec![Line::styled(
+            format!("Unable to read {}: {err}", path.display()),
+            Style::default().fg(Color::Red),
+        )],
+    }
+}
+
 pub(crate) struct PlanAttachRenderState<'a> {
     pub(crate) messages: &'a [PlanMessage],
     pub(crate) plan_events: &'a [PlanEvent],
