@@ -130,8 +130,13 @@ use crate::cli::{
 };
 use crate::narrative::{AttachViewMode, NarrativeVisualMode};
 use crate::plan_event_bus::{PlanEventBus, PlanFeedEvent};
+#[cfg(test)]
+use crate::tui::acceptance_activity_lines;
 use crate::tui::{
-    AttachPanel, AttachParentPlan, AttachTuiState, attach_panel_layout, markdown_to_tui_lines,
+    AttachPanel, AttachParentPlan, AttachTuiState, attach_activity_lines_for_tui,
+    attach_panel_layout, context_totals, live_file_lines, markdown_to_tui_lines,
+    narrative_list_item, panel_border_style, panel_title, process_lines, visible_items,
+    visible_narrative_items,
 };
 use crate::ui::{
     ui_command, ui_error, ui_heading, ui_id, ui_muted, ui_note, ui_ok, ui_status, ui_warn,
@@ -23012,130 +23017,6 @@ fn acceptance_color(status: AcceptanceUiStatus) -> Color {
     }
 }
 
-fn context_totals(spend: &[SpendRecord], live: &AttachLive) -> (u64, u64) {
-    let token_total = live.provider_context_tokens.unwrap_or_else(|| {
-        spend
-            .iter()
-            .map(|record| record.input_tokens + record.output_tokens)
-            .sum::<u64>()
-    });
-    let context_window = live.provider_context_window.unwrap_or(200_000).max(1);
-    (token_total, context_window)
-}
-
-fn render_turn_summary(spend: &[SpendRecord], show_cost: bool) -> Vec<String> {
-    if spend.is_empty() {
-        vec!["provider turn in progress; results land when the provider exits".to_string()]
-    } else {
-        spend
-            .iter()
-            .rev()
-            .take(3)
-            .map(|record| {
-                let tokens = record.input_tokens + record.output_tokens;
-                if show_cost {
-                    format!(
-                        "turn {}  {}  {} tokens  ${:.6}",
-                        record.turn, record.model, tokens, record.cost_usd
-                    )
-                } else if let Some(seconds) = record.wall_time_seconds {
-                    format!(
-                        "turn {}  {}  {} tokens  {:.0}s wall",
-                        record.turn,
-                        record.model,
-                        tokens,
-                        seconds.max(0.0)
-                    )
-                } else {
-                    format!("turn {}  {}  {} tokens", record.turn, record.model, tokens)
-                }
-            })
-            .collect()
-    }
-}
-
-fn attach_activity_lines_for_tui(
-    state: &deadreckon_core::PipelineState,
-    spend: &[SpendRecord],
-    traces: &[TraceRecord],
-    events: &[RunEvent],
-    live: &AttachLive,
-    tui_state: &AttachTuiState,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(notice) = tui_state.post_action_notice.as_ref() {
-        lines.extend(notice.lines());
-        lines.push(String::new());
-    }
-    lines.extend(attach_activity_lines(state, spend, traces, events, live));
-    lines
-}
-
-fn attach_activity_lines(
-    state: &deadreckon_core::PipelineState,
-    spend: &[SpendRecord],
-    traces: &[TraceRecord],
-    events: &[RunEvent],
-    live: &AttachLive,
-) -> Vec<String> {
-    let metered_provider = provider_is_metered(state);
-    let mut lines = render_turn_summary(spend, metered_provider);
-    lines.extend(acceptance_activity_lines(&live.acceptance));
-    if state.status == RunStatus::Executing && live.file_count > 0 {
-        lines.push(format!(
-            "live working tree: {} files, latest changes visible before provider exit",
-            live.file_count
-        ));
-    }
-    lines.extend(live.provider_activity.iter().rev().cloned());
-    lines.extend(
-        events
-            .iter()
-            .rev()
-            .map(|event| event_line(event, metered_provider)),
-    );
-    lines.extend(traces.iter().rev().map(|record| {
-        format!(
-            "trace turn {}  {}  {:?}ms",
-            record.turn, record.event, record.latency_ms
-        )
-    }));
-    lines
-}
-
-fn acceptance_activity_lines(acceptance: &AcceptanceLive) -> Vec<String> {
-    match acceptance.status {
-        AcceptanceUiStatus::DefaultGate | AcceptanceUiStatus::Configured => Vec::new(),
-        AcceptanceUiStatus::Running => {
-            let mut lines = vec![format!(
-                "acceptance running: {} / {} checked",
-                acceptance.completed, acceptance.total
-            )];
-            lines.extend(acceptance.progress_lines.iter().cloned());
-            lines.push(String::new());
-            lines
-        }
-        AcceptanceUiStatus::Passed => {
-            let mut lines = vec![format!(
-                "acceptance passed: {} / {} checks",
-                acceptance.passed, acceptance.total
-            )];
-            lines.extend(acceptance.progress_lines.iter().take(4).cloned());
-            lines.push(String::new());
-            lines
-        }
-        AcceptanceUiStatus::Failed => {
-            let mut lines = vec![format!(
-                "acceptance failed: {} required failures, {} / {} passed",
-                acceptance.required_failed, acceptance.passed, acceptance.total
-            )];
-            lines.extend(acceptance.progress_lines.iter().cloned());
-            lines.push(String::new());
-            lines
-        }
-    }
-}
-
 fn render_run_docs(
     frame: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
@@ -23913,31 +23794,6 @@ fn render_live_files(
     );
 }
 
-fn live_file_lines(live: &AttachLive) -> Vec<String> {
-    if !live.working_dir_exists {
-        return vec!["working tree was removed after cleanup".to_string()];
-    }
-    if live.files.is_empty() {
-        return vec!["no files yet".to_string()];
-    }
-    let mut lines = Vec::new();
-    lines.extend(live.files.iter().map(|file| {
-        format!(
-            "{:>7} {:>8}  {}",
-            format_age(file.modified_at),
-            format_bytes(file.bytes),
-            file.path
-        )
-    }));
-    if live.file_count > live.files.len() {
-        lines.push(format!(
-            "... {} more files not shown",
-            live.file_count - live.files.len()
-        ));
-    }
-    lines
-}
-
 fn render_processes(
     frame: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
@@ -23965,91 +23821,6 @@ fn render_processes(
         ),
         area,
     );
-}
-
-fn process_lines(live: &AttachLive) -> Vec<String> {
-    if live.pids.is_empty() {
-        vec!["no supervised pids".to_string()]
-    } else {
-        live.pids
-            .iter()
-            .map(|pid| {
-                let status = if pid.alive { "alive" } else { "dead" };
-                format!("{} {} {}", pid.pid, status, pid.command)
-            })
-            .collect()
-    }
-}
-
-fn visible_items(lines: &[String], offset: usize, rows: usize) -> Vec<ListItem<'static>> {
-    lines
-        .iter()
-        .skip(offset.min(lines.len()))
-        .take(rows)
-        .map(|line| ListItem::new(line.clone()))
-        .collect()
-}
-
-fn visible_narrative_items(lines: &[String], offset: usize, rows: usize) -> Vec<ListItem<'static>> {
-    lines
-        .iter()
-        .skip(offset.min(lines.len()))
-        .take(rows)
-        .cloned()
-        .map(narrative_list_item)
-        .collect()
-}
-
-fn narrative_list_item(line: String) -> ListItem<'static> {
-    let style = if line.starts_with("[done]") || line.contains("[success]") {
-        Style::default().fg(Color::Green)
-    } else if line.starts_with("[risk]")
-        || line.starts_with("[stale]")
-        || line.contains("[warning]")
-        || line.contains("failed")
-    {
-        Style::default().fg(Color::Yellow)
-    } else if line.starts_with("[blocked]") || line.contains("[danger]") {
-        Style::default().fg(Color::Red)
-    } else if line.starts_with("Current work")
-        || line.starts_with("Architecture")
-        || line.starts_with("Agents")
-        || line.starts_with("Coordination")
-        || line.starts_with("Risks")
-        || line.starts_with("Next likely")
-        || line.starts_with("Visual:")
-        || line.starts_with("Evidence")
-    {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else if line.starts_with("  ->") || line.contains(" -> ") {
-        Style::default().fg(Color::LightCyan)
-    } else if line.starts_with("- ") {
-        Style::default().fg(Color::White)
-    } else {
-        Style::default()
-    };
-    ListItem::new(Line::styled(line, style))
-}
-
-fn panel_border_style(focused: AttachPanel, panel: AttachPanel) -> Style {
-    if focused == panel {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-    }
-}
-
-fn panel_title(title: &str, focused: bool, offset: usize, rows: usize, total: usize) -> String {
-    let marker = if focused { "*" } else { " " };
-    if total <= rows || total == 0 {
-        format!("{marker}{title}")
-    } else {
-        let first = offset.saturating_add(1).min(total);
-        let last = offset.saturating_add(rows).min(total);
-        format!("{marker}{title} {first}-{last}/{total}")
-    }
 }
 
 fn event_line(event: &RunEvent, show_cost: bool) -> String {
