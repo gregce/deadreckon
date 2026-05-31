@@ -1,4 +1,7 @@
 use super::super::*;
+use crate::tui::{
+    AttachActionNotice, AttachParentPlan, AttachTuiState, attach_panel_counts, toggle_attach_view,
+};
 
 #[derive(Debug)]
 pub(crate) struct AttachCommandArgs {
