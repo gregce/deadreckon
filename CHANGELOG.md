@@ -68,6 +68,9 @@
 - P6b (`e213718`): Moved the pure Markdown-to-ratatui line renderer into
   `src/tui/render.rs`, leaving the run-doc file lookup wrapper in the crate
   root while the TUI render module takes over presentation-only parsing.
+- P6c (`f4dc268`): Moved pure run-attach activity, live-file, process, narrative
+  item, panel title, and context-count render helpers into `src/tui/render.rs`
+  while keeping the terminal draw loop and file/doc lookup wrappers in place.
 
 ## Effortless (production release) - 2026-05-28
 
