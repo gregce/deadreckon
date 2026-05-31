@@ -2538,7 +2538,7 @@ fn start_detected_cli_provider_ids(paths: &DeadreckonPaths) -> Result<Vec<String
             && descriptor
                 .default_binary
                 .as_deref()
-                .is_some_and(start_command_exists)
+                .is_some_and(command_exists)
         {
             push_unique(&mut ids, descriptor.id.clone());
         }
@@ -2565,15 +2565,19 @@ fn start_configured_provider_ids(paths: &DeadreckonPaths) -> Vec<String> {
     ids
 }
 
-fn start_command_exists(command: &str) -> bool {
+fn command_exists_in_paths(command: &str, paths: Option<std::ffi::OsString>) -> bool {
     let explicit = PathBuf::from(command);
     if explicit.components().count() > 1 {
         return explicit.is_file();
     }
-    let Some(paths) = std::env::var_os("PATH") else {
+    let Some(paths) = paths else {
         return false;
     };
     std::env::split_paths(&paths).any(|path| path.join(command).is_file())
+}
+
+fn command_exists(command: &str) -> bool {
+    command_exists_in_paths(command, std::env::var_os("PATH"))
 }
 
 fn start_latest_extendable_run(
@@ -6149,6 +6153,9 @@ mod acceptance_integrity_tests;
 
 #[cfg(test)]
 mod acceptance_render_tests;
+
+#[cfg(test)]
+mod command_exists_tests;
 
 fn read_optional_text(path: &Path) -> Result<Option<String>> {
     match fs::read_to_string(path) {
@@ -11478,16 +11485,6 @@ struct ParentMarker {
     #[serde(skip_serializing_if = "Option::is_none")]
     context_turns_included: Option<u32>,
     deadreckon_version: String,
-}
-
-fn command_exists(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .any(|dir| {
-            let path = dir.join(name);
-            path.is_file()
-        })
 }
 
 // SAFETY: Materialize arguments are owned clap values at the command boundary.

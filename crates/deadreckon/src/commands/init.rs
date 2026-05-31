@@ -88,7 +88,7 @@ fn preferred_init_subscription_cli_provider(registry: &ProviderRegistry) -> Opti
                 && descriptor
                     .default_binary
                     .as_deref()
-                    .is_some_and(start_command_exists)
+                    .is_some_and(command_exists)
         })
         .map(|descriptor| descriptor.id.clone())
         .next()

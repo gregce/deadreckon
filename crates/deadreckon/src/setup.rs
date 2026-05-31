@@ -173,7 +173,7 @@ pub(crate) fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Opt
                 && descriptor
                     .default_binary
                     .as_deref()
-                    .is_some_and(command_exists)
+                    .is_some_and(crate::command_exists)
         })
         .map(|descriptor| descriptor.id.clone())
         .collect::<Vec<_>>();
@@ -416,17 +416,6 @@ fn provider_kind_label(kind: &ProviderKind) -> String {
         ProviderKind::ScriptedSmoke => "scripted".to_string(),
         ProviderKind::Generic(id) => id.clone(),
     }
-}
-
-fn command_exists(command: &str) -> bool {
-    let explicit = PathBuf::from(command);
-    if explicit.components().count() > 1 {
-        return explicit.is_file();
-    }
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .any(|dir| dir.join(command).is_file())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
