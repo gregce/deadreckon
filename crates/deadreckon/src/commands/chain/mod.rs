@@ -1221,7 +1221,7 @@ fn auto_apply_chain_step(
         json!({ "run_id": run_id }),
     )?;
     if quiet {
-        apply_command_quiet(
+        super::lifecycle::apply_command_quiet(
             run_id.to_string(),
             apply_strategy_label(chain_apply_strategy(chain)).to_string(),
             None,
@@ -1231,7 +1231,7 @@ fn auto_apply_chain_step(
             None,
         )?;
     } else {
-        apply_command(
+        super::lifecycle::apply_command(
             run_id.to_string(),
             apply_strategy_label(chain_apply_strategy(chain)).to_string(),
             None,

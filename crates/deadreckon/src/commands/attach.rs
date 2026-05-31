@@ -799,7 +799,7 @@ async fn handle_tui_completion_key(
     let action_result = match action {
         CompletionAction::Materialize => prompt_materialize_action(paths, state),
         CompletionAction::Extend => prompt_extend_action(state).await,
-        CompletionAction::Apply => apply_command(
+        CompletionAction::Apply => super::lifecycle::apply_command(
             state.run_id.clone(),
             "squash".to_string(),
             None,
@@ -809,7 +809,9 @@ async fn handle_tui_completion_key(
             None,
             false,
         ),
-        CompletionAction::Abandon => abandon_command(state.run_id.clone(), false, false),
+        CompletionAction::Abandon => {
+            super::lifecycle::abandon_command(state.run_id.clone(), false, false)
+        }
         CompletionAction::Docs => {
             Box::pin(super::doc::doc_command(super::doc::DocCommandArgs {
                 run_id: state.run_id.clone(),

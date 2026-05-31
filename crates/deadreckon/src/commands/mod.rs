@@ -9,6 +9,7 @@ pub(crate) mod import;
 pub(crate) mod init;
 pub(crate) mod inspection;
 pub(crate) mod learning;
+pub(crate) mod lifecycle;
 pub(crate) mod merge;
 pub(crate) mod orchestrate;
 pub(crate) mod plan;

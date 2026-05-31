@@ -81,6 +81,8 @@ fn style_facade_and_status_tones_live_in_ui_module() {
 fn terminal_status_lines_do_not_use_warning_tone_for_failures() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let main = fs::read_to_string(manifest.join("src/main.rs")).expect("main");
+    let lifecycle =
+        fs::read_to_string(manifest.join("src/commands/lifecycle.rs")).expect("lifecycle");
     let ui = fs::read_to_string(manifest.join("src/ui.rs")).expect("ui");
 
     for stale in [
@@ -89,10 +91,14 @@ fn terminal_status_lines_do_not_use_warning_tone_for_failures() {
         "ui_warn(\"failed extended run\")",
         "ui_warn(\"done criteria failed\")",
     ] {
-        assert!(!main.contains(stale), "stale warning tone: {stale}");
+        assert!(!main.contains(stale), "stale warning tone in main: {stale}");
+        assert!(
+            !lifecycle.contains(stale),
+            "stale warning tone in lifecycle: {stale}"
+        );
     }
-    assert!(main.contains("fn print_extended_run_outcome("));
-    assert!(main.contains("ui_status(status)"));
+    assert!(lifecycle.contains("fn print_extended_run_outcome("));
+    assert!(lifecycle.contains("ui_status(status)"));
     assert!(ui.contains("Paused"));
     assert!(ui.contains("Note"));
 }

@@ -2475,7 +2475,7 @@ async fn dispatch_start_command(
             let before = start_run_ids(&paths)?;
             let goal = args.goal.clone();
             let quiet = args.quiet;
-            let result = extend_command(ExtendCommandArgs {
+            let result = super::lifecycle::extend_command(ExtendCommandArgs {
                 parent_run_id,
                 new_goal: args.goal,
                 dest: None,

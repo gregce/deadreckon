@@ -133,6 +133,10 @@
 - Post-P11g: Moved `deadreckon doc` run/plan dispatch and doc-polish preview
   helpers into `src/commands/doc.rs`, leaving narrative attach provider
   selection at the root and reducing `main.rs` to roughly 14.0k lines.
+- Post-P11h: Moved `finish`, `export`/`materialize`, `apply`, `abandon`,
+  `cleanup`, `extend`, parent markers, and lifecycle notification firing into
+  `src/commands/lifecycle.rs`, leaving status/resume/control helpers at the
+  root and reducing `main.rs` to roughly 12.4k lines.
 
 ## Effortless (production release) - 2026-05-28
 
