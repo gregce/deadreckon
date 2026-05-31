@@ -17,6 +17,16 @@
 - Long-lived notifier daemon: notifications are opt-in transition effects only. A daemon could batch, retry, and surface historical notifications after privacy, lifecycle, and process-supervision behavior are designed.
 - Richer guided onboarding: provider-specific and repo-specific onboarding can build on `start`, `try`, and the done contract once it can stay local-first and avoid surprise telemetry.
 
+## Decompose follow-ups
+
+- Core `pub mod` tightening with flat re-exports: Decompose left library module visibility alone because tightening it would rewrite deep-path callers and the public-surface baseline for no binary-layout gain.
+- Chain/Plan field encapsulation behind transition methods: the current structs remain field-accessible because wrapping the existing call sites is a separate library API migration with higher behavior risk than the private binary split.
+- Uniform `CommandHandler` trait: command families now live in private modules, but a trait-based `cli() -> exec()` framework remains cosmetic until there is repeated behavior worth abstracting.
+- Public binary facade or `deadreckon-cli` crate: the binary still has no external frontend consumer, so there is no `pub run(cli) -> ExitCode` maintenance contract.
+- `ProviderError` `#[source]` and sysexits exit codes: richer error chaining and exit taxonomy stay out of the behavior-preserving refactor because they would alter observable CLI behavior.
+- `cli.rs` enum-per-family split: the clap command enum remains centralized to avoid rename churn and help/completion drift while command bodies move behind private modules.
+- Integration-test submodule reorg: the lifted sibling test modules are intentionally boring; reshaping them into a deeper hierarchy can wait until test ownership pressure justifies it.
+
 ## General candidates
 
 - Tamper-evidence hardening beyond the production gate: causal proof that a covered-file edit caused a pass, language-aware test detection beyond Rust heuristics, a separate signed tamper/audit log distinct from learning logs, fleet/plan-level tamper reporting, and sandboxing acceptance checks' own filesystem writes.

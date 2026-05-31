@@ -107,6 +107,9 @@
   confirmed dead helpers, hardened docs regex initialization with BUG-tagged
   `expect` calls plus compile coverage, and applied targeted allocation nits
   while keeping characterization goldens unchanged.
+- P11: Documented the post-decompose binary layout in AS-BUILT §38, updated the
+  built-vs-thin accounting, and logged the rejected command/API/test reshaping
+  work in `docs/V1-CANDIDATES.md`.
 
 ## Effortless (production release) - 2026-05-28
 

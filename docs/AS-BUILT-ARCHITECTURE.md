@@ -64,7 +64,9 @@ deadreckon is a Rust 2024 CLI harness whose default flow is **unattended long-ru
 ┌────────────────────────────────▼──────────────────────────────────────────┐
 │ CLI LAYER (crates/deadreckon)                                             │
 │   cli.rs       clap parser definitions                                    │
-│   main.rs      command handlers, ratatui rendering, post-run summary       │
+│   main.rs      entrypoint, dispatcher, shared root helpers                 │
+│   commands/    private command-family modules                             │
+│   tui/         private attach render/state layer                           │
 └────────────────────────────────┬──────────────────────────────────────────┘
                                  │ create_run → acquire_lock → runtime loop
                                  ▼
@@ -181,7 +183,7 @@ Why this shape works:
 | `doctor.rs` | backend availability checks |
 | `process.rs` | `run(SandboxSpec) -> SandboxRunOutput`, PID files, cancellation, SIGTERM/SIGKILL escalation |
 
-**`deadreckon` (binary crate, `crates/deadreckon/src/`).** Clap parser definitions (`cli.rs`), command handlers and the ratatui TUIs for run/chain/plan `attach` (`main.rs`, ~40k lines), and `dr-gate` as a standalone acceptance-marker writer (`bin/dr-gate.rs`). Supporting modules: `narrative.rs` (deterministic + provider-backed narrative projection), `plan_event_bus.rs` (`PlanEventBus`/`PlanEventFeed`), `tui_events.rs` (`TuiEventFeed`), `ui.rs` + `ui_card.rs` + `cards/` (CLI/TUI rendering vocabulary and cards), `setup.rs` (provider/done-contract resolution), `prompt.rs` (confirmation prompts), and `sleep.rs` (sleep-prevention).
+**`deadreckon` (binary crate, `crates/deadreckon/src/`).** Clap parser definitions (`cli.rs`), a root entrypoint/dispatcher and shared helpers (`main.rs`), private command-family modules (`commands/`), private attach render/state modules (`tui/`), and `dr-gate` as a standalone acceptance-marker writer (`bin/dr-gate.rs`). Supporting modules: `narrative.rs` (deterministic + provider-backed narrative projection), `plan_event_bus.rs` (`PlanEventBus`/`PlanEventFeed`), `tui_events.rs` (`TuiEventFeed`), `ui.rs` + `ui_card.rs` + `cards/` (CLI/TUI rendering vocabulary and cards), `setup.rs` (provider/done-contract resolution), `prompt.rs` (confirmation prompts), and `sleep.rs` (sleep-prevention).
 
 ### 2.3 Top-level documentation
 
@@ -1270,7 +1272,7 @@ Trace `detail` rows use a stable import schema: `import_version`, canonical `sou
 
 ## 17. CLI Surface
 
-The `Commands` enum in `crates/deadreckon/src/cli.rs` defines the CLI surface; handlers live in `crates/deadreckon/src/main.rs`. Verbs and roles (line numbers are intentionally omitted — `cli.rs` is the source of truth and grows over time):
+The `Commands` enum in `crates/deadreckon/src/cli.rs` defines the CLI surface; `main_inner` in `crates/deadreckon/src/main.rs` dispatches to private command-family modules under `crates/deadreckon/src/commands/` and to root helpers for legacy lifecycle/inspection surfaces. Verbs and roles (line numbers are intentionally omitted — `cli.rs` is the source of truth and grows over time):
 
 Default top-level help presents the production model: `start`, `attach`,
 `status`, `list`, `finish`, `doctor`, `init`, `def-done`, `kill`, `resume`,
@@ -1345,7 +1347,7 @@ The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defau
 
 ## 18. TUI (`attach`)
 
-`attach_command` lives at `main.rs:18043`; `attach_tui` / `attach_tui_with_parent` at `main.rs:23560`/`23580`; the layout and collectors follow (`attach_panel_layout`, `collect_acceptance_live`, `collect_provider_activity`). `main.rs` is ~31k lines, so treat these line numbers as approximate locators.
+`attach_command` lives in `crates/deadreckon/src/commands/attach.rs`. The terminal loops delegate to the private `tui/` render/state facade for run, plan, and chain frames; provider refresh and narrative projection stay outside the render path. Historical `main.rs` line numbers for attach are obsolete after the Decompose pass.
 
 ### 18.1 Behavior
 
@@ -1564,6 +1566,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 
 - Workspace, crates, build, lint, fmt, test discipline.
 - Workspace lint discipline (deny-tier clippy + rustc), tuned release profile, registry-shaped library `lib.rs`, library print refusal, and error retryable/fatal taxonomy as vocabulary for future watchdog work.
+- Binary module layout: the former 40.6k-line `crates/deadreckon/src/main.rs` has been split into private `commands/` and `tui/` modules behind `main_inner` dispatch. `cli.rs`, the `Command` enum, all verbs, all user-facing output, and the public library surface remain unchanged by that split.
 - `PipelineState` shape, phase machine, atomic state writes, schema version.
 - PID-aware locks + heartbeats + stale reclaim.
 - Atomic working→library promotion with crash recovery.
@@ -1838,13 +1841,13 @@ The deterministic as-built seed maps changed paths into concrete layers such as 
 
 ### 26.2 Style Helpers
 
-`crates/deadreckon/src/ui.rs` owns ANSI rendering through `Tone`, `Stream`, `write`, `writeln`, `hint`, and `kv_block`. The small CLI facade (`ui_heading`, `ui_muted`, `ui_id`, `ui_command`, `ui_ok`, `ui_warn`, `ui_note`, `ui_status`, and `ui_error`) also lives there, so `main.rs` imports style intent instead of defining its own wrappers. Raw ANSI escapes are confined to `ui.rs`, and status labels route through `ui::status_tone` before choosing a tone. `failed`/`killed`, `paused`, `warning`, and `note` are separate style intents even when two intents currently share the same terminal color. The cyan `deadreckoning` banner, blue `* ^ . -` course strip, magenta IDs, spend gauge gradient, and chain glyph family remain product affordances.
+`crates/deadreckon/src/ui.rs` owns ANSI rendering through `Tone`, `Stream`, `render`, `writeln`, `hint`, line replacement, and ANSI stripping helpers. The small CLI facade (`ui_heading`, `ui_muted`, `ui_id`, `ui_command`, `ui_ok`, `ui_warn`, `ui_note`, `ui_status`, and `ui_error`) also lives there, so command modules import style intent instead of defining their own wrappers. Raw ANSI escapes are confined to `ui.rs`, and status labels route through `ui::status_tone` before choosing a tone. `failed`/`killed`, `paused`, `warning`, and `note` are separate style intents even when two intents currently share the same terminal color. The cyan `deadreckoning` banner, blue `* ^ . -` course strip, magenta IDs, spend gauge gradient, and chain glyph family remain product affordances.
 
 Custom top-level help and `help-all` command discovery now render from `COMMAND_HELP_CATALOG` in `crates/deadreckon/src/main.rs`. The default help first screen presents the production model (`start`, `attach`, `status`, `list`, `finish`, setup, and control) rather than every callable verb. The top-level clap after-help no longer carries a duplicate command table; unit tests verify catalog row uniqueness, command audience classification, and that every catalog entry points at a real clap subcommand or explicit pseudo-row such as `<command> --help`. `help-all` states the discovery policy: advanced commands remain callable and documented there, while compatibility aliases stay inline on their canonical row.
 
 ### 26.3 Key/Value Layout
 
-`print_kv_block` wraps `ui::kv_block` for CLI cards. Run start banners, run summaries, run locations, status cards, plan creation, and plan summaries now use lowercase keys, padded colons, and six-decimal spend where applicable.
+`print_kv_block` is a binary-private formatting helper backed by `ui::writeln` and `Tone::Plain`. Run start banners, run summaries, run locations, status cards, plan creation, and plan summaries now use lowercase keys, padded colons, and six-decimal spend where applicable.
 
 ### 26.4 Flag Truth
 
@@ -2295,7 +2298,7 @@ workstreams and composes their results into a single promoted run. The verb is
 the top-level `deadreckon campaign <goal> --n <2..=6>`, a peer of `run`,
 `orchestrate`, and `chain` (not a subcommand of `orchestrate`). Campaign logic
 lives in `crates/deadreckon-core/src/campaign.rs`; the command handler and spawn
-glue are in `crates/deadreckon/src/main.rs`.
+glue are in `crates/deadreckon/src/commands/campaign.rs`.
 
 ### 36.1 Mental model: fork→merge lifted one level
 
@@ -2480,4 +2483,130 @@ notifier, and deeper multi-piece classification are V1 candidates.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, and 37 in particular. Updated 2026-05-28 for Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~40k lines) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+## 38. Binary Module Layout (post-decompose)
+
+The Decompose pass made the binary crate navigable without changing its public or
+CLI contract. The public-surface baseline still covers only `deadreckon-core`,
+`deadreckon-providers`, `deadreckon-runtime`, and `deadreckon-sandbox`; the binary
+crate remains private implementation glue. The split moved the highest-churn
+command families and pure terminal render layer out of the monolithic `main.rs`
+while keeping `cli.rs`, the `Command` enum, every verb, every flag, every output
+string, and every exit path behavior-compatible.
+
+### 38.1 Why `main.rs` was split
+
+Before this pass, `crates/deadreckon/src/main.rs` carried roughly 40.6k lines:
+command handlers, cross-command helpers, and seven inline `#[cfg(test)]` modules
+in one namespace. That shape made ordinary command changes hard to review because
+tests, helpers, and unrelated command bodies interleaved in one file. The safety
+argument was narrow: moving binary-private code cannot change the library public
+surface, but it can change observable CLI behavior, so output characterization had
+to land before moving code.
+
+After the pass, the binary source is split across private modules. `main.rs` still
+owns the Tokio entrypoint, tracing setup, the `main_inner` command match, shared
+root-level lifecycle/inspection/update/learning helpers, and private glue used by
+multiple command families. It is no longer the single home for the core command
+families, TUI render layer, or lifted unit-test modules.
+
+### 38.2 Characterization net
+
+`crates/deadreckon/tests/characterization.rs` runs the built binary and compares
+normalized stdout/stderr against goldens under
+`crates/deadreckon/tests/goldens/characterization/`. It pins representative
+user-facing output for:
+
+- `plan --draft`
+- `plan --quiet`
+- `orchestrate ... --preview --json`
+- `chain ... status`
+- off-TTY attach narrative output
+- canonical `try:` refusal footers
+
+Those goldens stayed green through the command and render moves, the shared merge
+helper extraction, command-existence dedupe, and P10 cleanup nits. They are the
+explicit guard that the decompose work did not change CLI output shape.
+
+### 38.3 Command modules and `main_inner`
+
+`crates/deadreckon/src/commands/mod.rs` exposes only crate-private modules:
+
+- `commands/chain/` owns the chain command family, conductor entrypoints, chain
+  attach loop, and chain lifecycle verbs.
+- `commands/acceptance.rs` owns `acceptance` and `def-done` command handling.
+- `commands/run.rs` owns the supervised `run` command body.
+- `commands/init.rs` owns `init` setup wiring.
+- `commands/campaign.rs` owns campaign creation, preflight, fork/roll-up helpers,
+  attach summaries, and campaign failure reports.
+- `commands/attach.rs` owns attach command dispatch and terminal event loops.
+- `commands/merge.rs` owns merge entrypoint and CLI repair-strategy parsing.
+- `commands/orchestrate.rs` owns the orchestrate front door and mode/provider
+  selection helpers.
+- `commands/plan.rs` owns plan creation, fork, child-launch orchestration, and
+  plan/fork output helpers.
+
+`main_inner` remains the dispatcher. It parses the unchanged `cli.rs` command enum,
+sets plain-output policy where needed, and delegates to the command family module
+or to the root helper that still owns that legacy lifecycle/inspection surface.
+The binary does not expose a public `run(cli)` facade and does not add a new
+library crate.
+
+### 38.4 TUI render layer
+
+`crates/deadreckon/src/tui/` is private and presentation-oriented:
+
+- `tui/attach_state.rs` owns attach TUI state, key reducers, panel focus, and
+  selection state.
+- `tui/render.rs` owns pure state-to-frame rendering for run attach, plan attach,
+  chain attach, Markdown docs, narrative panels, live files, process rows, and
+  activity feeds.
+- `tui/mod.rs` is the crate-private facade consumed by command loops and tests.
+
+The event loops stay in command modules. Render functions do not call providers or
+write state; provider-backed narrative refresh remains asynchronous and outside the
+render path. P6 added pure-render snapshots for run and chain attach frames after
+the seam existed.
+
+### 38.5 Visibility discipline
+
+The split widened only binary-internal access to `pub(crate)` where moved modules
+or sibling `src` test modules needed it. It did not make binary helpers `pub`, did
+not re-export binary internals from a library crate, and did not alter the
+recorded library surface. Move commits were kept mechanical: relocation plus the
+minimum visibility widening, with logic edits isolated in later cleanup commits.
+
+### 38.6 The single public-surface rebaseline
+
+The only deliberate public-surface change in the whole Decompose pass was P9:
+`deadreckon_core::error::is_retryable_io_kind` became a shared public core helper
+so providers and sandbox could delete verbatim local copies. The public-surface
+baseline gained exactly that one path, and the P9 commit documents why the
+rebaseline is behavior-identical and isolated.
+
+### 38.7 Duplicated logic unified
+
+Two duplicated implementation families were unified after the move phases:
+
+- The merge composition loop now backs campaign result composition, plan merge
+  working-tree composition, and full-plan dependency source assembly while
+  preserving conflict/precedence semantics.
+- Command existence lookup now flows through one private helper that preserves
+  explicit-path handling and bare PATH search behavior.
+
+P10 also pruned unused `tracing`/`chrono` declarations from the targeted library
+crates, deleted confirmed dead helpers, hardened docs regex initialization with
+BUG-tagged `expect` calls plus compile coverage, and applied small allocation nits
+without moving characterization goldens.
+
+### 38.8 Deliberately not done
+
+The pass rejected broader churn that would not make the requested decomposition
+more true or would create public-surface/behavior risk: core `pub mod` tightening,
+Chain/Plan field encapsulation, a uniform `CommandHandler` trait, a public
+binary-run facade or new `deadreckon-cli` crate, `#[source]`/sysexits behavior
+changes, splitting `cli.rs`'s command enum, and integration-test submodule churn.
+Those are recorded in `docs/V1-CANDIDATES.md` as explicit "not now" pointers.
+
+---
+
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~22.6k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
