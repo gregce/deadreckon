@@ -1819,6 +1819,7 @@ fn render_plan_attach_text_with_view(
             show_hints: true,
             view,
             visual,
+            campaign_parent: None,
             narrative_notice: None,
             narrative_projection: None,
         },
@@ -1847,6 +1848,7 @@ fn render_plan_attach_text_with_feed(
             show_hints: true,
             view: AttachViewMode::Activity,
             visual: NarrativeVisualMode::Architecture,
+            campaign_parent: None,
             narrative_notice: None,
             narrative_projection: None,
         },
@@ -3535,6 +3537,7 @@ fn child_attach_from_plan_names_parent_and_back_action() {
         parent_plan: Some(AttachParentPlan {
             plan_id: "99998888777766665555444433332222".to_string(),
             task_id: "task-1".to_string(),
+            campaign_parent: None,
         }),
         ..AttachTuiState::default()
     };
@@ -3556,6 +3559,7 @@ fn plan_attach_child_breadcrumb_names_task_and_run() {
         parent_plan: Some(AttachParentPlan {
             plan_id: "99998888777766665555444433332222".to_string(),
             task_id: "task-1".to_string(),
+            campaign_parent: None,
         }),
         ..AttachTuiState::default()
     };
@@ -3576,6 +3580,7 @@ fn plan_attach_child_footer_includes_back_hint() {
         parent_plan: Some(AttachParentPlan {
             plan_id: "99998888777766665555444433332222".to_string(),
             task_id: "task-1".to_string(),
+            campaign_parent: None,
         }),
         ..AttachTuiState::default()
     };

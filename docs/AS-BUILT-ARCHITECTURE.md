@@ -1347,14 +1347,14 @@ The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defau
 
 ## 18. TUI (`attach`)
 
-`attach_command` lives in `crates/deadreckon/src/commands/attach.rs`. The terminal loops delegate to the private `tui/` render/state facade for run, plan, and chain frames; provider refresh and narrative projection stay outside the render path. Historical `main.rs` line numbers for attach are obsolete after the Decompose pass.
+`attach_command` lives in `crates/deadreckon/src/commands/attach.rs`. The terminal loops delegate to the private `tui/` render/state facade for run, plan, chain, and campaign frames; provider refresh and narrative projection stay outside the render path. Historical `main.rs` line numbers for attach are obsolete after the Decompose pass.
 
 ### 18.1 Behavior
 
 - On a TTY: `attach_tui()` enables raw mode, alternate screen, and renders a `ratatui` UI.
 - Off-TTY: prints a plain-text summary + locations.
 
-`attach` dispatches by id kind: a run id opens the run TUI documented below, a chain id opens the chain attach view (`Chains`, §28), and a plan id opens the plan attach TUI (`Plans`, §30.3 / §32.3). All three TUIs draw from the same palette (`ui::TUI_PALETTE`, §26.7) and the same key conventions (`q`/`Esc`/`Ctrl-D` detach; `d` toggles docs view in the run TUI; `Enter` drills into a child run from plan attach).
+`attach` dispatches by id kind: a run id opens the run TUI documented below, a chain id opens the chain attach view (`Chains`, §28), a plan id opens the plan attach TUI (`Plans`, §30.3 / §32.3), and a campaign id opens the campaign attach TUI (`Campaign Orchestration`, §36.9). These TUIs draw from the same palette (`ui::TUI_PALETTE`, §26.7) and the same key conventions (`q`/`Esc`/`Ctrl-D` detach; `d` toggles docs view in the run TUI; `Enter` drills into a child run from plan attach, or into a selected sub-plan from campaign attach). Campaign drill-in is navigated rather than flattened: campaign attach suspends its frame, opens the existing plan attach loop for the selected sub-plan, and the plan loop can then suspend again into the existing run attach loop.
 
 `attach <id> --view narrative` adds a calmer operator projection for runs, plans, and plan child refs. The default remains `activity`, so raw tool/provider lines still open first unless the user requests the narrative view. In narrative mode, `n` toggles back to raw activity, `v` cycles `architecture -> agents -> files -> evidence -> none`, and `r` requests a provider-backed refresh when a configured route is available. While the TTY narrative view is open, meaningful run and plan events also request a provider refresh: errors, completions, tool milestones, docs checkpoints, acceptance running/pass/fail transitions, child-run discovery, task terminal states, and merge-repair milestones. Long-running quiet periods request a refresh after the narrative quiet window when the run or plan is still running. Provider refreshes are background jobs: manual/event/quiet refreshes coalesce while one is active, `q`/`Esc`/`Ctrl-D` detach remains immediate, and child drill-in from plan attach cancels or suspends the in-flight narrator before opening the child run. Provider refreshes are bounded: the prompt is built from redacted evidence windows, the provider must return strict cited JSON, graph labels may only target deterministic graph ids, and failures persist a stale deterministic projection instead of breaking attach.
 
@@ -1387,6 +1387,8 @@ The top band is split horizontally into three panels for subscription providers 
 - **Bottom**: supervised PIDs + their `ps` lines (alive/dead annotation).
 - **Footer**: action-first completed footer (`[d] Docs` / `[d] Activity`, `[a] Apply`, `[b] Abandon`, `[s] Show`) or scroll/detach help while running. The footer's second line carries `deadreckoning_status_line` while long operations are in flight.
 
+Campaign attach has its own campaign-shaped frame rather than reusing the run panel grid. The TTY view shows a campaign header with goal, status, roll-up, aggregate spend, tree budget, and campaign breadcrumb; selectable sub-plan cards with sub id, status, plan/result prefixes, spend, and goal; a campaign feed; and a footer with select/drill/back/refresh/detach controls. `Enter` requires a selected sub with a `sub_plan_id`; otherwise it keeps the campaign frame open. Off-TTY and `--plain` still print the read-only campaign summary with an explicit `deadreckon attach <sub-plan-id>` hint, and `--json` emits the structured campaign attach object instead of entering ratatui.
+
 ### 18.3 Data source and responsiveness contract
 
 Each attach surface runs a budgeted tick loop. The render path is pure: it must not call providers, recurse through provider roots, append narrative snapshots, or reread unbounded JSONL files. Slow or potentially blocking work is either moved into an attach-owned cache/tailer or into a background refresh job whose completion is polled between frames.
@@ -1395,7 +1397,7 @@ Run attach uses `TuiEventFeed` for run events and `AttachJsonlTail` for `spend.j
 
 `collect_provider_activity` resolves provider ingest through descriptor `[ingest]` metadata: candidate roots, env overrides, cwd matching, storage kind, file glob, freshness window, and schema key. `deadreckon import` reuses the same descriptor metadata for provider transcript discovery and adds import-only session selection, manifest writing, and normalized trace/provenance event creation. `cli:codex` reads `~/.codex/sessions/**.jsonl` and matches `session_meta.payload.cwd`; `cli:claude-code` reads `~/.claude/projects/<cwd-slug>/*.jsonl` using Claude Code's path-to-project mapping and matches top-level `cwd`; `cli:gemini` reads Gemini JSON/JSONL file logs; `cli:opencode` reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON; `cli:copilot` reads `~/.copilot/session-state/*.jsonl` plus nested `events.jsonl` and matches `data.context.cwd`; `cli:pi` reads `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`, validates the first nonblank row is a Pi `session`, and matches the header `cwd`. Schema-specific adapters only decode rows into common activity lines (`agent`, `thinking`, `tool`, `result`, `todo`, `tokens`) and normalize tool labels through `deadreckon_providers::taxonomy`.
 
-Production run attaches — same-process and cross-process alike — read run events by tailing `events.jsonl` via `TuiEventFeed::file_tail`; `TuiEventFeed::from_broadcast` is `#[cfg(test)]` only. (The loop's `emit_event` writes the file and sends on the `RunEventBus` channel together, so the file tail stays current; the broadcast path is reserved for a future same-process attach.) Plan attach consumes `PlanEventBus` / `PlanEventFeed`, which owns `plan-events.jsonl` replay/tailing, emits plan snapshots, tolerates malformed or partial plan-event rows, and multiplexes discovered child and repair run `events.jsonl` streams into the plan activity pane. Chain attach keeps its own `AttachJsonlTail<ChainEvent>` for `chain-events.jsonl`, preserves the existing drill/redo/extend/pause/kill controls, ignores partial last lines until complete, and shows an activity-read hint when chain event catch-up falls behind the tick budget. The production feeds remain durable-file backed for cross-process attach, with broadcast-capable APIs available for same-process streams.
+Production run attaches — same-process and cross-process alike — read run events by tailing `events.jsonl` via `TuiEventFeed::file_tail`; `TuiEventFeed::from_broadcast` is `#[cfg(test)]` only. (The loop's `emit_event` writes the file and sends on the `RunEventBus` channel together, so the file tail stays current; the broadcast path is reserved for a future same-process attach.) Plan attach consumes `PlanEventBus` / `PlanEventFeed`, which owns `plan-events.jsonl` replay/tailing, emits plan snapshots, tolerates malformed or partial plan-event rows, and multiplexes discovered child and repair run `events.jsonl` streams into the plan activity pane. Chain attach keeps its own `AttachJsonlTail<ChainEvent>` for `chain-events.jsonl`, preserves the existing drill/redo/extend/pause/kill controls, ignores partial last lines until complete, and shows an activity-read hint when chain event catch-up falls behind the tick budget. Campaign attach uses `CampaignEventFeed`: it tails `campaign-events.jsonl` with `JsonlTail`, rediscovering sub-plans from `campaign.json`, and tails each discovered sub-plan's `plan-events.jsonl` with the same read-side tailer. It emits campaign snapshots, campaign events, sub-plan plan events, and warnings, but it does not flatten child run streams into a three-level tree; operators navigate to the existing plan/run attach loops for that detail. The production feeds remain durable-file backed for cross-process attach, with broadcast-capable APIs available for same-process streams.
 
 ### 18.4 Narrative projection files
 
@@ -1590,13 +1592,13 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Acceptance gate with signed marker; anti-self-attestation and tamper-evident hollow-pass detection are enforced without adding `PipelineState`, `Plan`, marker, or check-result fields.
 - `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `rewind`, `show`, `import`, `cleanup`/`prune`, `completion`, `learn`, and `improve` verbs.
 - Shell tab-completion via `completion install` / `completion {bash,zsh,fish,elvish,powershell}` driven from the live clap command tree; `init` opt-out installs completions and (for zsh) appends a managed `.zshrc` block.
-- `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, and completion action footer. Run, plan, and chain attach now share an explicit responsiveness contract: render paths are provider-free and write-free, JSONL streams are tailed or cached, provider narrative refreshes run in cancellable/coalesced background jobs, stale narrative snapshots survive redraw, and long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
+- `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, campaign sub-plan cards, and completion action footer. Run, plan, chain, and campaign attach now share an explicit responsiveness contract: render paths are provider-free and write-free, JSONL streams are tailed or cached, provider narrative refreshes run in cancellable/coalesced background jobs, stale narrative snapshots survive redraw, and long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
 - Descriptor-driven provider activity ingest for Codex, Claude Code, Gemini JSON/JSONL, OpenCode file-mode logs, GitHub Copilot CLI session-state JSONL, and Pi session JSONL, normalized into `agent` / `thinking` / `tool` / `result` / `todo` / `tokens` rows without rewriting provider-owned logs.
 - Descriptor import hardening: `deadreckon import` accepts legacy aliases and provider descriptor ids, discovers CLI transcripts through descriptor `[ingest]`, selects concrete sessions by cwd or `--session`, writes `import.json`, refuses ambiguous/changed imports with `try:` lines, and normalizes trace/provenance rows for Codex, Claude Code, Gemini, OpenCode file-mode, GitHub Copilot CLI, Pi, and Cursor SQLite.
 - Streaming acceptance progress: `proofs/acceptance-progress.jsonl` reports per-check `started`/`running`/`passed`/`failed` transitions while `dr-gate` is mid-evaluation; the attach TUI tails it alongside the signed marker.
 - Extended runs carry the parent's `acceptance.yaml` into the child run and emit the same `print_run_started` startup details (provider route, doc-provider source) as fresh runs; resume does the same.
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.
-- Event-backed TUI attach: production run attaches (same- and cross-process) tail `events.jsonl` incrementally via `TuiEventFeed::file_tail` — `TuiEventFeed::from_broadcast` is `#[cfg(test)]` only. Plan attach uses `PlanEventBus` for durable replay/tail plus child/repair event multiplexing, and chain attach tails `chain-events.jsonl` incrementally with partial-line tolerance.
+- Event-backed TUI attach: production run attaches (same- and cross-process) tail `events.jsonl` incrementally via `TuiEventFeed::file_tail` — `TuiEventFeed::from_broadcast` is `#[cfg(test)]` only. Plan attach uses `PlanEventBus` for durable replay/tail plus child/repair event multiplexing, chain attach tails `chain-events.jsonl` incrementally with partial-line tolerance, and campaign attach tails `campaign-events.jsonl` plus each discovered sub-plan's `plan-events.jsonl`.
 - Cross-process cancellation: `kill` writes a durable cancel marker before signaling; the run loop observes it while provider calls are in flight and reports killed status through events.
 - Partial-trace resume: resume reconstructs only completed tool boundaries and `resume --from-turn` truncates traces, spend records, and future snapshots together.
 - Durable per-run `sandbox.toml` plus per-tool sandbox policy: bash/write-file paths get specific filesystem and network permissions; refusals include `try:` and are recorded in traces and provenance.
@@ -1614,6 +1616,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Vocabulary and error-footers: user-facing copy treats a passed run as a "verified run" (verified by `dr-gate`) and groups `def-done` / `acceptance.yaml` wording under the "done contract"; P10 coverage asserts the shared glossary and a parameterized refusal table with final `try:` footers.
 - Autonomous sequential chains: `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`, and `chain redo`; chains use `latest`/`last` aliases, `chain.json`, `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps, green-policy auto-apply, and a multi-step ratatui timeline with single-run chain context.
 - Plan observability: orchestration plans now write `plan-events.jsonl`; `attach <plan-id>` renders plan events, drills into child run attach, and returns to the plan context; plain attach, `history grep --plan`, and `show --why-failed <plan-id>` include plan event evidence.
+- Campaign observability: `attach <campaign-id>` opens a live campaign ratatui TUI on TTYs with sub-plan cards, roll-up/budget header, campaign/sub-plan feed rows, and `Enter` drill-in to the existing plan attach TUI; plan child drill-in then reaches the normal run attach TUI, and backing out twice returns to the campaign frame. Off-TTY/`--plain` remains the read-only summary, and `--json` emits a structured campaign attach object.
 - Consolidated plan-result docs: completed plans write provider-backed or deterministic `PLAN-NARRATIVE.md`, `PLAN-AS-BUILT.md`, `PLAN-DECISIONS.md`, `PLAN-CHILDREN.md`, and `PLAN-DOCS-MANIFEST.json`; merged libraries, apply worktrees, and exports carry those docs, and synthetic plan-result apply runs expose wrapper `RUN-*` docs that point at the consolidated plan story.
 - Semantic merge repair: `merge <plan-id>` now defaults to DAG-aware composition, lets descendant tasks supersede ancestor file edits, writes conflict/repair sidecars under `merge-proofs/`, and automatically invokes a repair provider for true parallel conflicts unless `--no-repair` is set.
 - Provider flight recorder & rewind: CLI-backed provider turns record `flight-manifest.json`, `flight-events.jsonl`, and delta `checkpoints/`; `show --flight` / `--file` inspects them and `rewind --to-turn|--to-provider-event|--to-checkpoint` previews or applies a hash-guarded checkpoint restore.
@@ -2379,9 +2382,19 @@ invalidates the marker — nesting cannot launder a refused leaf into a clean pa
 
 ### 36.9 attach / show --why-failed / repair / kill for campaigns
 
-`resolve_campaign` matches a campaign id prefix. `attach <campaign-id>` prints a
-plain summary of sub rows + roll-up with a breadcrumb (full TUI drill-in into a
-selected sub-plan is a V1 candidate — use `attach <sub-plan-id>`).
+`resolve_campaign` matches a campaign id prefix and accepts `latest`/`last` for
+the most recently created campaign. `attach <campaign-id>` is a first-class live
+TTY surface: it opens a campaign ratatui view with the root goal, campaign status,
+roll-up, aggregate spend, tree budget, selectable sub-plan cards, and a feed built
+from `campaign-events.jsonl` plus each discovered sub-plan's `plan-events.jsonl`.
+`Enter` drills into the selected sub-plan by suspending the campaign TUI and
+calling the existing plan attach loop; the plan loop can then drill into a child
+run with the existing run attach loop. Breadcrumbs include the campaign tier
+(`campaign <id> / sub-* / plan <id> / task-*`), and `b`/Backspace returns through
+the nested contexts. Off-TTY or `--plain` still prints the read-only sub rows +
+roll-up summary with the explicit `deadreckon attach <sub-plan-id>` hint. `--json`
+emits a structured campaign attach object with id, status, goal, tree budget,
+aggregate spend, roll-up, and sub-plan rows.
 `show <campaign-id> --why-failed` reports refused/caveat subs.
 `campaign repair <campaign-id>` is state-changing and only accepts failed
 campaigns; successful repair writes a new promoted campaign result run and marks
@@ -2392,7 +2405,8 @@ then marks the campaign killed.
 ### 36.10 Current limits
 
 Depth is capped at 2; sub-goals are independent (no cross-sub dependency edges);
-attach is a one-hop summary, not a recursive event tree. These are tracked in
+campaign attach is navigated drill-in, not a flattened recursive event tree with
+every campaign, plan, and run event in one pane. These are tracked in
 `docs/V1-CANDIDATES.md`.
 
 ---
@@ -2552,10 +2566,12 @@ explicit guard that the decompose work did not change CLI output shape.
 - `commands/run.rs` owns the supervised `run` command body.
 - `commands/init.rs` owns `init` setup wiring.
 - `commands/campaign.rs` owns campaign creation, preflight, fork/roll-up helpers,
-  meta-merge repair, attach summaries, and campaign failure reports.
+  meta-merge repair, campaign attach state/feed helpers, attach summaries, and
+  campaign failure reports.
 - `commands/attach.rs` owns attach command dispatch and terminal event loops.
 - `commands/attach_runtime.rs` owns attach-loop tick timing and asynchronous
-  narrative-refresh job/request plumbing shared by run, plan, and chain attach.
+  narrative-refresh job/request plumbing shared by run, plan, chain, and
+  campaign attach.
 - `commands/merge.rs` owns merge entrypoint and CLI repair-strategy parsing.
 - `commands/orchestrate.rs` owns the orchestrate front door and mode/provider
   selection helpers.
@@ -2596,11 +2612,11 @@ library crate.
 
 `crates/deadreckon/src/tui/` is private and presentation-oriented:
 
-- `tui/attach_state.rs` owns attach TUI state, key reducers, panel focus, and
-  selection state.
+- `tui/attach_state.rs` owns attach TUI state, key reducers, panel focus,
+  campaign parent breadcrumbs, and selection state.
 - `tui/render.rs` owns pure state-to-frame rendering for run attach, plan attach,
-  chain attach, Markdown docs, narrative panels, live files, process rows, and
-  activity feeds.
+  chain attach, campaign attach, Markdown docs, narrative panels, live files,
+  process rows, and activity feeds.
 - `tui/mod.rs` is the crate-private facade consumed by command loops and tests.
 
 The event loops stay in command modules. Render functions do not call providers or
@@ -2650,4 +2666,4 @@ Those are recorded in `docs/V1-CANDIDATES.md` as explicit "not now" pointers.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

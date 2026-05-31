@@ -129,12 +129,12 @@ use crate::cli::{
 use crate::narrative::{AttachViewMode, NarrativeVisualMode};
 use crate::plan_event_bus::{PlanEventBus, PlanFeedEvent};
 use crate::tui::{
-    AttachPanel, AttachParentPlan, AttachTuiState, PlanAttachRenderState, RunNarrativeRenderInput,
-    attach_activity_lines_for_tui, attach_panel_layout, ensure_run_narrative_projection,
-    live_file_lines, plan_event_line, plan_event_summary, plan_final_gate_line,
-    plan_provider_summary, plan_repair_label, plan_task_detail_lines, process_lines,
-    provider_is_metered, render_attach, render_plan_attach, run_narrative_projection,
-    run_narrative_projection_signature,
+    AttachCampaignParent, AttachPanel, AttachParentPlan, AttachTuiState, PlanAttachRenderState,
+    RunNarrativeRenderInput, attach_activity_lines_for_tui, attach_panel_layout,
+    ensure_run_narrative_projection, live_file_lines, plan_event_line, plan_event_summary,
+    plan_final_gate_line, plan_provider_summary, plan_repair_label, plan_task_detail_lines,
+    process_lines, provider_is_metered, render_attach, render_campaign_attach, render_plan_attach,
+    run_narrative_projection, run_narrative_projection_signature,
 };
 #[cfg(test)]
 use crate::tui::{
@@ -4637,6 +4637,9 @@ mod campaign_spawn_tests;
 
 #[cfg(test)]
 mod effortless_consistency_tests;
+
+#[cfg(test)]
+mod navigable_tests;
 
 fn task_status_label(status: PlanTaskStatus) -> &'static str {
     plan_task_status_label(status)

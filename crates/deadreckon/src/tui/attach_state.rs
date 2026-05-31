@@ -27,9 +27,16 @@ impl AttachPanel {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct AttachCampaignParent {
+    pub(crate) campaign_id: String,
+    pub(crate) sub_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct AttachParentPlan {
     pub(crate) plan_id: String,
     pub(crate) task_id: String,
+    pub(crate) campaign_parent: Option<AttachCampaignParent>,
 }
 
 #[derive(Debug, Clone)]

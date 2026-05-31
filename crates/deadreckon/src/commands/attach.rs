@@ -28,17 +28,38 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     let run_ref = args.run_id.clone();
     if let Some((campaign_dir, campaign)) = commands::campaign::resolve_campaign(&paths, &run_ref)?
     {
-        let rollup = deadreckon_core::campaign::read_campaign_rollup(&campaign_dir).ok();
-        print!(
-            "{}",
-            commands::campaign::campaign_attach_summary(Some(&paths), &campaign, rollup.as_ref())
-        );
+        let state = commands::campaign::CampaignAttachState::new(&paths, &campaign_dir, campaign);
+        if args.json {
+            print!("{}", commands::campaign::campaign_attach_json_text(&state)?);
+        } else if io::stdout().is_terminal() && !args.plain {
+            let show_hints = completion_hints_enabled(args.no_hints);
+            print_attach_banner("campaign", &state.campaign.campaign_id);
+            attach_campaign_tui(
+                &paths,
+                state,
+                show_hints,
+                args.view,
+                args.visual,
+                narrative_config.clone(),
+            )
+            .await?;
+        } else {
+            print!(
+                "{}",
+                commands::campaign::campaign_attach_summary(
+                    Some(&paths),
+                    &state.campaign,
+                    state.rollup.as_ref(),
+                )
+            );
+        }
         return Ok(());
     }
     let state = if let Some(selection) = resolve_plan_child_ref(&paths, &run_ref)? {
         parent_plan = Some(AttachParentPlan {
             plan_id: selection.plan_id,
             task_id: selection.task_id,
+            campaign_parent: None,
         });
         load_run(&paths, &selection.run_id)?
     } else {
@@ -63,6 +84,7 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
                             args.view,
                             args.visual,
                             narrative_config.clone(),
+                            None,
                         )
                         .await?;
                     } else {
@@ -273,6 +295,101 @@ pub(crate) fn chain_narrative_refusal_text(run_ref: &str, json_output: bool) -> 
     ))
 }
 
+async fn attach_campaign_tui(
+    paths: &DeadreckonPaths,
+    mut state: commands::campaign::CampaignAttachState,
+    show_hints: bool,
+    initial_view: AttachViewMode,
+    initial_visual: NarrativeVisualMode,
+    narrative_config: NarrativeAttachConfig,
+) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let mut feed = commands::campaign::CampaignEventFeed::new(
+        paths.clone(),
+        state.campaign_dir.clone(),
+        state.campaign.campaign_id.clone(),
+    );
+
+    let result = loop {
+        let mut tick = AttachTickTiming::new(AttachSurface::Campaign, AttachTickBudget::default());
+        let stage_started = Instant::now();
+        let events = feed.refresh(Duration::ZERO).await;
+        state.apply_feed_events(events);
+        tick.record_since(AttachLoopStage::EventFeed, stage_started);
+
+        let stage_started = Instant::now();
+        if let Err(error) = state.refresh(paths) {
+            state
+                .feed
+                .push_back(commands::campaign::CampaignFeedEvent::Warning {
+                    message: format!("campaign refresh failed: {error}"),
+                });
+        }
+        tick.record_since(AttachLoopStage::LoadState, stage_started);
+
+        let stage_started = Instant::now();
+        terminal.draw(|frame| render_campaign_attach(frame, &state))?;
+        tick.record_since(AttachLoopStage::Draw, stage_started);
+
+        let stage_started = Instant::now();
+        let input_ready = event::poll(Duration::from_millis(250))?;
+        tick.record_since(AttachLoopStage::InputPoll, stage_started);
+        drop(tick.slow_sync_stages());
+        drop(tick.slow_stage_labels());
+        let _ = tick.frame_exceeded();
+
+        if input_ready && let Event::Key(key) = event::read()? {
+            match handle_campaign_key(&mut state, key) {
+                CampaignAttachKeyAction::None | CampaignAttachKeyAction::Refresh => {}
+                CampaignAttachKeyAction::Back | CampaignAttachKeyAction::Quit => break Ok(()),
+                CampaignAttachKeyAction::DrillInto { sub_id, plan_id } => {
+                    if load_plan(paths, &plan_id).is_err() {
+                        state
+                            .feed
+                            .push_back(commands::campaign::CampaignFeedEvent::Warning {
+                                message: format!("sub-plan {sub_id} unavailable: {plan_id}"),
+                            });
+                        continue;
+                    }
+                    suspend_tui(&mut terminal)?;
+                    let parent_campaign = AttachCampaignParent {
+                        campaign_id: state.campaign.campaign_id.clone(),
+                        sub_id,
+                    };
+                    let child_result = attach_plan_tui(
+                        paths,
+                        &plan_id,
+                        show_hints,
+                        initial_view,
+                        initial_visual,
+                        narrative_config.clone(),
+                        Some(parent_campaign),
+                    )
+                    .await;
+                    if let Err(err) = &child_result {
+                        print_error(err);
+                        let _ = prompt::open("press Enter to return to campaign attach...", None);
+                    }
+                    resume_tui(&mut terminal)?;
+                }
+            }
+        }
+    };
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+    result
+}
+
 async fn attach_plan_tui(
     paths: &DeadreckonPaths,
     plan_id: &str,
@@ -280,6 +397,7 @@ async fn attach_plan_tui(
     initial_view: AttachViewMode,
     initial_visual: NarrativeVisualMode,
     narrative_config: NarrativeAttachConfig,
+    parent_campaign: Option<AttachCampaignParent>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -399,6 +517,7 @@ async fn attach_plan_tui(
                     show_hints,
                     view,
                     visual,
+                    campaign_parent: parent_campaign.as_ref(),
                     narrative_notice: narrative_notice.as_deref(),
                     narrative_projection: narrative_projection.as_ref(),
                 },
@@ -455,6 +574,7 @@ async fn attach_plan_tui(
                                 show_hints,
                                 view,
                                 visual,
+                                campaign_parent: parent_campaign.as_ref(),
                                 narrative_notice: narrative_notice.as_deref(),
                                 narrative_projection: narrative_projection.as_ref(),
                             },
@@ -487,6 +607,7 @@ async fn attach_plan_tui(
                         let parent_plan = plan.tasks.get(selected).map(|task| AttachParentPlan {
                             plan_id: plan.plan_id.clone(),
                             task_id: task.task_id.clone(),
+                            campaign_parent: parent_campaign.clone(),
                         });
                         if cancel_plan_narrative_refresh_job(&mut narrative_refresh_job) {
                             narrative_notice = Some(
@@ -852,6 +973,7 @@ pub(crate) fn suspend_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>)
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
+    note_tui_suspended();
     Ok(())
 }
 
@@ -862,7 +984,17 @@ pub(crate) fn resume_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) 
         EnterAlternateScreen,
         EnableMouseCapture
     )?;
+    note_tui_resumed();
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn simulate_campaign_drill_cycle() {
+    reset_tui_suspend_depth();
+    note_tui_suspended();
+    note_tui_suspended();
+    note_tui_resumed();
+    note_tui_resumed();
 }
 
 pub(crate) fn attach_should_quit(key: KeyEvent) -> bool {

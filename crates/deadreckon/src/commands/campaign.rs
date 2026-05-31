@@ -4,6 +4,9 @@ use crate::commands::plan::{build_full_plan_tasks, resolve_plan_providers};
 use crate::commands::start::{
     classify_goal_shape_for_start, goal_shape_provider_route, write_goal_shape_preview_record,
 };
+use crate::plan_event_bus::JsonlTail;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
 
 // --- Campaign: sub-orchestrator spawn (P3) ---------------------------------
 // A campaign launches each sub-goal as a full `orchestrate full-plan`
@@ -1140,9 +1143,311 @@ pub(crate) fn rollup_verdict_text(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CampaignFeedEvent {
+    Campaign {
+        event: deadreckon_core::campaign::CampaignEvent,
+    },
+    SubPlan {
+        sub_id: String,
+        event: PlanEvent,
+    },
+    Snapshot {
+        campaign: Box<deadreckon_core::campaign::Campaign>,
+    },
+    Warning {
+        message: String,
+    },
+}
+
+pub(crate) struct CampaignEventFeed {
+    paths: DeadreckonPaths,
+    campaign_dir: PathBuf,
+    campaign_id: String,
+    campaign_tail: JsonlTail<deadreckon_core::campaign::CampaignEvent>,
+    sub_tails: BTreeMap<String, (String, JsonlTail<PlanEvent>)>,
+    seen: BTreeSet<String>,
+    last_snapshot_key: Option<String>,
+}
+
+impl CampaignEventFeed {
+    pub(crate) fn new(
+        paths: DeadreckonPaths,
+        campaign_dir: impl Into<PathBuf>,
+        campaign_id: impl Into<String>,
+    ) -> Self {
+        let campaign_dir = campaign_dir.into();
+        Self {
+            campaign_tail: JsonlTail::new(deadreckon_core::campaign::campaign_events_path(
+                &campaign_dir,
+            )),
+            paths,
+            campaign_dir,
+            campaign_id: campaign_id.into(),
+            sub_tails: BTreeMap::new(),
+            seen: BTreeSet::new(),
+            last_snapshot_key: None,
+        }
+    }
+
+    pub(crate) async fn refresh(&mut self, wait: Duration) -> Vec<CampaignFeedEvent> {
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        let mut events = Vec::new();
+        match self.campaign_tail.read_new() {
+            Ok(campaign_events) => {
+                events.extend(
+                    campaign_events
+                        .into_iter()
+                        .map(|event| CampaignFeedEvent::Campaign { event }),
+                );
+            }
+            Err(error) => events.push(CampaignFeedEvent::Warning {
+                message: format!("campaign event replay failed: {error}"),
+            }),
+        }
+        match deadreckon_core::campaign::read_campaign(&self.campaign_dir) {
+            Ok(campaign) => {
+                self.discover_sub_plans(&campaign);
+                self.maybe_push_snapshot(campaign, &mut events);
+            }
+            Err(error) => events.push(CampaignFeedEvent::Warning {
+                message: format!("campaign snapshot failed: {error}"),
+            }),
+        }
+        self.read_sub_plan_events(&mut events);
+        self.dedupe(events)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sub_plan_ids(&self) -> Vec<String> {
+        self.sub_tails
+            .values()
+            .map(|(plan_id, _)| plan_id.clone())
+            .collect()
+    }
+
+    fn discover_sub_plans(&mut self, campaign: &deadreckon_core::campaign::Campaign) {
+        for sub in &campaign.sub_goals {
+            let Some(plan_id) = sub.sub_plan_id.as_deref() else {
+                continue;
+            };
+            if self.sub_tails.contains_key(&sub.sub_id) {
+                continue;
+            }
+            self.sub_tails.insert(
+                sub.sub_id.clone(),
+                (
+                    plan_id.to_string(),
+                    JsonlTail::new(self.paths.plan_events(plan_id)),
+                ),
+            );
+        }
+    }
+
+    fn read_sub_plan_events(&mut self, events: &mut Vec<CampaignFeedEvent>) {
+        for (sub_id, (_plan_id, tail)) in &mut self.sub_tails {
+            match tail.read_new() {
+                Ok(plan_events) => {
+                    events.extend(
+                        plan_events
+                            .into_iter()
+                            .map(|event| CampaignFeedEvent::SubPlan {
+                                sub_id: sub_id.clone(),
+                                event,
+                            }),
+                    )
+                }
+                Err(error) => events.push(CampaignFeedEvent::Warning {
+                    message: format!("sub-plan {sub_id} event replay failed: {error}"),
+                }),
+            }
+        }
+    }
+
+    fn maybe_push_snapshot(
+        &mut self,
+        campaign: deadreckon_core::campaign::Campaign,
+        events: &mut Vec<CampaignFeedEvent>,
+    ) {
+        if campaign.campaign_id != self.campaign_id {
+            events.push(CampaignFeedEvent::Warning {
+                message: format!(
+                    "campaign id changed on disk: expected {}, found {}",
+                    self.campaign_id, campaign.campaign_id
+                ),
+            });
+        }
+        let key = campaign_snapshot_key(&campaign);
+        if self.last_snapshot_key.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        self.last_snapshot_key = Some(key);
+        events.push(CampaignFeedEvent::Snapshot {
+            campaign: Box::new(campaign),
+        });
+    }
+
+    fn dedupe(&mut self, events: Vec<CampaignFeedEvent>) -> Vec<CampaignFeedEvent> {
+        events
+            .into_iter()
+            .filter(|event| {
+                let key = format!("{event:?}");
+                self.seen.insert(key)
+            })
+            .collect()
+    }
+}
+
+fn campaign_snapshot_key(campaign: &deadreckon_core::campaign::Campaign) -> String {
+    let subs = campaign
+        .sub_goals
+        .iter()
+        .map(|sub| {
+            format!(
+                "{}:{:?}:{:?}:{:?}",
+                sub.sub_id, sub.status, sub.sub_plan_id, sub.result_run_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "{}:{:?}:{:?}:{}",
+        campaign.campaign_id, campaign.status, campaign.merged_run_id, subs
+    )
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CampaignAttachState {
+    pub(crate) campaign_dir: PathBuf,
+    pub(crate) campaign: deadreckon_core::campaign::Campaign,
+    pub(crate) rollup: Option<deadreckon_core::campaign::CampaignRollup>,
+    pub(crate) aggregate_spend_usd: f64,
+    pub(crate) sub_spend_usd: BTreeMap<String, f64>,
+    pub(crate) feed: VecDeque<CampaignFeedEvent>,
+    pub(crate) selected: usize,
+}
+
+impl CampaignAttachState {
+    pub(crate) fn new(
+        paths: &DeadreckonPaths,
+        campaign_dir: impl Into<PathBuf>,
+        campaign: deadreckon_core::campaign::Campaign,
+    ) -> Self {
+        let campaign_dir = campaign_dir.into();
+        let rollup = deadreckon_core::campaign::read_campaign_rollup(&campaign_dir).ok();
+        let (aggregate_spend_usd, sub_spend_usd) = campaign_spend(paths, &campaign);
+        Self {
+            campaign_dir,
+            campaign,
+            rollup,
+            aggregate_spend_usd,
+            sub_spend_usd,
+            feed: VecDeque::new(),
+            selected: 0,
+        }
+    }
+
+    pub(crate) fn refresh(&mut self, paths: &DeadreckonPaths) -> Result<()> {
+        self.campaign = deadreckon_core::campaign::read_campaign(&self.campaign_dir)?;
+        self.rollup = deadreckon_core::campaign::read_campaign_rollup(&self.campaign_dir).ok();
+        let (aggregate_spend_usd, sub_spend_usd) = campaign_spend(paths, &self.campaign);
+        self.aggregate_spend_usd = aggregate_spend_usd;
+        self.sub_spend_usd = sub_spend_usd;
+        self.clamp_selection();
+        Ok(())
+    }
+
+    pub(crate) fn apply_feed_events(&mut self, events: Vec<CampaignFeedEvent>) {
+        for event in events {
+            if let CampaignFeedEvent::Snapshot { campaign } = &event {
+                self.campaign = (**campaign).clone();
+            }
+            self.feed.push_back(event);
+        }
+        while self.feed.len() > 1_000 {
+            self.feed.pop_front();
+        }
+        self.clamp_selection();
+    }
+
+    pub(crate) fn clamp_selection(&mut self) {
+        if self.campaign.sub_goals.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(self.campaign.sub_goals.len() - 1);
+        }
+    }
+
+    pub(crate) fn selected_sub_plan(&self) -> Option<(String, String)> {
+        self.campaign.sub_goals.get(self.selected).and_then(|sub| {
+            sub.sub_plan_id
+                .as_ref()
+                .map(|plan_id| (sub.sub_id.clone(), plan_id.clone()))
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn campaign_attach_state_from_dir(
+    paths: &DeadreckonPaths,
+    campaign_dir: &Path,
+) -> Result<CampaignAttachState> {
+    let campaign = deadreckon_core::campaign::read_campaign(campaign_dir)?;
+    Ok(CampaignAttachState::new(paths, campaign_dir, campaign))
+}
+
+fn campaign_spend(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+) -> (f64, BTreeMap<String, f64>) {
+    let mut total = 0.0_f64;
+    let mut by_sub = BTreeMap::new();
+    for sub in &campaign.sub_goals {
+        let spend = sub
+            .result_run_id
+            .as_deref()
+            .and_then(|run_id| load_run(paths, run_id).ok())
+            .map(|state| state.total_spend_usd)
+            .unwrap_or(0.0);
+        total += spend;
+        by_sub.insert(sub.sub_id.clone(), spend);
+    }
+    (total, by_sub)
+}
+
+pub(crate) fn campaign_attach_json_text(state: &CampaignAttachState) -> Result<String> {
+    let rollup = state.rollup.as_ref();
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "kind": "campaign",
+            "id": &state.campaign.campaign_id,
+            "status": campaign_status_text(state.campaign.status),
+            "goal": &state.campaign.root_goal,
+            "tree_budget_usd": state.campaign.tree_budget_usd,
+            "aggregate_spend_usd": state.aggregate_spend_usd,
+            "rollup": rollup.map(|rollup| serde_json::json!({
+                "verdict": rollup_verdict_text(rollup.rollup_verdict),
+                "refused_subs": &rollup.refused_subs,
+                "caveat_subs": &rollup.caveat_subs,
+            })),
+            "subs": state.campaign.sub_goals.iter().map(|sub| serde_json::json!({
+                "sub_id": &sub.sub_id,
+                "goal": &sub.goal,
+                "status": sub_status_text(sub.status),
+                "sub_plan_id": &sub.sub_plan_id,
+                "result_run_id": &sub.result_run_id,
+                "spend_usd": state.sub_spend_usd.get(&sub.sub_id).copied().unwrap_or(0.0),
+            })).collect::<Vec<_>>()
+        }))?
+    ))
+}
+
 /// Read-only attach summary for a campaign: breadcrumb, sub rows, and roll-up.
-/// Full TUI drill-in into a selected sub-plan is a V1 candidate; this is the plain
-/// summary that works on and off TTY.
+/// This is the plain summary that works off TTY or with `--plain`; the live TUI
+/// uses the same campaign state but omits the retype hint.
 pub(crate) fn campaign_attach_summary(
     paths: Option<&DeadreckonPaths>,
     campaign: &deadreckon_core::campaign::Campaign,
@@ -1253,6 +1558,7 @@ pub(crate) fn resolve_campaign(
     if !plans.is_dir() {
         return Ok(None);
     }
+    let mut campaigns = Vec::new();
     for entry in std::fs::read_dir(&plans).map_err(|source| DeadreckonError::Io {
         path: plans.clone(),
         source,
@@ -1263,16 +1569,35 @@ pub(crate) fn resolve_campaign(
                 source,
             })?
             .path();
-        let name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
-        if !name.starts_with(reference) {
+        if !deadreckon_core::campaign::campaign_path_for_plan_dir(&dir).is_file() {
             continue;
         }
-        if deadreckon_core::campaign::campaign_path_for_plan_dir(&dir).is_file() {
-            let campaign = deadreckon_core::campaign::read_campaign(&dir)?;
-            return Ok(Some((dir, campaign)));
-        }
+        let campaign = deadreckon_core::campaign::read_campaign(&dir)?;
+        campaigns.push((dir, campaign));
     }
-    Ok(None)
+    if matches!(reference, "latest" | "last") {
+        campaigns.sort_by_key(|(_, campaign)| campaign.created_at);
+        return Ok(campaigns.pop());
+    }
+    let matches = campaigns
+        .into_iter()
+        .filter(|(_, campaign)| campaign.campaign_id.starts_with(reference))
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "ambiguous campaign id prefix {reference}; matches {}",
+                matches
+                    .iter()
+                    .map(|(_, campaign)| campaign.campaign_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "use a longer campaign id prefix",
+        ))),
+    }
 }
 
 /// Drive a campaign's sub-orchestrators sequentially, recording events and status

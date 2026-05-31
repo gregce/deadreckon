@@ -1,4 +1,8 @@
 use super::super::*;
+use super::campaign::CampaignAttachState;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static TUI_SUSPEND_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttachTickBudget {
@@ -22,6 +26,7 @@ pub(crate) enum AttachSurface {
     Run,
     Plan,
     Chain,
+    Campaign,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +141,73 @@ impl AttachTickTiming {
             .map(|stage| stage.stage.label())
             .collect()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CampaignAttachKeyAction {
+    None,
+    Refresh,
+    Back,
+    Quit,
+    DrillInto { sub_id: String, plan_id: String },
+}
+
+pub(crate) fn handle_campaign_key(
+    state: &mut CampaignAttachState,
+    key: KeyEvent,
+) -> CampaignAttachKeyAction {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.selected = state.selected.saturating_sub(1);
+            CampaignAttachKeyAction::None
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+            let max = state.campaign.sub_goals.len().saturating_sub(1);
+            state.selected = (state.selected + 1).min(max);
+            CampaignAttachKeyAction::None
+        }
+        KeyCode::Enter => state
+            .selected_sub_plan()
+            .map(|(sub_id, plan_id)| CampaignAttachKeyAction::DrillInto { sub_id, plan_id })
+            .unwrap_or(CampaignAttachKeyAction::None),
+        KeyCode::Char('r') if key.modifiers.is_empty() => CampaignAttachKeyAction::Refresh,
+        KeyCode::Char('b') if key.modifiers.is_empty() => CampaignAttachKeyAction::Back,
+        KeyCode::Backspace | KeyCode::Esc => CampaignAttachKeyAction::Back,
+        KeyCode::Char('q') if key.modifiers.is_empty() => CampaignAttachKeyAction::Quit,
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            CampaignAttachKeyAction::Quit
+        }
+        _ => CampaignAttachKeyAction::None,
+    }
+}
+
+pub(crate) fn note_tui_suspended() -> usize {
+    TUI_SUSPEND_DEPTH.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+pub(crate) fn note_tui_resumed() -> usize {
+    loop {
+        let current = TUI_SUSPEND_DEPTH.load(Ordering::SeqCst);
+        if current == 0 {
+            return 0;
+        }
+        if TUI_SUSPEND_DEPTH
+            .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return current - 1;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_tui_suspend_depth() {
+    TUI_SUSPEND_DEPTH.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn tui_suspend_depth() -> usize {
+    TUI_SUSPEND_DEPTH.load(Ordering::SeqCst)
 }
 
 #[derive(Debug, Clone)]

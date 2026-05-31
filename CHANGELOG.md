@@ -1,5 +1,26 @@
 # Changelog
 
+## Navigable campaign attach (production release) - 2026-05-31
+
+- Added campaign attach state/feed plumbing so `attach <campaign-id>` can refresh
+  campaign snapshots, roll-up, aggregate spend, sub-plan spend, and a bounded
+  campaign feed from `campaign-events.jsonl` plus each discovered sub-plan's
+  `plan-events.jsonl`.
+- Added a live ratatui campaign attach surface for TTYs: campaign header,
+  selectable sub-plan cards, campaign feed, and footer controls for select,
+  drill-in, back, refresh, and detach. Off-TTY/`--plain` keeps the read-only
+  summary, while `--json` emits a structured campaign attach object.
+- Wired campaign -> sub-plan -> child-run drill-in by suspending the campaign
+  frame and reusing the existing plan/run attach loops unchanged, with campaign
+  breadcrumbs threaded into plan and run attach views.
+- Covered the feature with focused navigable attach tests for campaign event
+  tailing, render text, key handling, nested suspend/resume depth, breadcrumbs,
+  JSON/plain fallbacks, latest campaign resolution, and campaign tick timing.
+- Updated AS-BUILT and V1 deferrals: campaign attach is now navigated production
+  behavior; the remaining V1 work is a flattened recursive event tree.
+- Rebaselined the release binary-size guard to the verified post-feature binary
+  after adding the campaign TUI/feed code path.
+
 ## Decompose (maintainability refactor) - 2026-05-30
 
 - P1 (`7ef2d5c`): Added a full-binary CLI characterization net for plan creation,

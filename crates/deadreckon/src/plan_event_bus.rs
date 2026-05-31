@@ -334,7 +334,7 @@ fn snapshot_key(plan: &Plan) -> String {
     )
 }
 
-struct JsonlTail<T> {
+pub(crate) struct JsonlTail<T> {
     path: PathBuf,
     offset: u64,
     partial: String,
@@ -345,7 +345,7 @@ impl<T> JsonlTail<T>
 where
     T: DeserializeOwned,
 {
-    fn new(path: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             offset: 0,
@@ -354,7 +354,7 @@ where
         }
     }
 
-    fn read_new(&mut self) -> std::io::Result<Vec<T>> {
+    pub(crate) fn read_new(&mut self) -> std::io::Result<Vec<T>> {
         let Some(mut file) = self.open_at_offset()? else {
             return Ok(Vec::new());
         };
