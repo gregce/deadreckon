@@ -65,6 +65,9 @@
 - P6a (`8d94316`): Created the private `src/tui/` module and moved the
   run-attach TUI state, key handling, post-action notice, and panel layout
   helpers into `src/tui/attach_state.rs`.
+- P6b (`e213718`): Moved the pure Markdown-to-ratatui line renderer into
+  `src/tui/render.rs`, leaving the run-doc file lookup wrapper in the crate
+  root while the TUI render module takes over presentation-only parsing.
 
 ## Effortless (production release) - 2026-05-28
 
