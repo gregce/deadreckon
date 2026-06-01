@@ -121,7 +121,14 @@ fn update_npm_prints_bun_update_hint() {
     let output = deadreckon(&paths).arg("update").output().expect("update");
 
     assert_success(&output);
-    assert!(stdout(&output).contains("try: bun update -g deadreckon"));
+    let out = stdout(&output);
+    assert!(out.contains("blocked update npm"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains("Recommended\nbun update -g deadreckon"),
+        "{out}"
+    );
+    assert!(!out.contains("try:"), "{out}");
 }
 
 #[test]
@@ -133,7 +140,14 @@ fn update_brew_prints_brew_upgrade_hint() {
     let output = deadreckon(&paths).arg("update").output().expect("update");
 
     assert_success(&output);
-    assert!(stdout(&output).contains("try: brew upgrade gdc/tap/deadreckon"));
+    let out = stdout(&output);
+    assert!(out.contains("blocked update brew"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains("Recommended\nbrew upgrade gdc/tap/deadreckon"),
+        "{out}"
+    );
+    assert!(!out.contains("try:"), "{out}");
 }
 
 #[test]
@@ -145,7 +159,14 @@ fn update_cargo_prints_binstall_or_install_hint() {
     let output = deadreckon(&paths).arg("update").output().expect("update");
 
     assert_success(&output);
-    assert!(stdout(&output).contains("try: cargo binstall --force deadreckon"));
+    let out = stdout(&output);
+    assert!(out.contains("blocked update cargo"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains("Recommended\ncargo binstall --force deadreckon"),
+        "{out}"
+    );
+    assert!(!out.contains("try:"), "{out}");
 }
 
 #[test]
@@ -269,6 +290,8 @@ fn update_shell_previews_before_swap() {
 
     assert_success(&output);
     let out = stdout(&output);
+    assert!(out.contains("completed update shell"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
     assert!(out.contains("target: 0.2.3"), "{out}");
     assert!(
         out.contains(
@@ -317,7 +340,11 @@ fn update_success_prints_doctor_hint() {
         .expect("update");
 
     assert_success(&output);
-    assert!(stdout(&output).contains("try: deadreckon doctor"));
+    let out = stdout(&output);
+    assert!(out.contains("completed update shell"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(out.contains("Recommended\ndeadreckon doctor"), "{out}");
+    assert!(!out.contains("try:"), "{out}");
 }
 
 #[test]
@@ -376,7 +403,13 @@ fn update_shell_rejects_swap_on_non_shell_receipt() {
         .expect("update");
 
     assert_success(&output);
-    assert!(stdout(&output).contains("try: bun update -g deadreckon"));
+    let out = stdout(&output);
+    assert!(out.contains("blocked update npm"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains("Recommended\nbun update -g deadreckon"),
+        "{out}"
+    );
     assert!(!paths.home().join("update-backups").exists());
 }
 

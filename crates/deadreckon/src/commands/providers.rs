@@ -80,9 +80,11 @@ pub(crate) async fn update_command(
     match receipt.channel {
         Channel::Npm | Channel::Brew | Channel::Cargo => {
             if !quiet {
-                println!("channel: {}", receipt.channel.as_str());
-                println!("current: {current}");
-                println!("try: {}", channel_native_update_command(receipt.channel));
+                println!(
+                    "{}",
+                    update_native_surface(receipt.channel, &current)
+                        .render_plain(!completion_hints_enabled(false))
+                );
             }
             Ok(())
         }
@@ -112,20 +114,17 @@ async fn update_shell_channel(
     let current = update_current_version(receipt);
     let latest = resolve_latest_update(paths, &current, allow_prerelease).await?;
     let backup_dir = unique_shell_backup_dir(&shell_backup_root(paths));
-    if !quiet {
-        print_shell_update_preview(&current, &latest, &backup_dir);
-    }
     confirm_shell_update(yes)?;
     let backup_dir = create_shell_update_backup(paths, receipt, backup_dir)?;
     match run_shell_swap(receipt, force, allow_prerelease, quiet).await {
         Ok(()) => {
             prune_shell_backups(paths)?;
             if !quiet {
-                println!("channel: shell");
-                println!("current: {current}");
-                println!("backup: {}", backup_dir.display());
-                println!("updated: {}", receipt.binary_path.display());
-                println!("try: deadreckon doctor");
+                println!(
+                    "{}",
+                    update_shell_completed_surface(&current, &latest, &backup_dir, receipt)
+                        .render_plain(!completion_hints_enabled(false))
+                );
             }
             Ok(())
         }
@@ -149,13 +148,57 @@ fn create_shell_update_backup(
     Ok(backup_dir)
 }
 
-fn print_shell_update_preview(current: &str, latest: &LatestUpdate, backup_dir: &Path) {
-    println!("channel: shell");
-    println!("current: {current}");
-    println!("target: {}", latest.version);
-    println!("archive: {}", latest.archive_url());
-    println!("sha256: {}", latest.sha256());
-    println!("backup: {}", backup_dir.display());
+fn update_native_surface(channel: Channel, current: &str) -> VerdictSurface {
+    let primary = channel_native_update_command(channel);
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "update",
+        Some(channel.as_str()),
+        ExplanationPanel::new(
+            format!(
+                "DeadReckon detected this binary is managed by the {} channel.",
+                channel.as_str()
+            ),
+            "DeadReckon cannot safely replace a package-manager-owned binary directly; run the native package-manager update command.",
+            vec![
+                ("channel", channel.as_str().to_string()),
+                ("current", current.to_string()),
+                ("managed by", channel.as_str().to_string()),
+            ],
+        ),
+        vec![("Recommended", primary)],
+        vec![("Secondary", "deadreckon update --check")],
+    )
+    .expect("native update verdict surface must be valid")
+}
+
+fn update_shell_completed_surface(
+    current: &str,
+    latest: &LatestUpdate,
+    backup_dir: &Path,
+    receipt: &deadreckon_core::install_receipt::Receipt,
+) -> VerdictSurface {
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "update",
+        Some("shell"),
+        ExplanationPanel::new(
+            "DeadReckon replaced the shell-installed binary and preserved a rollback backup.",
+            "The update completed; doctor is the safest next command to verify the new binary and provider setup.",
+            vec![
+                ("channel", "shell".to_string()),
+                ("current", current.to_string()),
+                ("target", latest.version.clone()),
+                ("archive", latest.archive_url()),
+                ("sha256", latest.sha256().to_string()),
+                ("backup", backup_dir.display().to_string()),
+                ("updated", receipt.binary_path.display().to_string()),
+            ],
+        ),
+        vec![("Recommended", "deadreckon doctor")],
+        vec![("Secondary", "deadreckon update --check")],
+    )
+    .expect("shell update verdict surface must be valid")
 }
 
 fn confirm_shell_update(yes: bool) -> Result<()> {
