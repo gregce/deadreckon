@@ -284,7 +284,8 @@ fn status_report_has_one_primary_action_and_demoted_secondary_actions() {
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("primary action:"), "{out}");
-    assert_eq!(count_action_label(&out, "next"), 1, "{out}");
+    assert_eq!(count_action_label(&out, "recommended"), 1, "{out}");
+    assert_eq!(count_action_label(&out, "next"), 0, "{out}");
     assert!(
         out.contains(&format!("deadreckon finish {}", &state.run_id[..8])),
         "{out}"

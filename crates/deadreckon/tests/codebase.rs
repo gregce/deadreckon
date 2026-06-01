@@ -2046,8 +2046,9 @@ fn post_run_hint_lists_apply_and_abandon_lines() {
     let stdout = stdout(&output);
     assert!(stdout.contains("primary action:"));
     assert!(stdout.contains(&format!(
-        "next: deadreckon finish {short} --autostash --cleanup"
+        "recommended: deadreckon finish {short} --autostash --cleanup"
     )));
+    assert!(!stdout.contains("next:"), "{stdout}");
     assert!(stdout.contains("secondary actions:"));
     assert!(stdout.contains(&format!("apply: deadreckon apply {short}")));
     assert!(stdout.contains(&format!(

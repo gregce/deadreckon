@@ -10053,13 +10053,17 @@ fn lifecycle_actions(state: &deadreckon_core::PipelineState) -> (HintLine, Vec<H
 
 fn print_action_block(primary: &HintLine, secondary: &[HintLine]) {
     println!("{}", ui_heading("primary action:"));
-    print_action_line(primary);
+    print_primary_action_line(primary);
     if !secondary.is_empty() {
         println!("{}", ui_heading("secondary actions:"));
         for action in secondary {
             print_action_line(action);
         }
     }
+}
+
+fn print_primary_action_line(action: &HintLine) {
+    println!("  recommended: {}", ui_command(&action.command));
 }
 
 fn print_action_line(action: &HintLine) {
