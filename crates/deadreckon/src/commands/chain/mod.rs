@@ -447,7 +447,7 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
             "deadreckon chain \"step one\" \"step two\"",
         ))
     })?;
-    let goals = parse_planner_goals(&response.content, n)?;
+    let goals = parse_planner_goals(&response.content, n, &options.root_goal, options.no_hints)?;
     let chain_id = chain_create_command(ChainCreateOptions { goals, ..options }).await?;
     append_chain_planner_spend(&paths, &chain_id, &response)?;
     Ok(())
@@ -2474,7 +2474,7 @@ Each step builds on the previous step's result. No prose, no commentary. Goal: {
     )
 }
 
-fn parse_planner_goals(raw: &str, n: u8) -> Result<Vec<String>> {
+fn parse_planner_goals(raw: &str, n: u8, root_goal: &str, no_hints: bool) -> Result<Vec<String>> {
     let raw = raw.trim();
     let json_text = if raw.starts_with("```") {
         raw.lines()
@@ -2503,31 +2503,62 @@ fn parse_planner_goals(raw: &str, n: u8) -> Result<Vec<String>> {
             continue;
         };
         if goal.chars().count() > 160 {
-            return Err(CliError::Core(deadreckon_core::user_error(
+            return Err(chain_create_refusal_surface(
+                VerdictKind::Blocked,
+                None,
                 "chain plan produced a step longer than 160 chars",
-                "ask for fewer steps or use explicit `deadreckon chain \"...\" \"...\"`",
-            )));
+                "DeadReckon refused the provider-produced plan because one step is too large to review and recover as a chain step.",
+                [
+                    ("step chars".to_string(), goal.chars().count().to_string()),
+                    ("maximum chars".to_string(), "160".to_string()),
+                ],
+                chain_plan_retry_command(root_goal),
+                no_hints,
+            ));
         }
         let key = goal
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
-        if !seen.insert(key) {
-            return Err(CliError::Core(deadreckon_core::user_error(
+        if !seen.insert(key.clone()) {
+            return Err(chain_create_refusal_surface(
+                VerdictKind::Blocked,
+                None,
                 "chain plan produced duplicate steps",
-                "rerun with --n 3 or provide explicit steps",
-            )));
+                "DeadReckon refused the provider-produced plan because duplicate steps make chain progress and recovery ambiguous.",
+                [
+                    ("duplicate step".to_string(), goal.to_string()),
+                    ("normalized step".to_string(), key),
+                ],
+                chain_plan_retry_command(root_goal),
+                no_hints,
+            ));
         }
         goals.push(goal.to_string());
     }
     deadreckon_core::validate_goal_count(goals.len()).map_err(|_| {
-        CliError::Core(deadreckon_core::user_error(
+        chain_create_refusal_surface(
+            VerdictKind::Blocked,
+            None,
             &format!("decomposition produced {} goals; need >= 2", goals.len()),
-            "deadreckon chain plan \"goal\" --n 3",
-        ))
+            "DeadReckon refused the provider-produced plan because a chain needs at least two ordered steps.",
+            [
+                ("produced goals".to_string(), goals.len().to_string()),
+                ("minimum goals".to_string(), "2".to_string()),
+            ],
+            chain_plan_retry_command(root_goal),
+            no_hints,
+        )
     })?;
     Ok(goals)
+}
+
+fn chain_plan_retry_command(root_goal: &str) -> String {
+    format!(
+        "deadreckon chain plan {} --n 3",
+        quote_chain_goal_arg(root_goal)
+    )
 }
 
 fn append_chain_planner_spend(

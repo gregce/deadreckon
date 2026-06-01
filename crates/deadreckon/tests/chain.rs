@@ -1536,8 +1536,17 @@ async fn chain_plan_refuses_single_step_response() {
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
     assert!(stderr.contains("decomposition produced 1 goals; need >= 2"));
-    assert!(stderr.contains("try:"));
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain plan \"build chess\" --n 3"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1563,8 +1572,17 @@ async fn chain_plan_refuses_duplicate_steps() {
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
     assert!(stderr.contains("duplicate steps"));
-    assert!(stderr.contains("try:"));
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain plan \"build chess\" --n 3"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]
