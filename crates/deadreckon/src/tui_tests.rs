@@ -3934,17 +3934,35 @@ fn chain_attach_activity_lists_newest_events_first() {
 }
 
 #[test]
-fn chain_attach_paused_footer_lists_try_lines() {
+fn chain_attach_paused_footer_lists_one_recommended_command() {
     let mut chain = chain_fixture();
     chain.status = ChainStatus::Paused;
     chain.paused_reason = Some("apply_refused_conflict".to_string());
+    let id = super::run_prefix(&chain.chain_id);
 
     let footer = chain_attach_footer_text(&chain);
 
     assert!(footer.contains("paused: apply_refused_conflict"));
-    assert!(footer.contains("show --why-failed"));
-    assert!(footer.contains("resume --apply-mode preview"));
-    assert!(footer.contains("undo"));
+    assert_eq!(footer.matches("try:").count(), 0, "{footer}");
+    assert_eq!(footer.matches("recommended:").count(), 1, "{footer}");
+    assert!(
+        footer.contains(&format!("recommended: deadreckon chain resume {id}")),
+        "{footer}"
+    );
+    assert!(
+        footer.contains(&format!("deadreckon chain show {id} --why-failed")),
+        "{footer}"
+    );
+    assert!(
+        footer.contains(&format!(
+            "deadreckon chain resume {id} --apply-mode preview"
+        )),
+        "{footer}"
+    );
+    assert!(
+        footer.contains(&format!("deadreckon chain undo {id}")),
+        "{footer}"
+    );
 }
 
 #[test]
@@ -4725,14 +4743,16 @@ fn chain_attach_plain_emits_periodic_snapshot_no_ansi() {
 }
 
 #[test]
-fn chain_attach_paused_footer_lists_four_try_lines() {
+fn chain_attach_paused_footer_does_not_list_peer_try_lines() {
     let mut chain = chain_fixture();
     chain.status = ChainStatus::Paused;
     chain.paused_reason = Some("cap".to_string());
 
     let footer = chain_attach_footer_text(&chain);
 
-    assert_eq!(footer.matches("try:").count(), 4, "{footer}");
+    assert_eq!(footer.matches("try:").count(), 0, "{footer}");
+    assert_eq!(footer.matches("recommended:").count(), 1, "{footer}");
+    assert!(footer.contains("secondary:"), "{footer}");
 }
 
 #[test]

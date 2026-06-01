@@ -1273,6 +1273,43 @@ fn chain_pause_refuses_when_status_not_running_with_try() {
 }
 
 #[test]
+fn chain_pause_success_uses_paused_verdict_surface() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.scope = deadreckon_core::paths::workspace_scope(temp.path()).expect("scope");
+    chain.status = ChainStatus::Running;
+    save_test_chain(&paths, &chain);
+
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args([
+            "chain",
+            "pause",
+            &chain.chain_id[..8],
+            "--reason",
+            "operator_pause",
+        ])
+        .output()
+        .expect("pause");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("paused chain "), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon chain resume {}",
+            &chain.chain_id[..8]
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("try:"), "{stdout}");
+}
+
+#[test]
 fn chain_kill_cascade_terminates_inner_run_and_conductor_under_5s() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -1682,7 +1719,7 @@ fn chain_error_messages_end_with_try_footer() {
 }
 
 #[test]
-fn chain_paused_footer_lists_four_try_lines() {
+fn chain_paused_footer_lists_one_recommended_command() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1707,11 +1744,21 @@ fn chain_paused_footer_lists_four_try_lines() {
         .expect("chain");
 
     assert_success(&output);
-    assert_eq!(
-        stdout(&output).matches("try:").count(),
-        4,
-        "{}",
-        stdout(&output)
+    let stdout = stdout(&output);
+    assert_eq!(stdout.matches("try:").count(), 0, "{stdout}");
+    assert!(stdout.contains("paused chain "), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon chain resume"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\nSecondary\n"), "{stdout}");
+    assert!(stdout.contains("deadreckon chain show"), "{stdout}");
+    assert!(
+        stdout.contains("deadreckon chain resume")
+            && stdout.contains("--apply-mode preview")
+            && stdout.contains("deadreckon chain undo"),
+        "{stdout}"
     );
 }
 

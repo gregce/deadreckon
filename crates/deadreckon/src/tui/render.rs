@@ -238,9 +238,10 @@ pub(crate) fn chain_activity_lines(
 
 pub(crate) fn chain_attach_footer_text(chain: &Chain) -> String {
     if chain.status == ChainStatus::Paused {
+        let id = run_prefix(&chain.chain_id);
+        let reason = chain.paused_reason.as_deref().unwrap_or("paused");
         format!(
-            "paused: {} | try: show --why-failed | try: resume | try: resume --apply-mode preview | try: undo | q detach",
-            chain.paused_reason.as_deref().unwrap_or("paused")
+            "paused: {reason} | recommended: deadreckon chain resume {id} | secondary: deadreckon chain show {id} --why-failed; deadreckon chain resume {id} --apply-mode preview; deadreckon chain undo {id} | q detach"
         )
     } else {
         "[Enter] drill  [r] redo  [e] extend  [p] pause  [k] kill  [Ctrl-D/q/Esc] detach  j/k move  PgUp/PgDn activity".to_string()

@@ -936,7 +936,7 @@ async fn run_chain_conductor(
             println!("list:    deadreckon chain list");
         }
     } else if !options.quiet {
-        print_chain_paused_footer(&chain);
+        print_chain_paused_footer(paths, &chain);
     }
     let _ = fs::remove_file(paths.conductor_json(&chain.chain_id));
     let _ = lock.release();
@@ -1691,12 +1691,17 @@ fn chain_primary_action(chain: &Chain) -> String {
 fn chain_secondary_actions(chain: &Chain, primary: &str) -> Vec<String> {
     let id = chain_prefix(&chain.chain_id);
     let mut actions = Vec::new();
-    for command in [
+    let mut candidates = vec![
         format!("deadreckon chain attach {id}"),
         format!("deadreckon chain show {id}"),
         format!("deadreckon chain show {id} --why-failed"),
         format!("deadreckon chain resume {id}"),
-    ] {
+    ];
+    if chain.status == ChainStatus::Paused {
+        candidates.push(format!("deadreckon chain resume {id} --apply-mode preview"));
+        candidates.push(format!("deadreckon chain undo {id}"));
+    }
+    for command in candidates {
         if command != primary && !actions.contains(&command) {
             actions.push(command);
         }
@@ -1965,10 +1970,9 @@ fn chain_pause_command(paths: &DeadreckonPaths, id: &str, reason: Option<String>
         None,
         json!({ "reason": chain.paused_reason }),
     )?;
-    println!("paused {}", chain_prefix(&chain.chain_id));
-    println!(
-        "try: deadreckon chain resume {}",
-        chain_prefix(&chain.chain_id)
+    print!(
+        "{}",
+        chain_verdict_surface(paths, &chain).render_plain(false)
     );
     Ok(())
 }
@@ -2769,23 +2773,9 @@ pub(crate) fn chain_step_dot(status: ChainStepStatus) -> &'static str {
     }
 }
 
-fn print_chain_paused_footer(chain: &Chain) {
-    let reason = chain.paused_reason.as_deref().unwrap_or("paused");
-    println!("chain {} paused ({reason})", chain_prefix(&chain.chain_id));
-    println!(
-        "  try: deadreckon chain show {} --why-failed",
-        chain_prefix(&chain.chain_id)
-    );
-    println!(
-        "  try: deadreckon chain resume {}",
-        chain_prefix(&chain.chain_id)
-    );
-    println!(
-        "  try: deadreckon chain resume {} --apply-mode preview",
-        chain_prefix(&chain.chain_id)
-    );
-    println!(
-        "  try: deadreckon chain undo {}",
-        chain_prefix(&chain.chain_id)
+fn print_chain_paused_footer(paths: &DeadreckonPaths, chain: &Chain) {
+    print!(
+        "{}",
+        chain_verdict_surface(paths, chain).render_plain(false)
     );
 }
