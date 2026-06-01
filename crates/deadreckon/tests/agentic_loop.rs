@@ -1459,6 +1459,12 @@ async fn import_stale_sessions_refuse_with_candidate_table_and_try_line() {
         stderr.contains("try: deadreckon import codex --since 1d --preview"),
         "{stderr}"
     );
+    assert_eq!(stderr.matches("try:").count(), 1, "{stderr}");
+    assert!(
+        !stderr.contains("try: deadreckon import codex --session"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try: deadreckon doctor"), "{stderr}");
     let paths = DeadreckonPaths::from_home(&home);
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }

@@ -182,13 +182,15 @@ pub(crate) fn import_command(options: ImportCommandOptions) -> Result<()> {
     if candidates.is_empty() {
         let stale = stale_import_candidates(&resolved, &options, &cwd, since);
         if !stale.is_empty() {
-            return Err(import_invalid(format!(
-                "no fresh import candidates for {}; stale candidates were found\n{}\ntry: deadreckon import {} --since 1d --preview\ntry: deadreckon import {} --session <id-or-path>",
-                resolved.alias,
-                import_candidate_table(&stale),
-                resolved.alias,
-                resolved.alias
-            )));
+            return Err(CliError::Exit {
+                code: 1,
+                message: format!(
+                    "no fresh import candidates for {}; stale candidates were found\n{}",
+                    resolved.alias,
+                    import_candidate_table(&stale)
+                ),
+                hint: format!("deadreckon import {} --since 1d --preview", resolved.alias),
+            });
         }
     }
 
