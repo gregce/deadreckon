@@ -83,16 +83,16 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
                     .join(", ")
             );
             record_plan_merge_failure(&paths, &mut plan, &reason)?;
-            return Err(CliError::Core(deadreckon_core::user_error(
-                &format!("{reason}; automatic repair disabled"),
-                &format!(
-                    "inspect {}",
-                    paths
-                        .merge_proofs(&plan.plan_id)
-                        .join("conflicts.json")
-                        .display()
-                ),
-            )));
+            return Err(CliError::Surface {
+                code: 1,
+                surface: merge_repair_disabled_surface(
+                    &paths,
+                    &plan,
+                    &unresolved_conflicts,
+                    &reason,
+                )
+                .render_plain(!completion_hints_enabled(no_hints)),
+            });
         }
         append_plan_event(
             &paths,
@@ -280,6 +280,42 @@ fn merge_incomplete_plan_surface(plan: &Plan, task: &PlanTask) -> VerdictSurface
         [("Secondary", secondary.as_str())],
     )
     .expect("merge incomplete plan surface must have one primary action")
+}
+
+fn merge_repair_disabled_surface(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    conflicts: &[PlanMergeConflict],
+    reason: &str,
+) -> VerdictSurface {
+    let id = run_prefix(&plan.plan_id);
+    let conflict_paths = conflicts
+        .iter()
+        .map(|conflict| conflict.path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conflicts_path = paths.merge_proofs(&plan.plan_id).join("conflicts.json");
+    let primary = format!("deadreckon merge {id}");
+    let secondary = format!("deadreckon show {id} --why-failed");
+    VerdictSurface::try_new(
+        VerdictKind::Failed,
+        "plan",
+        Some(&id),
+        ExplanationPanel::new(
+            format!("DeadReckon could not merge the plan because {reason}."),
+            "The plan has unresolved child artifact conflicts and automatic repair disabled for this attempt, so DeadReckon recorded the conflict bundle instead of choosing a result.",
+            [
+                ("plan".to_string(), id.clone()),
+                ("conflict count".to_string(), conflicts.len().to_string()),
+                ("conflict paths".to_string(), conflict_paths),
+                ("automatic repair".to_string(), "disabled".to_string()),
+                ("conflicts".to_string(), conflicts_path.display().to_string()),
+            ],
+        ),
+        [("Recommended", primary.as_str())],
+        [("Secondary", secondary.as_str())],
+    )
+    .expect("merge repair disabled surface must have one primary action")
 }
 
 fn parse_merge_strategy(strategy: &str, prefer_child: Option<u32>) -> Result<PlanMergeStrategy> {

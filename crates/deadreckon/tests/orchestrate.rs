@@ -3598,8 +3598,21 @@ fn merge_fails_on_conflict_default() {
 
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
+    assert!(err.starts_with("failed plan "), "{err}");
     assert!(err.contains("merge conflict at README.md"), "{err}");
     assert!(err.contains("automatic repair disabled"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon merge {}",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
     let events = read_plan_events(&paths, &plan.plan_id).expect("events");
     assert!(
         events
@@ -3631,14 +3644,23 @@ fn merge_conflict_path_characterization() {
     assert!(!output.status.success(), "{}", stdout(&output));
     let conflicts_path = paths.merge_proofs(&plan.plan_id).join("conflicts.json");
     let err = stderr(&output);
+    assert!(err.starts_with("failed plan "), "{err}");
+    assert!(err.contains("merge conflict at README.md"), "{err}");
+    assert!(err.contains("automatic repair disabled"), "{err}");
     assert!(
-        err.contains("merge conflict at README.md; automatic repair disabled"),
+        err.contains(&format!("conflicts: {}", conflicts_path.display())),
         "{err}"
     );
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
     assert!(
-        err.contains(&format!("inspect {}", conflicts_path.display())),
+        err.contains(&format!(
+            "Recommended\ndeadreckon merge {}",
+            &plan.plan_id[..8]
+        )),
         "{err}"
     );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
 
     let bundle: Value =
         serde_json::from_str(&fs::read_to_string(conflicts_path).expect("conflicts"))
