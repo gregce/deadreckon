@@ -521,23 +521,25 @@ async fn providers_list_command(
     } else {
         configured_provider_ids(&paths)?
     };
-    if json_output {
-        let mut results = Vec::new();
-        let mut missing = Vec::new();
-        for id in ids {
-            if let Some(descriptor) = registry.get(&id) {
-                results.push(descriptor.probe(ProviderProbeOptions { ping: false }).await);
-            } else {
-                missing.push(id);
-            }
+    let mut results = Vec::new();
+    let mut missing = Vec::new();
+    for id in ids {
+        if let Some(descriptor) = registry.get(&id) {
+            results.push(descriptor.probe(ProviderProbeOptions { ping: false }).await);
+        } else {
+            missing.push(id);
         }
+    }
+    let surface = providers_list_verdict_surface(&results, &missing, all);
+    if json_output {
+        let primary_action = surface.primary_action.command.clone();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string_pretty(&surface.add_to_json(json!({
                 "kind": "providers",
                 "id": if all { "all" } else { "configured" },
                 "status": "ok",
-                "next_actions": ["deadreckon detect"],
+                "next_actions": [primary_action],
                 "try_lines": Vec::<String>::new(),
                 "paths": {
                     "home": paths.home(),
@@ -546,49 +548,129 @@ async fn providers_list_command(
                 "providers": results,
                 "missing_providers": missing,
                 "active": active,
-            }))?
+            })))?
         );
         return Ok(());
     }
     println!("{}", ui_heading("provider registry"));
-    if ids.is_empty() {
+    if results.is_empty() && missing.is_empty() {
         println!("{} no configured providers", ui_muted("-"));
-        println!(
-            "{} {}",
-            ui_command("try:"),
-            ui_command("deadreckon providers list --all")
-        );
+        println!("{}", surface.render_plain(!completion_hints_enabled(false)));
         return Ok(());
     }
-    for id in ids {
-        let Some(descriptor) = registry.get(&id) else {
-            let marker = if active.as_deref() == Some(id.as_str()) {
-                "*"
-            } else {
-                " "
-            };
-            println!(
-                "{marker} {} {} not registered | {}",
-                ui_warn("✗"),
-                ui_id(&id),
-                ui_command("deadreckon detect")
-            );
+    for id in &missing {
+        let marker = if active.as_deref() == Some(id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        println!(
+            "{marker} {} {} not registered | {}",
+            ui_warn("✗"),
+            ui_id(id),
+            ui_command("deadreckon providers list --all")
+        );
+    }
+    for result in &results {
+        let Some(descriptor) = registry.get(&result.id) else {
             continue;
         };
-        let result = descriptor.probe(ProviderProbeOptions { ping: false }).await;
         print_provider_list_row(&result, descriptor, active.as_deref(), full);
         if models {
             print_provider_models(descriptor);
         }
     }
-    if !all {
-        println!(
-            "{} {}",
-            ui_muted("hint:"),
-            ui_command("deadreckon providers list --all")
-        );
-    }
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+fn providers_list_verdict_surface(
+    results: &[ProviderProbeResult],
+    missing: &[String],
+    all: bool,
+) -> VerdictSurface {
+    let failed = results
+        .iter()
+        .filter(|result| result.status == ProbeStatus::Failed)
+        .collect::<Vec<_>>();
+    let ok = results
+        .iter()
+        .filter(|result| result.status == ProbeStatus::Ok)
+        .count();
+    let skipped = results
+        .iter()
+        .filter(|result| result.status == ProbeStatus::Skipped)
+        .count();
+    let subject = if all { "all" } else { "configured" };
+    let kind = if results.is_empty() && missing.is_empty() {
+        VerdictKind::Noop
+    } else if missing.is_empty() && failed.is_empty() {
+        VerdictKind::Verified
+    } else {
+        VerdictKind::Blocked
+    };
+    let primary = if let Some(first) = failed.first() {
+        format!("deadreckon detect {}", first.id)
+    } else if !missing.is_empty() || results.is_empty() {
+        "deadreckon providers list --all".to_string()
+    } else {
+        "deadreckon detect".to_string()
+    };
+    let what = if results.is_empty() && missing.is_empty() {
+        "DeadReckon found no configured provider routes.".to_string()
+    } else if missing.is_empty() && failed.is_empty() {
+        format!("DeadReckon listed {ok} usable provider route(s).")
+    } else {
+        format!(
+            "DeadReckon listed provider routes and found {} issue(s).",
+            failed.len() + missing.len()
+        )
+    };
+    let why = if let Some(first) = failed.first() {
+        format!(
+            "{} is not ready; inspect that provider before using it for a run.",
+            first.id
+        )
+    } else if !missing.is_empty() {
+        "At least one configured provider is not registered; list all routes or change the configured provider."
+            .to_string()
+    } else if results.is_empty() {
+        "There is no configured provider inventory yet; listing all routes is the safest discovery step."
+            .to_string()
+    } else {
+        "The configured provider inventory is readable; a detect pass can refresh setup diagnostics."
+            .to_string()
+    };
+    let mut evidence = vec![
+        ("scope".to_string(), subject.to_string()),
+        ("providers".to_string(), results.len().to_string()),
+        ("ok".to_string(), ok.to_string()),
+        ("failed".to_string(), failed.len().to_string()),
+        ("skipped".to_string(), skipped.to_string()),
+        ("missing".to_string(), missing.len().to_string()),
+    ];
+    if let Some(first) = failed.first() {
+        evidence.push(("first failed".to_string(), first.id.clone()));
+        if let Some(message) = &first.message {
+            evidence.push(("reason".to_string(), message.clone()));
+        }
+    }
+    if let Some(first) = missing.first() {
+        evidence.push(("first missing".to_string(), first.clone()));
+    }
+    VerdictSurface::try_new(
+        kind,
+        "providers",
+        Some(subject),
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        vec![
+            ("Secondary", "deadreckon detect"),
+            ("Secondary", "deadreckon providers list --all"),
+            ("Secondary", "deadreckon config provider cli:codex"),
+        ],
+    )
+    .expect("providers list verdict surface must be valid")
 }
 
 fn print_provider_list_row(

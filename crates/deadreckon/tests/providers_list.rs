@@ -7,6 +7,8 @@
 use std::fs;
 use std::path::Path;
 
+use serde_json::Value;
+
 mod common;
 
 use common::{
@@ -42,6 +44,16 @@ kind = "anthropic"
     assert!(stdout.contains("cli:codex"));
     assert!(stdout.contains("anthropic"));
     assert!(!stdout.contains("openai-compatible"));
+    assert!(stdout.contains("blocked providers configured"), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert!(stdout.contains("Evidence"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon detect cli:codex"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("hint:"), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
 }
 
 #[test]
@@ -72,6 +84,37 @@ kind = "cli-codex"
     assert!(stdout.contains("cli:pi"));
     assert!(stdout.contains("openai-compatible"));
     assert!(stdout.contains("smoke"));
+}
+
+#[test]
+fn providers_list_json_adds_verdict_and_primary_action() {
+    let temp = repo_tempdir();
+    write_config(
+        temp.path(),
+        r#"
+default_provider = "cli:codex"
+
+[providers."cli:codex"]
+kind = "cli-codex"
+"#,
+    );
+
+    let output = deadreckon(temp.path())
+        .args(["providers", "list", "--json"])
+        .env("PATH", temp.path().join("empty-bin"))
+        .output()
+        .expect("providers list json");
+
+    assert_success(&output);
+    let json: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert!(json["providers"].is_array());
+    assert!(json["verdict"].is_object());
+    assert!(json["primary_action"].is_string());
+    assert_eq!(
+        json["primary_action"],
+        json["verdict"]["recommended_command"]
+    );
+    assert_eq!(json["next_actions"][0], json["primary_action"]);
 }
 
 #[test]
