@@ -1,5 +1,7 @@
 use super::super::*;
-use deadreckon_core::learning::LearningIndexSummary;
+use deadreckon_core::learning::{
+    LearningBundleExportReport, LearningBundleImportReport, LearningIndexSummary, LearningReport,
+};
 
 pub(crate) async fn learn_command(command: LearnCommand) -> Result<()> {
     match command {
@@ -116,48 +118,55 @@ fn learn_report_command(scope: Option<&str>, limit: usize, json_output: bool) ->
     let paths = DeadreckonPaths::discover();
     let mut report = learning_report(&paths, scope)?;
     report.top_signals.truncate(limit);
+    let surface = learn_report_surface(&report);
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
-    println!("{}", ui_heading("learning report"));
-    print_kv_block(&[
-        ("episodes", &report.episodes.to_string()),
-        ("signals", &report.signals.to_string()),
-        ("insights", &report.insights.to_string()),
-        ("proposals", &report.proposals.to_string()),
-    ]);
-    if report.signals_by_kind.is_empty() {
         println!(
-            "{} try `{}`",
-            ui_muted("hint:"),
-            ui_command("deadreckon learn index --all")
+            "{}",
+            serde_json::to_string_pretty(&surface.add_to_json(serde_json::to_value(&report)?))?
         );
         return Ok(());
     }
-    println!();
-    println!("{}", ui_heading("signals"));
-    for (kind, count) in &report.signals_by_kind {
-        println!("  {kind}: {count}");
-    }
-    if !report.top_signals.is_empty() {
-        println!();
-        println!("{}", ui_heading("top signals"));
-        for signal in &report.top_signals {
-            println!(
-                "  {} {} {}",
-                ui_id(&signal.signal_id),
-                ui_status(&signal.kind),
-                one_line(&signal.summary, 120)
-            );
-        }
-    }
-    println!(
-        "{} {}",
-        ui_muted("next:"),
-        ui_command("deadreckon learn propose")
-    );
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+fn learn_report_surface(report: &LearningReport) -> VerdictSurface {
+    let has_signals = report.signals > 0;
+    let (kind, why, primary, secondary) = if has_signals {
+        (
+            VerdictKind::Completed,
+            "The report found learning signals, so proposal generation is the next useful command.",
+            "deadreckon learn propose",
+            vec![("Secondary", "deadreckon learn index --all")],
+        )
+    } else {
+        (
+            VerdictKind::Noop,
+            "The report has no learning signals yet, so indexing all local evidence is the next useful command.",
+            "deadreckon learn index --all",
+            vec![("Secondary", "deadreckon learn report")],
+        )
+    };
+    VerdictSurface::try_new(
+        kind,
+        "learn",
+        Some("report"),
+        ExplanationPanel::new(
+            "DeadReckon summarized the local learning store.",
+            why,
+            vec![
+                ("episodes", report.episodes.to_string()),
+                ("signals", report.signals.to_string()),
+                ("insights", report.insights.to_string()),
+                ("proposals", report.proposals.to_string()),
+                ("signal kinds", report.signals_by_kind.len().to_string()),
+                ("top signals", report.top_signals.len().to_string()),
+            ],
+        ),
+        vec![("Recommended", primary)],
+        secondary,
+    )
+    .expect("learn report verdict surface must be valid")
 }
 
 fn learn_export_command(
@@ -173,35 +182,48 @@ fn learn_export_command(
         paths.learning_bundle_path(&bundle_id)
     });
     let report = export_learning_bundle(&paths, source, &output)?;
+    let surface = learn_export_surface(&report);
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&surface.add_to_json(serde_json::to_value(&report)?))?
+        );
         return Ok(());
     }
-    println!("{}", ui_heading("learning bundle exported"));
-    print_kv_block(&[
-        ("bundle", report.bundle_id.as_str()),
-        ("output", &report.output.display().to_string()),
-        ("episodes", &report.episodes.to_string()),
-        ("signals", &report.signals.to_string()),
-        ("insights", &report.insights.to_string()),
-        ("proposals", &report.proposals.to_string()),
-        ("redaction", report.redaction.profile.as_str()),
-    ]);
-    if !report.redaction.findings.is_empty() {
-        println!("redacted:");
-        for finding in &report.redaction.findings {
-            println!("  - {finding}");
-        }
-    }
-    println!(
-        "{} {}",
-        ui_muted("next:"),
-        ui_command(format!(
-            "deadreckon learn import-bundle {} --preview",
-            report.output.display()
-        ))
-    );
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+fn learn_export_surface(report: &LearningBundleExportReport) -> VerdictSurface {
+    let primary = format!(
+        "deadreckon learn import-bundle {} --preview",
+        report.output.display()
+    );
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "learn",
+        Some("export"),
+        ExplanationPanel::new(
+            "DeadReckon exported a redacted learning bundle.",
+            "The bundle was written to disk; previewing the import is the safest next command before applying it.",
+            vec![
+                ("bundle", report.bundle_id.clone()),
+                ("output", report.output.display().to_string()),
+                ("episodes", report.episodes.to_string()),
+                ("signals", report.signals.to_string()),
+                ("insights", report.insights.to_string()),
+                ("proposals", report.proposals.to_string()),
+                ("redaction", report.redaction.profile.clone()),
+                (
+                    "redaction findings",
+                    report.redaction.findings.len().to_string(),
+                ),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", "deadreckon learn report")],
+    )
+    .expect("learn export verdict surface must be valid")
 }
 
 fn learn_import_bundle_command(
@@ -219,37 +241,61 @@ fn learn_import_bundle_command(
     let apply = yes;
     let paths = DeadreckonPaths::discover();
     let report = import_learning_bundle(&paths, path, apply)?;
+    let surface = learn_import_bundle_surface(path, &report);
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&surface.add_to_json(serde_json::to_value(&report)?))?
+        );
         return Ok(());
     }
-    println!(
-        "{}",
-        ui_heading(if apply {
-            "learning bundle imported"
-        } else {
-            "learning bundle preview"
-        })
-    );
-    print_kv_block(&[
-        ("bundle", report.bundle_id.as_str()),
-        ("episodes", &report.episodes.to_string()),
-        ("signals", &report.signals.to_string()),
-        ("insights", &report.insights.to_string()),
-        ("proposals", &report.proposals.to_string()),
-        ("applied", if report.applied { "yes" } else { "no" }),
-    ]);
-    if !apply {
-        println!(
-            "{} {}",
-            ui_muted("next:"),
-            ui_command(format!(
-                "deadreckon learn import-bundle {} --yes",
-                path.display()
-            ))
-        );
-    }
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+fn learn_import_bundle_surface(path: &Path, report: &LearningBundleImportReport) -> VerdictSurface {
+    let primary = if report.applied {
+        "deadreckon learn report".to_string()
+    } else {
+        format!("deadreckon learn import-bundle {} --yes", path.display())
+    };
+    let (kind, what, why) = if report.applied {
+        (
+            VerdictKind::Completed,
+            "DeadReckon imported the learning bundle into the local learning store.",
+            "The import changed local learning evidence, so the next useful command is to inspect the report.",
+        )
+    } else {
+        (
+            VerdictKind::Preview,
+            "DeadReckon previewed the learning bundle import without applying it.",
+            "This is a preview because no learning records were written; the recommended command applies the same bundle.",
+        )
+    };
+    VerdictSurface::try_new(
+        kind,
+        "learn",
+        Some("import-bundle"),
+        ExplanationPanel::new(
+            what,
+            why,
+            vec![
+                ("bundle", report.bundle_id.clone()),
+                ("path", path.display().to_string()),
+                ("episodes", report.episodes.to_string()),
+                ("signals", report.signals.to_string()),
+                ("insights", report.insights.to_string()),
+                ("proposals", report.proposals.to_string()),
+                (
+                    "applied",
+                    if report.applied { "yes" } else { "no" }.to_string(),
+                ),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", "deadreckon learn report")],
+    )
+    .expect("learn import-bundle verdict surface must be valid")
 }
 
 async fn learn_propose_command(

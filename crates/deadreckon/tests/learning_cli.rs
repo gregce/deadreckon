@@ -271,8 +271,40 @@ fn learn_export_import_bundle_preview_roundtrips_redacted_counts() {
         .output()
         .expect("learn export");
     assert_success(&export);
+    let export_json: Value = serde_json::from_slice(&export.stdout).expect("export json");
+    assert_eq!(export_json["verdict"]["kind"], "completed");
+    assert!(
+        export_json["primary_action"]
+            .as_str()
+            .expect("primary action")
+            .contains("deadreckon learn import-bundle")
+    );
     let raw = fs::read_to_string(&bundle).expect("bundle");
     assert!(!raw.contains(temp.path().to_string_lossy().as_ref()));
+
+    let human_bundle = temp.path().join("bundle-human.json");
+    let human_export = deadreckon(temp.path())
+        .args([
+            "learn",
+            "export",
+            &state.run_id,
+            "--output",
+            human_bundle.to_str().expect("utf8"),
+            "--redacted",
+        ])
+        .output()
+        .expect("learn export human");
+    assert_success(&human_export);
+    let stdout = String::from_utf8_lossy(&human_export.stdout);
+    assert!(stdout.starts_with("completed learn export"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("deadreckon learn import-bundle"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("next:"), "{stdout}");
 
     let preview = deadreckon(temp.path())
         .args([
@@ -290,6 +322,34 @@ fn learn_export_import_bundle_preview_roundtrips_redacted_counts() {
     assert_eq!(json["applied"], false);
     assert_eq!(json["episodes"], 1);
     assert!(json["signals"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(json["verdict"]["kind"], "preview");
+    assert!(
+        json["primary_action"]
+            .as_str()
+            .expect("primary action")
+            .ends_with("--yes")
+    );
+
+    let human_preview = deadreckon(temp.path())
+        .args([
+            "learn",
+            "import-bundle",
+            bundle.to_str().expect("utf8"),
+            "--preview",
+        ])
+        .output()
+        .expect("learn import-bundle human");
+    assert_success(&human_preview);
+    let stdout = String::from_utf8_lossy(&human_preview.stdout);
+    assert!(
+        stdout.starts_with("preview learn import-bundle"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(stdout.contains(" --yes"), "{stdout}");
+    assert!(!stdout.contains("next:"), "{stdout}");
 }
 
 #[test]
@@ -370,7 +430,18 @@ fn learn_report_json_matches_text_counts() {
     assert_success(&json_output);
     assert_success(&text_output);
     let json: Value = serde_json::from_slice(&json_output.stdout).expect("json");
+    assert_eq!(json["verdict"]["kind"], "completed");
+    assert_eq!(json["primary_action"], "deadreckon learn propose");
     let text = String::from_utf8_lossy(&text_output.stdout);
+    assert!(text.starts_with("completed learn report"), "{text}");
+    assert!(text.contains("Explanation\n"), "{text}");
+    assert!(text.contains("Evidence\n"), "{text}");
+    assert_eq!(text.matches("\nRecommended\n").count(), 1, "{text}");
+    assert!(
+        text.contains("Recommended\ndeadreckon learn propose"),
+        "{text}"
+    );
+    assert!(!text.contains("next:"), "{text}");
     assert_text_count(
         &text,
         "episodes",
