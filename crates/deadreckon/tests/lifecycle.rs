@@ -1030,6 +1030,109 @@ fn init_installs_shell_completion_by_default() {
     assert!(temp.path().join(".zshrc").exists());
 }
 
+#[test]
+fn config_set_surface_has_one_recommended_command() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let output = deadreckon(&paths)
+        .args(["config", "set", "defaults.max_spend", "15"])
+        .output()
+        .expect("config set");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("completed config defaults.max_spend"), "{out}");
+    assert!(out.contains("Explanation"), "{out}");
+    assert!(out.contains("Evidence"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains("Recommended\ndeadreckon config get defaults.max_spend"),
+        "{out}"
+    );
+    assert!(!out.contains("try:"), "{out}");
+
+    let get = deadreckon(&paths)
+        .args(["config", "get", "defaults.max_spend"])
+        .output()
+        .expect("config get");
+    assert_success(&get);
+    assert_eq!(stdout(&get).trim(), "15");
+}
+
+#[test]
+fn config_provider_listing_surface_has_one_recommended_command() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_config(paths.home(), "http://127.0.0.1:9");
+
+    let output = deadreckon(&paths)
+        .args(["config", "provider"])
+        .output()
+        .expect("config provider");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("provider selection"), "{stdout}");
+    assert!(stdout.contains("verified config provider"), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon run \"goal\" --provider mock"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("try:"), "{stdout}");
+    assert!(!stdout.contains("default model:"), "{stdout}");
+}
+
+#[test]
+fn config_provider_and_model_mutations_have_one_recommended_command() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_config(paths.home(), "http://127.0.0.1:9");
+
+    let provider = deadreckon(&paths)
+        .args(["config", "provider", "mock"])
+        .output()
+        .expect("config provider set");
+    assert_success(&provider);
+    let provider_stdout = stdout(&provider);
+    assert!(
+        provider_stdout.contains("completed config provider"),
+        "{provider_stdout}"
+    );
+    assert_eq!(
+        provider_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{provider_stdout}"
+    );
+    assert!(
+        provider_stdout.contains("Recommended\ndeadreckon doctor"),
+        "{provider_stdout}"
+    );
+    assert!(!provider_stdout.contains("try:"), "{provider_stdout}");
+
+    let model = deadreckon(&paths)
+        .args(["config", "model", "mock-agent-v2", "--provider", "mock"])
+        .output()
+        .expect("config model set");
+    assert_success(&model);
+    let model_stdout = stdout(&model);
+    assert!(
+        model_stdout.contains("completed config model"),
+        "{model_stdout}"
+    );
+    assert_eq!(
+        model_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{model_stdout}"
+    );
+    assert!(
+        model_stdout.contains("Recommended\ndeadreckon config model --provider mock"),
+        "{model_stdout}"
+    );
+    assert!(!model_stdout.contains("try:"), "{model_stdout}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn done_plain_english_uses_configured_provider() {
     let temp = repo_tempdir();

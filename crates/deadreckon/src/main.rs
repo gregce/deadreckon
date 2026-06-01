@@ -2133,7 +2133,11 @@ fn config_command(command: ConfigCommand) -> Result<()> {
             let mut root = load_config_value(&paths)?;
             set_toml_path(&mut root, &key, parse_config_value(&value));
             fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
-            println!("{} {key}", ui_ok("set"));
+            print!(
+                "{}",
+                config_set_surface(&paths, &key, &value)
+                    .render_plain(!completion_hints_enabled(false))
+            );
         }
         ConfigCommand::Provider { provider } => match provider {
             Some(provider) => {
@@ -2166,8 +2170,11 @@ fn config_command(command: ConfigCommand) -> Result<()> {
                     toml::Value::String(provider.clone()),
                 );
                 fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
-                println!("{} default provider {}", ui_ok("set"), ui_id(&provider));
-                print_provider_setup_rows(&[selection]);
+                print!(
+                    "{}",
+                    config_provider_surface(&paths, &provider, &selection)
+                        .render_plain(!completion_hints_enabled(false))
+                );
             }
             None => print_provider_selection(&paths, None)?,
         },
@@ -2185,11 +2192,10 @@ fn config_command(command: ConfigCommand) -> Result<()> {
                     })?;
                 set_provider_model(&mut root, &provider, &model);
                 fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
-                println!(
-                    "{} model for {} -> {}",
-                    ui_ok("set"),
-                    ui_id(provider),
-                    ui_id(model)
+                print!(
+                    "{}",
+                    config_model_surface(&paths, &provider, &model)
+                        .render_plain(!completion_hints_enabled(false))
                 );
             }
             None => print_provider_selection(&paths, provider.as_deref())?,
@@ -2205,7 +2211,7 @@ fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> 
     let routes = router.route_info();
     let selected = router.selected_route_info();
     println!("{}", ui_heading("provider selection"));
-    for route in routes {
+    for route in &routes {
         let marker = if selected
             .as_ref()
             .is_some_and(|selected| selected.name == route.name)
@@ -2225,30 +2231,13 @@ fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> 
             .unwrap_or_else(|| provider_kind_label(&route.kind));
         println!(
             "{marker} {}  kind={}  model={}  credential={credential}",
-            ui_id(route.name),
+            ui_id(&route.name),
             kind,
             route.model
         );
     }
-    if let Some(selected) = selected {
-        println!(
-            "{} {}",
-            ui_command("try:"),
-            ui_command(format!(
-                "deadreckon run \"goal\" --provider {} --model <model>",
-                selected.name
-            ))
-        );
-        println!(
-            "{} {}",
-            ui_command("default model:"),
-            ui_command(format!(
-                "deadreckon config model <model> --provider {}",
-                selected.name
-            ))
-        );
-    }
-    if let Ok(selection) = provider_setup_selection(
+    println!();
+    let setup_selection = provider_setup_selection(
         paths,
         setup::ProviderSetupRequest {
             role: setup::SetupProviderRoleRef::ConfigDefault,
@@ -2267,10 +2256,173 @@ fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> 
             allow_auto_subscription: false,
             require_usable_route: false,
         },
-    ) {
-        print_provider_setup_rows(&[selection]);
-    }
+    )
+    .ok();
+    print!(
+        "{}",
+        provider_selection_surface(selected.as_ref(), setup_selection.as_ref(), routes.len())
+            .render_plain(!completion_hints_enabled(false))
+    );
     Ok(())
+}
+
+fn config_set_surface(paths: &DeadreckonPaths, key: &str, value: &str) -> VerdictSurface {
+    let primary = format!("deadreckon config get {key}");
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "config",
+        Some(key),
+        ExplanationPanel::new(
+            format!("DeadReckon wrote config key {key}."),
+            "The config mutation completed; reading the same key is the safest verification command.",
+            vec![
+                ("config", paths.config_path().display().to_string()),
+                ("key", key.to_string()),
+                ("value", value.to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", "deadreckon doctor")],
+    )
+    .expect("config set verdict surface must be valid")
+}
+
+fn config_provider_surface(
+    paths: &DeadreckonPaths,
+    provider: &str,
+    selection: &setup::ProviderSetupSelection,
+) -> VerdictSurface {
+    let setup_try = selection.try_lines.first().cloned();
+    let kind = if setup_try.is_some() {
+        VerdictKind::Blocked
+    } else {
+        VerdictKind::Completed
+    };
+    let primary = setup_try.unwrap_or_else(|| "deadreckon doctor".to_string());
+    let what = if kind == VerdictKind::Blocked {
+        format!("DeadReckon saved {provider} as the default provider, but setup is incomplete.")
+    } else {
+        format!("DeadReckon saved {provider} as the default provider.")
+    };
+    let why = if kind == VerdictKind::Blocked {
+        "The config write completed, but the selected provider still needs setup before it can run work."
+    } else {
+        "The provider route is configured; doctor is the safest next command to verify the whole setup."
+    };
+    let mut evidence = vec![
+        (
+            "config".to_string(),
+            paths.config_path().display().to_string(),
+        ),
+        ("provider".to_string(), provider.to_string()),
+        ("setup".to_string(), selection.row_value()),
+    ];
+    if !selection.warnings.is_empty() {
+        evidence.push(("warnings".to_string(), selection.warnings.join("; ")));
+    }
+    VerdictSurface::try_new(
+        kind,
+        "config",
+        Some("provider"),
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        vec![
+            ("Secondary", "deadreckon config provider"),
+            ("Secondary", "deadreckon run \"goal\""),
+        ],
+    )
+    .expect("config provider verdict surface must be valid")
+}
+
+fn config_model_surface(paths: &DeadreckonPaths, provider: &str, model: &str) -> VerdictSurface {
+    let primary = format!("deadreckon config model --provider {provider}");
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "config",
+        Some("model"),
+        ExplanationPanel::new(
+            format!("DeadReckon wrote model {model} for provider {provider}."),
+            "The model override is configured; reading the provider model is the safest verification command.",
+            vec![
+                ("config", paths.config_path().display().to_string()),
+                ("provider", provider.to_string()),
+                ("model", model.to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", "deadreckon doctor")],
+    )
+    .expect("config model verdict surface must be valid")
+}
+
+fn provider_selection_surface(
+    selected: Option<&ProviderRouteInfo>,
+    selection: Option<&setup::ProviderSetupSelection>,
+    route_count: usize,
+) -> VerdictSurface {
+    let setup_try = selection
+        .and_then(|selection| selection.try_lines.first())
+        .cloned();
+    let kind = if setup_try.is_some() {
+        VerdictKind::Blocked
+    } else {
+        VerdictKind::Verified
+    };
+    let primary = setup_try.unwrap_or_else(|| {
+        selected
+            .map(|route| format!("deadreckon run \"goal\" --provider {}", route.name))
+            .unwrap_or_else(|| "deadreckon config provider cli:codex".to_string())
+    });
+    let what = match selected {
+        Some(route) => format!(
+            "DeadReckon read provider routes and selected {}.",
+            route.name
+        ),
+        None => "DeadReckon read provider routes, but no active provider was selected.".to_string(),
+    };
+    let why = if kind == VerdictKind::Blocked {
+        "The provider listing found an incomplete setup; the recommended command fixes the first missing prerequisite."
+    } else {
+        "The provider listing is usable; the recommended command starts work with the selected route."
+    };
+    let mut evidence = vec![("routes".to_string(), route_count.to_string())];
+    if let Some(route) = selected {
+        evidence.push(("selected".to_string(), route.name.clone()));
+        evidence.push(("model".to_string(), route.model.clone()));
+        evidence.push((
+            "credential".to_string(),
+            if route.has_credential {
+                "ready".to_string()
+            } else {
+                "missing".to_string()
+            },
+        ));
+    }
+    if let Some(selection) = selection {
+        evidence.push(("setup".to_string(), selection.row_value()));
+        if !selection.warnings.is_empty() {
+            evidence.push(("warnings".to_string(), selection.warnings.join("; ")));
+        }
+    }
+    let mut secondary = vec![("Secondary", "deadreckon doctor".to_string())];
+    if let Some(route) = selected {
+        secondary.push((
+            "Secondary",
+            format!("deadreckon config model <model> --provider {}", route.name),
+        ));
+    }
+    VerdictSurface::try_new(
+        kind,
+        "config",
+        Some("provider"),
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        secondary
+            .iter()
+            .map(|(label, command)| (*label, command.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("provider selection verdict surface must be valid")
 }
 
 fn print_provider_setup_rows(selections: &[setup::ProviderSetupSelection]) {
