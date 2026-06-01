@@ -9,6 +9,7 @@ pub(crate) struct OrchestrateRunArgs {
 
 pub(crate) struct BareOrchestrateArgs {
     pub(crate) goal: Option<String>,
+    pub(crate) goal_file: Option<PathBuf>,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
     pub(crate) sandbox: Option<String>,
@@ -29,7 +30,12 @@ pub(crate) fn orchestrate_request_from_cli(
     match command {
         Some(OrchestrateCommand::Review(args)) => Ok(OrchestrateRunArgs {
             plan: PlanCommandArgs {
-                goal: args.goal,
+                goal: resolve_required_goal_input(
+                    "orchestrate review",
+                    args.goal,
+                    args.goal_file,
+                    "deadreckon orchestrate review --goal-file docs/goal.md --yes",
+                )?,
                 n: 2,
                 mode: CliPlanMode::Review,
                 max_spend: args.max_spend.or(bare.max_spend),
@@ -59,7 +65,12 @@ pub(crate) fn orchestrate_request_from_cli(
         }),
         Some(OrchestrateCommand::FullPlan(args)) => Ok(OrchestrateRunArgs {
             plan: PlanCommandArgs {
-                goal: args.goal,
+                goal: resolve_required_goal_input(
+                    "orchestrate full-plan",
+                    args.goal,
+                    args.goal_file,
+                    "deadreckon orchestrate full-plan --goal-file docs/goal.md --yes",
+                )?,
                 n: args.n,
                 mode: CliPlanMode::FullPlan,
                 max_spend: args.max_spend.or(bare.max_spend),
@@ -94,6 +105,7 @@ pub(crate) fn orchestrate_request_from_cli(
 fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<OrchestrateRunArgs> {
     let BareOrchestrateArgs {
         goal,
+        goal_file,
         max_spend,
         max_wall_seconds,
         sandbox,
@@ -106,10 +118,10 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         quiet,
         plain,
     } = bare;
-    let Some(goal) = goal else {
+    let Some(goal) = resolve_optional_goal_input("orchestrate", goal, goal_file)? else {
         return Err(CliError::Core(deadreckon_core::user_error(
             "orchestrate requires a mode or goal",
-            "deadreckon orchestrate review \"goal\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes",
+            "deadreckon orchestrate review --goal-file docs/goal.md --coder-provider cli:claude-code --reviewer-provider cli:codex --yes",
         )));
     };
     if !io::stdin().is_terminal() {

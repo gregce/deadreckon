@@ -2012,6 +2012,110 @@ fn start_args_for_test(goal: &str) -> StartCommandArgs {
 }
 
 #[test]
+fn goal_file_reads_document_goal() {
+    let temp = test_tempdir();
+    let goal_path = temp.path().join("goal.md");
+    std::fs::write(
+        &goal_path,
+        "\u{feff}\nBuild the dashboard\n\nInclude persistence.\n",
+    )
+    .expect("write goal");
+
+    let goal = super::resolve_required_goal_input(
+        "run",
+        None,
+        Some(goal_path),
+        "deadreckon run --goal-file docs/goal.md",
+    )
+    .expect("goal");
+
+    assert_eq!(goal, "Build the dashboard\n\nInclude persistence.");
+}
+
+#[test]
+fn at_goal_reads_document_goal() {
+    let temp = test_tempdir();
+    let goal_path = temp.path().join("goal.md");
+    std::fs::write(&goal_path, "Build from shorthand\n").expect("write goal");
+
+    let goal = super::resolve_required_goal_input(
+        "start",
+        Some(format!("@{}", goal_path.display())),
+        None,
+        "deadreckon start --goal-file docs/goal.md",
+    )
+    .expect("goal");
+
+    assert_eq!(goal, "Build from shorthand");
+}
+
+#[test]
+fn goal_input_rejects_positional_and_file() {
+    let temp = test_tempdir();
+    let goal_path = temp.path().join("goal.md");
+    std::fs::write(&goal_path, "Build from file\n").expect("write goal");
+
+    let err = super::resolve_required_goal_input(
+        "campaign",
+        Some("Build inline".to_string()),
+        Some(goal_path),
+        "deadreckon campaign --goal-file docs/goal.md",
+    )
+    .expect_err("conflict should fail");
+
+    assert!(
+        err.to_string()
+            .contains("either a positional goal or --goal-file")
+    );
+}
+
+#[test]
+fn goal_file_resolution_uses_project_root_when_cwd_misses() {
+    let temp = test_tempdir();
+    let root = temp.path();
+    let cwd = root.join("src").join("feature");
+    let docs = root.join("docs");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&docs).expect("docs");
+    let goal_path = docs.join("goal.md");
+    std::fs::write(&goal_path, "Build from project root\n").expect("write goal");
+
+    let resolved =
+        super::resolve_goal_file_path_from(std::path::Path::new("docs/goal.md"), &cwd, Some(root));
+
+    assert_eq!(resolved, goal_path);
+}
+
+#[test]
+fn goal_file_resolution_prefers_cwd_before_project_root() {
+    let temp = test_tempdir();
+    let root = temp.path();
+    let cwd = root.join("src");
+    std::fs::create_dir_all(root.join("docs")).expect("root docs");
+    std::fs::create_dir_all(cwd.join("docs")).expect("cwd docs");
+    let root_goal = root.join("docs").join("goal.md");
+    let cwd_goal = cwd.join("docs").join("goal.md");
+    std::fs::write(&root_goal, "Build from root\n").expect("write root goal");
+    std::fs::write(&cwd_goal, "Build from cwd\n").expect("write cwd goal");
+
+    let resolved =
+        super::resolve_goal_file_path_from(std::path::Path::new("docs/goal.md"), &cwd, Some(root));
+
+    assert_eq!(resolved, cwd_goal);
+}
+
+#[test]
+fn goal_file_resolution_expands_home_prefix() {
+    let temp = test_tempdir();
+    let home = temp.path().join("home");
+
+    let resolved =
+        super::expand_goal_file_home(std::path::Path::new("~/goals/app.md"), Some(&home));
+
+    assert_eq!(resolved, home.join("goals").join("app.md"));
+}
+
+#[test]
 fn orchestration_mode_recommendation_prefers_full_plan_for_broad_products() {
     assert_eq!(
         recommend_orchestration_mode("make a fully multiplayer live flight simulator"),

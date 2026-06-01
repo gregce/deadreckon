@@ -585,7 +585,7 @@ fn start_non_git_tty_can_choose_init_git_copy_or_fresh() {
     let output = deadreckon_pty(
         &paths,
         &source,
-        &["1", "1", "3", "1", "3"],
+        &["1", "1", "1", "3"],
         &["start", "build the app", "--preview"],
         "workspace.*fresh",
         None,
@@ -840,7 +840,7 @@ fn start_plain_preview_strips_ansi() {
 }
 
 #[test]
-fn start_preview_in_existing_repo_shows_extend_and_new_pass_actions() {
+fn start_preview_in_existing_repo_shows_concise_history_hint() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -866,16 +866,9 @@ fn start_preview_in_existing_repo_shows_extend_and_new_pass_actions() {
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("history"), "{out}");
+    assert!(out.contains("follow-up available from aaaabbbb"), "{out}");
     assert!(
-        out.contains("deadreckon extend aaaabbbb \"add settings\""),
-        "{out}"
-    );
-    assert!(
-        out.contains("deadreckon start \"add settings\" --mode review --yes"),
-        "{out}"
-    );
-    assert!(
-        out.contains("deadreckon start \"add settings\" --mode full-plan --yes"),
+        out.contains("override  : deadreckon start <goal> --mode review"),
         "{out}"
     );
 }
@@ -5921,10 +5914,7 @@ fn deadreckon_pty(
     let mut interactions = String::new();
     for answer in answers {
         interactions.push_str("expect -re {choose \\[[0-9]+\\]:}\n");
-        interactions.push_str(&format!(
-            "send -- \"{}\"\n",
-            tcl_string_escape(&format!("{answer}\r"))
-        ));
+        interactions.push_str(&format!("send -- \"{}\"\n", tcl_string_escape(answer)));
     }
     let path_setup = path_prefix
         .map(|path| {

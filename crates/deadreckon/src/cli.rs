@@ -88,6 +88,8 @@ Power-user one-run launcher. Most users can begin with `deadreckon start \"goal\
 
 Lifecycle:
   deadreckon run \"build the thing\"
+  deadreckon run --goal-file docs/goal.md
+  deadreckon run @docs/goal.md
   deadreckon attach latest
   deadreckon status latest
   deadreckon finish latest
@@ -124,6 +126,8 @@ need provider credentials and does not edit your current checkout.";
 const START_HELP: &str = "\
 Lifecycle:
   deadreckon start \"build the app\"
+  deadreckon start --goal-file docs/goal.md
+  deadreckon start @docs/goal.md
   deadreckon attach latest
   deadreckon status latest
   deadreckon list
@@ -160,6 +164,8 @@ Power-user multi-agent launcher. `deadreckon start --mode review` and
 Lifecycle:
   deadreckon orchestrate review \"build the thing\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes
   deadreckon orchestrate full-plan \"build the thing\" --planner-provider cli:codex --provider cli:claude-code --yes
+  deadreckon orchestrate full-plan --goal-file docs/goal.md --planner-provider cli:codex --provider cli:claude-code --yes
+  deadreckon orchestrate @docs/goal.md
   deadreckon orchestrate \"build the thing\"
   deadreckon attach <plan-id>
   deadreckon merge <plan-id>
@@ -654,8 +660,14 @@ pub(crate) enum Commands {
         after_help = START_HELP
     )]
     Start {
-        #[arg(help = "Natural-language coding goal")]
-        goal: String,
+        #[arg(help = "Natural-language coding goal, or @path/to/goal.md")]
+        goal: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Read the natural-language goal from a file; relative paths try cwd, then git root"
+        )]
+        goal_file: Option<PathBuf>,
         #[arg(
             long,
             value_enum,
@@ -713,8 +725,14 @@ pub(crate) enum Commands {
         after_help = RUN_HELP
     )]
     Run {
-        #[arg(help = "Natural-language coding goal")]
-        goal: String,
+        #[arg(help = "Natural-language coding goal, or @path/to/goal.md")]
+        goal: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Read the natural-language goal from a file; relative paths try cwd, then git root"
+        )]
+        goal_file: Option<PathBuf>,
         #[arg(long, help = "Start from an empty workspace")]
         fresh: bool,
         #[arg(long, help = "Force a git worktree run")]
@@ -807,8 +825,16 @@ pub(crate) enum Commands {
     Orchestrate {
         #[command(subcommand)]
         command: Option<OrchestrateCommand>,
-        #[arg(help = "Natural-language coding goal for the interactive mode chooser")]
+        #[arg(
+            help = "Natural-language coding goal for the interactive mode chooser, or @path/to/goal.md"
+        )]
         goal: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Read the natural-language goal for the interactive mode chooser from a file; relative paths try cwd, then git root"
+        )]
+        goal_file: Option<PathBuf>,
         #[arg(long, help = "Per-child spend cap in USD for the interactive chooser")]
         max_spend: Option<f64>,
         #[arg(
@@ -850,13 +876,21 @@ pub(crate) enum Commands {
     },
     #[command(
         about = "Run one goal as N independent orchestrators, then compose their results (depth-capped at 2)",
-        after_help = "Examples:\n  deadreckon campaign \"rebuild billing, notifications, and admin\" --yes\n  deadreckon campaign repair <campaign-id>"
+        after_help = "Examples:\n  deadreckon campaign \"rebuild billing, notifications, and admin\" --yes\n  deadreckon campaign --goal-file docs/goal.md --yes\n  deadreckon campaign @docs/goal.md --yes\n  deadreckon campaign repair <campaign-id>"
     )]
     Campaign {
         #[command(subcommand)]
         command: Option<CampaignCommand>,
-        #[arg(help = "Natural-language coding goal to split into N sub-orchestrators")]
+        #[arg(
+            help = "Natural-language coding goal to split into N sub-orchestrators, or @path/to/goal.md"
+        )]
         goal: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Read the natural-language goal to split from a file; relative paths try cwd, then git root"
+        )]
+        goal_file: Option<PathBuf>,
         #[arg(
             long,
             help = "Number of sub-orchestrators, 2 through 6; omitted lets DeadReckon recommend"
@@ -1758,8 +1792,14 @@ pub(crate) struct CampaignRepairCliArgs {
 
 #[derive(Args)]
 pub(crate) struct OrchestrateReviewArgs {
-    #[arg(help = "Natural-language coding goal")]
-    pub(crate) goal: String,
+    #[arg(help = "Natural-language coding goal, or @path/to/goal.md")]
+    pub(crate) goal: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Read the natural-language goal from a file; relative paths try cwd, then git root"
+    )]
+    pub(crate) goal_file: Option<PathBuf>,
     #[arg(long, help = "Per-child spend cap in USD")]
     pub(crate) max_spend: Option<f64>,
     #[arg(long, help = "Per-child wall-clock cap for CLI-backed turns")]
@@ -1803,8 +1843,14 @@ pub(crate) struct OrchestrateReviewArgs {
 
 #[derive(Args)]
 pub(crate) struct OrchestrateFullPlanArgs {
-    #[arg(help = "Natural-language coding goal")]
-    pub(crate) goal: String,
+    #[arg(help = "Natural-language coding goal, or @path/to/goal.md")]
+    pub(crate) goal: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Read the natural-language goal from a file; relative paths try cwd, then git root"
+    )]
+    pub(crate) goal_file: Option<PathBuf>,
     #[arg(long, default_value_t = 3, help = "Full-plan child count, 2 through 6")]
     pub(crate) n: u8,
     #[arg(long, help = "Per-child spend cap in USD")]

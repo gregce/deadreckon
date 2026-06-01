@@ -387,6 +387,139 @@ fn print_error_hint(err: &CliError) {
     let _ = ui::hint(ui::Stream::Stderr, error_hint(err));
 }
 
+fn goal_input_error(message: impl Into<String>, try_hint: impl Into<String>) -> CliError {
+    let message = message.into();
+    let try_hint = try_hint.into();
+    CliError::Core(deadreckon_core::user_error(&message, &try_hint))
+}
+
+fn resolve_required_goal_input(
+    command_label: &str,
+    positional: Option<String>,
+    goal_file: Option<PathBuf>,
+    missing_hint: &str,
+) -> Result<String> {
+    resolve_optional_goal_input(command_label, positional, goal_file)?.ok_or_else(|| {
+        goal_input_error(
+            format!("{command_label} goal required"),
+            missing_hint.to_string(),
+        )
+    })
+}
+
+fn resolve_optional_goal_input(
+    command_label: &str,
+    positional: Option<String>,
+    goal_file: Option<PathBuf>,
+) -> Result<Option<String>> {
+    match (positional, goal_file) {
+        (Some(_), Some(_)) => Err(goal_input_error(
+            format!("{command_label} accepts either a positional goal or --goal-file, not both"),
+            format!("deadreckon {command_label} --goal-file docs/goal.md"),
+        )),
+        (Some(goal), None) => {
+            if let Some(path) = goal.strip_prefix('@') {
+                if path.is_empty() {
+                    return Err(goal_input_error(
+                        format!("{command_label} @file goal is missing a path"),
+                        format!("deadreckon {command_label} @docs/goal.md"),
+                    ));
+                }
+                return read_goal_file(command_label, Path::new(path)).map(Some);
+            }
+            let goal = normalize_goal_text(goal);
+            validate_goal_text(command_label, &goal)?;
+            Ok(Some(goal))
+        }
+        (None, Some(path)) => read_goal_file(command_label, &path).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+fn read_goal_file(command_label: &str, path: &Path) -> Result<String> {
+    let resolved_path = resolve_goal_file_path(path)?;
+    let contents = fs::read_to_string(&resolved_path).map_err(|err| {
+        goal_input_error(
+            format!(
+                "could not read {command_label} goal file {}",
+                path.display()
+            ),
+            format!(
+                "check the path and permissions; resolved to {} ({err})",
+                resolved_path.display()
+            ),
+        )
+    })?;
+    let goal = normalize_goal_text(contents);
+    validate_goal_text(command_label, &goal)?;
+    Ok(goal)
+}
+
+fn resolve_goal_file_path(path: &Path) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = expand_goal_file_home(path, home.as_deref());
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let cwd = std::env::current_dir()?;
+    let project_root = deadreckon_core::find_git_root(&cwd)?;
+    Ok(resolve_goal_file_path_from(
+        &path,
+        &cwd,
+        project_root.as_deref(),
+    ))
+}
+
+fn resolve_goal_file_path_from(path: &Path, cwd: &Path, project_root: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let cwd_candidate = cwd.join(path);
+    if cwd_candidate.exists() {
+        return cwd_candidate;
+    }
+    if let Some(project_root) = project_root {
+        let project_candidate = project_root.join(path);
+        if project_candidate.exists() {
+            return project_candidate;
+        }
+    }
+    cwd_candidate
+}
+
+fn expand_goal_file_home(path: &Path, home: Option<&Path>) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let Some(home) = home else {
+        return path.to_path_buf();
+    };
+    if raw == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    path.to_path_buf()
+}
+
+fn normalize_goal_text(goal: String) -> String {
+    goal.strip_prefix('\u{feff}')
+        .unwrap_or(&goal)
+        .trim_matches(|ch| ch == '\r' || ch == '\n')
+        .to_string()
+}
+
+fn validate_goal_text(command_label: &str, goal: &str) -> Result<()> {
+    if goal.trim().is_empty() {
+        return Err(goal_input_error(
+            format!("{command_label} goal is empty"),
+            format!("write a non-empty goal or use deadreckon {command_label} \"goal\""),
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = main_inner().await {
@@ -459,6 +592,7 @@ async fn main_inner() -> Result<()> {
         }
         Commands::Start {
             goal,
+            goal_file,
             mode,
             provider,
             children,
@@ -478,6 +612,12 @@ async fn main_inner() -> Result<()> {
             json,
         } => {
             ui::set_plain_output(plain || json);
+            let goal = resolve_required_goal_input(
+                "start",
+                goal,
+                goal_file,
+                "deadreckon start --goal-file docs/goal.md --yes",
+            )?;
             commands::start::start_command(StartCommandArgs {
                 goal,
                 mode,
@@ -502,6 +642,7 @@ async fn main_inner() -> Result<()> {
         }
         Commands::Run {
             goal,
+            goal_file,
             fresh,
             worktree,
             from,
@@ -533,6 +674,12 @@ async fn main_inner() -> Result<()> {
             doc_skill,
         } => {
             ui::set_plain_output(plain);
+            let goal = resolve_required_goal_input(
+                "run",
+                goal,
+                goal_file,
+                "deadreckon run --goal-file docs/goal.md --yes",
+            )?;
             commands::run::run_command(RunCommandArgs {
                 goal,
                 fresh,
@@ -570,6 +717,7 @@ async fn main_inner() -> Result<()> {
         Commands::Orchestrate {
             command,
             goal,
+            goal_file,
             max_spend,
             max_wall_seconds,
             sandbox,
@@ -587,6 +735,7 @@ async fn main_inner() -> Result<()> {
                 command,
                 commands::orchestrate::BareOrchestrateArgs {
                     goal,
+                    goal_file,
                     max_spend,
                     max_wall_seconds,
                     sandbox,
@@ -606,6 +755,7 @@ async fn main_inner() -> Result<()> {
         Commands::Campaign {
             command,
             goal,
+            goal_file,
             n,
             planner_provider,
             provider,
@@ -637,12 +787,12 @@ async fn main_inner() -> Result<()> {
                     }
                 }
             }
-            let Some(goal) = goal else {
-                return Err(CliError::Core(deadreckon_core::user_error(
-                    "campaign goal required",
-                    "deadreckon campaign \"your goal\" --yes, or deadreckon campaign repair <campaign-id>",
-                )));
-            };
+            let goal = resolve_required_goal_input(
+                "campaign",
+                goal,
+                goal_file,
+                "deadreckon campaign --goal-file docs/goal.md --yes, or deadreckon campaign repair <campaign-id>",
+            )?;
             commands::campaign::campaign_command(commands::campaign::CampaignArgs {
                 goal,
                 n,
