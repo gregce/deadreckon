@@ -695,6 +695,29 @@ fn library_list_filters_goal_and_dates() {
 }
 
 #[test]
+fn library_list_invalid_date_has_one_recovery_hint() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .args(["library", "list", "--all", "--since", "not-a-date"])
+        .output()
+        .expect("library list invalid date");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("invalid --since date \"not-a-date\""),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("try:").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("try: deadreckon library list --since 2026-05-11"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn library_search_greps_promoted_run_docs() {
     let temp = repo_tempdir();
     let (paths, parent) = completed_parent(&temp, "ordinary searchable parent");

@@ -814,15 +814,19 @@ fn parse_library_date_filter(label: &str, value: Option<String>) -> Result<Optio
             date.and_hms_opt(0, 0, 0)
         };
         let Some(date_time) = date_time else {
-            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                "invalid {label} date {value:?}\ntry: deadreckon library list {label} 2026-05-11"
-            ))));
+            return Err(invalid_library_date_error(label, &value));
         };
         return Ok(Some(date_time.and_utc()));
     }
-    Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-        "invalid {label} date {value:?}\ntry: deadreckon library list {label} 2026-05-11"
-    ))))
+    Err(invalid_library_date_error(label, &value))
+}
+
+fn invalid_library_date_error(label: &str, value: &str) -> CliError {
+    CliError::Exit {
+        code: 2,
+        message: format!("invalid {label} date {value:?}"),
+        hint: format!("deadreckon library list {label} 2026-05-11"),
+    }
 }
 
 pub(crate) fn library_entries(
