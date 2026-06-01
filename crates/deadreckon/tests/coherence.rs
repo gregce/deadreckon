@@ -1249,16 +1249,24 @@ fn chain_show_and_attach_plain_share_header_precision() {
     assert!(attach.status.success(), "{}", stderr(&attach));
     let attach_stdout = stdout(&attach);
 
-    let show_header = show_stdout.lines().take(8).collect::<Vec<_>>();
-    let attach_header = attach_stdout.lines().take(8).collect::<Vec<_>>();
-    assert_eq!(
-        show_header, attach_header,
-        "{show_stdout}\n---\n{attach_stdout}"
-    );
-    assert!(
-        show_stdout.contains("spend : $1.250000 / $5.000000"),
-        "{show_stdout}"
-    );
+    assert!(show_stdout.starts_with("paused chain "), "{show_stdout}");
+    assert!(show_stdout.contains("Explanation"), "{show_stdout}");
+    assert!(show_stdout.contains("Recommended"), "{show_stdout}");
+    for fragment in [
+        &format!("chain : {} ({})", &chain.chain_id[..8], chain.chain_id),
+        "status: running",
+        "steps : 0/2",
+        "spend : $1.250000 / $5.000000",
+    ] {
+        assert!(
+            show_stdout.contains(fragment),
+            "chain show lost shared header fragment {fragment}:\n{show_stdout}"
+        );
+        assert!(
+            attach_stdout.contains(fragment),
+            "chain attach lost shared header fragment {fragment}:\n{attach_stdout}"
+        );
+    }
 }
 
 #[test]
@@ -1441,12 +1449,24 @@ fn why_failed_run_and_chain_share_failure_layout() {
             run_stdout.contains(label),
             "missing {label} in {run_stdout}"
         );
+    }
+    for label in ["failed chain", "Explanation", "Evidence", "Recommended"] {
         assert!(
             chain_stdout.contains(label),
             "missing {label} in {chain_stdout}"
         );
     }
-    assert!(chain_stdout.contains("try: deadreckon show aaaabbbb --why-failed"));
+    assert!(chain_stdout.contains("failed run: aaaabbbb"));
+    assert_eq!(
+        chain_stdout
+            .matches(&format!(
+                "deadreckon chain show {} --why-failed",
+                &chain.chain_id[..8]
+            ))
+            .count(),
+        1,
+        "{chain_stdout}"
+    );
 }
 
 #[test]

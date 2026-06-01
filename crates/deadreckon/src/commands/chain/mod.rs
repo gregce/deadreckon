@@ -1501,26 +1501,34 @@ fn chain_show_command(
     let id = resolve_chain_id(paths, id, false)?;
     let chain = load_chain(paths, &id)?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "chain",
-                "id": &chain.chain_id,
-                "status": chain_status_label(&chain),
-                "next_actions": [format!("deadreckon chain attach {}", chain_prefix(&chain.chain_id))],
-                "try_lines": Vec::<String>::new(),
-                "paths": {
-                    "chain": paths.chain_json(&chain.chain_id),
-                },
-                "chain": chain,
-            }))?
-        );
+        let surface = chain_verdict_surface(paths, &chain);
+        let value = surface.add_to_json(json!({
+            "kind": "chain",
+            "id": &chain.chain_id,
+            "status": chain_status_label(&chain),
+            "next_actions": [surface.primary_action.command.clone()],
+            "try_lines": Vec::<String>::new(),
+            "paths": {
+                "chain": paths.chain_json(&chain.chain_id),
+            },
+            "chain": chain,
+        }));
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
     if why_failed {
-        show_chain_why_failed(&chain);
+        print!(
+            "{}",
+            chain_verdict_surface(paths, &chain).render_plain(false)
+        );
         return Ok(());
     }
+    print!(
+        "{}",
+        chain_verdict_surface(paths, &chain).render_plain(false)
+    );
+    println!();
+    println!("Steps");
     print_chain_header(paths, &chain);
     for step in &chain.steps {
         println!(
@@ -1536,6 +1544,135 @@ fn chain_show_command(
         );
     }
     Ok(())
+}
+
+fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurface {
+    let id = chain_prefix(&chain.chain_id);
+    let completed = chain
+        .steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.status,
+                ChainStepStatus::Completed | ChainStepStatus::Applied
+            )
+        })
+        .count();
+    let total = chain.steps.len();
+    let failed_step = chain
+        .steps
+        .iter()
+        .find(|step| step.status == ChainStepStatus::Failed || step.fail_reason.is_some());
+    let (kind, what, why) = match chain.status {
+        ChainStatus::Completed => (
+            VerdictKind::Completed,
+            "The chain reached a terminal completed state.",
+            "All required chain steps are complete, so the safest next command is inspection.",
+        ),
+        ChainStatus::Failed => (
+            VerdictKind::Failed,
+            "The chain stopped before all required steps completed.",
+            "Failure inspection is the safest next command before resuming, skipping, or applying any step.",
+        ),
+        ChainStatus::Paused => (
+            VerdictKind::Paused,
+            "The chain is paused before reaching a terminal result.",
+            "The chain still has resumable state, so resume is the primary next command.",
+        ),
+        ChainStatus::Killed => (
+            VerdictKind::Killed,
+            "The chain was stopped before reaching a terminal result.",
+            "Killed chain state should be inspected before cleanup or relaunch.",
+        ),
+        ChainStatus::Running => (
+            VerdictKind::Paused,
+            "The chain is still running.",
+            "Attaching is the safest next command because active conductor state may still exist.",
+        ),
+        ChainStatus::Pending => (
+            VerdictKind::Preview,
+            "The chain has been planned but has not started running.",
+            "Resume starts or continues the stored chain state.",
+        ),
+        ChainStatus::Undone => (
+            VerdictKind::Noop,
+            "The chain has already been undone.",
+            "Inspection is the safest next command because there is no active chain work to advance.",
+        ),
+    };
+    let mut evidence = vec![
+        ("chain".to_string(), id.clone()),
+        ("status".to_string(), chain_status_label(chain).to_string()),
+        ("steps".to_string(), format!("{completed}/{total} complete")),
+        (
+            "state".to_string(),
+            paths.chain_json(&chain.chain_id).display().to_string(),
+        ),
+    ];
+    if let Some(reason) = chain
+        .failure_reason
+        .as_deref()
+        .or(chain.paused_reason.as_deref())
+    {
+        evidence.push(("reason".to_string(), reason.to_string()));
+    }
+    if let Some(step) = failed_step {
+        evidence.push((
+            "failed step".to_string(),
+            format!(
+                "{} {}",
+                step.index + 1,
+                chain_step_status_label(step.status)
+            ),
+        ));
+        if let Some(run_id) = step.run_id.as_deref() {
+            evidence.push(("failed run".to_string(), run_prefix(run_id)));
+        }
+        if let Some(reason) = step.fail_reason.as_deref() {
+            evidence.push(("step reason".to_string(), reason.to_string()));
+        }
+    }
+    let primary = chain_primary_action(chain);
+    let secondary = chain_secondary_actions(chain, &primary);
+    VerdictSurface::try_new(
+        kind,
+        "chain",
+        Some(&id),
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        secondary
+            .iter()
+            .map(|command| ("Secondary", command.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("chain verdict surface must have one primary action")
+}
+
+fn chain_primary_action(chain: &Chain) -> String {
+    let id = chain_prefix(&chain.chain_id);
+    match chain.status {
+        ChainStatus::Failed => format!("deadreckon chain show {id} --why-failed"),
+        ChainStatus::Paused | ChainStatus::Pending => format!("deadreckon chain resume {id}"),
+        ChainStatus::Running => format!("deadreckon chain attach {id}"),
+        ChainStatus::Completed | ChainStatus::Undone => format!("deadreckon chain show {id}"),
+        ChainStatus::Killed => format!("deadreckon chain show {id} --why-failed"),
+    }
+}
+
+fn chain_secondary_actions(chain: &Chain, primary: &str) -> Vec<String> {
+    let id = chain_prefix(&chain.chain_id);
+    let mut actions = Vec::new();
+    for command in [
+        format!("deadreckon chain attach {id}"),
+        format!("deadreckon chain show {id}"),
+        format!("deadreckon chain show {id} --why-failed"),
+        format!("deadreckon chain resume {id}"),
+    ] {
+        if command != primary && !actions.contains(&command) {
+            actions.push(command);
+        }
+    }
+    actions
 }
 
 fn print_chains_json(chains: &[Chain]) -> Result<()> {

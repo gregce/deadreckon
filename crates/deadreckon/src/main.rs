@@ -8460,55 +8460,6 @@ fn render_why_failed(report: WhyFailedReport) {
     }
 }
 
-fn show_chain_why_failed(chain: &Chain) {
-    let has_failed_step = chain
-        .steps
-        .iter()
-        .any(|step| step.status == ChainStepStatus::Failed || step.fail_reason.is_some());
-    if chain.status == ChainStatus::Completed && !has_failed_step {
-        println!("no failures detected");
-        return;
-    }
-
-    let mut evidence = Vec::new();
-    let mut try_lines = Vec::new();
-    for step in &chain.steps {
-        if step.status != ChainStepStatus::Failed && step.fail_reason.is_none() {
-            continue;
-        }
-        evidence.push(format!(
-            "step {} status {} run {}",
-            step.index + 1,
-            commands::chain::chain_step_status_label(step.status),
-            step.run_id
-                .as_deref()
-                .map(run_prefix)
-                .unwrap_or_else(|| "-".to_string())
-        ));
-        if let Some(reason) = step.fail_reason.as_deref() {
-            evidence.push(format!("step {} reason: {reason}", step.index + 1));
-        }
-        if let Some(run_id) = step.run_id.as_deref() {
-            try_lines.push(format!(
-                "deadreckon show {} --why-failed",
-                run_prefix(run_id)
-            ));
-        }
-    }
-
-    render_why_failed(WhyFailedReport {
-        kind: "chain",
-        id: commands::chain::chain_prefix(&chain.chain_id),
-        status: commands::chain::chain_status_label(chain).to_string(),
-        reason: chain
-            .failure_reason
-            .clone()
-            .or_else(|| chain.paused_reason.clone()),
-        evidence,
-        try_lines,
-    });
-}
-
 fn show_plan_why_failed(paths: &DeadreckonPaths, plan: &Plan) {
     if plan.status == PlanStatus::Merged
         && plan
@@ -8858,18 +8809,20 @@ fn show_command(
             commands::campaign::campaign_attach_summary(Some(&paths), &campaign, rollup.as_ref())
         };
         if json_output {
+            let surface = commands::campaign::campaign_verdict_surface(&campaign, rollup.as_ref());
+            let value = surface.add_to_json(json!({
+                "campaign_id": campaign.campaign_id,
+                "status": commands::campaign::campaign_status_text(campaign.status),
+                "n": campaign.n,
+                "merged_run_id": campaign.merged_run_id,
+                "next_actions": [surface.primary_action.command.clone()],
+                "rollup": rollup
+                    .as_ref()
+                    .map(|r| commands::campaign::rollup_verdict_text(r.rollup_verdict)),
+            }));
             println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({
-                    "campaign_id": campaign.campaign_id,
-                    "status": commands::campaign::campaign_status_text(campaign.status),
-                    "n": campaign.n,
-                    "merged_run_id": campaign.merged_run_id,
-                    "rollup": rollup
-                        .as_ref()
-                        .map(|r| commands::campaign::rollup_verdict_text(r.rollup_verdict)),
-                }))
-                .unwrap_or_default()
+                serde_json::to_string_pretty(&value).unwrap_or_default()
             );
         } else {
             print!("{report}");

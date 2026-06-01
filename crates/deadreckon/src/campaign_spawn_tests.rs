@@ -501,6 +501,89 @@ fn why_failed_reports_refused_and_caveat_subs() {
 }
 
 #[test]
+fn campaign_cross_sub_conflict_recommends_campaign_repair_once() {
+    let (mut campaign, rollup) = campaign_with_rollup();
+    campaign.status = deadreckon_core::campaign::CampaignStatus::Failed;
+
+    let surface = campaign_verdict_surface(&campaign, Some(&rollup));
+    let rendered = surface.render_plain(false);
+
+    assert!(rendered.starts_with("blocked campaign "), "{rendered}");
+    assert!(
+        rendered.contains("deterministic campaign-level refusal"),
+        "{rendered}"
+    );
+    assert_eq!(
+        rendered
+            .matches(&format!(
+                "deadreckon campaign repair {}",
+                &campaign.campaign_id[..8]
+            ))
+            .count(),
+        1,
+        "{rendered}"
+    );
+    assert_eq!(
+        surface.primary_action.command,
+        format!("deadreckon campaign repair {}", &campaign.campaign_id[..8])
+    );
+
+    let summary = campaign_attach_summary(None, &campaign, Some(&rollup));
+    assert!(summary.starts_with("blocked campaign "), "{summary}");
+    assert!(summary.contains("Explanation"), "{summary}");
+    assert!(summary.contains("Recommended"), "{summary}");
+    assert_eq!(
+        summary
+            .matches(&format!(
+                "deadreckon campaign repair {}",
+                &campaign.campaign_id[..8]
+            ))
+            .count(),
+        1,
+        "{summary}"
+    );
+}
+
+#[test]
+fn campaign_completed_surface_recommends_apply_or_finish_once() {
+    let (mut campaign, rollup) = campaign_with_rollup();
+    campaign.status = deadreckon_core::campaign::CampaignStatus::Merged;
+    campaign.merged_run_id = Some("d01795896e854713a51211cb7491f716".to_string());
+
+    let surface = campaign_verdict_surface(&campaign, Some(&rollup));
+    let rendered = surface.render_plain(false);
+
+    assert!(rendered.starts_with("completed campaign "), "{rendered}");
+    assert_eq!(
+        rendered.matches("deadreckon apply d0179589").count(),
+        1,
+        "{rendered}"
+    );
+    assert_eq!(surface.primary_action.command, "deadreckon apply d0179589");
+}
+
+#[test]
+fn campaign_json_primary_action_matches_human_primary_action() {
+    let (mut campaign, rollup) = campaign_with_rollup();
+    campaign.status = deadreckon_core::campaign::CampaignStatus::Failed;
+
+    let surface = campaign_verdict_surface(&campaign, Some(&rollup));
+    let value = surface.add_to_json(serde_json::json!({
+        "kind": "campaign",
+        "id": &campaign.campaign_id,
+        "status": campaign_status_text(campaign.status),
+        "next_actions": [surface.primary_action.command.clone()],
+    }));
+
+    assert_eq!(value["primary_action"], surface.primary_action.command);
+    assert_eq!(
+        value["verdict"]["recommended_command"],
+        value["primary_action"]
+    );
+    assert_eq!(value["next_actions"][0], value["primary_action"]);
+}
+
+#[test]
 fn campaign_attach_lists_subs_with_rollup_and_breadcrumb() {
     let (campaign, rollup) = campaign_with_rollup();
     let summary = campaign_attach_summary(None, &campaign, Some(&rollup));

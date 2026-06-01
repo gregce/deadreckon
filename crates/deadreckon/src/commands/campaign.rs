@@ -742,27 +742,146 @@ fn print_campaign_completion(
     result_state: &deadreckon_core::PipelineState,
     no_hints: bool,
 ) {
-    use deadreckon_core::campaign;
-
-    let verdict = match rollup.rollup_verdict {
-        campaign::RollupVerdict::Clean => "clean",
-        campaign::RollupVerdict::Caveat => "caveat",
-        campaign::RollupVerdict::Refused => "refused",
-    };
-    println!(
-        "campaign {} complete: {}/{} subs · roll-up {verdict} · result {}",
-        run_prefix(&campaign.campaign_id),
-        campaign
-            .sub_goals
-            .iter()
-            .filter(|sub| sub.status == campaign::SubGoalStatus::Merged)
-            .count(),
-        campaign.n,
-        run_prefix(&result_state.run_id)
-    );
-    if !no_hints {
-        println!("try: deadreckon apply {}", run_prefix(&result_state.run_id));
+    let mut campaign_for_surface = campaign.clone();
+    if campaign_for_surface.merged_run_id.is_none() {
+        campaign_for_surface.merged_run_id = Some(result_state.run_id.clone());
     }
+    print!(
+        "{}",
+        campaign_verdict_surface(&campaign_for_surface, Some(rollup)).render_plain(no_hints)
+    );
+}
+
+pub(crate) fn campaign_verdict_surface(
+    campaign: &deadreckon_core::campaign::Campaign,
+    rollup: Option<&deadreckon_core::campaign::CampaignRollup>,
+) -> VerdictSurface {
+    use deadreckon_core::campaign::{CampaignStatus, RollupVerdict, SubGoalStatus};
+
+    let id = run_prefix(&campaign.campaign_id);
+    let merged_subs = campaign
+        .sub_goals
+        .iter()
+        .filter(|sub| sub.status == SubGoalStatus::Merged)
+        .count();
+    let repairable = campaign.status == CampaignStatus::Failed
+        && rollup.is_some_and(|rollup| rollup.rollup_verdict != RollupVerdict::Clean);
+    let (kind, what, why) = match campaign.status {
+        CampaignStatus::Merged => (
+            VerdictKind::Completed,
+            "The campaign assembled its sub-orchestrator results into one result run.",
+            "DeadReckon has a campaign artifact; the recommended command lands or inspects that result.",
+        ),
+        CampaignStatus::Failed if repairable => (
+            VerdictKind::Blocked,
+            "The campaign stopped after sub-orchestrator work produced a refused roll-up.",
+            "This is a deterministic campaign-level refusal, not a provider crash; repair can inspect the sub-results and produce a consolidated artifact.",
+        ),
+        CampaignStatus::Failed => (
+            VerdictKind::Failed,
+            "The campaign stopped before producing a merged result.",
+            "No repairable roll-up evidence is available, so failure inspection is the safest next command.",
+        ),
+        CampaignStatus::Killed => (
+            VerdictKind::Killed,
+            "The campaign was stopped before all sub-orchestrators could finish.",
+            "Killed campaign state should be inspected before cleanup or relaunch.",
+        ),
+        CampaignStatus::Forked => (
+            VerdictKind::Paused,
+            "The campaign has launched sub-orchestrators and is not merged yet.",
+            "Attach is the safest next command because sub-plan state may still be active.",
+        ),
+        CampaignStatus::Pending => (
+            VerdictKind::Preview,
+            "The campaign record exists, but no sub-orchestrator has started yet.",
+            "Attaching or launching the stored campaign state is the next non-destructive step.",
+        ),
+    };
+    let primary = campaign_primary_action(campaign, repairable);
+    let mut evidence = vec![
+        ("campaign".to_string(), id.clone()),
+        (
+            "status".to_string(),
+            campaign_status_text(campaign.status).to_string(),
+        ),
+        (
+            "subs".to_string(),
+            format!("{merged_subs}/{} merged", campaign.n),
+        ),
+    ];
+    if let Some(result_run_id) = campaign.merged_run_id.as_deref() {
+        evidence.push(("result run".to_string(), run_prefix(result_run_id)));
+    }
+    if let Some(rollup) = rollup {
+        evidence.push((
+            "roll-up".to_string(),
+            rollup_verdict_text(rollup.rollup_verdict).to_string(),
+        ));
+        if !rollup.refused_subs.is_empty() {
+            evidence.push(("refused subs".to_string(), rollup.refused_subs.join(", ")));
+        }
+        if !rollup.caveat_subs.is_empty() {
+            evidence.push(("caveat subs".to_string(), rollup.caveat_subs.join(", ")));
+        }
+    }
+    let secondary = campaign_secondary_actions(campaign, &primary);
+    VerdictSurface::try_new(
+        kind,
+        "campaign",
+        Some(&id),
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        secondary
+            .iter()
+            .map(|command| ("Secondary", command.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("campaign verdict surface must have one primary action")
+}
+
+fn campaign_primary_action(
+    campaign: &deadreckon_core::campaign::Campaign,
+    repairable: bool,
+) -> String {
+    let id = run_prefix(&campaign.campaign_id);
+    if repairable {
+        return format!("deadreckon campaign repair {id}");
+    }
+    if let Some(result_run_id) = campaign.merged_run_id.as_deref() {
+        return format!("deadreckon apply {}", run_prefix(result_run_id));
+    }
+    match campaign.status {
+        deadreckon_core::campaign::CampaignStatus::Failed => {
+            format!("deadreckon show {id} --why-failed")
+        }
+        deadreckon_core::campaign::CampaignStatus::Killed
+        | deadreckon_core::campaign::CampaignStatus::Forked
+        | deadreckon_core::campaign::CampaignStatus::Pending => format!("deadreckon attach {id}"),
+        deadreckon_core::campaign::CampaignStatus::Merged => format!("deadreckon show {id}"),
+    }
+}
+
+fn campaign_secondary_actions(
+    campaign: &deadreckon_core::campaign::Campaign,
+    primary: &str,
+) -> Vec<String> {
+    let id = run_prefix(&campaign.campaign_id);
+    let mut actions = Vec::new();
+    for command in [
+        format!("deadreckon attach {id}"),
+        format!("deadreckon show {id} --why-failed"),
+        campaign
+            .merged_run_id
+            .as_deref()
+            .map(|run_id| format!("deadreckon show {}", run_prefix(run_id)))
+            .unwrap_or_else(|| format!("deadreckon show {id}")),
+    ] {
+        if command != primary && !actions.contains(&command) {
+            actions.push(command);
+        }
+    }
+    actions
 }
 
 pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
@@ -1098,12 +1217,6 @@ pub(crate) async fn campaign_repair_command(args: CampaignRepairArgs) -> Result<
 
     if !args.quiet {
         print_campaign_completion(&campaign_obj, &rollup, &result_state, args.no_hints);
-        if !args.no_hints {
-            println!(
-                "try: deadreckon attach {}",
-                run_prefix(&campaign_obj.campaign_id)
-            );
-        }
     }
     Ok(())
 }
@@ -1419,30 +1532,30 @@ fn campaign_spend(
 
 pub(crate) fn campaign_attach_json_text(state: &CampaignAttachState) -> Result<String> {
     let rollup = state.rollup.as_ref();
-    Ok(format!(
-        "{}\n",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "kind": "campaign",
-            "id": &state.campaign.campaign_id,
-            "status": campaign_status_text(state.campaign.status),
-            "goal": &state.campaign.root_goal,
-            "tree_budget_usd": state.campaign.tree_budget_usd,
-            "aggregate_spend_usd": state.aggregate_spend_usd,
-            "rollup": rollup.map(|rollup| serde_json::json!({
-                "verdict": rollup_verdict_text(rollup.rollup_verdict),
-                "refused_subs": &rollup.refused_subs,
-                "caveat_subs": &rollup.caveat_subs,
-            })),
-            "subs": state.campaign.sub_goals.iter().map(|sub| serde_json::json!({
-                "sub_id": &sub.sub_id,
-                "goal": &sub.goal,
-                "status": sub_status_text(sub.status),
-                "sub_plan_id": &sub.sub_plan_id,
-                "result_run_id": &sub.result_run_id,
-                "spend_usd": state.sub_spend_usd.get(&sub.sub_id).copied().unwrap_or(0.0),
-            })).collect::<Vec<_>>()
-        }))?
-    ))
+    let surface = campaign_verdict_surface(&state.campaign, rollup);
+    let value = surface.add_to_json(serde_json::json!({
+        "kind": "campaign",
+        "id": &state.campaign.campaign_id,
+        "status": campaign_status_text(state.campaign.status),
+        "goal": &state.campaign.root_goal,
+        "tree_budget_usd": state.campaign.tree_budget_usd,
+        "aggregate_spend_usd": state.aggregate_spend_usd,
+        "next_actions": [surface.primary_action.command.clone()],
+        "rollup": rollup.map(|rollup| serde_json::json!({
+            "verdict": rollup_verdict_text(rollup.rollup_verdict),
+            "refused_subs": &rollup.refused_subs,
+            "caveat_subs": &rollup.caveat_subs,
+        })),
+        "subs": state.campaign.sub_goals.iter().map(|sub| serde_json::json!({
+            "sub_id": &sub.sub_id,
+            "goal": &sub.goal,
+            "status": sub_status_text(sub.status),
+            "sub_plan_id": &sub.sub_plan_id,
+            "result_run_id": &sub.result_run_id,
+            "spend_usd": state.sub_spend_usd.get(&sub.sub_id).copied().unwrap_or(0.0),
+        })).collect::<Vec<_>>()
+    }));
+    Ok(format!("{}\n", serde_json::to_string_pretty(&value)?))
 }
 
 /// Read-only attach summary for a campaign: breadcrumb, sub rows, and roll-up.
@@ -1455,6 +1568,13 @@ pub(crate) fn campaign_attach_summary(
 ) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+    let _ = write!(
+        out,
+        "{}",
+        campaign_verdict_surface(campaign, rollup).render_plain(false)
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Details");
     let _ = writeln!(
         out,
         "campaign: {} ({})",
@@ -1504,6 +1624,13 @@ pub(crate) fn campaign_why_failed_report(
 ) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+    let _ = write!(
+        out,
+        "{}",
+        campaign_verdict_surface(campaign, rollup).render_plain(false)
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Details");
     let _ = writeln!(
         out,
         "campaign {} {}",

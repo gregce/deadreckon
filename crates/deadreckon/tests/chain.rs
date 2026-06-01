@@ -21,7 +21,7 @@ use axum::{Json, Router};
 use deadreckon_core::{
     ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainNewOptions, ChainStatus, ChainStepStatus,
     DeadreckonPaths, OnFail, RunEvent, RunEventKind, RunOptions, chain_task_key, create_run,
-    load_chain, load_run, promote_completed_run,
+    load_chain, load_run, promote_completed_run, save_chain,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -108,6 +108,134 @@ fn chain_paths_match_locks_pattern() {
 #[test]
 fn chain_lock_task_key_prefix_chain_double_dash() {
     assert_eq!(chain_task_key("chain-a"), "chain--chain-a");
+}
+
+#[test]
+fn chain_failed_surface_has_single_inspection_or_recovery_command() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.scope = deadreckon_core::paths::workspace_scope(temp.path()).expect("scope");
+    chain.status = ChainStatus::Failed;
+    chain.failure_reason = Some("step 2 failed".to_string());
+    save_test_chain(&paths, &chain);
+
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args(["chain", "show", &chain.chain_id[..8], "--json"])
+        .output()
+        .expect("chain show json");
+
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["verdict"]["kind"], "failed");
+    assert_eq!(
+        value["primary_action"],
+        value["verdict"]["recommended_command"]
+    );
+    assert_eq!(value["primary_action"], value["next_actions"][0]);
+    assert_eq!(
+        value["primary_action"],
+        format!(
+            "deadreckon chain show {} --why-failed",
+            &chain.chain_id[..8]
+        )
+    );
+
+    let human = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args(["chain", "show", &chain.chain_id[..8], "--why-failed"])
+        .output()
+        .expect("chain show human");
+    assert_success(&human);
+    let stdout = stdout(&human);
+    assert!(stdout.starts_with("failed chain "), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert!(stdout.contains("Recommended"), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "deadreckon chain show {} --why-failed",
+                &chain.chain_id[..8]
+            ))
+            .count(),
+        1,
+        "{stdout}"
+    );
+}
+
+#[test]
+fn chain_paused_surface_recommends_resume_once() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.scope = deadreckon_core::paths::workspace_scope(temp.path()).expect("scope");
+    chain.status = ChainStatus::Paused;
+    chain.paused_reason = Some("operator pause".to_string());
+    save_test_chain(&paths, &chain);
+
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args(["chain", "show", &chain.chain_id[..8], "--json"])
+        .output()
+        .expect("chain show json");
+
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["verdict"]["kind"], "paused");
+    assert_eq!(
+        value["primary_action"],
+        format!("deadreckon chain resume {}", &chain.chain_id[..8])
+    );
+    assert_eq!(value["primary_action"], value["next_actions"][0]);
+
+    let human = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args(["chain", "show", &chain.chain_id[..8]])
+        .output()
+        .expect("chain show human");
+    assert_success(&human);
+    let stdout = stdout(&human);
+    assert!(stdout.starts_with("paused chain "), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!("deadreckon chain resume {}", &chain.chain_id[..8]))
+            .count(),
+        1,
+        "{stdout}"
+    );
+}
+
+#[test]
+fn chain_completed_surface_has_one_verdict_and_explanation() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.scope = deadreckon_core::paths::workspace_scope(temp.path()).expect("scope");
+    chain.status = ChainStatus::Completed;
+    chain.steps[0].status = ChainStepStatus::Completed;
+    chain.steps[1].status = ChainStepStatus::Completed;
+    save_test_chain(&paths, &chain);
+
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args(["chain", "show", &chain.chain_id[..8], "--json"])
+        .output()
+        .expect("chain show json");
+
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["verdict"]["kind"], "completed");
+    assert_eq!(
+        value["primary_action"],
+        value["verdict"]["recommended_command"]
+    );
+    assert!(
+        value["verdict"]["explanation"]
+            .as_str()
+            .expect("explanation")
+            .contains("chain reached a terminal completed state")
+    );
 }
 
 #[test]
@@ -3108,11 +3236,8 @@ fn wait_until_pid_dead(pid: u32) {
 }
 
 fn save_test_chain(paths: &DeadreckonPaths, chain: &Chain) {
-    fs::write(
-        paths.chain_json(&chain.chain_id),
-        serde_json::to_vec_pretty(chain).expect("chain json"),
-    )
-    .expect("save chain");
+    fs::create_dir_all(paths.chains_dir().join(&chain.chain_id)).expect("chain dir");
+    save_chain(paths, chain).expect("save chain");
 }
 
 fn newest_chain(paths: &DeadreckonPaths) -> Chain {
