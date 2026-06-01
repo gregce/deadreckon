@@ -97,6 +97,44 @@ fn campaign_preflight_shows_depth_cap_and_tree_budget() {
 }
 
 #[test]
+fn campaign_depth_refusal_has_one_recovery_hint() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let work = workdir(&temp);
+
+    let output = deadreckon(&paths)
+        .current_dir(&work)
+        .env("DEADRECKON_CAMPAIGN_DEPTH", "1")
+        .args([
+            "campaign",
+            "nested campaign",
+            "--n",
+            "2",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--preview",
+            "--plain",
+        ])
+        .output()
+        .expect("campaign depth refusal");
+
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(
+        err.contains("campaign refused: depth cap 2 reached"),
+        "{err}"
+    );
+    assert_eq!(err.matches("try:").count(), 1, "{err}");
+    assert!(
+        err.contains("try: deadreckon orchestrate full-plan \"nested campaign\""),
+        "{err}"
+    );
+    assert!(!err.contains("try: deadreckon doctor"), "{err}");
+}
+
+#[test]
 fn campaign_without_n_uses_recommended_count() {
     let temp = TempDir::new().expect("tempdir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));

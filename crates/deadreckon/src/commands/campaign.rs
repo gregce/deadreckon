@@ -921,11 +921,22 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
 
     let lineage = campaign::lineage_from_env();
     if lineage.depth + 1 >= campaign::CAMPAIGN_MAX_DEPTH {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(
-            "campaign refused: depth cap 2 reached\n\
-             try: run `orchestrate full-plan` (not campaign) inside a sub-orchestrator"
-                .to_string(),
-        )));
+        let mut hint = format!(
+            "deadreckon orchestrate full-plan \"{}\" --n {}",
+            shell_display_quote(&goal),
+            n
+        );
+        if let Some(provider) = args.planner_provider.as_deref() {
+            hint.push_str(&format!(" --planner-provider {provider}"));
+        }
+        if let Some(provider) = args.provider.as_deref() {
+            hint.push_str(&format!(" --provider {provider}"));
+        }
+        return Err(CliError::Exit {
+            code: 1,
+            message: "campaign refused: depth cap 2 reached; use orchestrate full-plan inside the sub-orchestrator instead".to_string(),
+            hint,
+        });
     }
 
     let providers = resolve_plan_providers(

@@ -2,9 +2,8 @@ case: campaign-depth
 status: 1
 --- stdout ---
 --- stderr ---
-error: invalid input: campaign refused: depth cap 2 reached
-try: run `orchestrate full-plan` (not campaign) inside a sub-orchestrator
-  hint: try: deadreckon doctor
+error: campaign refused: depth cap 2 reached; use orchestrate full-plan inside the sub-orchestrator instead
+  hint: try: deadreckon orchestrate full-plan "nested campaign" --n 2 --planner-provider smoke --provider smoke
 
 case: non-git-worktree
 status: 1
