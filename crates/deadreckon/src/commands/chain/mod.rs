@@ -2077,10 +2077,25 @@ fn chain_pause_command(paths: &DeadreckonPaths, id: &str, reason: Option<String>
     let id = resolve_chain_id(paths, id, false)?;
     let mut chain = load_chain(paths, &id)?;
     if chain.status != ChainStatus::Running {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            &format!("cannot pause '{}' chain", chain_status_label(&chain)),
-            &format!("deadreckon chain status {}", chain_prefix(&chain.chain_id)),
-        )));
+        let status = chain_status_label(&chain).to_string();
+        let primary = format!("deadreckon chain status {}", chain_prefix(&chain.chain_id));
+        return Err(CliError::Surface {
+            code: 1,
+            surface: chain_transition_surface(
+                paths,
+                &chain,
+                VerdictKind::Blocked,
+                &format!("DeadReckon did not pause the chain because cannot pause '{status}' chain."),
+                "Only a running chain can be paused; this chain is already outside the active conductor state.",
+                vec![
+                    ("requested transition".to_string(), "pause".to_string()),
+                    ("required status".to_string(), "running".to_string()),
+                ],
+                primary,
+                Vec::new(),
+            )
+            .render_plain(false),
+        });
     }
     chain.status = ChainStatus::Paused;
     chain.paused_reason = Some(reason.unwrap_or_else(|| "user_paused".to_string()));

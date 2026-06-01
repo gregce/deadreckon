@@ -1333,7 +1333,7 @@ fn chain_undo_records_undone_step_events() {
 }
 
 #[test]
-fn chain_pause_refuses_when_status_not_running_with_try() {
+fn chain_pause_refuses_when_status_not_running_with_verdict_surface() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1353,8 +1353,17 @@ fn chain_pause_refuses_when_status_not_running_with_try() {
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
     assert!(stderr.contains("cannot pause 'pending' chain"));
-    assert!(stderr.contains("try:"));
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain status"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]
