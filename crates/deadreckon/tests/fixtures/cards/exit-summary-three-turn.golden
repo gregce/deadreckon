@@ -26,7 +26,7 @@
 |   lineage: src/main.rs ← turn 2 · cli:codex · tool-write-2                           |
 |   → deadreckon apply abc12345                                                        |
 |                                                                                      |
-|   next          deadreckon apply abc12345                                            |
+|   recommended   deadreckon apply abc12345                                            |
 |   attach        deadreckon attach abc12345                                           |
 |   show          deadreckon show abc12345                                             |
 +--------------------------------------------------------------------------------------+

@@ -25,7 +25,7 @@ status: 0
 |   lineage: README.md ← turn 2 · smoke · smoke-bash-2                                                                 |
 |   → deadreckon export <ID8> --dest <path>                                                                         |
 |                                                                                                                      |
-|   next          deadreckon export <ID8> --dest <path>                                                             |
+|   recommended   deadreckon export <ID8> --dest <path>                                                             |
 |   attach        deadreckon attach <ID8>                                                                           |
 |   show          deadreckon show <ID8>                                                                             |
 +----------------------------------------------------------------------------------------------------------------------+

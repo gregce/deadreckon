@@ -70,11 +70,12 @@ fn exit_card_leads_with_one_verdict_and_one_primary_action() {
         "{rendered}"
     );
     assert_eq!(primary_action_count(&rendered), 1, "{rendered}");
-    let primary = line_index(&rendered, "next", "deadreckon apply abc12345");
+    let primary = line_index(&rendered, "recommended", "deadreckon apply abc12345");
     let attach = line_index(&rendered, "attach", "deadreckon attach abc12345");
     let show = line_index(&rendered, "show", "deadreckon show abc12345");
     assert!(primary < attach, "{rendered}");
     assert!(primary < show, "{rendered}");
+    assert_no_next_primary(&rendered);
 }
 
 #[test]
@@ -129,10 +130,11 @@ fn paused_and_failed_cards_each_have_one_primary_action() {
     );
     assert_eq!(primary_action_count(&paused), 1, "{paused}");
     assert!(
-        line_index(&paused, "next", "deadreckon resume abc12345")
+        line_index(&paused, "recommended", "deadreckon resume abc12345")
             < line_index(&paused, "attach", "deadreckon attach abc12345"),
         "{paused}"
     );
+    assert_no_next_primary(&paused);
 
     let mut failed = input(OutcomeKind::Failed);
     failed.hints = vec![
@@ -157,10 +159,14 @@ fn paused_and_failed_cards_each_have_one_primary_action() {
     );
     assert_eq!(primary_action_count(&failed), 1, "{failed}");
     assert!(
-        line_index(&failed, "next", "deadreckon show abc12345 --why-failed")
-            < line_index(&failed, "resume", "deadreckon resume abc12345"),
+        line_index(
+            &failed,
+            "recommended",
+            "deadreckon show abc12345 --why-failed"
+        ) < line_index(&failed, "resume", "deadreckon resume abc12345"),
         "{failed}"
     );
+    assert_no_next_primary(&failed);
 }
 
 #[test]
@@ -273,8 +279,16 @@ fn accepted_exit_card_shows_proof_block() {
 fn primary_action_count(rendered: &str) -> usize {
     rendered
         .lines()
-        .filter(|line| line.contains(" next") && line.contains("deadreckon "))
+        .filter(|line| line.contains(" recommended") && line.contains("deadreckon "))
         .count()
+}
+
+fn assert_no_next_primary(rendered: &str) {
+    let next_count = rendered
+        .lines()
+        .filter(|line| line.contains(" next") && line.contains("deadreckon "))
+        .count();
+    assert_eq!(next_count, 0, "{rendered}");
 }
 
 fn line_index(rendered: &str, label: &str, command: &str) -> usize {

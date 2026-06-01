@@ -255,7 +255,7 @@ fn exit_summary_primary_action(input: &ExitSummaryInput) -> Option<HintLine> {
         })
         .or_else(|| input.hints.first())?;
     Some(HintLine {
-        label: "next".to_string(),
+        label: "recommended".to_string(),
         command: selected.1.clone(),
     })
 }
