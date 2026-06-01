@@ -358,15 +358,49 @@ pub(crate) fn update_current_version(
 }
 
 fn print_update_check(channel: Channel, current: &str, latest: &LatestUpdate) {
-    println!("channel: {}", channel.as_str());
-    println!("current: {current}");
-    println!("latest: {}", latest.version);
-    println!("release: {}", latest.release_url);
-    if latest.update_available && matches!(channel, Channel::Npm | Channel::Brew | Channel::Cargo) {
-        println!("try: {}", channel_native_update_command(channel));
-    } else if latest.update_available && channel == Channel::Shell {
-        println!("try: deadreckon update");
+    println!(
+        "{}",
+        update_check_surface(channel, current, latest)
+            .render_plain(!completion_hints_enabled(false))
+    );
+}
+
+fn update_check_surface(channel: Channel, current: &str, latest: &LatestUpdate) -> VerdictSurface {
+    let evidence = vec![
+        ("channel", channel.as_str().to_string()),
+        ("current", current.to_string()),
+        ("latest", latest.version.clone()),
+        ("release", latest.release_url.clone()),
+    ];
+    if latest.update_available {
+        return VerdictSurface::try_new(
+            VerdictKind::Preview,
+            "update",
+            Some(channel.as_str()),
+            ExplanationPanel::new(
+                "DeadReckon found a newer release for this install channel.",
+                "The check is read-only; run the channel update command to apply the available release.",
+                evidence,
+            ),
+            vec![("Recommended", channel_native_update_command(channel))],
+            vec![("Secondary", "deadreckon doctor")],
+        )
+        .expect("update-check preview verdict surface must be valid");
     }
+
+    VerdictSurface::try_new(
+        VerdictKind::Noop,
+        "update",
+        Some(channel.as_str()),
+        ExplanationPanel::new(
+            "DeadReckon did not find a newer release for this install channel.",
+            "The installed version is already current, or the check fell back to cached/current release metadata.",
+            evidence,
+        ),
+        vec![("Recommended", "deadreckon doctor")],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("update-check no-op verdict surface must be valid")
 }
 
 fn channel_native_update_command(channel: Channel) -> &'static str {

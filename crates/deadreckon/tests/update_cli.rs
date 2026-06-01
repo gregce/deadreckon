@@ -30,9 +30,16 @@ fn update_check_prints_channel_from_receipt() {
 
     assert_success(&output);
     let out = stdout(&output);
+    assert!(out.contains("preview update npm"), "{out}");
     assert!(out.contains("channel: npm"), "{out}");
     assert!(out.contains("current: 0.1.0"), "{out}");
     assert!(out.contains("latest: 0.2.3"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains("Recommended\nbun update -g deadreckon"),
+        "{out}"
+    );
+    assert!(!out.contains("try:"), "{out}");
 }
 
 #[test]
@@ -48,7 +55,14 @@ fn update_check_exits_zero_when_no_network() {
         .expect("update check");
 
     assert_success(&output);
-    assert!(stdout(&output).contains("channel: brew"));
+    let out = stdout(&output);
+    assert!(out.contains("no-op update brew"), "{out}");
+    assert!(out.contains("channel: brew"), "{out}");
+    assert!(out.contains("current: 0.1.0"), "{out}");
+    assert!(out.contains("latest: 0.1.0"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(out.contains("Recommended\ndeadreckon doctor"), "{out}");
+    assert!(!out.contains("try:"), "{out}");
 }
 
 #[test]
