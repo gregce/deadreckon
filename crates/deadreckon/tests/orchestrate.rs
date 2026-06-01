@@ -4998,11 +4998,25 @@ fn merge_refuses_running_child() {
 
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
+    assert!(err.starts_with("paused plan "), "{err}");
     assert!(err.contains("child 0 is running"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
     assert!(
-        err.contains("try: wait, or run deadreckon kill <plan-id>"),
+        err.contains(&format!(
+            "Recommended\ndeadreckon attach {}",
+            &plan.plan_id[..8]
+        )),
         "{err}"
     );
+    assert!(err.contains("Secondary\n"), "{err}");
+    assert!(
+        err.contains(&format!("deadreckon kill {}", &plan.plan_id[..8])),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
 }
 
 #[test]

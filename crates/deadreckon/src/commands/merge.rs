@@ -33,10 +33,11 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
         .iter()
         .find(|task| task.status != PlanTaskStatus::Completed)
     {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            &format!("child {} is {}", task.index, task_status_label(task.status)),
-            "wait, or run deadreckon kill <plan-id>",
-        )));
+        return Err(CliError::Surface {
+            code: 1,
+            surface: merge_incomplete_plan_surface(&plan, task)
+                .render_plain(!completion_hints_enabled(no_hints)),
+        });
     }
     append_plan_event(&paths, &plan.plan_id, PlanEventKind::MergeStarted)?;
     let strategy = parse_merge_strategy(&strategy, prefer_child)?;
@@ -202,6 +203,49 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
         print_merge_finished(&paths, &plan, &merged_run, &library_dir, no_hints);
     }
     Ok(())
+}
+
+fn merge_incomplete_plan_surface(plan: &Plan, task: &PlanTask) -> VerdictSurface {
+    let id = run_prefix(&plan.plan_id);
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .count();
+    let primary = format!("deadreckon attach {id}");
+    let secondary = format!("deadreckon kill {id}");
+    VerdictSurface::try_new(
+        VerdictKind::Paused,
+        "plan",
+        Some(&id),
+        ExplanationPanel::new(
+            format!(
+                "DeadReckon cannot merge yet because child {} is {}.",
+                task.index,
+                task_status_label(task.status)
+            ),
+            "The merge step requires every child task to complete before composing a result run.",
+            [
+                ("plan".to_string(), id.clone()),
+                (
+                    "status".to_string(),
+                    plan_status_label(plan.status).to_string(),
+                ),
+                ("child".to_string(), task.index.to_string()),
+                (
+                    "child status".to_string(),
+                    task_status_label(task.status).to_string(),
+                ),
+                (
+                    "tasks".to_string(),
+                    format!("{completed}/{} completed", plan.tasks.len()),
+                ),
+            ],
+        ),
+        [("Recommended", primary.as_str())],
+        [("Secondary", secondary.as_str())],
+    )
+    .expect("merge incomplete plan surface must have one primary action")
 }
 
 fn parse_merge_strategy(strategy: &str, prefer_child: Option<u32>) -> Result<PlanMergeStrategy> {
