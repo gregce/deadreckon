@@ -31,6 +31,39 @@ mod common;
 
 use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
 
+#[test]
+fn chain_help_topics_use_one_recommended_footer() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let topics = [
+        ("plan", "deadreckon chain run latest"),
+        ("run", "deadreckon chain attach latest"),
+        ("attach", "deadreckon chain status latest"),
+        ("status", "deadreckon chain show latest"),
+        ("show", "deadreckon chain resume latest"),
+        ("pause", "deadreckon chain resume latest"),
+        ("undo", "deadreckon chain show latest"),
+        ("extend", "deadreckon chain run latest"),
+    ];
+
+    for (topic, command) in topics {
+        let output = deadreckon(&paths)
+            .args(["chain", "help", topic])
+            .output()
+            .expect("chain help");
+
+        assert_success(&output);
+        let stdout = stdout(&output);
+        assert_eq!(stdout.matches("recommended:").count(), 1, "{stdout}");
+        assert!(
+            stdout.contains(&format!("recommended: {command}")),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("next:"), "{stdout}");
+        assert!(!stdout.contains("try:"), "{stdout}");
+    }
+}
+
 fn sample_chain(temp: &TempDir) -> Chain {
     Chain::new(ChainNewOptions {
         root_goal: "manual: 2 steps".to_string(),

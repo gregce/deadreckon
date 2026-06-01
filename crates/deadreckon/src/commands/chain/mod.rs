@@ -16,7 +16,7 @@ fn print_chain_help(topic: Option<&str>) {
             println!(
                 "purpose: ask the configured provider to split a large goal into ordered steps"
             );
-            println!("next:    {}", ui_command("deadreckon chain run latest"));
+            print_chain_help_recommended("deadreckon chain run latest");
         }
         "run" | "resume" => {
             println!("{}", ui_heading("deadreckon chain run"));
@@ -26,7 +26,7 @@ fn print_chain_help(topic: Option<&str>) {
                 ui_command("deadreckon chain resume latest --from-step 2")
             );
             println!("purpose: execute or continue the conductor for a chain");
-            println!("next:    {}", ui_command("deadreckon chain attach latest"));
+            print_chain_help_recommended("deadreckon chain attach latest");
         }
         "attach" | "watch" => {
             println!("{}", ui_heading("deadreckon chain attach"));
@@ -34,7 +34,7 @@ fn print_chain_help(topic: Option<&str>) {
             println!(
                 "purpose: open the chain TUI, including step timeline and live inner run status"
             );
-            println!("next:    {}", ui_command("deadreckon chain status latest"));
+            print_chain_help_recommended("deadreckon chain status latest");
         }
         "status" | "list" => {
             println!("{}", ui_heading("deadreckon chain status/list"));
@@ -44,7 +44,7 @@ fn print_chain_help(topic: Option<&str>) {
                 ui_command("deadreckon chain list --all-scopes")
             );
             println!("purpose: find chains, summarize progress, and see the next action");
-            println!("next:    {}", ui_command("deadreckon chain show latest"));
+            print_chain_help_recommended("deadreckon chain show latest");
         }
         "show" => {
             println!("{}", ui_heading("deadreckon chain show"));
@@ -53,7 +53,7 @@ fn print_chain_help(topic: Option<&str>) {
                 ui_command("deadreckon chain show latest --why-failed")
             );
             println!("purpose: inspect steps, policies, failures, applied SHAs, and run ids");
-            println!("next:    {}", ui_command("deadreckon chain resume latest"));
+            print_chain_help_recommended("deadreckon chain resume latest");
         }
         "pause" | "kill" => {
             println!("{}", ui_heading("deadreckon chain pause/kill"));
@@ -68,7 +68,7 @@ fn print_chain_help(topic: Option<&str>) {
             println!(
                 "purpose: stop the conductor intentionally; kill also cascades to the live inner run"
             );
-            println!("next:    {}", ui_command("deadreckon chain resume latest"));
+            print_chain_help_recommended("deadreckon chain resume latest");
         }
         "undo" | "redo" => {
             println!("{}", ui_heading("deadreckon chain undo/redo"));
@@ -81,7 +81,7 @@ fn print_chain_help(topic: Option<&str>) {
                 ui_command("deadreckon chain redo latest --step 2")
             );
             println!("purpose: back out or rerun an applied step with bounded chain state changes");
-            println!("next:    {}", ui_command("deadreckon chain show latest"));
+            print_chain_help_recommended("deadreckon chain show latest");
         }
         "extend" => {
             println!("{}", ui_heading("deadreckon chain extend"));
@@ -94,7 +94,7 @@ fn print_chain_help(topic: Option<&str>) {
                 ui_command("deadreckon chain extend latest \"new step goal\" --insert-at 2")
             );
             println!("purpose: add a new step to an existing chain");
-            println!("next:    {}", ui_command("deadreckon chain run latest"));
+            print_chain_help_recommended("deadreckon chain run latest");
         }
         "hooks" => {
             println!("{}", ui_heading("deadreckon chain hooks"));
@@ -112,6 +112,10 @@ fn print_chain_help(topic: Option<&str>) {
             println!("  {}", ui_command("deadreckon chain help undo"));
         }
     }
+}
+
+fn print_chain_help_recommended(command: &str) {
+    println!("recommended: {}", ui_command(command));
 }
 
 pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
