@@ -1001,21 +1001,30 @@ fn validate_acceptance_helper_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn print_acceptance_written(cwd: &Path, source: &str, checks: usize) {
-    println!("{}", ui_ok("done criteria configured"));
-    println!("source  {source}");
-    println!("checks  {checks}");
-    println!("yaml    {}", project_acceptance_yaml(cwd).display());
-    println!("notes   {}", project_acceptance_md(cwd).display());
-    println!();
-    println!(
-        "{} {}",
-        ui_command("next:"),
-        ui_command("deadreckon def-done check")
-    );
-    println!(
-        "{} {}",
-        ui_command("run: "),
-        ui_command("deadreckon run \"goal\"")
+    let yaml_path = project_acceptance_yaml(cwd);
+    let notes_path = project_acceptance_md(cwd);
+    let primary = "deadreckon def-done check";
+    print!(
+        "{}",
+        VerdictSurface::try_new(
+            VerdictKind::Completed,
+            "def-done",
+            None,
+            ExplanationPanel::new(
+                "DeadReckon wrote project done criteria and companion notes.",
+                "The criteria are configured; check them once before launching a long run.",
+                vec![
+                    ("source", source.to_string()),
+                    ("checks", checks.to_string()),
+                    ("yaml", yaml_path.display().to_string()),
+                    ("notes", notes_path.display().to_string()),
+                ],
+            ),
+            vec![("Recommended", primary)],
+            vec![("Secondary", "deadreckon run \"goal\"")],
+        )
+        .expect("acceptance written verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false))
     );
 }
 

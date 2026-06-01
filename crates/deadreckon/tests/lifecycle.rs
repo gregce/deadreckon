@@ -1057,7 +1057,17 @@ async fn done_plain_english_uses_configured_provider() {
         .expect("def-done");
 
     assert_success(&output);
-    assert!(stdout(&output).contains("done criteria configured"));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("completed def-done"), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert!(stdout.contains("Evidence"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon def-done check"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("next:"), "{stdout}");
+    assert!(!stdout.contains("run: "), "{stdout}");
     assert!(workspace.join(".deadreckon/acceptance.yaml").exists());
 }
 
@@ -1146,6 +1156,14 @@ fn acceptance_init_writes_project_spec() {
         .expect("acceptance init");
 
     assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("completed def-done"), "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon def-done check"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(!stdout.contains("next:"), "{stdout}");
     let yaml = fs::read_to_string(workspace.join(".deadreckon/acceptance.yaml")).expect("yaml");
     assert!(yaml.contains("npm run build --if-present"));
     assert!(workspace.join(".deadreckon/acceptance.md").exists());
