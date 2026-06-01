@@ -407,7 +407,7 @@ pub async fn notify_run(
 
 fn notify_failure_detail(channel: &str, detail: String) -> String {
     if channel == "command" {
-        format!("{detail}; try: deadreckon config notify.command \"<cmd>\" and re-run")
+        format!("{detail}; configure notify.command with a working command and re-run")
     } else {
         detail
     }

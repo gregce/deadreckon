@@ -116,7 +116,7 @@ async fn notify_records_attempt_to_jsonl() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_command_notification_records_try_footer() {
+async fn failed_command_notification_records_evidence_not_try_footer() {
     let temp = TempDir::new().expect("tempdir");
     let state = state(&temp);
     let config = NotifyConfig {
@@ -134,9 +134,10 @@ async fn failed_command_notification_records_try_footer() {
     assert!(!attempts[0].ok, "{attempts:?}");
     let detail = attempts[0].detail.as_deref().expect("detail");
     assert!(
-        detail.contains("try: deadreckon config notify.command \"<cmd>\" and re-run"),
+        detail.contains("configure notify.command with a working command and re-run"),
         "{detail}"
     );
+    assert!(!detail.contains("try:"), "{detail}");
 }
 
 struct FakeChannel;
