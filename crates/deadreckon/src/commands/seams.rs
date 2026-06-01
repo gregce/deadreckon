@@ -17,21 +17,23 @@ pub(crate) async fn seams_command(command: SeamsCommand) -> Result<()> {
             let sandbox_backend: SandboxBackend = sandbox.parse()?;
             let report =
                 validate_seam_report(kind, &config, fixture.as_deref(), sandbox_backend).await?;
+            let surface = seam_validation_surface(&report);
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &surface.add_to_json(serde_json::to_value(&report)?)
+                    )?
+                );
             } else {
-                print_validation_report(&report);
+                print_validation_report(&surface);
             }
             if report.exit_success {
                 Ok(())
             } else {
                 Err(CliError::Core(deadreckon_core::user_error(
                     "seam validation failed",
-                    &report
-                        .try_lines
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "deadreckon doctor".to_string()),
+                    &surface.primary_action.command,
                 )))
             }
         }
@@ -231,32 +233,94 @@ fn classify_validation_outcome(
     }
 }
 
-fn print_validation_report(report: &SeamValidationReport) {
-    println!("{}", ui_heading("seam validation"));
-    let status = if report.exit_success {
-        ui_ok("✓")
+fn print_validation_report(surface: &VerdictSurface) {
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
+}
+
+fn seam_validation_surface(report: &SeamValidationReport) -> VerdictSurface {
+    let kind = if report.exit_success {
+        VerdictKind::Verified
     } else {
-        ui_warn("✗")
+        VerdictKind::Failed
     };
-    println!(
-        "{} {} {} command={} fixture={} sandbox={} fail={}",
-        status,
-        report.kind,
-        report.outcome,
-        report.command,
-        report.fixture,
-        report.sandbox,
-        report.fail_policy
-    );
+    let primary = seam_validation_primary_action(report);
+    let secondary = report
+        .try_lines
+        .iter()
+        .filter_map(|line| {
+            let line = line.trim();
+            (line.starts_with("deadreckon ") && line != primary).then_some(("Secondary", line))
+        })
+        .collect::<Vec<_>>();
+    VerdictSurface::try_new(
+        kind,
+        "seam",
+        Some(&report.kind),
+        seam_validation_explanation(report),
+        vec![("Recommended", primary.as_str())],
+        secondary,
+    )
+    .expect("seam validation verdict surface must be valid")
+}
+
+fn seam_validation_primary_action(report: &SeamValidationReport) -> String {
+    if !report.exit_success
+        && let Some(command) = report
+            .try_lines
+            .iter()
+            .map(|line| line.trim())
+            .find(|line| line.starts_with("deadreckon "))
+    {
+        return command.to_string();
+    }
+    if report.exit_success {
+        "deadreckon run \"goal\"".to_string()
+    } else {
+        "deadreckon doctor".to_string()
+    }
+}
+
+fn seam_validation_explanation(report: &SeamValidationReport) -> ExplanationPanel {
+    let what = if report.exit_success {
+        format!(
+            "Seam validation completed for the {} worker with outcome {}.",
+            report.kind, report.outcome
+        )
+    } else {
+        format!(
+            "Seam validation failed for the {} worker with outcome {}.",
+            report.kind, report.outcome
+        )
+    };
+    let why = report.detail.clone().unwrap_or_else(|| {
+        if report.exit_success {
+            format!(
+                "The worker response satisfies the {} fail policy for this seam.",
+                report.fail_policy
+            )
+        } else {
+            format!(
+                "The worker response does not satisfy the {} fail policy for this seam.",
+                report.fail_policy
+            )
+        }
+    });
+    let mut evidence = vec![
+        ("kind", report.kind.clone()),
+        ("outcome", report.outcome.clone()),
+        ("command", report.command.clone()),
+        ("fixture", report.fixture.clone()),
+        ("sandbox", report.sandbox.clone()),
+        ("fail policy", report.fail_policy.clone()),
+        ("source", report.source.clone()),
+    ];
     if let Some(decision) = &report.decision {
-        println!("    decision {decision}");
+        evidence.push(("decision", decision.clone()));
     }
     if let Some(detail) = &report.detail {
-        println!("    detail {detail}");
+        evidence.push(("detail", detail.clone()));
     }
-    for line in &report.try_lines {
-        println!("    {} {line}", ui_command("try:"));
-    }
+    ExplanationPanel::new(what, why, evidence)
 }
 
 fn seam_kind_from_cli(kind: CliSeamKind) -> SeamKind {
@@ -425,6 +489,60 @@ mod tests {
         assert_eq!(report.outcome, "failed");
         assert!(report.detail.expect("detail").contains("config not found"));
         assert!(!report.try_lines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn seam_validation_failed_surface_has_one_primary_action() {
+        let temp = TempDir::new().expect("temp");
+        let report = validate_seam_report(
+            SeamKind::Policy,
+            &temp.path().join("missing.toml"),
+            None,
+            SandboxBackend::None,
+        )
+        .await
+        .expect("report");
+
+        let rendered = seam_validation_surface(&report).render_plain(false);
+
+        assert!(rendered.starts_with("failed seam policy"), "{rendered}");
+        assert!(rendered.contains("Explanation\n"), "{rendered}");
+        assert!(rendered.contains("Evidence\n"), "{rendered}");
+        assert!(rendered.contains("config not found"), "{rendered}");
+        assert_eq!(rendered.matches("\nRecommended\n").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains(
+                "Recommended\ndeadreckon seams validate policy --config examples/seams/config.toml --sandbox none"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("try:"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn seam_validation_json_adds_verdict_and_primary_action() {
+        let temp = TempDir::new().expect("temp");
+        let report = validate_seam_report(
+            SeamKind::Policy,
+            &temp.path().join("missing.toml"),
+            None,
+            SandboxBackend::None,
+        )
+        .await
+        .expect("report");
+        let surface = seam_validation_surface(&report);
+        let value = surface.add_to_json(serde_json::to_value(&report).expect("json"));
+
+        assert_eq!(value["try"].as_array().expect("try").len(), 2);
+        assert_eq!(
+            value["primary_action"],
+            "deadreckon seams validate policy --config examples/seams/config.toml --sandbox none"
+        );
+        assert_eq!(value["verdict"]["kind"], "failed");
+        assert_eq!(
+            value["verdict"]["recommended_command"],
+            value["primary_action"]
+        );
     }
 
     #[tokio::test]
