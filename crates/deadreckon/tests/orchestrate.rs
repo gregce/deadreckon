@@ -4982,11 +4982,13 @@ fn review_mode_stops_before_reviewer_when_coder_fails_gate() {
     let out = stdout(&output);
     assert!(
         out.contains(&format!(
-            "try: deadreckon show {} --why-failed",
+            "Recommended\ndeadreckon show {} --why-failed",
             &coder_run_id[..8]
         )),
         "{out}"
     );
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(!out.contains("try:"), "{out}");
 }
 
 #[test]
@@ -5100,12 +5102,16 @@ fn show_why_failed_plan_names_blocking_child() {
         .expect("show why failed");
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("failure summary"), "{out}");
+    assert!(out.starts_with("failed plan "), "{out}");
+    assert!(out.contains("Explanation\n"), "{out}");
+    assert!(out.contains("Evidence\n"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
     assert!(out.contains("child 0 task-0 status failed"), "{out}");
     assert!(
-        out.contains("deadreckon show abc12345 --why-failed"),
+        out.contains("Recommended\ndeadreckon show abc12345 --why-failed"),
         "{out}"
     );
+    assert!(!out.contains("try:"), "{out}");
 }
 
 #[test]
@@ -5128,7 +5134,16 @@ fn show_why_failed_completed_says_no_failures() {
         .output()
         .expect("show why failed");
     assert_success(&output);
-    assert_eq!(stdout(&output).trim(), "no failures detected");
+    let out = stdout(&output);
+    assert!(out.starts_with("no-op run ccccdddd"), "{out}");
+    assert!(out.contains("Explanation\n"), "{out}");
+    assert!(out.contains("Evidence\n"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains("Recommended\ndeadreckon show ccccdddd"),
+        "{out}"
+    );
+    assert!(!out.contains("try:"), "{out}");
 }
 
 #[test]
@@ -5169,11 +5184,19 @@ fn show_why_failed_failed_emits_rca() {
         .expect("show why failed");
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("run ddddcccc failure summary"), "{out}");
+    assert!(out.starts_with("failed run ddddcccc"), "{out}");
+    assert!(out.contains("Explanation\n"), "{out}");
+    assert!(out.contains("Evidence\n"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains("Recommended\ndeadreckon show ddddcccc --why-failed"),
+        "{out}"
+    );
     assert!(out.contains("status: failed"), "{out}");
     assert!(out.contains("reason: acceptance failed"), "{out}");
     assert!(out.contains("turn 3 tool.failed"), "{out}");
     assert!(out.contains("boom from failing test"), "{out}");
+    assert!(!out.contains("try:"), "{out}");
 }
 
 #[test]

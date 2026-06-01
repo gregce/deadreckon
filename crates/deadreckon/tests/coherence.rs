@@ -1454,12 +1454,22 @@ fn why_failed_run_and_chain_share_failure_layout() {
     assert!(chain_output.status.success(), "{}", stderr(&chain_output));
     let chain_stdout = stdout(&chain_output);
 
-    for label in ["failure summary", "status:", "reason:", "evidence:"] {
+    for label in ["failed run", "Explanation", "Evidence", "Recommended"] {
         assert!(
             run_stdout.contains(label),
             "missing {label} in {run_stdout}"
         );
     }
+    assert_eq!(
+        run_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{run_stdout}"
+    );
+    assert!(
+        run_stdout.contains("Recommended\ndeadreckon show aaaabbbb --why-failed"),
+        "{run_stdout}"
+    );
+    assert!(!run_stdout.contains("try:"), "{run_stdout}");
     for label in ["failed chain", "Explanation", "Evidence", "Recommended"] {
         assert!(
             chain_stdout.contains(label),

@@ -8722,21 +8722,78 @@ struct WhyFailedReport {
 }
 
 fn render_why_failed(report: WhyFailedReport) {
-    println!("{} {} failure summary", report.kind, report.id);
-    let mut items = vec![("status", report.status)];
-    if let Some(reason) = report.reason {
-        items.push(("reason", reason));
+    print!("{}", why_failed_surface(&report).render_plain(false));
+}
+
+fn why_failed_surface(report: &WhyFailedReport) -> VerdictSurface {
+    let primary = report
+        .try_lines
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("deadreckon show {} --why-failed", report.id));
+    let secondary = report
+        .try_lines
+        .iter()
+        .skip(1)
+        .filter(|line| line.as_str() != primary)
+        .map(|line| ("Secondary", line.as_str()))
+        .collect::<Vec<_>>();
+    let reason = report
+        .reason
+        .as_deref()
+        .unwrap_or("no explicit failure reason was recorded");
+    VerdictSurface::try_new(
+        VerdictKind::Failed,
+        report.kind,
+        Some(&report.id),
+        ExplanationPanel::new(
+            format!(
+                "DeadReckon inspected {} {} and found failure evidence.",
+                report.kind, report.id
+            ),
+            format!("The stored status is {} and {reason}.", report.status),
+            why_failed_evidence(report),
+        ),
+        vec![("Recommended", primary.as_str())],
+        secondary,
+    )
+    .expect("why-failed verdict surface must have one primary action")
+}
+
+fn why_failed_evidence(report: &WhyFailedReport) -> Vec<(String, String)> {
+    let mut evidence = vec![("status".to_string(), report.status.clone())];
+    if let Some(reason) = report.reason.as_deref() {
+        evidence.push(("reason".to_string(), reason.to_string()));
     }
-    print_kv_block(&items);
-    if !report.evidence.is_empty() {
-        println!("evidence:");
-        for line in report.evidence {
-            println!("  - {line}");
-        }
-    }
-    for line in report.try_lines {
-        println!("try: {line}");
-    }
+    evidence.extend(
+        report
+            .evidence
+            .iter()
+            .enumerate()
+            .map(|(index, line)| (format!("evidence {}", index + 1), line.clone())),
+    );
+    evidence
+}
+
+fn render_no_failures(kind: &'static str, id: &str, status: impl Into<String>) {
+    let primary = format!("deadreckon show {id}");
+    print!(
+        "{}",
+        VerdictSurface::try_new(
+            VerdictKind::Noop,
+            kind,
+            Some(id),
+            ExplanationPanel::new(
+                format!("DeadReckon inspected {kind} {id} and found no failure evidence."),
+                "The stored state is already successful, so --why-failed has no failure root cause to report.",
+                vec![("status", status.into())],
+            ),
+            vec![("Recommended", primary.as_str())],
+            Vec::<(&str, &str)>::new(),
+        )
+        .expect("no-failure verdict surface must have one primary action")
+        .render_plain(false)
+    );
 }
 
 fn show_plan_why_failed(paths: &DeadreckonPaths, plan: &Plan) {
@@ -8746,7 +8803,11 @@ fn show_plan_why_failed(paths: &DeadreckonPaths, plan: &Plan) {
             .iter()
             .all(|task| task.status == PlanTaskStatus::Completed)
     {
-        println!("no failures detected");
+        render_no_failures(
+            "plan",
+            &run_prefix(&plan.plan_id),
+            plan_status_label(plan.status),
+        );
         return;
     }
     let mut evidence = Vec::new();
@@ -8820,7 +8881,11 @@ fn show_plan_why_failed(paths: &DeadreckonPaths, plan: &Plan) {
 
 fn show_run_why_failed(state: &deadreckon_core::PipelineState) -> Result<()> {
     if state.status == RunStatus::Completed {
-        println!("no failures detected");
+        render_no_failures(
+            "run",
+            &run_prefix(&state.run_id),
+            run_status_label(state.status),
+        );
         return Ok(());
     }
     let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
