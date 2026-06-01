@@ -641,6 +641,19 @@ fn library_list_search_show_reads_promoted_manifests() {
     assert!(show_stdout.contains(&parent.run_id));
     assert!(show_stdout.contains("provenance:"));
     assert!(show_stdout.contains("gallery provenance search target"));
+    assert_eq!(
+        show_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{show_stdout}"
+    );
+    assert!(
+        show_stdout.contains(&format!(
+            "Recommended\ndeadreckon export {}",
+            &parent.run_id[..8]
+        )),
+        "{show_stdout}"
+    );
+    assert!(!show_stdout.contains("next:"), "{show_stdout}");
 }
 
 #[test]

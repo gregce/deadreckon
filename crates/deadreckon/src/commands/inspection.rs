@@ -1013,8 +1013,9 @@ fn print_library_entry(entry: &LibraryEntry) {
     println!("provenance: {}", manifest.provenance_hash);
     println!("goal:       {}", manifest.goal);
     println!();
+    println!("Recommended");
     println!(
-        "next:       {}",
+        "{}",
         ui_command(format!(
             "deadreckon export {}",
             run_prefix(&manifest.run_id)
