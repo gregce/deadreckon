@@ -267,8 +267,14 @@ fn detect_marks_anthropic_missing_credential_when_env_unset() {
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("ANTHROPIC_API_KEY missing"));
-    assert!(stdout.contains("try:"));
-    assert!(stdout.contains("export ANTHROPIC_API_KEY"));
+    assert!(stdout.contains("blocked detect anthropic"), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\nexport ANTHROPIC_API_KEY"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("try:"), "{stdout}");
 }
 
 #[test]
@@ -298,8 +304,13 @@ min_known_good = "99.0.0"
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("version below known-good 99.0.0"));
-    assert!(stdout.contains("try:"));
-    assert!(stdout.contains("npm i -g @openai/codex"));
+    assert!(stdout.contains("blocked detect cli:codex"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\nnpm i -g @openai/codex"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("try:"), "{stdout}");
 }
 
 #[test]
@@ -326,6 +337,13 @@ fn detect_json_output_matches_schema() {
     assert_eq!(codex["kind"], "cli");
     assert_eq!(codex["status"], "failed");
     assert!(codex["try_lines"].is_array());
+    assert!(json["verdict"].is_object());
+    assert!(json["primary_action"].is_string());
+    assert_eq!(
+        json["primary_action"],
+        json["verdict"]["recommended_command"]
+    );
+    assert_eq!(json["next_actions"][0], json["primary_action"]);
 }
 
 #[test]

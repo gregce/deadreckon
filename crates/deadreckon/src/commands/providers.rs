@@ -21,24 +21,27 @@ pub(crate) async fn detect_command(
     } else {
         registry.probe_all(options).await
     };
+    let surface = detect_verdict_surface(&results, requested_id.as_deref());
     if json_output {
+        let primary_action = surface.primary_action.command.clone();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string_pretty(&surface.add_to_json(json!({
                 "kind": "provider_detect",
                 "id": requested_id.as_deref().unwrap_or("all"),
                 "status": "ok",
-                "next_actions": ["deadreckon providers list"],
+                "next_actions": [primary_action],
                 "try_lines": Vec::<String>::new(),
                 "paths": {
                     "home": paths.home(),
                     "config": paths.config_path(),
                 },
                 "providers": results,
-            }))?
+            })))?
         );
     } else {
         print_detect_results(&results);
+        println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     }
     Ok(())
 }
@@ -688,10 +691,108 @@ fn print_detect_results(results: &[ProviderProbeResult]) {
         if !message.is_empty() {
             println!("    {}", ui_muted(message));
         }
-        if result.status == ProbeStatus::Failed {
-            for line in &result.try_lines {
-                println!("    {} {}", ui_command("try:"), ui_command(line));
+    }
+}
+
+fn detect_verdict_surface(
+    results: &[ProviderProbeResult],
+    requested_id: Option<&str>,
+) -> VerdictSurface {
+    let failed = results
+        .iter()
+        .filter(|result| result.status == ProbeStatus::Failed)
+        .collect::<Vec<_>>();
+    let skipped = results
+        .iter()
+        .filter(|result| result.status == ProbeStatus::Skipped)
+        .count();
+    let ok = results
+        .iter()
+        .filter(|result| result.status == ProbeStatus::Ok)
+        .count();
+    let subject = requested_id.unwrap_or("all");
+    let kind = if failed.is_empty() {
+        VerdictKind::Verified
+    } else {
+        VerdictKind::Blocked
+    };
+    let primary = failed
+        .first()
+        .and_then(|result| result.try_lines.first())
+        .cloned()
+        .or_else(|| {
+            requested_id.map(|id| {
+                if failed.is_empty() {
+                    format!("deadreckon config provider {id}")
+                } else {
+                    "deadreckon providers list".to_string()
+                }
+            })
+        })
+        .unwrap_or_else(|| {
+            if failed.is_empty() {
+                "deadreckon providers list".to_string()
+            } else {
+                "deadreckon providers list --all".to_string()
             }
+        });
+    let what = if failed.is_empty() {
+        match requested_id {
+            Some(id) => format!("DeadReckon verified provider probe {id}."),
+            None => "DeadReckon completed provider detection without failed probes.".to_string(),
+        }
+    } else if failed.len() == 1 {
+        format!("DeadReckon found provider {} is not ready.", failed[0].id)
+    } else {
+        format!(
+            "DeadReckon found {} provider probes are not ready.",
+            failed.len()
+        )
+    };
+    let why = if let Some(first) = failed.first() {
+        first.message.clone().unwrap_or_else(|| {
+            "A provider probe failed, so setup must be repaired before it can run work.".to_string()
+        })
+    } else {
+        "All failed-provider checks passed; the selected provider catalog is ready for the next setup or run command.".to_string()
+    };
+    let mut evidence = vec![
+        ("providers".to_string(), results.len().to_string()),
+        ("ok".to_string(), ok.to_string()),
+        ("failed".to_string(), failed.len().to_string()),
+        ("skipped".to_string(), skipped.to_string()),
+    ];
+    if let Some(first) = failed.first() {
+        evidence.push(("first failed".to_string(), first.id.clone()));
+        evidence.push(("credential".to_string(), first.credential.clone()));
+        if let Some(kind) = &first.error_kind {
+            evidence.push(("error kind".to_string(), format!("{kind:?}")));
         }
     }
+    let mut secondary = vec![
+        (
+            "Secondary".to_string(),
+            "deadreckon providers list".to_string(),
+        ),
+        ("Secondary".to_string(), "deadreckon doctor".to_string()),
+    ];
+    for line in failed
+        .iter()
+        .flat_map(|result| result.try_lines.iter())
+        .filter(|line| line.as_str() != primary)
+    {
+        secondary.push(("Secondary".to_string(), line.clone()));
+    }
+    VerdictSurface::try_new(
+        kind,
+        "detect",
+        Some(subject),
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        secondary
+            .iter()
+            .map(|(label, command)| (label.as_str(), command.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("detect verdict surface must be valid")
 }
