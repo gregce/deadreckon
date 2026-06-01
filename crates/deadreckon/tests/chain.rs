@@ -1278,8 +1278,18 @@ fn chain_redo_applied_step_requires_reapply_flag() {
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
     assert!(stderr.contains("redo needs --reapply"));
-    assert!(stderr.contains("try:"));
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain redo")
+            && stderr.contains("--step 1 --reapply"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]

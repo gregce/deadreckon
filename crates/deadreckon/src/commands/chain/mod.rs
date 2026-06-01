@@ -2363,22 +2363,40 @@ fn chain_redo_command(
                 &format!("deadreckon chain show {}", chain_prefix(&chain.chain_id)),
             ))
         })? as usize;
-    let step = chain.steps.get_mut(index).ok_or_else(|| {
+    let selected_step = chain.steps.get(index).ok_or_else(|| {
         CliError::Core(deadreckon_core::user_error(
             &format!("step {} does not exist", index + 1),
             &format!("deadreckon chain show {}", chain_prefix(&chain.chain_id)),
         ))
     })?;
-    if step.status == ChainStepStatus::Applied && !reapply {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            &format!("step '{}' already applied; redo needs --reapply", index + 1),
-            &format!(
-                "deadreckon chain redo {} --step {} --reapply",
-                chain_prefix(&chain.chain_id),
-                index + 1
-            ),
-        )));
+    if selected_step.status == ChainStepStatus::Applied && !reapply {
+        let step_number = index + 1;
+        let primary = format!(
+            "deadreckon chain redo {} --step {step_number} --reapply",
+            chain_prefix(&chain.chain_id)
+        );
+        return Err(CliError::Surface {
+            code: 1,
+            surface: chain_transition_surface(
+                paths,
+                &chain,
+                VerdictKind::Blocked,
+                &format!("DeadReckon did not redo the step because step '{step_number}' already applied; redo needs --reapply."),
+                "Redoing an applied step requires explicit reapply consent because DeadReckon may need to revert a previously applied commit before replaying the step.",
+                vec![
+                    ("requested step".to_string(), step_number.to_string()),
+                    (
+                        "step status".to_string(),
+                        chain_step_status_label(selected_step.status).to_string(),
+                    ),
+                ],
+                primary,
+                Vec::new(),
+            )
+            .render_plain(false),
+        });
     }
+    let step = chain.steps.get_mut(index).expect("validated step index");
     if reapply && let Some(sha) = step.applied_sha.as_deref() {
         git_status(&chain.cwd, &["revert", "--no-edit", sha])?;
     }
