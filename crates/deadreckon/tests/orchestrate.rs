@@ -4290,6 +4290,41 @@ fn merge_no_repair_prints_conflict_without_planner() {
 }
 
 #[test]
+fn merge_missing_repair_provider_recommends_provider_list_once() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut plan = plan_with_readme_conflict(&paths, &repo);
+    plan.providers.planner = None;
+    plan.providers.default_child = None;
+    save_plan(&paths, &plan).expect("save plan without repair provider");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.starts_with("failed plan "), "{err}");
+    assert!(
+        err.contains("merge repair needs a configured provider"),
+        "{err}"
+    );
+    assert!(err.contains("conflicts remain"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains("Recommended\ndeadreckon providers list --all"),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
 fn merge_auto_repair_resolves_provider_from_plan_then_config() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
