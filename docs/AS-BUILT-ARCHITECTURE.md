@@ -2765,7 +2765,20 @@ policy fails closed, catalog fails open, and hooks/event-sink fail safe. The
 policy seam can only narrow after `sandbox.toml`; it cannot widen filesystem or
 network permissions.
 
-### 39.9 Limits
+### 39.9 Conformance kit
+
+`docs/SEAMS.md` and `examples/seams/` make the seam protocol executable. The
+examples include fixture JSON plus POSIX shell workers for policy allow/deny,
+minimal catalog override, hooks JSONL, and event-sink JSONL. `deadreckon seams
+validate <kind> --config <path> [--fixture <path>] [--json]` reads the same
+`[seams]` config as runtime, dispatches through the same sandboxed primitive,
+and reports the fixed fail policy in plain or JSON output.
+
+Validation is diagnostic, not a new durable contract: it does not add registry,
+version-negotiation, or schema state, and it still cannot make the gate
+swappable.
+
+### 39.10 Limits
 
 This release does not add human approval, a persistent bus, a worker registry,
 capability negotiation, or LLM-backed semantic compaction. Built-in telemetry is

@@ -1,0 +1,5 @@
+{
+  "function_id": "bash",
+  "command": "printf 'hello from a policy seam\\n'",
+  "working_dir": "/tmp/deadreckon-seam-example"
+}

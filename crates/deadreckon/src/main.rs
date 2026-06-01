@@ -122,10 +122,10 @@ mod ui;
 
 use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, CampaignCommand, ChainCommandArgs, Cli,
-    CliDocKind, CliPlanMode, Commands, CompletionCommand, ConfigCommand, ExtendCommandArgs,
-    ForkCommandArgs, HistoryCommand, HistoryKind, ImproveCommand, LearnCommand, LibraryCommand,
-    MergeCommandArgs, OrchestrateCommand, PlanCommandArgs, ProvidersCommand, RunCommandArgs,
-    StartCommandArgs,
+    CliDocKind, CliPlanMode, CliSeamKind, Commands, CompletionCommand, ConfigCommand,
+    ExtendCommandArgs, ForkCommandArgs, HistoryCommand, HistoryKind, ImproveCommand, LearnCommand,
+    LibraryCommand, MergeCommandArgs, OrchestrateCommand, PlanCommandArgs, ProvidersCommand,
+    RunCommandArgs, SeamsCommand, StartCommandArgs,
 };
 use crate::narrative::{AttachViewMode, NarrativeVisualMode};
 use crate::plan_event_bus::{PlanEventBus, PlanFeedEvent};
@@ -762,6 +762,7 @@ async fn main_inner() -> Result<()> {
             .await
         }
         Commands::Doctor { json } => commands::doctor::doctor_command(json).await,
+        Commands::Seams { command } => commands::seams::seams_command(command).await,
         Commands::Detect { id, json, ping } => {
             commands::providers::detect_command(id, json, ping).await
         }
@@ -1190,6 +1191,14 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         display: "providers",
         clap_name: Some("providers"),
         purpose: "list provider routes and models",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::SetupProviders),
+    },
+    CommandHelpEntry {
+        display: "seams",
+        clap_name: Some("seams"),
+        purpose: "validate configured seam workers",
         audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::SetupProviders),

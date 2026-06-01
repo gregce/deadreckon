@@ -16,4 +16,5 @@ pub(crate) mod orchestrate;
 pub(crate) mod plan;
 pub(crate) mod providers;
 pub(crate) mod run;
+pub(crate) mod seams;
 pub(crate) mod start;

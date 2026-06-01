@@ -32,6 +32,7 @@
 - Human-in-the-loop approval seam with pause/resume semantics and explicit operator UX.
 - LLM-backed compaction summaries after cost, determinism, and evaluation policy are defined.
 - Bus/WebSocket transport plus a long-lived worker registry for high-frequency seam workers.
+- Packaged seam SDKs, published worker templates, and a registry-backed discovery flow beyond the local conformance examples.
 - Seam versioning and capability negotiation.
 - Routing built-in telemetry through the hook seam once durable-audit guarantees are preserved.
 - Richer catalog capabilities beyond context-window and pricing metadata.

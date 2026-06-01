@@ -409,7 +409,7 @@ fn command_basename(command: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use deadreckon_sandbox::resolve_backend;
     use serde_json::json;
@@ -443,6 +443,189 @@ mod tests {
             SeamKind::Policy => r#"{"decision":"allow"}"#,
             SeamKind::Catalog | SeamKind::Hooks | SeamKind::EventSink => r#"{"ok":true}"#,
         }
+    }
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root")
+    }
+
+    fn example_path(relative: &str) -> PathBuf {
+        repo_root().join(relative)
+    }
+
+    fn example_worker_command(relative: &str) -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            example_path(relative).to_string_lossy().into_owned(),
+        ]
+    }
+
+    #[test]
+    fn seam_example_fixtures_are_valid_json() {
+        for relative in [
+            "examples/seams/fixtures/policy-allow.json",
+            "examples/seams/fixtures/policy-deny.json",
+            "examples/seams/fixtures/catalog-request.json",
+            "examples/seams/fixtures/hook-event.json",
+            "examples/seams/fixtures/event-sink-event.json",
+        ] {
+            let raw = std::fs::read_to_string(example_path(relative)).expect("fixture");
+            let parsed: Value = serde_json::from_str(&raw).expect("valid fixture JSON");
+            assert!(parsed.is_object(), "{relative} should be a JSON object");
+        }
+    }
+
+    #[test]
+    fn example_config_uses_known_seam_kinds() {
+        let raw = std::fs::read_to_string(example_path("examples/seams/config.toml"))
+            .expect("example config");
+        let parsed: toml::Value = toml::from_str(&raw).expect("toml");
+        let seams = parsed
+            .get("seams")
+            .and_then(toml::Value::as_table)
+            .expect("seams table");
+        for key in seams.keys() {
+            assert!(
+                SeamKind::from_config_key(key).is_some(),
+                "unknown example seam key {key}"
+            );
+        }
+        parse_seams_config(&raw).expect("runtime parses example config");
+    }
+
+    #[test]
+    fn example_config_paths_exist() {
+        let seams = read_seams_config(&example_path("examples/seams/config.toml"), false)
+            .expect("example seams");
+        for kind in SeamKind::all() {
+            let command = seams.command_for(kind).expect("example command");
+            let worker = command
+                .command
+                .get(1)
+                .map(|path| repo_root().join(path))
+                .expect("script path");
+            assert!(worker.exists(), "{} worker exists", kind.config_key());
+        }
+    }
+
+    #[tokio::test]
+    async fn example_policy_workers_round_trip_through_dispatch() {
+        let temp = TempDir::new().expect("temp");
+        let allow = SeamsConfig::with_command(
+            SeamKind::Policy,
+            SeamCommandConfig {
+                command: example_worker_command("examples/seams/workers/policy-allow.sh"),
+                timeout_ms: 1_000,
+            },
+        )
+        .expect("allow seam");
+        let deny = SeamsConfig::with_command(
+            SeamKind::Policy,
+            SeamCommandConfig {
+                command: example_worker_command("examples/seams/workers/policy-deny.sh"),
+                timeout_ms: 1_000,
+            },
+        )
+        .expect("deny seam");
+
+        assert_eq!(
+            dispatch_seam(
+                SeamKind::Policy,
+                &json!({"function_id":"bash"}),
+                &allow,
+                &ctx(&temp)
+            )
+            .await,
+            SeamOutcome::Ok(json!({"decision":"allow"}))
+        );
+        assert_eq!(
+            dispatch_seam(
+                SeamKind::Policy,
+                &json!({"function_id":"bash"}),
+                &deny,
+                &ctx(&temp)
+            )
+            .await,
+            SeamOutcome::Deny("example policy denial".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn example_catalog_worker_returns_valid_override() {
+        let temp = TempDir::new().expect("temp");
+        let seams = SeamsConfig::with_command(
+            SeamKind::Catalog,
+            SeamCommandConfig {
+                command: example_worker_command("examples/seams/workers/catalog-minimal.sh"),
+                timeout_ms: 1_000,
+            },
+        )
+        .expect("catalog seam");
+
+        let outcome = dispatch_seam(SeamKind::Catalog, &json!({}), &seams, &ctx(&temp)).await;
+        let SeamOutcome::Ok(value) = outcome else {
+            panic!("catalog example did not return ok: {outcome:?}");
+        };
+        let catalog = ModelCatalogOverride::from_value(value).expect("catalog override");
+        assert!(catalog.entry_for_model("seam-example").is_some());
+    }
+
+    #[tokio::test]
+    async fn example_observer_workers_accept_events_without_control_flow() {
+        let temp = TempDir::new().expect("temp");
+        let run_ctx = ctx(&temp);
+        let hooks = SeamsConfig::with_command(
+            SeamKind::Hooks,
+            SeamCommandConfig {
+                command: example_worker_command("examples/seams/workers/hooks-jsonl.sh"),
+                timeout_ms: 1_000,
+            },
+        )
+        .expect("hooks seam");
+        let sink = SeamsConfig::with_command(
+            SeamKind::EventSink,
+            SeamCommandConfig {
+                command: example_worker_command("examples/seams/workers/event-sink-jsonl.sh"),
+                timeout_ms: 1_000,
+            },
+        )
+        .expect("event sink seam");
+
+        assert_eq!(
+            dispatch_seam(
+                SeamKind::Hooks,
+                &json!({"kind":"tool_call_started"}),
+                &hooks,
+                &run_ctx
+            )
+            .await,
+            SeamOutcome::Ok(json!({"ok": true}))
+        );
+        assert_eq!(
+            dispatch_seam(
+                SeamKind::EventSink,
+                &json!({"event":{"kind":"turn_started"}}),
+                &sink,
+                &run_ctx
+            )
+            .await,
+            SeamOutcome::Ok(json!({"ok": true}))
+        );
+        assert!(
+            run_ctx
+                .working_dir
+                .join(".deadreckon-seams/hooks.jsonl")
+                .exists()
+        );
+        assert!(
+            run_ctx
+                .working_dir
+                .join(".deadreckon-seams/event-sink.jsonl")
+                .exists()
+        );
     }
 
     #[test]

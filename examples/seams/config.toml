@@ -1,0 +1,19 @@
+# Example seam config for `deadreckon seams validate`.
+# Run from the repository root. For live use, prefer absolute worker paths or
+# commands on PATH because run workspaces have a different working directory.
+
+[seams.policy]
+command = ["sh", "examples/seams/workers/policy-allow.sh"]
+timeout_ms = 1000
+
+[seams.catalog]
+command = ["sh", "examples/seams/workers/catalog-minimal.sh"]
+timeout_ms = 1000
+
+[seams.hooks]
+command = ["sh", "examples/seams/workers/hooks-jsonl.sh"]
+timeout_ms = 1000
+
+[seams.event_sink]
+command = ["sh", "examples/seams/workers/event-sink-jsonl.sh"]
+timeout_ms = 1000

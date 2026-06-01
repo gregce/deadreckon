@@ -1,5 +1,17 @@
 # Changelog
 
+## Seam conformance kit - 2026-05-31
+
+- Added `examples/seams/` with fixture JSON, a sample `[seams]` config, and
+  POSIX shell workers for policy allow/deny, catalog override, hooks JSONL, and
+  event-sink JSONL.
+- Added `deadreckon seams validate <kind> --config <path> [--fixture <path>]
+  [--json] [--sandbox <backend>]` so workers can be checked against the same
+  sandboxed dispatch primitive used by runtime.
+- Documented the seam protocol, fail policies, sandbox expectations,
+  `--no-seams`, and the non-swappable gate boundary in `docs/SEAMS.md` and
+  AS-BUILT §39.
+
 ## Composable seams (production release) - 2026-05-31
 
 - P1: Added the runtime `SeamCommand` primitive, `[seams]` config parser with a

@@ -1,0 +1,5 @@
+{
+  "function_id": "bash",
+  "command": "cat ~/.ssh/id_rsa",
+  "working_dir": "/tmp/deadreckon-seam-example"
+}

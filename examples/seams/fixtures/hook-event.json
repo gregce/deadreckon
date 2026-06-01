@@ -1,0 +1,8 @@
+{
+  "kind": "tool_call_started",
+  "run_id": "example-run",
+  "tool_name": "bash",
+  "request": {
+    "command": "printf ok"
+  }
+}

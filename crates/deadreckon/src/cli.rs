@@ -293,6 +293,15 @@ Lifecycle:
 
 Doctor checks providers, CLI binaries, sandboxes, disk space, write permissions, and OS details.";
 
+const SEAMS_HELP: &str = "\
+Lifecycle:
+  deadreckon seams validate policy --config examples/seams/config.toml
+  deadreckon seams validate catalog --config examples/seams/config.toml --json
+  deadreckon run \"goal\" --no-seams
+
+Seams validate external policy, model-catalog, hooks, and event-sink workers
+against fixture JSON before a run. The acceptance gate is not a seam.";
+
 const LIST_HELP: &str = "\
 Lifecycle:
   deadreckon list
@@ -1128,6 +1137,15 @@ pub(crate) enum Commands {
     Doctor {
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
+    },
+    #[command(
+        next_help_heading = "Setup",
+        about = "Validate configured seam workers against fixture JSON",
+        after_help = SEAMS_HELP
+    )]
+    Seams {
+        #[command(subcommand)]
+        command: SeamsCommand,
     },
     #[command(
         next_help_heading = "Setup",
@@ -2111,6 +2129,40 @@ pub(crate) enum ConfigCommand {
         )]
         provider: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SeamsCommand {
+    #[command(
+        about = "Run one configured seam worker against a fixture",
+        after_help = SEAMS_HELP
+    )]
+    Validate {
+        #[arg(value_enum, help = "Seam kind to validate")]
+        kind: CliSeamKind,
+        #[arg(long, value_name = "PATH", help = "TOML config containing [seams]")]
+        config: PathBuf,
+        #[arg(long, value_name = "PATH", help = "Fixture JSON to send on stdin")]
+        fixture: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value = "auto",
+            value_parser = ["auto", "sandbox-exec", "bwrap", "docker", "none"],
+            help = "Sandbox backend for the validation subprocess"
+        )]
+        sandbox: String,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum CliSeamKind {
+    Policy,
+    Catalog,
+    Hooks,
+    #[value(name = "event-sink", alias = "event_sink")]
+    EventSink,
 }
 
 #[derive(Subcommand)]
