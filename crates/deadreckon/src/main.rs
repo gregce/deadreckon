@@ -2429,23 +2429,86 @@ fn print_provider_setup_rows(selections: &[setup::ProviderSetupSelection]) {
     if selections.is_empty() {
         return;
     }
-    println!("{}", ui_heading("provider setup"));
-    let rows = selections
-        .iter()
-        .map(|selection| (selection.role.label(), selection.row_value()))
-        .collect::<Vec<_>>();
-    let refs = rows
-        .iter()
-        .map(|(label, value)| (label.as_str(), value.as_str()))
-        .collect::<Vec<_>>();
-    print_kv_block(&refs);
+    for line in provider_setup_row_lines(selections) {
+        println!("{line}");
+    }
+}
+
+fn provider_setup_row_lines(selections: &[setup::ProviderSetupSelection]) -> Vec<String> {
+    if selections.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![ui_heading("provider setup")];
+    for selection in selections {
+        lines.push(format!(
+            "{} {}",
+            ui_command(format!("{}:", selection.role.label())),
+            selection.row_value()
+        ));
+    }
+    let mut recommended_printed = false;
     for selection in selections {
         for warning in &selection.warnings {
-            println!("  {}", ui_warn(warning));
+            lines.push(format!("  {}", ui_warn(warning)));
         }
         for try_line in &selection.try_lines {
-            println!("  {} {}", ui_command("try:"), ui_command(try_line));
+            let label = if recommended_printed {
+                "secondary:"
+            } else {
+                recommended_printed = true;
+                "recommended:"
+            };
+            lines.push(format!("  {} {}", ui_command(label), ui_command(try_line)));
         }
+    }
+    lines
+}
+
+#[cfg(test)]
+mod provider_setup_row_tests {
+    use super::*;
+
+    fn selection_with_try_lines(try_lines: Vec<&str>) -> setup::ProviderSetupSelection {
+        setup::ProviderSetupSelection {
+            role: setup::SetupProviderRole::ConfigDefault,
+            provider: Some("cli:codex".to_string()),
+            model: Some("provider default".to_string()),
+            source: setup::SetupProviderSource::Flag,
+            kind: Some("subscription-cli".to_string()),
+            credential: Some("missing".to_string()),
+            install_hint: None,
+            warnings: vec![
+                "provider cli:codex needs credentials or an installed binary".to_string(),
+            ],
+            try_lines: try_lines.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn provider_setup_rows_use_one_recommended_command() {
+        let rendered = provider_setup_row_lines(&[selection_with_try_lines(vec![
+            "npm i -g @openai/codex",
+            "deadreckon providers list --all",
+        ])])
+        .join("\n");
+
+        assert!(rendered.contains("provider setup"), "{rendered}");
+        assert!(rendered.contains("default:"), "{rendered}");
+        assert_eq!(rendered.matches("recommended:").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("recommended: npm i -g @openai/codex"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("secondary: deadreckon providers list --all"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("try:"), "{rendered}");
+    }
+
+    #[test]
+    fn provider_setup_rows_without_selections_stay_empty() {
+        assert!(provider_setup_row_lines(&[]).is_empty());
     }
 }
 
