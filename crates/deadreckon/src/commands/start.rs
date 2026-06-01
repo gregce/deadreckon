@@ -1667,9 +1667,9 @@ pub(crate) fn start_launch_preview_facts(decision: &StartLaunchDecision) -> Laun
         history: decision.history_action_label.clone(),
         done: &decision.done_criteria_label,
         workspace: &decision.source_mode_label,
-        watch: "deadreckon attach <after-start>".to_string(),
-        stop: "deadreckon kill <after-start>".to_string(),
-        finish: "deadreckon finish <after-start>".to_string(),
+        watch: "deadreckon attach <id>".to_string(),
+        stop: "deadreckon kill <id>".to_string(),
+        finish: "deadreckon finish <id>".to_string(),
         override_command,
     }
 }
@@ -2218,9 +2218,7 @@ fn prompt_start_launch_confirmation(
     if args.preview || args.yes || args.quiet {
         return Ok(());
     }
-    println!("{}", ui_heading("deadreckon start preview"));
-    let rows = start_launch_preview_rows(decision, args, paths)?;
-    print_launch_preview_rows(&rows);
+    print_start_preview_surface(decision, args, paths)?;
     decision.requires_confirmation = true;
     if prompter.confirm("start this launch?", true)? {
         decision.confirmed_by_start_picker = true;
@@ -2245,6 +2243,106 @@ fn start_launch_preview_rows(
     let seams = read_seams_config(&paths.config_path(), args.no_seams)?;
     rows.push(("seams".to_string(), seam_preview_label(&seams)));
     Ok(rows)
+}
+
+fn start_preview_primary_action(decision: &StartLaunchDecision) -> String {
+    if decision.recovery.is_some() {
+        return decision
+            .try_lines
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "deadreckon doctor".to_string());
+    }
+    match decision.selected_mode {
+        StartSelectedMode::Extend => decision
+            .base_run_id
+            .as_ref()
+            .map(|run_id| {
+                format!(
+                    "deadreckon extend {} \"{}\"",
+                    run_prefix(run_id),
+                    shell_display_quote(&decision.goal)
+                )
+            })
+            .unwrap_or_else(|| "deadreckon list".to_string()),
+        StartSelectedMode::Campaign => format!(
+            "deadreckon campaign \"{}\" --n {} --yes",
+            shell_display_quote(&decision.goal),
+            decision.child_count.unwrap_or(3)
+        ),
+        StartSelectedMode::Run | StartSelectedMode::Review | StartSelectedMode::FullPlan => {
+            format!(
+                "deadreckon start \"{}\" --mode {} --yes",
+                shell_display_quote(&decision.goal),
+                decision.selected_mode.label()
+            )
+        }
+    }
+}
+
+fn start_preview_secondary_actions(decision: &StartLaunchDecision) -> Vec<String> {
+    if decision.recovery.is_some() {
+        return decision.try_lines.iter().skip(1).cloned().collect();
+    }
+    vec![
+        "deadreckon attach <id>".to_string(),
+        "deadreckon kill <id>".to_string(),
+        "deadreckon finish <id>".to_string(),
+    ]
+}
+
+fn start_preview_surface(
+    decision: &StartLaunchDecision,
+    args: &StartCommandArgs,
+    paths: &DeadreckonPaths,
+) -> Result<VerdictSurface> {
+    let rows = start_launch_preview_rows(decision, args, paths)?;
+    let mut evidence = rows
+        .into_iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "watch" | "stop" | "finish"))
+        .collect::<Vec<_>>();
+    evidence.push(("will start".to_string(), "false".to_string()));
+    let primary = start_preview_primary_action(decision);
+    let secondary = start_preview_secondary_actions(decision);
+    let (kind, what, why) = if decision.recovery.is_some() {
+        (
+            VerdictKind::Blocked,
+            "DeadReckon previewed the launch, but setup is blocked before any run or plan id exists.",
+            "The selected path cannot start until the recommended recovery command resolves the missing setup.",
+        )
+    } else {
+        (
+            VerdictKind::Preview,
+            "DeadReckon classified the goal and is ready to launch, but no run, plan, or campaign id exists yet.",
+            "This is a preview; post-launch commands become real only after the launch creates an id.",
+        )
+    };
+    let secondary = secondary
+        .iter()
+        .map(|command| ("After start", command.as_str()))
+        .collect::<Vec<_>>();
+    Ok(VerdictSurface::try_new(
+        kind,
+        "start",
+        None,
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        secondary,
+    )
+    .expect("start preview verdict surface must be valid"))
+}
+
+fn print_start_preview_surface(
+    decision: &StartLaunchDecision,
+    args: &StartCommandArgs,
+    paths: &DeadreckonPaths,
+) -> Result<()> {
+    print!(
+        "{}",
+        start_preview_surface(decision, args, paths)?
+            .render_plain(!completion_hints_enabled(false))
+    );
+    Ok(())
 }
 
 pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
@@ -2294,34 +2392,9 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         resolve_start_setup(&mut decision, &args, None, stdin_is_tty)?;
     }
     if args.json {
-        let mut next_actions = if decision.recovery.is_some() {
-            decision.try_lines.clone()
-        } else if matches!(decision.selected_mode, StartSelectedMode::Extend) {
-            decision
-                .base_run_id
-                .as_ref()
-                .map(|run_id| {
-                    vec![format!(
-                        "deadreckon extend {} \"{}\"",
-                        run_prefix(run_id),
-                        shell_display_quote(&decision.goal)
-                    )]
-                })
-                .unwrap_or_else(|| vec!["deadreckon list".to_string()])
-        } else {
-            match decision.selected_mode {
-                StartSelectedMode::Campaign => vec![format!(
-                    "deadreckon campaign \"{}\" --n {} --yes",
-                    shell_display_quote(&decision.goal),
-                    decision.child_count.unwrap_or(3)
-                )],
-                _ => vec![format!(
-                    "deadreckon start \"{}\" --mode {} --yes",
-                    shell_display_quote(&decision.goal),
-                    decision.selected_mode.label()
-                )],
-            }
-        };
+        let surface = start_preview_surface(&decision, &args, &paths)?;
+        let mut next_actions = vec![surface.primary_action.command.clone()];
+        next_actions.extend(start_preview_secondary_actions(&decision));
         if decision.recovery.is_none()
             && !matches!(decision.selected_mode, StartSelectedMode::Extend)
         {
@@ -2331,7 +2404,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
                 }
             }
         }
-        let payload = json!({
+        let payload = surface.add_to_json(json!({
             "kind": "start",
             "goal": decision.goal,
             "selected_mode": decision.selected_mode.label(),
@@ -2348,15 +2421,13 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             "history_actions": decision.history_next_actions,
             "next_actions": next_actions,
             "try_lines": decision.try_lines
-        });
+        }));
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
     if args.preview {
         if !args.quiet {
-            println!("{}", ui_heading("deadreckon start preview"));
-            let rows = start_launch_preview_rows(&decision, &args, &paths)?;
-            print_launch_preview_rows(&rows);
+            print_start_preview_surface(&decision, &args, &paths)?;
         }
         return Ok(());
     }
@@ -2717,12 +2788,28 @@ fn print_start_lifecycle_footer(kind: &str, id: &str) {
     let status = format!("deadreckon status {id}");
     let kill = format!("deadreckon kill {id}");
     let finish = format!("deadreckon finish {id}");
-    println!("{}", ui_heading("start lifecycle"));
-    print_kv_block(&[
-        ("target", kind),
-        ("attach", attach.as_str()),
-        ("status", status.as_str()),
-        ("kill", kill.as_str()),
-        ("finish", finish.as_str()),
-    ]);
+    print!(
+        "{}",
+        VerdictSurface::try_new(
+            VerdictKind::Completed,
+            "start",
+            Some(&id),
+            ExplanationPanel::new(
+                format!("DeadReckon launched the guided start path as a {kind}."),
+                "The id now exists; attach is the safest first command for observing the launched work before applying, finishing, or stopping it.",
+                vec![
+                    ("target".to_string(), kind.to_string()),
+                    ("id".to_string(), id.clone()),
+                ],
+            ),
+            vec![("Recommended", attach.as_str())],
+            vec![
+                ("Secondary", status.as_str()),
+                ("Secondary", kill.as_str()),
+                ("Secondary", finish.as_str()),
+            ],
+        )
+        .expect("start lifecycle verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false))
+    );
 }

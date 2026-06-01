@@ -419,10 +419,11 @@ fn run_and_orchestrate_preview_share_done_criteria_source_label() {
 }
 
 #[test]
-fn start_preview_names_path_provider_done_workspace_and_finish() {
+fn start_preview_surface_has_one_future_watch_command() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
@@ -432,15 +433,18 @@ fn start_preview_names_path_provider_done_workspace_and_finish() {
 
     assert_success(&output);
     let out = stdout(&output);
-    for field in [
-        "path",
-        "provider",
-        "done",
-        "workspace",
-        "watch",
-        "stop",
-        "finish",
-    ] {
+    assert!(out.starts_with("preview start"), "{out}");
+    assert!(out.contains("Explanation"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(!out.contains("<after-start>"), "{out}");
+    assert_eq!(out.matches("deadreckon attach <id>").count(), 1, "{out}");
+    assert_eq!(
+        out.matches("deadreckon start \"preview guided start\" --mode run --yes")
+            .count(),
+        1,
+        "{out}"
+    );
+    for field in ["path", "provider", "done", "workspace"] {
         assert!(out.contains(field), "missing {field}:\n{out}");
     }
     assert!(out.contains("run"), "{out}");
@@ -919,6 +923,9 @@ fn start_preview_json_has_next_actions_and_try_lines_without_ansi() {
     assert_eq!(value["will_start"], false);
     assert_eq!(value["try_lines"][0], "deadreckon try");
     assert_eq!(value["next_actions"][0], "deadreckon try");
+    assert_eq!(value["primary_action"], "deadreckon try");
+    assert_eq!(value["verdict"]["kind"], "blocked");
+    assert_eq!(value["verdict"]["recommended_command"], "deadreckon try");
 }
 
 #[test]
@@ -936,7 +943,7 @@ fn start_plain_preview_strips_ansi() {
 
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("deadreckon start preview"), "{out}");
+    assert!(out.contains("preview start"), "{out}");
     assert!(!out.contains("\u{1b}["), "{out}");
 }
 
@@ -969,7 +976,7 @@ fn start_preview_in_existing_repo_shows_concise_history_hint() {
     assert!(out.contains("history"), "{out}");
     assert!(out.contains("follow-up available from aaaabbbb"), "{out}");
     assert!(
-        out.contains("override  : deadreckon start <goal> --mode review"),
+        out.contains("override: deadreckon start <goal> --mode review"),
         "{out}"
     );
 }
@@ -1028,7 +1035,8 @@ fn start_run_success_prints_attach_status_kill_finish() {
         .find(|run| run.goal == "footer guided run")
         .expect("run");
     let run_ref = &run.run_id[..8];
-    assert!(text.contains("start lifecycle"), "{text}");
+    assert!(text.contains("completed start"), "{text}");
+    assert_eq!(text.matches("\nRecommended\n").count(), 1, "{text}");
     assert!(
         text.contains(&format!("deadreckon attach {run_ref}")),
         "{text}"
@@ -1071,7 +1079,8 @@ fn start_orchestrate_success_prints_plan_lifecycle_commands() {
     let text = format!("{}{}", stdout(&output), stderr(&output));
     let plan = newest_plan(&paths);
     let plan_ref = &plan.plan_id[..8];
-    assert!(text.contains("start lifecycle"), "{text}");
+    assert!(text.contains("completed start"), "{text}");
+    assert_eq!(text.matches("\nRecommended\n").count(), 1, "{text}");
     assert!(
         text.contains(&format!("deadreckon attach {plan_ref}")),
         "{text}"
@@ -1121,10 +1130,7 @@ fn start_footer_uses_plan_id_for_orchestrated_goal() {
     for task in &plan.tasks {
         if let Some(run_id) = task.child_run_id.as_ref() {
             assert!(
-                !text.contains(&format!(
-                    "start lifecycle\nattach: deadreckon attach {}",
-                    &run_id[..8]
-                )),
+                !text.contains(&format!("completed start {}\n\nExplanation", &run_id[..8])),
                 "{text}"
             );
         }
