@@ -2715,17 +2715,12 @@ fn list_chain_records(paths: &DeadreckonPaths, scope: Option<String>) -> Result<
 
 pub(crate) fn resolve_chain_id(paths: &DeadreckonPaths, id: &str, all: bool) -> Result<String> {
     let scope = if all { None } else { Some(current_scope()?) };
-    let chains = list_chain_records(paths, scope)?;
+    let chains = list_chain_records(paths, scope.clone())?;
     if matches!(id, "latest" | "last") {
         return chains
             .first()
             .map(|chain| chain.chain_id.clone())
-            .ok_or_else(|| {
-                CliError::Core(deadreckon_core::user_error(
-                    "no chains in scope",
-                    "deadreckon chain \"step one\" \"step two\"",
-                ))
-            });
+            .ok_or_else(|| chain_missing_scope_surface(scope.as_deref()));
     }
     let matches = chains
         .iter()
@@ -2745,6 +2740,29 @@ pub(crate) fn resolve_chain_id(paths: &DeadreckonPaths, id: &str, all: bool) -> 
             ),
             "deadreckon chain list --full",
         ))),
+    }
+}
+
+fn chain_missing_scope_surface(scope: Option<&str>) -> CliError {
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "chain",
+            None,
+            ExplanationPanel::new(
+                "DeadReckon could not resolve a chain because no chains in scope.",
+                "The requested command needs an existing chain id or latest chain, but the current scope has no chain state to operate on.",
+                [
+                    ("scope".to_string(), scope.unwrap_or("all").to_string()),
+                    ("matching chains".to_string(), "0".to_string()),
+                ],
+            ),
+            [("Recommended", "deadreckon chain \"step one\" \"step two\"")],
+            Vec::<(&str, &str)>::new(),
+        )
+        .expect("missing chain scope surface must have one primary action")
+        .render_plain(false),
     }
 }
 

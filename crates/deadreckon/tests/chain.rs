@@ -1766,7 +1766,7 @@ fn chain_run_bare_verb_dispatches_to_chain_resume_latest() {
 }
 
 #[test]
-fn chain_run_bare_verb_refuses_when_no_chain_in_scope_with_try() {
+fn chain_run_bare_verb_refuses_when_no_chain_in_scope_with_verdict_surface() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1779,8 +1779,17 @@ fn chain_run_bare_verb_refuses_when_no_chain_in_scope_with_try() {
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
     assert!(stderr.contains("no chains in scope"), "{stderr}");
-    assert!(stderr.contains("try:"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain \"step one\" \"step two\""),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]
