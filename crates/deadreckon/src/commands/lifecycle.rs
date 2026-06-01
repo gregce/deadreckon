@@ -248,9 +248,33 @@ pub(crate) fn materialize_completed_run(
 }
 
 pub(crate) fn print_materialized(materialized: &MaterializedRun) {
-    println!("{} {}", ui_ok("exported run"), ui_id(&materialized.run_id));
-    println!("  source: {}", materialized.source.display());
-    println!("  dest:   {}", materialized.dest.display());
+    println!(
+        "{}",
+        materialized_surface(materialized).render_plain(!completion_hints_enabled(false))
+    );
+}
+
+fn materialized_surface(materialized: &MaterializedRun) -> VerdictSurface {
+    let id = run_prefix(&materialized.run_id);
+    let primary = format!("deadreckon show {id}");
+    let secondary = "deadreckon status".to_string();
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "materialize",
+        Some(&id),
+        ExplanationPanel::new(
+            "DeadReckon exported run output into the requested destination.",
+            "Materialize completed because the run was already completed, the destination was safe to write, and the library artifact was copied.",
+            vec![
+                ("run".to_string(), id.clone()),
+                ("source".to_string(), materialized.source.display().to_string()),
+                ("dest".to_string(), materialized.dest.display().to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", secondary.as_str())],
+    )
+    .expect("materialize verdict surface must be valid")
 }
 
 #[allow(clippy::too_many_arguments)]
