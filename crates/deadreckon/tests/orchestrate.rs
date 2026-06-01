@@ -153,6 +153,55 @@ fn plan_failed_surface_recommends_why_failed_or_merge_once_json() {
 }
 
 #[test]
+fn finish_failed_plan_uses_one_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "failed finish verdict plan",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.status = PlanStatus::Failed;
+    save_plan(&paths, &plan).expect("save failed plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["finish", &plan.plan_id[..8], "--no-confirm"])
+        .output()
+        .expect("finish failed plan");
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.starts_with("failed plan "), "{err}");
+    assert!(err.contains("no completed result to finish"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon show {} --why-failed",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
 fn plan_writes_plan_created_event_when_saved() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

@@ -3607,13 +3607,11 @@ fn merged_run_id_for_completed_plan(plan: &Plan, verb: &str) -> Result<Option<St
             )));
         }
         PlanStatus::Failed => {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                &format!(
-                    "plan {} failed; no completed result to {verb}",
-                    run_prefix(&plan.plan_id)
-                ),
-                &format!("deadreckon show {} --why-failed", run_prefix(&plan.plan_id)),
-            )));
+            return Err(CliError::Surface {
+                code: 1,
+                surface: failed_plan_result_surface(plan, verb)
+                    .render_plain(!completion_hints_enabled(false)),
+            });
         }
     }
     let run_id = plan.merged_run_id.clone().ok_or_else(|| {
@@ -3626,6 +3624,45 @@ fn merged_run_id_for_completed_plan(plan: &Plan, verb: &str) -> Result<Option<St
         ))
     })?;
     Ok(Some(run_id))
+}
+
+fn failed_plan_result_surface(plan: &Plan, verb: &str) -> VerdictSurface {
+    let id = run_prefix(&plan.plan_id);
+    let failed_tasks = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Failed)
+        .map(|task| task.task_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut evidence = vec![
+        ("plan".to_string(), id.clone()),
+        (
+            "status".to_string(),
+            plan_status_label(plan.status).to_string(),
+        ),
+        ("requested verb".to_string(), verb.to_string()),
+    ];
+    if !failed_tasks.is_empty() {
+        evidence.push(("failed tasks".to_string(), failed_tasks));
+    }
+
+    let primary = format!("deadreckon show {id} --why-failed");
+    VerdictSurface::try_new(
+        VerdictKind::Failed,
+        "plan",
+        Some(&id),
+        ExplanationPanel::new(
+            "The plan failed before producing a completed result run.",
+            format!(
+                "DeadReckon has no completed result to {verb}; inspect the failure evidence before trying to finish, apply, or export it."
+            ),
+            evidence,
+        ),
+        [("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("failed plan result surface must have one primary action")
 }
 
 fn default_plan_materialize_dest(plan: &Plan) -> PathBuf {
