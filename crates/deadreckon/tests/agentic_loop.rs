@@ -1357,6 +1357,8 @@ async fn import_unknown_source_lists_supported_sources_with_try_line() {
         stderr.contains("try: deadreckon import codex --list"),
         "{stderr}"
     );
+    assert_eq!(stderr.matches("try:").count(), 1, "{stderr}");
+    assert!(!stderr.contains("try: deadreckon doctor"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1428,6 +1430,8 @@ async fn import_ambiguous_sessions_prints_candidate_table_and_try_line() {
         stderr.contains("try: deadreckon import codex --session"),
         "{stderr}"
     );
+    assert_eq!(stderr.matches("try:").count(), 1, "{stderr}");
+    assert!(!stderr.contains("try: deadreckon doctor"), "{stderr}");
     let paths = DeadreckonPaths::from_home(&home);
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
@@ -1499,6 +1503,8 @@ async fn import_gemini_requires_session_when_cwd_match_is_none_and_ambiguous() {
         stderr.contains("try: deadreckon import cli:gemini --session"),
         "{stderr}"
     );
+    assert_eq!(stderr.matches("try:").count(), 1, "{stderr}");
+    assert!(!stderr.contains("try: deadreckon doctor"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

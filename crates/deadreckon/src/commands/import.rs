@@ -1651,7 +1651,26 @@ fn import_descriptor_id(source: &str) -> Option<String> {
 }
 
 fn import_invalid(message: String) -> CliError {
-    CliError::Core(DeadreckonError::InvalidInput(message))
+    let mut body = Vec::new();
+    let mut primary_hint = None;
+    for line in message.lines() {
+        if let Some(hint) = line.trim_start().strip_prefix("try:") {
+            if primary_hint.is_none() {
+                primary_hint = Some(hint.trim().to_string());
+            }
+        } else {
+            body.push(line);
+        }
+    }
+    if let Some(hint) = primary_hint {
+        CliError::Exit {
+            code: 1,
+            message: body.join("\n").trim_end().to_string(),
+            hint,
+        }
+    } else {
+        CliError::Core(DeadreckonError::InvalidInput(message))
+    }
 }
 
 fn print_import_candidates(
