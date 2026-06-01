@@ -1117,7 +1117,7 @@ pub(crate) fn plan_attach_footer(
         match task.child_run_id.as_deref() {
             None => {
                 let wait_hint = format!(
-                    "Enter waits for child run  |  try: deadreckon fork {}",
+                    "Enter waits for child run  |  recommended: deadreckon fork {}",
                     run_prefix(&plan.plan_id)
                 );
                 if view.is_narrative() {
@@ -1128,7 +1128,8 @@ pub(crate) fn plan_attach_footer(
                 }
             }
             Some(run_id) if load_run(paths, run_id).is_err() => {
-                let unavailable_hint = "child detail unavailable  |  try: deadreckon list --all";
+                let unavailable_hint =
+                    "child detail unavailable  |  recommended: deadreckon list --all";
                 if view.is_narrative() {
                     footer = format!("{footer}  |  {unavailable_hint}");
                 } else {
@@ -1140,7 +1141,7 @@ pub(crate) fn plan_attach_footer(
             Some(_) => {}
         }
     }
-    if show_hints && !footer.contains("try:") {
+    if show_hints && !footer.contains("recommended:") {
         footer.push_str("  |  merge after fork");
     }
     footer
