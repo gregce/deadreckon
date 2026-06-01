@@ -7,7 +7,11 @@ pub(crate) fn completion_command(command: Option<CompletionCommand>) -> Result<(
         no_rc: false,
     }) {
         CompletionCommand::Install { shell, path, no_rc } => {
-            install_completion(shell, path, !no_rc)?;
+            let outcome = install_completion(shell, path, !no_rc)?;
+            println!(
+                "{}",
+                completion_install_surface(&outcome).render_plain(!completion_hints_enabled(false))
+            );
         }
         CompletionCommand::Bash => write_completion_script(Shell::Bash, &mut io::stdout()),
         CompletionCommand::Elvish => write_completion_script(Shell::Elvish, &mut io::stdout()),
@@ -40,7 +44,7 @@ fn install_completion(
     shell: Option<Shell>,
     path_override: Option<PathBuf>,
     update_rc: bool,
-) -> Result<PathBuf> {
+) -> Result<CompletionInstallOutcome> {
     let shell = shell.or_else(detect_completion_shell).ok_or_else(|| {
         CliError::Core(deadreckon_core::user_error(
             "could not detect your shell",
@@ -54,28 +58,88 @@ fn install_completion(
     let mut script = Vec::new();
     write_completion_script(shell, &mut script);
     fs::write(&path, script)?;
-    println!("{} completion {}", ui_ok("installed"), path.display());
-    if shell == Shell::Zsh && update_rc {
-        ensure_zsh_completion_rc(&path)?;
-    }
-    println!(
-        "{} {}",
-        ui_command("next:"),
-        ui_command("open a new shell, or source your shell rc file")
-    );
-    Ok(path)
+    let rc_status = match (shell, update_rc) {
+        (Shell::Zsh, true) => ensure_zsh_completion_rc(&path)?,
+        (Shell::Zsh, false) => CompletionRcStatus::Skipped,
+        _ => CompletionRcStatus::NotApplicable,
+    };
+    Ok(CompletionInstallOutcome {
+        shell,
+        path,
+        rc_status,
+    })
 }
 
-pub(crate) fn try_install_completion_after_init() {
+pub(crate) fn try_install_completion_after_init() -> String {
     match install_completion(None, None, true) {
-        Ok(_) => {}
-        Err(err) => {
-            eprintln!("{} shell completion not installed: {err}", ui_note("note"));
-            eprintln!(
-                "{} {}",
-                ui_command("try:"),
-                ui_command("deadreckon completion install --shell zsh")
-            );
+        Ok(outcome) => format!(
+            "installed {} completion at {}",
+            completion_shell_name(outcome.shell),
+            outcome.path.display()
+        ),
+        Err(err) => format!("not installed: {err}"),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompletionInstallOutcome {
+    shell: Shell,
+    path: PathBuf,
+    rc_status: CompletionRcStatus,
+}
+
+#[derive(Clone, Debug)]
+enum CompletionRcStatus {
+    Updated(PathBuf),
+    Ready(PathBuf),
+    Skipped,
+    NotApplicable,
+}
+
+fn completion_install_surface(outcome: &CompletionInstallOutcome) -> VerdictSurface {
+    let shell = completion_shell_name(outcome.shell);
+    let primary = "deadreckon doctor";
+    let rc_evidence = outcome.rc_status.evidence_value();
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "completion",
+        Some(shell),
+        ExplanationPanel::new(
+            format!(
+                "DeadReckon wrote the {shell} completion script to {}.",
+                outcome.path.display()
+            ),
+            "The install command finished and the shell integration state was recorded; doctor is the safest next command to verify setup.",
+            vec![
+                ("shell", shell.to_string()),
+                ("script", outcome.path.display().to_string()),
+                ("shell rc", rc_evidence),
+            ],
+        ),
+        vec![("Recommended", primary)],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("completion install verdict surface must be valid")
+}
+
+fn completion_shell_name(shell: Shell) -> &'static str {
+    match shell {
+        Shell::Bash => "bash",
+        Shell::Elvish => "elvish",
+        Shell::Fish => "fish",
+        Shell::PowerShell => "powershell",
+        Shell::Zsh => "zsh",
+        _ => "shell",
+    }
+}
+
+impl CompletionRcStatus {
+    fn evidence_value(&self) -> String {
+        match self {
+            Self::Updated(path) => format!("updated {}", path.display()),
+            Self::Ready(path) => format!("already configured {}", path.display()),
+            Self::Skipped => "not updated (--no-rc)".to_string(),
+            Self::NotApplicable => "not required for this shell".to_string(),
         }
     }
 }
@@ -123,9 +187,9 @@ fn default_completion_path(shell: Shell) -> PathBuf {
     }
 }
 
-fn ensure_zsh_completion_rc(completion_path: &Path) -> Result<()> {
+fn ensure_zsh_completion_rc(completion_path: &Path) -> Result<CompletionRcStatus> {
     let Some(completion_dir) = completion_path.parent() else {
-        return Ok(());
+        return Ok(CompletionRcStatus::Skipped);
     };
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -139,14 +203,12 @@ fn ensure_zsh_completion_rc(completion_path: &Path) -> Result<()> {
     if existing.contains("# >>> deadreckon completion >>>")
         || existing.contains(&format!("fpath=({completion_dir} $fpath)"))
     {
-        println!("{} zshrc already loads completion dir", ui_ok("ready"));
-        return Ok(());
+        return Ok(CompletionRcStatus::Ready(zshrc));
     }
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&zshrc)?;
     file.write_all(block.as_bytes())?;
-    println!("{} {}", ui_ok("updated"), zshrc.display());
-    Ok(())
+    Ok(CompletionRcStatus::Updated(zshrc))
 }

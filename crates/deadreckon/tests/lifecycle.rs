@@ -976,8 +976,16 @@ fn completion_install_detects_zsh_writes_script_and_managed_rc_block() {
         .expect("completion install");
     assert_success(&output);
     let stdout = stdout(&output);
-    assert!(stdout.contains("installed"), "{stdout}");
+    assert!(stdout.contains("completed completion zsh"), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert!(stdout.contains("Evidence"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon doctor"),
+        "{stdout}"
+    );
     assert!(stdout.contains("_deadreckon"), "{stdout}");
+    assert!(!stdout.contains("next:"), "{stdout}");
 
     let script = fs::read_to_string(temp.path().join(".zsh/completions/_deadreckon"))
         .expect("completion script");
@@ -1009,7 +1017,15 @@ fn init_installs_shell_completion_by_default() {
         .expect("init");
     assert_success(&output);
     let stdout = stdout(&output);
-    assert!(stdout.contains("completion"), "{stdout}");
+    assert!(stdout.contains("completed init"), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon run \"describe the coding goal\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("completion:"), "{stdout}");
+    assert!(!stdout.contains("next:"), "{stdout}");
     assert!(temp.path().join(".zsh/completions/_deadreckon").exists());
     assert!(temp.path().join(".zshrc").exists());
 }

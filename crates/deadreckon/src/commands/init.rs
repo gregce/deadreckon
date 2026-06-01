@@ -68,15 +68,44 @@ pub(crate) async fn init_command(
     println!("{} {}", ui_ok("wrote"), paths.config_path().display());
     print_provider_setup_rows(&[provider_setup]);
     super::doctor::doctor_command(false).await?;
-    if !no_completion {
-        super::completion::try_install_completion_after_init();
-    }
-    println!(
-        "{} {}",
-        ui_command("next:"),
-        ui_command("deadreckon run \"describe the coding goal\"")
+    let completion_status = if no_completion {
+        "skipped by --no-completion".to_string()
+    } else {
+        super::completion::try_install_completion_after_init()
+    };
+    print!(
+        "{}",
+        init_completion_surface(&paths, &provider, &sandbox, &completion_status)
+            .render_plain(!completion_hints_enabled(false))
     );
     Ok(())
+}
+
+fn init_completion_surface(
+    paths: &DeadreckonPaths,
+    provider: &str,
+    sandbox: &str,
+    completion_status: &str,
+) -> VerdictSurface {
+    let primary = "deadreckon run \"describe the coding goal\"";
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "init",
+        None,
+        ExplanationPanel::new(
+            "DeadReckon wrote the local configuration and checked the provider setup.",
+            "Initialization completed; the next step is to start a managed run from this workspace.",
+            vec![
+                ("config", paths.config_path().display().to_string()),
+                ("provider", provider.to_string()),
+                ("sandbox", sandbox.to_string()),
+                ("completion", completion_status.to_string()),
+            ],
+        ),
+        vec![("Recommended", primary)],
+        vec![("Secondary", "deadreckon doctor")],
+    )
+    .expect("init verdict surface must be valid")
 }
 
 fn preferred_init_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String> {

@@ -143,9 +143,7 @@ use crate::tui::{
     acceptance_activity_lines, attach_header_text, deadreckoning_status_text, meter_color,
     plan_attach_footer, threshold_color,
 };
-use crate::ui::{
-    ui_command, ui_error, ui_heading, ui_id, ui_muted, ui_note, ui_ok, ui_status, ui_warn,
-};
+use crate::ui::{ui_command, ui_error, ui_heading, ui_id, ui_muted, ui_ok, ui_status, ui_warn};
 
 #[derive(Debug, thiserror::Error)]
 enum CliError {

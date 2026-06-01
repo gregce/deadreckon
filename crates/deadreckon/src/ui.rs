@@ -194,10 +194,6 @@ pub(crate) fn ui_warn(text: impl AsRef<str>) -> String {
     render(Stream::Stdout, Tone::Warn, text)
 }
 
-pub(crate) fn ui_note(text: impl AsRef<str>) -> String {
-    render(Stream::Stdout, Tone::Note, text)
-}
-
 pub(crate) fn ui_status(text: impl AsRef<str>) -> String {
     render_status(Stream::Stdout, text)
 }
