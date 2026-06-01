@@ -325,7 +325,7 @@ fn shell_update_failure(
             backup_dir.display()
         ),
         hint: format!(
-            "try: cp {} {}",
+            "cp {} {}",
             backup_dir.join("deadreckon").display(),
             receipt.binary_path.display()
         ),
@@ -954,4 +954,41 @@ fn detect_verdict_surface(
             .collect::<Vec<_>>(),
     )
     .expect("detect verdict surface must be valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use chrono::Utc;
+    use deadreckon_core::install_receipt::{Channel, INSTALL_RECEIPT_VERSION, Receipt};
+
+    use super::*;
+
+    #[test]
+    fn shell_update_failure_hint_is_raw_primary_action() {
+        let receipt = Receipt {
+            channel: Channel::Shell,
+            channel_version: "0.1.0".to_string(),
+            binary_path: PathBuf::from("/usr/local/bin/deadreckon"),
+            installed_at: Utc::now(),
+            install_source: Some("https://example.test/deadreckon".to_string()),
+            platform_package: None,
+            receipt_version: INSTALL_RECEIPT_VERSION,
+        };
+
+        match shell_update_failure(&receipt, PathBuf::from("/tmp/dr-backup").as_path(), "boom") {
+            CliError::Exit { hint, .. } => {
+                assert!(
+                    !hint.starts_with("try:"),
+                    "raw exit hints should not embed try footers: {hint}"
+                );
+                assert_eq!(
+                    hint,
+                    "cp /tmp/dr-backup/deadreckon /usr/local/bin/deadreckon"
+                );
+            }
+            other => panic!("expected exit error, got {other:?}"),
+        }
+    }
 }
