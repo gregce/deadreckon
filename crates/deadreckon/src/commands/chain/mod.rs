@@ -483,7 +483,38 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
     if goals.is_empty() {
         goals = collect_chain_goals(&[], from_file, from_stdin)?;
     }
-    deadreckon_core::validate_goal_count(goals.len()).map_err(CliError::from)?;
+    if goals.len() < 2 {
+        let primary = goals
+            .first()
+            .map(|goal| format!("deadreckon run {}", quote_chain_goal_arg(goal)))
+            .unwrap_or_else(|| "deadreckon run \"<goal>\"".to_string());
+        return Err(chain_create_refusal_surface(
+            VerdictKind::Blocked,
+            None,
+            "DeadReckon did not create the chain because chain must have >= 2 steps.",
+            "A single goal should run as a normal run; chain state is only for ordered multi-step work.",
+            [
+                ("requested steps".to_string(), goals.len().to_string()),
+                ("minimum steps".to_string(), "2".to_string()),
+            ],
+            primary,
+            no_hints,
+        ));
+    }
+    if goals.len() > 12 {
+        return Err(chain_create_refusal_surface(
+            VerdictKind::Blocked,
+            None,
+            "DeadReckon did not create the chain because chain capped at 12 steps.",
+            "Longer step lists need to be split into multiple chains or replanned so one chain stays reviewable and recoverable.",
+            [
+                ("requested steps".to_string(), goals.len().to_string()),
+                ("maximum steps".to_string(), "12".to_string()),
+            ],
+            "deadreckon chain plan \"<larger goal>\" --n 12".to_string(),
+            no_hints,
+        ));
+    }
     let cwd = std::env::current_dir()?;
     let git_root = deadreckon_core::find_git_root(&cwd)?.ok_or_else(|| {
         chain_create_refusal_surface(
@@ -625,6 +656,10 @@ where
         .expect("chain creation refusal surface must have one primary action")
         .render_plain(!completion_hints_enabled(no_hints)),
     }
+}
+
+fn quote_chain_goal_arg(goal: &str) -> String {
+    format!("\"{}\"", goal.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 async fn chain_run_command(

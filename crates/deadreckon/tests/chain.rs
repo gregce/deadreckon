@@ -520,9 +520,17 @@ fn chain_refuses_one_step_with_try_run_hint() {
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
     assert!(stderr.contains("chain must have >= 2 steps"));
-    assert!(stderr.contains("try:"));
-    assert!(stderr.contains("deadreckon run"));
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon run \"one step only\""),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]
@@ -539,7 +547,18 @@ fn chain_refuses_more_than_12_steps() {
     let output = command.output().expect("chain");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("chain capped at 12 steps"));
+    let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
+    assert!(stderr.contains("chain capped at 12 steps"));
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain plan \"<larger goal>\" --n 12"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]
@@ -1778,7 +1797,7 @@ fn chain_post_action_hints_print_next_verbs() {
 }
 
 #[test]
-fn chain_error_messages_end_with_try_footer() {
+fn chain_goal_count_errors_use_verdict_surface() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1790,7 +1809,17 @@ fn chain_error_messages_end_with_try_footer() {
         .expect("chain");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("try:"), "{}", stderr(&output));
+    let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon run \"only one\""),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]
