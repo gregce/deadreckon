@@ -156,8 +156,8 @@ fn select_one_menu(prompt: &SelectPrompt) -> Result<SelectChoice> {
             }
             KeyCode::Char(value) if key.modifiers.is_empty() && value.is_ascii_digit() => {
                 if let Some(index) = select_index_from_digit(value, prompt.choices.len()) {
-                    selected = index;
-                    render_select_menu(prompt, selected, true)?;
+                    finish_select_menu_line()?;
+                    return Ok(prompt.choices[index].clone());
                 }
             }
             KeyCode::Esc => {
@@ -180,22 +180,18 @@ fn render_select_menu(prompt: &SelectPrompt, selected: usize, redraw: bool) -> R
     if redraw {
         execute!(stdout, MoveUp(prompt.choices.len() as u16), MoveToColumn(0))?;
     }
+    let width = selectable_menu_width();
     for (index, choice) in prompt.choices.iter().enumerate() {
         let ordinal = index + 1;
         let marker = if index == selected { ">" } else { " " };
         execute!(stdout, Clear(ClearType::CurrentLine))?;
-        match choice.detail.as_deref() {
+        let line = match choice.detail.as_deref() {
             Some(detail) if !detail.trim().is_empty() => {
-                write_select_menu_line(
-                    &mut stdout,
-                    &format!("  {marker} [{ordinal}] {} - {detail}", choice.label),
-                )?;
+                format!("  {marker} [{ordinal}] {} - {detail}", choice.label)
             }
-            _ => write_select_menu_line(
-                &mut stdout,
-                &format!("  {marker} [{ordinal}] {}", choice.label),
-            )?,
-        }
+            _ => format!("  {marker} [{ordinal}] {}", choice.label),
+        };
+        write_select_menu_line(&mut stdout, &truncate_menu_line(&line, width))?;
     }
     execute!(stdout, Clear(ClearType::CurrentLine))?;
     let default = prompt
@@ -209,6 +205,54 @@ fn render_select_menu(prompt: &SelectPrompt, selected: usize, redraw: bool) -> R
 
 fn write_select_menu_line(stdout: &mut impl io::Write, line: &str) -> io::Result<()> {
     write!(stdout, "{line}\r\n")
+}
+
+fn selectable_menu_width() -> usize {
+    crossterm::terminal::size()
+        .ok()
+        .map(|(columns, _)| usize::from(columns))
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|columns| columns.parse::<usize>().ok())
+        })
+        .filter(|columns| *columns > 1)
+        .map(|columns| columns.saturating_sub(1))
+        .unwrap_or(119)
+}
+
+fn truncate_menu_line(line: &str, max_visible: usize) -> String {
+    let normalized = normalize_menu_line(line);
+    if normalized.chars().count() <= max_visible {
+        return normalized;
+    }
+    if max_visible == 0 {
+        return String::new();
+    }
+    if max_visible <= 3 {
+        return normalized.chars().take(max_visible).collect();
+    }
+    let keep = max_visible.saturating_sub(3);
+    let mut out = normalized.chars().take(keep).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn normalize_menu_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut previous_was_space = false;
+    for ch in line.chars() {
+        if ch.is_whitespace() {
+            if !previous_was_space {
+                out.push(' ');
+                previous_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            previous_was_space = false;
+        }
+    }
+    out.trim_end().to_string()
 }
 
 fn finish_select_menu_line() -> io::Result<()> {
@@ -283,7 +327,8 @@ fn parse_confirm_answer(answer: &str, default_yes: bool) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_confirm_answer, parse_select_answer, select_index_from_digit, write_select_menu_line,
+        parse_confirm_answer, parse_select_answer, select_index_from_digit, truncate_menu_line,
+        write_select_menu_line,
     };
 
     #[test]
@@ -328,5 +373,23 @@ mod tests {
         let mut output = Vec::new();
         write_select_menu_line(&mut output, "  > [1] Run").expect("write line");
         assert_eq!(output, b"  > [1] Run\r\n");
+    }
+
+    #[test]
+    fn selectable_menu_lines_are_single_terminal_rows() {
+        let line = truncate_menu_line(
+            "  > [1] Recommended: campaign orchestration - a very long detail",
+            32,
+        );
+
+        assert_eq!(line.chars().count(), 32);
+        assert_eq!(line, " > [1] Recommended: campaign ...");
+    }
+
+    #[test]
+    fn selectable_menu_lines_collapse_embedded_whitespace() {
+        let line = truncate_menu_line("  > [1] Follow up\nfrom\tprevious", 80);
+
+        assert_eq!(line, " > [1] Follow up from previous");
     }
 }

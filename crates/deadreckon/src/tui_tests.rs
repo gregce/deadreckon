@@ -64,7 +64,8 @@ use super::{
     provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
     read_plan_events_lossy, refresh_plan_docs, render_attach, render_plan_attach,
     resolve_plan_doc_target, run_narrative_refresh_trigger, threshold_color,
-    validate_plan_provider_docs, write_plan_docs_deterministic, write_plan_docs_from_provider,
+    validate_plan_provider_docs, wrap_kv_value, write_plan_docs_deterministic,
+    write_plan_docs_from_provider,
 };
 use crate::cli::{Cli, CliPlanMode, CliStartMode, StartCommandArgs};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -2361,9 +2362,7 @@ fn start_history_actions_name_extend_and_new_orchestration_passes() {
 
     assert_eq!(
         decision.history_action_label.as_deref(),
-        Some(
-            "extend: deadreckon extend bbbbaaaa \"add charts\"; review: deadreckon start \"add charts\" --mode review --yes; full-plan: deadreckon start \"add charts\" --mode full-plan --yes"
-        )
+        Some("follow-up available from bbbbaaaa")
     );
     assert_eq!(
         decision.history_next_actions,
@@ -2375,9 +2374,24 @@ fn start_history_actions_name_extend_and_new_orchestration_passes() {
     );
     let rows = launch_preview_rows(&start_launch_preview_facts(&decision));
     assert!(
-        rows.iter().any(|(key, value)| key == "history"
-            && value == "extend: deadreckon extend bbbbaaaa \"add charts\"; review: deadreckon start \"add charts\" --mode review --yes; full-plan: deadreckon start \"add charts\" --mode full-plan --yes"),
+        rows.iter()
+            .any(|(key, value)| key == "history" && value == "follow-up available from bbbbaaaa"),
         "{rows:?}"
+    );
+}
+
+#[test]
+fn launch_preview_values_wrap_without_losing_words() {
+    let lines = wrap_kv_value("deadreckon start \"add charts\" --mode full-plan --yes", 18);
+
+    assert_eq!(
+        lines,
+        vec![
+            "deadreckon start".to_string(),
+            "\"add charts\"".to_string(),
+            "--mode full-plan".to_string(),
+            "--yes".to_string(),
+        ]
     );
 }
 

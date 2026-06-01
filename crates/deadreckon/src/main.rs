@@ -290,14 +290,93 @@ where
         .map(|(key, _)| key.as_ref().chars().count())
         .max()
         .unwrap_or(0);
+    let prefix_width = width + 2;
+    let value_width = kv_value_width(prefix_width);
     for (key, value) in items {
-        ui::writeln(
-            ui::Stream::Stdout,
-            ui::Tone::Plain,
-            format!("{:<width$}: {}", key.as_ref(), value.as_ref()),
-        )?;
+        let mut first = true;
+        for logical_line in value
+            .as_ref()
+            .lines()
+            .chain(value.as_ref().is_empty().then_some("").into_iter())
+        {
+            for line in wrap_kv_value(logical_line, value_width) {
+                let rendered = if first {
+                    first = false;
+                    format!("{:<width$}: {}", key.as_ref(), line)
+                } else {
+                    format!("{:prefix_width$}{}", "", line)
+                };
+                ui::writeln(ui::Stream::Stdout, ui::Tone::Plain, rendered)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn kv_value_width(prefix_width: usize) -> usize {
+    let terminal_width = crossterm::terminal::size()
+        .ok()
+        .map(|(columns, _)| usize::from(columns))
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|columns| columns.parse::<usize>().ok())
+        })
+        .filter(|columns| *columns > 1)
+        .unwrap_or(120)
+        .saturating_sub(1);
+    terminal_width.saturating_sub(prefix_width).max(20)
+}
+
+fn wrap_kv_value(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let words = value.split_whitespace().collect::<Vec<_>>();
+    if words.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in words {
+        push_wrapped_word(&mut lines, &mut current, word, width);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, word: &str, width: usize) {
+    if current.is_empty() {
+        push_word_chunks(lines, current, word, width);
+        return;
+    }
+    let current_len = current.chars().count();
+    let word_len = word.chars().count();
+    if current_len + 1 + word_len <= width {
+        current.push(' ');
+        current.push_str(word);
+        return;
+    }
+    lines.push(std::mem::take(current));
+    push_word_chunks(lines, current, word, width);
+}
+
+fn push_word_chunks(lines: &mut Vec<String>, current: &mut String, word: &str, width: usize) {
+    let mut remainder = word;
+    while remainder.chars().count() > width {
+        let chunk = remainder.chars().take(width).collect::<String>();
+        lines.push(chunk);
+        let byte_offset = remainder
+            .char_indices()
+            .nth(width)
+            .map(|(index, _)| index)
+            .unwrap_or(remainder.len());
+        remainder = &remainder[byte_offset..];
+    }
+    if !remainder.is_empty() {
+        current.push_str(remainder);
+    }
 }
 
 fn print_error(err: &CliError) {
@@ -6725,14 +6804,20 @@ where
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(180));
     let started = std::time::Instant::now();
     let mut tick = 0usize;
+    let mut printed = false;
     loop {
         tokio::select! {
             result = &mut future => {
-                clear_cli_wait_status();
+                if printed {
+                    finish_cli_wait_status();
+                } else {
+                    clear_cli_wait_status();
+                }
                 return result;
             }
             _ = interval.tick() => {
                 tick = tick.wrapping_add(1);
+                printed = true;
                 print_cli_wait_status(label, started.elapsed(), tick);
             }
         }
@@ -7040,6 +7125,11 @@ fn print_cli_wait_status(label: &str, elapsed: std::time::Duration, tick: usize)
 
 fn clear_cli_wait_status() {
     let _ = ui::clear_current_line(ui::Stream::Stderr);
+}
+
+fn finish_cli_wait_status() {
+    let _ = ui::clear_current_line(ui::Stream::Stderr);
+    eprintln!();
 }
 
 fn cli_wait_status_line(label: &str, elapsed: std::time::Duration, tick: usize) -> String {

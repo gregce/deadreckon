@@ -855,10 +855,7 @@ pub(crate) fn add_start_history_actions(
         format!("deadreckon start \"{goal}\" --mode review --yes"),
         format!("deadreckon start \"{goal}\" --mode full-plan --yes"),
     ];
-    decision.history_action_label = Some(format!(
-        "extend: {}; review: {}; full-plan: {}",
-        actions[0], actions[1], actions[2]
-    ));
+    decision.history_action_label = Some(format!("follow-up available from {prefix}"));
     decision.history_next_actions = actions;
 }
 
