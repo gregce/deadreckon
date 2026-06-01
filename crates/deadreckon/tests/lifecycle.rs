@@ -14,11 +14,15 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
+use deadreckon_core::flight::{
+    CheckpointBase, CheckpointBaseKind, CheckpointCaptureRequest, CheckpointTrigger,
+    build_working_file_index, capture_delta_checkpoint,
+};
 use deadreckon_core::{
     CodebaseMode, CodebaseRecord, DeadreckonPaths, PhaseId, PhaseStatus, PipelineState, RunOptions,
     RunStatus, TraceRecord, acquire_lock, append_trace, create_run, list_runs, load_run,
-    promote_completed_run, read_codebase_record, save_state, write_acceptance_marker,
-    write_codebase_record,
+    promote_completed_run, read_codebase_record, save_state, snapshot_working,
+    write_acceptance_marker, write_codebase_record,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1441,6 +1445,249 @@ fn finish_in_place_run_has_one_primary_action_and_demoted_secondary_actions() {
 }
 
 #[test]
+fn resume_completed_run_surface_has_one_noop_recommendation() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "resume completed parent");
+
+    let output = deadreckon(&paths)
+        .arg("resume")
+        .arg(&parent.run_id)
+        .output()
+        .expect("resume completed");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("no-op run "), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert!(stdout.contains("Evidence"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!("deadreckon show {}", &parent.run_id[..8]))
+            .count(),
+        1,
+        "{stdout}"
+    );
+}
+
+#[test]
+fn undo_rewind_surfaces_do_not_offer_multiple_primary_actions() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("workspace");
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "recovery surface".to_string(),
+            cwd,
+            sandbox: "none".to_string(),
+            provider: Some("mock".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(30.0),
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+
+    fs::write(state.working_dir.join("app.txt"), "before").expect("before");
+    snapshot_working(&state, 0).expect("snapshot");
+    let before = build_working_file_index(&state.working_dir).expect("before index");
+    fs::write(state.working_dir.join("app.txt"), "checkpoint").expect("checkpoint");
+    let checkpoint = build_working_file_index(&state.working_dir).expect("checkpoint index");
+    capture_delta_checkpoint(
+        &state,
+        &before,
+        &checkpoint,
+        CheckpointCaptureRequest {
+            checkpoint_id: "cp-000001".to_string(),
+            flight_session_id: "flight-turn-1-attempt-1".to_string(),
+            deadreckon_turn: 1,
+            attempt: 1,
+            provider_event_seq: Some(1),
+            trigger: CheckpointTrigger::ProviderTool,
+            base: CheckpointBase {
+                kind: CheckpointBaseKind::TurnSnapshot,
+                id: "turn-0".to_string(),
+            },
+            full_anchor: false,
+        },
+    )
+    .expect("checkpoint");
+    fs::write(state.working_dir.join("app.txt"), "current").expect("current");
+    state.turn = 1;
+    save_state(&state).expect("save");
+
+    let undo = deadreckon(&paths)
+        .arg("undo")
+        .arg("--run")
+        .arg(&state.run_id)
+        .arg("--turn")
+        .arg("0")
+        .output()
+        .expect("undo");
+    assert_success(&undo);
+    assert_eq!(
+        fs::read_to_string(state.working_dir.join("app.txt")).expect("app"),
+        "before"
+    );
+    let undo_stdout = stdout(&undo);
+    assert!(undo_stdout.starts_with("completed undo "), "{undo_stdout}");
+    assert_eq!(
+        undo_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{undo_stdout}"
+    );
+    assert_eq!(
+        undo_stdout
+            .matches(&format!("deadreckon show {}", &state.run_id[..8]))
+            .count(),
+        1,
+        "{undo_stdout}"
+    );
+
+    fs::write(state.working_dir.join("app.txt"), "current").expect("current again");
+    let rewind = deadreckon(&paths)
+        .arg("rewind")
+        .arg(&state.run_id)
+        .arg("--to-checkpoint")
+        .arg("cp-000001")
+        .output()
+        .expect("rewind");
+    assert_success(&rewind);
+    let rewind_stdout = stdout(&rewind);
+    assert!(
+        rewind_stdout.starts_with("preview rewind "),
+        "{rewind_stdout}"
+    );
+    assert!(rewind_stdout.contains("Explanation"), "{rewind_stdout}");
+    assert_eq!(
+        rewind_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{rewind_stdout}"
+    );
+    assert_eq!(
+        rewind_stdout
+            .matches(&format!(
+                "deadreckon rewind {} --to-checkpoint cp-000001 --apply",
+                &state.run_id[..8]
+            ))
+            .count(),
+        1,
+        "{rewind_stdout}"
+    );
+
+    let rewind_json = deadreckon(&paths)
+        .arg("rewind")
+        .arg(&state.run_id)
+        .arg("--to-checkpoint")
+        .arg("cp-000001")
+        .arg("--json")
+        .output()
+        .expect("rewind json");
+    assert_success(&rewind_json);
+    let value: Value = serde_json::from_slice(&rewind_json.stdout).expect("rewind json");
+    let expected_primary = format!(
+        "deadreckon rewind {} --to-checkpoint cp-000001 --apply",
+        &state.run_id[..8]
+    );
+    assert_eq!(
+        value["primary_action"].as_str(),
+        Some(expected_primary.as_str())
+    );
+    assert_eq!(
+        value["verdict"]["recommended_command"].as_str(),
+        Some(expected_primary.as_str())
+    );
+    assert_eq!(value["checkpoint_id"].as_str(), Some("cp-000001"));
+}
+
+#[test]
+fn cleanup_refusal_surface_has_one_safe_recovery_command() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths).arg("cleanup").output().expect("cleanup");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("no-op cleanup"), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert_eq!(
+        stdout.matches("deadreckon cleanup --completed").count(),
+        1,
+        "{stdout}"
+    );
+}
+
+#[test]
+fn abandon_surface_recommends_inspection_after_removing_worktree() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let worktree = temp.path().join("abandon-worktree");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "dr-abandon-test",
+            path_str(&worktree),
+        ],
+    )
+    .expect("worktree add");
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "abandon surface".to_string(),
+            cwd: repo.clone(),
+            sandbox: "none".to_string(),
+            provider: Some("mock".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(30.0),
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+    state.working_dir = worktree.clone();
+    save_state(&state).expect("save");
+    let mut record = CodebaseRecord::fresh();
+    record.mode = CodebaseMode::Worktree;
+    record.source_git_root = Some(repo.clone());
+    record.worktree_path = Some(worktree.clone());
+    record.branch_name = Some("dr-abandon-test".to_string());
+    write_codebase_record(&worktree, &record).expect("codebase record");
+
+    let output = deadreckon(&paths)
+        .arg("abandon")
+        .arg(&state.run_id)
+        .arg("--anyway")
+        .output()
+        .expect("abandon");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("completed abandon "), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!("deadreckon show {}", &state.run_id[..8]))
+            .count(),
+        1,
+        "{stdout}"
+    );
+    assert!(!worktree.exists(), "worktree should be removed");
+    assert!(!git_ref_exists(&repo, "dr-abandon-test"));
+}
+
+#[test]
 fn status_includes_library_count_and_disk_usage() {
     let temp = repo_tempdir();
     let (paths, parent) = completed_parent(&temp, "status library disk");
@@ -1587,6 +1834,10 @@ fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
+}
+
+fn path_str(path: &std::path::Path) -> &str {
+    path.to_str().expect("utf8 path")
 }
 
 fn git_ref_exists(cwd: &std::path::Path, reference: &str) -> bool {

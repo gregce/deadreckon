@@ -7690,13 +7690,10 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
             "campaign_killed",
             serde_json::json!({ "subs": campaign.n }),
         )?;
-        if !plain {
-            println!(
-                "campaign {} killed ({} subs)",
-                run_prefix(&campaign.campaign_id),
-                campaign.n
-            );
-        }
+        print!(
+            "{}",
+            commands::campaign::campaign_verdict_surface(&campaign, None).render_plain(false)
+        );
         return Ok(());
     }
     let mut state = match load_cli_run(&paths, &run_id) {
@@ -7712,7 +7709,6 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
         }
     };
     kill_loaded_run(&paths, &mut state, force)?;
-    print_kill_banner("run", &run_prefix(&state.run_id), force, None);
     print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain);
     Ok(())
 }
@@ -7833,14 +7829,42 @@ fn kill_plan_command(paths: &DeadreckonPaths, plan_id: &str, force: bool) -> Res
             reason: "killed by user".to_string(),
         },
     )?;
-    print_kill_banner("plan", &run_prefix(plan_id), force, Some(killed));
+    let id = run_prefix(plan_id);
+    let mut evidence = vec![
+        ("plan".to_string(), id.clone()),
+        ("status".to_string(), "killed".to_string()),
+        ("processes signalled".to_string(), killed.to_string()),
+        (
+            "events".to_string(),
+            paths.plan_events(plan_id).display().to_string(),
+        ),
+    ];
+    if force {
+        evidence.push(("signal".to_string(), "escalated".to_string()));
+    }
+    let primary = format!("deadreckon show {id} --why-failed");
+    let secondary = format!("deadreckon attach {id}");
+    print!(
+        "{}",
+        VerdictSurface::try_new(
+            VerdictKind::Killed,
+            "plan",
+            Some(&id),
+            ExplanationPanel::new(
+                "DeadReckon stopped the plan coordinator and any known live child work.",
+                "The plan is no longer advancing; inspect the failure record before cleanup or relaunch.",
+                evidence,
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![("Secondary", secondary.as_str())],
+        )
+        .expect("plan kill verdict surface must be valid")
+        .render_plain(false)
+    );
     Ok(())
 }
 
-fn print_kill_banner(kind: &str, id: &str, force: bool, processes: Option<u32>) {
-    println!("{}", kill_banner(kind, id, force, processes));
-}
-
+#[cfg(test)]
 fn kill_banner(kind: &str, id: &str, force: bool, processes: Option<u32>) -> String {
     let forcefully = if force { " forcefully" } else { "" };
     match processes {
@@ -7951,7 +7975,29 @@ async fn resume_command(
     let paths = DeadreckonPaths::discover();
     let mut state = load_cli_run(&paths, &run_id)?;
     if state.status == RunStatus::Completed {
-        println!("run {} is already completed", state.run_id);
+        let id = run_prefix(&state.run_id);
+        let primary = format!("deadreckon show {id}");
+        print!(
+            "{}",
+            VerdictSurface::try_new(
+                VerdictKind::Noop,
+                "run",
+                Some(&id),
+                ExplanationPanel::new(
+                    "DeadReckon did not resume the run because it is already completed.",
+                    "There is no incomplete provider turn to continue; inspect the completed record before starting follow-up work.",
+                    vec![
+                        ("run".to_string(), id.clone()),
+                        ("status".to_string(), "completed".to_string()),
+                        ("state".to_string(), state.run_root.display().to_string()),
+                    ],
+                ),
+                vec![("Recommended", primary.as_str())],
+                Vec::<(&str, &str)>::new(),
+            )
+            .expect("completed resume no-op verdict surface must be valid")
+            .render_plain(!completion_hints_enabled(false))
+        );
         return Ok(());
     }
     let mut lock = acquire_lock(
@@ -8070,7 +8116,41 @@ fn undo_command(run: Option<String>, turn: Option<u32>) -> Result<()> {
             detail: json!({ "snapshot": format!("turn-{target_turn}") }),
         },
     )?;
-    println!("restored run {} to turn {}", state.run_id, target_turn);
+    let id = run_prefix(&state.run_id);
+    let primary = format!("deadreckon show {id}");
+    print!(
+        "{}",
+        VerdictSurface::try_new(
+            VerdictKind::Completed,
+            "undo",
+            Some(&id),
+            ExplanationPanel::new(
+                format!("DeadReckon restored the run workspace to snapshot turn {target_turn}."),
+                "The snapshot restore completed; inspect the run state before resuming or making another recovery move.",
+                vec![
+                    ("run".to_string(), id.clone()),
+                    ("turn".to_string(), target_turn.to_string()),
+                    (
+                        "snapshot".to_string(),
+                        restore_state
+                            .run_root
+                            .join("snapshots")
+                            .join(format!("turn-{target_turn}"))
+                            .display()
+                            .to_string(),
+                    ),
+                    (
+                        "workspace".to_string(),
+                        restore_state.working_dir.display().to_string(),
+                    ),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            Vec::<(&str, &str)>::new(),
+        )
+        .expect("undo verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false))
+    );
     Ok(())
 }
 
@@ -8157,42 +8237,91 @@ fn rewind_command(run_id: &str, options: &RewindCliOptions) -> Result<()> {
         },
     )?;
 
+    let surface = rewind_verdict_surface(&state, mode, &resolved, &preview_dir, &files);
+
     if options.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string_pretty(&surface.add_to_json(json!({
                 "run_id": state.run_id,
                 "mode": rewind_mode_label(mode),
                 "target": resolved.target,
                 "checkpoint_id": resolved.checkpoint_id,
                 "preview_dir": preview_dir,
                 "files": files,
-            }))?
+            })))?
         );
         return Ok(());
     }
 
-    match mode {
-        RewindMode::Preview => {
-            println!(
-                "rewind preview {} -> {}",
-                resolved.checkpoint_id,
-                preview_dir.display()
-            );
-        }
-        RewindMode::Apply => {
-            println!("rewound {} to {}", state.run_id, resolved.checkpoint_id);
-        }
-    }
-    if files.is_empty() {
-        println!("files: none");
-    } else {
-        println!("files:");
-        for path in files {
-            println!("  {}", path.display());
-        }
-    }
+    print!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+fn rewind_verdict_surface(
+    state: &deadreckon_core::PipelineState,
+    mode: RewindMode,
+    resolved: &ResolvedRewindTarget,
+    preview_dir: &Path,
+    files: &[PathBuf],
+) -> VerdictSurface {
+    let id = run_prefix(&state.run_id);
+    let target = format!("{:?} {}", resolved.target.kind, resolved.target.id);
+    let mut evidence = vec![
+        ("run".to_string(), id.clone()),
+        ("checkpoint".to_string(), resolved.checkpoint_id.clone()),
+        ("target".to_string(), target),
+        ("changed files".to_string(), files.len().to_string()),
+        ("preview".to_string(), preview_dir.display().to_string()),
+    ];
+    for (index, path) in files.iter().take(5).enumerate() {
+        evidence.push((format!("file {}", index + 1), path.display().to_string()));
+    }
+    if files.len() > 5 {
+        evidence.push((
+            "additional files".to_string(),
+            (files.len() - 5).to_string(),
+        ));
+    }
+
+    let (kind, what, why, primary, secondary) = match mode {
+        RewindMode::Preview => (
+            VerdictKind::Preview,
+            format!(
+                "DeadReckon materialized checkpoint {} into a preview directory without changing the run workspace.",
+                resolved.checkpoint_id
+            ),
+            "This is a preview because the hash-guarded apply step has not run yet.".to_string(),
+            format!(
+                "deadreckon rewind {id} --to-checkpoint {} --apply",
+                resolved.checkpoint_id
+            ),
+            format!("deadreckon show {id} --flight"),
+        ),
+        RewindMode::Apply => (
+            VerdictKind::Completed,
+            format!(
+                "DeadReckon rewound the run workspace to checkpoint {}.",
+                resolved.checkpoint_id
+            ),
+            "The checkpoint passed the hash guard and the changed files were restored.".to_string(),
+            format!("deadreckon show {id}"),
+            format!(
+                "deadreckon rewind {id} --to-checkpoint {} --preview",
+                resolved.checkpoint_id
+            ),
+        ),
+    };
+
+    VerdictSurface::try_new(
+        kind,
+        "rewind",
+        Some(&id),
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", secondary.as_str())],
+    )
+    .expect("rewind verdict surface must be valid")
 }
 
 fn rewind_mode(options: &RewindCliOptions) -> Result<RewindMode> {

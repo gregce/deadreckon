@@ -2496,6 +2496,19 @@ fn kill_plan_cascade_cleans_all_children_in_under_5s() {
         .output()
         .expect("kill plan");
     assert_success(&output);
+    let kill_stdout = stdout(&output);
+    assert!(kill_stdout.starts_with("killed plan "), "{kill_stdout}");
+    assert!(kill_stdout.contains("Explanation"), "{kill_stdout}");
+    assert_eq!(
+        kill_stdout
+            .matches(&format!(
+                "deadreckon show {} --why-failed",
+                &plan.plan_id[..8]
+            ))
+            .count(),
+        1,
+        "{kill_stdout}"
+    );
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     let _ = fork.wait();
 

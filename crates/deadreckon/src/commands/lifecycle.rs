@@ -618,7 +618,26 @@ pub(crate) fn abandon_command(run_id: String, keep_branch: bool, force: bool) ->
     let paths = DeadreckonPaths::discover();
     let mut state = load_cli_run(&paths, &run_id)?;
     let Ok(record) = read_codebase_record(&state.working_dir) else {
-        println!("nothing to abandon for run {}", state.run_id);
+        print!(
+            "{}",
+            cleanup_noop_surface(
+                "abandon",
+                Some(&run_prefix(&state.run_id)),
+                "DeadReckon did not find a temporary worktree record for this run.",
+                "There is no worktree or temporary branch for abandon to remove; inspect the run before choosing another cleanup command.",
+                vec![
+                    ("run".to_string(), run_prefix(&state.run_id)),
+                    ("status".to_string(), run_status_label(state.status).to_string()),
+                    (
+                        "workspace".to_string(),
+                        state.working_dir.display().to_string(),
+                    ),
+                ],
+                format!("deadreckon show {}", run_prefix(&state.run_id)),
+                Vec::<String>::new(),
+            )
+            .render_plain(!completion_hints_enabled(false))
+        );
         return Ok(());
     };
     if record.mode == CodebaseMode::InPlace {
@@ -636,13 +655,15 @@ pub(crate) fn abandon_command(run_id: String, keep_branch: bool, force: bool) ->
         }
         let _ = kill_loaded_run(&paths, &mut state, true);
     }
-    cleanup_worktree_run(
+    let result = cleanup_worktree_run(
         &state,
         &record,
         keep_branch,
         force,
         CleanupReason::Abandoned,
-    )
+    )?;
+    print_cleanup_results(&[result]);
+    Ok(())
 }
 
 pub(crate) struct CleanupCommandRequest {
@@ -680,31 +701,24 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
             let _ = kill_loaded_run(&paths, &mut state, escalate);
         }
         let record = read_codebase_record(&state.working_dir)?;
-        cleanup_worktree_run(
+        let result = cleanup_worktree_run(
             &state,
             &record,
             keep_branch,
             overwrite,
             CleanupReason::Cleaned,
         )?;
+        print_cleanup_results(&[result]);
         return Ok(());
     }
 
     let candidates = cleanup_candidates(&paths, all, completed, stale)?;
     if candidates.is_empty() {
-        println!("no cleanup candidates");
-        if !completed {
-            let _ = ui::hint(
-                ui::Stream::Stderr,
-                "use `deadreckon cleanup --completed` to discard completed worktree runs",
-            );
-        }
-        if !all {
-            let _ = ui::hint(
-                ui::Stream::Stderr,
-                "use `deadreckon cleanup --all-scopes` to search every project",
-            );
-        }
+        print!(
+            "{}",
+            cleanup_no_candidates_surface(completed, all)
+                .render_plain(!completion_hints_enabled(false))
+        );
         return Ok(());
     }
 
@@ -731,18 +745,21 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
         }
     }
 
+    let mut results = Vec::new();
     for mut candidate in candidates {
         if candidate.state.status == RunStatus::Executing {
             let _ = kill_loaded_run(&paths, &mut candidate.state, escalate);
         }
-        cleanup_worktree_run(
+        let result = cleanup_worktree_run(
             &candidate.state,
             &candidate.record,
             keep_branch,
             overwrite,
             CleanupReason::Cleaned,
         )?;
+        results.push(result);
     }
+    print_cleanup_results(&results);
     Ok(())
 }
 
@@ -808,12 +825,23 @@ impl CleanupReason {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn subject(self) -> &'static str {
         match self {
-            Self::Abandoned => "abandoned",
-            Self::Applied | Self::Cleaned => "cleaned",
+            Self::Abandoned => "abandon",
+            Self::Applied | Self::Cleaned => "cleanup",
         }
     }
+}
+
+#[derive(Debug)]
+struct CleanupRunResult {
+    run_id: String,
+    status: RunStatus,
+    mode: CodebaseMode,
+    removed: Vec<String>,
+    keep_branch: bool,
+    force: bool,
+    reason: CleanupReason,
 }
 
 fn cleanup_worktree_run(
@@ -822,7 +850,7 @@ fn cleanup_worktree_run(
     keep_branch: bool,
     force: bool,
     reason: CleanupReason,
-) -> Result<()> {
+) -> Result<CleanupRunResult> {
     let mut removed = Vec::new();
     if record.mode == CodebaseMode::Worktree
         && let (Some(git_root), Some(worktree)) = (
@@ -848,11 +876,175 @@ fn cleanup_worktree_run(
         }
     }
     write_abandoned_marker(state, reason)?;
-    println!("{} {}", ui_ok(reason.label()), ui_id(&state.run_id));
-    for item in removed {
-        println!("  removed: {item}");
+    Ok(CleanupRunResult {
+        run_id: state.run_id.clone(),
+        status: state.status,
+        mode: record.mode,
+        removed,
+        keep_branch,
+        force,
+        reason,
+    })
+}
+
+fn print_cleanup_results(results: &[CleanupRunResult]) {
+    if results.len() == 1 {
+        print!(
+            "{}",
+            cleanup_result_surface(&results[0]).render_plain(!completion_hints_enabled(false))
+        );
+        return;
     }
-    Ok(())
+    let removed_count = results
+        .iter()
+        .map(|result| result.removed.len())
+        .sum::<usize>();
+    let subject = format!("{} runs", results.len());
+    let primary = "deadreckon status".to_string();
+    let secondary = "deadreckon list --all".to_string();
+    let mut evidence = vec![
+        ("runs".to_string(), results.len().to_string()),
+        ("removed entries".to_string(), removed_count.to_string()),
+    ];
+    for result in results.iter().take(5) {
+        evidence.push((
+            format!("run {}", run_prefix(&result.run_id)),
+            format!("{} removed", result.removed.len()),
+        ));
+    }
+    print!(
+        "{}",
+        VerdictSurface::try_new(
+            VerdictKind::Completed,
+            "cleanup",
+            Some(&subject),
+            ExplanationPanel::new(
+                "DeadReckon removed the selected temporary run worktrees and branches.",
+                "Cleanup completed across multiple runs; inspect status before starting another destructive cleanup.",
+                evidence,
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![("Secondary", secondary.as_str())],
+        )
+        .expect("aggregate cleanup verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false))
+    );
+}
+
+fn cleanup_result_surface(result: &CleanupRunResult) -> VerdictSurface {
+    let id = run_prefix(&result.run_id);
+    let primary = format!("deadreckon show {id}");
+    let secondary = "deadreckon status".to_string();
+    let mut evidence = vec![
+        ("run".to_string(), id.clone()),
+        (
+            "status".to_string(),
+            run_status_label(result.status).to_string(),
+        ),
+        ("mode".to_string(), result.mode.to_string()),
+        (
+            "removed entries".to_string(),
+            result.removed.len().to_string(),
+        ),
+        (
+            "branch".to_string(),
+            if result.keep_branch {
+                "kept".to_string()
+            } else {
+                "removed when present".to_string()
+            },
+        ),
+    ];
+    if result.force {
+        evidence.push(("force".to_string(), "true".to_string()));
+    }
+    for (index, item) in result.removed.iter().take(5).enumerate() {
+        evidence.push((format!("removed {}", index + 1), item.clone()));
+    }
+    if result.removed.len() > 5 {
+        evidence.push((
+            "additional removed entries".to_string(),
+            (result.removed.len() - 5).to_string(),
+        ));
+    }
+    let what = match result.reason {
+        CleanupReason::Abandoned => {
+            "DeadReckon marked the run abandoned and removed its temporary worktree resources."
+        }
+        CleanupReason::Applied => {
+            "DeadReckon removed temporary worktree resources after applying the run."
+        }
+        CleanupReason::Cleaned => {
+            "DeadReckon removed the selected temporary run worktree resources."
+        }
+    };
+    let why = match result.reason {
+        CleanupReason::Abandoned => {
+            "This is completed abandon cleanup; inspect the run record if you need provenance or docs."
+        }
+        CleanupReason::Applied | CleanupReason::Cleaned => {
+            "This is completed cleanup; inspect the run record before further recovery or deletion."
+        }
+    };
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        result.reason.subject(),
+        Some(&id),
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", secondary.as_str())],
+    )
+    .expect("cleanup verdict surface must be valid")
+}
+
+fn cleanup_no_candidates_surface(completed: bool, all: bool) -> VerdictSurface {
+    let mut secondary = Vec::new();
+    let primary = if !completed {
+        if !all {
+            secondary.push("deadreckon cleanup --all-scopes".to_string());
+        }
+        "deadreckon cleanup --completed".to_string()
+    } else if !all {
+        "deadreckon cleanup --all-scopes".to_string()
+    } else {
+        "deadreckon status".to_string()
+    };
+    cleanup_noop_surface(
+        "cleanup",
+        None,
+        "DeadReckon did not find any temporary run worktrees or branches matching this cleanup filter.",
+        "No cleanup mutation was made; broaden the safe filter if you expected completed or cross-scope candidates.",
+        vec![
+            ("completed filter".to_string(), completed.to_string()),
+            ("all scopes".to_string(), all.to_string()),
+        ],
+        primary,
+        secondary,
+    )
+}
+
+fn cleanup_noop_surface(
+    subject_kind: &str,
+    subject: Option<&str>,
+    what: impl Into<String>,
+    why: impl Into<String>,
+    evidence: Vec<(String, String)>,
+    primary: String,
+    secondary: Vec<String>,
+) -> VerdictSurface {
+    let secondary = secondary
+        .iter()
+        .map(|command| ("Secondary", command.as_str()))
+        .collect::<Vec<_>>();
+    VerdictSurface::try_new(
+        VerdictKind::Noop,
+        subject_kind,
+        subject,
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        secondary,
+    )
+    .expect("cleanup no-op verdict surface must be valid")
 }
 
 fn apply_mode_error(run_id: &str, mode: CodebaseMode) -> DeadreckonError {

@@ -2011,7 +2011,10 @@ pub(crate) fn chain_kill_command(paths: &DeadreckonPaths, id: &str, force: bool)
         json!({ "force": force }),
     )?;
     let _ = fs::remove_file(paths.conductor_json(&chain.chain_id));
-    print_kill_banner("chain", &chain_prefix(&chain.chain_id), force, None);
+    print!(
+        "{}",
+        chain_verdict_surface(paths, &chain).render_plain(false)
+    );
     Ok(())
 }
 

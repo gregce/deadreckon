@@ -855,8 +855,10 @@ fn campaign_primary_action(
         deadreckon_core::campaign::CampaignStatus::Failed => {
             format!("deadreckon show {id} --why-failed")
         }
-        deadreckon_core::campaign::CampaignStatus::Killed
-        | deadreckon_core::campaign::CampaignStatus::Forked
+        deadreckon_core::campaign::CampaignStatus::Killed => {
+            format!("deadreckon show {id} --why-failed")
+        }
+        deadreckon_core::campaign::CampaignStatus::Forked
         | deadreckon_core::campaign::CampaignStatus::Pending => format!("deadreckon attach {id}"),
         deadreckon_core::campaign::CampaignStatus::Merged => format!("deadreckon show {id}"),
     }

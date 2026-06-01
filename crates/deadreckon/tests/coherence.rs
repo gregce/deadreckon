@@ -1270,7 +1270,7 @@ fn chain_show_and_attach_plain_share_header_precision() {
 }
 
 #[test]
-fn top_level_kill_accepts_chain_id_and_uses_shared_banner() {
+fn kill_surface_explains_state_transition_and_next_inspection() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let cwd = temp.path().join("repo");
@@ -1308,8 +1308,18 @@ fn top_level_kill_accepts_chain_id_and_uses_shared_banner() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let stdout = stdout(&output);
-    assert!(
-        stdout.contains(&format!("killed chain {} forcefully", &chain.chain_id[..8])),
+    assert!(stdout.starts_with("killed chain "), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert!(stdout.contains("Evidence"), "{stdout}");
+    assert!(stdout.contains("Recommended"), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches(&format!(
+                "deadreckon chain show {} --why-failed",
+                &chain.chain_id[..8]
+            ))
+            .count(),
+        1,
         "{stdout}"
     );
 }
