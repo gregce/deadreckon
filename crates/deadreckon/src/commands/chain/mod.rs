@@ -1581,17 +1581,6 @@ fn chain_show_command(
 
 fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurface {
     let id = chain_prefix(&chain.chain_id);
-    let completed = chain
-        .steps
-        .iter()
-        .filter(|step| {
-            matches!(
-                step.status,
-                ChainStepStatus::Completed | ChainStepStatus::Applied
-            )
-        })
-        .count();
-    let total = chain.steps.len();
     let failed_step = chain
         .steps
         .iter()
@@ -1633,15 +1622,7 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
             "Inspection is the safest next command because there is no active chain work to advance.",
         ),
     };
-    let mut evidence = vec![
-        ("chain".to_string(), id.clone()),
-        ("status".to_string(), chain_status_label(chain).to_string()),
-        ("steps".to_string(), format!("{completed}/{total} complete")),
-        (
-            "state".to_string(),
-            paths.chain_json(&chain.chain_id).display().to_string(),
-        ),
-    ];
+    let mut evidence = chain_base_evidence(paths, chain);
     if let Some(reason) = chain
         .failure_reason
         .as_deref()
@@ -1679,6 +1660,58 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
             .collect::<Vec<_>>(),
     )
     .expect("chain verdict surface must have one primary action")
+}
+
+fn chain_transition_surface(
+    paths: &DeadreckonPaths,
+    chain: &Chain,
+    kind: VerdictKind,
+    what: &str,
+    why: &str,
+    mut evidence: Vec<(String, String)>,
+    primary: String,
+    secondary: Vec<String>,
+) -> VerdictSurface {
+    let id = chain_prefix(&chain.chain_id);
+    let mut all_evidence = chain_base_evidence(paths, chain);
+    all_evidence.append(&mut evidence);
+    VerdictSurface::try_new(
+        kind,
+        "chain",
+        Some(&id),
+        ExplanationPanel::new(what, why, all_evidence),
+        vec![("Recommended", primary.as_str())],
+        secondary
+            .iter()
+            .map(|command| ("Secondary", command.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("chain transition verdict surface must have one primary action")
+}
+
+fn chain_base_evidence(paths: &DeadreckonPaths, chain: &Chain) -> Vec<(String, String)> {
+    let completed = chain
+        .steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.status,
+                ChainStepStatus::Completed | ChainStepStatus::Applied
+            )
+        })
+        .count();
+    vec![
+        ("chain".to_string(), chain_prefix(&chain.chain_id)),
+        ("status".to_string(), chain_status_label(chain).to_string()),
+        (
+            "steps".to_string(),
+            format!("{completed}/{} complete", chain.steps.len()),
+        ),
+        (
+            "state".to_string(),
+            paths.chain_json(&chain.chain_id).display().to_string(),
+        ),
+    ]
 }
 
 fn chain_primary_action(chain: &Chain) -> String {
@@ -2101,6 +2134,7 @@ fn chain_undo_command(
         None,
         json!({ "count": applied.len() }),
     )?;
+    let undo_count = applied.len();
     applied.reverse();
     for (index, sha) in applied {
         git_status(&chain.cwd, &["revert", "--no-edit", &sha])?;
@@ -2117,7 +2151,21 @@ fn chain_undo_command(
     }
     chain.status = ChainStatus::Undone;
     save_chain(paths, &chain)?;
-    println!("undone {}", chain_prefix(&chain.chain_id));
+    let id = chain_prefix(&chain.chain_id);
+    print!(
+        "{}",
+        chain_transition_surface(
+            paths,
+            &chain,
+            VerdictKind::Noop,
+            "DeadReckon reverted the applied chain commits and marked the chain undone.",
+            "There is no active chain work to advance, so inspection is the safest next command.",
+            vec![("undone steps".to_string(), undo_count.to_string())],
+            format!("deadreckon chain show {id}"),
+            vec![format!("deadreckon chain redo {id}")],
+        )
+        .render_plain(false)
+    );
     Ok(())
 }
 
@@ -2165,10 +2213,20 @@ fn chain_extend_command(
         Some(insert as u32),
         json!({ "insert_at": insert }),
     )?;
-    println!("extended {}", chain_prefix(&chain.chain_id));
-    println!(
-        "next: deadreckon chain resume {}",
-        chain_prefix(&chain.chain_id)
+    let id = chain_prefix(&chain.chain_id);
+    print!(
+        "{}",
+        chain_transition_surface(
+            paths,
+            &chain,
+            VerdictKind::Preview,
+            "DeadReckon queued a new chain step.",
+            "The chain has stored work that has not run yet, so resume is the safest next command.",
+            vec![("inserted step".to_string(), (insert + 1).to_string())],
+            format!("deadreckon chain resume {id}"),
+            vec![format!("deadreckon chain show {id}")],
+        )
+        .render_plain(false)
     );
     Ok(())
 }
@@ -2240,10 +2298,20 @@ fn chain_redo_command(
         Some(index as u32),
         json!({ "prior_goal": prior_goal, "new_goal": chain.steps[index].goal }),
     )?;
-    println!("redo queued {}", chain_prefix(&chain.chain_id));
-    println!(
-        "next: deadreckon chain resume {}",
-        chain_prefix(&chain.chain_id)
+    let id = chain_prefix(&chain.chain_id);
+    print!(
+        "{}",
+        chain_transition_surface(
+            paths,
+            &chain,
+            VerdictKind::Preview,
+            "DeadReckon reset a chain step for redo.",
+            "The selected step is pending again, so resume is the safest next command.",
+            vec![("redo step".to_string(), (index + 1).to_string())],
+            format!("deadreckon chain resume {id}"),
+            vec![format!("deadreckon chain show {id}")],
+        )
+        .render_plain(false)
     );
     Ok(())
 }

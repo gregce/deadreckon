@@ -197,11 +197,12 @@ fn chain_paused_surface_recommends_resume_once() {
     assert_success(&human);
     let stdout = stdout(&human);
     assert!(stdout.starts_with("paused chain "), "{stdout}");
-    assert_eq!(
-        stdout
-            .matches(&format!("deadreckon chain resume {}", &chain.chain_id[..8]))
-            .count(),
-        1,
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon chain resume {}",
+            &chain.chain_id[..8]
+        )),
         "{stdout}"
     );
 }
@@ -1170,6 +1171,19 @@ fn chain_extend_appends_step_and_writes_event() {
     let chain = newest_chain(&paths);
     assert_eq!(chain.steps.len(), 3);
     assert_eq!(chain.steps[2].goal, "three");
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("preview chain "), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon chain resume {}",
+            &chain.chain_id[..8]
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("next:"), "{stdout}");
     let events = fs::read_to_string(paths.chain_events(&chain.chain_id)).expect("events");
     assert!(events.contains("chain_step_extended"));
 }
@@ -1243,6 +1257,19 @@ fn chain_undo_records_undone_step_events() {
     assert_success(&output);
     let chain = newest_chain(&paths);
     assert_eq!(chain.status, ChainStatus::Undone);
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("no-op chain "), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon chain show {}",
+            &chain.chain_id[..8]
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("next:"), "{stdout}");
     let events = fs::read_to_string(paths.chain_events(&chain.chain_id)).expect("events");
     assert!(events.contains("chain_undone_step"));
 }
@@ -2652,16 +2679,28 @@ fn chain_redo_default_picks_first_failed_step() {
     chain.steps[0].status = ChainStepStatus::Failed;
     save_test_chain(&paths, &chain);
 
-    assert_success(
-        &deadreckon(&paths)
-            .current_dir(&repo)
-            .args(["chain", "redo", "latest"])
-            .output()
-            .expect("redo"),
-    );
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "redo", "latest"])
+        .output()
+        .expect("redo");
 
+    assert_success(&output);
     let chain = newest_chain(&paths);
     assert_eq!(chain.steps[0].status, ChainStepStatus::Pending);
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("preview chain "), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon chain resume {}",
+            &chain.chain_id[..8]
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("next:"), "{stdout}");
 }
 
 #[test]
