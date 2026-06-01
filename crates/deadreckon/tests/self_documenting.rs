@@ -1387,8 +1387,15 @@ fn no_doc_provider_emits_install_try_hint() {
         .output()
         .expect("doc");
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("no doc provider available"));
-    assert!(stderr(&output).contains("try: install codex or claude"));
+    let err = stderr(&output);
+    assert!(err.contains("no doc provider available"), "{err}");
+    assert_eq!(err.matches("try:").count(), 1, "{err}");
+    assert!(
+        err.contains("try: deadreckon config set defaults.doc_provider cli:codex"),
+        "{err}"
+    );
+    assert!(!err.contains("try: install codex or claude"), "{err}");
+    assert!(!err.contains("try: deadreckon doctor"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

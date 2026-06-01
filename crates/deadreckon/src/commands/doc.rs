@@ -76,10 +76,11 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
         )?;
         let selection = doc_provider_selection_from_setup(&setup_selection);
         let Some(provider) = selection.provider.clone() else {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                "deadreckon: no doc provider available",
-                "deadreckon config set defaults.doc_provider cli:codex\ntry: install codex or claude; deadreckon auto-detects subscription CLIs on the next run",
-            )));
+            return Err(CliError::Exit {
+                code: 1,
+                message: "deadreckon: no doc provider available; configure a doc provider after installing codex or claude".to_string(),
+                hint: "deadreckon config set defaults.doc_provider cli:codex".to_string(),
+            });
         };
         let subskills = effective_doc_subskills(&defaults);
         let token_budget = defaults
