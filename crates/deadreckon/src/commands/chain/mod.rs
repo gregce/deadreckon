@@ -1055,11 +1055,15 @@ async fn run_chain_step(
     }
     live_run_id
         .or_else(|| parse_started_run_id(&stdout_text))
-        .ok_or_else(|| {
-            CliError::Core(DeadreckonError::InvalidInput(
-                "could not find inner run id in run output\ntry: deadreckon list".to_string(),
-            ))
-        })
+        .ok_or_else(missing_inner_run_id_error)
+}
+
+fn missing_inner_run_id_error() -> CliError {
+    CliError::Exit {
+        code: 1,
+        message: "could not find inner run id in run output".to_string(),
+        hint: "deadreckon list".to_string(),
+    }
 }
 
 pub(crate) fn spawn_chain_step_reader<R: Read + Send + 'static>(
@@ -2778,4 +2782,26 @@ fn print_chain_paused_footer(paths: &DeadreckonPaths, chain: &Chain) {
         "{}",
         chain_verdict_surface(paths, chain).render_plain(false)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_inner_run_id_error_has_one_primary_hint() {
+        match missing_inner_run_id_error() {
+            CliError::Exit {
+                code,
+                message,
+                hint,
+            } => {
+                assert_eq!(code, 1);
+                assert_eq!(message, "could not find inner run id in run output");
+                assert_eq!(hint, "deadreckon list");
+                assert!(!message.contains("try:"));
+            }
+            other => panic!("expected exit error, got {other:?}"),
+        }
+    }
 }
