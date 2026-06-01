@@ -1519,8 +1519,15 @@ fn post_apply_hint_includes_git_log_one_stat() {
     assert!(stdout.contains(&format!("applied {run_id} into")));
     assert!(stdout.contains("commit "));
     assert!(stdout.contains("Cargo.toml"));
-    assert!(stdout.contains(&format!("next: deadreckon cleanup {}", &run_id[..8])));
-    assert!(stdout.contains("completed run"), "{stdout}");
+    assert!(stdout.contains("completed apply"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!("Recommended\ndeadreckon cleanup {}", &run_id[..8])),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("next:"), "{stdout}");
     assert!(!stdout.contains('\u{1b}'), "{stdout}");
 }
 

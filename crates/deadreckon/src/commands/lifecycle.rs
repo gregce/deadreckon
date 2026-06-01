@@ -335,7 +335,7 @@ fn apply_command_inner(
     cleanup: bool,
     message: Option<String>,
     quiet: bool,
-    plain: bool,
+    _plain: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = match load_cli_run(&paths, &run_id) {
@@ -381,11 +381,13 @@ fn apply_command_inner(
         if !quiet {
             print_already_applied(&state, branch, &target);
         }
-        let summary =
-            (!quiet).then(|| render_exit_summary_card(&state, &RunLoopOutcome::Done, plain));
-        finish_apply_cleanup(&state, &record, cleanup, no_confirm, quiet)?;
-        if let Some(summary) = summary {
-            print!("{summary}");
+        let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
+        if !quiet {
+            print!(
+                "{}",
+                apply_completed_surface(&state, &record, &target, cleaned)
+                    .render_plain(!completion_hints_enabled(false))
+            );
         }
         return Ok(());
     }
@@ -443,11 +445,13 @@ fn apply_command_inner(
                 if !quiet {
                     print_already_applied(&state, branch, &target);
                 }
-                let summary = (!quiet)
-                    .then(|| render_exit_summary_card(&state, &RunLoopOutcome::Done, plain));
-                finish_apply_cleanup(&state, &record, cleanup, no_confirm, quiet)?;
-                if let Some(summary) = summary {
-                    print!("{summary}");
+                let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
+                if !quiet {
+                    print!(
+                        "{}",
+                        apply_completed_surface(&state, &record, &target, cleaned)
+                            .render_plain(!completion_hints_enabled(false))
+                    );
                 }
                 return Ok(());
             }
@@ -480,10 +484,13 @@ fn apply_command_inner(
         );
         println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
     }
-    let summary = (!quiet).then(|| render_exit_summary_card(&state, &RunLoopOutcome::Done, plain));
-    finish_apply_cleanup(&state, &record, cleanup, no_confirm, quiet)?;
-    if let Some(summary) = summary {
-        print!("{summary}");
+    let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
+    if !quiet {
+        print!(
+            "{}",
+            apply_completed_surface(&state, &record, &target, cleaned)
+                .render_plain(!completion_hints_enabled(false))
+        );
     }
     Ok(())
 }
@@ -500,24 +507,80 @@ fn print_already_applied(state: &deadreckon_core::PipelineState, branch: &str, t
     println!("  reason: no file changes remain between the run branch and target branch");
 }
 
+fn apply_completed_surface(
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
+    target: &str,
+    cleaned: bool,
+) -> VerdictSurface {
+    let id = run_prefix(&state.run_id);
+    let primary = if cleaned {
+        format!("deadreckon show {id}")
+    } else {
+        format!("deadreckon cleanup {id}")
+    };
+    let secondary = if cleaned {
+        "deadreckon status".to_string()
+    } else {
+        format!("deadreckon show {id}")
+    };
+    let mut evidence = vec![
+        ("run".to_string(), id.clone()),
+        ("target branch".to_string(), target.to_string()),
+        (
+            "run branch".to_string(),
+            record
+                .branch_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        ("mode".to_string(), record.mode.to_string()),
+        (
+            "cleanup".to_string(),
+            if cleaned {
+                "completed".to_string()
+            } else {
+                "pending".to_string()
+            },
+        ),
+    ];
+    if let Some(worktree) = record.worktree_path.as_ref() {
+        evidence.push(("worktree".to_string(), worktree.display().to_string()));
+    }
+    if let Some(source) = record.source_git_root.as_ref() {
+        evidence.push(("source git root".to_string(), source.display().to_string()));
+    }
+    let why = if cleaned {
+        "The apply transition is complete and temporary resources were removed; inspect the run record before further cleanup or recovery."
+    } else {
+        "The apply transition is complete, but the temporary worktree resources remain; cleanup is the safest next command."
+    };
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "apply",
+        Some(&id),
+        ExplanationPanel::new(
+            "DeadReckon applied or confirmed the run branch in the target checkout.",
+            why,
+            evidence,
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", secondary.as_str())],
+    )
+    .expect("apply completion verdict surface must be valid")
+}
+
 fn finish_apply_cleanup(
     state: &deadreckon_core::PipelineState,
     record: &CodebaseRecord,
     cleanup: bool,
     no_confirm: bool,
-    quiet: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let cleanup_now = cleanup || should_prompt_cleanup(no_confirm)?;
     if cleanup_now {
         cleanup_worktree_run(state, record, false, false, CleanupReason::Applied)?;
-    } else if !quiet {
-        println!(
-            "{} {}",
-            ui_command("next:"),
-            ui_command(format!("deadreckon cleanup {}", run_prefix(&state.run_id)))
-        );
     }
-    Ok(())
+    Ok(cleanup_now)
 }
 
 #[derive(Debug, Clone)]
