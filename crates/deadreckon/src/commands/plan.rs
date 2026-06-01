@@ -592,6 +592,139 @@ pub(crate) fn plan_next_actions(plan: &Plan) -> Vec<String> {
     }
 }
 
+pub(crate) fn plan_next_actions_with_context(paths: &DeadreckonPaths, plan: &Plan) -> Vec<String> {
+    let id = run_prefix(&plan.plan_id);
+    match plan.status {
+        PlanStatus::Failed if plan_has_repair_evidence(paths, plan) => vec![
+            format!("deadreckon merge {id}"),
+            format!("deadreckon show {id} --why-failed"),
+        ],
+        _ => plan_next_actions(plan),
+    }
+}
+
+pub(crate) fn plan_verdict_surface(paths: &DeadreckonPaths, plan: &Plan) -> VerdictSurface {
+    let id = run_prefix(&plan.plan_id);
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .count();
+    let total = plan.tasks.len();
+    let repairable = plan_has_repair_evidence(paths, plan);
+    let (kind, what, why) = match plan.status {
+        PlanStatus::Pending => (
+            VerdictKind::Preview,
+            "DeadReckon wrote the plan graph, but no child run has started yet.",
+            "This is a pre-fork plan state; forking is the one command that advances it.",
+        ),
+        PlanStatus::Forked
+            if plan
+                .tasks
+                .iter()
+                .all(|task| task.status == PlanTaskStatus::Completed) =>
+        {
+            (
+                VerdictKind::Completed,
+                "All child runs completed and the plan is ready to merge.",
+                "The next state-changing command composes the child artifacts into one result.",
+            )
+        }
+        PlanStatus::Forked => (
+            VerdictKind::Paused,
+            "The plan has launched child work and is not merged yet.",
+            "Attaching is the safest next command because the plan still has active or pending child state.",
+        ),
+        PlanStatus::Merged => (
+            VerdictKind::Completed,
+            "The plan merged its child results into a promoted result run.",
+            "DeadReckon has a merged artifact; the recommended command lands or exports that result.",
+        ),
+        PlanStatus::Failed if repairable => (
+            VerdictKind::Failed,
+            "The plan stopped before producing a merged result.",
+            "Merge-repair evidence exists, so rerunning merge is the safest recovery path before inspection-only commands.",
+        ),
+        PlanStatus::Failed => (
+            VerdictKind::Failed,
+            "The plan stopped before producing a merged result.",
+            "No repair evidence is available, so the why-failed view is the safest next inspection command.",
+        ),
+    };
+    let mut evidence = vec![
+        ("plan".to_string(), id.clone()),
+        (
+            "status".to_string(),
+            plan_status_label(plan.status).to_string(),
+        ),
+        (
+            "tasks".to_string(),
+            format!("{completed}/{total} completed"),
+        ),
+        (
+            "events".to_string(),
+            paths.plan_events(&plan.plan_id).display().to_string(),
+        ),
+    ];
+    if let Some(merged_run_id) = plan.merged_run_id.as_deref() {
+        evidence.push(("result run".to_string(), run_prefix(merged_run_id)));
+    }
+    if repairable {
+        evidence.push((
+            "repair evidence".to_string(),
+            paths.merge_proofs(&plan.plan_id).display().to_string(),
+        ));
+    }
+    let primary = plan_next_actions_with_context(paths, plan)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| format!("deadreckon show {id}"));
+    let secondary = plan_secondary_actions(paths, plan, &primary);
+    VerdictSurface::try_new(
+        kind,
+        "plan",
+        Some(&id),
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        secondary
+            .iter()
+            .map(|command| ("Secondary", command.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("plan verdict surface must have one primary action")
+}
+
+fn plan_secondary_actions(paths: &DeadreckonPaths, plan: &Plan, primary: &str) -> Vec<String> {
+    let id = run_prefix(&plan.plan_id);
+    let mut actions = Vec::new();
+    for command in plan_next_actions_with_context(paths, plan) {
+        if command != primary && !actions.contains(&command) {
+            actions.push(command);
+        }
+    }
+    for command in [
+        format!("deadreckon attach {id}"),
+        format!("deadreckon show {id} --why-failed"),
+    ] {
+        if command != primary && !actions.contains(&command) {
+            actions.push(command);
+        }
+    }
+    actions
+}
+
+fn plan_has_repair_evidence(paths: &DeadreckonPaths, plan: &Plan) -> bool {
+    let proofs = paths.merge_proofs(&plan.plan_id);
+    [
+        "conflicts.json",
+        "repair-request.json",
+        "repair-plan.json",
+        "repair-run.json",
+    ]
+    .iter()
+    .any(|name| proofs.join(name).is_file())
+}
+
 pub(crate) fn plan_paths_json(plan: &Plan) -> Value {
     let paths = DeadreckonPaths::discover();
     json!({
@@ -602,18 +735,17 @@ pub(crate) fn plan_paths_json(plan: &Plan) -> Value {
 }
 
 fn print_plan_json(plan: &Plan) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "kind": "plan",
-            "id": &plan.plan_id,
-            "status": plan_status_label(plan.status),
-            "next_actions": plan_next_actions(plan),
-            "try_lines": Vec::<String>::new(),
-            "paths": plan_paths_json(plan),
-            "plan": plan,
-        }))?
-    );
+    let paths = DeadreckonPaths::discover();
+    let value = plan_verdict_surface(&paths, plan).add_to_json(json!({
+        "kind": "plan",
+        "id": &plan.plan_id,
+        "status": plan_status_label(plan.status),
+        "next_actions": plan_next_actions_with_context(&paths, plan),
+        "try_lines": Vec::<String>::new(),
+        "paths": plan_paths_json(plan),
+        "plan": plan,
+    }));
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 

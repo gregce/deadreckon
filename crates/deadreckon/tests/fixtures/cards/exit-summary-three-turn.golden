@@ -1,6 +1,16 @@
 +--------------------------------------------------------------------------------------+
 | * VERIFIED                                                                           |
 |   verified run, verified by dr-gate; completed run by cli:codex on branch dr/ship... |
+|   Explanation                                                                        |
+|   The provider finished and acceptance checks passed.                                |
+|   DeadReckon has a verified result; the recommended command lands or exports the ... |
+|                                                                                      |
+|   Evidence                                                                           |
+|   run            abc12345                                                            |
+|   provider       cli:codex                                                           |
+|   gate           passed by dr-gate (2 checks)                                        |
+|   working        /tmp/work                                                           |
+|   changed files  3                                                                   |
 |   turns         3                                                                    |
 |   tokens        in 100  out 50                                                       |
 |   spend         not metered (subscription) · wall 12.5s · 3 turns                    |

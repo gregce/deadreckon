@@ -52,6 +52,107 @@ fn plan_writes_plan_json_with_n_tasks() {
 }
 
 #[test]
+fn plan_completed_surface_uses_lifecycle_primary_action_json() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "json verdict plan",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+            "--json",
+        ])
+        .output()
+        .expect("plan json");
+
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["kind"], "plan");
+    assert_eq!(value["verdict"]["kind"], "preview");
+    assert_eq!(
+        value["primary_action"],
+        value["verdict"]["recommended_command"]
+    );
+    assert_eq!(value["primary_action"], value["next_actions"][0]);
+    assert_eq!(
+        value["primary_action"],
+        format!(
+            "deadreckon fork {}",
+            &value["id"].as_str().expect("id")[..8]
+        )
+    );
+    assert!(
+        value["verdict"]["explanation"]
+            .as_str()
+            .expect("explanation")
+            .contains("plan graph")
+    );
+}
+
+#[test]
+fn plan_failed_surface_recommends_why_failed_or_merge_once_json() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "failed json verdict plan",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.status = PlanStatus::Failed;
+    save_plan(&paths, &plan).expect("save failed plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["show", &plan.plan_id[..8], "--json"])
+        .output()
+        .expect("show plan json");
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["verdict"]["kind"], "failed");
+    assert_eq!(
+        value["primary_action"],
+        value["verdict"]["recommended_command"]
+    );
+    assert_eq!(value["primary_action"], value["next_actions"][0]);
+    assert_eq!(
+        value["primary_action"],
+        format!("deadreckon show {} --why-failed", &plan.plan_id[..8])
+    );
+    assert_eq!(
+        value["next_actions"]
+            .as_array()
+            .expect("next actions")
+            .iter()
+            .filter(|action| action.as_str() == value["primary_action"].as_str())
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn plan_writes_plan_created_event_when_saved() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

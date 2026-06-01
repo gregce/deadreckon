@@ -78,6 +78,33 @@ fn exit_card_leads_with_one_verdict_and_one_primary_action() {
 }
 
 #[test]
+fn run_completed_surface_has_one_verdict_one_primary_action_and_explanation() {
+    let rendered = render_card(
+        &build_exit_summary_card(&input(OutcomeKind::Completed)),
+        &CardOptions {
+            color: false,
+            plain: true,
+            terminal_columns: Some(140),
+            no_color_env: false,
+        },
+    );
+
+    assert!(
+        rendered.contains(&format!("* {VERDICT_VERIFIED}")),
+        "{rendered}"
+    );
+    assert_eq!(primary_action_count(&rendered), 1, "{rendered}");
+    assert!(rendered.contains("Explanation"), "{rendered}");
+    assert!(
+        rendered.contains("The provider finished and acceptance checks passed."),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Evidence"), "{rendered}");
+    assert!(rendered.contains("run"), "{rendered}");
+    assert!(rendered.contains("abc12345"), "{rendered}");
+}
+
+#[test]
 fn paused_and_failed_cards_each_have_one_primary_action() {
     let mut paused = input(OutcomeKind::Paused);
     paused.hints = vec![
@@ -133,6 +160,78 @@ fn paused_and_failed_cards_each_have_one_primary_action() {
         line_index(&failed, "next", "deadreckon show abc12345 --why-failed")
             < line_index(&failed, "resume", "deadreckon resume abc12345"),
         "{failed}"
+    );
+}
+
+#[test]
+fn run_failed_surface_recommends_show_why_failed_once_with_explanation() {
+    let mut failed = input(OutcomeKind::Failed);
+    failed.hints = vec![
+        (
+            "why".to_string(),
+            "deadreckon show abc12345 --why-failed".to_string(),
+        ),
+        (
+            "resume".to_string(),
+            "deadreckon resume abc12345".to_string(),
+        ),
+    ];
+    let rendered = render_card(
+        &build_exit_summary_card(&failed),
+        &CardOptions {
+            color: false,
+            plain: true,
+            terminal_columns: Some(140),
+            no_color_env: false,
+        },
+    );
+
+    assert!(rendered.contains("! failed run"), "{rendered}");
+    assert_eq!(primary_action_count(&rendered), 1, "{rendered}");
+    assert_eq!(
+        rendered
+            .matches("deadreckon show abc12345 --why-failed")
+            .count(),
+        1,
+        "{rendered}"
+    );
+    assert!(rendered.contains("Explanation"), "{rendered}");
+    assert!(
+        rendered.contains("The run ended before producing a verified result."),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn run_paused_surface_recommends_resume_once_with_explanation() {
+    let mut paused = input(OutcomeKind::Paused);
+    paused.hints = vec![
+        (
+            "resume".to_string(),
+            "deadreckon resume abc12345".to_string(),
+        ),
+        ("show".to_string(), "deadreckon show abc12345".to_string()),
+    ];
+    let rendered = render_card(
+        &build_exit_summary_card(&paused),
+        &CardOptions {
+            color: false,
+            plain: true,
+            terminal_columns: Some(140),
+            no_color_env: false,
+        },
+    );
+
+    assert!(rendered.contains("~ paused run"), "{rendered}");
+    assert_eq!(primary_action_count(&rendered), 1, "{rendered}");
+    assert_eq!(
+        rendered.matches("deadreckon resume abc12345").count(),
+        1,
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("No final acceptance verdict exists yet"),
+        "{rendered}"
     );
 }
 

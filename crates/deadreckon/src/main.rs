@@ -40,6 +40,7 @@ use deadreckon::sleep::{self, SleepPrefs, SleepPrevention};
 use deadreckon::ui_card::{
     Card, CardOptions, HintLine, Section, TitleGlyph, TitleLine, Tone, render_card,
 };
+use deadreckon::verdict_surface::{ExplanationPanel, VerdictKind, VerdictSurface};
 use deadreckon_core::flight::{
     CheckpointManifest, FLIGHT_EVENTS_JSONL, FlightEvent, FlightEventKind, FlightSessionStatus,
     RewindEvent, RewindMode, RewindStatus, RewindTarget, RewindTargetKind, append_rewind_event,
@@ -8887,13 +8888,12 @@ fn show_command(
                 if let Ok(plan_id) = resolve_plan_id(&paths, run_id) {
                     let plan = load_plan(&paths, &plan_id)?;
                     if json_output {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json!({
+                        let value = commands::plan::plan_verdict_surface(&paths, &plan)
+                            .add_to_json(json!({
                                 "kind": "plan",
                                 "id": &plan.plan_id,
                                 "status": plan_status_label(plan.status),
-                                "next_actions": commands::plan::plan_next_actions(&plan),
+                                "next_actions": commands::plan::plan_next_actions_with_context(&paths, &plan),
                                 "try_lines": Vec::<String>::new(),
                                 "paths": commands::plan::plan_paths_json(&plan),
                                 "docs": {
@@ -8904,8 +8904,8 @@ fn show_command(
                                     "children": plan_doc_path(&paths, &plan.plan_id, PLAN_CHILDREN),
                                 },
                                 "plan": plan,
-                            }))?
-                        );
+                            }));
+                        println!("{}", serde_json::to_string_pretty(&value)?);
                         return Ok(());
                     }
                     if why_failed {

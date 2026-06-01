@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::proof_block::ProofBlock;
 use crate::ui_card::{Card, HintLine, MetricColumn, Section, TitleGlyph, TitleLine, Tone};
+use crate::verdict_surface::ExplanationPanel;
 use deadreckon_core::glossary::{NOUN_VERIFIED_RUN, PHRASE_VERIFIED_BY_DR_GATE, VERDICT_VERIFIED};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,7 +54,8 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
         OutcomeKind::Killed => (TitleGlyph::Stopped, "killed run", Tone::Bad),
         OutcomeKind::Failed => (TitleGlyph::Failed, "failed run", Tone::Bad),
     };
-    let mut sections = vec![
+    let mut sections = exit_summary_explanation(input).sections();
+    sections.extend([
         Section::Metric {
             label: "turns".to_string(),
             columns: vec![MetricColumn {
@@ -81,7 +83,7 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
                 tone: Tone::Neutral,
             }],
         },
-    ];
+    ]);
     if let Some(diff) = input.diff.as_ref() {
         sections.push(Section::Metric {
             label: "branch diff".to_string(),
@@ -179,6 +181,46 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
             })
             .collect(),
     }
+}
+
+fn exit_summary_explanation(input: &ExitSummaryInput) -> ExplanationPanel {
+    let (what_happened, why_this_verdict) = match input.outcome {
+        OutcomeKind::Completed => (
+            "The provider finished and acceptance checks passed.",
+            "DeadReckon has a verified result; the recommended command lands or exports the produced changes.",
+        ),
+        OutcomeKind::Paused => (
+            "The run stopped before the provider produced a final result.",
+            "No final acceptance verdict exists yet, but the run is still resumable.",
+        ),
+        OutcomeKind::Killed => (
+            "The run was stopped by operator or supervisor control.",
+            "DeadReckon cannot treat a killed run as complete; inspect it before resuming or cleaning up.",
+        ),
+        OutcomeKind::Failed => (
+            "The run ended before producing a verified result.",
+            "DeadReckon needs failure inspection before the work can be continued or applied.",
+        ),
+    };
+    let mut evidence = vec![
+        ("run".to_string(), input.run_id.chars().take(8).collect()),
+        ("provider".to_string(), input.provider.clone()),
+        ("gate".to_string(), input.gate.clone()),
+        (
+            "working".to_string(),
+            input.working_dir.display().to_string(),
+        ),
+    ];
+    if let Some(diff) = input.diff.as_ref() {
+        evidence.push((
+            "changed files".to_string(),
+            (diff.files_added + diff.files_updated + diff.files_deleted).to_string(),
+        ));
+    }
+    if input.proof_block.is_none() {
+        evidence.push(("proof".to_string(), input.proof_path.display().to_string()));
+    }
+    ExplanationPanel::new(what_happened, why_this_verdict, evidence)
 }
 
 fn exit_summary_subtitle(input: &ExitSummaryInput) -> String {

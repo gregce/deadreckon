@@ -64,6 +64,12 @@ verb.
 | `run` | One-command rollback | pass | Worktree runs can be abandoned and in-place runs have undo snapshots. |
 | `run` | One verdict + ONE primary action | pass | Exit cards now distinguish one primary next action and demote the rest. |
 | `run` | Lifecycle hint | pass | Completion hints point to attach/show/apply/finish/cleanup. |
+| `seams` | Auto-detect, don't ask | pass | Validation targets an explicit seam worker kind and config path without prompting. |
+| `seams` | Preview before mutate | n-a | Seam validation is read-only and does not mutate workspace or run state. |
+| `seams` | Refuse with try: | pass | Missing or invalid seam worker configuration reports a concrete validation/config recovery command. |
+| `seams` | One-command rollback | n-a | Seam validation has no durable mutation to roll back. |
+| `seams` | One verdict + ONE primary action | fail | Validation summaries have not adopted the Verdict Surface primary-action slot. |
+| `seams` | Lifecycle hint | pass | Help and diagnostics point back to `run --no-seams` or focused seam validation. |
 | `orchestrate` | Auto-detect, don't ask | pass | Explicit mode/provider flags avoid extra prompts; auto chooses a conservative path. |
 | `orchestrate` | Preview before mutate | pass | Preview and final confirmation precede plan creation/forking. |
 | `orchestrate` | Refuse with try: | pass | Planner/provider/source refusals include concrete launch commands. |

@@ -95,6 +95,10 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
         marks: [P, P, P, P, P, P],
     },
     VerbFriendliness {
+        verb: "seams",
+        marks: [P, N, P, N, F, P],
+    },
+    VerbFriendliness {
         verb: "orchestrate",
         marks: [P, P, P, P, F, P],
     },
