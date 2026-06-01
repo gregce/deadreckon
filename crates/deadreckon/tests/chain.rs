@@ -239,6 +239,56 @@ fn chain_completed_surface_has_one_verdict_and_explanation() {
 }
 
 #[test]
+fn chain_empty_status_surface_has_one_primary_action() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "status"])
+        .output()
+        .expect("chain status");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("no-op chain status"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon chain \"step one\" \"step two\""),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("try:"), "{stdout}");
+}
+
+#[test]
+fn chain_empty_list_surface_has_one_primary_action() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "list"])
+        .output()
+        .expect("chain list");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("no-op chain list"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon chain \"step one\" \"step two\""),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("try:"), "{stdout}");
+}
+
+#[test]
 fn run_promoted_event_emitted_after_atomic_swap() {
     let temp = TempDir::new().expect("tempdir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));

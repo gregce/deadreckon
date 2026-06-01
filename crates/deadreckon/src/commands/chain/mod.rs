@@ -1468,8 +1468,10 @@ fn chain_status_command(
         return Ok(());
     }
     if chains.is_empty() {
-        println!("no chains in scope");
-        println!("try: deadreckon chain \"step one\" \"step two\"");
+        println!(
+            "{}",
+            chain_empty_surface("status", !all).render_plain(!completion_hints_enabled(false))
+        );
         return Ok(());
     }
     print_chain_table(&chains, full);
@@ -1484,12 +1486,39 @@ fn chain_list_command(all: bool, full: bool, json_output: bool) -> Result<()> {
         return Ok(());
     }
     if chains.is_empty() {
-        println!("no chains");
-        println!("try: deadreckon chain \"step one\" \"step two\"");
+        println!(
+            "{}",
+            chain_empty_surface("list", !all).render_plain(!completion_hints_enabled(false))
+        );
         return Ok(());
     }
     print_chain_table(&chains, full);
     Ok(())
+}
+
+fn chain_empty_surface(command: &str, scoped: bool) -> VerdictSurface {
+    let scope = if scoped {
+        "current scope"
+    } else {
+        "all scopes"
+    };
+    VerdictSurface::try_new(
+        VerdictKind::Noop,
+        format!("chain {command}"),
+        None,
+        ExplanationPanel::new(
+            format!("DeadReckon found no chains in {scope}."),
+            "The command was read-only and there is no chain state to inspect yet.",
+            vec![
+                ("command", format!("deadreckon chain {command}")),
+                ("scope", scope.to_string()),
+                ("chains", "0".to_string()),
+            ],
+        ),
+        vec![("Recommended", "deadreckon chain \"step one\" \"step two\"")],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("empty chain verdict surface must have one primary action")
 }
 
 fn chain_show_command(
