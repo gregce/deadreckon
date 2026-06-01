@@ -167,6 +167,8 @@ enum CliError {
         message: String,
         hint: String,
     },
+    #[error("{surface}")]
+    Surface { code: i32, surface: String },
 }
 
 type Result<T> = std::result::Result<T, CliError>;
@@ -175,6 +177,7 @@ impl CliError {
     fn exit_code(&self) -> i32 {
         match self {
             Self::Exit { code, .. } => *code,
+            Self::Surface { code, .. } => *code,
             Self::Core(_)
             | Self::Provider(_)
             | Self::Sandbox(_)
@@ -189,6 +192,7 @@ impl CliError {
 fn error_hint(err: &CliError) -> String {
     let hint = match err {
         CliError::Exit { hint, .. } => hint.clone(),
+        CliError::Surface { .. } => String::new(),
         CliError::Provider(deadreckon_providers::ProviderError::MissingCredential(_))
         | CliError::Provider(deadreckon_providers::ProviderError::NoRoute(_)) => {
             "deadreckon try; then deadreckon config provider cli:codex".to_string()
@@ -235,7 +239,11 @@ fn error_hint(err: &CliError) -> String {
         CliError::Json(_) => "inspect the referenced JSON file for invalid syntax".to_string(),
         CliError::Core(_) | CliError::Provider(_) => "deadreckon doctor".to_string(),
     };
-    try_footer(hint)
+    if hint.trim().is_empty() {
+        String::new()
+    } else {
+        try_footer(hint)
+    }
 }
 
 fn try_footer(hint: impl AsRef<str>) -> String {
@@ -379,11 +387,22 @@ fn push_word_chunks(lines: &mut Vec<String>, current: &mut String, word: &str, w
 }
 
 fn print_error(err: &CliError) {
+    if let CliError::Surface { surface, .. } = err {
+        eprint!("{surface}");
+        if !surface.ends_with('\n') {
+            eprintln!();
+        }
+        return;
+    }
     eprintln!("{} {err}", ui_error("error:"));
 }
 
 fn print_error_hint(err: &CliError) {
-    let _ = ui::hint(ui::Stream::Stderr, error_hint(err));
+    let hint = error_hint(err);
+    if hint.trim().is_empty() {
+        return;
+    }
+    let _ = ui::hint(ui::Stream::Stderr, hint);
 }
 
 fn goal_input_error(message: impl Into<String>, try_hint: impl Into<String>) -> CliError {

@@ -2,8 +2,21 @@ case: campaign-depth
 status: 1
 --- stdout ---
 --- stderr ---
-error: campaign refused: depth cap 2 reached; use orchestrate full-plan inside the sub-orchestrator instead
-  hint: try: deadreckon orchestrate full-plan "nested campaign" --n 2 --planner-provider smoke --provider smoke
+blocked campaign
+
+Explanation
+DeadReckon refused to start a nested campaign because depth cap 2 reached.
+This is a controlled recursion guard; use an orchestrated full-plan inside the sub-orchestrator instead of starting another campaign coordinator.
+
+Evidence
+goal: nested campaign
+current depth: 1
+depth cap: 2
+requested subs: 2
+reason: sub-orchestrators cannot campaign again
+
+Recommended
+deadreckon orchestrate full-plan "nested campaign" --n 2 --planner-provider smoke --provider smoke
 
 case: non-git-worktree
 status: 1

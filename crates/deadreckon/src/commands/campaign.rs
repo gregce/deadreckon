@@ -921,21 +921,16 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
 
     let lineage = campaign::lineage_from_env();
     if lineage.depth + 1 >= campaign::CAMPAIGN_MAX_DEPTH {
-        let mut hint = format!(
-            "deadreckon orchestrate full-plan \"{}\" --n {}",
-            shell_display_quote(&goal),
-            n
-        );
-        if let Some(provider) = args.planner_provider.as_deref() {
-            hint.push_str(&format!(" --planner-provider {provider}"));
-        }
-        if let Some(provider) = args.provider.as_deref() {
-            hint.push_str(&format!(" --provider {provider}"));
-        }
-        return Err(CliError::Exit {
+        return Err(CliError::Surface {
             code: 1,
-            message: "campaign refused: depth cap 2 reached; use orchestrate full-plan inside the sub-orchestrator instead".to_string(),
-            hint,
+            surface: campaign_depth_refusal_surface(
+                &goal,
+                n,
+                lineage.depth,
+                args.planner_provider.as_deref(),
+                args.provider.as_deref(),
+            )
+            .render_plain(!completion_hints_enabled(args.no_hints)),
         });
     }
 
@@ -1160,6 +1155,49 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         print_campaign_completion(&campaign_obj, &rollup, &result_state, args.no_hints);
     }
     Ok(())
+}
+
+fn campaign_depth_refusal_surface(
+    goal: &str,
+    n: u8,
+    current_depth: u32,
+    planner_provider: Option<&str>,
+    child_provider: Option<&str>,
+) -> VerdictSurface {
+    let mut primary = format!(
+        "deadreckon orchestrate full-plan \"{}\" --n {}",
+        shell_display_quote(goal),
+        n
+    );
+    if let Some(provider) = planner_provider {
+        primary.push_str(&format!(" --planner-provider {provider}"));
+    }
+    if let Some(provider) = child_provider {
+        primary.push_str(&format!(" --provider {provider}"));
+    }
+
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "campaign",
+        None,
+        ExplanationPanel::new(
+            "DeadReckon refused to start a nested campaign because depth cap 2 reached.",
+            "This is a controlled recursion guard; use an orchestrated full-plan inside the sub-orchestrator instead of starting another campaign coordinator.",
+            [
+                ("goal", goal.to_string()),
+                ("current depth", current_depth.to_string()),
+                (
+                    "depth cap",
+                    deadreckon_core::campaign::CAMPAIGN_MAX_DEPTH.to_string(),
+                ),
+                ("requested subs", n.to_string()),
+                ("reason", "sub-orchestrators cannot campaign again".to_string()),
+            ],
+        ),
+        [("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("campaign depth refusal must have one primary action")
 }
 
 pub(crate) async fn campaign_repair_command(args: CampaignRepairArgs) -> Result<()> {

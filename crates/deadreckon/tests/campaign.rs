@@ -122,16 +122,17 @@ fn campaign_depth_refusal_has_one_recovery_hint() {
 
     assert!(!output.status.success());
     let err = stderr(&output);
+    assert!(err.starts_with("blocked campaign"), "{err}");
+    assert!(err.contains("depth cap 2 reached"), "{err}");
+    assert!(err.contains("Explanation"), "{err}");
+    assert!(err.contains("Evidence"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
     assert!(
-        err.contains("campaign refused: depth cap 2 reached"),
+        err.contains("Recommended\ndeadreckon orchestrate full-plan \"nested campaign\""),
         "{err}"
     );
-    assert_eq!(err.matches("try:").count(), 1, "{err}");
-    assert!(
-        err.contains("try: deadreckon orchestrate full-plan \"nested campaign\""),
-        "{err}"
-    );
-    assert!(!err.contains("try: deadreckon doctor"), "{err}");
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("deadreckon doctor"), "{err}");
 }
 
 #[test]
