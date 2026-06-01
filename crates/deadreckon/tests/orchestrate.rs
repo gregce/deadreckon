@@ -5020,6 +5020,103 @@ fn merge_refuses_running_child() {
 }
 
 #[test]
+fn merge_pending_plan_recommends_fork_once() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "pending merge verdict plan",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.status, PlanStatus::Pending);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge pending plan");
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.starts_with("blocked plan "), "{err}");
+    assert!(err.contains("is pending"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon fork {}",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
+fn merge_already_merged_plan_recommends_finish_once() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "merged merge verdict plan",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.status = PlanStatus::Merged;
+    save_plan(&paths, &plan).expect("save merged plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--quiet"])
+        .output()
+        .expect("merge merged plan");
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.starts_with("no-op plan "), "{err}");
+    assert!(err.contains("is merged"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon finish {}",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
 fn review_mode_runs_coder_then_reviewer_extend() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

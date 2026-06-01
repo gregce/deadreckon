@@ -19,14 +19,11 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
     let resolved_id = resolve_plan_id(&paths, &plan_id)?;
     let mut plan = load_plan(&paths, &resolved_id)?;
     if !matches!(plan.status, PlanStatus::Forked | PlanStatus::Failed) {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "plan {} is {}",
-                run_prefix(&plan.plan_id),
-                plan_status_label(plan.status)
-            ),
-            "deadreckon fork <plan-id>",
-        )));
+        return Err(CliError::Surface {
+            code: 1,
+            surface: merge_unavailable_plan_surface(&paths, &plan)
+                .render_plain(!completion_hints_enabled(no_hints)),
+        });
     }
     if let Some(task) = plan
         .tasks
@@ -203,6 +200,43 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
         print_merge_finished(&paths, &plan, &merged_run, &library_dir, no_hints);
     }
     Ok(())
+}
+
+fn merge_unavailable_plan_surface(paths: &DeadreckonPaths, plan: &Plan) -> VerdictSurface {
+    let id = run_prefix(&plan.plan_id);
+    let status = merge_plan_status_word(plan.status);
+    let kind = match plan.status {
+        PlanStatus::Merged => VerdictKind::Noop,
+        _ => VerdictKind::Blocked,
+    };
+    let primary = super::plan::plan_next_actions_with_context(paths, plan)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| format!("deadreckon show {id}"));
+    VerdictSurface::try_new(
+        kind,
+        "plan",
+        Some(&id),
+        ExplanationPanel::new(
+            format!("DeadReckon did not merge the plan because it is {status}."),
+            "Merge only composes forked or failed plans; the recommended command follows the current plan state instead.",
+            [
+                ("plan".to_string(), id.clone()),
+                ("status".to_string(), status.to_string()),
+                ("tasks".to_string(), plan.tasks.len().to_string()),
+            ],
+        ),
+        [("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("merge unavailable plan surface must have one primary action")
+}
+
+fn merge_plan_status_word(status: PlanStatus) -> &'static str {
+    match status {
+        PlanStatus::Merged => "merged",
+        other => plan_status_label(other),
+    }
 }
 
 fn merge_incomplete_plan_surface(plan: &Plan, task: &PlanTask) -> VerdictSurface {
