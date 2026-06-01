@@ -1183,12 +1183,8 @@ pub(crate) fn print_orchestrate_preflight(
             println!("  - {warning}");
         }
         println!(
-            "  {} {}",
-            ui_command("try:"),
-            ui_command(format!(
-                "deadreckon attach {} --plain",
-                run_prefix(&plan.plan_id)
-            ))
+            "{}",
+            orchestrate_preflight_warning_recovery_line(&plan.plan_id)
         );
     }
     println!(
@@ -1197,6 +1193,14 @@ pub(crate) fn print_orchestrate_preflight(
         DeadreckonPaths::discover().home().display(),
         plan.plan_id
     );
+}
+
+fn orchestrate_preflight_warning_recovery_line(plan_id: &str) -> String {
+    format!(
+        "  {} {}",
+        ui_command("recommended:"),
+        ui_command(format!("deadreckon attach {} --plain", run_prefix(plan_id)))
+    )
 }
 
 fn orchestration_path_label(mode: PlanMode) -> &'static str {
@@ -2724,5 +2728,23 @@ fn print_fork_finished(plan: &Plan, no_hints: bool) {
             ui_command("merge:"),
             ui_command(format!("deadreckon merge {}", run_prefix(&plan.plan_id)))
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preflight_warning_footer_has_one_recommended_command() {
+        let rendered =
+            orchestrate_preflight_warning_recovery_line("1234567890abcdef1234567890abcdef");
+
+        assert_eq!(rendered.matches("recommended:").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("recommended: deadreckon attach 12345678 --plain"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("try:"), "{rendered}");
     }
 }

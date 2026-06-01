@@ -338,25 +338,40 @@ fn print_orchestrate_provider_choices(
     default_provider: Option<&str>,
 ) -> Result<()> {
     let configured = configured_provider_ids(paths)?;
-    println!("{}", ui_heading("Providers"));
-    println!(
-        "  default: {}",
-        default_provider
-            .map(ui_command)
-            .unwrap_or_else(|| ui_muted("none configured"))
-    );
-    if configured.is_empty() {
-        println!("  configured: none");
-        println!(
-            "  {} {}",
-            ui_command("try:"),
-            ui_command("deadreckon providers list --all")
-        );
-    } else {
-        println!("  configured: {}", configured.join(", "));
+    for line in orchestrate_provider_choice_lines(default_provider, &configured) {
+        println!("{line}");
     }
-    println!("  planner creates the child graph; child/coder/reviewer providers execute work.");
     Ok(())
+}
+
+fn orchestrate_provider_choice_lines(
+    default_provider: Option<&str>,
+    configured: &[String],
+) -> Vec<String> {
+    let mut lines = vec![
+        ui_heading("Providers"),
+        format!(
+            "  default: {}",
+            default_provider
+                .map(ui_command)
+                .unwrap_or_else(|| ui_muted("none configured"))
+        ),
+    ];
+    if configured.is_empty() {
+        lines.push("  configured: none".to_string());
+        lines.push(format!(
+            "  {} {}",
+            ui_command("recommended:"),
+            ui_command("deadreckon providers list --all")
+        ));
+    } else {
+        lines.push(format!("  configured: {}", configured.join(", ")));
+    }
+    lines.push(
+        "  planner creates the child graph; child/coder/reviewer providers execute work."
+            .to_string(),
+    );
+    lines
 }
 
 pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
@@ -433,4 +448,38 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
         );
     }
     merge_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_choices_without_configured_providers_has_one_recommended_command() {
+        let rendered = orchestrate_provider_choice_lines(None, &[]).join("\n");
+
+        assert!(rendered.contains("Providers"), "{rendered}");
+        assert!(rendered.contains("default: none configured"), "{rendered}");
+        assert!(rendered.contains("configured: none"), "{rendered}");
+        assert_eq!(rendered.matches("recommended:").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("recommended: deadreckon providers list --all"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("try:"), "{rendered}");
+    }
+
+    #[test]
+    fn provider_choices_with_configured_providers_does_not_add_recovery_command() {
+        let configured = vec!["cli:codex".to_string(), "cli:claude-code".to_string()];
+        let rendered = orchestrate_provider_choice_lines(Some("cli:codex"), &configured).join("\n");
+
+        assert!(rendered.contains("default: cli:codex"), "{rendered}");
+        assert!(
+            rendered.contains("configured: cli:codex, cli:claude-code"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("recommended:"), "{rendered}");
+        assert!(!rendered.contains("try:"), "{rendered}");
+    }
 }
