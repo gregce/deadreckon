@@ -82,6 +82,51 @@ impl DoctorFinding {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DoctorSetupSummary {
+    checked_count: usize,
+    failed_count: usize,
+    warning_count: usize,
+}
+
+impl DoctorSetupSummary {
+    pub(crate) fn has_blocking_issues(&self) -> bool {
+        self.failed_count > 0
+    }
+
+    pub(crate) fn evidence_detail(&self) -> String {
+        format!(
+            "{} setup checks; {} blocking issue(s); {} optional warning(s)",
+            self.checked_count, self.failed_count, self.warning_count
+        )
+    }
+}
+
+impl From<&DoctorReport> for DoctorSetupSummary {
+    fn from(report: &DoctorReport) -> Self {
+        Self {
+            checked_count: report.findings.len(),
+            failed_count: report
+                .findings
+                .iter()
+                .filter(|finding| finding.is_failed())
+                .count(),
+            warning_count: report
+                .findings
+                .iter()
+                .filter(|finding| finding.status == "warning")
+                .count(),
+        }
+    }
+}
+
+pub(crate) async fn doctor_setup_summary() -> Result<DoctorSetupSummary> {
+    let paths = DeadreckonPaths::discover();
+    let source = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let report = build_doctor_report(&paths, source).await?;
+    Ok(DoctorSetupSummary::from(&report))
+}
+
 async fn build_doctor_report(paths: &DeadreckonPaths, source: PathBuf) -> Result<DoctorReport> {
     let mut findings = vec![
         DoctorFinding::passed("source", source.display().to_string(), None),

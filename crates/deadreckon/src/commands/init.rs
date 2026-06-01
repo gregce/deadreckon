@@ -67,7 +67,7 @@ pub(crate) async fn init_command(
     )?;
     println!("{} {}", ui_ok("wrote"), paths.config_path().display());
     print_provider_setup_rows(&[provider_setup]);
-    super::doctor::doctor_command(false).await?;
+    let doctor_summary = super::doctor::doctor_setup_summary().await?;
     let completion_status = if no_completion {
         "skipped by --no-completion".to_string()
     } else {
@@ -75,8 +75,14 @@ pub(crate) async fn init_command(
     };
     print!(
         "{}",
-        init_completion_surface(&paths, &provider, &sandbox, &completion_status)
-            .render_plain(!completion_hints_enabled(false))
+        init_completion_surface(
+            &paths,
+            &provider,
+            &sandbox,
+            &completion_status,
+            &doctor_summary,
+        )
+        .render_plain(!completion_hints_enabled(false))
     );
     Ok(())
 }
@@ -86,24 +92,40 @@ fn init_completion_surface(
     provider: &str,
     sandbox: &str,
     completion_status: &str,
+    doctor_summary: &super::doctor::DoctorSetupSummary,
 ) -> VerdictSurface {
-    let primary = "deadreckon run \"describe the coding goal\"";
+    let (kind, why, primary, secondary) = if doctor_summary.has_blocking_issues() {
+        (
+            VerdictKind::Blocked,
+            "Initialization wrote the config, but setup verification found blocking issues; run doctor before starting managed work.",
+            "deadreckon doctor",
+            vec![("Secondary", "deadreckon run \"describe the coding goal\"")],
+        )
+    } else {
+        (
+            VerdictKind::Completed,
+            "Initialization completed; the next step is to start a managed run from this workspace.",
+            "deadreckon run \"describe the coding goal\"",
+            vec![("Secondary", "deadreckon doctor")],
+        )
+    };
     VerdictSurface::try_new(
-        VerdictKind::Completed,
+        kind,
         "init",
         None,
         ExplanationPanel::new(
             "DeadReckon wrote the local configuration and checked the provider setup.",
-            "Initialization completed; the next step is to start a managed run from this workspace.",
+            why,
             vec![
                 ("config", paths.config_path().display().to_string()),
                 ("provider", provider.to_string()),
                 ("sandbox", sandbox.to_string()),
+                ("doctor", doctor_summary.evidence_detail()),
                 ("completion", completion_status.to_string()),
             ],
         ),
         vec![("Recommended", primary)],
-        vec![("Secondary", "deadreckon doctor")],
+        secondary,
     )
     .expect("init verdict surface must be valid")
 }

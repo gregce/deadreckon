@@ -1056,11 +1056,15 @@ fn init_installs_shell_completion_by_default() {
     let stdout = stdout(&output);
     assert!(stdout.contains("completed init"), "{stdout}");
     assert!(stdout.contains("Explanation"), "{stdout}");
+    assert_eq!(stdout.matches("\nExplanation\n").count(), 1, "{stdout}");
     assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
     assert!(
         stdout.contains("Recommended\ndeadreckon run \"describe the coding goal\""),
         "{stdout}"
     );
+    assert!(stdout.contains("doctor:"), "{stdout}");
+    assert!(!stdout.contains("verified doctor"), "{stdout}");
+    assert!(!stdout.contains("blocked doctor"), "{stdout}");
     assert!(stdout.contains("completion:"), "{stdout}");
     assert!(!stdout.contains("next:"), "{stdout}");
     assert!(temp.path().join(".zsh/completions/_deadreckon").exists());
