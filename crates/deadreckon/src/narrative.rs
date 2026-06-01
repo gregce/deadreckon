@@ -1231,7 +1231,7 @@ pub(crate) fn apply_provider_response(
         return Err(crate::CliError::Exit {
             code: 1,
             message: "narrative provider output contained sensitive or unsafe text".to_string(),
-            hint: "try: inspect provider output and rely on deterministic narrative fallback"
+            hint: "inspect provider output and rely on deterministic narrative fallback"
                 .to_string(),
         });
     }
@@ -1443,8 +1443,7 @@ fn parse_provider_narrative_output(raw_content: &str) -> crate::Result<ProviderN
             "narrative provider returned invalid JSON: {}",
             last_error.unwrap_or_else(|| "no JSON object found".to_string())
         ),
-        hint: "try: press r later or use --no-narrative-provider for deterministic fallback"
-            .to_string(),
+        hint: "press r later or use --no-narrative-provider for deterministic fallback".to_string(),
     })
 }
 
@@ -1555,7 +1554,7 @@ fn validate_provider_claims(
                 "narrative provider claims failed validation: {}",
                 errors.join("; ")
             ),
-            hint: "try: rely on deterministic fallback or refresh after more evidence exists"
+            hint: "rely on deterministic fallback or refresh after more evidence exists"
                 .to_string(),
         })
     }
@@ -1608,8 +1607,7 @@ fn validate_provider_graph_labels(
                 "narrative provider suggested unknown graph target(s): {}",
                 unknown.join(", ")
             ),
-            hint: "try: refresh after the architecture map has more deterministic evidence"
-                .to_string(),
+            hint: "refresh after the architecture map has more deterministic evidence".to_string(),
         })
     }
 }
@@ -2656,7 +2654,7 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> 
     let parent = path.parent().ok_or_else(|| crate::CliError::Exit {
         code: 1,
         message: format!("path has no parent: {}", path.display()),
-        hint: "try: rerun attach with a valid run or plan id".to_string(),
+        hint: "rerun attach with a valid run or plan id".to_string(),
     })?;
     fs::create_dir_all(parent)?;
     let file_name = path
@@ -2677,7 +2675,7 @@ fn append_json_line<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {
     let parent = path.parent().ok_or_else(|| crate::CliError::Exit {
         code: 1,
         message: format!("path has no parent: {}", path.display()),
-        hint: "try: rerun attach with a valid run or plan id".to_string(),
+        hint: "rerun attach with a valid run or plan id".to_string(),
     })?;
     fs::create_dir_all(parent)?;
     let mut file = File::options().create(true).append(true).open(path)?;
@@ -3141,6 +3139,26 @@ mod tests {
             .expect_err("schema-less provider output rejected");
 
         assert!(err.to_string().contains("did not include headline"));
+    }
+
+    #[test]
+    fn narrative_provider_refusal_hint_is_raw_primary_action() {
+        let err = parse_provider_narrative_output("not json")
+            .expect_err("invalid provider output rejected");
+
+        match err {
+            crate::CliError::Exit { hint, .. } => {
+                assert!(
+                    !hint.starts_with("try:"),
+                    "raw exit hints should not embed try footers: {hint}"
+                );
+                assert_eq!(
+                    hint,
+                    "press r later or use --no-narrative-provider for deterministic fallback"
+                );
+            }
+            other => panic!("expected exit error, got {other:?}"),
+        }
     }
 
     #[test]
