@@ -309,13 +309,11 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         SleepPrevention::Active { handle } => Some(handle),
         SleepPrevention::Skipped { reason } => {
             if prevent_sleep_prefs == SleepPrefs::On && !quiet {
-                eprintln!(
-                    "sleep prevention skipped: {}",
-                    sleep::skip_reason_label(reason)
+                eprint!(
+                    "{}",
+                    sleep_skipped_surface(&state.run_id, &state.working_dir, reason)
+                        .render_plain(!completion_hints_enabled(effective_no_hints))
                 );
-                if let Some(try_line) = sleep_try_line(reason) {
-                    eprintln!("try: {try_line}");
-                }
             }
             None
         }

@@ -3316,6 +3316,30 @@ mod seam_surface_tests {
         assert!(preview.contains("seams"));
         assert!(preview.contains("external: policy, event_sink"));
     }
+
+    #[test]
+    fn sleep_skipped_surface_has_one_primary_action() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let surface = sleep_skipped_surface(
+            "abcdef1234567890",
+            temp.path(),
+            sleep::SkipReason::Unsupported,
+        );
+        let rendered = surface.render_plain(false);
+
+        assert!(
+            rendered.starts_with("no-op sleep prevention abcdef12"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Explanation\n"), "{rendered}");
+        assert!(rendered.contains("Evidence\n"), "{rendered}");
+        assert_eq!(rendered.matches("\nRecommended\n").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("Recommended\ndeadreckon config set defaults.prevent_sleep off"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("try:"), "{rendered}");
+    }
 }
 
 fn card_options(stream: ui::Stream, plain: bool) -> CardOptions {
@@ -3339,21 +3363,68 @@ fn terminal_columns() -> Option<usize> {
         })
 }
 
-fn sleep_try_line(reason: sleep::SkipReason) -> Option<&'static str> {
+fn sleep_skipped_surface(
+    run_id: &str,
+    working_dir: &Path,
+    reason: sleep::SkipReason,
+) -> VerdictSurface {
+    let id = run_prefix(run_id);
+    let reason_label = sleep::skip_reason_label(reason);
+    let primary = sleep_primary_command(reason);
+    let secondary = sleep_secondary_commands(reason);
+    VerdictSurface::try_new(
+        VerdictKind::Noop,
+        "sleep prevention",
+        Some(&id),
+        ExplanationPanel::new(
+            format!("DeadReckon skipped sleep prevention for run {id}."),
+            format!(
+                "The run continues, so this is no-op; the inhibitor was not armed because {reason_label}."
+            ),
+            vec![
+                ("run".to_string(), id.clone()),
+                ("reason".to_string(), reason_label.to_string()),
+                ("prevent_sleep".to_string(), "on".to_string()),
+                (
+                    "metadata".to_string(),
+                    sleep::metadata_path(working_dir).display().to_string(),
+                ),
+                ("working_dir".to_string(), working_dir.display().to_string()),
+            ],
+        ),
+        vec![("Recommended", primary)],
+        secondary,
+    )
+    .expect("sleep skipped verdict surface must have one primary action")
+}
+
+fn sleep_primary_command(reason: sleep::SkipReason) -> &'static str {
     match reason {
-        sleep::SkipReason::UnavailableBinary if cfg!(target_os = "macos") => {
-            Some("macOS bundles caffeinate; check $PATH or run \"/usr/bin/caffeinate -di\"")
-        }
         sleep::SkipReason::UnavailableBinary if cfg!(target_os = "linux") => {
-            Some("sudo apt install systemd")
+            "sudo apt install systemd"
         }
-        sleep::SkipReason::Unsupported => {
-            Some("--prevent-sleep off (Windows native prevention is a V1 candidate)")
+        sleep::SkipReason::UnavailableBinary if cfg!(target_os = "macos") => {
+            "/usr/bin/caffeinate -di"
         }
-        sleep::SkipReason::AlreadyInhibited
+        sleep::SkipReason::UnavailableBinary
+        | sleep::SkipReason::Unsupported
         | sleep::SkipReason::NonTty
         | sleep::SkipReason::UserDisabled
-        | sleep::SkipReason::UnavailableBinary => None,
+        | sleep::SkipReason::AlreadyInhibited => "deadreckon config set defaults.prevent_sleep off",
+    }
+}
+
+fn sleep_secondary_commands(reason: sleep::SkipReason) -> Vec<(&'static str, &'static str)> {
+    match reason {
+        sleep::SkipReason::UnavailableBinary
+            if cfg!(target_os = "linux") || cfg!(target_os = "macos") =>
+        {
+            vec![(
+                "Silence future skips",
+                "deadreckon config set defaults.prevent_sleep off",
+            )]
+        }
+        _ => Vec::new(),
     }
 }
 
