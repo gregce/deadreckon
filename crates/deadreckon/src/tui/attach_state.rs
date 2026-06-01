@@ -227,14 +227,19 @@ pub(crate) struct AttachActionNotice {
 
 impl AttachActionNotice {
     pub(crate) fn lines(&self) -> Vec<String> {
-        let status = if self.success { "finished" } else { "failed" };
-        let mut lines = vec![format!("{} action {status}", self.action.label())];
+        let verdict = if self.success { "completed" } else { "failed" };
+        let mut lines = vec![format!("{verdict} {} action", self.action.label())];
         if self.success {
-            lines.push(self.action.success_detail().to_string());
-            lines.push("next: q detach | deadreckon status | deadreckon list".to_string());
+            lines.push(format!("explanation: {}", self.action.success_detail()));
+            lines.push("recommended: q detach".to_string());
+            lines.push("secondary: deadreckon status; deadreckon list".to_string());
         } else {
-            lines.push("see the terminal output above for the error and suggested fix".to_string());
-            lines.push("next: retry the action or q detach".to_string());
+            lines.push(
+                "explanation: see the terminal output above for the error and suggested fix"
+                    .to_string(),
+            );
+            lines.push("recommended: q detach".to_string());
+            lines.push("secondary: retry the action after fixing the error".to_string());
         }
         lines
     }

@@ -4965,8 +4965,41 @@ fn post_completion_action_resets_docs_view_and_explains_next_step() {
         .expect("post-action notice")
         .lines()
         .join("\n");
-    assert!(notice.contains("apply action finished"), "{notice}");
-    assert!(notice.contains("q detach"), "{notice}");
+    assert!(notice.starts_with("completed apply action"), "{notice}");
+    assert!(notice.contains("explanation:"), "{notice}");
+    assert_eq!(notice.matches("recommended:").count(), 1, "{notice}");
+    assert!(notice.contains("recommended: q detach"), "{notice}");
+    assert!(
+        notice.contains("secondary: deadreckon status; deadreckon list"),
+        "{notice}"
+    );
+    assert!(!notice.contains("next:"), "{notice}");
+
+    let failed_notice = AttachActionNotice {
+        action: CompletionAction::Apply,
+        success: false,
+    }
+    .lines()
+    .join("\n");
+    assert!(
+        failed_notice.starts_with("failed apply action"),
+        "{failed_notice}"
+    );
+    assert!(failed_notice.contains("explanation:"), "{failed_notice}");
+    assert_eq!(
+        failed_notice.matches("recommended:").count(),
+        1,
+        "{failed_notice}"
+    );
+    assert!(
+        failed_notice.contains("recommended: q detach"),
+        "{failed_notice}"
+    );
+    assert!(
+        failed_notice.contains("secondary: retry the action after fixing the error"),
+        "{failed_notice}"
+    );
+    assert!(!failed_notice.contains("next:"), "{failed_notice}");
 }
 
 #[test]
