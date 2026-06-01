@@ -274,10 +274,11 @@ fn print_chain_narrative_refusal(run_ref: &str, json_output: bool) -> Result<()>
 }
 
 pub(crate) fn chain_narrative_refusal_text(run_ref: &str, json_output: bool) -> Result<String> {
+    let surface = chain_narrative_refusal_surface(run_ref);
     if json_output {
         return Ok(format!(
             "{}\n",
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string_pretty(&surface.add_to_json(json!({
                 "status": "unsupported",
                 "kind": "chain",
                 "id": run_ref,
@@ -287,12 +288,34 @@ pub(crate) fn chain_narrative_refusal_text(run_ref: &str, json_output: bool) -> 
                     "deadreckon attach <run-id> --view narrative",
                     "deadreckon attach <plan-id> --view narrative"
                 ]
-            }))?
+            })))?
         ));
     }
-    Ok(format!(
-        "chain narrative attach is not supported yet\ntry: deadreckon chain status {run_ref}\ntry: deadreckon attach <run-id> --view narrative\ntry: deadreckon attach <plan-id> --view narrative\n"
-    ))
+    Ok(surface.render_plain(false))
+}
+
+fn chain_narrative_refusal_surface(run_ref: &str) -> VerdictSurface {
+    let primary = format!("deadreckon chain status {run_ref}");
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "chain narrative",
+        Some(run_ref),
+        ExplanationPanel::new(
+            "Chain narrative attach is not supported yet.",
+            "Narrative attach currently supports runs, plans, and plan child refs; chain status is the supported chain inspection path.",
+            vec![
+                ("chain", run_ref),
+                ("view", "narrative"),
+                ("supported narrative targets", "run, plan, plan child"),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![
+            ("Secondary", "deadreckon attach <run-id> --view narrative"),
+            ("Secondary", "deadreckon attach <plan-id> --view narrative"),
+        ],
+    )
+    .expect("chain narrative refusal surface must be valid")
 }
 
 async fn attach_campaign_tui(

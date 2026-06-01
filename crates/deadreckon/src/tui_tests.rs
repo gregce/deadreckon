@@ -3483,22 +3483,39 @@ fn non_tty_narrative_attach_does_not_call_provider_without_explicit_refresh() {
 fn chain_narrative_attach_has_clear_supported_behavior() {
     let plain = chain_narrative_refusal_text("chain-1234", false).expect("plain");
     assert!(
-        plain.contains("chain narrative attach is not supported yet"),
+        plain.starts_with("blocked chain narrative chain-1234"),
         "{plain}"
     );
+    assert!(plain.contains("Explanation\n"), "{plain}");
+    assert!(plain.contains("Evidence\n"), "{plain}");
     assert!(
-        plain.contains("try: deadreckon chain status chain-1234"),
+        plain.contains("Chain narrative attach is not supported yet."),
+        "{plain}"
+    );
+    assert_eq!(plain.matches("\nRecommended\n").count(), 1, "{plain}");
+    assert!(
+        plain.contains("Recommended\ndeadreckon chain status chain-1234"),
         "{plain}"
     );
     assert!(
         plain.contains("deadreckon attach <run-id> --view narrative"),
         "{plain}"
     );
+    assert!(!plain.contains("try:"), "{plain}");
 
     let json_text = chain_narrative_refusal_text("chain-1234", true).expect("json");
     let value: serde_json::Value = serde_json::from_str(&json_text).expect("json value");
     assert_eq!(value["status"], "unsupported");
     assert_eq!(value["kind"], "chain");
+    assert_eq!(
+        value["primary_action"],
+        "deadreckon chain status chain-1234"
+    );
+    assert_eq!(value["verdict"]["kind"], "blocked");
+    assert_eq!(
+        value["verdict"]["recommended_command"],
+        "deadreckon chain status chain-1234"
+    );
     assert!(
         value["try"]
             .as_array()
