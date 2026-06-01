@@ -3582,29 +3582,22 @@ fn merged_run_id_for_completed_plan(plan: &Plan, verb: &str) -> Result<Option<St
     match plan.status {
         PlanStatus::Merged => {}
         PlanStatus::Pending => {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                &format!("plan {} has not started yet", run_prefix(&plan.plan_id)),
-                &format!("deadreckon fork {}", run_prefix(&plan.plan_id)),
-            )));
+            return Err(CliError::Surface {
+                code: 1,
+                surface: pending_plan_result_surface(plan, verb)
+                    .render_plain(!completion_hints_enabled(false)),
+            });
         }
         PlanStatus::Forked => {
             let ready_to_merge = plan
                 .tasks
                 .iter()
                 .all(|task| task.status == PlanTaskStatus::Completed);
-            let try_line = if ready_to_merge {
-                format!("deadreckon merge {}", run_prefix(&plan.plan_id))
-            } else {
-                format!("deadreckon attach {}", run_prefix(&plan.plan_id))
-            };
-            return Err(CliError::Core(deadreckon_core::user_error(
-                &format!(
-                    "plan {} is still {}; cannot {verb} it yet",
-                    run_prefix(&plan.plan_id),
-                    plan_status_label(plan.status)
-                ),
-                &try_line,
-            )));
+            return Err(CliError::Surface {
+                code: 1,
+                surface: forked_plan_result_surface(plan, verb, ready_to_merge)
+                    .render_plain(!completion_hints_enabled(false)),
+            });
         }
         PlanStatus::Failed => {
             return Err(CliError::Surface {
@@ -3624,6 +3617,90 @@ fn merged_run_id_for_completed_plan(plan: &Plan, verb: &str) -> Result<Option<St
         ))
     })?;
     Ok(Some(run_id))
+}
+
+fn pending_plan_result_surface(plan: &Plan, verb: &str) -> VerdictSurface {
+    let id = run_prefix(&plan.plan_id);
+    let primary = format!("deadreckon fork {id}");
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "plan",
+        Some(&id),
+        ExplanationPanel::new(
+            "The plan has not started yet.",
+            format!(
+                "DeadReckon has no completed result to {verb} until the plan is forked and merged."
+            ),
+            [
+                ("plan".to_string(), id.clone()),
+                (
+                    "status".to_string(),
+                    plan_status_label(plan.status).to_string(),
+                ),
+                ("requested verb".to_string(), verb.to_string()),
+                ("tasks".to_string(), plan.tasks.len().to_string()),
+            ],
+        ),
+        [("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("pending plan result surface must have one primary action")
+}
+
+fn forked_plan_result_surface(plan: &Plan, verb: &str, ready_to_merge: bool) -> VerdictSurface {
+    let id = run_prefix(&plan.plan_id);
+    let primary = if ready_to_merge {
+        format!("deadreckon merge {id}")
+    } else {
+        format!("deadreckon attach {id}")
+    };
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .count();
+    let kind = if ready_to_merge {
+        VerdictKind::Blocked
+    } else {
+        VerdictKind::Paused
+    };
+    let why = if ready_to_merge {
+        format!(
+            "All child tasks are complete, but DeadReckon has no completed result to {verb} until merge creates the result run."
+        )
+    } else {
+        format!(
+            "DeadReckon has no completed result to {verb} while child tasks are still running or waiting."
+        )
+    };
+    VerdictSurface::try_new(
+        kind,
+        "plan",
+        Some(&id),
+        ExplanationPanel::new(
+            format!(
+                "The plan is still {}; cannot {verb} it yet.",
+                plan_status_label(plan.status)
+            ),
+            why,
+            [
+                ("plan".to_string(), id.clone()),
+                (
+                    "status".to_string(),
+                    plan_status_label(plan.status).to_string(),
+                ),
+                ("requested verb".to_string(), verb.to_string()),
+                (
+                    "tasks".to_string(),
+                    format!("{completed}/{} completed", plan.tasks.len()),
+                ),
+                ("ready to merge".to_string(), ready_to_merge.to_string()),
+            ],
+        ),
+        [("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("forked plan result surface must have one primary action")
 }
 
 fn failed_plan_result_surface(plan: &Plan, verb: &str) -> VerdictSurface {

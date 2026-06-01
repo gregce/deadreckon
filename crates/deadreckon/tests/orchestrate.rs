@@ -202,6 +202,105 @@ fn finish_failed_plan_uses_one_verdict_surface() {
 }
 
 #[test]
+fn finish_pending_plan_recommends_fork_once() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "pending finish verdict plan",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+    assert_eq!(plan.status, PlanStatus::Pending);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["finish", &plan.plan_id[..8], "--no-confirm"])
+        .output()
+        .expect("finish pending plan");
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.starts_with("blocked plan "), "{err}");
+    assert!(err.contains("has not started yet"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon fork {}",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
+fn finish_forked_plan_recommends_attach_once() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "forked finish verdict plan",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.status = PlanStatus::Forked;
+    plan.tasks[0].status = PlanTaskStatus::Completed;
+    plan.tasks[1].status = PlanTaskStatus::Pending;
+    save_plan(&paths, &plan).expect("save forked plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["finish", &plan.plan_id[..8], "--no-confirm"])
+        .output()
+        .expect("finish forked plan");
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.starts_with("paused plan "), "{err}");
+    assert!(err.contains("cannot finish it yet"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon attach {}",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
 fn plan_writes_plan_created_event_when_saved() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
