@@ -53,6 +53,8 @@ fn learn_index_writes_episode_and_signals_for_completed_run() {
     let json: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(json["indexed"], 1);
     assert!(json["signals_written"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(json["verdict"]["kind"], "completed");
+    assert_eq!(json["primary_action"], "deadreckon learn propose");
     assert!(
         paths
             .learning_episode_path(&state.scope, &state.run_id)
@@ -90,7 +92,29 @@ fn improve_self_preview_has_no_worktree_or_run_side_effect() {
     assert_success(&output);
     let json: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(json["mode"], "isolated-worktree");
+    assert_eq!(json["verdict"]["kind"], "preview");
+    assert_eq!(
+        json["primary_action"],
+        format!(
+            "deadreckon improve self {} --yes",
+            json["proposal_id"].as_str().expect("proposal id")
+        )
+    );
     assert!(!temp.path().join("learning").join("candidates").exists());
+
+    let human = deadreckon(temp.path())
+        .args(["improve", "self", goal.to_str().expect("utf8"), "--preview"])
+        .output()
+        .expect("improve preview human");
+
+    assert_success(&human);
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(stdout.starts_with("preview improve self"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(stdout.contains(" --yes"), "{stdout}");
+    assert!(!stdout.contains("next:"), "{stdout}");
 }
 
 #[test]
@@ -311,12 +335,28 @@ fn learn_report_json_matches_text_counts() {
     state.updated_at = Utc::now();
     state.failure_reason = Some("provider route cli:missing has no credential".to_string());
     save_state(&state).expect("save");
-    assert_success(
-        &deadreckon(temp.path())
-            .args(["learn", "index", "--all"])
-            .output()
-            .expect("index"),
+    let index_output = deadreckon(temp.path())
+        .args(["learn", "index", "--all"])
+        .output()
+        .expect("index");
+    assert_success(&index_output);
+    let index_text = String::from_utf8_lossy(&index_output.stdout);
+    assert!(
+        index_text.starts_with("completed learn index"),
+        "{index_text}"
     );
+    assert!(index_text.contains("Explanation\n"), "{index_text}");
+    assert!(index_text.contains("Evidence\n"), "{index_text}");
+    assert_eq!(
+        index_text.matches("\nRecommended\n").count(),
+        1,
+        "{index_text}"
+    );
+    assert!(
+        index_text.contains("Recommended\ndeadreckon learn propose"),
+        "{index_text}"
+    );
+    assert!(!index_text.contains("next:"), "{index_text}");
 
     let json_output = deadreckon(temp.path())
         .args(["learn", "report", "--json"])

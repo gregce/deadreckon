@@ -1,4 +1,5 @@
 use super::super::*;
+use deadreckon_core::learning::LearningIndexSummary;
 
 pub(crate) async fn learn_command(command: LearnCommand) -> Result<()> {
     match command {
@@ -62,31 +63,47 @@ fn learn_index_command(
     let paths = DeadreckonPaths::discover();
     let scope = resolve_learning_scope(scope, all)?;
     let summary = index_learning(&paths, &LearningIndexOptions { scope })?;
+    let surface = learn_index_surface(&summary);
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&summary)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&surface.add_to_json(serde_json::to_value(&summary)?))?
+        );
         return Ok(());
     }
-    println!("{}", ui_heading("learning indexed"));
-    print_kv_block(&[
-        ("episodes", &summary.indexed.to_string()),
-        ("signals", &summary.signals_written.to_string()),
-        ("skipped live", &summary.skipped_live.to_string()),
-        ("skipped corrupt", &summary.skipped_corrupt.to_string()),
-    ]);
-    if summary.signals_written == 0 {
-        println!(
-            "{} try `{}`",
-            ui_muted("next:"),
-            ui_command("deadreckon learn report")
-        );
-    } else {
-        println!(
-            "{} try `{}`",
-            ui_muted("next:"),
-            ui_command("deadreckon learn propose")
-        );
-    }
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+fn learn_index_surface(summary: &LearningIndexSummary) -> VerdictSurface {
+    let primary = if summary.signals_written == 0 {
+        "deadreckon learn report"
+    } else {
+        "deadreckon learn propose"
+    };
+    let secondary = if summary.signals_written == 0 {
+        vec![("Secondary", "deadreckon learn index --all")]
+    } else {
+        vec![("Secondary", "deadreckon learn report")]
+    };
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "learn",
+        Some("index"),
+        ExplanationPanel::new(
+            "DeadReckon indexed local run evidence into the learning store.",
+            "Indexing completed; the recommended command advances to proposal generation when signals were written, otherwise it inspects the report.",
+            vec![
+                ("episodes", summary.indexed.to_string()),
+                ("signals", summary.signals_written.to_string()),
+                ("skipped live", summary.skipped_live.to_string()),
+                ("skipped corrupt", summary.skipped_corrupt.to_string()),
+            ],
+        ),
+        vec![("Recommended", primary)],
+        secondary,
+    )
+    .expect("learn index verdict surface must be valid")
 }
 
 fn learn_report_command(scope: Option<&str>, limit: usize, json_output: bool) -> Result<()> {
@@ -414,6 +431,7 @@ async fn improve_self_command(
 }
 
 fn improve_self_preview(proposal: &LearningProposal, json_output: bool) -> Result<()> {
+    let surface = improve_self_preview_surface(proposal);
     let payload = json!({
         "proposal_id": proposal.proposal_id,
         "title": proposal.title,
@@ -425,31 +443,41 @@ fn improve_self_preview(proposal: &LearningProposal, json_output: bool) -> Resul
         "pr": "dry-run by default; live open requires evidence gate"
     });
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&surface.add_to_json(payload))?
+        );
         return Ok(());
     }
-    println!("{}", ui_heading("self-improve preview"));
-    print_kv_block(&[
-        ("proposal", proposal.proposal_id.as_str()),
-        ("title", proposal.title.as_str()),
-        ("mode", "isolated worktree"),
-        ("provider", "existing resolver"),
-        ("PR", "dry-run until evidence gate passes"),
-    ]);
-    println!();
-    println!("{}", ui_heading("done criteria"));
-    for criterion in &proposal.done_criteria {
-        println!("  - {criterion}");
-    }
-    println!(
-        "{} {}",
-        ui_muted("next:"),
-        ui_command(format!(
-            "deadreckon improve self {} --yes",
-            proposal.proposal_id
-        ))
-    );
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+fn improve_self_preview_surface(proposal: &LearningProposal) -> VerdictSurface {
+    let primary = format!("deadreckon improve self {} --yes", proposal.proposal_id);
+    let secondary = format!(
+        "deadreckon improve self {} --pr-dry-run",
+        proposal.proposal_id
+    );
+    VerdictSurface::try_new(
+        VerdictKind::Preview,
+        "improve",
+        Some("self"),
+        ExplanationPanel::new(
+            "DeadReckon previewed a self-improvement proposal without creating a candidate worktree.",
+            "This is a preview because no run, worktree, branch, or PR state was created; the recommended command starts the isolated candidate run.",
+            vec![
+                ("proposal", proposal.proposal_id.clone()),
+                ("title", proposal.title.clone()),
+                ("mode", "isolated worktree".to_string()),
+                ("done criteria", proposal.done_criteria.len().to_string()),
+                ("risk", proposal.expected_risk.clone()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", secondary.as_str())],
+    )
+    .expect("improve self preview verdict surface must be valid")
 }
 
 async fn run_self_improve_candidate(
