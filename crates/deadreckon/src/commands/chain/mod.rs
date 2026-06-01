@@ -486,10 +486,18 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
     deadreckon_core::validate_goal_count(goals.len()).map_err(CliError::from)?;
     let cwd = std::env::current_dir()?;
     let git_root = deadreckon_core::find_git_root(&cwd)?.ok_or_else(|| {
-        CliError::Core(deadreckon_core::user_error(
-            "chains require a git repo",
-            "cd into a repo or initialize one with git init",
-        ))
+        chain_create_refusal_surface(
+            VerdictKind::Blocked,
+            None,
+            "DeadReckon did not create the chain because chains require a git repo.",
+            "Chain runs coordinate branches, checkpoints, and step application against a git repository, so DeadReckon refused before writing chain state.",
+            [
+                ("cwd".to_string(), cwd.display().to_string()),
+                ("git root".to_string(), "not found".to_string()),
+            ],
+            "git init".to_string(),
+            no_hints,
+        )
     })?;
     let scope = workspace_scope(&cwd).map_err(CliError::from)?;
     let base_ref = base.unwrap_or_else(|| "HEAD".to_string());
@@ -548,10 +556,19 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
     }
     if !yes {
         if !io::stdin().is_terminal() {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                "non-interactive chain start requires --yes",
-                "deadreckon chain --yes \"step one\" \"step two\"",
-            )));
+            return Err(chain_create_refusal_surface(
+                VerdictKind::Blocked,
+                Some(&chain.chain_id),
+                "DeadReckon did not start the chain because non-interactive chain start requires --yes.",
+                "The chain was drafted, but this session cannot ask for launch confirmation, so DeadReckon stopped before starting the conductor.",
+                [
+                    ("chain".to_string(), chain_prefix(&chain.chain_id)),
+                    ("steps".to_string(), chain.steps.len().to_string()),
+                    ("stdin".to_string(), "non-interactive".to_string()),
+                ],
+                "deadreckon chain --yes \"step one\" \"step two\"".to_string(),
+                no_hints,
+            ));
         }
         if !prompt::confirm("start the chain?", true)? {
             println!("cancelled");
@@ -579,6 +596,35 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         chain_attach_command(&paths, &chain_id, false)?;
     }
     Ok(chain_id)
+}
+
+fn chain_create_refusal_surface<K, V>(
+    kind: VerdictKind,
+    chain_id: Option<&str>,
+    what_happened: impl Into<String>,
+    why_this_verdict: impl Into<String>,
+    evidence: impl IntoIterator<Item = (K, V)>,
+    primary: String,
+    no_hints: bool,
+) -> CliError
+where
+    K: Into<String>,
+    V: Into<String>,
+{
+    let subject = chain_id.map(chain_prefix);
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            kind,
+            "chain",
+            subject.as_deref(),
+            ExplanationPanel::new(what_happened, why_this_verdict, evidence),
+            [("Recommended", primary.as_str())],
+            Vec::<(&str, &str)>::new(),
+        )
+        .expect("chain creation refusal surface must have one primary action")
+        .render_plain(!completion_hints_enabled(no_hints)),
+    }
 }
 
 async fn chain_run_command(
