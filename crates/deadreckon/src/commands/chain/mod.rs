@@ -442,10 +442,21 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
     )
     .await
     .map_err(|err| {
-        CliError::Core(deadreckon_core::user_error(
+        chain_create_refusal_surface(
+            VerdictKind::Blocked,
+            None,
             &format!("chain planner provider failed: {err}"),
-            "deadreckon chain \"step one\" \"step two\"",
-        ))
+            "DeadReckon could not get a valid decomposition from the configured provider, so it refused before writing chain state.",
+            [
+                ("goal".to_string(), options.root_goal.clone()),
+                (
+                    "provider".to_string(),
+                    options.provider.as_deref().unwrap_or("default").to_string(),
+                ),
+            ],
+            "deadreckon chain \"step one\" \"step two\"".to_string(),
+            options.no_hints,
+        )
     })?;
     let goals = parse_planner_goals(&response.content, n, &options.root_goal, options.no_hints)?;
     let chain_id = chain_create_command(ChainCreateOptions { goals, ..options }).await?;

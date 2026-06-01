@@ -3320,7 +3320,7 @@ async fn chain_plan_decomposition_spend_recorded_separately() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chain_plan_falls_back_with_try_explicit_hint_on_provider_error() {
+async fn chain_plan_provider_error_uses_verdict_surface() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -3347,8 +3347,17 @@ api_key = "test"
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
     assert!(stderr.contains("chain planner provider failed"), "{stderr}");
-    assert!(stderr.contains("try:"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain \"step one\" \"step two\""),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]
