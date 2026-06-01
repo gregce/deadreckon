@@ -2158,10 +2158,9 @@ fn start_recovery_error(recovery: &StartRecovery) -> CliError {
         message: recovery.message.clone(),
         hint: recovery
             .try_lines
-            .iter()
-            .map(|line| format!("try: {line}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "deadreckon doctor".to_string()),
     }
 }
 

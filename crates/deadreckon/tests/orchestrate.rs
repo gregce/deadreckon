@@ -667,15 +667,16 @@ fn start_non_git_non_tty_refuses_with_source_mode_try_lines() {
         err.contains("non-interactive without a source mode"),
         "{err}"
     );
+    assert_eq!(err.matches("try:").count(), 1, "{err}");
     assert!(
         err.contains("try: deadreckon start \"build the app\" --from ."),
         "{err}"
     );
     assert!(
-        err.contains("try: deadreckon start \"build the app\" --fresh"),
+        !err.contains("try: deadreckon start \"build the app\" --fresh"),
         "{err}"
     );
-    assert!(err.contains("try: git init"), "{err}");
+    assert!(!err.contains("try: git init"), "{err}");
 }
 
 #[test]
