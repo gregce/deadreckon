@@ -1401,19 +1401,11 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     let resolved_id = resolve_plan_id(&paths, &plan_id)?;
     let mut plan = load_plan(&paths, &resolved_id)?;
     if plan.status != PlanStatus::Pending {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "plan {} is {}",
-                run_prefix(&plan.plan_id),
-                plan_status_label(plan.status)
-            ),
-            match plan.status {
-                PlanStatus::Forked => "deadreckon merge <plan-id>",
-                PlanStatus::Merged => "deadreckon finish <plan-id>",
-                PlanStatus::Failed => "deadreckon show <plan-id> --why-failed",
-                PlanStatus::Pending => "deadreckon fork <plan-id>",
-            },
-        )));
+        return Err(CliError::Surface {
+            code: 1,
+            surface: fork_refusal_surface(&paths, &plan)
+                .render_plain(!completion_hints_enabled(no_hints)),
+        });
     }
     apply_fork_provider_overrides(
         &mut plan,
@@ -1683,6 +1675,42 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         print_fork_finished(&plan, no_hints);
     }
     Ok(())
+}
+
+fn fork_refusal_surface(paths: &DeadreckonPaths, plan: &Plan) -> VerdictSurface {
+    let id = run_prefix(&plan.plan_id);
+    let primary = plan_next_actions_with_context(paths, plan)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| format!("deadreckon show {id}"));
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .count();
+    VerdictSurface::try_new(
+        VerdictKind::Noop,
+        "plan",
+        Some(&id),
+        ExplanationPanel::new(
+            format!("DeadReckon did not fork the plan because it is already {}.", plan_status_label(plan.status)),
+            "Fork only starts pending plans; the recommended command follows the current plan state instead.",
+            [
+                ("plan".to_string(), id.clone()),
+                (
+                    "status".to_string(),
+                    plan_status_label(plan.status).to_string(),
+                ),
+                (
+                    "tasks".to_string(),
+                    format!("{completed}/{} completed", plan.tasks.len()),
+                ),
+            ],
+        ),
+        [("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("fork refusal surface must have one primary action")
 }
 
 #[derive(Debug)]

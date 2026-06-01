@@ -3179,9 +3179,20 @@ fn fork_refuses_when_plan_already_forked() {
 
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
-    assert!(err.contains("plan"), "{err}");
+    assert!(err.starts_with("no-op plan "), "{err}");
     assert!(err.contains("running"), "{err}");
-    assert!(err.contains("try: deadreckon merge <plan-id>"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon merge {}",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
 }
 
 #[test]
