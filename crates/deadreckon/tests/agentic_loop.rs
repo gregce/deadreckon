@@ -800,7 +800,7 @@ async fn kill_storm_no_leaks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn doctor_fails_actionably() {
+async fn doctor_fails_with_one_verdict_surface() {
     let temp = repo_tempdir();
     let home = temp.path().join("home");
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
@@ -810,16 +810,16 @@ async fn doctor_fails_actionably() {
         .expect("doctor");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("blocked doctor"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
     assert!(stdout.contains("config.toml missing"));
-    assert!(stdout.contains("fix: deadreckon init"));
     assert!(stdout.contains("disk space"));
     assert!(stdout.contains("runstate dir"));
-    for line in stdout.lines().filter(|line| line.contains("✓")) {
-        assert!(
-            line.contains("try:"),
-            "doctor success line is not actionable: {line}"
-        );
-    }
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(stdout.contains("Recommended\ndeadreckon init"), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
+    assert!(!stdout.contains("fix:"), "{stdout}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -4,166 +4,574 @@ use std::path::Path;
 pub(crate) async fn doctor_command(json_output: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let source = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let report = build_doctor_report(&paths, source).await?;
+    let surface = doctor_verdict_surface(&report);
     if json_output {
-        let sandbox_checks = deadreckon_sandbox::doctor()
-            .into_iter()
-            .map(|backend| {
-                json!({
-                    "backend": backend.backend,
-                    "available": backend.available,
-                    "path": backend.path,
-                    "note": backend.note,
-                })
-            })
-            .collect::<Vec<_>>();
-        let seams = match doctor_seam_resolution(&paths, false) {
-            Ok(lines) => json!({
-                "status": "ok",
-                "resolution": lines,
-            }),
-            Err(err) => json!({
-                "status": "invalid",
-                "error": err.to_string(),
-            }),
-        };
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "doctor",
-                "id": &source,
-                "status": "ok",
-                "next_actions": ["deadreckon detect", "deadreckon providers list"],
-                "try_lines": Vec::<String>::new(),
-                "paths": {
-                    "home": paths.home(),
-                    "config": paths.config_path(),
-                },
-                "source": &source,
-                "home": paths.home(),
-                "config_path": paths.config_path(),
-                "config_present": paths.config_path().exists(),
-                "sandboxes": sandbox_checks,
-                "seams": seams,
-            }))?
+            serde_json::to_string_pretty(
+                &surface.add_to_json(doctor_json_payload(&paths, &report, &surface))
+            )?
         );
         return Ok(());
     }
-    println!("{}", ui_heading("deadreckon doctor"));
-    println!(
-        "{} source {} | {} cd {}",
-        ui_ok("✓"),
-        source.display(),
-        ui_command("try:"),
-        source.display()
-    );
-    println!(
-        "{} home {} | {} DEADRECKON_HOME={}",
-        ui_ok("✓"),
-        paths.home().display(),
-        ui_command("try:"),
-        paths.home().display()
-    );
-    for backend in deadreckon_sandbox::doctor() {
-        if backend.available {
-            let path = backend
-                .path
-                .as_ref()
-                .map(|path| format!(" at {}", path.display()))
-                .unwrap_or_default();
-            let version = backend
-                .path
-                .as_ref()
-                .and_then(|path| command_version(path))
-                .map(|version| format!(" ({version})"))
-                .unwrap_or_default();
-            println!(
-                "{} sandbox {} found{}{} | {} deadreckon run \"goal\" --sandbox {} --preview",
-                ui_ok("✓"),
-                backend.backend,
-                path,
-                version,
-                ui_command("try:"),
-                backend.backend
-            );
-        } else {
-            println!("{} sandbox {} missing", ui_warn("✗"), backend.backend);
-            println!("    {} {}", ui_command("fix:"), backend.note);
-        }
-    }
-    if paths.config_path().exists() {
-        match load_config_value(&paths) {
-            Ok(root) => {
-                println!(
-                    "{} {} present and parseable | {} deadreckon config provider",
-                    ui_ok("✓"),
-                    paths.config_path().display(),
-                    ui_command("try:")
-                );
-                doctor_providers(&paths, &root).await?;
-            }
-            Err(err) => {
-                println!(
-                    "{} {} is not parseable",
-                    ui_warn("✗"),
-                    paths.config_path().display()
-                );
-                println!(
-                    "    {} check TOML syntax or rerun `deadreckon init` ({err})",
-                    ui_command("fix:")
-                );
-            }
-        }
-    } else {
-        println!("{} {} missing", ui_warn("✗"), paths.config_path().display());
-        println!("    {} deadreckon init", ui_command("fix:"));
-    }
-    let defaults = config_defaults(&paths).unwrap_or_default();
-    if defaults.provider.is_some() || paths.config_path().exists() {
-        println!(
-            "{} provider defaults configured | {} deadreckon config provider",
-            ui_ok("✓"),
-            ui_command("try:")
-        );
-    } else if command_exists("claude") || command_exists("codex") {
-        println!(
-            "{} cli subscription provider available | {} deadreckon init --no-confirm",
-            ui_ok("✓"),
-            ui_command("try:")
-        );
-    } else {
-        println!("{} no provider configured", ui_warn("✗"));
-        println!(
-            "    {} deadreckon init or deadreckon config set providers.anthropic.api_key <KEY>",
-            ui_command("fix:")
-        );
-    }
-    doctor_seams(&paths);
-    doctor_disk_and_permissions(&paths);
-    doctor_os();
-    doctor_sleep_prevention();
-    doctor_subscription_binary("claude");
-    doctor_subscription_binary("codex");
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
 }
 
-fn doctor_seams(paths: &DeadreckonPaths) {
-    println!("seams");
-    match doctor_seam_resolution(paths, false) {
-        Ok(lines) => {
-            println!(
-                "{} seams resolved | {} deadreckon run \"goal\" --no-seams",
-                ui_ok("✓"),
-                ui_command("try:")
-            );
-            for line in lines {
-                println!("    {line}");
+#[derive(Debug, Clone)]
+struct DoctorReport {
+    source: PathBuf,
+    config_present: bool,
+    sandboxes: Vec<Value>,
+    seams: Value,
+    findings: Vec<DoctorFinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorFinding {
+    status: String,
+    subject: String,
+    detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+}
+
+impl DoctorFinding {
+    fn passed(
+        subject: impl Into<String>,
+        detail: impl Into<String>,
+        action: Option<String>,
+    ) -> Self {
+        Self {
+            status: "passed".to_string(),
+            subject: subject.into(),
+            detail: detail.into(),
+            action,
+        }
+    }
+
+    fn warning(
+        subject: impl Into<String>,
+        detail: impl Into<String>,
+        action: Option<String>,
+    ) -> Self {
+        Self {
+            status: "warning".to_string(),
+            subject: subject.into(),
+            detail: detail.into(),
+            action,
+        }
+    }
+
+    fn failed(
+        subject: impl Into<String>,
+        detail: impl Into<String>,
+        action: Option<String>,
+    ) -> Self {
+        Self {
+            status: "failed".to_string(),
+            subject: subject.into(),
+            detail: detail.into(),
+            action,
+        }
+    }
+
+    fn is_failed(&self) -> bool {
+        self.status == "failed"
+    }
+}
+
+async fn build_doctor_report(paths: &DeadreckonPaths, source: PathBuf) -> Result<DoctorReport> {
+    let mut findings = vec![
+        DoctorFinding::passed("source", source.display().to_string(), None),
+        DoctorFinding::passed("home", paths.home().display().to_string(), None),
+    ];
+
+    let mut sandboxes = Vec::new();
+    for backend in deadreckon_sandbox::doctor() {
+        let path = backend.path.as_ref().map(|path| path.display().to_string());
+        let version = backend.path.as_ref().and_then(|path| command_version(path));
+        if backend.available {
+            findings.push(DoctorFinding::passed(
+                format!("sandbox {}", backend.backend),
+                format!(
+                    "found{}{}",
+                    path.as_ref()
+                        .map(|path| format!(" at {path}"))
+                        .unwrap_or_default(),
+                    version
+                        .as_ref()
+                        .map(|version| format!(" ({version})"))
+                        .unwrap_or_default()
+                ),
+                Some(format!(
+                    "deadreckon run \"goal\" --sandbox {} --preview",
+                    backend.backend
+                )),
+            ));
+        } else {
+            findings.push(DoctorFinding::warning(
+                format!("sandbox {}", backend.backend),
+                format!("missing: {}", backend.note),
+                None,
+            ));
+        }
+        sandboxes.push(json!({
+            "backend": backend.backend,
+            "available": backend.available,
+            "path": backend.path,
+            "note": backend.note,
+        }));
+    }
+
+    let mut config_root = None;
+    let config_present = paths.config_path().exists();
+    if config_present {
+        match load_config_value(paths) {
+            Ok(root) => {
+                findings.push(DoctorFinding::passed(
+                    "config",
+                    format!("{} present and parseable", paths.config_path().display()),
+                    Some("deadreckon config provider".to_string()),
+                ));
+                config_root = Some(root);
             }
+            Err(err) => findings.push(DoctorFinding::failed(
+                "config",
+                format!("{} is not parseable: {err}", paths.config_path().display()),
+                Some("deadreckon init".to_string()),
+            )),
+        }
+    } else {
+        findings.push(DoctorFinding::failed(
+            "config",
+            format!("{} missing", paths.config_path().display()),
+            Some("deadreckon init".to_string()),
+        ));
+    }
+
+    if let Some(root) = &config_root {
+        findings.extend(collect_doctor_provider_findings(paths, root).await?);
+    }
+
+    let defaults = config_defaults(paths).unwrap_or_default();
+    if defaults.provider.is_some() || config_present {
+        findings.push(DoctorFinding::passed(
+            "provider defaults",
+            "provider defaults configured",
+            Some("deadreckon config provider".to_string()),
+        ));
+    } else if command_exists("claude") || command_exists("codex") {
+        findings.push(DoctorFinding::passed(
+            "provider defaults",
+            "CLI subscription provider available",
+            Some("deadreckon init --no-confirm".to_string()),
+        ));
+    } else {
+        findings.push(DoctorFinding::failed(
+            "provider defaults",
+            "no provider configured",
+            Some("deadreckon init".to_string()),
+        ));
+    }
+
+    let seams = match doctor_seam_resolution(paths, false) {
+        Ok(lines) => {
+            findings.push(DoctorFinding::passed(
+                "seams",
+                format!("resolved: {}", lines.join("; ")),
+                Some("deadreckon run \"goal\" --no-seams".to_string()),
+            ));
+            json!({
+                "status": "ok",
+                "resolution": lines,
+            })
         }
         Err(err) => {
-            println!("{} seams config invalid", ui_warn("✗"));
-            println!("    {} {err}", ui_command("fix:"));
-            println!("    {} deadreckon doctor", ui_command("try:"));
+            findings.push(DoctorFinding::failed(
+                "seams",
+                format!("config invalid: {err}"),
+                Some("deadreckon doctor".to_string()),
+            ));
+            json!({
+                "status": "invalid",
+                "error": err.to_string(),
+            })
         }
+    };
+
+    collect_doctor_disk_and_permission_findings(paths, &mut findings);
+    collect_doctor_os_finding(&mut findings);
+    collect_doctor_sleep_finding(&mut findings);
+    collect_doctor_subscription_binary_finding("claude", &mut findings);
+    collect_doctor_subscription_binary_finding("codex", &mut findings);
+
+    Ok(DoctorReport {
+        source,
+        config_present,
+        sandboxes,
+        seams,
+        findings,
+    })
+}
+
+fn doctor_verdict_surface(report: &DoctorReport) -> VerdictSurface {
+    let failed_count = report
+        .findings
+        .iter()
+        .filter(|finding| finding.is_failed())
+        .count();
+    let warning_count = report
+        .findings
+        .iter()
+        .filter(|finding| finding.status == "warning")
+        .count();
+    let kind = if failed_count == 0 {
+        VerdictKind::Verified
+    } else {
+        VerdictKind::Blocked
+    };
+    let primary = doctor_primary_action(report);
+    let secondary = doctor_secondary_actions(report, &primary)
+        .into_iter()
+        .map(|action| ("Secondary", action))
+        .collect::<Vec<_>>();
+    VerdictSurface::try_new(
+        kind,
+        "doctor",
+        None,
+        doctor_explanation(report, failed_count, warning_count),
+        vec![("Recommended", primary.as_str())],
+        secondary,
+    )
+    .expect("doctor verdict surface must be valid")
+}
+
+fn doctor_explanation(
+    report: &DoctorReport,
+    failed_count: usize,
+    warning_count: usize,
+) -> ExplanationPanel {
+    let what = if failed_count == 0 {
+        format!(
+            "Doctor checked {} setup areas and found no blocking setup failures.",
+            report.findings.len()
+        )
+    } else {
+        format!(
+            "Doctor checked {} setup areas and found {failed_count} blocking setup issue(s).",
+            report.findings.len()
+        )
+    };
+    let why = if failed_count == 0 {
+        "All required checks passed; warnings, if any, are optional capabilities or local environment notes."
+            .to_string()
+    } else {
+        format!(
+            "The verdict is blocked because required setup checks failed; {warning_count} optional warning(s) were also recorded."
+        )
+    };
+    let evidence = report
+        .findings
+        .iter()
+        .map(|finding| {
+            (
+                finding.subject.clone(),
+                format!("{} - {}", finding.status, finding.detail),
+            )
+        })
+        .collect::<Vec<_>>();
+    ExplanationPanel::new(what, why, evidence)
+}
+
+fn doctor_primary_action(report: &DoctorReport) -> String {
+    report
+        .findings
+        .iter()
+        .filter(|finding| finding.is_failed())
+        .filter_map(|finding| finding.action.as_deref())
+        .find(|action| action.starts_with("deadreckon "))
+        .map(str::to_string)
+        .unwrap_or_else(|| "deadreckon run \"goal\" --preview".to_string())
+}
+
+fn doctor_secondary_actions(report: &DoctorReport, primary: &str) -> Vec<String> {
+    let mut actions = Vec::new();
+    for action in report
+        .findings
+        .iter()
+        .filter_map(|finding| finding.action.as_deref())
+    {
+        if action != primary && !actions.iter().any(|existing| existing == action) {
+            actions.push(action.to_string());
+        }
+    }
+    actions
+}
+
+fn doctor_json_payload(
+    paths: &DeadreckonPaths,
+    report: &DoctorReport,
+    surface: &VerdictSurface,
+) -> Value {
+    let mut next_actions = vec![surface.primary_action.command.clone()];
+    next_actions.extend(doctor_secondary_actions(
+        report,
+        &surface.primary_action.command,
+    ));
+    json!({
+        "kind": "doctor",
+        "id": &report.source,
+        "status": surface.kind.as_str(),
+        "next_actions": next_actions,
+        "try_lines": Vec::<String>::new(),
+        "paths": {
+            "home": paths.home(),
+            "config": paths.config_path(),
+        },
+        "source": &report.source,
+        "home": paths.home(),
+        "config_path": paths.config_path(),
+        "config_present": report.config_present,
+        "sandboxes": report.sandboxes,
+        "seams": report.seams,
+        "findings": report.findings,
+    })
+}
+
+async fn collect_doctor_provider_findings(
+    paths: &DeadreckonPaths,
+    root: &toml::Value,
+) -> Result<Vec<DoctorFinding>> {
+    let Some(providers) = root.get("providers").and_then(toml::Value::as_table) else {
+        return Ok(vec![DoctorFinding::failed(
+            "providers",
+            "providers table missing",
+            Some("deadreckon init".to_string()),
+        )]);
+    };
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let mut findings = Vec::new();
+    for (name, entry) in providers {
+        let kind = entry
+            .get("kind")
+            .and_then(toml::Value::as_str)
+            .unwrap_or(name);
+        let kind_label = registry
+            .get(name)
+            .map(|descriptor| descriptor_kind_label(&descriptor.kind).to_string())
+            .unwrap_or_else(|| config_provider_kind_label(kind).to_string());
+        let subject = format!("provider {name} kind={kind_label}");
+        if kind.contains("cli") || name.starts_with("cli:") {
+            let binary = entry
+                .get("binary")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| {
+                    if name.contains("claude") {
+                        "claude"
+                    } else {
+                        "codex"
+                    }
+                });
+            if command_exists(binary) || PathBuf::from(binary).exists() {
+                findings.push(DoctorFinding::passed(
+                    subject,
+                    format!("CLI binary {binary} found"),
+                    Some(format!(
+                        "deadreckon run \"goal\" --provider {name} --preview"
+                    )),
+                ));
+            } else {
+                findings.push(DoctorFinding::failed(
+                    subject,
+                    format!("CLI binary {binary} missing"),
+                    Some("deadreckon config provider".to_string()),
+                ));
+            }
+        } else if provider_has_key(entry) {
+            if std::env::var_os("DEADRECKON_DOCTOR_PING").is_some() {
+                findings.push(collect_doctor_provider_ping(paths, name, &kind_label).await?);
+            } else {
+                findings.push(DoctorFinding::passed(
+                    subject,
+                    "credential present; ping skipped",
+                    Some("DEADRECKON_DOCTOR_PING=1 deadreckon doctor".to_string()),
+                ));
+            }
+        } else {
+            findings.push(DoctorFinding::failed(
+                subject,
+                "credential missing",
+                Some(format!(
+                    "deadreckon config set providers.{name}.api_key <KEY>"
+                )),
+            ));
+        }
+    }
+    Ok(findings)
+}
+
+async fn collect_doctor_provider_ping(
+    paths: &DeadreckonPaths,
+    name: &str,
+    kind_label: &str,
+) -> Result<DoctorFinding> {
+    let router = ProviderRouter::from_config_path(&paths.config_path(), Some(name))?;
+    let request = ProviderRequest {
+        prompt: "Reply with OK only.".to_string(),
+        max_output_tokens: 8,
+        cwd: None,
+        output_path: None,
+        sandbox_backend: None,
+        pid_file: None,
+        cancellation_token: None,
+    };
+    let subject = format!("provider {name} kind={kind_label}");
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        router.complete(&request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Ok(DoctorFinding::passed(
+            subject,
+            format!("ping ok model {}", response.model),
+            Some(format!(
+                "deadreckon run \"goal\" --provider {name} --preview"
+            )),
+        )),
+        Ok(Err(err)) => Ok(DoctorFinding::failed(
+            subject,
+            format!("ping failed: {err}"),
+            Some("deadreckon config provider".to_string()),
+        )),
+        Err(_) => Ok(DoctorFinding::failed(
+            subject,
+            "ping timed out",
+            Some("deadreckon config provider".to_string()),
+        )),
+    }
+}
+
+fn collect_doctor_disk_and_permission_findings(
+    paths: &DeadreckonPaths,
+    findings: &mut Vec<DoctorFinding>,
+) {
+    if let Err(err) = fs::create_dir_all(paths.runstate_dir()) {
+        findings.push(DoctorFinding::failed(
+            "runstate dir",
+            format!("{} not writable: {err}", paths.runstate_dir().display()),
+            None,
+        ));
+    } else {
+        let probe = paths.runstate_dir().join(".doctor-write-test");
+        match fs::write(&probe, b"ok").and_then(|_| fs::remove_file(&probe)) {
+            Ok(()) => findings.push(DoctorFinding::passed(
+                "runstate dir",
+                format!("{} writable", paths.runstate_dir().display()),
+                Some("deadreckon run \"goal\" --preview".to_string()),
+            )),
+            Err(err) => findings.push(DoctorFinding::failed(
+                "runstate dir",
+                format!("{} not writable: {err}", paths.runstate_dir().display()),
+                None,
+            )),
+        }
+    }
+
+    match free_kb(paths.home()) {
+        Some(kb) if kb < 1_048_576 => findings.push(DoctorFinding::failed(
+            "disk space",
+            format!("{} MB free in {}", kb / 1024, paths.home().display()),
+            None,
+        )),
+        Some(kb) => findings.push(DoctorFinding::passed(
+            "disk space",
+            format!("{} MB free in {}", kb / 1024, paths.home().display()),
+            Some("deadreckon status".to_string()),
+        )),
+        None => findings.push(DoctorFinding::warning(
+            "disk space",
+            format!("check unavailable for {}", paths.home().display()),
+            None,
+        )),
+    }
+}
+
+fn collect_doctor_os_finding(findings: &mut Vec<DoctorFinding>) {
+    #[cfg(target_os = "macos")]
+    {
+        let version = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        findings.push(DoctorFinding::passed(
+            "os",
+            format!("macOS {version}"),
+            None,
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let version = std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        findings.push(DoctorFinding::passed(
+            "os",
+            format!("Linux kernel {version}"),
+            None,
+        ));
+    }
+}
+
+fn collect_doctor_sleep_finding(findings: &mut Vec<DoctorFinding>) {
+    let preview = sleep::preview(SleepPrefs::On, true);
+    match preview.mode {
+        sleep::SleepMode::Caffeinate | sleep::SleepMode::SystemdInhibit => {
+            findings.push(DoctorFinding::passed(
+                "sleep prevention",
+                preview.label(),
+                Some("deadreckon run \"goal\" --prevent-sleep auto".to_string()),
+            ));
+        }
+        sleep::SleepMode::None => findings.push(DoctorFinding::warning(
+            "sleep prevention",
+            "disabled",
+            Some("deadreckon run \"goal\" --prevent-sleep on".to_string()),
+        )),
+        sleep::SleepMode::Unsupported => findings.push(DoctorFinding::warning(
+            "sleep prevention",
+            "unsupported",
+            Some("deadreckon run \"goal\" --prevent-sleep off".to_string()),
+        )),
+    }
+}
+
+fn collect_doctor_subscription_binary_finding(binary: &str, findings: &mut Vec<DoctorFinding>) {
+    if command_exists(binary) {
+        let provider = if binary == "claude" {
+            "cli:claude-code"
+        } else {
+            "cli:codex"
+        };
+        findings.push(DoctorFinding::passed(
+            format!("subscription binary {binary}"),
+            command_version(std::path::Path::new(binary))
+                .unwrap_or_else(|| "version unknown".to_string()),
+            Some(format!("deadreckon config provider {provider}")),
+        ));
+    } else {
+        findings.push(DoctorFinding::warning(
+            format!("subscription binary {binary}"),
+            "missing",
+            Some("deadreckon config provider".to_string()),
+        ));
     }
 }
 
@@ -195,105 +603,6 @@ fn seam_command_basename(command: &[String]) -> String {
         .to_string()
 }
 
-fn doctor_sleep_prevention() {
-    let preview = sleep::preview(SleepPrefs::On, true);
-    match preview.mode {
-        sleep::SleepMode::Caffeinate | sleep::SleepMode::SystemdInhibit => {
-            println!(
-                "{} sleep prevention {} | {} deadreckon run \"goal\" --prevent-sleep auto",
-                ui_ok("✓"),
-                preview.label(),
-                ui_command("try:")
-            );
-        }
-        sleep::SleepMode::None => {
-            println!(
-                "{} sleep prevention disabled | {} deadreckon run \"goal\" --prevent-sleep on",
-                ui_warn("✗"),
-                ui_command("try:")
-            );
-        }
-        sleep::SleepMode::Unsupported => {
-            let fix = if cfg!(target_os = "linux") {
-                "sudo apt install systemd"
-            } else if cfg!(target_os = "macos") {
-                "check /usr/bin/caffeinate"
-            } else {
-                "--prevent-sleep off (Windows native prevention is a V1 candidate)"
-            };
-            println!("{} sleep prevention unsupported", ui_warn("✗"));
-            println!("    {} {fix}", ui_command("fix:"));
-        }
-    }
-}
-
-async fn doctor_providers(paths: &DeadreckonPaths, root: &toml::Value) -> Result<()> {
-    let Some(providers) = root.get("providers").and_then(toml::Value::as_table) else {
-        println!("{} providers table missing", ui_warn("✗"));
-        println!("    {} deadreckon init", ui_command("fix:"));
-        return Ok(());
-    };
-    let registry = ProviderRegistry::with_overrides(paths.home())?;
-    for (name, entry) in providers {
-        let kind = entry
-            .get("kind")
-            .and_then(toml::Value::as_str)
-            .unwrap_or(name);
-        let kind_label = registry
-            .get(name)
-            .map(|descriptor| descriptor_kind_label(&descriptor.kind).to_string())
-            .unwrap_or_else(|| config_provider_kind_label(kind).to_string());
-        if kind.contains("cli") || name.starts_with("cli:") {
-            let binary = entry
-                .get("binary")
-                .and_then(toml::Value::as_str)
-                .unwrap_or_else(|| {
-                    if name.contains("claude") {
-                        "claude"
-                    } else {
-                        "codex"
-                    }
-                });
-            if command_exists(binary) || PathBuf::from(binary).exists() {
-                println!(
-                    "{} provider {name} kind={kind_label} CLI binary {binary} found | {} deadreckon run \"goal\" --provider {name} --preview",
-                    ui_ok("✓"),
-                    ui_command("try:")
-                );
-            } else {
-                println!(
-                    "{} provider {name} kind={kind_label} CLI binary {binary} missing",
-                    ui_warn("✗")
-                );
-                println!(
-                    "    {} install {binary} or set providers.\"{name}\".binary",
-                    ui_command("fix:")
-                );
-            }
-        } else if provider_has_key(entry) {
-            if std::env::var_os("DEADRECKON_DOCTOR_PING").is_some() {
-                doctor_provider_ping(paths, name, &kind_label).await?;
-            } else {
-                println!(
-                    "{} provider {name} kind={kind_label} credential present; ping skipped | {} DEADRECKON_DOCTOR_PING=1 deadreckon doctor",
-                    ui_ok("✓"),
-                    ui_command("try:")
-                );
-            }
-        } else {
-            println!(
-                "{} provider {name} kind={kind_label} credential missing",
-                ui_warn("✗")
-            );
-            println!(
-                "    {} deadreckon config set providers.{name}.api_key <KEY>",
-                ui_command("fix:")
-            );
-        }
-    }
-    Ok(())
-}
-
 fn config_provider_kind_label(kind: &str) -> &'static str {
     let kind = kind.to_ascii_lowercase();
     if kind.contains("cli") {
@@ -309,53 +618,6 @@ fn config_provider_kind_label(kind: &str) -> &'static str {
     }
 }
 
-async fn doctor_provider_ping(paths: &DeadreckonPaths, name: &str, kind_label: &str) -> Result<()> {
-    let router = ProviderRouter::from_config_path(&paths.config_path(), Some(name))?;
-    let request = ProviderRequest {
-        prompt: "Reply with OK only.".to_string(),
-        max_output_tokens: 8,
-        cwd: None,
-        output_path: None,
-        sandbox_backend: None,
-        pid_file: None,
-        cancellation_token: None,
-    };
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        router.complete(&request),
-    )
-    .await
-    {
-        Ok(Ok(response)) => println!(
-            "{} provider {name} kind={kind_label} ping ok model {} | {} deadreckon run \"goal\" --provider {name} --preview",
-            ui_ok("✓"),
-            response.model,
-            ui_command("try:")
-        ),
-        Ok(Err(err)) => {
-            println!(
-                "{} provider {name} kind={kind_label} ping failed",
-                ui_warn("✗")
-            );
-            println!(
-                "    {} check credentials or set a fallback provider ({err})",
-                ui_command("fix:")
-            );
-        }
-        Err(_) => {
-            println!(
-                "{} provider {name} kind={kind_label} ping timed out",
-                ui_warn("✗")
-            );
-            println!(
-                "    {} check network/provider status or unset DEADRECKON_DOCTOR_PING",
-                ui_command("fix:")
-            );
-        }
-    }
-    Ok(())
-}
-
 fn provider_has_key(entry: &toml::Value) -> bool {
     entry
         .get("api_key")
@@ -366,133 +628,6 @@ fn provider_has_key(entry: &toml::Value) -> bool {
             .and_then(toml::Value::as_str)
             .and_then(std::env::var_os)
             .is_some()
-}
-
-fn doctor_disk_and_permissions(paths: &DeadreckonPaths) {
-    if let Err(err) = fs::create_dir_all(paths.runstate_dir()) {
-        println!(
-            "{} runstate dir {} not writable",
-            ui_warn("✗"),
-            paths.runstate_dir().display()
-        );
-        println!(
-            "    {} mkdir -p {} && chmod u+w {}",
-            ui_command("fix:"),
-            paths.runstate_dir().display(),
-            paths.runstate_dir().display()
-        );
-        println!("    detail: {err}");
-        return;
-    }
-    let probe = paths.runstate_dir().join(".doctor-write-test");
-    match fs::write(&probe, b"ok").and_then(|_| fs::remove_file(&probe)) {
-        Ok(()) => println!(
-            "{} runstate dir {} writable | {} deadreckon run \"goal\" --preview",
-            ui_ok("✓"),
-            paths.runstate_dir().display(),
-            ui_command("try:")
-        ),
-        Err(err) => {
-            println!(
-                "{} runstate dir {} not writable",
-                ui_warn("✗"),
-                paths.runstate_dir().display()
-            );
-            println!(
-                "    {} chmod u+w {}",
-                ui_command("fix:"),
-                paths.runstate_dir().display()
-            );
-            println!("    detail: {err}");
-        }
-    }
-    match free_kb(paths.home()) {
-        Some(kb) if kb < 1_048_576 => {
-            println!(
-                "{} disk space low: {} MB free in {}",
-                ui_warn("✗"),
-                kb / 1024,
-                paths.home().display()
-            );
-            println!(
-                "    {} free at least 1 GB or set DEADRECKON_HOME to a larger disk",
-                ui_command("fix:")
-            );
-        }
-        Some(kb) => println!(
-            "{} disk space {} MB free in {} | {} deadreckon status",
-            ui_ok("✓"),
-            kb / 1024,
-            paths.home().display(),
-            ui_command("try:")
-        ),
-        None => {
-            println!(
-                "{} disk space check unavailable for {}",
-                ui_warn("✗"),
-                paths.home().display()
-            );
-            println!(
-                "    {} run `df -Pk {}` manually",
-                ui_command("fix:"),
-                paths.home().display()
-            );
-        }
-    }
-}
-
-fn doctor_os() {
-    #[cfg(target_os = "macos")]
-    {
-        let version = std::process::Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
-            .ok()
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        println!(
-            "{} os macOS {version} | {} sw_vers -productVersion",
-            ui_ok("✓"),
-            ui_command("try:")
-        );
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let version = std::process::Command::new("uname")
-            .arg("-r")
-            .output()
-            .ok()
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        println!(
-            "{} os Linux kernel {version} | {} uname -r",
-            ui_ok("✓"),
-            ui_command("try:")
-        );
-    }
-}
-
-fn doctor_subscription_binary(binary: &str) {
-    if command_exists(binary) {
-        let provider = if binary == "claude" {
-            "cli:claude-code"
-        } else {
-            "cli:codex"
-        };
-        println!(
-            "{} subscription binary {binary} {} | {} deadreckon config provider {provider}",
-            ui_ok("✓"),
-            command_version(std::path::Path::new(binary))
-                .unwrap_or_else(|| "version unknown".to_string()),
-            ui_command("try:")
-        );
-    } else {
-        println!("{} subscription binary {binary} missing", ui_warn("✗"));
-        println!(
-            "    {} install {binary} or choose another provider with `deadreckon config set defaults.provider <name>`",
-            ui_command("fix:")
-        );
-    }
 }
 
 fn command_version(path: &std::path::Path) -> Option<String> {
@@ -550,5 +685,55 @@ timeout_ms = 1234
                 .iter()
                 .any(|line| line == "event_sink: builtin fail=safe")
         );
+    }
+
+    #[tokio::test]
+    async fn doctor_missing_config_surface_has_one_primary_action() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("repo");
+        std::fs::create_dir_all(&source).expect("source");
+
+        let report = build_doctor_report(&paths, source)
+            .await
+            .expect("doctor report");
+        let rendered = doctor_verdict_surface(&report).render_plain(false);
+
+        assert!(rendered.starts_with("blocked doctor"), "{rendered}");
+        assert!(rendered.contains("Explanation\n"), "{rendered}");
+        assert!(rendered.contains("Evidence\n"), "{rendered}");
+        assert!(rendered.contains("config.toml missing"), "{rendered}");
+        assert!(rendered.contains("runstate dir"), "{rendered}");
+        assert!(rendered.contains("disk space"), "{rendered}");
+        assert_eq!(rendered.matches("\nRecommended\n").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("Recommended\ndeadreckon init"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("try:"), "{rendered}");
+        assert!(!rendered.contains("fix:"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn doctor_json_adds_verdict_and_primary_action() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("repo");
+        std::fs::create_dir_all(&source).expect("source");
+
+        let report = build_doctor_report(&paths, source)
+            .await
+            .expect("doctor report");
+        let surface = doctor_verdict_surface(&report);
+        let value = surface.add_to_json(doctor_json_payload(&paths, &report, &surface));
+
+        assert!(value["findings"].as_array().expect("findings").len() > 3);
+        assert_eq!(value["primary_action"], "deadreckon init");
+        assert_eq!(value["verdict"]["kind"], "blocked");
+        assert_eq!(
+            value["verdict"]["recommended_command"],
+            value["primary_action"]
+        );
+        assert_eq!(value["next_actions"][0], value["primary_action"]);
     }
 }
