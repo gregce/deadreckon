@@ -42,10 +42,10 @@ use deadreckon::ui_card::{
 };
 use deadreckon::verdict_surface::{ExplanationPanel, VerdictKind, VerdictSurface};
 use deadreckon_core::flight::{
-    CheckpointManifest, FLIGHT_EVENTS_JSONL, FlightEvent, FlightEventKind, FlightSessionStatus,
-    RewindEvent, RewindMode, RewindStatus, RewindTarget, RewindTargetKind, append_rewind_event,
-    build_working_file_index, list_checkpoint_manifests, materialize_checkpoint,
-    read_flight_events, read_flight_manifest,
+    CheckpointManifest, FLIGHT_EVENTS_JSONL, FLIGHT_MANIFEST_JSON, FlightEvent, FlightEventKind,
+    FlightSessionStatus, RewindEvent, RewindMode, RewindStatus, RewindTarget, RewindTargetKind,
+    append_rewind_event, build_working_file_index, list_checkpoint_manifests,
+    materialize_checkpoint, read_flight_events, read_flight_manifest,
 };
 use deadreckon_core::glossary::{NOUN_DONE_CONTRACT, NOUN_VERIFIED_RUN};
 use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt, write_receipt};
@@ -8984,28 +8984,38 @@ fn show_flight(
         .collect::<Vec<_>>();
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "flight",
-                "id": &state.run_id,
-                "available": manifest.is_some(),
-                "turn": turn,
-                "file": file_filter,
-                "manifest": manifest,
-                "events": filtered_events,
-                "checkpoints": filtered_checkpoints,
-            }))?
-        );
+        let surface = manifest
+            .is_none()
+            .then(|| flight_unavailable_surface(state, turn, file_filter.as_deref()));
+        let next_actions = surface
+            .as_ref()
+            .map(|surface| vec![surface.primary_action.command.clone()])
+            .unwrap_or_default();
+        let value = json!({
+            "kind": "flight",
+            "id": &state.run_id,
+            "available": manifest.is_some(),
+            "turn": turn,
+            "file": file_filter,
+            "manifest": manifest,
+            "events": filtered_events,
+            "checkpoints": filtered_checkpoints,
+            "next_actions": next_actions,
+            "try_lines": Vec::<String>::new(),
+        });
+        let value = surface
+            .as_ref()
+            .map(|surface| surface.add_to_json(value.clone()))
+            .unwrap_or(value);
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 
     let Some(manifest) = manifest else {
-        println!(
-            "no flight recorder data for run {}",
-            run_prefix(&state.run_id)
+        print!(
+            "{}",
+            flight_unavailable_surface(state, turn, file_filter.as_deref()).render_plain(false)
         );
-        println!("try: deadreckon show {}", run_prefix(&state.run_id));
         return Ok(());
     };
 
@@ -9092,6 +9102,50 @@ fn show_flight(
         }
     }
     Ok(())
+}
+
+fn flight_unavailable_surface(
+    state: &deadreckon_core::PipelineState,
+    turn: Option<u32>,
+    file: Option<&Path>,
+) -> VerdictSurface {
+    let id = run_prefix(&state.run_id);
+    let primary = format!("deadreckon show {id}");
+    let mut evidence = vec![
+        ("run".to_string(), id.clone()),
+        ("available".to_string(), "false".to_string()),
+        (
+            "manifest".to_string(),
+            state
+                .run_root
+                .join(FLIGHT_MANIFEST_JSON)
+                .display()
+                .to_string(),
+        ),
+        (
+            "state".to_string(),
+            state.state_path().display().to_string(),
+        ),
+    ];
+    if let Some(turn) = turn {
+        evidence.push(("turn".to_string(), turn.to_string()));
+    }
+    if let Some(file) = file {
+        evidence.push(("file".to_string(), file.display().to_string()));
+    }
+    VerdictSurface::try_new(
+        VerdictKind::Noop,
+        "flight",
+        Some(&id),
+        ExplanationPanel::new(
+            format!("DeadReckon found no flight recorder data for run {id}."),
+            "The command was read-only and the run has no flight manifest to inspect.",
+            evidence,
+        ),
+        vec![("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("flight unavailable verdict surface must have one primary action")
 }
 
 fn normalize_flight_file_filter(path: &Path, working_dir: &Path) -> Option<PathBuf> {

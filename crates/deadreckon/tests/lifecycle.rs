@@ -1742,6 +1742,89 @@ fn undo_rewind_surfaces_do_not_offer_multiple_primary_actions() {
 }
 
 #[test]
+fn show_flight_missing_data_surface_has_one_primary_action() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let state = create_run(
+        &paths,
+        RunOptions {
+            goal: "missing flight surface".to_string(),
+            cwd: temp.path().join("workspace"),
+            sandbox: "none".to_string(),
+            provider: Some("mock".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(30.0),
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+
+    let output = deadreckon(&paths)
+        .arg("show")
+        .arg(&state.run_id)
+        .arg("--flight")
+        .output()
+        .expect("show flight");
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("no-op flight "), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon show {}",
+            &state.run_id[..8]
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("try:"), "{stdout}");
+}
+
+#[test]
+fn show_flight_missing_data_json_adds_verdict_and_primary_action() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let state = create_run(
+        &paths,
+        RunOptions {
+            goal: "missing flight json".to_string(),
+            cwd: temp.path().join("workspace"),
+            sandbox: "none".to_string(),
+            provider: Some("mock".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(30.0),
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+
+    let output = deadreckon(&paths)
+        .arg("show")
+        .arg(&state.run_id)
+        .arg("--flight")
+        .arg("--json")
+        .output()
+        .expect("show flight json");
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("flight json");
+    let expected_primary = format!("deadreckon show {}", &state.run_id[..8]);
+    assert_eq!(value["kind"], "flight");
+    assert_eq!(value["available"], false);
+    assert_eq!(value["primary_action"], expected_primary);
+    assert_eq!(value["verdict"]["kind"], "no-op");
+    assert_eq!(
+        value["verdict"]["recommended_command"],
+        value["primary_action"]
+    );
+    assert_eq!(value["next_actions"][0], value["primary_action"]);
+}
+
+#[test]
 fn cleanup_refusal_surface_has_one_safe_recovery_command() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
