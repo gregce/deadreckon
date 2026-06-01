@@ -7,7 +7,8 @@ use std::process::Command;
 use chrono::Utc;
 use deadreckon_core::learning::{
     LearningAutoPrStatus, LearningCandidate, LearningCandidateDiff, LearningEval,
-    LearningEvalCommand, LearningProposal, LearningProposalTarget, LearningRisk, LearningStimulus,
+    LearningEvalCommand, LearningProposal, LearningProposalTarget, LearningRisk, LearningSignal,
+    LearningStimulus, read_signals,
 };
 use deadreckon_core::{DeadreckonPaths, RunOptions, RunStatus, create_run, save_state};
 use serde_json::Value;
@@ -228,6 +229,69 @@ fn learn_propose_defaults_to_local_evidence_source() {
 }
 
 #[test]
+fn learn_propose_success_has_one_verdict_and_primary_action() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path());
+    let cwd = std::env::current_dir().expect("cwd");
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "provider setup failure".to_string(),
+            cwd,
+            sandbox: "seatbelt".to_string(),
+            provider: Some("cli:codex".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: None,
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+    state.status = RunStatus::Failed;
+    state.updated_at = Utc::now();
+    state.failure_reason = Some("provider route cli:missing has no credential".to_string());
+    save_state(&state).expect("save");
+
+    let index = deadreckon(temp.path())
+        .args(["learn", "index", "--all", "--json"])
+        .output()
+        .expect("learn index");
+    assert_success(&index);
+    let signals = read_signals(&paths).expect("signals");
+    let signal = signals.first().expect("signal");
+    write_fake_learning_reflection_provider(&paths, temp.path(), signal);
+
+    let json_output = deadreckon(temp.path())
+        .args(["learn", "propose", "--limit", "1", "--json"])
+        .output()
+        .expect("learn propose json");
+    assert_success(&json_output);
+    let json: Value = serde_json::from_slice(&json_output.stdout).expect("json");
+    assert_eq!(json["insights_written"], 1);
+    assert_eq!(json["proposals_written"], 1);
+    let proposal_id = json["proposals"][0]["proposal_id"]
+        .as_str()
+        .expect("proposal id");
+    let expected_primary = format!("deadreckon improve self {proposal_id} --preview");
+    assert_eq!(json["verdict"]["kind"], "completed");
+    assert_eq!(json["primary_action"], expected_primary);
+
+    let human = deadreckon(temp.path())
+        .args(["learn", "propose", "--limit", "1"])
+        .output()
+        .expect("learn propose human");
+    assert_success(&human);
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(stdout.starts_with("completed learn propose"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(stdout.contains(&expected_primary), "{stdout}");
+    assert!(!stdout.contains("next:"), "{stdout}");
+}
+
+#[test]
 fn learn_export_import_bundle_preview_roundtrips_redacted_counts() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path());
@@ -365,10 +429,31 @@ fn pr_dry_run_writes_body_without_network_or_push() {
 
     assert_success(&output);
     let json: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(json["verdict"]["kind"], "completed");
+    assert_eq!(
+        json["primary_action"],
+        "deadreckon improve self prop-cli --open-pr"
+    );
     assert_eq!(json["decision"]["eligible"], true);
     let body_path = json["body_path"].as_str().expect("body_path");
     assert!(Path::new(body_path).exists());
     assert!(paths.learning_pr_events_path().exists());
+
+    let human = deadreckon(temp.path())
+        .args(["improve", "self", "prop-cli", "--pr-dry-run"])
+        .output()
+        .expect("pr dry-run human");
+    assert_success(&human);
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(stdout.starts_with("completed improve self"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("deadreckon improve self prop-cli --open-pr"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("next:"), "{stdout}");
 }
 
 #[test]
@@ -645,4 +730,102 @@ fn write_synthetic_pr_fixture(paths: &DeadreckonPaths) {
     let eval_path = paths.learning_eval_path(&eval.candidate_id);
     fs::create_dir_all(eval_path.parent().expect("eval parent")).expect("eval dir");
     fs::write(eval_path, serde_json::to_vec_pretty(&eval).expect("eval")).expect("eval write");
+}
+
+fn write_fake_learning_reflection_provider(
+    paths: &DeadreckonPaths,
+    root: &Path,
+    signal: &LearningSignal,
+) {
+    fs::create_dir_all(paths.home()).expect("home");
+    let response = root.join("learning-reflection-response.json");
+    fs::write(
+        &response,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "insights": [{
+                "stimulus": [{
+                    "signal_id": signal.signal_id,
+                    "run_id": signal.run_id
+                }],
+                "summary": "Provider setup failures need one recovery surface.",
+                "user_need": "A clear recovery command after learning reflection.",
+                "hypothesis": "A verdict surface makes learning proposals easier to act on.",
+                "confidence": "high",
+                "rejected_claims": []
+            }],
+            "proposals": [{
+                "title": "Normalize learning propose output",
+                "insights": [],
+                "stimulus": [{
+                    "signal_id": signal.signal_id,
+                    "run_id": signal.run_id
+                }],
+                "hypothesis": "Learning propose output should lead with one action.",
+                "target": {
+                    "repo": "/Users/gdc/deadreckon",
+                    "scope": "cli-friendliness"
+                },
+                "goal_text": "Normalize learning propose output to the verdict surface.",
+                "done_criteria": ["focused learning_cli tests pass"],
+                "expected_risk": "low",
+                "blocked_auto_pr_reasons": []
+            }]
+        }))
+        .expect("response"),
+    )
+    .expect("write response");
+
+    let binary = root.join("learning-reflection-provider.sh");
+    fs::write(
+        &binary,
+        format!("#!/bin/sh\ncat '{}'\n", response.display()),
+    )
+    .expect("provider script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = fs::metadata(&binary)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&binary, perms).expect("chmod");
+    }
+
+    let providers_dir = paths.home().join("providers.d");
+    fs::create_dir_all(&providers_dir).expect("providers dir");
+    fs::write(
+        providers_dir.join("learning-reflection.toml"),
+        format!(
+            r#"
+id = "learning-reflection"
+display_name = "Learning Reflection Fixture"
+kind = "cli"
+default_binary = "{binary}"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["{{prompt}}"]
+"#,
+            binary = binary.display()
+        ),
+    )
+    .expect("descriptor");
+    fs::write(
+        paths.config_path(),
+        format!(
+            r#"
+default_provider = "learning-reflection"
+fallback = ["learning-reflection"]
+
+[providers.learning-reflection]
+binary = "{binary}"
+"#,
+            binary = binary.display()
+        ),
+    )
+    .expect("config");
 }

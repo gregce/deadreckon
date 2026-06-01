@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 use crate::commands::learning::{SelfImprovePrAdapter, open_self_improve_pr_if_eligible};
-use deadreckon_core::learning::{AutoPrDecision, LearningRisk};
+use deadreckon_core::learning::{AutoPrDecision, LearningRisk, PrDryRun};
 use tempfile::TempDir;
 
 use super::*;

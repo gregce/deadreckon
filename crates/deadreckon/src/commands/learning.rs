@@ -1,6 +1,7 @@
 use super::super::*;
 use deadreckon_core::learning::{
     LearningBundleExportReport, LearningBundleImportReport, LearningIndexSummary, LearningReport,
+    PrDryRun, ProposalGenerationReport,
 };
 
 pub(crate) async fn learn_command(command: LearnCommand) -> Result<()> {
@@ -356,34 +357,66 @@ async fn learn_propose_command(
         model: response.model,
     };
     let report = persist_reflection(&paths, &reflection_provider, &response.content, limit)?;
+    let surface = learn_propose_surface(&route.name, &report);
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&surface.add_to_json(serde_json::to_value(&report)?))?
+        );
         return Ok(());
     }
-    println!("{}", ui_heading("learning proposals"));
-    print_kv_block(&[
-        ("provider route", route.name.as_str()),
-        ("insights", &report.insights_written.to_string()),
-        ("proposals", &report.proposals_written.to_string()),
-    ]);
-    for proposal in &report.proposals {
-        println!(
-            "  {} {}",
-            ui_id(&proposal.proposal_id),
-            one_line(&proposal.title, 100)
-        );
-    }
-    if let Some(proposal) = report.proposals.first() {
-        println!(
-            "{} {}",
-            ui_muted("next:"),
-            ui_command(format!(
-                "deadreckon improve self {} --preview",
-                proposal.proposal_id
-            ))
-        );
-    }
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+fn learn_propose_surface(
+    provider_route: &str,
+    report: &ProposalGenerationReport,
+) -> VerdictSurface {
+    let (kind, primary, why) = if let Some(proposal) = report.proposals.first() {
+        (
+            VerdictKind::Completed,
+            format!("deadreckon improve self {} --preview", proposal.proposal_id),
+            "The provider returned valid reflection JSON and at least one proposal was persisted; previewing the first proposal is the safest next command."
+                .to_string(),
+        )
+    } else {
+        (
+            VerdictKind::Noop,
+            "deadreckon learn report".to_string(),
+            "No proposals were persisted, so the next useful command is to inspect the learning report before trying reflection again."
+                .to_string(),
+        )
+    };
+    let first_proposal = report
+        .proposals
+        .first()
+        .map(|proposal| proposal.proposal_id.clone())
+        .unwrap_or_else(|| "none".to_string());
+    let first_title = report
+        .proposals
+        .first()
+        .map(|proposal| one_line(&proposal.title, 100))
+        .unwrap_or_else(|| "none".to_string());
+    VerdictSurface::try_new(
+        kind,
+        "learn",
+        Some("propose"),
+        ExplanationPanel::new(
+            "DeadReckon converted learning signals into provider-backed proposals.",
+            why,
+            vec![
+                ("provider route", provider_route.to_string()),
+                ("insights written", report.insights_written.to_string()),
+                ("proposals written", report.proposals_written.to_string()),
+                ("first proposal", first_proposal),
+                ("first title", first_title),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", "deadreckon learn report")],
+    )
+    .expect("learn propose verdict surface must be valid")
 }
 
 fn resolve_learning_scope(scope: Option<String>, all: bool) -> Result<Option<String>> {
@@ -444,36 +477,110 @@ async fn improve_self_command(
                 &dry_run,
                 &adapter,
             )?;
-            println!("{}", ui_ok(format!("opened PR {pr_url}")));
+            let surface = improve_self_open_pr_surface(&proposal, &candidate, &dry_run, &pr_url);
+            if json_output {
+                let payload = json!({
+                    "proposal_id": proposal.proposal_id,
+                    "candidate_id": candidate.candidate_id,
+                    "branch": candidate.branch,
+                    "pr_url": pr_url,
+                    "body_path": dry_run.body_path,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&surface.add_to_json(payload))?
+                );
+            } else {
+                println!("{}", surface.render_plain(!completion_hints_enabled(false)));
+            }
             return Ok(());
         }
+        let surface = improve_self_pr_dry_run_surface(&proposal, &candidate, &dry_run);
         if json_output {
-            println!("{}", serde_json::to_string_pretty(&dry_run)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &surface.add_to_json(serde_json::to_value(&dry_run)?)
+                )?
+            );
         } else {
-            println!("{}", ui_heading("self-improve PR dry-run"));
-            print_kv_block(&[
-                ("branch", dry_run.branch.as_str()),
-                ("title", dry_run.title.as_str()),
-                (
-                    "eligible",
-                    if dry_run.decision.eligible {
-                        "yes"
-                    } else {
-                        "no"
-                    },
-                ),
-                ("body", &dry_run.body_path.display().to_string()),
-            ]);
-            if !dry_run.decision.reasons.is_empty() {
-                println!("reasons:");
-                for reason in &dry_run.decision.reasons {
-                    println!("  - {reason}");
-                }
-            }
+            println!("{}", surface.render_plain(!completion_hints_enabled(false)));
         }
         return Ok(());
     }
     run_self_improve_candidate(&paths, &proposal, json_output).await
+}
+
+fn improve_self_pr_dry_run_surface(
+    proposal: &LearningProposal,
+    candidate: &LearningCandidate,
+    dry_run: &PrDryRun,
+) -> VerdictSurface {
+    let eligible = dry_run.decision.eligible;
+    let kind = if eligible {
+        VerdictKind::Completed
+    } else {
+        VerdictKind::Blocked
+    };
+    let primary = if eligible {
+        format!("deadreckon improve self {} --open-pr", proposal.proposal_id)
+    } else if candidate.status == "verified" {
+        format!("deadreckon improve self {} --yes", proposal.proposal_id)
+    } else {
+        format!("deadreckon show {} --why-failed", candidate.run_id)
+    };
+    let why = if eligible {
+        "The evidence gate passed in dry-run mode; opening the PR remains an explicit opt-in command."
+    } else {
+        "The PR gate blocked live opening; the recommended command is the safest recovery path for the current candidate state."
+    };
+    VerdictSurface::try_new(
+        kind,
+        "improve",
+        Some("self"),
+        ExplanationPanel::new(
+            "DeadReckon prepared the self-improvement PR body without pushing or opening a PR.",
+            why,
+            vec![
+                ("proposal", proposal.proposal_id.clone()),
+                ("candidate", candidate.candidate_id.clone()),
+                ("branch", dry_run.branch.clone()),
+                ("body", dry_run.body_path.display().to_string()),
+                ("eligible", if eligible { "yes" } else { "no" }.to_string()),
+                ("gate reasons", dry_run.decision.reasons.len().to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", "deadreckon status")],
+    )
+    .expect("improve self PR dry-run verdict surface must be valid")
+}
+
+fn improve_self_open_pr_surface(
+    proposal: &LearningProposal,
+    candidate: &LearningCandidate,
+    dry_run: &PrDryRun,
+    pr_url: &str,
+) -> VerdictSurface {
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "improve",
+        Some("self"),
+        ExplanationPanel::new(
+            "DeadReckon opened the self-improvement pull request after the evidence gate passed.",
+            "The PR URL is now the durable review target, so the safest next command is local status inspection.",
+            vec![
+                ("proposal", proposal.proposal_id.clone()),
+                ("candidate", candidate.candidate_id.clone()),
+                ("branch", candidate.branch.clone()),
+                ("body", dry_run.body_path.display().to_string()),
+                ("pr", pr_url.to_string()),
+            ],
+        ),
+        vec![("Recommended", "deadreckon status")],
+        vec![("Secondary", "deadreckon learn report")],
+    )
+    .expect("improve self open-pr verdict surface must be valid")
 }
 
 fn improve_self_preview(proposal: &LearningProposal, json_output: bool) -> Result<()> {
@@ -691,35 +798,64 @@ checks:
             "rollback": format!("git branch -D {} && git worktree remove {}", candidate.branch, candidate.worktree.display())
         }))?,
     )?;
+    let surface = improve_self_candidate_surface(proposal, &candidate, &eval, &evidence_path);
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string_pretty(&surface.add_to_json(json!({
                 "candidate_id": candidate_id,
                 "candidate": candidate,
                 "eval": eval,
                 "evidence": evidence_path,
-            }))?
+            })))?
         );
     } else {
-        println!("{}", ui_heading("self-improve candidate"));
-        print_kv_block(&[
-            ("candidate", candidate_id.as_str()),
-            ("run", candidate.run_id.as_str()),
-            ("branch", candidate.branch.as_str()),
-            ("status", candidate.status.as_str()),
-            ("evidence score", &format!("{:.2}", eval.evidence_score)),
-        ]);
-        println!(
-            "{} {}",
-            ui_muted("next:"),
-            ui_command(format!(
-                "deadreckon improve self {} --pr-dry-run",
-                proposal.proposal_id
-            ))
-        );
+        println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     }
     Ok(())
+}
+
+fn improve_self_candidate_surface(
+    proposal: &LearningProposal,
+    candidate: &LearningCandidate,
+    eval: &LearningEval,
+    evidence_path: &Path,
+) -> VerdictSurface {
+    let kind = if candidate.status == "verified" {
+        VerdictKind::Verified
+    } else {
+        VerdictKind::Blocked
+    };
+    let primary = format!(
+        "deadreckon improve self {} --pr-dry-run",
+        proposal.proposal_id
+    );
+    let why = if candidate.status == "verified" {
+        "The isolated candidate run and focused verification completed; the next safe command previews PR eligibility without opening anything."
+    } else {
+        "The isolated candidate did not satisfy the evidence gate; the PR dry-run explains the blocking reasons without pushing anything."
+    };
+    VerdictSurface::try_new(
+        kind,
+        "improve",
+        Some("self"),
+        ExplanationPanel::new(
+            "DeadReckon created and evaluated a self-improvement candidate in an isolated worktree.",
+            why,
+            vec![
+                ("proposal", proposal.proposal_id.clone()),
+                ("candidate", candidate.candidate_id.clone()),
+                ("run", candidate.run_id.clone()),
+                ("branch", candidate.branch.clone()),
+                ("status", candidate.status.clone()),
+                ("evidence score", format!("{:.2}", eval.evidence_score)),
+                ("evidence", evidence_path.display().to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", "deadreckon status")],
+    )
+    .expect("improve self candidate verdict surface must be valid")
 }
 
 fn load_self_improve_proposal(paths: &DeadreckonPaths, target: &str) -> Result<LearningProposal> {

@@ -52,7 +52,7 @@ use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt, wr
 use deadreckon_core::learning::{
     LearningAutoPrStatus, LearningCandidate, LearningCandidateDiff, LearningEval,
     LearningEvalCommand, LearningIndexOptions, LearningInsightProvider, LearningPrEvent,
-    LearningProposal, LearningProposalTarget, LearningStimulus, PrDryRun, build_reflection_prompt,
+    LearningProposal, LearningProposalTarget, LearningStimulus, build_reflection_prompt,
     build_reflection_prompt_from_bundle, classify_candidate_risk, evaluate_auto_pr, evidence_score,
     export_learning_bundle, import_learning_bundle, index_learning, learning_report,
     load_learning_policy, persist_reflection, prepare_pr_dry_run, read_learning_bundle,
