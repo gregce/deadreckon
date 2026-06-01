@@ -1194,8 +1194,9 @@ async fn import_accepts_descriptor_provider_ids_and_legacy_aliases() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains("source "),
-            "{source}"
+            String::from_utf8_lossy(&output.stdout).contains("source:"),
+            "{source}\n{}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 }
@@ -1217,9 +1218,126 @@ async fn import_preview_does_not_create_run() {
         .expect("preview");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("preview import"), "{stdout}");
+    assert!(stdout.starts_with("preview import"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon import codex --session"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("try:"), "{stdout}");
     let paths = DeadreckonPaths::from_home(&home);
     assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_list_and_complete_surfaces_have_one_verdict_and_primary_action() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("codex");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(root.join("session.jsonl"), "{\"path\":\"surface.md\"}\n").expect("jsonl");
+
+    let list = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .arg("--list")
+        .env("DEADRECKON_HOME", &home)
+        .env("CODEX_SESSIONS_DIR", &root)
+        .output()
+        .expect("import list");
+    assert!(list.status.success());
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(list_stdout.starts_with("preview import"), "{list_stdout}");
+    assert!(list_stdout.contains("Explanation\n"), "{list_stdout}");
+    assert!(list_stdout.contains("Evidence\n"), "{list_stdout}");
+    assert_eq!(
+        list_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{list_stdout}"
+    );
+    assert!(
+        list_stdout.contains("Recommended\ndeadreckon import codex --session <id-or-path>"),
+        "{list_stdout}"
+    );
+    assert!(!list_stdout.contains("try:"), "{list_stdout}");
+
+    let import = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .env("DEADRECKON_HOME", &home)
+        .env("CODEX_SESSIONS_DIR", &root)
+        .output()
+        .expect("import");
+    assert!(import.status.success());
+    let import_stdout = String::from_utf8_lossy(&import.stdout);
+    assert!(
+        import_stdout.starts_with("completed import"),
+        "{import_stdout}"
+    );
+    assert!(import_stdout.contains("Explanation\n"), "{import_stdout}");
+    assert!(import_stdout.contains("Evidence\n"), "{import_stdout}");
+    assert_eq!(
+        import_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{import_stdout}"
+    );
+    let run_id = imported_run_id(&import);
+    assert!(
+        import_stdout.contains(&format!("Recommended\ndeadreckon show {run_id}")),
+        "{import_stdout}"
+    );
+    assert!(!import_stdout.contains("try:"), "{import_stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_json_adds_verdict_and_primary_action() {
+    let temp = repo_tempdir();
+    let home = temp.path().join("home");
+    let root = temp.path().join("codex");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(root.join("session.jsonl"), "{\"path\":\"json.md\"}\n").expect("jsonl");
+
+    let preview = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .arg("--preview")
+        .arg("--json")
+        .env("DEADRECKON_HOME", &home)
+        .env("CODEX_SESSIONS_DIR", &root)
+        .output()
+        .expect("preview json");
+    assert!(preview.status.success());
+    let preview_json: Value = serde_json::from_slice(&preview.stdout).expect("preview json");
+    assert_eq!(preview_json["kind"], "import_preview");
+    assert_eq!(
+        preview_json["primary_action"],
+        preview_json["verdict"]["recommended_command"]
+    );
+    assert_eq!(
+        preview_json["primary_action"], preview_json["try_lines"][0],
+        "{preview_json:#?}"
+    );
+
+    let completed = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("import")
+        .arg("codex")
+        .arg("--json")
+        .env("DEADRECKON_HOME", &home)
+        .env("CODEX_SESSIONS_DIR", &root)
+        .output()
+        .expect("import json");
+    assert!(completed.status.success());
+    let completed_json: Value = serde_json::from_slice(&completed.stdout).expect("completed json");
+    assert_eq!(completed_json["kind"], "import_completed");
+    assert_eq!(
+        completed_json["primary_action"],
+        completed_json["verdict"]["recommended_command"]
+    );
+    assert_eq!(
+        completed_json["primary_action"], completed_json["try_lines"][0],
+        "{completed_json:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1986,6 +2104,7 @@ fn normalize_import_show(
     }
     text = text.replace(run_id, "<RUN_ID>");
     text = text.replace(scope, "<SCOPE>");
+    text = normalize_wrapped_import_show_paths(&text);
     let mut normalized = text
         .lines()
         .map(normalize_import_show_line)
@@ -1993,6 +2112,11 @@ fn normalize_import_show(
         .join("\n");
     normalized.push('\n');
     normalized
+}
+
+fn normalize_wrapped_import_show_paths(text: &str) -> String {
+    text.replace("<HOME>/ru\n            nstate/", "<HOME>/runstate/")
+        .replace("<TEMP>\n            /workspace", "<CWD>")
 }
 
 fn normalize_import_show_line(line: &str) -> String {
@@ -2020,7 +2144,10 @@ fn command_available(program: &str) -> bool {
 fn imported_run_id(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .find_map(|line| line.strip_prefix("imported "))
+        .find_map(|line| {
+            line.strip_prefix("imported ")
+                .or_else(|| line.strip_prefix("completed import "))
+        })
         .expect("imported id")
         .to_string()
 }

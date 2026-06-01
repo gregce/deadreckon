@@ -145,6 +145,7 @@ struct ImportJsonOutput<'a> {
     schema: &'a str,
     roots: &'a [PathBuf],
     candidates: &'a [ImportCandidate],
+    next_actions: Vec<String>,
     try_lines: Vec<String>,
 }
 
@@ -154,6 +155,7 @@ struct ImportCompletedJson<'a> {
     run_id: &'a str,
     manifest_path: PathBuf,
     manifest: &'a ImportManifest,
+    next_actions: Vec<String>,
     try_lines: Vec<String>,
 }
 
@@ -197,46 +199,30 @@ pub(crate) fn import_command(options: ImportCommandOptions) -> Result<()> {
     }
 
     let (run_id, manifest) = normalize_import(&paths, &resolved, &selected, mode, &options, &cwd)?;
+    let manifest_path = paths
+        .run_root(&manifest_scope(&cwd)?, &run_id)
+        .join("import.json");
+    let surface = import_completed_surface(&resolved, &run_id, &manifest, &manifest_path, mode);
     if options.json {
+        let primary = surface.primary_action.command.clone();
+        let secondary = manifest.reimport_command.clone();
         println!(
             "{}",
-            serde_json::to_string_pretty(&ImportCompletedJson {
-                kind: "import_completed",
-                run_id: &run_id,
-                manifest_path: paths
-                    .run_root(&workspace_scope(&cwd).map_err(CliError::from)?, &run_id)
-                    .join("import.json"),
-                manifest: &manifest,
-                try_lines: vec![
-                    format!("deadreckon show {run_id}"),
-                    manifest.reimport_command.clone(),
-                ],
-            })?
+            serde_json::to_string_pretty(&surface.add_to_json(serde_json::to_value(
+                ImportCompletedJson {
+                    kind: "import_completed",
+                    run_id: &run_id,
+                    manifest_path,
+                    manifest: &manifest,
+                    next_actions: vec![primary.clone(), secondary.clone()],
+                    try_lines: vec![primary, secondary],
+                },
+            )?))?
         );
         return Ok(());
     }
 
-    println!("source {}", resolved.source);
-    println!("schema {}", resolved.schema);
-    println!("mode {}", import_mode_label(mode));
-    if let Some(session_id) = manifest.session_id.as_deref() {
-        println!("session {session_id}");
-    }
-    for path in &manifest.session_paths {
-        println!("path {}", path.display());
-    }
-    println!("imported {run_id}");
-    println!("events {}", manifest.events_imported);
-    println!("provenance {}", manifest.provenance_records);
-    println!(
-        "manifest {}",
-        paths
-            .run_root(&manifest_scope(&cwd)?, &run_id)
-            .join("import.json")
-            .display()
-    );
-    println!("try: deadreckon show {run_id}");
-    println!("try: {}", manifest.reimport_command);
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
 }
 
@@ -1672,40 +1658,26 @@ fn print_import_candidates(
     json_output: bool,
     kind: &str,
 ) -> Result<()> {
+    let surface = import_candidates_surface(resolved, candidates, kind);
+    let primary = surface.primary_action.command.clone();
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&ImportJsonOutput {
-                kind,
-                source: &resolved.source,
-                schema: &resolved.schema,
-                roots: &resolved.roots,
-                candidates,
-                try_lines: vec![format!(
-                    "deadreckon import {} --session <id-or-path>",
-                    resolved.alias
-                )],
-            })?
+            serde_json::to_string_pretty(&surface.add_to_json(serde_json::to_value(
+                ImportJsonOutput {
+                    kind,
+                    source: &resolved.source,
+                    schema: &resolved.schema,
+                    roots: &resolved.roots,
+                    candidates,
+                    next_actions: vec![primary.clone()],
+                    try_lines: vec![primary],
+                },
+            )?))?
         );
         return Ok(());
     }
-    println!("source {}", resolved.source);
-    println!("schema {}", resolved.schema);
-    println!("roots:");
-    for root in &resolved.roots {
-        println!("  {}", root.display());
-    }
-    if candidates.is_empty() {
-        println!("candidates 0");
-        println!("try: deadreckon import {} --all --preview", resolved.alias);
-        return Ok(());
-    }
-    println!("candidates {}", candidates.len());
-    print!("{}", import_candidate_table(candidates));
-    println!(
-        "try: deadreckon import {} --session <id-or-path>",
-        resolved.alias
-    );
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
 }
 
@@ -1715,27 +1687,176 @@ fn print_import_selection(
     mode: ImportMode,
     json_output: bool,
 ) -> Result<()> {
+    let surface = import_selection_surface(resolved, selected, mode);
+    let primary = surface.primary_action.command.clone();
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&ImportJsonOutput {
-                kind: "import_preview",
-                source: &resolved.source,
-                schema: &resolved.schema,
-                roots: &resolved.roots,
-                candidates: selected,
-                try_lines: vec![reimport_command(resolved, selected, mode)],
-            })?
+            serde_json::to_string_pretty(&surface.add_to_json(serde_json::to_value(
+                ImportJsonOutput {
+                    kind: "import_preview",
+                    source: &resolved.source,
+                    schema: &resolved.schema,
+                    roots: &resolved.roots,
+                    candidates: selected,
+                    next_actions: vec![primary.clone()],
+                    try_lines: vec![primary],
+                },
+            )?))?
         );
         return Ok(());
     }
-    println!("preview import");
-    println!("source {}", resolved.source);
-    println!("schema {}", resolved.schema);
-    println!("mode {}", import_mode_label(mode));
-    print!("{}", import_candidate_table(selected));
-    println!("try: {}", reimport_command(resolved, selected, mode));
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+fn import_candidates_surface(
+    resolved: &ResolvedImportSource,
+    candidates: &[ImportCandidate],
+    kind: &str,
+) -> VerdictSurface {
+    let candidate_count = candidates.len();
+    let primary = if candidates.is_empty() {
+        format!("deadreckon import {} --all --preview", resolved.alias)
+    } else {
+        format!(
+            "deadreckon import {} --session <id-or-path>",
+            resolved.alias
+        )
+    };
+    let mut evidence = vec![
+        ("source", resolved.source.clone()),
+        ("schema", resolved.schema.clone()),
+        ("candidates", candidate_count.to_string()),
+        (
+            "roots",
+            resolved_roots_lines(&resolved.roots).replace('\n', "; "),
+        ),
+        ("surface", kind.to_string()),
+    ];
+    if !candidates.is_empty() {
+        evidence.push(("candidate table", compact_candidate_table(candidates)));
+    }
+    let kind = if candidates.is_empty() {
+        VerdictKind::Noop
+    } else {
+        VerdictKind::Preview
+    };
+    let why = if candidates.is_empty() {
+        "No fresh candidate matched the current import filters, so DeadReckon did not select a session."
+    } else {
+        "The command is read-only; choose a concrete session before importing transcript state."
+    };
+    VerdictSurface::try_new(
+        kind,
+        "import",
+        None,
+        ExplanationPanel::new(
+            format!(
+                "DeadReckon inspected {} import roots and found {candidate_count} candidate session{}.",
+                resolved.alias,
+                if candidate_count == 1 { "" } else { "s" }
+            ),
+            why,
+            evidence,
+        ),
+        vec![("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("import candidates verdict surface must be valid")
+}
+
+fn import_selection_surface(
+    resolved: &ResolvedImportSource,
+    selected: &[ImportCandidate],
+    mode: ImportMode,
+) -> VerdictSurface {
+    let primary = reimport_command(resolved, selected, mode);
+    let mut evidence = vec![
+        ("source", resolved.source.clone()),
+        ("schema", resolved.schema.clone()),
+        ("mode", import_mode_label(mode).to_string()),
+        ("selected", selected.len().to_string()),
+    ];
+    if !selected.is_empty() {
+        evidence.push(("candidate table", compact_candidate_table(selected)));
+    }
+    VerdictSurface::try_new(
+        VerdictKind::Preview,
+        "import",
+        None,
+        ExplanationPanel::new(
+            format!(
+                "DeadReckon previewed {} selected import candidate{}.",
+                selected.len(),
+                if selected.len() == 1 { "" } else { "s" }
+            ),
+            "Preview mode writes no run state; rerun without --preview or with --replace to create the import run.",
+            evidence,
+        ),
+        vec![("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
+    )
+    .expect("import preview verdict surface must be valid")
+}
+
+fn import_completed_surface(
+    resolved: &ResolvedImportSource,
+    run_id: &str,
+    manifest: &ImportManifest,
+    manifest_path: &Path,
+    mode: ImportMode,
+) -> VerdictSurface {
+    let primary = format!("deadreckon show {run_id}");
+    let mut evidence = vec![
+        ("run", run_id.to_string()),
+        ("source", resolved.source.clone()),
+        ("schema", resolved.schema.clone()),
+        ("mode", import_mode_label(mode).to_string()),
+        ("events", manifest.events_imported.to_string()),
+        ("provenance", manifest.provenance_records.to_string()),
+        ("manifest", manifest_path.display().to_string()),
+    ];
+    if let Some(session_id) = manifest.session_id.as_deref() {
+        evidence.push(("session", session_id.to_string()));
+    }
+    if !manifest.session_paths.is_empty() {
+        evidence.push((
+            "paths",
+            manifest
+                .session_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    VerdictSurface::try_new(
+        VerdictKind::Completed,
+        "import",
+        Some(run_id),
+        ExplanationPanel::new(
+            format!(
+                "DeadReckon imported {} event{} into run {run_id}.",
+                manifest.events_imported,
+                if manifest.events_imported == 1 { "" } else { "s" }
+            ),
+            "The transcript was normalized into completed run state and its import manifest was written for repeatable reimport.",
+            evidence,
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", manifest.reimport_command.as_str())],
+    )
+    .expect("import completed verdict surface must be valid")
+}
+
+fn compact_candidate_table(candidates: &[ImportCandidate]) -> String {
+    import_candidate_table(candidates)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn import_mode_label(mode: ImportMode) -> &'static str {
