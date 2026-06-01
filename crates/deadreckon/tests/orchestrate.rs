@@ -3841,6 +3841,162 @@ fn merge_parallel_children_still_conflict() {
 }
 
 #[test]
+fn merge_prefer_child_requires_child_index_verdict() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--strategy",
+            "prefer-child",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.starts_with("blocked plan "), "{err}");
+    assert!(
+        err.contains("prefer-child needs --prefer-child <idx>"),
+        "{err}"
+    );
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon merge {} --strategy prefer-child --prefer-child 1",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
+fn merge_unknown_strategy_uses_one_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--strategy",
+            "surprise",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.starts_with("blocked plan "), "{err}");
+    assert!(
+        err.contains("unknown plan merge strategy surprise"),
+        "{err}"
+    );
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon merge {} --strategy dag-aware",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
+fn merge_unknown_child_index_uses_one_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--strategy",
+            "prefer-child",
+            "--prefer-child",
+            "99",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.starts_with("blocked plan "), "{err}");
+    assert!(err.contains("unknown child index 99"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon show {}",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
+fn merge_unknown_repair_mode_uses_one_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "merge",
+            &plan.plan_id[..8],
+            "--repair-mode",
+            "wild",
+            "--quiet",
+        ])
+        .output()
+        .expect("merge");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.starts_with("blocked plan "), "{err}");
+    assert!(err.contains("unknown repair mode wild"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon merge {} --repair-mode auto",
+            &plan.plan_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
 fn merge_repair_prefer_child_records_rationale_and_promotes() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

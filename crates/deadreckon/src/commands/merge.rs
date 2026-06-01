@@ -37,16 +37,32 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
         });
     }
     append_plan_event(&paths, &plan.plan_id, PlanEventKind::MergeStarted)?;
-    let strategy = parse_merge_strategy(&strategy, prefer_child)?;
+    let strategy = parse_merge_strategy(&plan, &strategy, prefer_child, no_hints)?;
     if let PlanMergeStrategy::PreferChild(chosen) = strategy
         && !plan.tasks.iter().any(|task| task.index == chosen)
     {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            &format!("unknown child index {chosen}"),
-            "deadreckon merge <plan-id> --strategy prefer-child --prefer-child 1",
-        )));
+        let id = run_prefix(&plan.plan_id);
+        return Err(merge_argument_surface_error(
+            &plan,
+            no_hints,
+            format!("DeadReckon did not merge because unknown child index {chosen}."),
+            "The prefer-child strategy must name one of the plan child indexes before DeadReckon can choose a winner.",
+            vec![
+                ("flag".to_string(), "--prefer-child".to_string()),
+                ("value".to_string(), chosen.to_string()),
+                (
+                    "available children".to_string(),
+                    plan.tasks
+                        .iter()
+                        .map(|task| task.index.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            ],
+            format!("deadreckon show {id}"),
+        ));
     }
-    let repair_mode = parse_merge_repair_mode(&repair_mode)?;
+    let repair_mode = parse_merge_repair_mode(&plan, &repair_mode, no_hints)?;
     let mut merge = compose_plan_merge_working(&paths, &plan, strategy)?;
     let unresolved_conflicts = merge.unresolved_conflicts();
     if !unresolved_conflicts.is_empty() {
@@ -360,34 +376,96 @@ fn merge_repair_provider_missing_surface(
     .expect("merge missing repair provider surface must have one primary action")
 }
 
-fn parse_merge_strategy(strategy: &str, prefer_child: Option<u32>) -> Result<PlanMergeStrategy> {
+fn parse_merge_strategy(
+    plan: &Plan,
+    strategy: &str,
+    prefer_child: Option<u32>,
+    no_hints: bool,
+) -> Result<PlanMergeStrategy> {
     match strategy {
         "fail-on-conflict" => Ok(PlanMergeStrategy::FailOnConflict),
         "dag-aware" => Ok(PlanMergeStrategy::DagAware),
         "prefer-child" => prefer_child
             .map(PlanMergeStrategy::PreferChild)
             .ok_or_else(|| {
-                CliError::Core(deadreckon_core::user_error(
-                    "plan merge strategy prefer-child needs --prefer-child <idx>",
-                    "deadreckon merge <plan-id> --strategy prefer-child --prefer-child 1",
-                ))
+                let id = run_prefix(&plan.plan_id);
+                merge_argument_surface_error(
+                    plan,
+                    no_hints,
+                    "DeadReckon did not merge because prefer-child needs --prefer-child <idx>.",
+                    "The prefer-child strategy requires a concrete child index so DeadReckon knows which completed child result to keep for conflicting files.",
+                    vec![
+                        ("flag".to_string(), "--prefer-child".to_string()),
+                        ("strategy".to_string(), "prefer-child".to_string()),
+                    ],
+                    format!("deadreckon merge {id} --strategy prefer-child --prefer-child 1"),
+                )
             }),
-        other => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("unknown plan merge strategy {other}"),
-            "use --strategy dag-aware, fail-on-conflict, or prefer-child --prefer-child <idx>",
-        ))),
+        other => Err({
+            let id = run_prefix(&plan.plan_id);
+            merge_argument_surface_error(
+                plan,
+                no_hints,
+                format!("DeadReckon did not merge because unknown plan merge strategy {other}."),
+                "Merge only supports dag-aware, fail-on-conflict, or prefer-child strategies.",
+                vec![
+                    ("flag".to_string(), "--strategy".to_string()),
+                    ("value".to_string(), other.to_string()),
+                ],
+                format!("deadreckon merge {id} --strategy dag-aware"),
+            )
+        }),
     }
 }
 
-fn parse_merge_repair_mode(mode: &str) -> Result<MergeRepairMode> {
+fn parse_merge_repair_mode(plan: &Plan, mode: &str, no_hints: bool) -> Result<MergeRepairMode> {
     match mode {
         "auto" => Ok(MergeRepairMode::Auto),
         "prefer" => Ok(MergeRepairMode::Prefer),
         "synthesize" => Ok(MergeRepairMode::Synthesize),
         "child" => Ok(MergeRepairMode::Child),
-        other => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("unknown repair mode {other}"),
-            "use --repair-mode auto|prefer|synthesize|child",
-        ))),
+        other => Err({
+            let id = run_prefix(&plan.plan_id);
+            merge_argument_surface_error(
+                plan,
+                no_hints,
+                format!("DeadReckon did not merge because unknown repair mode {other}."),
+                "Merge repair only supports auto, prefer, synthesize, or child modes.",
+                vec![
+                    ("flag".to_string(), "--repair-mode".to_string()),
+                    ("value".to_string(), other.to_string()),
+                ],
+                format!("deadreckon merge {id} --repair-mode auto"),
+            )
+        }),
+    }
+}
+
+fn merge_argument_surface_error(
+    plan: &Plan,
+    no_hints: bool,
+    what_happened: impl Into<String>,
+    why_this_verdict: impl Into<String>,
+    mut evidence: Vec<(String, String)>,
+    primary: String,
+) -> CliError {
+    let id = run_prefix(&plan.plan_id);
+    evidence.insert(0, ("plan".to_string(), id.clone()));
+    evidence.push((
+        "status".to_string(),
+        plan_status_label(plan.status).to_string(),
+    ));
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "plan",
+            Some(&id),
+            ExplanationPanel::new(what_happened, why_this_verdict, evidence),
+            [("Recommended", primary.as_str())],
+            Vec::<(&str, &str)>::new(),
+        )
+        .expect("merge argument surface must have one primary action")
+        .render_plain(!completion_hints_enabled(no_hints)),
     }
 }
