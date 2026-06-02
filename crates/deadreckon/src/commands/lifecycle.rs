@@ -68,14 +68,6 @@ pub(crate) fn finish_command(
         Err(run_error) => match resolve_plan_result_run(&paths, &requested, "finish")? {
             Some(result) => {
                 if dest.is_none() && plan_apply_git_root(&result.plan)?.is_some() {
-                    println!(
-                        "{} {}",
-                        ui_heading("finish:"),
-                        ui_command(format!(
-                            "deadreckon apply {}",
-                            run_prefix(&result.plan.plan_id)
-                        ))
-                    );
                     return apply_command_inner(
                         requested, strategy, branch, no_confirm, autostash, cleanup, message,
                         false, false,
@@ -88,10 +80,6 @@ pub(crate) fn finish_command(
             None => return Err(run_error),
         },
     };
-    let finish_ref = plan_context
-        .as_ref()
-        .map(|plan| run_prefix(&plan.plan_id))
-        .unwrap_or_else(|| run_prefix(&state.run_id));
     if let Some(plan) = plan_context.as_ref() {
         print_plan_result_context(plan, &state);
         let library_dir = paths.library_dir(&state.scope, &state.run_id);
@@ -119,29 +107,17 @@ pub(crate) fn finish_command(
         .map(|record| record.mode)
         .unwrap_or(CodebaseMode::Fresh);
     match mode {
-        CodebaseMode::Worktree => {
-            println!(
-                "{} {}",
-                ui_heading("finish:"),
-                ui_command(format!("deadreckon apply {}", run_prefix(&state.run_id)))
-            );
-            apply_command(
-                state.run_id,
-                strategy,
-                branch,
-                no_confirm,
-                autostash,
-                cleanup,
-                message,
-                false,
-            )
-        }
+        CodebaseMode::Worktree => apply_command(
+            state.run_id,
+            strategy,
+            branch,
+            no_confirm,
+            autostash,
+            cleanup,
+            message,
+            false,
+        ),
         CodebaseMode::Copy | CodebaseMode::Fresh => {
-            println!(
-                "{} {}",
-                ui_heading("finish:"),
-                ui_command(format!("deadreckon export {finish_ref}"))
-            );
             materialize_completed_run(&paths, &state, dest, force, include_manifest)
                 .map(|materialized| print_materialized(&materialized))
         }

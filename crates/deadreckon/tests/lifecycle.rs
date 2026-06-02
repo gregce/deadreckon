@@ -1902,11 +1902,23 @@ fn finish_exports_completed_fresh_run() {
 
     assert_success(&output);
     let stdout = stdout(&output);
-    assert!(stdout.contains("finish:"));
     assert!(stdout.contains("not metered (subscription)"), "{stdout}");
     assert!(stdout.contains("gate: PASSED 2/2"), "{stdout}");
     assert!(!stdout.contains("~$0.000000"), "{stdout}");
     assert!(stdout.contains("exported run"));
+    assert!(stdout.contains("completed materialize "), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon show {}",
+            &parent.run_id[..8]
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("finish:"), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
     assert_eq!(
         fs::read_to_string(dest.join("app.txt")).expect("app"),
         "parent app"
