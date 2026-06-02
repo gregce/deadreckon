@@ -672,6 +672,59 @@ fn library_list_search_show_reads_promoted_manifests() {
 }
 
 #[test]
+fn list_empty_current_scope_has_one_primary_recovery_action() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let list = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("list")
+        .output()
+        .expect("list");
+
+    assert_success(&list);
+    let stdout = stdout(&list);
+    assert!(stdout.contains("no-op list current-project"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon list --all"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\nSecondary\n"), "{stdout}");
+    assert!(stdout.contains("deadreckon start \"goal\""), "{stdout}");
+    assert!(!stdout.contains("hint:"), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
+    assert!(stderr(&list).trim().is_empty(), "{:?}", stderr(&list));
+}
+
+#[test]
+fn list_empty_json_adds_verdict_and_primary_action() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let list = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["list", "--json"])
+        .output()
+        .expect("list json");
+
+    assert_success(&list);
+    let value: Value = serde_json::from_slice(&list.stdout).expect("list json");
+    assert_eq!(value["kind"], "list");
+    assert_eq!(value["verdict"]["kind"], "no-op");
+    assert_eq!(value["primary_action"], "deadreckon list --all");
+    assert_eq!(
+        value["verdict"]["recommended_command"],
+        value["primary_action"]
+    );
+    assert_eq!(value["next_actions"][0], value["primary_action"]);
+}
+
+#[test]
 fn library_list_empty_has_one_primary_recovery_action() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

@@ -50,25 +50,40 @@ pub(crate) fn list_command(
                 })
             })
             .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "list",
-                "id": effective_scope.as_deref().unwrap_or("all-scopes"),
-                "status": "ok",
-                "next_actions": [
-                    "deadreckon status latest",
-                    "deadreckon attach <id>",
-                    "deadreckon show <id>",
-                ],
-                "try_lines": Vec::<String>::new(),
-                "paths": {
-                    "home": paths.home(),
-                },
-                "runs": runs,
-                "plans": plans,
-            }))?
-        );
+        let empty = runs.is_empty() && plans.is_empty();
+        let empty_surface = empty.then(|| empty_list_surface(effective_scope.as_deref(), all));
+        let next_actions = if let Some(surface) = empty_surface.as_ref() {
+            let mut actions = vec![surface.primary_action.command.clone()];
+            actions.extend(
+                surface
+                    .secondary_actions
+                    .iter()
+                    .map(|action| action.command.clone()),
+            );
+            actions
+        } else {
+            vec![
+                "deadreckon status latest".to_string(),
+                "deadreckon attach <id>".to_string(),
+                "deadreckon show <id>".to_string(),
+            ]
+        };
+        let mut value = json!({
+            "kind": "list",
+            "id": effective_scope.as_deref().unwrap_or("all-scopes"),
+            "status": "ok",
+            "next_actions": next_actions,
+            "try_lines": Vec::<String>::new(),
+            "paths": {
+                "home": paths.home(),
+            },
+            "runs": runs,
+            "plans": plans,
+        });
+        if let Some(surface) = empty_surface.as_ref() {
+            value = surface.add_to_json(value);
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
     let mut entries = runs
@@ -78,16 +93,10 @@ pub(crate) fn list_command(
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| Reverse(entry.updated_at()));
     if entries.is_empty() {
-        match effective_scope.as_deref() {
-            Some(scope) => {
-                println!("no runs for current project ({scope})");
-                let _ = ui::hint(
-                    ui::Stream::Stderr,
-                    "use `deadreckon list --all` to see every project",
-                );
-            }
-            None => println!("no runs"),
-        }
+        print!(
+            "{}",
+            empty_list_surface(effective_scope.as_deref(), all).render_plain(false)
+        );
         return Ok(());
     }
     let header = list_header();
@@ -127,6 +136,49 @@ pub(crate) fn list_command(
     }
     print_list_action_footer();
     Ok(())
+}
+
+fn empty_list_surface(scope: Option<&str>, all: bool) -> VerdictSurface {
+    let subject = if all || scope.is_none() {
+        "all-scopes"
+    } else {
+        "current-project"
+    };
+    let scope_label = if all || scope.is_none() {
+        "all scopes".to_string()
+    } else {
+        format!("current project ({})", scope.expect("scope"))
+    };
+    let primary = if all || scope.is_none() {
+        "deadreckon start \"goal\""
+    } else {
+        "deadreckon list --all"
+    };
+    let secondary = if all || scope.is_none() {
+        vec![("Secondary", "deadreckon init")]
+    } else {
+        vec![
+            ("Secondary", "deadreckon start \"goal\""),
+            ("Secondary", "deadreckon run \"goal\""),
+        ]
+    };
+    VerdictSurface::try_new(
+        VerdictKind::Noop,
+        "list",
+        Some(subject),
+        ExplanationPanel::new(
+            format!("List found no runs or plans for {scope_label}."),
+            "This is a no-op because the selected run inventory scope has no durable run or orchestration records.",
+            vec![
+                ("scope".to_string(), scope_label),
+                ("inventory".to_string(), "runs and plans".to_string()),
+                ("state".to_string(), "no matching runstate entries".to_string()),
+            ],
+        ),
+        vec![("Recommended", primary)],
+        secondary,
+    )
+    .expect("empty list verdict surface must be valid")
 }
 
 fn print_list_action_footer() {
