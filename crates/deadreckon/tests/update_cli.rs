@@ -278,11 +278,17 @@ fn update_shell_swap_failure_preserves_binary() {
 
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     assert_eq!(fs::read(&binary).expect("binary"), b"old binary");
-    assert!(
-        stderr(&output).contains("update: swap failed"),
-        "{}",
-        stderr(&output)
-    );
+    let err = stderr(&output);
+    assert!(err.contains("failed update shell"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(err.contains("Recommended\ncp "), "{err}");
+    assert!(err.contains("backup:"), "{err}");
+    assert!(err.contains("updated:"), "{err}");
+    assert!(err.contains("source: test requested swap failure"), "{err}");
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
     assert!(newest_backup(&paths).join("deadreckon").exists());
 }
 

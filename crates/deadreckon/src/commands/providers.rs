@@ -351,17 +351,32 @@ fn shell_update_failure(
     backup_dir: &Path,
     source: &str,
 ) -> CliError {
-    CliError::Exit {
+    let primary = format!(
+        "cp {} {}",
+        backup_dir.join("deadreckon").display(),
+        receipt.binary_path.display()
+    );
+    CliError::Surface {
         code: 2,
-        message: format!(
-            "update: swap failed; prior binary preserved: {source}; backup {}",
-            backup_dir.display()
-        ),
-        hint: format!(
-            "cp {} {}",
-            backup_dir.join("deadreckon").display(),
-            receipt.binary_path.display()
-        ),
+        surface: VerdictSurface::try_new(
+            VerdictKind::Failed,
+            "update",
+            Some("shell"),
+            ExplanationPanel::new(
+                "DeadReckon could not replace the shell-installed binary.",
+                "The update failed after creating a rollback backup, so restoring the preserved binary is the safest next step.",
+                vec![
+                    ("channel".to_string(), "shell".to_string()),
+                    ("source".to_string(), source.to_string()),
+                    ("backup".to_string(), backup_dir.display().to_string()),
+                    ("updated".to_string(), receipt.binary_path.display().to_string()),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![("Secondary", "deadreckon update --check")],
+        )
+        .expect("shell update failure verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false)),
     }
 }
 
