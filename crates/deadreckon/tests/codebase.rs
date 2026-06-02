@@ -216,6 +216,10 @@ fn missing_run_goal_uses_blocked_verdict_surface() {
 
 fn assert_blocked_run_surface(stderr: &str, recommended: &str) {
     assert!(stderr.contains("blocked run"), "{stderr}");
+    assert_blocked_surface(stderr, recommended);
+}
+
+fn assert_blocked_surface(stderr: &str, recommended: &str) {
     assert!(stderr.contains("Explanation\n"), "{stderr}");
     assert!(stderr.contains("Evidence\n"), "{stderr}");
     assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
@@ -1164,7 +1168,11 @@ fn materialize_in_place_refuses_with_undo_hint() {
     assert!(!materialize.status.success());
     let stderr = stderr(&materialize);
     assert!(stderr.contains("export is not needed; run edited the source in-place"));
-    assert!(stderr.contains("try: deadreckon undo"));
+    assert!(stderr.contains("blocked materialize"), "{stderr}");
+    assert_blocked_surface(
+        &stderr,
+        &format!("deadreckon undo --run {}", &run.run_id[..8]),
+    );
 }
 
 #[test]
@@ -1206,7 +1214,11 @@ fn in_place_refuses_apply_with_try_undo_hint() {
     assert!(!apply.status.success());
     let stderr = stderr(&apply);
     assert!(stderr.contains("apply requires worktree mode; run was in-place"));
-    assert!(stderr.contains("try: deadreckon undo to revert if needed"));
+    assert!(stderr.contains("blocked apply"), "{stderr}");
+    assert_blocked_surface(
+        &stderr,
+        &format!("deadreckon undo --run {}", &run.run_id[..8]),
+    );
 }
 
 #[test]
@@ -1514,10 +1526,11 @@ fn apply_refuses_non_worktree_with_mode_specific_hint() {
     assert!(!apply.status.success());
     let stderr = stderr(&apply);
     assert!(stderr.contains("apply requires worktree mode; run was fresh"));
-    assert!(stderr.contains(&format!(
-        "try: deadreckon export {} --dest <path>",
-        run.run_id
-    )));
+    assert!(stderr.contains("blocked apply"), "{stderr}");
+    assert_blocked_surface(
+        &stderr,
+        &format!("deadreckon export {} --dest <path>", &run.run_id[..8]),
+    );
 }
 
 #[test]
@@ -1840,7 +1853,11 @@ fn abandon_in_place_refuses_with_undo_hint() {
     assert!(!abandon.status.success());
     let stderr = stderr(&abandon);
     assert!(stderr.contains("cannot abandon in-place edits"));
-    assert!(stderr.contains("try: deadreckon undo"));
+    assert!(stderr.contains("blocked abandon"), "{stderr}");
+    assert_blocked_surface(
+        &stderr,
+        &format!("deadreckon undo --run {}", &run.run_id[..8]),
+    );
 }
 
 #[test]
@@ -1862,7 +1879,8 @@ fn materialize_in_worktree_refuses_with_apply_hint() {
     assert!(!materialize.status.success());
     let stderr = stderr(&materialize);
     assert!(stderr.contains("export is for copy/fresh runs; run was worktree"));
-    assert!(stderr.contains(&format!("try: deadreckon apply {run_id}")));
+    assert!(stderr.contains("blocked materialize"), "{stderr}");
+    assert_blocked_surface(&stderr, &format!("deadreckon apply {}", &run_id[..8]));
 }
 
 #[test]

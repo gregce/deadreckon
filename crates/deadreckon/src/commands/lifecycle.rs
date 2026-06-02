@@ -198,16 +198,24 @@ pub(crate) fn materialize_completed_run(
     if let Ok(record) = read_codebase_record(&state.working_dir) {
         match record.mode {
             CodebaseMode::Worktree => {
-                return Err(CliError::Core(deadreckon_core::user_error(
+                return Err(codebase_mode_refusal_error(
+                    "materialize",
+                    state,
+                    record.mode,
                     "export is for copy/fresh runs; run was worktree",
-                    &format!("deadreckon apply {}", state.run_id),
-                )));
+                    format!("deadreckon apply {}", run_prefix(&state.run_id)),
+                    "Materialize exports copy/fresh artifacts, while this run already has a worktree branch that should be applied instead.",
+                ));
             }
             CodebaseMode::InPlace => {
-                return Err(CliError::Core(deadreckon_core::user_error(
+                return Err(codebase_mode_refusal_error(
+                    "materialize",
+                    state,
+                    record.mode,
                     "export is not needed; run edited the source in-place",
-                    "deadreckon undo",
-                )));
+                    format!("deadreckon undo --run {}", run_prefix(&state.run_id)),
+                    "Materialize would duplicate work already written in place; use undo only if those edits need to be reverted.",
+                ));
             }
             CodebaseMode::Copy | CodebaseMode::Fresh => {}
         }
@@ -358,7 +366,7 @@ fn apply_command_inner(
     }
     let record = read_codebase_record(&state.working_dir)?;
     if record.mode != CodebaseMode::Worktree {
-        return Err(CliError::Core(apply_mode_error(&state.run_id, record.mode)));
+        return Err(apply_mode_error(&state, record.mode));
     }
     let git_root = record.source_git_root.as_ref().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(
@@ -728,10 +736,14 @@ pub(crate) fn abandon_command(run_id: String, keep_branch: bool, force: bool) ->
         return Ok(());
     };
     if record.mode == CodebaseMode::InPlace {
-        return Err(CliError::Core(deadreckon_core::user_error(
+        return Err(codebase_mode_refusal_error(
+            "abandon",
+            &state,
+            record.mode,
             "cannot abandon in-place edits",
-            "deadreckon undo",
-        )));
+            format!("deadreckon undo --run {}", run_prefix(&state.run_id)),
+            "Abandon removes temporary worktrees; this run changed the source checkout directly, so undo is the safe recovery command.",
+        ));
     }
     if state.status == RunStatus::Executing {
         if !force {
@@ -1134,17 +1146,61 @@ fn cleanup_noop_surface(
     .expect("cleanup no-op verdict surface must be valid")
 }
 
-fn apply_mode_error(run_id: &str, mode: CodebaseMode) -> DeadreckonError {
-    let hint = match mode {
+fn codebase_mode_refusal_error(
+    subject_kind: &str,
+    state: &deadreckon_core::PipelineState,
+    mode: CodebaseMode,
+    what: &str,
+    primary: String,
+    why: &str,
+) -> CliError {
+    let id = run_prefix(&state.run_id);
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            subject_kind,
+            Some(&id),
+            ExplanationPanel::new(
+                what,
+                why,
+                [
+                    ("run".to_string(), id.clone()),
+                    (
+                        "status".to_string(),
+                        run_status_label(state.status).to_string(),
+                    ),
+                    ("mode".to_string(), mode.to_string()),
+                    (
+                        "working".to_string(),
+                        state.working_dir.display().to_string(),
+                    ),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            Vec::<(&str, &str)>::new(),
+        )
+        .expect("codebase mode refusal verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false)),
+    }
+}
+
+fn apply_mode_error(state: &deadreckon_core::PipelineState, mode: CodebaseMode) -> CliError {
+    let run_id = run_prefix(&state.run_id);
+    let primary = match mode {
         CodebaseMode::Copy | CodebaseMode::Fresh => {
             format!("deadreckon export {run_id} --dest <path>")
         }
-        CodebaseMode::InPlace => "deadreckon undo to revert if needed".to_string(),
+        CodebaseMode::InPlace => format!("deadreckon undo --run {run_id}"),
         CodebaseMode::Worktree => format!("deadreckon apply {run_id}"),
     };
-    deadreckon_core::user_error(
+    codebase_mode_refusal_error(
+        "apply",
+        state,
+        mode,
         &format!("apply requires worktree mode; run was {mode}"),
-        &hint,
+        primary,
+        "Apply only lands isolated worktree branches; choose the recovery command that matches this run's source mode.",
     )
 }
 
