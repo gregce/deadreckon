@@ -1532,6 +1532,7 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         no_hints,
         quiet,
         plain,
+        completion_surface,
     } = args;
     let paths = DeadreckonPaths::discover();
     let resolved_id = resolve_plan_id(&paths, &plan_id)?;
@@ -1807,7 +1808,7 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     mark_failed_fork_plan_terminal(&paths, &mut plan)?;
     save_plan(&paths, &plan)?;
     let _ = fs::remove_file(paths.coordinator_json(&plan.plan_id));
-    if !quiet {
+    if !quiet && completion_surface {
         print_fork_finished(&plan, no_hints);
     }
     Ok(())
@@ -2857,42 +2858,13 @@ fn mark_failed_fork_plan_terminal(paths: &DeadreckonPaths, plan: &mut Plan) -> R
 }
 
 fn print_fork_finished(plan: &Plan, no_hints: bool) {
-    let completed = plan
-        .tasks
-        .iter()
-        .filter(|task| task.status == PlanTaskStatus::Completed)
-        .count();
+    let paths = DeadreckonPaths::discover();
     println!(
-        "{} {} done with {}/{} completed",
-        ui_ok("forked"),
-        ui_id(run_prefix(&plan.plan_id)),
-        completed,
-        plan.tasks.len()
+        "{}",
+        plan_verdict_surface(&paths, plan).render_plain(!completion_hints_enabled(no_hints))
     );
     print_orchestration_role_table(plan, true, None);
     print_orchestration_dependency_summary(plan);
-    if !no_hints {
-        println!(
-            "{} {}",
-            ui_command("attach:"),
-            ui_command(format!("deadreckon attach {}", run_prefix(&plan.plan_id)))
-        );
-        if plan.tasks.iter().any(|task| task.child_run_id.is_some()) {
-            println!(
-                "{} {}",
-                ui_command("child:"),
-                ui_command(format!(
-                    "deadreckon attach {}:task-0",
-                    run_prefix(&plan.plan_id)
-                ))
-            );
-        }
-        println!(
-            "{} {}",
-            ui_command("merge:"),
-            ui_command(format!("deadreckon merge {}", run_prefix(&plan.plan_id)))
-        );
-    }
 }
 
 #[cfg(test)]

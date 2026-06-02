@@ -935,6 +935,7 @@ async fn main_inner() -> Result<()> {
                 no_hints,
                 quiet,
                 plain,
+                completion_surface: true,
             })
             .await
         }

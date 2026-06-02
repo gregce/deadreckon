@@ -2401,6 +2401,7 @@ pub(crate) struct ForkCommandArgs {
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
     pub(crate) plain: bool,
+    pub(crate) completion_surface: bool,
 }
 
 pub(crate) struct MergeCommandArgs {

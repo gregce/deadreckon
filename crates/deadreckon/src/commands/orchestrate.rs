@@ -482,6 +482,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
         no_hints,
         quiet,
         plain,
+        completion_surface: false,
     })
     .await?;
     let sub_result_launch_dir = std::env::var(deadreckon_core::campaign::ENV_SUB_RESULT).ok();

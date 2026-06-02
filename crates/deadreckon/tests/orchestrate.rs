@@ -463,6 +463,49 @@ fn plan_preview_prints_capabilities_and_provider_table() {
 }
 
 #[test]
+fn fork_completion_uses_one_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let plan = newest_plan(&paths);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--plain"])
+        .output()
+        .expect("fork");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert_verdict_surface(
+        &out,
+        &format!("completed plan {}", &plan.plan_id[..8]),
+        &format!("deadreckon merge {}", &plan.plan_id[..8]),
+    );
+    assert!(!out.contains("attach:"), "{out}");
+    assert!(!out.contains("merge:"), "{out}");
+    assert!(out.contains("provider roles"), "{out}");
+    assert!(out.contains("dependencies"), "{out}");
+}
+
+#[test]
 fn orchestrate_review_preview_shows_coder_reviewer_providers_without_forking() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
