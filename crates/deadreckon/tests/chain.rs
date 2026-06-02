@@ -2434,7 +2434,20 @@ fn chain_detach_starts_background_conductor_and_returns_zero() {
 
     assert_success(&output);
     let chain = newest_chain(&paths);
-    assert!(stdout(&output).contains("detached"), "{}", stdout(&output));
+    let stdout = stdout(&output);
+    assert!(stdout.starts_with("verified chain "), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon chain attach {}",
+            &chain.chain_id[..8]
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("attach:"), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
     let _ = wait_for_live_conductor(&paths, &chain.chain_id);
     let _ = deadreckon(&paths)
         .current_dir(&repo)

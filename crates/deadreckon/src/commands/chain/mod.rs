@@ -601,7 +601,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         None,
         json!({ "steps": chain.steps.len(), "draft": draft }),
     )?;
-    if !quiet {
+    if !quiet && (draft || !yes) {
         println!("{}", chain_preview(&chain));
     }
     if draft {
@@ -1504,13 +1504,49 @@ fn detach_chain_conductor(
         command.arg("--plain");
     }
     let child = command.spawn()?;
-    println!(
-        "chain {} detached (pid {})",
-        chain_prefix(chain_id),
-        child.id()
-    );
-    println!("attach: deadreckon chain attach {}", chain_prefix(chain_id));
+    if !options.quiet {
+        print!(
+            "{}",
+            chain_detached_surface(paths, chain_id, child.id()).render_plain(false)
+        );
+    }
     Ok(())
+}
+
+fn chain_detached_surface(
+    paths: &DeadreckonPaths,
+    chain_id: &str,
+    conductor_pid: u32,
+) -> VerdictSurface {
+    let id = chain_prefix(chain_id);
+    let primary = format!("deadreckon chain attach {id}");
+    let secondary = [
+        format!("deadreckon chain status {id}"),
+        format!("deadreckon chain show {id}"),
+    ];
+    VerdictSurface::try_new(
+        VerdictKind::Verified,
+        "chain",
+        Some(&id),
+        ExplanationPanel::new(
+            "DeadReckon started the chain conductor in the background.",
+            "The detached conductor process was spawned successfully, so attaching is the primary next command to watch progress.",
+            vec![
+                ("chain", id.clone()),
+                ("conductor pid", conductor_pid.to_string()),
+                (
+                    "state",
+                    paths.chain_json(chain_id).display().to_string(),
+                ),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        secondary
+            .iter()
+            .map(|command| ("Secondary", command.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("chain detached verdict surface must have one primary action")
 }
 
 fn read_conductor_state(paths: &DeadreckonPaths, chain_id: &str) -> Result<Option<ConductorState>> {
