@@ -1562,8 +1562,13 @@ fn apply_refuses_uncompleted_run() {
 
     assert!(!apply.status.success());
     let stderr = stderr(&apply);
-    assert!(stderr.contains(&format!("run {} is planned", state.run_id)));
-    assert!(stderr.contains(&format!("try: deadreckon resume {}", state.run_id)));
+    assert!(stderr.contains("apply requires a completed run"));
+    assert!(stderr.contains("planned"));
+    assert!(stderr.contains("blocked apply"), "{stderr}");
+    assert_blocked_surface(
+        &stderr,
+        &format!("deadreckon resume {}", &state.run_id[..8]),
+    );
 }
 
 #[test]

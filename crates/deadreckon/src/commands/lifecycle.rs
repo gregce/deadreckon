@@ -358,12 +358,7 @@ fn apply_command_inner(
             None => return Err(run_error),
         },
     };
-    if state.status != RunStatus::Completed {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            &format!("run {} is {}", state.run_id, state.status),
-            &format!("deadreckon resume {}", state.run_id),
-        )));
-    }
+    ensure_completed_run(&state, "apply")?;
     let record = read_codebase_record(&state.working_dir)?;
     if record.mode != CodebaseMode::Worktree {
         return Err(apply_mode_error(&state, record.mode));
