@@ -1181,8 +1181,17 @@ async fn doc_polish_budget_cap_refuses_above_threshold() {
         .output()
         .expect("doc");
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("doc polish would cost"));
-    assert!(stderr(&output).contains("try: deadreckon doc"));
+    let err = stderr(&output);
+    assert!(err.contains("blocked doc polish"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(err.contains("Recommended\ndeadreckon doc "), "{err}");
+    assert!(err.contains("--polish --max-spend"), "{err}");
+    assert!(err.contains("estimated spend:"), "{err}");
+    assert!(err.contains("budget cap:"), "{err}");
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
     assert_eq!(server.journal().len(), 0);
 }
 
@@ -1374,7 +1383,7 @@ async fn doc_provider_falls_back_to_run_provider_last() {
 }
 
 #[test]
-fn no_doc_provider_emits_install_try_hint() {
+fn no_doc_provider_uses_blocked_verdict_surface() {
     let (temp, paths, mut state) = completed_state_with_docs("no provider docs");
     state.provider = None;
     save_state(&state).expect("save");
@@ -1388,12 +1397,18 @@ fn no_doc_provider_emits_install_try_hint() {
         .expect("doc");
     assert!(!output.status.success());
     let err = stderr(&output);
-    assert!(err.contains("no doc provider available"), "{err}");
-    assert_eq!(err.matches("try:").count(), 1, "{err}");
+    assert!(err.contains("blocked doc polish"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
     assert!(
-        err.contains("try: deadreckon config set defaults.doc_provider cli:codex"),
+        err.contains("Recommended\ndeadreckon config set defaults.doc_provider cli:codex"),
         "{err}"
     );
+    assert!(err.contains("provider source: none"), "{err}");
+    assert!(err.contains("run provider: none"), "{err}");
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
     assert!(!err.contains("try: install codex or claude"), "{err}");
     assert!(!err.contains("try: deadreckon doctor"), "{err}");
 }

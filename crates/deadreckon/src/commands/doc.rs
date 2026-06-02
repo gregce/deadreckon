@@ -76,11 +76,11 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
         )?;
         let selection = doc_provider_selection_from_setup(&setup_selection);
         let Some(provider) = selection.provider.clone() else {
-            return Err(CliError::Exit {
-                code: 1,
-                message: "deadreckon: no doc provider available; configure a doc provider after installing codex or claude".to_string(),
-                hint: "deadreckon config set defaults.doc_provider cli:codex".to_string(),
-            });
+            return Err(missing_doc_provider_error(
+                &paths,
+                state.provider.as_deref(),
+                &setup_selection,
+            ));
         };
         let subskills = effective_doc_subskills(&defaults);
         let token_budget = defaults
@@ -93,16 +93,13 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
         if let Some(cap) = budget_cap
             && estimated_spend.cost_usd > cap
         {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                &format!(
-                    "doc polish would cost about ${:.6}, above cap ${cap:.6}",
-                    estimated_spend.cost_usd
-                ),
-                &format!(
-                    "deadreckon doc {} --polish --max-spend {:.2} --no-confirm",
-                    state.run_id, estimated_spend.cost_usd
-                ),
-            )));
+            return Err(doc_polish_budget_cap_error(
+                &state,
+                &provider,
+                selection.source.as_str(),
+                &estimated_spend,
+                cap,
+            ));
         }
         if !no_confirm && completion_hints_enabled(false) && io::stdin().is_terminal() {
             print_doc_polish_preview(
@@ -267,6 +264,83 @@ fn print_doc_polish_preview(
         )?
     );
     Ok(())
+}
+
+fn missing_doc_provider_error(
+    paths: &DeadreckonPaths,
+    run_provider: Option<&str>,
+    setup_selection: &setup::ProviderSetupSelection,
+) -> CliError {
+    let primary = "deadreckon config set defaults.doc_provider cli:codex";
+    let mut secondary = vec![("Secondary", "deadreckon doctor".to_string())];
+    if let Some(setup_command) = setup_selection.try_lines.first()
+        && setup_command != primary
+    {
+        secondary.push(("Secondary", setup_command.clone()));
+    }
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "doc",
+            Some("polish"),
+            ExplanationPanel::new(
+                "DeadReckon could not polish run documentation because no doc provider is available.",
+                "Documentation polish needs an installed or configured provider route; setting defaults.doc_provider is the safest next step.",
+                vec![
+                    ("provider source".to_string(), setup_selection.source.as_str().to_string()),
+                    (
+                        "run provider".to_string(),
+                        run_provider.unwrap_or("none").to_string(),
+                    ),
+                    ("config".to_string(), paths.config_path().display().to_string()),
+                ],
+            ),
+            vec![("Recommended", primary)],
+            secondary,
+        )
+        .expect("missing doc provider verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false)),
+    }
+}
+
+fn doc_polish_budget_cap_error(
+    state: &deadreckon_core::PipelineState,
+    provider: &str,
+    provider_source: &str,
+    estimated_spend: &SpendEstimate,
+    cap: f64,
+) -> CliError {
+    let primary = format!(
+        "deadreckon doc {} --polish --max-spend {:.2} --no-confirm",
+        state.run_id, estimated_spend.cost_usd
+    );
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "doc",
+            Some("polish"),
+            ExplanationPanel::new(
+                "DeadReckon did not start documentation polish because the estimated provider spend exceeds the budget cap.",
+                "The budget cap is a preflight guard, so increasing the explicit max-spend to the estimate is the safest command if this polish is intended.",
+                vec![
+                    ("run".to_string(), state.run_id.clone()),
+                    ("provider".to_string(), provider.to_string()),
+                    ("provider source".to_string(), provider_source.to_string()),
+                    (
+                        "estimated spend".to_string(),
+                        format!("${:.6}", estimated_spend.cost_usd),
+                    ),
+                    ("budget cap".to_string(), format!("${cap:.6}")),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![("Secondary", "deadreckon doctor")],
+        )
+        .expect("doc polish budget cap verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false)),
+    }
 }
 
 pub(crate) fn doc_polish_preview_text(
