@@ -194,7 +194,7 @@ pub(crate) fn materialize_completed_run(
     force: bool,
     include_manifest: bool,
 ) -> Result<MaterializedRun> {
-    ensure_completed_run(state, "run")?;
+    ensure_completed_run(state, "materialize")?;
     if let Ok(record) = read_codebase_record(&state.working_dir) {
         match record.mode {
             CodebaseMode::Worktree => {
@@ -1871,14 +1871,41 @@ fn trace_one_liner(trace: &TraceRecord) -> String {
     }
 }
 
-fn ensure_completed_run(state: &deadreckon_core::PipelineState, label: &str) -> Result<()> {
+fn ensure_completed_run(state: &deadreckon_core::PipelineState, verb: &str) -> Result<()> {
     if state.status != RunStatus::Completed {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-            "{label} {} is not completed (status={}); use 'deadreckon resume' first",
-            state.run_id, state.status
-        ))));
+        return Err(CliError::Surface {
+            code: 1,
+            surface: incomplete_run_required_surface(state, verb)
+                .render_plain(!completion_hints_enabled(false)),
+        });
     }
     Ok(())
+}
+
+fn incomplete_run_required_surface(
+    state: &deadreckon_core::PipelineState,
+    verb: &str,
+) -> VerdictSurface {
+    let id = run_prefix(&state.run_id);
+    let primary = format!("deadreckon resume {id}");
+    let secondary = format!("deadreckon show {id}");
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        verb,
+        Some(&id),
+        ExplanationPanel::new(
+            format!("{verb} requires a completed run, but run {id} is {}.", state.status),
+            "This command needs stable completed artifacts; an incomplete run may still change if it is resumed.",
+            vec![
+                ("run".to_string(), id.clone()),
+                ("status".to_string(), state.status.to_string()),
+                ("state".to_string(), state.state_path().display().to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", secondary.as_str())],
+    )
+    .expect("incomplete run requirement verdict surface must be valid")
 }
 
 fn materialized_parent_marker(state: &deadreckon_core::PipelineState) -> ParentMarker {

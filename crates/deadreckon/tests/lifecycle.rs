@@ -98,6 +98,56 @@ fn materialize_refuses_existing_nonempty_dest() {
 }
 
 #[test]
+fn materialize_refuses_incomplete_run_with_one_primary_action() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("workspace");
+    let state = create_run(
+        &paths,
+        RunOptions {
+            goal: "incomplete materialize".to_string(),
+            cwd,
+            sandbox: "none".to_string(),
+            provider: Some("mock".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(30.0),
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+
+    let output = deadreckon(&paths)
+        .arg("materialize")
+        .arg(&state.run_id)
+        .arg("--dest")
+        .arg(temp.path().join("materialized-incomplete"))
+        .output()
+        .expect("materialize");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains(&format!("blocked materialize {}", &state.run_id[..8])),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Recommended\ndeadreckon resume {}",
+            &state.run_id[..8]
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
+}
+
+#[test]
 fn materialize_force_overwrites() {
     let temp = repo_tempdir();
     let (paths, parent) = completed_parent(&temp, "materialize force");
