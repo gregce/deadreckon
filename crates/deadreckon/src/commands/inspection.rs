@@ -1015,16 +1015,40 @@ fn resolve_library_entry(
 }
 
 fn print_empty_library_hint(scope: Option<&str>, all: bool) {
-    match scope {
-        Some(scope) => println!("no library artifacts for scope {scope}"),
-        None if all => println!("no library artifacts"),
-        None => println!("no library artifacts for current project"),
-    }
-    println!(
-        "{} completed fresh/copy runs are promoted automatically; use `{}` to inspect all scopes",
-        ui_muted("hint:"),
-        ui_command("deadreckon library list --all")
-    );
+    let subject = match scope {
+        Some(scope) => scope.to_string(),
+        None if all => "all-scopes".to_string(),
+        None => "current-project".to_string(),
+    };
+    let scope_label = match scope {
+        Some(scope) => format!("scope {scope}"),
+        None if all => "all scopes".to_string(),
+        None => "current project".to_string(),
+    };
+    let surface = VerdictSurface::try_new(
+        VerdictKind::Noop,
+        "library list",
+        Some(&subject),
+        ExplanationPanel::new(
+            format!("Library list found no promoted artifacts for {scope_label}."),
+            "This is a no-op because there are no completed fresh/copy run artifacts in the selected library scope.",
+            vec![
+                ("scope".to_string(), scope_label),
+                ("library".to_string(), "promoted run artifacts".to_string()),
+                (
+                    "promotion".to_string(),
+                    "completed fresh/copy runs promote automatically".to_string(),
+                ),
+            ],
+        ),
+        vec![("Recommended", "deadreckon library list --all")],
+        vec![
+            ("Secondary", "deadreckon run \"goal\""),
+            ("Secondary", "deadreckon finish <run-id>"),
+        ],
+    )
+    .expect("empty library list verdict surface must be valid");
+    print!("{}", surface.render_plain(false));
 }
 
 fn print_library_table(entries: &[LibraryEntry], full: bool) {

@@ -672,6 +672,37 @@ fn library_list_search_show_reads_promoted_manifests() {
 }
 
 #[test]
+fn library_list_empty_has_one_primary_recovery_action() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let list = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["library", "list"])
+        .output()
+        .expect("library list");
+
+    assert_success(&list);
+    let stdout = stdout(&list);
+    assert!(
+        stdout.contains("no-op library list current-project"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon library list --all"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\nSecondary\n"), "{stdout}");
+    assert!(stdout.contains("deadreckon run \"goal\""), "{stdout}");
+    assert!(!stdout.contains("hint:"), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
+}
+
+#[test]
 fn library_defaults_to_current_scope_unless_all() {
     let temp = TempDir::new().expect("tempdir");
     let (paths, first) = completed_parent_at(&temp, "scope one artifact", "workspace-one");
