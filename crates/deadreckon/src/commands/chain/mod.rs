@@ -753,10 +753,21 @@ async fn run_chain_conductor(
     }
     match chain.status {
         ChainStatus::Completed => {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                &format!("chain '{}' is completed", chain_prefix(&chain.chain_id)),
-                &format!("deadreckon chain show {}", chain_prefix(&chain.chain_id)),
-            )));
+            let id = chain_prefix(&chain.chain_id);
+            return Err(CliError::Surface {
+                code: 1,
+                surface: chain_transition_surface(
+                    paths,
+                    &chain,
+                    VerdictKind::Blocked,
+                    "DeadReckon did not run the chain because the chain is completed.",
+                    "Completed chain state is terminal, so inspection is the safest next command before redo or extension.",
+                    vec![("requested action".to_string(), "chain run".to_string())],
+                    format!("deadreckon chain show {id}"),
+                    Vec::new(),
+                )
+                .render_plain(false),
+            });
         }
         ChainStatus::Running if chain.conductor_pid.is_some_and(pid_is_alive) => {
             return Err(CliError::Core(deadreckon_core::user_error(

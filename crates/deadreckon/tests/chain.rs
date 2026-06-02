@@ -2334,6 +2334,40 @@ fn chain_run_idempotent_on_replay_skips_completed() {
 }
 
 #[test]
+fn chain_run_refuses_completed_chain_with_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.status = ChainStatus::Completed;
+    chain.scope = deadreckon_core::paths::workspace_scope(&repo).expect("scope");
+    save_test_chain(&paths, &chain);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "run", &chain.chain_id])
+        .output()
+        .expect("run completed chain");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
+    assert!(stderr.contains("chain is completed"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Recommended\ndeadreckon chain show {}",
+            &chain.chain_id[..8]
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
+}
+
+#[test]
 fn chain_run_ctrl_c_cascades_terminate_in_under_5s() {
     chain_kill_cascade_terminates_inner_run_and_conductor_under_5s();
 }
