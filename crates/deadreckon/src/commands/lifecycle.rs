@@ -624,10 +624,12 @@ fn prepare_apply_autostash(
     }
 
     if !should_stash {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "your working tree has uncommitted changes",
-            &apply_dirty_hint(run_id, no_confirm),
-        )));
+        return Err(apply_dirty_error(
+            git_root,
+            run_id,
+            no_confirm,
+            dirty.as_str(),
+        ));
     }
 
     let marker = format!(
@@ -646,11 +648,38 @@ fn prepare_apply_autostash(
 }
 
 fn apply_dirty_hint(run_id: &str, no_confirm: bool) -> String {
-    let mut hint = format!("deadreckon apply {run_id} --autostash");
+    let mut hint = format!("deadreckon apply {} --autostash", run_prefix(run_id));
     if no_confirm {
         hint.push_str(" --no-confirm");
     }
     hint
+}
+
+fn apply_dirty_error(git_root: &Path, run_id: &str, no_confirm: bool, dirty: &str) -> CliError {
+    let id = run_prefix(run_id);
+    let dirty_count = dirty.lines().count();
+    let primary = apply_dirty_hint(run_id, no_confirm);
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "apply",
+            Some(&id),
+            ExplanationPanel::new(
+                "your working tree has uncommitted changes",
+                "Apply would merge a run branch into a checkout that already has local changes; autostash is required to preserve and restore those changes around the merge.",
+                [
+                    ("run".to_string(), id.clone()),
+                    ("working".to_string(), git_root.display().to_string()),
+                    ("dirty paths".to_string(), dirty_count.to_string()),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            Vec::<(&str, &str)>::new(),
+        )
+        .expect("apply dirty refusal verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false)),
+    }
 }
 
 fn find_stash_by_marker(git_root: &Path, marker: &str) -> Result<Option<String>> {
@@ -678,21 +707,41 @@ fn restore_apply_autostash(git_root: &Path, run_id: &str, stash: &ApplyAutoStash
 }
 
 fn apply_merge_error(run_id: &str, autostash: &Option<ApplyAutoStash>, err: &CliError) -> CliError {
-    CliError::Core(deadreckon_core::user_error(
-        &format!("merge produced conflicts: {err}"),
-        &apply_conflict_hint(run_id, autostash),
-    ))
-}
-
-fn apply_conflict_hint(run_id: &str, autostash: &Option<ApplyAutoStash>) -> String {
-    let mut hint = format!("resolve, then git commit && deadreckon cleanup {run_id}");
+    let id = run_prefix(run_id);
+    let cleanup = format!("deadreckon cleanup {id}");
+    let mut secondary = vec![("Secondary", cleanup.as_str())];
+    let stash_hint;
     if let Some(stash) = autostash {
-        hint.push_str(&format!(
-            "; restore local changes with git stash pop {}",
-            stash.refname
-        ));
+        stash_hint = format!("git stash pop {}", stash.refname);
+        secondary.push(("Secondary", stash_hint.as_str()));
     }
-    hint
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Failed,
+            "apply",
+            Some(&id),
+            ExplanationPanel::new(
+                format!("merge produced conflicts: {err}"),
+                "Git stopped during apply with conflict markers in the target checkout; inspect the conflicted paths, resolve them, commit the result, then clean up the run worktree.",
+                [
+                    ("run".to_string(), id.clone()),
+                    ("primary evidence".to_string(), "git merge failed".to_string()),
+                    (
+                        "autostash".to_string(),
+                        autostash
+                            .as_ref()
+                            .map(|stash| stash.refname.clone())
+                            .unwrap_or_else(|| "none".to_string()),
+                    ),
+                ],
+            ),
+            vec![("Recommended", "git status")],
+            secondary,
+        )
+        .expect("apply conflict verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false)),
+    }
 }
 
 fn should_prompt_cleanup(no_confirm: bool) -> Result<bool> {

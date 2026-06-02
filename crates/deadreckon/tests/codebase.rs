@@ -220,6 +220,10 @@ fn assert_blocked_run_surface(stderr: &str, recommended: &str) {
 }
 
 fn assert_blocked_surface(stderr: &str, recommended: &str) {
+    assert_verdict_surface(stderr, recommended);
+}
+
+fn assert_verdict_surface(stderr: &str, recommended: &str) {
     assert!(stderr.contains("Explanation\n"), "{stderr}");
     assert!(stderr.contains("Evidence\n"), "{stderr}");
     assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
@@ -1295,9 +1299,11 @@ fn apply_refuses_on_dirty_user_tree() {
     assert!(!apply.status.success());
     let stderr = stderr(&apply);
     assert!(stderr.contains("your working tree has uncommitted changes"));
-    assert!(stderr.contains(&format!(
-        "try: deadreckon apply {run_id} --autostash --no-confirm"
-    )));
+    assert!(stderr.contains("blocked apply"), "{stderr}");
+    assert_blocked_surface(
+        &stderr,
+        &format!("deadreckon apply {} --autostash --no-confirm", &run_id[..8]),
+    );
 }
 
 #[test]
@@ -1481,9 +1487,9 @@ fn apply_conflict_leaves_markers_and_prints_resolve_hint() {
     assert!(!apply.status.success());
     let stderr = stderr(&apply);
     assert!(stderr.contains("merge produced conflicts"));
-    assert!(stderr.contains(&format!(
-        "try: resolve, then git commit && deadreckon cleanup {run_id}"
-    )));
+    assert!(stderr.contains("failed apply"), "{stderr}");
+    assert_verdict_surface(&stderr, "git status");
+    assert!(stderr.contains(&format!("deadreckon cleanup {}", &run_id[..8])));
     assert!(
         fs::read_to_string(repo.join("conflict.txt"))
             .expect("conflict markers")
