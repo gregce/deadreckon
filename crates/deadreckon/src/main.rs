@@ -2599,19 +2599,16 @@ fn provider_setup_row_lines(selections: &[setup::ProviderSetupSelection]) -> Vec
             selection.row_value()
         ));
     }
-    let mut recommended_printed = false;
     for selection in selections {
         for warning in &selection.warnings {
             lines.push(format!("  {}", ui_warn(warning)));
         }
         for try_line in &selection.try_lines {
-            let label = if recommended_printed {
-                "secondary:"
-            } else {
-                recommended_printed = true;
-                "recommended:"
-            };
-            lines.push(format!("  {} {}", ui_command(label), ui_command(try_line)));
+            lines.push(format!(
+                "  {} {}",
+                ui_command("setup:"),
+                ui_command(try_line)
+            ));
         }
     }
     lines
@@ -2638,7 +2635,7 @@ mod provider_setup_row_tests {
     }
 
     #[test]
-    fn provider_setup_rows_use_one_recommended_command() {
+    fn provider_setup_rows_do_not_print_a_second_recommended_command() {
         let rendered = provider_setup_row_lines(&[selection_with_try_lines(vec![
             "npm i -g @openai/codex",
             "deadreckon providers list --all",
@@ -2647,13 +2644,13 @@ mod provider_setup_row_tests {
 
         assert!(rendered.contains("provider setup"), "{rendered}");
         assert!(rendered.contains("default:"), "{rendered}");
-        assert_eq!(rendered.matches("recommended:").count(), 1, "{rendered}");
+        assert!(!rendered.contains("recommended:"), "{rendered}");
         assert!(
-            rendered.contains("recommended: npm i -g @openai/codex"),
+            rendered.contains("setup: npm i -g @openai/codex"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("secondary: deadreckon providers list --all"),
+            rendered.contains("setup: deadreckon providers list --all"),
             "{rendered}"
         );
         assert!(!rendered.contains("try:"), "{rendered}");
