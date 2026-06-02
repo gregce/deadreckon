@@ -3601,8 +3601,9 @@ fn plan_attach_footer_snapshot_captures_back_navigation_grammar() {
     assert!(footer.starts_with("q/Esc/Ctrl-D detach"), "{footer}");
     assert!(footer.contains("arrows/Tab focus child"), "{footer}");
     assert!(footer.contains("Enter waits for child run"), "{footer}");
-    assert_eq!(footer.matches("recommended:").count(), 1, "{footer}");
-    assert!(footer.contains("recommended: deadreckon fork"), "{footer}");
+    assert_eq!(footer.matches("recommended:").count(), 0, "{footer}");
+    assert_eq!(footer.matches("next ").count(), 1, "{footer}");
+    assert!(footer.contains("next deadreckon fork"), "{footer}");
     assert!(!footer.contains("try:"), "{footer}");
 }
 
@@ -3657,24 +3658,23 @@ fn attach_plan_back_returns_to_same_selected_task() {
 }
 
 #[test]
-fn attach_plan_enter_without_run_id_shows_recommended_footer() {
+fn attach_plan_enter_without_run_id_shows_one_next_action_footer() {
     let (_temp, paths, plan) = full_plan_fixture(2);
 
     let text = render_plan_attach_text(&paths, &plan, &[], &[], 0);
 
     assert!(text.contains("Enter waits for child run"), "{text}");
     assert!(
-        text.contains(&format!(
-            "recommended: deadreckon fork {}",
-            &plan.plan_id[..8]
-        )),
+        text.contains(&format!("next deadreckon fork {}", &plan.plan_id[..8])),
         "{text}"
     );
+    assert_eq!(text.matches("recommended:").count(), 0, "{text}");
+    assert_eq!(text.matches("next ").count(), 1, "{text}");
     assert!(!text.contains("try: deadreckon fork"), "{text}");
 }
 
 #[test]
-fn attach_plan_missing_child_run_shows_one_recommended_recovery() {
+fn attach_plan_missing_child_run_shows_one_next_recovery() {
     let (_temp, paths, mut plan) = full_plan_fixture(2);
     plan.tasks[0].child_run_id = Some("missing-child-run".to_string());
 
@@ -3688,11 +3688,9 @@ fn attach_plan_missing_child_run_shows_one_recommended_recovery() {
     );
 
     assert!(footer.contains("child detail unavailable"), "{footer}");
-    assert_eq!(footer.matches("recommended:").count(), 1, "{footer}");
-    assert!(
-        footer.contains("recommended: deadreckon list --all"),
-        "{footer}"
-    );
+    assert_eq!(footer.matches("recommended:").count(), 0, "{footer}");
+    assert_eq!(footer.matches("next ").count(), 1, "{footer}");
+    assert!(footer.contains("next deadreckon list --all"), "{footer}");
     assert!(!footer.contains("try:"), "{footer}");
 }
 

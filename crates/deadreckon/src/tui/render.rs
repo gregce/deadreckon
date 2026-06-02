@@ -1150,6 +1150,7 @@ pub(crate) fn plan_attach_footer(
     view: AttachViewMode,
     visual: NarrativeVisualMode,
 ) -> String {
+    let mut has_primary_footer_action = false;
     let mut footer = if view.is_narrative() {
         format!(
             "n narrative/activity  v visual={}  r refresh  |  arrows/Tab child  Enter child run  q detach",
@@ -1162,8 +1163,9 @@ pub(crate) fn plan_attach_footer(
     if let Some(task) = plan.tasks.get(selected) {
         match task.child_run_id.as_deref() {
             None => {
+                has_primary_footer_action = true;
                 let wait_hint = format!(
-                    "Enter waits for child run  |  recommended: deadreckon fork {}",
+                    "Enter waits for child run  |  next deadreckon fork {}",
                     run_prefix(&plan.plan_id)
                 );
                 if view.is_narrative() {
@@ -1174,8 +1176,8 @@ pub(crate) fn plan_attach_footer(
                 }
             }
             Some(run_id) if load_run(paths, run_id).is_err() => {
-                let unavailable_hint =
-                    "child detail unavailable  |  recommended: deadreckon list --all";
+                has_primary_footer_action = true;
+                let unavailable_hint = "child detail unavailable  |  next deadreckon list --all";
                 if view.is_narrative() {
                     footer = format!("{footer}  |  {unavailable_hint}");
                 } else {
@@ -1187,7 +1189,7 @@ pub(crate) fn plan_attach_footer(
             Some(_) => {}
         }
     }
-    if show_hints && !footer.contains("recommended:") {
+    if show_hints && !has_primary_footer_action {
         footer.push_str("  |  merge after fork");
     }
     footer
