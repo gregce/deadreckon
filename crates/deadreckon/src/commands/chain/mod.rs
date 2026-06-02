@@ -1011,7 +1011,7 @@ async fn run_chain_conductor(
                         paths,
                         &mut chain,
                         index,
-                        format!("apply_refused_{}", compact_reason(&err.to_string())),
+                        chain_apply_refusal_pause_reason(&err.to_string()),
                     )?;
                     completed = false;
                     break;
@@ -1743,6 +1743,10 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
         .steps
         .iter()
         .find(|step| step.status == ChainStepStatus::Failed || step.fail_reason.is_some());
+    let reason = chain
+        .failure_reason
+        .as_deref()
+        .or(chain.paused_reason.as_deref());
     let (kind, what, why) = match chain.status {
         ChainStatus::Completed => (
             VerdictKind::Completed,
@@ -1756,8 +1760,8 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
         ),
         ChainStatus::Paused => (
             VerdictKind::Paused,
-            "The chain is paused before reaching a terminal result.",
-            "The chain still has resumable state, so resume is the primary next command.",
+            chain_paused_what(reason),
+            chain_paused_why(reason),
         ),
         ChainStatus::Killed => (
             VerdictKind::Killed,
@@ -1781,11 +1785,7 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
         ),
     };
     let mut evidence = chain_base_evidence(paths, chain);
-    if let Some(reason) = chain
-        .failure_reason
-        .as_deref()
-        .or(chain.paused_reason.as_deref())
-    {
+    if let Some(reason) = reason {
         evidence.push(("reason".to_string(), reason.to_string()));
     }
     if let Some(step) = failed_step {
@@ -1876,10 +1876,36 @@ fn chain_primary_action(chain: &Chain) -> String {
     let id = chain_prefix(&chain.chain_id);
     match chain.status {
         ChainStatus::Failed => format!("deadreckon chain show {id} --why-failed"),
+        ChainStatus::Paused if chain_paused_for_outside_allowlist(chain) => {
+            format!("deadreckon chain resume {id} --apply-mode preview")
+        }
         ChainStatus::Paused | ChainStatus::Pending => format!("deadreckon chain resume {id}"),
         ChainStatus::Running => format!("deadreckon chain attach {id}"),
         ChainStatus::Completed | ChainStatus::Undone => format!("deadreckon chain show {id}"),
         ChainStatus::Killed => format!("deadreckon chain show {id} --why-failed"),
+    }
+}
+
+fn chain_paused_for_outside_allowlist(chain: &Chain) -> bool {
+    chain
+        .paused_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist"))
+}
+
+fn chain_paused_what(reason: Option<&str>) -> &'static str {
+    if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
+        "The chain paused because auto-apply refused a file outside the apply allowlist."
+    } else {
+        "The chain is paused before reaching a terminal result."
+    }
+}
+
+fn chain_paused_why(reason: Option<&str>) -> &'static str {
+    if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
+        "Previewing the diff is the primary next command before widening the allowlist or manually applying the step."
+    } else {
+        "The chain still has resumable state, so resume is the primary next command."
     }
 }
 
@@ -3181,6 +3207,28 @@ fn allowlist_matches(pattern: &str, file: &str) -> bool {
 
 fn looks_like_chain_id(value: &str) -> bool {
     value.len() >= 6 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn chain_apply_refusal_pause_reason(message: &str) -> String {
+    if let Some(file) = message
+        .split("outside_allowlist ")
+        .nth(1)
+        .and_then(|tail| tail.split(')').next())
+        .map(str::trim)
+        .filter(|file| !file.is_empty())
+    {
+        return format!("apply_refused_outside_allowlist {file}");
+    }
+    if message.contains("dirty target") {
+        return "apply_refused_dirty_target".to_string();
+    }
+    if message.contains("paused by hook on-promote") {
+        return "apply_paused_by_hook_on_promote".to_string();
+    }
+    if message.contains("refused by hook on-promote") {
+        return "apply_refused_by_hook_on_promote".to_string();
+    }
+    format!("apply_refused_{}", compact_reason(message))
 }
 
 fn compact_reason(reason: &str) -> String {

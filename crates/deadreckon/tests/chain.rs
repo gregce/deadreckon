@@ -946,7 +946,22 @@ fn apply_mode_auto_refuses_when_file_outside_allowlist() {
         .expect("chain run");
 
     assert_success(&output);
+    let stdout = stdout(&output);
     let chain = newest_chain(&paths);
+    let short_id = &chain.chain_id[..8];
+    assert!(stdout.contains("paused chain"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon chain resume {short_id} --apply-mode preview"
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("outside_allowlist"), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
+    assert!(!stdout.contains("hint:"), "{stdout}");
     assert_eq!(chain.status, ChainStatus::Paused);
     assert_eq!(chain.steps[0].status, ChainStepStatus::Completed);
     assert_ne!(chain.steps[0].status, ChainStepStatus::Applied);
@@ -955,7 +970,7 @@ fn apply_mode_auto_refuses_when_file_outside_allowlist() {
             .paused_reason
             .as_deref()
             .unwrap_or_default()
-            .contains("outside_allowlist"),
+            .starts_with("apply_refused_outside_allowlist"),
         "{:?}",
         chain.paused_reason
     );
