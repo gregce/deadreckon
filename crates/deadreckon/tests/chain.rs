@@ -562,6 +562,33 @@ fn chain_refuses_more_than_12_steps() {
 }
 
 #[test]
+fn chain_id_shorthand_refuses_with_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "abc123"])
+        .output()
+        .expect("chain id shorthand");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
+    assert!(stderr.contains("chain <id> is ambiguous"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain run abc123"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
+}
+
+#[test]
 fn chain_refuses_non_git_cwd_with_try_hint() {
     let temp = TempDir::new().expect("tempdir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));

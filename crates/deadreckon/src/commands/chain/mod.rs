@@ -359,10 +359,19 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
         ),
         "hooks" if args.get(1).is_some_and(|arg| arg == "list") => chain_hooks_list_command(),
         maybe_id if args.len() == 1 && looks_like_chain_id(maybe_id) => {
-            Err(CliError::Core(deadreckon_core::user_error(
-                &format!("did you mean `chain run {maybe_id}`?"),
-                &format!("deadreckon chain run {maybe_id}"),
-            )))
+            Err(chain_create_refusal_surface(
+                VerdictKind::Blocked,
+                Some(maybe_id),
+                "DeadReckon did not run the chain because chain <id> is ambiguous.",
+                "A chain id without an explicit verb could mean run, show, attach, pause, or another action, so DeadReckon refused before changing chain state.",
+                [
+                    ("command".to_string(), "chain <id>".to_string()),
+                    ("chain".to_string(), maybe_id.to_string()),
+                    ("verb".to_string(), "missing".to_string()),
+                ],
+                format!("deadreckon chain run {maybe_id}"),
+                no_hints,
+            ))
         }
         _ => {
             let goals = collect_chain_goals(&args, from_file, from_stdin)?;
