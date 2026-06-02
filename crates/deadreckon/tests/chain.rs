@@ -866,6 +866,68 @@ fn chain_on_promote_hook_refuse_blocks_apply() {
 }
 
 #[test]
+fn chain_on_promote_hook_pause_uses_reasoned_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_hook(
+        &repo,
+        "on-promote",
+        "#!/bin/sh\necho pause before promote\nexit 1\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "2",
+            "pause promote",
+            "never reached",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    let chain = newest_chain(&paths);
+    let short_id = &chain.chain_id[..8];
+    assert!(stdout.contains("paused chain"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!("Recommended\ndeadreckon chain resume {short_id}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .contains("The chain paused because the on-promote hook requested an operator pause."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("apply_paused_by_hook_on_promote"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("try:"), "{stdout}");
+    assert!(!stdout.contains("hint:"), "{stdout}");
+    assert_eq!(chain.status, ChainStatus::Paused);
+    assert!(
+        chain
+            .paused_reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("apply_paused_by_hook_on_promote")
+    );
+    assert_ne!(chain.steps[0].status, ChainStepStatus::Applied);
+}
+
+#[test]
 fn branch_policy_stack_chains_branches_off_prior_head() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

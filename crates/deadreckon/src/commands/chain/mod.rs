@@ -1906,6 +1906,8 @@ fn chain_paused_for_outside_allowlist(chain: &Chain) -> bool {
 fn chain_paused_what(reason: Option<&str>) -> &'static str {
     if reason.is_some_and(|reason| reason.starts_with("apply_refused_by_hook_on_promote")) {
         "The chain paused because the on-promote hook refused auto-apply."
+    } else if reason.is_some_and(|reason| reason.starts_with("apply_paused_by_hook_on_promote")) {
+        "The chain paused because the on-promote hook requested an operator pause."
     } else if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
         "The chain paused because auto-apply refused a file outside the apply allowlist."
     } else {
@@ -1916,6 +1918,8 @@ fn chain_paused_what(reason: Option<&str>) -> &'static str {
 fn chain_paused_why(reason: Option<&str>) -> &'static str {
     if reason.is_some_and(|reason| reason.starts_with("apply_refused_by_hook_on_promote")) {
         "The hook policy blocked promotion, so inspecting configured chain hooks is the primary next command before resuming."
+    } else if reason.is_some_and(|reason| reason.starts_with("apply_paused_by_hook_on_promote")) {
+        "The hook requested a resumable pause, so resuming the chain is the primary next command after the operator check."
     } else if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
         "Previewing the diff is the primary next command before widening the allowlist or manually applying the step."
     } else {
