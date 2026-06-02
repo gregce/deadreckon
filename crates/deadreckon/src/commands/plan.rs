@@ -1330,6 +1330,7 @@ pub(crate) fn print_orchestrate_started(
         ui_ok("started orchestration"),
         ui_id(format!("{} ({})", run_prefix(&plan.plan_id), plan.plan_id))
     );
+    let paths = DeadreckonPaths::discover();
     let children = plan.tasks.len().to_string();
     let providers = plan_provider_summary(plan);
     let source = plan_source_label(plan);
@@ -1342,7 +1343,6 @@ pub(crate) fn print_orchestrate_started(
     let wall = max_wall_seconds
         .map(|value| format!("{value:.0}s per child"))
         .unwrap_or_else(|| "config default".to_string());
-    let paths = DeadreckonPaths::discover();
     let plan_path = paths.plan_json(&plan.plan_id);
     let plan_path_display = plan_path.to_string_lossy().to_string();
     let events_path_display = paths
@@ -1365,37 +1365,6 @@ pub(crate) fn print_orchestrate_started(
     print_kv_block(&items);
     print_orchestration_role_table(plan, !no_repair, None);
     print_orchestration_dependency_summary(plan);
-    println!(
-        "{} {}",
-        ui_command("attach:"),
-        ui_command(format!("deadreckon attach {}", run_prefix(&plan.plan_id)))
-    );
-    println!(
-        "{} {}",
-        ui_command("show:"),
-        ui_command(format!("deadreckon show {}", run_prefix(&plan.plan_id)))
-    );
-    println!(
-        "{} {}",
-        ui_command("child:"),
-        ui_command(format!(
-            "deadreckon attach {}:task-0",
-            run_prefix(&plan.plan_id)
-        ))
-    );
-    println!(
-        "{} {}",
-        ui_command("when done:"),
-        ui_command(format!("deadreckon finish {}", run_prefix(&plan.plan_id)))
-    );
-    println!(
-        "{} {}",
-        ui_command("history:"),
-        ui_command(format!(
-            "deadreckon history grep <pattern> --plan {}",
-            run_prefix(&plan.plan_id)
-        ))
-    );
     let _ = io::stdout().flush();
 }
 

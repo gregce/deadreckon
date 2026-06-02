@@ -1458,12 +1458,20 @@ fn orchestrate_start_prints_run_like_context() {
     let plan = newest_plan(&paths);
     let out = stdout(&output);
     assert!(out.contains("started orchestration"), "{out}");
-    assert!(out.contains(&plan.plan_id[..8]), "{out}");
-    assert!(out.contains("attach:"), "{out}");
+    assert_verdict_surface(
+        &out,
+        &format!("completed plan {}", &plan.plan_id[..8]),
+        &format!("deadreckon finish {}", &plan.plan_id[..8]),
+    );
     assert!(
         out.contains(&format!("deadreckon attach {}", &plan.plan_id[..8])),
         "{out}"
     );
+    assert!(!out.contains("attach:"), "{out}");
+    assert!(!out.contains("show:"), "{out}");
+    assert!(!out.contains("child:"), "{out}");
+    assert!(!out.contains("when done:"), "{out}");
+    assert!(!out.contains("history:"), "{out}");
     assert!(out.contains("providers"), "{out}");
     assert!(out.contains("merge repair"), "{out}");
     assert!(out.contains("automatic via"), "{out}");
@@ -3655,10 +3663,14 @@ fn finish_accepts_completed_plan_id_and_applies_in_git_repo() {
 
     let out = stdout(&output);
     assert!(out.contains("plan result:"), "{out}");
-    assert!(
-        out.contains(&format!("deadreckon apply {}", &plan.plan_id[..8])),
-        "{out}"
-    );
+    assert!(out.contains("completed apply "), "{out}");
+    assert!(out.contains("Explanation\n"), "{out}");
+    assert!(out.contains("Evidence\n"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(out.contains("Recommended\ndeadreckon show "), "{out}");
+    assert!(!out.contains("try:"), "{out}");
+    assert!(!out.contains("finish:"), "{out}");
+    assert!(!out.contains("apply:"), "{out}");
     assert!(repo.join("plan-finish-marker.txt").is_file());
     let subject = git_output(&repo, &["log", "-1", "--pretty=%s"]);
     assert!(subject.contains("deadreckon plan"), "{subject}");
