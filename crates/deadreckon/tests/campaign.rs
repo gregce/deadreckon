@@ -63,6 +63,50 @@ fn campaign_preview_writes_campaign_json_and_stops() {
 }
 
 #[test]
+fn campaign_preview_uses_one_verdict_surface() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let work = workdir(&temp);
+
+    let output = deadreckon(&paths)
+        .current_dir(&work)
+        .args([
+            "campaign",
+            "build a thing",
+            "--n",
+            "2",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--preview",
+            "--plain",
+        ])
+        .output()
+        .expect("run campaign --preview");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let out = stdout(&output);
+    assert!(out.starts_with("preview campaign"), "{out}");
+    assert!(out.contains("Explanation\n"), "{out}");
+    assert!(out.contains("Evidence\n"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains("Recommended\ndeadreckon campaign \"build a thing\" --n 2 --yes"),
+        "{out}"
+    );
+    assert!(!out.contains("try:"), "{out}");
+    assert!(out.contains("Sub-goals"), "{out}");
+    assert!(out.contains("sub-0"), "{out}");
+    assert!(out.contains("sub-1"), "{out}");
+}
+
+#[test]
 fn campaign_preflight_shows_depth_cap_and_tree_budget() {
     let temp = TempDir::new().expect("tempdir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -92,8 +136,8 @@ fn campaign_preflight_shows_depth_cap_and_tree_budget() {
         stderr(&output)
     );
     let out = stdout(&output);
-    assert!(out.contains("depth cap 2"), "{out}");
-    assert!(out.contains("tree budget $10"), "{out}");
+    assert!(out.contains("depth cap: 2"), "{out}");
+    assert!(out.contains("tree budget: $10.00"), "{out}");
 }
 
 #[test]
@@ -170,7 +214,13 @@ fn campaign_without_n_uses_recommended_count() {
         .expect("campaign.json");
     let body = std::fs::read_to_string(campaign_json).expect("read campaign.json");
     assert!(body.contains("\"n\": 3"), "{body}");
-    assert!(stdout(&output).contains("campaign: 3 sub-orchestrators"));
+    let out = stdout(&output);
+    assert!(out.contains("preview campaign"), "{out}");
+    assert!(out.contains("subs: 3"), "{out}");
+    assert!(
+        out.contains("Recommended\ndeadreckon campaign \"rebuild billing, notifications, and admin\" --n 3 --yes"),
+        "{out}"
+    );
 }
 
 #[test]

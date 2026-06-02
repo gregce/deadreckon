@@ -140,32 +140,65 @@ fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sand
     let per_sub = campaign
         .tree_budget_usd
         .map(|budget| deadreckon_core::campaign::allocate_budget(budget, campaign.sub_goals.len()));
-    println!("campaign: {} sub-orchestrators", campaign.n);
-    println!(
-        "  depth cap {} (sub-orchestrators cannot campaign again)",
-        deadreckon_core::campaign::CAMPAIGN_MAX_DEPTH
+    let id = run_prefix(&campaign.campaign_id);
+    let primary = format!(
+        "deadreckon campaign \"{}\" --n {} --yes",
+        shell_display_quote(&campaign.root_goal),
+        campaign.n
     );
+    let mut evidence = vec![
+        ("campaign".to_string(), id.clone()),
+        ("subs".to_string(), campaign.n.to_string()),
+        (
+            "depth cap".to_string(),
+            deadreckon_core::campaign::CAMPAIGN_MAX_DEPTH.to_string(),
+        ),
+    ];
     match (
         campaign.tree_budget_usd,
         per_sub.as_ref().and_then(|s| s.first()),
     ) {
         (Some(total), Some(share)) => {
-            println!("  tree budget ${total:.2} (~${share:.2}/sub)");
+            evidence.push((
+                "tree budget".to_string(),
+                format!("${total:.2} (~${share:.2}/sub)"),
+            ));
         }
         _ => {
             if let Some(warning) =
                 deadreckon_core::campaign::unbounded_budget_warning(campaign.tree_budget_usd)
             {
-                println!("  tree budget: {warning}");
+                evidence.push(("tree budget".to_string(), warning));
             }
         }
     }
     if let Some(sandbox) = sandbox {
-        println!("  sandbox {sandbox}");
+        evidence.push(("sandbox".to_string(), sandbox.to_string()));
     }
     if let Some(planner) = campaign.providers.planner.as_deref() {
-        println!("  planner {planner}");
+        evidence.push(("planner".to_string(), planner.to_string()));
     }
+    println!(
+        "{}",
+        VerdictSurface::try_new(
+            VerdictKind::Preview,
+            "campaign",
+            Some(&id),
+            ExplanationPanel::new(
+                "DeadReckon prepared a campaign plan, but no sub-orchestrator has launched yet.",
+                "Launching with --yes is the one command that advances this preflight into campaign execution.",
+                evidence,
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![
+                ("Secondary", format!("deadreckon attach {id}").as_str()),
+                ("Secondary", format!("deadreckon show {id}").as_str()),
+            ],
+        )
+        .expect("campaign preflight verdict surface must have one primary action")
+        .render_plain(true)
+    );
+    println!("Sub-goals");
     for sub in &campaign.sub_goals {
         println!("  {} {}", sub.sub_id, sub.goal);
     }
