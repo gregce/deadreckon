@@ -1876,6 +1876,9 @@ fn chain_primary_action(chain: &Chain) -> String {
     let id = chain_prefix(&chain.chain_id);
     match chain.status {
         ChainStatus::Failed => format!("deadreckon chain show {id} --why-failed"),
+        ChainStatus::Paused if chain_paused_for_hook_refusal(chain) => {
+            "deadreckon chain hooks list".to_string()
+        }
         ChainStatus::Paused if chain_paused_for_outside_allowlist(chain) => {
             format!("deadreckon chain resume {id} --apply-mode preview")
         }
@@ -1886,6 +1889,13 @@ fn chain_primary_action(chain: &Chain) -> String {
     }
 }
 
+fn chain_paused_for_hook_refusal(chain: &Chain) -> bool {
+    chain
+        .paused_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("apply_refused_by_hook_on_promote"))
+}
+
 fn chain_paused_for_outside_allowlist(chain: &Chain) -> bool {
     chain
         .paused_reason
@@ -1894,7 +1904,9 @@ fn chain_paused_for_outside_allowlist(chain: &Chain) -> bool {
 }
 
 fn chain_paused_what(reason: Option<&str>) -> &'static str {
-    if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
+    if reason.is_some_and(|reason| reason.starts_with("apply_refused_by_hook_on_promote")) {
+        "The chain paused because the on-promote hook refused auto-apply."
+    } else if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
         "The chain paused because auto-apply refused a file outside the apply allowlist."
     } else {
         "The chain is paused before reaching a terminal result."
@@ -1902,7 +1914,9 @@ fn chain_paused_what(reason: Option<&str>) -> &'static str {
 }
 
 fn chain_paused_why(reason: Option<&str>) -> &'static str {
-    if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
+    if reason.is_some_and(|reason| reason.starts_with("apply_refused_by_hook_on_promote")) {
+        "The hook policy blocked promotion, so inspecting configured chain hooks is the primary next command before resuming."
+    } else if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
         "Previewing the diff is the primary next command before widening the allowlist or manually applying the step."
     } else {
         "The chain still has resumable state, so resume is the primary next command."

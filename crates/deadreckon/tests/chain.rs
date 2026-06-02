@@ -836,14 +836,29 @@ fn chain_on_promote_hook_refuse_blocks_apply() {
         .expect("chain run");
 
     assert_success(&output);
+    let stdout = stdout(&output);
     let chain = newest_chain(&paths);
+    assert!(stdout.contains("paused chain"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon chain hooks list"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("apply_refused_by_hook_on_promote"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("try:"), "{stdout}");
+    assert!(!stdout.contains("hint:"), "{stdout}");
     assert_eq!(chain.status, ChainStatus::Paused);
     assert!(
         chain
             .paused_reason
             .as_deref()
             .unwrap_or_default()
-            .contains("apply_refused")
+            .starts_with("apply_refused_by_hook_on_promote")
     );
     assert_ne!(chain.steps[0].status, ChainStepStatus::Applied);
     let events = fs::read_to_string(paths.chain_events(&chain.chain_id)).expect("events");
