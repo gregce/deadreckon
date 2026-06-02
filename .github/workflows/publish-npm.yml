@@ -8,7 +8,7 @@ on:
         type: string
     secrets:
       NPM_TOKEN:
-        required: true
+        required: false
   workflow_dispatch:
     inputs:
       tag:
@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish-npm:
@@ -34,6 +35,18 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Validate stable npm release lane
+        shell: bash
+        run: |
+          node release/trust/release-trust.mjs validate \
+            --ref "refs/tags/$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY"
+          node release/trust/release-trust.mjs lane \
+            --ref "refs/tags/$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --out npm-release-lane.json
+          node -e "const fs = require('node:fs'); const lane = JSON.parse(fs.readFileSync('npm-release-lane.json', 'utf8')); if (lane.lane !== 'stable' || lane.publish_npm !== true) { console.error('npm publishing is allowed only for official stable release tags'); process.exit(1); }"
       - name: Download GitHub release artifacts
         run: |
           mkdir -p target/distrib
@@ -41,11 +54,12 @@ jobs:
       - name: Repack npm packages
         run: |
           node npm/scripts/prepare-release.mjs --tag "$RELEASE_TAG" --artifacts target/distrib
-      - name: Check npm auth
+      - name: Check npm provenance path
         run: |
           if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
-            echo "::error::NPM_TOKEN is required to publish deadreckon npm packages"
-            exit 1
+            echo "NODE_AUTH_TOKEN is empty; npm trusted publishing must be configured for this workflow."
+          else
+            echo "NODE_AUTH_TOKEN is present; npm publish will still request provenance."
           fi
       - name: Publish platform packages
         run: |
@@ -56,8 +70,8 @@ jobs:
             npm/deadreckon-linux-x64 \
             npm/deadreckon-win32-x64
           do
-            npm publish "$package_dir" --access public
+            npm publish "$package_dir" --access public --provenance
           done
       - name: Publish wrapper package
         run: |
-          npm publish npm/deadreckon --access public
+          npm publish npm/deadreckon --access public --provenance

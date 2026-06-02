@@ -39,6 +39,7 @@
 
 ## General candidates
 
+- Windows signing hardening: stable Windows artifacts now require Authenticode signing through CI secrets. V1 can move that key material to a managed signing service, hardware-backed certificate, or key-vault flow after the basic signed-artifact path proves out.
 - Tamper-evidence hardening beyond the production gate: causal proof that a covered-file edit caused a pass, language-aware test detection beyond Rust heuristics, a separate signed tamper/audit log distinct from learning logs, fleet/plan-level tamper reporting, and sandboxing acceptance checks' own filesystem writes.
 - Explicit sub-agent forking command: `deadreckon fork <run-id> --prompt "..."`, from AS-BUILT §10 and REPORT.md coordination needs.
 - Provider HTTP retry taxonomy: `ProviderError::Http` currently carries provider/detail text but no HTTP status field, so the hygiene taxonomy treats it as fatal. Add a status/code field before retrying 408, 429, or 5xx provider failures.

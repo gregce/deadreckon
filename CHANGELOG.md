@@ -1,5 +1,22 @@
 # Changelog
 
+## Release Trust - 2026-06-02
+
+- Added a lane-aware release policy gate for branch/PR, RC, stable, and invalid
+  tags so official RC/stable releases share one publish/signing/provenance
+  contract while forks and PRs remain secret-free dry-runs.
+- Hardened official releases to fail closed when macOS signing/notarization,
+  Homebrew, npm provenance, attestation, manifest, checksum, or Windows signing
+  policy requirements are missing.
+- Moved macOS signing proof to the packaged cargo-dist artifact: CI now signs,
+  verifies, notarizes, and repacks the archive contents before upload.
+- Added release trust artifacts: `SHA256SUMS`, `release-manifest.json`,
+  `release.spdx.json`, GitHub artifact attestations, Homebrew checksum
+  verification, and npm `--provenance` publishing.
+- Updated the release runbook with the Apple Developer ID checklist, npm
+  trusted-publishing/token fallback, Windows Authenticode signing secrets, and
+  artifact verification commands.
+
 ## Verdict Surface - 2026-06-02
 
 - Added a shared Verdict Surface contract for terminal outcomes: one verdict,

@@ -236,11 +236,38 @@ fn npm_platform_package_json_pins_os_and_cpu() {
 fn npm_publish_workflow_downloads_release_artifacts_and_publishes_wrapper_last() {
     let workflow = fs::read_to_string(workspace_root().join(".github/workflows/publish-npm.yml"))
         .expect("publish-npm workflow");
+    assert!(workflow.contains("id-token: write"), "{workflow}");
+    assert!(
+        workflow.contains("required: false"),
+        "NPM_TOKEN must not be the only official publishing path"
+    );
+    assert!(
+        workflow.contains("Validate stable npm release lane"),
+        "{workflow}"
+    );
+    assert!(
+        workflow.contains("release/trust/release-trust.mjs validate"),
+        "{workflow}"
+    );
+    assert!(
+        workflow.contains("release/trust/release-trust.mjs lane"),
+        "{workflow}"
+    );
+    assert!(
+        workflow.contains("npm publishing is allowed only for official stable release tags"),
+        "{workflow}"
+    );
     assert!(workflow.contains("gh release download"), "{workflow}");
     assert!(
         workflow.contains("node npm/scripts/prepare-release.mjs"),
         "{workflow}"
     );
+    let validate = workflow
+        .find("Validate stable npm release lane")
+        .expect("stable release validation step");
+    let download = workflow
+        .find("Download GitHub release artifacts")
+        .expect("download release artifacts step");
     let platform_publish = workflow
         .find("Publish platform packages")
         .expect("platform publish step");
@@ -248,10 +275,25 @@ fn npm_publish_workflow_downloads_release_artifacts_and_publishes_wrapper_last()
         .find("Publish wrapper package")
         .expect("wrapper publish step");
     assert!(
+        validate < download,
+        "npm stable-lane validation must run before artifact download"
+    );
+    assert!(
+        validate < platform_publish,
+        "npm stable-lane validation must run before package publishing"
+    );
+    assert!(
         platform_publish < wrapper_publish,
         "wrapper must publish after platform packages"
     );
-    assert!(workflow.contains("npm publish npm/deadreckon --access public"));
+    assert!(
+        workflow.contains("npm publish \"$package_dir\" --access public --provenance"),
+        "{workflow}"
+    );
+    assert!(
+        workflow.contains("npm publish npm/deadreckon --access public --provenance"),
+        "{workflow}"
+    );
 }
 
 fn prepare_fake_npm_release() -> TempDir {

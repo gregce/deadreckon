@@ -2,3 +2,12 @@
 /.deadreckon-smoke/
 /.test-tmp/
 /RELEASE.md
+
+# Apple code-signing material — never commit
+*.certSigningRequest
+*.p12
+*.pfx
+*.cer
+*.pem
+*.mobileprovision
+developer-id*
