@@ -2754,23 +2754,55 @@ fn branch_policy_refuses_in_place_on_any_step() {
 }
 
 #[test]
-fn branch_policy_stack_refuses_apply_mode_skip() {
-    let temp = repo_tempdir();
-    let repo = clean_git_repo(&temp);
-    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+fn chain_unknown_policy_options_use_blocked_verdict_surface() {
+    let cases = [
+        (
+            ["--branch-policy", "sideways"],
+            "unknown branch policy sideways",
+            "deadreckon chain --branch-policy stack \"step one\" \"step two\"",
+        ),
+        (
+            ["--apply-mode", "skip"],
+            "unknown apply mode skip",
+            "deadreckon chain --apply-mode auto \"step one\" \"step two\"",
+        ),
+        (
+            ["--apply-strategy", "rebase"],
+            "unknown chain git apply strategy rebase",
+            "deadreckon chain --apply-strategy squash \"step one\" \"step two\"",
+        ),
+        (
+            ["--on-fail", "retry"],
+            "unknown on-fail policy retry",
+            "deadreckon chain --on-fail stop \"step one\" \"step two\"",
+        ),
+    ];
 
-    let output = deadreckon(&paths)
-        .current_dir(&repo)
-        .args(["chain", "--draft", "--apply-mode", "skip", "one", "two"])
-        .output()
-        .expect("chain");
+    for (flag, expected, recommended) in cases {
+        let temp = repo_tempdir();
+        let repo = clean_git_repo(&temp);
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
 
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("unknown apply mode"),
-        "{}",
-        stderr(&output)
-    );
+        let output = deadreckon(&paths)
+            .current_dir(&repo)
+            .args(["chain", "--draft", flag[0], flag[1], "one", "two"])
+            .output()
+            .expect("chain");
+
+        assert!(!output.status.success());
+        let stderr = stderr(&output);
+        assert!(stderr.starts_with("blocked chain"), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(stderr.contains("Explanation\n"), "{stderr}");
+        assert!(stderr.contains("Evidence\n"), "{stderr}");
+        assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+        assert!(
+            stderr.contains(&format!("Recommended\n{recommended}")),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("try:"), "{stderr}");
+        assert!(!stderr.contains("hint:"), "{stderr}");
+    }
 }
 
 #[test]

@@ -2931,15 +2931,50 @@ fn chain_missing_scope_surface(scope: Option<&str>) -> CliError {
     }
 }
 
+fn chain_option_parse_surface(
+    flag: &str,
+    value: &str,
+    allowed: &str,
+    what_happened: String,
+    primary: &str,
+) -> CliError {
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "chain",
+            None,
+            ExplanationPanel::new(
+                what_happened,
+                "DeadReckon refused before writing chain state because the option value is outside the supported policy set.",
+                [
+                    ("option".to_string(), flag.to_string()),
+                    ("value".to_string(), value.to_string()),
+                    ("allowed".to_string(), allowed.to_string()),
+                ],
+            ),
+            [("Recommended", primary)],
+            Vec::<(&str, &str)>::new(),
+        )
+        .expect("chain option parse surface must have one primary action")
+        .render_plain(false),
+    }
+}
+
 fn parse_branch_policy(value: &str) -> Result<BranchPolicy> {
     match value {
         "stack" => Ok(BranchPolicy::Stack),
         "base" => Ok(BranchPolicy::Base),
         "linear-merge" | "merge" => Ok(BranchPolicy::Merge),
-        other => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("unknown branch policy {other}"),
-            "use --branch-policy stack|base|linear-merge",
-        ))),
+        other => Err(chain_option_parse_surface(
+            "--branch-policy",
+            other,
+            "stack|base|linear-merge",
+            format!(
+                "DeadReckon did not accept the chain option because unknown branch policy {other}."
+            ),
+            "deadreckon chain --branch-policy stack \"step one\" \"step two\"",
+        )),
     }
 }
 
@@ -2948,10 +2983,15 @@ fn parse_apply_mode(value: &str) -> Result<ApplyMode> {
         "auto" => Ok(ApplyMode::Auto),
         "preview" => Ok(ApplyMode::Preview),
         "manual" => Ok(ApplyMode::Manual),
-        other => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("unknown apply mode {other}"),
-            "use --apply-mode auto|preview|manual",
-        ))),
+        other => Err(chain_option_parse_surface(
+            "--apply-mode",
+            other,
+            "auto|preview|manual",
+            format!(
+                "DeadReckon did not accept the chain option because unknown apply mode {other}."
+            ),
+            "deadreckon chain --apply-mode auto \"step one\" \"step two\"",
+        )),
     }
 }
 
@@ -2960,10 +3000,15 @@ fn parse_apply_strategy(value: &str) -> Result<ApplyStrategy> {
         "squash" => Ok(ApplyStrategy::Squash),
         "merge" => Ok(ApplyStrategy::Merge),
         "cherry-pick" => Ok(ApplyStrategy::CherryPick),
-        other => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("unknown chain git apply strategy {other}"),
-            "use --apply-strategy squash|merge|cherry-pick",
-        ))),
+        other => Err(chain_option_parse_surface(
+            "--apply-strategy",
+            other,
+            "squash|merge|cherry-pick",
+            format!(
+                "DeadReckon did not accept the chain option because unknown chain git apply strategy {other}."
+            ),
+            "deadreckon chain --apply-strategy squash \"step one\" \"step two\"",
+        )),
     }
 }
 
@@ -2972,10 +3017,15 @@ fn parse_on_fail(value: &str) -> Result<OnFail> {
         "stop" => Ok(OnFail::Stop),
         "skip" => Ok(OnFail::Skip),
         "continue" => Ok(OnFail::Continue),
-        other => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("unknown on-fail policy {other}"),
-            "use --on-fail stop|skip|continue",
-        ))),
+        other => Err(chain_option_parse_surface(
+            "--on-fail",
+            other,
+            "stop|skip|continue",
+            format!(
+                "DeadReckon did not accept the chain option because unknown on-fail policy {other}."
+            ),
+            "deadreckon chain --on-fail stop \"step one\" \"step two\"",
+        )),
     }
 }
 
