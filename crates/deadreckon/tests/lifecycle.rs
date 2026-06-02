@@ -903,15 +903,17 @@ fn library_list_invalid_date_has_one_recovery_hint() {
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
+    assert!(stderr.contains("blocked library list --since"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
     assert!(
-        stderr.contains("invalid --since date \"not-a-date\""),
+        stderr.contains("Recommended\ndeadreckon library list --since 2026-05-11"),
         "{stderr}"
     );
-    assert_eq!(stderr.matches("try:").count(), 1, "{stderr}");
-    assert!(
-        stderr.contains("try: deadreckon library list --since 2026-05-11"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("value: not-a-date"), "{stderr}");
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]

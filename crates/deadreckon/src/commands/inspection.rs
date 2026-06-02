@@ -958,10 +958,27 @@ fn parse_library_date_filter(label: &str, value: Option<String>) -> Result<Optio
 }
 
 fn invalid_library_date_error(label: &str, value: &str) -> CliError {
-    CliError::Exit {
+    let primary = format!("deadreckon library list {label} 2026-05-11");
+    CliError::Surface {
         code: 2,
-        message: format!("invalid {label} date {value:?}"),
-        hint: format!("deadreckon library list {label} 2026-05-11"),
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "library list",
+            Some(label),
+            ExplanationPanel::new(
+                format!("Library list could not parse {label} date {value:?}."),
+                "The command stopped before reading artifacts because date filters must be RFC3339 timestamps or YYYY-MM-DD dates.",
+                vec![
+                    ("filter".to_string(), label.to_string()),
+                    ("value".to_string(), value.to_string()),
+                    ("accepted format".to_string(), "YYYY-MM-DD or RFC3339".to_string()),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![("Secondary", "deadreckon library list --all")],
+        )
+        .expect("invalid library date verdict surface must be valid")
+        .render_plain(false),
     }
 }
 
