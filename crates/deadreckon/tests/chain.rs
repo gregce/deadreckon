@@ -1432,6 +1432,59 @@ fn chain_resume_runs_pending_draft() {
 }
 
 #[test]
+fn chain_completion_uses_one_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "2",
+            "complete one",
+            "complete two",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let chain = newest_chain(&paths);
+    let short = &chain.chain_id[..8];
+    let stdout = stdout(&output);
+    let final_surface = stdout
+        .rfind("completed chain")
+        .map(|index| &stdout[index..])
+        .unwrap_or_else(|| panic!("missing final completed chain surface:\n{stdout}"));
+    assert!(
+        final_surface.starts_with("completed chain"),
+        "{final_surface}"
+    );
+    assert!(final_surface.contains("Explanation\n"), "{final_surface}");
+    assert!(final_surface.contains("Evidence\n"), "{final_surface}");
+    assert_eq!(
+        final_surface.matches("\nRecommended\n").count(),
+        1,
+        "{final_surface}"
+    );
+    assert!(
+        final_surface.contains(&format!("Recommended\ndeadreckon chain show {short}")),
+        "{final_surface}"
+    );
+    assert!(final_surface.contains("Secondary\n"), "{final_surface}");
+    assert!(!final_surface.contains("chained:"), "{final_surface}");
+    assert!(!final_surface.contains("show:    "), "{final_surface}");
+    assert!(!final_surface.contains("list:    "), "{final_surface}");
+    assert!(!final_surface.contains("try:"), "{final_surface}");
+}
+
+#[test]
 fn chain_extend_appends_step_and_writes_event() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

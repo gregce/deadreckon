@@ -1081,17 +1081,10 @@ async fn run_chain_conductor(
         )?;
         save_chain(paths, &chain)?;
         if !options.quiet {
-            println!(
-                "chained: {} done {}/{}",
-                chain_prefix(&chain.chain_id),
-                chain.steps.len(),
-                chain.steps.len()
+            print!(
+                "{}",
+                chain_verdict_surface(paths, &chain).render_plain(false)
             );
-            println!(
-                "show:    deadreckon chain show {}",
-                chain_prefix(&chain.chain_id)
-            );
-            println!("list:    deadreckon chain list");
         }
     } else if !options.quiet {
         print_chain_paused_footer(paths, &chain);
