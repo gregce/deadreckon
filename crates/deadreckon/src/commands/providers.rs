@@ -115,7 +115,7 @@ async fn update_shell_channel(
     let current = update_current_version(receipt);
     let latest = resolve_latest_update(paths, &current, allow_prerelease).await?;
     let backup_dir = unique_shell_backup_dir(&shell_backup_root(paths));
-    confirm_shell_update(yes)?;
+    confirm_shell_update(yes, &current, &latest, receipt)?;
     let backup_dir = create_shell_update_backup(paths, receipt, backup_dir)?;
     match run_shell_swap(receipt, force, allow_prerelease, quiet).await {
         Ok(()) => {
@@ -202,15 +202,21 @@ fn update_shell_completed_surface(
     .expect("shell update verdict surface must be valid")
 }
 
-fn confirm_shell_update(yes: bool) -> Result<()> {
+fn confirm_shell_update(
+    yes: bool,
+    current: &str,
+    latest: &LatestUpdate,
+    receipt: &deadreckon_core::install_receipt::Receipt,
+) -> Result<()> {
     if yes {
         return Ok(());
     }
     if !io::stdin().is_terminal() {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "non-interactive shell update requires --yes after reviewing preview",
-            "deadreckon update --yes",
-        )));
+        return Err(CliError::Surface {
+            code: 1,
+            surface: update_shell_requires_yes_surface(current, latest, receipt)
+                .render_plain(!completion_hints_enabled(false)),
+        });
     }
     if prompt::confirm("apply this shell update?", false)? {
         Ok(())
@@ -219,6 +225,32 @@ fn confirm_shell_update(yes: bool) -> Result<()> {
             "update cancelled by user".to_string(),
         )))
     }
+}
+
+fn update_shell_requires_yes_surface(
+    current: &str,
+    latest: &LatestUpdate,
+    receipt: &deadreckon_core::install_receipt::Receipt,
+) -> VerdictSurface {
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "update",
+        Some("shell"),
+        ExplanationPanel::new(
+            "DeadReckon did not replace the shell-installed binary because confirmation is required.",
+            "This shell update can mutate the active binary, so non-interactive execution must pass --yes after reviewing the target release.",
+            vec![
+                ("channel".to_string(), "shell".to_string()),
+                ("current".to_string(), current.to_string()),
+                ("target".to_string(), latest.version.clone()),
+                ("archive".to_string(), latest.archive_url()),
+                ("updated".to_string(), receipt.binary_path.display().to_string()),
+            ],
+        ),
+        vec![("Recommended", "deadreckon update --yes")],
+        vec![("Secondary", "deadreckon update --check")],
+    )
+    .expect("shell update --yes refusal verdict surface must be valid")
 }
 
 fn shell_backup_root(paths: &DeadreckonPaths) -> PathBuf {

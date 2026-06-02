@@ -335,11 +335,18 @@ fn update_shell_requires_yes_under_non_tty() {
 
     assert!(!output.status.success());
     let err = stderr(&output);
+    assert!(err.contains("blocked update shell"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
     assert!(
-        err.contains("non-interactive shell update requires --yes"),
+        err.contains("Recommended\ndeadreckon update --yes"),
         "{err}"
     );
-    assert!(err.contains("try: deadreckon update --yes"), "{err}");
+    assert!(err.contains("channel: shell"), "{err}");
+    assert!(err.contains("updated:"), "{err}");
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
     assert!(!paths.home().join("update-backups").exists());
 }
 
