@@ -1613,7 +1613,7 @@ fn orchestrate_init_git_initializes_plain_directory_before_preview() {
 }
 
 #[test]
-fn orchestrate_headless_without_mode_refuses_with_try_line() {
+fn orchestrate_headless_without_mode_uses_verdict_surface() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1630,8 +1630,48 @@ fn orchestrate_headless_without_mode_refuses_with_try_line() {
         err.contains("non-interactive orchestrate requires an explicit mode"),
         "{err}"
     );
-    assert!(err.contains("deadreckon orchestrate review"), "{err}");
+    assert_verdict_surface(
+        &err,
+        "blocked orchestrate",
+        "deadreckon orchestrate review \"tiny hello rust\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes",
+    );
     assert_eq!(saved_plan_count(&paths), 0);
+}
+
+#[test]
+fn orchestrate_headless_without_yes_recommends_forking_saved_plan() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "orchestrate",
+            "review",
+            "tiny hello rust",
+            "--coder-provider",
+            "smoke",
+            "--reviewer-provider",
+            "smoke",
+            "--quiet",
+        ])
+        .output()
+        .expect("orchestrate review");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    let plan = newest_plan(&paths);
+    assert!(
+        err.contains("non-interactive orchestrate requires --yes after reviewing preflight"),
+        "{err}"
+    );
+    assert_verdict_surface(
+        &err,
+        "blocked orchestrate",
+        &format!("deadreckon fork {}", &plan.plan_id[..8]),
+    );
+    assert_eq!(saved_plan_count(&paths), 1);
 }
 
 #[test]

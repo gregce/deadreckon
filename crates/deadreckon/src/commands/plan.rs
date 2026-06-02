@@ -1472,23 +1472,12 @@ fn orchestration_mode_summary(plan: &Plan) -> &'static str {
     }
 }
 
-pub(crate) fn confirm_orchestration_start(plan: &Plan, yes: bool) -> Result<()> {
+pub(crate) fn confirm_orchestration_start(plan: &Plan, yes: bool, no_hints: bool) -> Result<()> {
     if yes {
         return Ok(());
     }
     if !io::stdin().is_terminal() {
-        let command = match plan.mode {
-            PlanMode::FullPlan => {
-                "deadreckon orchestrate full-plan \"goal\" --planner-provider cli:codex --provider cli:claude-code --yes"
-            }
-            PlanMode::Review => {
-                "deadreckon orchestrate review \"goal\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes"
-            }
-        };
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "non-interactive orchestrate requires --yes after reviewing preflight",
-            command,
-        )));
+        return Err(orchestrate_confirmation_refusal_error(plan, no_hints));
     }
     if !prompt::confirm("start this orchestration?", true)? {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
@@ -1496,6 +1485,45 @@ pub(crate) fn confirm_orchestration_start(plan: &Plan, yes: bool) -> Result<()> 
         )));
     }
     Ok(())
+}
+
+fn orchestrate_confirmation_refusal_error(plan: &Plan, no_hints: bool) -> CliError {
+    let id = run_prefix(&plan.plan_id);
+    let primary = format!("deadreckon fork {id}");
+    let secondary = [
+        format!("deadreckon show {id}"),
+        format!("deadreckon kill {id}"),
+    ];
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "orchestrate",
+            Some(&id),
+            ExplanationPanel::new(
+                "DeadReckon wrote the orchestration preflight plan but did not launch child work because this shell cannot confirm the launch.",
+                "Starting child agents mutates plan and run state; without an interactive confirmation or --yes, the saved pending plan must be advanced explicitly.",
+                vec![
+                    (
+                        "reason".to_string(),
+                        "non-interactive orchestrate requires --yes after reviewing preflight"
+                            .to_string(),
+                    ),
+                    ("plan".to_string(), id.clone()),
+                    ("status".to_string(), plan_status_label(plan.status).to_string()),
+                    ("mode".to_string(), plan_mode_label(plan.mode).to_string()),
+                    ("children".to_string(), plan.tasks.len().to_string()),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            secondary
+                .iter()
+                .map(|command| ("Secondary", command.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .expect("orchestrate confirmation refusal verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(no_hints)),
+    }
 }
 
 pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {

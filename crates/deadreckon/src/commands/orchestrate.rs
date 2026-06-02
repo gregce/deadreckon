@@ -125,10 +125,11 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         )));
     };
     if !io::stdin().is_terminal() {
-        return Err(CliError::Core(deadreckon_core::user_error(
+        return Err(orchestrate_mode_refusal_error(
+            &goal,
             "non-interactive orchestrate requires an explicit mode",
-            "deadreckon orchestrate review \"goal\" --coder-provider cli:claude-code --reviewer-provider cli:codex --yes",
-        )));
+            no_hints,
+        ));
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
@@ -195,6 +196,65 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         yes,
         no_repair,
     })
+}
+
+fn orchestrate_mode_refusal_error(goal: &str, message: &str, no_hints: bool) -> CliError {
+    let recommended_mode = recommend_orchestration_mode(goal);
+    let primary = orchestrate_mode_command(goal, recommended_mode);
+    let secondary_mode = match recommended_mode {
+        CliPlanMode::FullPlan => CliPlanMode::Review,
+        CliPlanMode::Review => CliPlanMode::FullPlan,
+    };
+    let secondary_command = orchestrate_mode_command(goal, secondary_mode);
+    let secondary = [secondary_command.as_str()];
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "orchestrate",
+            None,
+            ExplanationPanel::new(
+                "DeadReckon did not start orchestration because this shell cannot choose a mode interactively.",
+                "Bare orchestrate needs a review or full-plan decision before it can create accurate plan state, so non-interactive execution must supply the mode explicitly.",
+                vec![
+                    ("reason".to_string(), message.to_string()),
+                    ("command".to_string(), "orchestrate".to_string()),
+                    ("stdin".to_string(), "non-interactive".to_string()),
+                    (
+                        "recommended mode".to_string(),
+                        plan_mode_label(match recommended_mode {
+                            CliPlanMode::FullPlan => PlanMode::FullPlan,
+                            CliPlanMode::Review => PlanMode::Review,
+                        })
+                        .to_string(),
+                    ),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            secondary
+                .iter()
+                .map(|command| ("Secondary", *command))
+                .collect::<Vec<_>>(),
+        )
+        .expect("orchestrate mode refusal verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(no_hints)),
+    }
+}
+
+fn orchestrate_mode_command(goal: &str, mode: CliPlanMode) -> String {
+    let raw_goal = goal;
+    let goal = format!("\"{}\"", shell_display_quote(goal));
+    match mode {
+        CliPlanMode::Review => {
+            format!(
+                "deadreckon orchestrate review {goal} --coder-provider cli:claude-code --reviewer-provider cli:codex --yes"
+            )
+        }
+        CliPlanMode::FullPlan => format!(
+            "deadreckon orchestrate full-plan {goal} --planner-provider cli:codex --provider cli:claude-code --n {} --yes",
+            recommend_child_count_for_goal(raw_goal, CliPlanMode::FullPlan)
+        ),
+    }
 }
 
 pub(crate) fn recommend_orchestration_mode(goal: &str) -> CliPlanMode {
@@ -398,7 +458,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     if args.preview {
         return Ok(());
     }
-    commands::plan::confirm_orchestration_start(&plan, args.yes)?;
+    commands::plan::confirm_orchestration_start(&plan, args.yes, no_hints)?;
     if !quiet {
         commands::plan::print_orchestrate_started(
             &plan,
