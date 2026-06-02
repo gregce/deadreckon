@@ -621,6 +621,21 @@ fn library_list_search_show_reads_promoted_manifests() {
     assert!(list_stdout.contains("RUN"));
     assert!(list_stdout.contains(&parent.run_id[..8]));
     assert!(list_stdout.contains("gallery provenance search target"));
+    assert_eq!(
+        list_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{list_stdout}"
+    );
+    assert!(
+        list_stdout.contains("Recommended\ndeadreckon library show <run-id>"),
+        "{list_stdout}"
+    );
+    assert!(list_stdout.contains("\nSecondary\n"), "{list_stdout}");
+    assert!(
+        list_stdout.contains("deadreckon export <run-id> --dest <path>"),
+        "{list_stdout}"
+    );
+    assert!(!list_stdout.contains("hint:"), "{list_stdout}");
 
     let search = deadreckon(&paths)
         .current_dir(&parent.cwd)

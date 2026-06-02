@@ -986,12 +986,16 @@ fn print_library_table(entries: &[LibraryEntry], full: bool) {
             truncate_text(&one_line(&manifest.goal, 88), 88)
         );
     }
-    println!(
-        "{} use `{}` or `{}`",
-        ui_muted("hint:"),
-        ui_command("deadreckon library show <run-id>"),
-        ui_command("deadreckon export <run-id> --dest <path>")
-    );
+    print_library_table_action_footer();
+}
+
+fn print_library_table_action_footer() {
+    println!();
+    println!("Recommended");
+    println!("deadreckon library show <run-id>");
+    println!();
+    println!("Secondary");
+    println!("deadreckon export <run-id> --dest <path>");
 }
 
 pub(crate) fn materialized_count_label(count: usize) -> String {
