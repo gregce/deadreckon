@@ -2633,6 +2633,17 @@ fn parse_goal_lines(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 fn chain_planner_prompt(goal: &str, n: u8) -> String {
     format!(
         "You are decomposing a coding goal into an ordered serial chain.\n\
@@ -2652,16 +2663,32 @@ fn parse_planner_goals(raw: &str, n: u8, root_goal: &str, no_hints: bool) -> Res
         raw.to_string()
     };
     let value = serde_json::from_str::<Value>(json_text.trim()).map_err(|err| {
-        CliError::Core(deadreckon_core::user_error(
+        chain_create_refusal_surface(
+            VerdictKind::Blocked,
+            None,
             &format!("chain plan returned invalid JSON: {err}"),
-            "deadreckon chain \"step one\" \"step two\"",
-        ))
+            "DeadReckon refused the provider-produced plan because the planner response could not be parsed as the required JSON step list.",
+            [
+                ("parse error".to_string(), err.to_string()),
+                ("response bytes".to_string(), json_text.len().to_string()),
+            ],
+            chain_plan_retry_command(root_goal),
+            no_hints,
+        )
     })?;
     let array = value.as_array().ok_or_else(|| {
-        CliError::Core(deadreckon_core::user_error(
+        chain_create_refusal_surface(
+            VerdictKind::Blocked,
+            None,
             "chain plan must return a JSON array of strings",
-            "deadreckon chain \"step one\" \"step two\"",
-        ))
+            "DeadReckon refused the provider-produced plan because the planner response had the wrong JSON shape for ordered chain steps.",
+            [
+                ("expected".to_string(), "array".to_string()),
+                ("actual".to_string(), json_value_kind(&value).to_string()),
+            ],
+            chain_plan_retry_command(root_goal),
+            no_hints,
+        )
     })?;
     let mut seen = BTreeSet::new();
     let mut goals = Vec::new();

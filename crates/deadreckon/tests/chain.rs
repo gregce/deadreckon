@@ -1814,6 +1814,49 @@ async fn chain_plan_refuses_single_step_response() {
     assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_plan_parser_errors_use_blocked_verdict_surface() {
+    let cases = [
+        ("not json", "chain plan returned invalid JSON"),
+        (r#"{"step":"one"}"#, "chain plan must return a JSON array"),
+    ];
+
+    for (fixture, expected) in cases {
+        let temp = repo_tempdir();
+        let repo = clean_git_repo(&temp);
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let server = MockServer::start(fixture).await;
+        write_config(temp.path(), &server.base_url());
+
+        let output = deadreckon(&paths)
+            .current_dir(&repo)
+            .args([
+                "chain",
+                "plan",
+                "build chess",
+                "--draft",
+                "--provider",
+                "mock",
+            ])
+            .output()
+            .expect("chain plan");
+
+        assert!(!output.status.success());
+        let stderr = stderr(&output);
+        assert!(stderr.starts_with("blocked chain"), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(stderr.contains("Explanation\n"), "{stderr}");
+        assert!(stderr.contains("Evidence\n"), "{stderr}");
+        assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+        assert!(
+            stderr.contains("Recommended\ndeadreckon chain plan \"build chess\" --n 3"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("try:"), "{stderr}");
+        assert!(!stderr.contains("hint:"), "{stderr}");
+    }
+}
+
 #[test]
 fn chain_plan_refuses_missing_goal_with_verdict_surface() {
     let temp = repo_tempdir();
