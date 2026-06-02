@@ -498,12 +498,27 @@ fn chain_from_stdin_refuses_when_stdin_is_tty() {
         .output()
         .expect("script");
 
-    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    let combined = format!("{}{}", stdout(&output), stderr(&output))
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     assert!(
         combined.contains("--from-stdin needs a pipe")
             || combined.contains("chain must have >= 2 steps"),
         "{combined}"
     );
+    if combined.contains("--from-stdin needs a pipe") {
+        assert!(combined.contains("blocked chain"), "{combined}");
+        assert!(combined.contains("Explanation\n"), "{combined}");
+        assert!(combined.contains("Evidence\n"), "{combined}");
+        assert_eq!(combined.matches("\nRecommended\n").count(), 1, "{combined}");
+        assert!(
+            combined
+                .contains("Recommended\nprintf 'g1\\ng2\\n' | deadreckon chain --from-stdin --yes"),
+            "{combined}"
+        );
+    }
+    assert!(!combined.contains("try:"), "{combined}");
+    assert!(!combined.contains("hint:"), "{combined}");
 }
 
 #[test]

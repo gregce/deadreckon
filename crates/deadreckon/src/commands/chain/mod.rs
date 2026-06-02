@@ -164,7 +164,7 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
     }
     let Some(first) = args.first().map(String::as_str) else {
         if from_file.is_some() || from_stdin {
-            let goals = collect_chain_goals(&[], from_file, from_stdin)?;
+            let goals = collect_chain_goals(&[], from_file, from_stdin, no_hints)?;
             return chain_create_command(ChainCreateOptions {
                 paths,
                 root_goal: format!("manual: {} steps", goals.len()),
@@ -374,7 +374,7 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
             ))
         }
         _ => {
-            let goals = collect_chain_goals(&args, from_file, from_stdin)?;
+            let goals = collect_chain_goals(&args, from_file, from_stdin, no_hints)?;
             chain_create_command(ChainCreateOptions {
                 paths,
                 root_goal: format!("manual: {} steps", goals.len()),
@@ -518,7 +518,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         plain,
     } = options;
     if goals.is_empty() {
-        goals = collect_chain_goals(&[], from_file, from_stdin)?;
+        goals = collect_chain_goals(&[], from_file, from_stdin, no_hints)?;
     }
     if goals.len() < 2 {
         let primary = goals
@@ -2571,6 +2571,7 @@ fn collect_chain_goals(
     args: &[String],
     from_file: Option<PathBuf>,
     from_stdin: bool,
+    no_hints: bool,
 ) -> Result<Vec<String>> {
     let mut goals = Vec::new();
     goals.extend(args.iter().cloned());
@@ -2586,10 +2587,18 @@ fn collect_chain_goals(
     }
     if from_stdin {
         if io::stdin().is_terminal() {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                "--from-stdin needs a pipe",
-                "printf 'g1\\ng2\\n' | deadreckon chain --from-stdin --yes",
-            )));
+            return Err(chain_create_refusal_surface(
+                VerdictKind::Blocked,
+                None,
+                "DeadReckon did not read chain steps because --from-stdin needs a pipe.",
+                "The command requested stdin input, but stdin is an interactive terminal. DeadReckon refused before reading goals or writing chain state.",
+                [
+                    ("stdin".to_string(), "terminal".to_string()),
+                    ("from-stdin".to_string(), "true".to_string()),
+                ],
+                "printf 'g1\\ng2\\n' | deadreckon chain --from-stdin --yes".to_string(),
+                no_hints,
+            ));
         }
         let mut raw = String::new();
         io::stdin().read_to_string(&mut raw)?;
