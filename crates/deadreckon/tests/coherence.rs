@@ -57,7 +57,6 @@ fn style_facade_and_status_tones_live_in_ui_module() {
         "ui_command",
         "ui_ok",
         "ui_warn",
-        "ui_note",
         "ui_status",
         "ui_error",
     ] {

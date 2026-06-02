@@ -1034,7 +1034,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_update_failure_hint_is_raw_primary_action() {
+    fn shell_update_failure_surface_uses_single_recommended_restore_command() {
         let receipt = Receipt {
             channel: Channel::Shell,
             channel_version: "0.1.0".to_string(),
@@ -1046,17 +1046,22 @@ mod tests {
         };
 
         match shell_update_failure(&receipt, PathBuf::from("/tmp/dr-backup").as_path(), "boom") {
-            CliError::Exit { hint, .. } => {
+            CliError::Surface { code, surface } => {
+                assert_eq!(code, 2);
                 assert!(
-                    !hint.starts_with("try:"),
-                    "raw exit hints should not embed try footers: {hint}"
+                    !surface.contains("try:"),
+                    "verdict surface should not embed try footers: {surface}"
                 );
-                assert_eq!(
-                    hint,
-                    "cp /tmp/dr-backup/deadreckon /usr/local/bin/deadreckon"
+                assert_eq!(surface.matches("\nRecommended\n").count(), 1, "{surface}");
+                assert!(
+                    surface.contains(
+                        "Recommended\ncp /tmp/dr-backup/deadreckon /usr/local/bin/deadreckon"
+                    ),
+                    "{surface}"
                 );
+                assert_eq!(surface.matches("\nSecondary\n").count(), 1, "{surface}");
             }
-            other => panic!("expected exit error, got {other:?}"),
+            other => panic!("expected verdict surface error, got {other:?}"),
         }
     }
 }

@@ -1307,7 +1307,21 @@ async fn doc_provider_resolves_to_cli_codex_when_in_path() {
         .expect("doc");
     assert_success(&output);
     assert!(stdout(&output).contains("provider: cli:codex"));
-    assert!(stdout(&output).contains("cost:     $0.000000"));
+    assert!(
+        stdout(&output).contains("cost: not metered (subscription)"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !stdout(&output).contains("$0.00 (subscription)"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !stdout(&output).contains("$0.000000"),
+        "{}",
+        stdout(&output)
+    );
 
     let narrative =
         fs::read_to_string(state.working_dir.join("docs/RUN-NARRATIVE.md")).expect("narrative");

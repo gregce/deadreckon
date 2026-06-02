@@ -7549,17 +7549,25 @@ fn print_exit_summary_card(
     state: &deadreckon_core::PipelineState,
     outcome: &RunLoopOutcome,
     plain: bool,
+    show_secondary_hints: bool,
 ) {
-    print!("{}", render_exit_summary_card(state, outcome, plain));
+    print!(
+        "{}",
+        render_exit_summary_card(state, outcome, plain, show_secondary_hints)
+    );
 }
 
 fn render_exit_summary_card(
     state: &deadreckon_core::PipelineState,
     outcome: &RunLoopOutcome,
     plain: bool,
+    show_secondary_hints: bool,
 ) -> String {
     let input = exit_summary_input(state, outcome);
-    let card = build_exit_summary_card(&input);
+    let mut card = build_exit_summary_card(&input);
+    if !show_secondary_hints {
+        card.hints.clear();
+    }
     render_card(&card, &card_options(ui::Stream::Stdout, plain))
 }
 
@@ -8253,7 +8261,7 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
         }
     };
     kill_loaded_run(&paths, &mut state, force)?;
-    print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain);
+    print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain, true);
     Ok(())
 }
 
@@ -8635,7 +8643,7 @@ async fn resume_command(
     state.child_pids.clear();
     save_state(&state)?;
     lock.release()?;
-    print_exit_summary_card(&state, &outcome, plain);
+    print_exit_summary_card(&state, &outcome, plain, true);
     commands::lifecycle::fire_lifecycle_notification(&paths, &state, &outcome).await;
     Ok(())
 }

@@ -111,7 +111,7 @@ fn exit_card_shows_per_check_verdict_and_failing_detail() {
     let (_temp, state) = fixture_state("failed gate render");
     failed_cargo_progress(&state);
 
-    let rendered = render_exit_summary_card(&state, &RunLoopOutcome::Failed, true);
+    let rendered = render_exit_summary_card(&state, &RunLoopOutcome::Failed, true, true);
 
     assert!(rendered.contains("gate: FAILED 0/1"), "{rendered}");
     assert!(

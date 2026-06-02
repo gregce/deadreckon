@@ -460,7 +460,10 @@ pub(crate) fn estimate_doc_polish_spend(
 
 fn doc_polish_cost_label(estimate: &SpendEstimate) -> String {
     if estimate.subscription {
-        "$0.00 (subscription)".to_string()
+        format!(
+            "not metered (subscription) for up to {} output tokens",
+            estimate.output_tokens
+        )
     } else {
         format!(
             "${:.6} for up to {} output tokens",
@@ -498,7 +501,7 @@ fn print_doc_polish_summary(
     let mut evidence = vec![
         ("run".to_string(), id.clone()),
         ("status".to_string(), record.status.clone()),
-        ("cost".to_string(), format!("${:.6}", record.cost_usd)),
+        ("cost".to_string(), polish_record_cost_label(record)),
         ("completed".to_string(), record.completed_at.clone()),
     ];
     if let Some(provider) = record.provider.as_deref() {
@@ -514,8 +517,11 @@ fn print_doc_polish_summary(
         evidence.push((
             format!("subcall {}", subcall.skill),
             format!(
-                "{} {} in / {} out ${:.6}",
-                subcall.status, subcall.tokens_in, subcall.tokens_out, subcall.cost_usd
+                "{} {} in / {} out {}",
+                subcall.status,
+                subcall.tokens_in,
+                subcall.tokens_out,
+                polish_subcall_cost_label(record, subcall)
             ),
         ));
     }
@@ -535,4 +541,25 @@ fn print_doc_polish_summary(
         .expect("doc polish verdict surface must have one primary action")
         .render_plain(false)
     );
+}
+
+fn polish_record_cost_label(record: &deadreckon_runtime::PolishRecord) -> String {
+    if record.doc_provider_source.as_deref() == Some("auto_subscription") && record.cost_usd == 0.0
+    {
+        "not metered (subscription)".to_string()
+    } else {
+        format!("${:.6}", record.cost_usd)
+    }
+}
+
+fn polish_subcall_cost_label(
+    record: &deadreckon_runtime::PolishRecord,
+    subcall: &deadreckon_core::PolishSubcallRecord,
+) -> String {
+    if record.doc_provider_source.as_deref() == Some("auto_subscription") && subcall.cost_usd == 0.0
+    {
+        "not metered (subscription)".to_string()
+    } else {
+        format!("${:.6}", subcall.cost_usd)
+    }
 }

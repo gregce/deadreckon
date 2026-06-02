@@ -3847,7 +3847,8 @@ fn polish_preview_block_lists_provider_and_subskills() {
     assert!(text.contains("provider:"));
     assert!(text.contains("cli:codex"));
     assert!(text.contains("narrator-overview, narrator-phases"));
-    assert!(text.contains("$0.00 (subscription)"));
+    assert!(text.contains("not metered (subscription) for up to 65536 output tokens"));
+    assert!(!text.contains("$0.00 (subscription)"), "{text}");
 }
 
 #[test]
@@ -4810,8 +4811,10 @@ fn chain_attach_paused_footer_does_not_list_peer_try_lines() {
     let footer = chain_attach_footer_text(&chain);
 
     assert_eq!(footer.matches("try:").count(), 0, "{footer}");
-    assert_eq!(footer.matches("recommended:").count(), 1, "{footer}");
-    assert!(footer.contains("secondary:"), "{footer}");
+    assert_eq!(footer.matches("recommended:").count(), 0, "{footer}");
+    assert_eq!(footer.matches("secondary:").count(), 0, "{footer}");
+    assert_eq!(footer.matches("next ").count(), 1, "{footer}");
+    assert!(footer.contains(" | other "), "{footer}");
 }
 
 #[test]

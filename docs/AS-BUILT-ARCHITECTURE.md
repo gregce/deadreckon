@@ -2460,11 +2460,23 @@ remain deterministic and state-free until launch confirmation.
 
 ### 37.4 One verdict + one primary action
 
-Exit cards, `status`, and `finish` no longer show several equal-weight next steps.
-The shared card/action helpers choose one primary action (`next`) and render
-secondary actions below it. Completed exit cards lead with `VERIFIED` and include
-the proof block; paused and failed variants point first at resume or failure
-inspection.
+Terminal completion, failure, blocked, paused, killed, preview, and no-op
+surfaces now converge through the Verdict Surface contract in
+`crates/deadreckon/src/verdict_surface.rs`. The invariant is one verdict label,
+one `Recommended` command, and one `Explanation`/`Evidence` panel, with
+secondary actions rendered below the primary action and suppressed by
+`--no-hints` where appropriate. JSON outputs keep existing fields and add
+`verdict` plus `primary_action` when the command reports a terminal outcome.
+
+The rollout covers run exit cards, `status`, `finish`, `apply`, `materialize`,
+plan/orchestrate/fork/merge, campaign, chain, recovery verbs, setup/diagnostic
+commands, import/learning/doc surfaces, and TUI post-action footers. Focused
+coverage includes `cargo test -p deadreckon verdict_surface`, the audit
+burndown test `friendliness_one_verdict_primary_action_burndown_has_no_in_scope_failures`,
+and command-family tests for run, plan/orchestrate, campaign, chain, recovery,
+setup, diagnostics, import, learning, and doc paths. Larger layout work remains
+V1: a full output-layout facade, card template engine, localization, and broad
+command-matrix golden snapshots are still tracked in `docs/V1-CANDIDATES.md`.
 
 ### 37.5 Spend + gate-verdict consistency
 

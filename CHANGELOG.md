@@ -1,5 +1,19 @@
 # Changelog
 
+## Verdict Surface - 2026-06-02
+
+- Added a shared Verdict Surface contract for terminal outcomes: one verdict,
+  one `Recommended` command, one `Explanation`/`Evidence` panel, additive
+  `verdict`/`primary_action` JSON, and subordinate secondary actions.
+- Normalized run/lifecycle, plan/orchestrate/fork/merge, campaign, chain,
+  recovery, setup/diagnostic, import, learning, and doc outcome surfaces through
+  the shared contract while preserving command names, quiet/plain/json/no-hints
+  behavior, and durable state schemas.
+- Demoted competing TUI/help/preflight action hints from primary-looking
+  `recommended:` rows to compact `next`/inspection guidance.
+- Burned down the FRIENDLINESS-AUDIT one-primary-action failures and added a
+  regression test that rejects new in-scope audit failures.
+
 ## Seam conformance kit - 2026-05-31
 
 - Added `examples/seams/` with fixture JSON, a sample `[seams]` config, and

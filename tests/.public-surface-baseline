@@ -226,6 +226,9 @@ crate: deadreckon-providers
   error::ProviderError
   error::Result
   http::ProviderAdapter
+  registry::ModelCatalogOverride
+  registry::ModelEntry
+  router::ModelContextWindowSource
   router::ProviderRouter
   types::Provider
   types::ProviderConfigFile
@@ -238,6 +241,14 @@ crate: deadreckon-providers
   types::ProviderUsage
   types::SpendEstimate
 crate: deadreckon-runtime
+  compaction::append_compaction_record
+  compaction::COMPACTION_JSONL
+  compaction::compact_history
+  compaction::CompactionConfig
+  compaction::CompactionRecord
+  compaction::estimate_tokens
+  compaction::parse_compaction_config
+  compaction::read_compaction_config
   polish::default_polished_json_for_tests
   polish::inputs_hash
   polish::polish_run_docs
@@ -250,6 +261,17 @@ crate: deadreckon-runtime
   polish::SkillSource
   polish::substitute_placeholders
   polish::templated_docs_json
+  seam::dispatch_seam
+  seam::FailPolicy
+  seam::parse_seams_config
+  seam::read_seams_config
+  seam::resolve_catalog_override
+  seam::SeamCommandConfig
+  seam::SeamKind
+  seam::SeamOutcome
+  seam::SeamRunCtx
+  seam::SeamsConfig
+  seam::write_seams_audit
   turn_loop::run_turn_loop
   turn_loop::RunLoopConfig
   turn_loop::RunLoopDocsConfig

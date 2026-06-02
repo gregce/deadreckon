@@ -284,7 +284,12 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     if run_cancelled_before_turn_loop(&paths, &mut state)? {
         lock.release()?;
         if !quiet {
-            print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain);
+            print_exit_summary_card(
+                &state,
+                &RunLoopOutcome::Killed,
+                plain,
+                completion_hints_enabled(effective_no_hints),
+            );
         }
         return Ok(());
     }
@@ -293,7 +298,12 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     if run_cancelled_before_turn_loop(&paths, &mut state)? {
         lock.release()?;
         if !quiet {
-            print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain);
+            print_exit_summary_card(
+                &state,
+                &RunLoopOutcome::Killed,
+                plain,
+                completion_hints_enabled(effective_no_hints),
+            );
         }
         return Ok(());
     }
@@ -303,7 +313,12 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     if run_cancelled_before_turn_loop(&paths, &mut state)? {
         lock.release()?;
         if !quiet {
-            print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain);
+            print_exit_summary_card(
+                &state,
+                &RunLoopOutcome::Killed,
+                plain,
+                completion_hints_enabled(effective_no_hints),
+            );
         }
         return Ok(());
     }
@@ -391,7 +406,12 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
 
     let completed = outcome == RunLoopOutcome::Done;
     if !quiet {
-        print_exit_summary_card(&state, &outcome, plain);
+        print_exit_summary_card(
+            &state,
+            &outcome,
+            plain,
+            completion_hints_enabled(effective_no_hints),
+        );
     }
     super::lifecycle::fire_lifecycle_notification(&paths, &state, &outcome).await;
     if completed && completion_hints_enabled(effective_no_hints) {

@@ -138,7 +138,7 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
         }
         let state = load_run(&paths, &run_id)?;
         if state.status == RunStatus::Completed && show_hints {
-            print_exit_summary_card(&state, &RunLoopOutcome::Done, args.plain);
+            print_exit_summary_card(&state, &RunLoopOutcome::Done, args.plain, true);
             print_chain_context_for_working(&state.working_dir);
         }
         return Ok(());
@@ -152,7 +152,7 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
         );
     }
     if state.status == RunStatus::Completed && show_hints {
-        print_exit_summary_card(&state, &RunLoopOutcome::Done, args.plain);
+        print_exit_summary_card(&state, &RunLoopOutcome::Done, args.plain, true);
         print_chain_context_for_working(&state.working_dir);
     } else {
         print_run_summary(&state);

@@ -1025,8 +1025,9 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
     let run_stdout = stdout(&output);
     assert!(run_stdout.contains("started run "));
     assert!(run_stdout.contains("attach  : deadreckon attach "));
-    assert!(run_stdout.contains("export:"));
-    assert!(run_stdout.contains("extend:"));
+    assert!(run_stdout.contains("recommended"), "{run_stdout}");
+    assert!(run_stdout.contains("deadreckon export "), "{run_stdout}");
+    assert!(run_stdout.contains("deadreckon show "), "{run_stdout}");
     let run_id = run_id_from_stdout(&output);
     assert!(run_stdout.contains(&format!("attach  : deadreckon attach {}", &run_id[..8])));
     let attach = deadreckon(&paths)
@@ -1037,8 +1038,15 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
     assert_success(&attach);
     let attach_stdout = stdout(&attach);
     assert!(attach_stdout.contains("completed run"), "{attach_stdout}");
-    assert!(attach_stdout.contains("export:"));
-    assert!(attach_stdout.contains("extend:"));
+    assert!(attach_stdout.contains("recommended"), "{attach_stdout}");
+    assert!(
+        attach_stdout.contains("deadreckon export "),
+        "{attach_stdout}"
+    );
+    assert!(
+        attach_stdout.contains("deadreckon show "),
+        "{attach_stdout}"
+    );
 
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1060,8 +1068,9 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .output()
         .expect("run no hints");
     assert_success(&output);
-    assert!(!stdout(&output).contains("export:"));
-    assert!(!stdout(&output).contains("extend:"));
+    assert!(stdout(&output).contains("recommended"));
+    assert!(stdout(&output).contains("deadreckon export "));
+    assert!(!stdout(&output).contains("deadreckon show "));
     let run_id = run_id_from_stdout(&output);
     let attach = deadreckon(&paths)
         .arg("attach")
@@ -1070,8 +1079,8 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .output()
         .expect("attach no hints");
     assert_success(&attach);
-    assert!(!stdout(&attach).contains("export:"));
-    assert!(!stdout(&attach).contains("extend:"));
+    assert!(!stdout(&attach).contains("deadreckon export "));
+    assert!(!stdout(&attach).contains("deadreckon show "));
 
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1093,8 +1102,9 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .output()
         .expect("run env no hints");
     assert_success(&output);
-    assert!(!stdout(&output).contains("export:"));
-    assert!(!stdout(&output).contains("extend:"));
+    assert!(stdout(&output).contains("recommended"));
+    assert!(stdout(&output).contains("deadreckon export "));
+    assert!(!stdout(&output).contains("deadreckon show "));
     let run_id = run_id_from_stdout(&output);
     let attach = deadreckon(&paths)
         .arg("attach")
@@ -1103,8 +1113,8 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .output()
         .expect("attach env no hints");
     assert_success(&attach);
-    assert!(!stdout(&attach).contains("export:"));
-    assert!(!stdout(&attach).contains("extend:"));
+    assert!(!stdout(&attach).contains("deadreckon export "));
+    assert!(!stdout(&attach).contains("deadreckon show "));
 }
 
 #[test]

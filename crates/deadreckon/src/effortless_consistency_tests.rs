@@ -138,7 +138,7 @@ fn campaign_for_state(
 fn no_surface_renders_zero_dollar_subscription_spend() {
     let temp = TempDir::new().expect("tempdir");
     let (paths, state) = subscription_state(&temp);
-    let exit = render_exit_summary_card(&state, &RunLoopOutcome::Done, true);
+    let exit = render_exit_summary_card(&state, &RunLoopOutcome::Done, true, true);
     let plan = plan_for_state(&state);
     let plan_detail = plan_task_detail_lines(&paths, &plan, &plan.tasks[0], 120).join("\n");
     let campaign = campaign_for_state(&state);
@@ -164,7 +164,7 @@ fn no_surface_renders_zero_dollar_subscription_spend() {
 fn gate_verdict_is_per_check_on_every_outcome_surface() {
     let temp = TempDir::new().expect("tempdir");
     let (paths, state) = subscription_state(&temp);
-    let exit = render_exit_summary_card(&state, &RunLoopOutcome::Done, true);
+    let exit = render_exit_summary_card(&state, &RunLoopOutcome::Done, true, true);
     let status = acceptance_status_line(&state);
     let plan = plan_for_state(&state);
     let plan_detail = plan_task_detail_lines(&paths, &plan, &plan.tasks[0], 120).join("\n");

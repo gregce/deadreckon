@@ -134,7 +134,7 @@ fn guarantee_noun_is_consistent_across_surfaces() {
 }
 
 #[test]
-fn every_refusal_carries_a_try_line() {
+fn every_refusal_carries_actionable_primary_recovery() {
     struct RefusalCase {
         name: &'static str,
         args: Vec<&'static str>,
@@ -209,7 +209,15 @@ fn every_refusal_carries_a_try_line() {
             .filter(|line| !line.trim().is_empty())
             .last()
             .expect("last stderr line");
-        assert!(last.contains("try:"), "{}\n{err}", case.name);
+        let has_try_footer = last.contains("try:");
+        let has_verdict_recommended = err.matches("\nRecommended\n").count() == 1
+            && err.contains("\nExplanation\n")
+            && err.contains("\nEvidence\n");
+        assert!(
+            has_try_footer || has_verdict_recommended,
+            "{}\n{err}",
+            case.name
+        );
     }
 }
 

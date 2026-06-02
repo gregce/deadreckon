@@ -31,6 +31,26 @@ fn verdict_surface_friendliness_audit_tracks_terminal_outcome_surfaces() {
 }
 
 #[test]
+fn friendliness_one_verdict_primary_action_burndown_has_no_in_scope_failures() {
+    let audit = fs::read_to_string(workspace_root().join("docs/FRIENDLINESS-AUDIT.md"))
+        .expect("friendliness audit");
+    let rows = audit_rows(&audit);
+
+    for verb in TERMINAL_OUTCOME_SURFACE_VERBS {
+        let status = rows
+            .get(&(
+                (*verb).to_string(),
+                "One verdict + ONE primary action".to_string(),
+            ))
+            .unwrap_or_else(|| panic!("missing one-primary-action row for {verb}"));
+        assert_ne!(
+            status, "fail",
+            "{verb} still lists an in-scope one-primary-action failure"
+        );
+    }
+}
+
+#[test]
 fn verdict_surface_contract_rejects_multiple_primary_actions() {
     let err = VerdictSurface::try_new(
         VerdictKind::Failed,
