@@ -535,7 +535,7 @@ fn history_grep_command(args: HistoryGrepRequest) -> Result<()> {
     }
     let paths = DeadreckonPaths::discover();
     let matcher = HistoryMatcher::new(pattern.clone(), regex)?;
-    let cutoff = parse_history_since(since)?;
+    let cutoff = parse_history_since(&pattern, since)?;
     let plan_children = plan
         .as_deref()
         .map(|plan_id| history_plan_children(&paths, plan_id))
@@ -691,42 +691,57 @@ fn history_kind_label(kind: HistoryKind) -> &'static str {
     }
 }
 
-fn parse_history_since(value: Option<String>) -> Result<Option<DateTime<Utc>>> {
+fn parse_history_since(pattern: &str, value: Option<String>) -> Result<Option<DateTime<Utc>>> {
     let Some(value) = value else {
         return Ok(None);
     };
     let value = value.trim();
     if value.len() < 2 {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "invalid --since duration",
-            "use a duration like 7d, 24h, or 30m",
-        )));
+        return Err(invalid_history_since_error(pattern, value));
     }
     let (amount, unit) = value.split_at(value.len() - 1);
-    let amount = amount.parse::<i64>().map_err(|_| {
-        CliError::Core(deadreckon_core::user_error(
-            "invalid --since duration",
-            "use a duration like 7d, 24h, or 30m",
-        ))
-    })?;
+    let amount = amount
+        .parse::<i64>()
+        .map_err(|_| invalid_history_since_error(pattern, value))?;
     if amount < 0 {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "invalid --since duration",
-            "use a positive duration like 7d, 24h, or 30m",
-        )));
+        return Err(invalid_history_since_error(pattern, value));
     }
     let duration = match unit {
         "d" => ChronoDuration::days(amount),
         "h" => ChronoDuration::hours(amount),
         "m" => ChronoDuration::minutes(amount),
-        _ => {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                "invalid --since duration unit",
-                "use d, h, or m, for example 7d",
-            )));
-        }
+        _ => return Err(invalid_history_since_error(pattern, value)),
     };
     Ok(Some(Utc::now() - duration))
+}
+
+fn invalid_history_since_error(pattern: &str, value: &str) -> CliError {
+    let primary = format!(
+        "deadreckon history grep {} --since 7d",
+        command_literal(pattern)
+    );
+    let secondary = format!("deadreckon history grep {} --all", command_literal(pattern));
+    CliError::Surface {
+        code: 2,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "history grep",
+            Some("--since"),
+            ExplanationPanel::new(
+                format!("History grep could not parse --since duration {value:?}."),
+                "The command stopped before scanning history because --since must be a positive duration ending in d, h, or m.",
+                vec![
+                    ("filter".to_string(), "--since".to_string()),
+                    ("value".to_string(), value.to_string()),
+                    ("accepted duration".to_string(), "7d, 24h, or 30m".to_string()),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![("Secondary", secondary.as_str())],
+        )
+        .expect("invalid history since verdict surface must be valid")
+        .render_plain(false),
+    }
 }
 
 fn history_file_within_cutoff(path: &Path, cutoff: Option<DateTime<Utc>>) -> Result<bool> {

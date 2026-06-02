@@ -5867,6 +5867,33 @@ fn history_grep_no_matches_has_one_primary_recovery_action() {
 }
 
 #[test]
+fn history_grep_invalid_since_has_one_recovery_action() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["history", "grep", "needle", "--since", "soon"])
+        .output()
+        .expect("history grep");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("blocked history grep --since"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains("Recommended\ndeadreckon history grep needle --since 7d"),
+        "{err}"
+    );
+    assert!(err.contains("value: soon"), "{err}");
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
 fn history_grep_scope_and_all_match_list_semantics() {
     let temp = repo_tempdir();
     let repo_a = clean_git_repo(&temp);
