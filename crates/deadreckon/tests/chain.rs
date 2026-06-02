@@ -1350,6 +1350,39 @@ fn chain_redo_applied_step_requires_reapply_flag() {
 }
 
 #[test]
+fn chain_undo_no_applied_steps_uses_noop_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.scope = deadreckon_core::paths::workspace_scope(&repo).expect("scope");
+    save_test_chain(&paths, &chain);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "undo", &chain.chain_id, "--no-confirm"])
+        .output()
+        .expect("undo");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.starts_with("no-op chain"), "{stderr}");
+    assert!(stderr.contains("nothing to undo"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Recommended\ndeadreckon chain show {}",
+            &chain.chain_id[..8]
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
+}
+
+#[test]
 fn chain_undo_records_undone_step_events() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

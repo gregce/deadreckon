@@ -2267,10 +2267,21 @@ fn chain_undo_command(
         })
         .collect::<Vec<_>>();
     if applied.is_empty() {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "nothing to undo",
-            &format!("deadreckon chain show {}", chain_prefix(&chain.chain_id)),
-        )));
+        let id = chain_prefix(&chain.chain_id);
+        return Err(CliError::Surface {
+            code: 1,
+            surface: chain_transition_surface(
+                paths,
+                &chain,
+                VerdictKind::Noop,
+                "DeadReckon did not undo the chain because there is nothing to undo.",
+                "Undo only applies to chain steps with applied commits, so inspection is the safest next command.",
+                vec![("applied steps".to_string(), "0".to_string())],
+                format!("deadreckon chain show {id}"),
+                Vec::new(),
+            )
+            .render_plain(false),
+        });
     }
     if !no_confirm && io::stdin().is_terminal() {
         if !prompt::confirm("undo applied chain commits?", false)? {
