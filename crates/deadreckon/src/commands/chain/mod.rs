@@ -1024,14 +1024,6 @@ async fn run_chain_conductor(
                     Some(index as u32),
                     json!({ "reason": "apply_mode_preview", "diff_summary": diff_summary }),
                 )?;
-                if !options.quiet {
-                    println!("preview diff for step {}:", index + 1);
-                    if diff_summary.trim().is_empty() {
-                        println!("  no diff");
-                    } else {
-                        println!("{diff_summary}");
-                    }
-                }
                 pause_chain_at_step(paths, &mut chain, index, "apply_mode_preview".to_string())?;
                 completed = false;
                 break;
@@ -1815,6 +1807,12 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
     if let Some(reason) = reason {
         evidence.push(("reason".to_string(), reason.to_string()));
     }
+    if chain.status == ChainStatus::Paused
+        && reason == Some("apply_mode_preview")
+        && let Some(diff_summary) = latest_chain_preview_diff_summary(paths, chain)
+    {
+        evidence.push(("diff summary".to_string(), diff_summary));
+    }
     if let Some(step) = failed_step {
         evidence.push((
             "failed step".to_string(),
@@ -1845,6 +1843,47 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
             .collect::<Vec<_>>(),
     )
     .expect("chain verdict surface must have one primary action")
+}
+
+fn latest_chain_preview_diff_summary(paths: &DeadreckonPaths, chain: &Chain) -> Option<String> {
+    let raw = fs::read_to_string(paths.chain_events(&chain.chain_id)).ok()?;
+    raw.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<ChainEvent>(line).ok())
+        .find(|event| {
+            event.event == ChainEventKind::ChainApplyRefused
+                && event
+                    .detail
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("apply_mode_preview")
+        })
+        .map(|event| {
+            event
+                .detail
+                .get("diff_summary")
+                .and_then(serde_json::Value::as_str)
+                .map(compact_chain_diff_summary)
+                .unwrap_or_else(|| "no diff".to_string())
+        })
+}
+
+fn compact_chain_diff_summary(summary: &str) -> String {
+    let mut lines = summary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "no diff".to_string();
+    }
+    if let Some(index) = lines
+        .iter()
+        .rposition(|line| line.contains("file changed") || line.contains("files changed"))
+    {
+        return lines.swap_remove(index).to_string();
+    }
+    lines[0].to_string()
 }
 
 fn chain_transition_surface(

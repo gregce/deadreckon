@@ -2995,7 +2995,7 @@ fn apply_mode_auto_refuses_when_marker_invalid() {
 }
 
 #[test]
-fn apply_mode_preview_writes_diff_summary_before_landing() {
+fn apply_mode_preview_folds_diff_summary_into_paused_verdict() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -3020,11 +3020,11 @@ fn apply_mode_preview_writes_diff_summary_before_landing() {
         .expect("chain");
 
     assert_success(&output);
-    assert!(
-        stdout(&output).contains("preview diff for step 1"),
-        "{}",
-        stdout(&output)
-    );
+    let stdout = stdout(&output);
+    assert!(stdout.contains("paused chain "), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(!stdout.contains("preview diff for step"), "{stdout}");
+    assert!(stdout.contains("diff summary"), "{stdout}");
     let chain = newest_chain(&paths);
     assert_eq!(chain.status, ChainStatus::Paused);
     assert_eq!(chain.steps[0].status, ChainStepStatus::Completed);
