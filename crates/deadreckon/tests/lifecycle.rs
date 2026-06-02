@@ -287,7 +287,28 @@ fn extend_refuses_incomplete_parent() {
         .expect("extend");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("use 'deadreckon resume' for incomplete runs"));
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains(&format!("blocked extend {}", &parent.run_id[..8])),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Recommended\ndeadreckon resume {}",
+            &parent.run_id[..8]
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("\nSecondary\n"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("deadreckon show {}", &parent.run_id[..8])),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

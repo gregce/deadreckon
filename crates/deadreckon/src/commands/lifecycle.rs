@@ -1174,10 +1174,11 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let parent = load_cli_run(&paths, &parent_run_id)?;
     if parent.status != RunStatus::Completed {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-            "parent {} is {}; use 'deadreckon resume' for incomplete runs",
-            parent.run_id, parent.status
-        ))));
+        return Err(CliError::Surface {
+            code: 1,
+            surface: incomplete_parent_extend_surface(&parent)
+                .render_plain(!completion_hints_enabled(false)),
+        });
     }
     let parent_codebase = read_run_codebase_record(&paths, &parent).ok();
     if parent_codebase
@@ -1426,6 +1427,29 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         Box::pin(complete_run_actions(&state, true)).await?;
     }
     Ok(())
+}
+
+fn incomplete_parent_extend_surface(parent: &deadreckon_core::PipelineState) -> VerdictSurface {
+    let id = run_prefix(&parent.run_id);
+    let primary = format!("deadreckon resume {id}");
+    let secondary = format!("deadreckon show {id}");
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "extend",
+        Some(&id),
+        ExplanationPanel::new(
+            format!("Parent run {id} is {} and cannot be extended yet.", parent.status),
+            "Extend requires a completed parent with promoted artifacts; an incomplete run may still change if it is resumed.",
+            vec![
+                ("run".to_string(), id.clone()),
+                ("status".to_string(), parent.status.to_string()),
+                ("state".to_string(), parent.state_path().display().to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", secondary.as_str())],
+    )
+    .expect("incomplete parent extend verdict surface must be valid")
 }
 
 struct ExtendWorktreeArgs {
