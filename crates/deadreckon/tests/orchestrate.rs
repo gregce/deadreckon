@@ -22,6 +22,18 @@ mod common;
 
 use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
 
+fn assert_verdict_surface(text: &str, verdict: &str, recommended: &str) {
+    assert!(text.contains(verdict), "{text}");
+    assert!(text.contains("Explanation\n"), "{text}");
+    assert!(text.contains("Evidence\n"), "{text}");
+    assert_eq!(text.matches("\nRecommended\n").count(), 1, "{text}");
+    assert!(
+        text.contains(&format!("Recommended\n{recommended}")),
+        "{text}"
+    );
+    assert!(!text.contains("try:"), "{text}");
+}
+
 #[test]
 fn plan_writes_plan_json_with_n_tasks() {
     let temp = repo_tempdir();
@@ -677,9 +689,9 @@ fn start_with_no_provider_refuses_with_try_line() {
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
     assert!(err.contains("provider"), "{err}");
-    assert!(err.contains("try: deadreckon try"), "{err}");
+    assert_verdict_surface(&err, "blocked start", "deadreckon try");
     assert!(
-        err.contains("try: deadreckon config provider cli:codex"),
+        err.contains("deadreckon config provider cli:codex"),
         "{err}"
     );
 }
@@ -790,8 +802,11 @@ fn start_missing_done_criteria_suggests_def_done_in_non_tty() {
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
     assert!(err.contains(NOUN_DONE_CONTRACT), "{err}");
-    assert!(err.contains("try: deadreckon def-done"), "{err}");
-    assert!(err.contains("deadreckon start \"build the app\""), "{err}");
+    assert_verdict_surface(
+        &err,
+        "blocked start",
+        "deadreckon def-done \"what should count as done\" && deadreckon start \"build the app\"",
+    );
 }
 
 #[test]
@@ -815,16 +830,16 @@ fn start_non_git_non_tty_refuses_with_source_mode_try_lines() {
         err.contains("non-interactive without a source mode"),
         "{err}"
     );
-    assert_eq!(err.matches("try:").count(), 1, "{err}");
-    assert!(
-        err.contains("try: deadreckon start \"build the app\" --from ."),
-        "{err}"
+    assert_verdict_surface(
+        &err,
+        "blocked start",
+        "deadreckon start \"build the app\" --from .",
     );
     assert!(
-        !err.contains("try: deadreckon start \"build the app\" --fresh"),
+        err.contains("deadreckon start \"build the app\" --fresh"),
         "{err}"
     );
-    assert!(!err.contains("try: git init"), "{err}");
+    assert!(err.contains("git init"), "{err}");
 }
 
 #[test]
@@ -935,9 +950,10 @@ fn start_dirty_git_reuses_allow_dirty_guidance() {
         err.contains("working tree has uncommitted changes"),
         "{err}"
     );
-    assert!(
-        err.contains("try: git stash && deadreckon start \"build the app\""),
-        "{err}"
+    assert_verdict_surface(
+        &err,
+        "blocked start",
+        "git stash && deadreckon start \"build the app\"",
     );
     assert!(err.contains("--allow-dirty"), "{err}");
 }
@@ -2081,11 +2097,11 @@ fn plan_capability_preview_allows_network_for_multiplayer_live_goals() {
 }
 
 #[test]
-fn error_messages_end_with_try_footer() {
+fn error_messages_include_recovery_guidance() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
-    let cases: Vec<(Vec<&str>, &str, &str)> = vec![
+    let legacy_try_cases: Vec<(Vec<&str>, &str, &str)> = vec![
         (
             vec!["plan", "", "--quiet"],
             "--goal must be non-empty",
@@ -2106,14 +2122,9 @@ fn error_messages_end_with_try_footer() {
             "plan must have >= 2 children",
             "try: deadreckon run \"<the only child>\"",
         ),
-        (
-            vec!["history", "grep", "[", "--regex"],
-            "invalid regex",
-            "try: re-quote or escape",
-        ),
     ];
 
-    for (args, message, hint) in cases {
+    for (args, message, hint) in legacy_try_cases {
         let output = deadreckon(&paths)
             .current_dir(&repo)
             .args(args)
@@ -2124,6 +2135,23 @@ fn error_messages_end_with_try_footer() {
         assert!(err.contains(message), "{err}");
         assert!(err.contains(hint), "{err}");
     }
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["history", "grep", "[", "--regex"])
+        .output()
+        .expect("history grep");
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("History grep could not compile regex pattern"),
+        "{err}"
+    );
+    assert_verdict_surface(
+        &err,
+        "blocked history grep --regex",
+        "deadreckon history grep '[' --regex",
+    );
 }
 
 #[test]

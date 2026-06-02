@@ -2303,22 +2303,27 @@ fn start_preview_surface(
     evidence.push(("will start".to_string(), "false".to_string()));
     let primary = start_preview_primary_action(decision);
     let secondary = start_preview_secondary_actions(decision);
-    let (kind, what, why) = if decision.recovery.is_some() {
+    let (kind, what, why) = if let Some(recovery) = decision.recovery.as_ref() {
         (
             VerdictKind::Blocked,
-            "DeadReckon previewed the launch, but setup is blocked before any run or plan id exists.",
-            "The selected path cannot start until the recommended recovery command resolves the missing setup.",
+            recovery.message.clone(),
+            "The selected path cannot start until the recommended recovery command resolves the missing setup.".to_string(),
         )
     } else {
         (
             VerdictKind::Preview,
-            "DeadReckon classified the goal and is ready to launch, but no run, plan, or campaign id exists yet.",
-            "This is a preview; post-launch commands become real only after the launch creates an id.",
+            "DeadReckon classified the goal and is ready to launch, but no run, plan, or campaign id exists yet.".to_string(),
+            "This is a preview; post-launch commands become real only after the launch creates an id.".to_string(),
         )
+    };
+    let secondary_label = if decision.recovery.is_some() {
+        "Secondary"
+    } else {
+        "After start"
     };
     let secondary = secondary
         .iter()
-        .map(|command| ("After start", command.as_str()))
+        .map(|command| (secondary_label, command.as_str()))
         .collect::<Vec<_>>();
     Ok(VerdictSurface::try_new(
         kind,
@@ -2433,7 +2438,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     if decision.recovery.is_none() && eligibility.allows_prompts() {
         prompt_start_launch_confirmation(&mut decision, &args, &paths, &mut terminal_prompter)?;
     }
-    if !args.quiet {
+    if !args.quiet && decision.recovery.is_none() {
         println!("{}", ui_heading("guided start"));
         let seam_label =
             seam_preview_label(&read_seams_config(&paths.config_path(), args.no_seams)?);
@@ -2481,8 +2486,10 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         ]);
         print_kv_block(&rows);
     }
-    if let Some(recovery) = decision.recovery.as_ref() {
-        return Err(start_recovery_error(recovery));
+    if decision.recovery.is_some() {
+        let surface = start_preview_surface(&decision, &args, &paths)?
+            .render_plain(!completion_hints_enabled(false));
+        return Err(CliError::Surface { code: 1, surface });
     }
     materialize_start_done_criteria(&mut decision).await?;
     dispatch_start_command(args, &decision).await
