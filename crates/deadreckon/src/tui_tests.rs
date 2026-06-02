@@ -4976,13 +4976,15 @@ fn post_completion_action_resets_docs_view_and_explains_next_step() {
         .lines()
         .join("\n");
     assert!(notice.starts_with("completed apply action"), "{notice}");
-    assert!(notice.contains("explanation:"), "{notice}");
-    assert_eq!(notice.matches("recommended:").count(), 1, "{notice}");
-    assert!(notice.contains("recommended: q detach"), "{notice}");
-    assert!(
-        notice.contains("secondary: deadreckon status; deadreckon list"),
-        "{notice}"
-    );
+    assert!(notice.contains("\nExplanation\n"), "{notice}");
+    assert!(notice.contains("\nEvidence\n"), "{notice}");
+    assert_eq!(notice.matches("\nRecommended\n").count(), 1, "{notice}");
+    assert!(notice.contains("Recommended\nq detach"), "{notice}");
+    assert!(notice.contains("\nSecondary\n"), "{notice}");
+    assert!(notice.contains("deadreckon status"), "{notice}");
+    assert!(notice.contains("deadreckon list"), "{notice}");
+    assert!(!notice.contains("recommended:"), "{notice}");
+    assert!(!notice.contains("explanation:"), "{notice}");
     assert!(!notice.contains("next:"), "{notice}");
 
     let failed_notice = AttachActionNotice {
@@ -4995,20 +4997,23 @@ fn post_completion_action_resets_docs_view_and_explains_next_step() {
         failed_notice.starts_with("failed apply action"),
         "{failed_notice}"
     );
-    assert!(failed_notice.contains("explanation:"), "{failed_notice}");
+    assert!(failed_notice.contains("\nExplanation\n"), "{failed_notice}");
+    assert!(failed_notice.contains("\nEvidence\n"), "{failed_notice}");
     assert_eq!(
-        failed_notice.matches("recommended:").count(),
+        failed_notice.matches("\nRecommended\n").count(),
         1,
         "{failed_notice}"
     );
     assert!(
-        failed_notice.contains("recommended: q detach"),
+        failed_notice.contains("Recommended\nq detach"),
         "{failed_notice}"
     );
     assert!(
-        failed_notice.contains("secondary: retry the action after fixing the error"),
+        failed_notice.contains("retry the action after fixing the error"),
         "{failed_notice}"
     );
+    assert!(!failed_notice.contains("recommended:"), "{failed_notice}");
+    assert!(!failed_notice.contains("explanation:"), "{failed_notice}");
     assert!(!failed_notice.contains("next:"), "{failed_notice}");
 }
 

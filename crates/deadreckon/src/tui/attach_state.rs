@@ -227,21 +227,48 @@ pub(crate) struct AttachActionNotice {
 
 impl AttachActionNotice {
     pub(crate) fn lines(&self) -> Vec<String> {
-        let verdict = if self.success { "completed" } else { "failed" };
-        let mut lines = vec![format!("{verdict} {} action", self.action.label())];
-        if self.success {
-            lines.push(format!("explanation: {}", self.action.success_detail()));
-            lines.push("recommended: q detach".to_string());
-            lines.push("secondary: deadreckon status; deadreckon list".to_string());
-        } else {
-            lines.push(
-                "explanation: see the terminal output above for the error and suggested fix"
+        let (kind, what, why, evidence, secondary) = if self.success {
+            (
+                VerdictKind::Completed,
+                self.action.success_detail().to_string(),
+                "The action completed inside attach, so detaching returns to the shell with the updated state available for inspection."
                     .to_string(),
-            );
-            lines.push("recommended: q detach".to_string());
-            lines.push("secondary: retry the action after fixing the error".to_string());
-        }
-        lines
+                vec![
+                    ("action".to_string(), self.action.label().to_string()),
+                    ("result".to_string(), "succeeded".to_string()),
+                ],
+                vec![
+                    ("Secondary", "deadreckon status"),
+                    ("Secondary", "deadreckon list"),
+                ],
+            )
+        } else {
+            (
+                VerdictKind::Failed,
+                "The attach action failed before completing the requested state change."
+                    .to_string(),
+                "The terminal output above contains the concrete error; detaching is the safest next step before retrying after the error is fixed."
+                    .to_string(),
+                vec![
+                    ("action".to_string(), self.action.label().to_string()),
+                    ("result".to_string(), "failed".to_string()),
+                ],
+                vec![("Secondary", "retry the action after fixing the error")],
+            )
+        };
+        VerdictSurface::try_new(
+            kind,
+            format!("{} action", self.action.label()),
+            None,
+            ExplanationPanel::new(what, why, evidence),
+            vec![("Recommended", "q detach")],
+            secondary,
+        )
+        .expect("attach action notice must have one primary action")
+        .render_plain(false)
+        .lines()
+        .map(ToString::to_string)
+        .collect()
     }
 }
 
