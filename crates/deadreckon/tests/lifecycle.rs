@@ -1187,6 +1187,31 @@ fn config_provider_and_model_mutations_have_one_recommended_command() {
     assert!(!model_stdout.contains("try:"), "{model_stdout}");
 }
 
+#[test]
+fn config_model_without_active_provider_uses_blocked_verdict_surface() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .args(["config", "model", "mock-agent-v2"])
+        .output()
+        .expect("config model set without provider");
+
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("blocked config model"), "{err}");
+    assert!(err.contains("Explanation"), "{err}");
+    assert!(err.contains("Evidence"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains("Recommended\ndeadreckon config provider cli:codex"),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+    assert!(!paths.config_path().exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn done_plain_english_uses_configured_provider() {
     let temp = repo_tempdir();

@@ -2203,11 +2203,10 @@ fn config_command(command: ConfigCommand) -> Result<()> {
                 let mut root = load_config_value(&paths)?;
                 let provider = provider
                     .or_else(|| active_provider_from_config(&root))
-                    .ok_or_else(|| {
-                        CliError::Core(deadreckon_core::user_error(
-                            "no active provider configured",
-                            "deadreckon config provider cli:codex",
-                        ))
+                    .ok_or_else(|| CliError::Surface {
+                        code: 1,
+                        surface: config_model_missing_provider_surface(&paths, &model)
+                            .render_plain(!completion_hints_enabled(false)),
                     })?;
                 set_provider_model(&mut root, &provider, &model);
                 fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
@@ -2372,6 +2371,26 @@ fn config_model_surface(paths: &DeadreckonPaths, provider: &str, model: &str) ->
         vec![("Secondary", "deadreckon doctor")],
     )
     .expect("config model verdict surface must be valid")
+}
+
+fn config_model_missing_provider_surface(paths: &DeadreckonPaths, model: &str) -> VerdictSurface {
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "config",
+        Some("model"),
+        ExplanationPanel::new(
+            format!("DeadReckon could not write model {model} because no active provider is configured."),
+            "Model overrides are provider-scoped; configure the default provider before saving a model without --provider.",
+            vec![
+                ("config", paths.config_path().display().to_string()),
+                ("model", model.to_string()),
+                ("provider", "none".to_string()),
+            ],
+        ),
+        vec![("Recommended", "deadreckon config provider cli:codex")],
+        vec![("Secondary", "deadreckon config provider")],
+    )
+    .expect("config model missing-provider surface must be valid")
 }
 
 fn provider_selection_surface(
