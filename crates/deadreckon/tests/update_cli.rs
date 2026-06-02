@@ -193,11 +193,17 @@ fn update_source_refuses_with_cargo_install_path() {
 
     assert!(!output.status.success());
     let err = stderr(&output);
-    assert!(err.contains("update: channel = source"), "{err}");
+    assert!(err.contains("blocked update source"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
     assert!(
-        err.contains("try: cargo install --path crates/deadreckon"),
+        err.contains("Recommended\ncargo install --path crates/deadreckon"),
         "{err}"
     );
+    assert!(err.contains("channel: source"), "{err}");
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
 }
 
 #[test]

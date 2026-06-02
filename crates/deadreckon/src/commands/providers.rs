@@ -88,9 +88,10 @@ pub(crate) async fn update_command(
             }
             Ok(())
         }
-        Channel::Source => Err(CliError::Core(DeadreckonError::InvalidInput(
-            "update: channel = source; in-place swap not supported".to_string(),
-        ))),
+        Channel::Source => Err(CliError::Surface {
+            code: 1,
+            surface: update_source_surface(&current).render_plain(!completion_hints_enabled(false)),
+        }),
         Channel::Shell => {
             update_shell_channel(&paths, &receipt, force, allow_prerelease, yes, quiet).await
         }
@@ -401,6 +402,26 @@ fn update_check_surface(channel: Channel, current: &str, latest: &LatestUpdate) 
         Vec::<(&str, &str)>::new(),
     )
     .expect("update-check no-op verdict surface must be valid")
+}
+
+fn update_source_surface(current: &str) -> VerdictSurface {
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "update",
+        Some("source"),
+        ExplanationPanel::new(
+            "DeadReckon cannot replace a source-built binary in place.",
+            "Source installs do not have a managed package channel for self-update; reinstall from the checkout so Cargo rebuilds the binary.",
+            vec![
+                ("channel".to_string(), "source".to_string()),
+                ("current".to_string(), current.to_string()),
+                ("managed swap".to_string(), "unsupported".to_string()),
+            ],
+        ),
+        vec![("Recommended", "cargo install --path crates/deadreckon")],
+        vec![("Secondary", "deadreckon update --check")],
+    )
+    .expect("source update verdict surface must be valid")
 }
 
 fn channel_native_update_command(channel: Channel) -> &'static str {
