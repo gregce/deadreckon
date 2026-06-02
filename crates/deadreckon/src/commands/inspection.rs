@@ -506,6 +506,35 @@ fn invalid_history_regex_error(pattern: &str, parser_error: &str) -> CliError {
     }
 }
 
+fn invalid_history_limit_error(pattern: &str, value: usize) -> CliError {
+    let primary = format!(
+        "deadreckon history grep {} --limit 20",
+        command_literal(pattern)
+    );
+    let secondary = format!("deadreckon history grep {}", command_literal(pattern));
+    CliError::Surface {
+        code: 2,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "history grep",
+            Some("--limit"),
+            ExplanationPanel::new(
+                format!("History grep cannot run with --limit {value}."),
+                "The command stopped before scanning history because --limit must allow at least one matching line to be printed.",
+                vec![
+                    ("filter".to_string(), "--limit".to_string()),
+                    ("value".to_string(), value.to_string()),
+                    ("minimum".to_string(), "1".to_string()),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![("Secondary", secondary.as_str())],
+        )
+        .expect("invalid history limit verdict surface must be valid")
+        .render_plain(false),
+    }
+}
+
 pub(crate) fn history_command(command: HistoryCommand) -> Result<()> {
     match command {
         HistoryCommand::Grep {
@@ -553,10 +582,7 @@ fn history_grep_command(args: HistoryGrepRequest) -> Result<()> {
         regex,
     } = args;
     if limit == 0 {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "--limit must be at least 1",
-            "deadreckon history grep \"pattern\" --limit 20",
-        )));
+        return Err(invalid_history_limit_error(&pattern, limit));
     }
     let paths = DeadreckonPaths::discover();
     let matcher = HistoryMatcher::new(pattern.clone(), regex)?;

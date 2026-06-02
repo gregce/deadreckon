@@ -6133,6 +6133,33 @@ fn history_grep_regex_invalid_pattern_errors() {
 }
 
 #[test]
+fn history_grep_invalid_limit_has_one_recovery_action() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["history", "grep", "needle", "--limit", "0"])
+        .output()
+        .expect("history grep");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("blocked history grep --limit"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains("Recommended\ndeadreckon history grep needle --limit 20"),
+        "{err}"
+    );
+    assert!(err.contains("value: 0"), "{err}");
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
 fn history_grep_limit_respected() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
