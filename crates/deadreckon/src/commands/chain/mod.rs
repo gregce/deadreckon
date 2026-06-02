@@ -2849,17 +2849,62 @@ pub(crate) fn resolve_chain_id(paths: &DeadreckonPaths, id: &str, all: bool) -> 
         .collect::<Vec<_>>();
     match matches.len() {
         1 => Ok(matches[0].clone()),
-        0 => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("no chain '{id}'"),
+        0 => Err(chain_id_resolution_surface(
+            id,
+            &format!("DeadReckon could not resolve the chain because no chain '{id}' was found."),
+            "The command needs one concrete chain id, but no chain in the selected scope starts with the requested id.",
+            [
+                ("requested id".to_string(), id.to_string()),
+                (
+                    "scope".to_string(),
+                    scope.as_deref().unwrap_or("all").to_string(),
+                ),
+                ("matching chains".to_string(), "0".to_string()),
+            ],
             "deadreckon chain list",
-        ))),
-        _ => Err(CliError::Core(deadreckon_core::user_error(
+        )),
+        _ => Err(chain_id_resolution_surface(
+            id,
             &format!(
-                "ambiguous chain id prefix {id}; matches {}",
-                matches.join(", ")
+                "DeadReckon could not resolve the chain because chain id prefix {id} is ambiguous."
             ),
+            "The command needs one concrete chain id, but the requested prefix matches multiple chains.",
+            [
+                ("requested prefix".to_string(), id.to_string()),
+                (
+                    "scope".to_string(),
+                    scope.as_deref().unwrap_or("all").to_string(),
+                ),
+                ("matches".to_string(), matches.join(", ")),
+            ],
             "deadreckon chain list --full",
-        ))),
+        )),
+    }
+}
+
+fn chain_id_resolution_surface<K, V>(
+    id: &str,
+    what_happened: impl Into<String>,
+    why_this_verdict: impl Into<String>,
+    evidence: impl IntoIterator<Item = (K, V)>,
+    primary: &str,
+) -> CliError
+where
+    K: Into<String>,
+    V: Into<String>,
+{
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "chain",
+            Some(id),
+            ExplanationPanel::new(what_happened, why_this_verdict, evidence),
+            [("Recommended", primary)],
+            Vec::<(&str, &str)>::new(),
+        )
+        .expect("chain id resolution surface must have one primary action")
+        .render_plain(false),
     }
 }
 
