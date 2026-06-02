@@ -425,7 +425,7 @@ fn orchestrate_provider_choice_lines(
         lines.push("  configured: none".to_string());
         lines.push(format!(
             "  {} {}",
-            ui_command("recommended:"),
+            ui_command("setup:"),
             ui_command("deadreckon providers list --all")
         ));
     } else {
@@ -521,15 +521,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_choices_without_configured_providers_has_one_recommended_command() {
+    fn provider_choices_without_configured_providers_use_setup_recovery_rows() {
         let rendered = orchestrate_provider_choice_lines(None, &[]).join("\n");
 
         assert!(rendered.contains("Providers"), "{rendered}");
         assert!(rendered.contains("default: none configured"), "{rendered}");
         assert!(rendered.contains("configured: none"), "{rendered}");
-        assert_eq!(rendered.matches("recommended:").count(), 1, "{rendered}");
+        assert!(!rendered.contains("recommended:"), "{rendered}");
         assert!(
-            rendered.contains("recommended: deadreckon providers list --all"),
+            rendered.contains("setup: deadreckon providers list --all"),
             "{rendered}"
         );
         assert!(!rendered.contains("try:"), "{rendered}");
