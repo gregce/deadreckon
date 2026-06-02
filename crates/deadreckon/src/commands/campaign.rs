@@ -1251,6 +1251,53 @@ fn campaign_depth_refusal_surface(
     .expect("campaign depth refusal must have one primary action")
 }
 
+fn campaign_repair_refusal_surface(
+    campaign: &deadreckon_core::campaign::Campaign,
+    kind: VerdictKind,
+    what: impl Into<String>,
+    why: impl Into<String>,
+    primary: String,
+) -> VerdictSurface {
+    let id = run_prefix(&campaign.campaign_id);
+    let mut evidence = vec![
+        ("campaign".to_string(), id.clone()),
+        (
+            "status".to_string(),
+            campaign_status_text(campaign.status).to_string(),
+        ),
+        ("subs".to_string(), campaign.n.to_string()),
+    ];
+    if let Some(result_run_id) = campaign.merged_run_id.as_deref() {
+        evidence.push(("result run".to_string(), run_prefix(result_run_id)));
+    }
+    let mut secondary = Vec::new();
+    for command in [
+        format!("deadreckon show {id}"),
+        format!("deadreckon attach {id}"),
+        campaign
+            .merged_run_id
+            .as_deref()
+            .map(|run_id| format!("deadreckon show {}", run_prefix(run_id)))
+            .unwrap_or_else(|| format!("deadreckon show {id} --why-failed")),
+    ] {
+        if command != primary && !secondary.contains(&command) {
+            secondary.push(command);
+        }
+    }
+    VerdictSurface::try_new(
+        kind,
+        "campaign",
+        Some(&id),
+        ExplanationPanel::new(what, why, evidence),
+        vec![("Recommended", primary.as_str())],
+        secondary
+            .iter()
+            .map(|command| ("Secondary", command.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("campaign repair refusal surface must have one primary action")
+}
+
 pub(crate) async fn campaign_repair_command(args: CampaignRepairArgs) -> Result<()> {
     use deadreckon_core::campaign;
 
@@ -1271,36 +1318,53 @@ pub(crate) async fn campaign_repair_command(args: CampaignRepairArgs) -> Result<
     match campaign_obj.status {
         campaign::CampaignStatus::Failed => {}
         campaign::CampaignStatus::Merged => {
-            let hint = campaign_obj
+            let primary = campaign_obj
                 .merged_run_id
                 .as_deref()
                 .map(|run_id| format!("deadreckon apply {}", run_prefix(run_id)))
                 .unwrap_or_else(|| "deadreckon show <campaign-id>".to_string());
-            return Err(CliError::Core(deadreckon_core::user_error(
-                &format!(
-                    "campaign {} is already merged",
-                    run_prefix(&campaign_obj.campaign_id)
-                ),
-                &hint,
-            )));
+            return Err(CliError::Surface {
+                code: 1,
+                surface: campaign_repair_refusal_surface(
+                    &campaign_obj,
+                    VerdictKind::Noop,
+                    "DeadReckon did not run campaign repair because this campaign is already merged.",
+                    "Repair is only needed for failed campaign roll-ups; the merged result is ready for the normal apply or inspection path.",
+                    primary,
+                )
+                .render_plain(!completion_hints_enabled(args.no_hints)),
+            });
         }
         status => {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                &format!(
-                    "campaign {} is {}",
-                    run_prefix(&campaign_obj.campaign_id),
-                    campaign_status_text(status)
-                ),
-                "deadreckon attach <campaign-id>",
-            )));
+            return Err(CliError::Surface {
+                code: 1,
+                surface: campaign_repair_refusal_surface(
+                    &campaign_obj,
+                    VerdictKind::Blocked,
+                    format!(
+                        "DeadReckon did not run campaign repair because the campaign is {}.",
+                        campaign_status_text(status)
+                    ),
+                    "Campaign repair needs a failed campaign with a completed roll-up before it can inspect sub-results.",
+                    format!("deadreckon attach {}", run_prefix(&campaign_obj.campaign_id)),
+                )
+                .render_plain(!completion_hints_enabled(args.no_hints)),
+            });
         }
     }
 
     let rollup = campaign::read_campaign_rollup(&campaign_dir).map_err(|_| {
-        CliError::Core(deadreckon_core::user_error(
-            "campaign repair needs a completed roll-up",
-            "deadreckon attach <campaign-id> and wait for sub-orchestrators to finish",
-        ))
+        CliError::Surface {
+            code: 1,
+            surface: campaign_repair_refusal_surface(
+                &campaign_obj,
+                VerdictKind::Blocked,
+                "DeadReckon did not run campaign repair because no completed roll-up was found.",
+                "Repair needs the sub-orchestrator roll-up evidence before it can decide whether to synthesize or promote a result.",
+                format!("deadreckon attach {}", run_prefix(&campaign_obj.campaign_id)),
+            )
+            .render_plain(!completion_hints_enabled(args.no_hints)),
+        }
     })?;
     let repair_mode = parse_campaign_repair_mode(&args.repair_mode)?;
     let cwd = std::env::current_dir()?;

@@ -363,4 +363,29 @@ fn campaign_repair_promotes_failed_campaign_without_conflicts() {
         std::fs::read_to_string(library.join("src/notify.rs")).expect("notify"),
         "notify"
     );
+
+    let output = deadreckon(&paths)
+        .current_dir(&work)
+        .args(["campaign", "repair", &campaign.campaign_id, "--plain"])
+        .output()
+        .expect("repair merged campaign");
+    assert!(
+        !output.status.success(),
+        "merged campaign repair should refuse: {}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(err.starts_with("no-op campaign"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains(&format!(
+            "Recommended\ndeadreckon apply {}",
+            &result_run_id[..8]
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
 }
