@@ -2160,8 +2160,9 @@ fn config_command(command: ConfigCommand) -> Result<()> {
         }
         ConfigCommand::Provider { provider } => match provider {
             Some(provider) => {
-                let selection = provider_setup_selection(
+                let selection = config_provider_setup_selection(
                     &paths,
+                    &provider,
                     setup::ProviderSetupRequest {
                         role: setup::SetupProviderRoleRef::ConfigDefault,
                         explicit_provider: Some(&provider),
@@ -2220,6 +2221,56 @@ fn config_command(command: ConfigCommand) -> Result<()> {
         },
     }
     Ok(())
+}
+
+fn config_provider_setup_selection(
+    paths: &DeadreckonPaths,
+    provider: &str,
+    request: setup::ProviderSetupRequest<'_>,
+) -> Result<setup::ProviderSetupSelection> {
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    setup::select_provider_setup(&paths.config_path(), &registry, request)
+        .map_err(|refusal| config_setup_refusal_surface_error(paths, "provider", provider, refusal))
+}
+
+fn config_setup_refusal_surface_error(
+    paths: &DeadreckonPaths,
+    subject: &str,
+    target: &str,
+    refusal: setup::SetupRefusal,
+) -> CliError {
+    let setup::SetupRefusal { message, try_line } = refusal;
+    CliError::Surface {
+        code: 1,
+        surface: config_refusal_surface(paths, subject, target, &message, &try_line)
+            .render_plain(!completion_hints_enabled(false)),
+    }
+}
+
+fn config_refusal_surface(
+    paths: &DeadreckonPaths,
+    subject: &str,
+    target: &str,
+    message: &str,
+    primary: &str,
+) -> VerdictSurface {
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "config",
+        Some(subject),
+        ExplanationPanel::new(
+            format!("DeadReckon could not update config {subject} {target}."),
+            format!("The config mutation was blocked before writing because {message}."),
+            vec![
+                ("config", paths.config_path().display().to_string()),
+                (subject, target.to_string()),
+                ("reason", message.to_string()),
+            ],
+        ),
+        vec![("Recommended", primary)],
+        vec![("Secondary", "deadreckon config provider")],
+    )
+    .expect("config refusal surface must be valid")
 }
 
 fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> Result<()> {

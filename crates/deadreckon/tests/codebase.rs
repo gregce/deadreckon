@@ -598,7 +598,16 @@ fn config_provider_rejects_unknown_route_without_writing_config() {
         err.contains("unknown provider route cli:missing-provider"),
         "{err}"
     );
-    assert!(err.contains("deadreckon providers list --all"), "{err}");
+    assert!(err.contains("blocked config provider"), "{err}");
+    assert!(err.contains("Explanation"), "{err}");
+    assert!(err.contains("Evidence"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains("Recommended\ndeadreckon providers list --all"),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
     assert!(!paths.config_path().exists());
 }
 
