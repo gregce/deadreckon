@@ -5719,8 +5719,18 @@ fn attach_and_show_accept_plan_ids() {
         .expect("attach");
     assert_success(&output);
     let out = stdout(&output);
+    assert_verdict_surface(
+        &out,
+        &format!("preview plan {}", &plan.plan_id[..8]),
+        &format!("deadreckon fork {}", &plan.plan_id[..8]),
+    );
     assert!(out.contains("plan"), "{out}");
     assert!(out.contains("task-0"), "{out}");
+    assert!(!out.contains("\nSecondary\n"), "{out}");
+    assert!(!out.contains("attach:"), "{out}");
+    assert!(!out.contains("show:"), "{out}");
+    assert!(!out.contains("finish:"), "{out}");
+    assert!(!out.contains("apply:"), "{out}");
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
@@ -5729,8 +5739,17 @@ fn attach_and_show_accept_plan_ids() {
         .expect("show");
     assert_success(&output);
     let out = stdout(&output);
+    assert_verdict_surface(
+        &out,
+        &format!("preview plan {}", &plan.plan_id[..8]),
+        &format!("deadreckon fork {}", &plan.plan_id[..8]),
+    );
     assert!(out.contains(&plan.plan_id), "{out}");
     assert!(out.contains("\"root_goal\""), "{out}");
+    assert!(!out.contains("attach:"), "{out}");
+    assert!(!out.contains("show:"), "{out}");
+    assert!(!out.contains("finish:"), "{out}");
+    assert!(!out.contains("apply:"), "{out}");
 }
 
 #[test]

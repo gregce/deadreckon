@@ -7092,6 +7092,11 @@ fn print_merge_finished(
 }
 
 fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
+    print!(
+        "{}",
+        commands::plan::plan_verdict_surface(paths, plan).render_plain(!show_hints)
+    );
+    println!();
     println!(
         "{} {} ({})",
         ui_heading("plan"),
@@ -7166,14 +7171,13 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
         }
         if show_hints && let Some(run_id) = task.child_run_id.as_deref() {
             let child_ref = format!("{}:{}", run_prefix(&plan.plan_id), task.task_id);
+            println!("    child actions");
             println!(
-                "    {} {}",
-                ui_command("drill:"),
+                "      {}",
                 ui_command(format!("deadreckon attach {child_ref}"))
             );
             println!(
-                "    {} {}",
-                ui_command("show:"),
+                "      {}",
                 ui_command(format!("deadreckon show {child_ref}"))
             );
             println!("    run id {}", run_prefix(run_id));
@@ -7188,57 +7192,6 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
     }
     if let Some(merged_run_id) = plan.merged_run_id.as_deref() {
         println!("result run (secondary) {}", run_prefix(merged_run_id));
-    }
-    if show_hints {
-        println!(
-            "{} {}",
-            ui_command("attach:"),
-            ui_command(format!("deadreckon attach {}", run_prefix(&plan.plan_id)))
-        );
-        match plan.status {
-            PlanStatus::Pending => {
-                println!(
-                    "{} {}",
-                    ui_command("fork:"),
-                    ui_command(format!("deadreckon fork {}", run_prefix(&plan.plan_id)))
-                );
-            }
-            PlanStatus::Forked => {
-                println!(
-                    "{} {}",
-                    ui_command("merge:"),
-                    ui_command(format!("deadreckon merge {}", run_prefix(&plan.plan_id)))
-                );
-            }
-            PlanStatus::Merged => {
-                if plan.merged_run_id.is_some() {
-                    println!(
-                        "{} {}",
-                        ui_command("finish:"),
-                        ui_command(format!("deadreckon finish {}", run_prefix(&plan.plan_id)))
-                    );
-                    if plan_apply_git_root(plan).ok().flatten().is_some() {
-                        println!(
-                            "{} {}",
-                            ui_command("apply:"),
-                            ui_command(format!("deadreckon apply {}", run_prefix(&plan.plan_id)))
-                        );
-                    }
-                    println!(
-                        "{} {}",
-                        ui_command("export:"),
-                        ui_command(format!("deadreckon export {}", run_prefix(&plan.plan_id)))
-                    );
-                }
-            }
-            PlanStatus::Failed => {
-                println!(
-                    "{} {}",
-                    ui_command("why:"),
-                    ui_command(format!("deadreckon show {}", run_prefix(&plan.plan_id)))
-                );
-            }
-        }
     }
 }
 

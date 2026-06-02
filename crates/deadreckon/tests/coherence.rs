@@ -1137,22 +1137,34 @@ fn attach_plan_plain_displays_running_for_inflight_child() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let stdout = stdout(&output);
+    assert!(
+        stdout.contains(&format!("paused plan {}", &plan.plan_id[..8])),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon attach {}",
+            &plan.plan_id[..8]
+        )),
+        "{stdout}"
+    );
     assert!(stdout.contains("status      : running"), "{stdout}");
     assert!(stdout.contains("task-0"), "{stdout}");
     assert!(
-        stdout.contains(&format!(
-            "drill: deadreckon attach {}:task-0",
-            &plan.plan_id[..8]
-        )),
+        stdout.contains(&format!("deadreckon attach {}:task-0", &plan.plan_id[..8])),
         "{stdout}"
     );
     assert!(
-        stdout.contains(&format!(
-            "show: deadreckon show {}:task-0",
-            &plan.plan_id[..8]
-        )),
+        stdout.contains(&format!("deadreckon show {}:task-0", &plan.plan_id[..8])),
         "{stdout}"
     );
+    assert!(!stdout.contains("attach:"), "{stdout}");
+    assert!(!stdout.contains("show:"), "{stdout}");
+    assert!(!stdout.contains("finish:"), "{stdout}");
+    assert!(!stdout.contains("apply:"), "{stdout}");
     assert!(stdout.contains("run id aaaabbbb"), "{stdout}");
 }
 
