@@ -646,8 +646,19 @@ async fn extend_in_in_place_refuses_with_run_hint() {
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
-    assert!(stderr.contains("extend is not available for in-place runs"));
-    assert!(stderr.contains("try: deadreckon run --in-place --i-know-its-a-lot"));
+    assert!(stderr.contains("blocked extend in-place"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(
+            "Recommended\ndeadreckon run --in-place --i-know-its-a-lot \"in-place child\""
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("mode: in-place"), "{stderr}");
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]

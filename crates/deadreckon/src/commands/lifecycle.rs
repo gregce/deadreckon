@@ -1185,13 +1185,11 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         .as_ref()
         .is_some_and(|record| record.mode == CodebaseMode::InPlace)
     {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "extend is not available for in-place runs",
-            &format!(
-                "deadreckon run --in-place --i-know-its-a-lot {:?}",
-                new_goal
-            ),
-        )));
+        return Err(CliError::Surface {
+            code: 1,
+            surface: in_place_parent_extend_surface(&parent, &new_goal)
+                .render_plain(!completion_hints_enabled(false)),
+        });
     }
     let parent_library = paths.library_dir(&parent.scope, &parent.run_id);
     if !parent_library.is_dir() {
@@ -1450,6 +1448,33 @@ fn incomplete_parent_extend_surface(parent: &deadreckon_core::PipelineState) -> 
         vec![("Secondary", secondary.as_str())],
     )
     .expect("incomplete parent extend verdict surface must be valid")
+}
+
+fn in_place_parent_extend_surface(
+    parent: &deadreckon_core::PipelineState,
+    new_goal: &str,
+) -> VerdictSurface {
+    let id = run_prefix(&parent.run_id);
+    let primary = format!("deadreckon run --in-place --i-know-its-a-lot {new_goal:?}");
+    let secondary = format!("deadreckon show {id}");
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "extend",
+        Some("in-place"),
+        ExplanationPanel::new(
+            format!("Parent run {id} is in-place and cannot be extended."),
+            "Extend creates a follow-up from promoted copy or worktree artifacts; in-place work should continue as a new in-place run from the current checkout.",
+            vec![
+                ("run".to_string(), id.clone()),
+                ("mode".to_string(), "in-place".to_string()),
+                ("new goal".to_string(), new_goal.to_string()),
+                ("state".to_string(), parent.state_path().display().to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", secondary.as_str())],
+    )
+    .expect("in-place parent extend verdict surface must be valid")
 }
 
 struct ExtendWorktreeArgs {
