@@ -2942,11 +2942,25 @@ fn chain_extend_refuses_completed_chain_without_insert_at() {
         .expect("extend");
 
     assert!(!output.status.success());
+    let stderr = stderr(&output);
+    let chain = newest_chain(&paths);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
     assert!(
-        stderr(&output).contains("cannot extend completed"),
-        "{}",
-        stderr(&output)
+        stderr.contains("cannot extend completed chain at end"),
+        "{stderr}"
     );
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Recommended\ndeadreckon chain extend {} \"...\" --insert-at <N>",
+            &chain.chain_id[..8]
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]

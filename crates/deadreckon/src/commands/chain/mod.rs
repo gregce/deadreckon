@@ -2357,13 +2357,21 @@ fn chain_extend_command(
     let id = resolve_chain_id(paths, id, false)?;
     let mut chain = load_chain(paths, &id)?;
     if chain.status == ChainStatus::Completed && insert_at.is_none() {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "cannot extend completed chain at end",
-            &format!(
-                "deadreckon chain extend {} \"...\" --insert-at <N>",
-                chain_prefix(&chain.chain_id)
-            ),
-        )));
+        let id = chain_prefix(&chain.chain_id);
+        return Err(CliError::Surface {
+            code: 1,
+            surface: chain_transition_surface(
+                paths,
+                &chain,
+                VerdictKind::Blocked,
+                "DeadReckon did not extend the chain because it cannot extend completed chain at end.",
+                "A completed chain can only be reopened by inserting a step at a specific position, so DeadReckon refused before mutating chain state.",
+                vec![("insert-at".to_string(), "missing".to_string())],
+                format!("deadreckon chain extend {id} \"...\" --insert-at <N>"),
+                Vec::new(),
+            )
+            .render_plain(false),
+        });
     }
     if let Some(add) = max_spend_add {
         chain.max_spend_usd = Some(chain.max_spend_usd.unwrap_or(0.0) + add);
