@@ -214,6 +214,18 @@ fn missing_run_goal_uses_blocked_verdict_surface() {
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 
+fn assert_blocked_run_surface(stderr: &str, recommended: &str) {
+    assert!(stderr.contains("blocked run"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!("Recommended\n{recommended}")),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+}
+
 #[test]
 fn dirty_repo_refused_with_stash_hint() {
     let temp = repo_tempdir();
@@ -233,7 +245,7 @@ fn dirty_repo_refused_with_stash_hint() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(stderr.contains("working tree has uncommitted changes"));
-    assert!(stderr.contains("try: git stash && deadreckon run"));
+    assert_blocked_run_surface(&stderr, "git stash && deadreckon run \"dirty run\" --yes");
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 
@@ -257,7 +269,7 @@ fn no_commits_refused_with_initial_commit_hint() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(stderr.contains("git repo has no commits"));
-    assert!(stderr.contains("try: git commit -m initial"));
+    assert_blocked_run_surface(&stderr, "git commit -m initial");
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 
@@ -280,7 +292,7 @@ fn detached_head_refused_with_switch_hint() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(stderr.contains("HEAD is detached"));
-    assert!(stderr.contains("try: git switch -c <branch>"));
+    assert_blocked_run_surface(&stderr, "git switch -c <branch>");
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 
@@ -303,7 +315,7 @@ fn mid_merge_refused_with_abort_hint() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(stderr.contains("git is in the middle of a merge"));
-    assert!(stderr.contains("try: git merge --abort"));
+    assert_blocked_run_surface(&stderr, "git merge --abort");
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 
@@ -326,7 +338,7 @@ fn mid_rebase_refused_with_abort_hint() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(stderr.contains("git is in the middle of a rebase"));
-    assert!(stderr.contains("try: git rebase --abort"));
+    assert_blocked_run_surface(&stderr, "git rebase --abort");
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 
@@ -395,7 +407,10 @@ fn branch_collision_refused_with_branch_hint() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(stderr.contains("branch main already exists"));
-    assert!(stderr.contains("try: pass --branch-name <other-name>"));
+    assert_blocked_run_surface(
+        &stderr,
+        "deadreckon run \"branch collision\" --branch-name <other-name> --yes",
+    );
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 
@@ -875,7 +890,7 @@ fn non_git_non_interactive_refuses_with_try_line() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(stderr.contains("non-interactive without a mode flag"));
-    assert!(stderr.contains("try: --fresh or --from . or git init"));
+    assert_blocked_run_surface(&stderr, "deadreckon run \"plain non tty\" --from . --yes");
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 
@@ -1018,7 +1033,10 @@ fn in_place_requires_double_confirm_or_i_know_flag() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(stderr.contains("--in-place requires --i-know-its-a-lot"));
-    assert!(stderr.contains("try: add --i-know-its-a-lot or run in a TTY"));
+    assert_blocked_run_surface(
+        &stderr,
+        "deadreckon run \"in-place refused\" --in-place --i-know-its-a-lot --yes",
+    );
 }
 
 #[test]

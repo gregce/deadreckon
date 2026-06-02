@@ -185,7 +185,8 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             }
         }
     }
-    let resolved_mode = resolve_mode(&mode_flags, &cwd, io::stdin().is_terminal())?;
+    let resolved_mode = resolve_mode(&mode_flags, &cwd, io::stdin().is_terminal())
+        .map_err(|err| run_codebase_refusal_error(err, &goal, effective_no_hints))?;
     let mut codebase = match &resolved_mode {
         ResolvedMode::Worktree { source_path, .. } => prepare_worktree_record(
             &paths,
@@ -197,7 +198,8 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
                 branch_name: branch,
                 allow_dirty,
             },
-        )?,
+        )
+        .map_err(|err| run_codebase_refusal_error(err, &goal, effective_no_hints))?,
         _ => record_for_resolved_mode(resolved_mode.clone()),
     };
     if codebase.mode == CodebaseMode::Fresh {
@@ -395,6 +397,109 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         complete_run_actions(&state, !auto_confirm).await?;
     }
     Ok(())
+}
+
+fn run_codebase_refusal_error(err: DeadreckonError, goal: &str, no_hints: bool) -> CliError {
+    let DeadreckonError::InvalidInput(message) = err else {
+        return CliError::Core(err);
+    };
+    let Some((primary, why)) = run_codebase_refusal_primary(&message, goal) else {
+        return CliError::Core(DeadreckonError::InvalidInput(message));
+    };
+    let first_reason_line = message.lines().next().unwrap_or(message.as_str());
+    let evidence_reason = run_codebase_refusal_reason(&message);
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "run",
+            None,
+            ExplanationPanel::new(
+                first_reason_line.to_string(),
+                why.to_string(),
+                [
+                    ("command".to_string(), "run".to_string()),
+                    ("goal".to_string(), goal.to_string()),
+                    ("reason".to_string(), evidence_reason),
+                ],
+            ),
+            [("Recommended", primary)],
+            std::iter::empty::<(&str, String)>(),
+        )
+        .expect("run codebase refusal verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(no_hints)),
+    }
+}
+
+fn run_codebase_refusal_primary(message: &str, goal: &str) -> Option<(String, &'static str)> {
+    let quoted_goal = run_goal_argument(goal);
+    if message.contains("working tree has uncommitted changes") {
+        return Some((
+            format!("git stash && deadreckon run {quoted_goal} --yes"),
+            "DeadReckon refused to create a worktree from a dirty source because the run would not have a clean base to apply or clean up from.",
+        ));
+    }
+    if message.contains("git repo has no commits") {
+        return Some((
+            "git commit -m initial".to_string(),
+            "DeadReckon needs a committed Git base before it can create an isolated worktree branch.",
+        ));
+    }
+    if message.contains("HEAD is detached") {
+        return Some((
+            "git switch -c <branch>".to_string(),
+            "DeadReckon needs a named source branch so the run branch has an unambiguous base.",
+        ));
+    }
+    if message.contains("git is in the middle of a merge") {
+        return Some((
+            "git merge --abort".to_string(),
+            "DeadReckon will not start a run while Git has an unresolved merge state.",
+        ));
+    }
+    if message.contains("git is in the middle of a rebase") {
+        return Some((
+            "git rebase --abort".to_string(),
+            "DeadReckon will not start a run while Git has an unresolved rebase state.",
+        ));
+    }
+    if message.contains("branch ") && message.contains(" already exists") {
+        return Some((
+            format!("deadreckon run {quoted_goal} --branch-name <other-name> --yes"),
+            "DeadReckon refused to reuse an existing branch name because that would blur this run's provenance.",
+        ));
+    }
+    if message.contains("non-interactive without a mode flag") {
+        return Some((
+            format!("deadreckon run {quoted_goal} --from . --yes"),
+            "DeadReckon cannot ask for a source-mode choice in non-interactive output, so one explicit source mode is required.",
+        ));
+    }
+    if message.contains("--in-place requires --i-know-its-a-lot") {
+        return Some((
+            format!("deadreckon run {quoted_goal} --in-place --i-know-its-a-lot --yes"),
+            "In-place runs can mutate the current checkout, so DeadReckon requires the stronger acknowledgement before launching.",
+        ));
+    }
+    if message.contains(" is not a git repo") {
+        return Some((
+            "git init".to_string(),
+            "Worktree mode requires a Git repository; initialize Git or choose an explicit copy/fresh source mode.",
+        ));
+    }
+    None
+}
+
+fn run_goal_argument(goal: &str) -> String {
+    format!("\"{}\"", shell_display_quote(goal))
+}
+
+fn run_codebase_refusal_reason(message: &str) -> String {
+    message
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("try:"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn run_cancelled_before_turn_loop(
