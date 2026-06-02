@@ -2444,16 +2444,41 @@ fn chain_redo_command(
                 .map(|step| step.index)
         })
         .ok_or_else(|| {
-            CliError::Core(deadreckon_core::user_error(
-                "no failed or applied step to redo",
-                &format!("deadreckon chain show {}", chain_prefix(&chain.chain_id)),
-            ))
+            let id = chain_prefix(&chain.chain_id);
+            CliError::Surface {
+                code: 1,
+                surface: chain_transition_surface(
+                    paths,
+                    &chain,
+                    VerdictKind::Noop,
+                    "DeadReckon did not redo a chain step because no failed or applied step to redo.",
+                    "The default redo target is the first failed step or the latest applied step. This chain has no eligible redo candidate, so DeadReckon left chain state unchanged.",
+                    vec![("redo candidate".to_string(), "none".to_string())],
+                    format!("deadreckon chain show {id}"),
+                    Vec::new(),
+                )
+                .render_plain(false),
+            }
         })? as usize;
     let selected_step = chain.steps.get(index).ok_or_else(|| {
-        CliError::Core(deadreckon_core::user_error(
-            &format!("step {} does not exist", index + 1),
-            &format!("deadreckon chain show {}", chain_prefix(&chain.chain_id)),
-        ))
+        let id = chain_prefix(&chain.chain_id);
+        CliError::Surface {
+            code: 1,
+            surface: chain_transition_surface(
+                paths,
+                &chain,
+                VerdictKind::Blocked,
+                &format!("DeadReckon did not redo the step because step {} does not exist.", index + 1),
+                "The requested step is outside the chain's stored step list, so DeadReckon refused before mutating chain state.",
+                vec![
+                    ("requested step".to_string(), (index + 1).to_string()),
+                    ("step count".to_string(), chain.steps.len().to_string()),
+                ],
+                format!("deadreckon chain show {id}"),
+                Vec::new(),
+            )
+            .render_plain(false),
+        }
     })?;
     if selected_step.status == ChainStepStatus::Applied && !reapply {
         let step_number = index + 1;
