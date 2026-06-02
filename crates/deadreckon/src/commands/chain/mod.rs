@@ -874,14 +874,28 @@ async fn run_chain_conductor(
         }
         let state = if chain.steps[index].status == ChainStepStatus::Completed {
             let run_id = chain.steps[index].run_id.clone().ok_or_else(|| {
-                CliError::Core(deadreckon_core::user_error(
-                    &format!("step {} is completed but has no run id", index + 1),
-                    &format!(
-                        "deadreckon chain redo {} --step {}",
-                        chain_prefix(&chain.chain_id),
-                        index + 1
-                    ),
-                ))
+                let id = chain_prefix(&chain.chain_id);
+                let step_number = index + 1;
+                CliError::Surface {
+                    code: 1,
+                    surface: chain_transition_surface(
+                        paths,
+                        &chain,
+                        VerdictKind::Blocked,
+                        &format!(
+                            "DeadReckon did not run the chain because step {step_number} is completed but has no run id."
+                        ),
+                        "Completed chain steps must point at a recorded run before they can be replayed or applied. DeadReckon refused before continuing from inconsistent chain state.",
+                        vec![
+                            ("step".to_string(), step_number.to_string()),
+                            ("step status".to_string(), "completed".to_string()),
+                            ("run id".to_string(), "missing".to_string()),
+                        ],
+                        format!("deadreckon chain redo {id} --step {step_number}"),
+                        Vec::new(),
+                    )
+                    .render_plain(false),
+                }
             })?;
             load_run(paths, &run_id)?
         } else {
