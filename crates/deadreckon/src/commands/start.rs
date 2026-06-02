@@ -2722,6 +2722,7 @@ async fn dispatch_start_command(
                     preview: false,
                     yes: auto_confirm,
                     no_repair: false,
+                    completion_surface: false,
                 },
             )
             .await;

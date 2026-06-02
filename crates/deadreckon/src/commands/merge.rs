@@ -14,6 +14,7 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
         no_hints,
         quiet,
         plain: _plain,
+        completion_surface,
     } = args;
     let paths = DeadreckonPaths::discover();
     let resolved_id = resolve_plan_id(&paths, &plan_id)?;
@@ -218,7 +219,7 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
     )
     .await?;
     materialize_plan_docs_to_working(&paths, &plan, &library_dir, None)?;
-    if !quiet {
+    if !quiet && completion_surface {
         print_merge_finished(&paths, &plan, &merged_run, &library_dir, no_hints);
     }
     Ok(())

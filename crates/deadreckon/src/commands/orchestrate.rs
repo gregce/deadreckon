@@ -5,6 +5,7 @@ pub(crate) struct OrchestrateRunArgs {
     pub(crate) preview: bool,
     pub(crate) yes: bool,
     pub(crate) no_repair: bool,
+    pub(crate) completion_surface: bool,
 }
 
 pub(crate) struct BareOrchestrateArgs {
@@ -62,6 +63,7 @@ pub(crate) fn orchestrate_request_from_cli(
             preview: args.preview || bare.preview,
             yes: args.yes || bare.yes,
             no_repair: args.no_repair || bare.no_repair,
+            completion_surface: true,
         }),
         Some(OrchestrateCommand::FullPlan(args)) => Ok(OrchestrateRunArgs {
             plan: PlanCommandArgs {
@@ -97,6 +99,7 @@ pub(crate) fn orchestrate_request_from_cli(
             preview: args.preview || bare.preview,
             yes: args.yes || bare.yes,
             no_repair: args.no_repair || bare.no_repair,
+            completion_surface: true,
         }),
         None => interactive_orchestrate_request(bare),
     }
@@ -195,6 +198,7 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         preview,
         yes,
         no_repair,
+        completion_surface: true,
     })
 }
 
@@ -499,6 +503,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
         no_hints,
         quiet,
         plain,
+        completion_surface: args.completion_surface,
     })
     .await;
     if let Some(launch_dir) = sub_result_launch_dir {

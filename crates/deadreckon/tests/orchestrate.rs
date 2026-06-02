@@ -506,6 +506,37 @@ fn fork_completion_uses_one_verdict_surface() {
 }
 
 #[test]
+fn merge_completion_uses_one_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let plan = plan_and_fork_smoke(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["merge", &plan.plan_id[..8], "--plain"])
+        .output()
+        .expect("merge");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    let merged = load_plan(&paths, &plan.plan_id).expect("merged plan");
+    let merged_run_id = merged.merged_run_id.as_deref().expect("result run");
+    assert_verdict_surface(
+        &out,
+        &format!("completed plan {}", &plan.plan_id[..8]),
+        &format!("deadreckon finish {}", &plan.plan_id[..8]),
+    );
+    assert!(out.contains(&merged_run_id[..8]), "{out}");
+    assert!(out.contains("artifact library"), "{out}");
+    assert!(!out.contains("finish:"), "{out}");
+    assert!(!out.contains("apply:"), "{out}");
+    assert!(!out.contains("export:"), "{out}");
+    assert!(out.contains("provider roles"), "{out}");
+    assert!(out.contains("dependencies"), "{out}");
+}
+
+#[test]
 fn orchestrate_review_preview_shows_coder_reviewer_providers_without_forking() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

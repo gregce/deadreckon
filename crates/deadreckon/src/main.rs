@@ -967,6 +967,7 @@ async fn main_inner() -> Result<()> {
                 no_hints,
                 quiet,
                 plain,
+                completion_surface: true,
             })
             .await
         }
@@ -7025,13 +7026,58 @@ fn print_merge_finished(
     library_dir: &Path,
     no_hints: bool,
 ) {
+    let id = run_prefix(&plan.plan_id);
+    let finish = format!("deadreckon finish {id}");
+    let mut secondary = Vec::new();
+    if plan_apply_git_root(plan).ok().flatten().is_some() {
+        secondary.push(format!("deadreckon apply {id}"));
+    }
+    secondary.push(format!(
+        "deadreckon export {} --dest ./{}",
+        id,
+        deadreckon_core::paths::task_key(&plan.root_goal)
+            .chars()
+            .take(24)
+            .collect::<String>()
+    ));
+    secondary.push(format!("deadreckon show {id}"));
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .count();
     println!(
-        "{} {}",
-        ui_ok("completed plan"),
-        ui_id(run_prefix(&plan.plan_id))
+        "{}",
+        VerdictSurface::try_new(
+            VerdictKind::Completed,
+            "plan",
+            Some(&id),
+            ExplanationPanel::new(
+                "DeadReckon merged the child artifacts into a promoted result run.",
+                "The plan now has a completed result; finish is the canonical next command for landing or exporting it.",
+                vec![
+                    ("plan".to_string(), id.clone()),
+                    ("result run".to_string(), run_prefix(&merged_run.run_id)),
+                    (
+                        "artifact library".to_string(),
+                        library_dir.display().to_string(),
+                    ),
+                    ("status".to_string(), plan_status_label(plan.status).to_string()),
+                    (
+                        "tasks".to_string(),
+                        format!("{completed}/{} completed", plan.tasks.len()),
+                    ),
+                ],
+            ),
+            vec![("Recommended", finish.as_str())],
+            secondary
+                .iter()
+                .map(|command| ("Secondary", command.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .expect("merge completion verdict surface must have one primary action")
+        .render_plain(!completion_hints_enabled(no_hints))
     );
-    println!("result run (secondary) {}", run_prefix(&merged_run.run_id));
-    println!("artifact library {}", library_dir.display());
     commands::plan::print_orchestration_role_table(plan, true, None);
     commands::plan::print_orchestration_dependency_summary(plan);
     let repair_summary = plan_merge_repair_summary_items(paths, plan);
@@ -7042,32 +7088,6 @@ fn print_merge_finished(
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect::<Vec<_>>();
         print_kv_block(&repair_items);
-    }
-    if !no_hints {
-        println!(
-            "{} {}",
-            ui_command("finish:"),
-            ui_command(format!("deadreckon finish {}", run_prefix(&plan.plan_id)))
-        );
-        if plan_apply_git_root(plan).ok().flatten().is_some() {
-            println!(
-                "{} {}",
-                ui_command("apply:"),
-                ui_command(format!("deadreckon apply {}", run_prefix(&plan.plan_id)))
-            );
-        }
-        println!(
-            "{} {}",
-            ui_command("export:"),
-            ui_command(format!(
-                "deadreckon export {} --dest ./{}",
-                run_prefix(&plan.plan_id),
-                deadreckon_core::paths::task_key(&plan.root_goal)
-                    .chars()
-                    .take(24)
-                    .collect::<String>()
-            ))
-        );
     }
 }
 
