@@ -29,11 +29,4 @@ status: 0
 |   attach        deadreckon attach <ID8>                                                                           |
 |   show          deadreckon show <ID8>                                                                             |
 +----------------------------------------------------------------------------------------------------------------------+
-primary action:
-  recommended: deadreckon finish <ID8> --dest ./attach-characterize-<SLUG>
-secondary actions:
-  export: deadreckon export <ID8> --dest ./attach-characterize-<SLUG>
-  extend: deadreckon extend <ID8> '<your follow-up goal>'
-  show: deadreckon show <ID8>
-  docs: deadreckon doc <ID8> --kind decisions
 --- stderr ---

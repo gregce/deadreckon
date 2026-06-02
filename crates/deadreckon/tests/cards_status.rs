@@ -283,15 +283,21 @@ fn status_report_has_one_primary_action_and_demoted_secondary_actions() {
 
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("primary action:"), "{out}");
-    assert_eq!(count_action_label(&out, "recommended"), 1, "{out}");
+    assert!(out.contains("completed run"), "{out}");
+    assert!(out.contains("Explanation\n"), "{out}");
+    assert!(out.contains("Evidence\n"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
     assert_eq!(count_action_label(&out, "next"), 0, "{out}");
     assert!(
-        out.contains(&format!("deadreckon finish {}", &state.run_id[..8])),
+        out.contains(&format!(
+            "Recommended\ndeadreckon finish {}",
+            &state.run_id[..8]
+        )),
         "{out}"
     );
-    assert!(out.contains("secondary actions:"), "{out}");
-    assert_eq!(out.matches("secondary actions:").count(), 1, "{out}");
+    assert!(out.contains("Secondary\n"), "{out}");
+    assert!(!out.contains("primary action:"), "{out}");
+    assert!(!out.contains("secondary actions:"), "{out}");
 }
 
 fn state(temp: &TempDir, goal: &str) -> (DeadreckonPaths, deadreckon_core::PipelineState) {

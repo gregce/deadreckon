@@ -2170,17 +2170,19 @@ fn post_run_hint_lists_apply_and_abandon_lines() {
         .expect("run");
     let short = &run.run_id[..8];
     let stdout = stdout(&output);
-    assert!(stdout.contains("primary action:"));
-    assert!(stdout.contains(&format!(
-        "recommended: deadreckon finish {short} --autostash --cleanup"
-    )));
+    assert!(!stdout.contains("primary action:"), "{stdout}");
+    assert!(!stdout.contains("secondary actions:"), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    let recommended_command_lines = stdout
+        .lines()
+        .filter(|line| line.contains("recommended") && line.contains("deadreckon "))
+        .count();
+    assert_eq!(recommended_command_lines, 1, "{stdout}");
+    assert!(stdout.contains(&format!("deadreckon finish {short} --autostash --cleanup")));
     assert!(!stdout.contains("next:"), "{stdout}");
-    assert!(stdout.contains("secondary actions:"));
-    assert!(stdout.contains(&format!("apply: deadreckon apply {short}")));
-    assert!(stdout.contains(&format!(
-        "cleanup: deadreckon apply {short} --autostash --cleanup"
-    )));
-    assert!(stdout.contains(&format!("cleanup: deadreckon cleanup {short}")));
+    assert!(stdout.contains(&format!("deadreckon apply {short}")));
+    assert!(stdout.contains(&format!("deadreckon apply {short} --autostash --cleanup")));
+    assert!(stdout.contains(&format!("deadreckon cleanup {short}")));
 }
 
 fn run_worktree_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> String {

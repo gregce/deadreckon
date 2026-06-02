@@ -129,21 +129,32 @@ pub(crate) fn finish_command(
                 ui_id(&state.run_id)
             );
             println!("  working: {}", state.working_dir.display());
-            print_action_block(
-                &HintLine {
-                    label: "next".to_string(),
-                    command: format!("deadreckon show {prefix}"),
-                },
-                &[
-                    HintLine {
-                        label: "docs".to_string(),
-                        command: format!("deadreckon doc {prefix} --kind decisions"),
-                    },
-                    HintLine {
-                        label: "undo".to_string(),
-                        command: format!("deadreckon undo --run {prefix}"),
-                    },
-                ],
+            println!(
+                "{}",
+                VerdictSurface::try_new(
+                    VerdictKind::Completed,
+                    "run",
+                    Some(&prefix),
+                    ExplanationPanel::new(
+                        "DeadReckon finished the in-place run and left the checkout as the result.",
+                        "The safest next command is inspection because the changes already live in the working tree.",
+                        vec![
+                            ("run".to_string(), prefix.clone()),
+                            ("status".to_string(), run_status_label(state.status).to_string()),
+                            ("working".to_string(), state.working_dir.display().to_string()),
+                        ],
+                    ),
+                    vec![("Recommended", format!("deadreckon show {prefix}"))],
+                    vec![
+                        (
+                            "Secondary",
+                            format!("deadreckon doc {prefix} --kind decisions"),
+                        ),
+                        ("Secondary", format!("deadreckon undo --run {prefix}")),
+                    ],
+                )
+                .expect("in-place finish verdict surface must have one primary action")
+                .render_plain(false)
             );
             Ok(())
         }
@@ -1498,7 +1509,7 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     }
     fire_lifecycle_notification(&paths, &state, &outcome).await;
     if completed && post_actions {
-        Box::pin(complete_run_actions(&state, true)).await?;
+        Box::pin(complete_run_actions(&state, true, true)).await?;
     }
     Ok(())
 }
@@ -1748,7 +1759,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
     }
     fire_lifecycle_notification(&paths, &state, &outcome).await;
     if completed && post_actions {
-        Box::pin(complete_run_actions(&state, true)).await?;
+        Box::pin(complete_run_actions(&state, true, true)).await?;
     }
     Ok(())
 }

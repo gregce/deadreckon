@@ -7632,7 +7632,7 @@ fn completed_proof_block(
     let paths = DeadreckonPaths::discover();
     let next_command = hints
         .iter()
-        .find(|(label, _)| matches!(label.as_str(), "apply" | "export" | "undo" | "finish"))
+        .find(|(label, _)| matches!(label.as_str(), "finish" | "apply" | "export" | "undo"))
         .or_else(|| hints.first())
         .map(|(_, command)| command.clone())
         .unwrap_or_else(|| format!("deadreckon show {}", run_prefix(&state.run_id)));
@@ -7709,7 +7709,31 @@ fn exit_summary_hints(
                 .unwrap_or(CodebaseMode::Fresh)
             {
                 CodebaseMode::Worktree => {
+                    if let Some(worktree) =
+                        codebase.and_then(|record| record.worktree_path.as_ref())
+                    {
+                        hints.push((
+                            "inspect".to_string(),
+                            format!("cd {} && git status", worktree.display()),
+                        ));
+                    }
+                    hints.push((
+                        "finish".to_string(),
+                        format!("deadreckon finish {prefix} --autostash --cleanup"),
+                    ));
                     hints.push(("apply".to_string(), format!("deadreckon apply {prefix}")));
+                    hints.push((
+                        "cleanup".to_string(),
+                        format!("deadreckon apply {prefix} --autostash --cleanup"),
+                    ));
+                    hints.push((
+                        "cleanup".to_string(),
+                        format!("deadreckon cleanup {prefix}"),
+                    ));
+                    hints.push((
+                        "docs".to_string(),
+                        format!("deadreckon doc {prefix} --kind decisions"),
+                    ));
                 }
                 CodebaseMode::Copy | CodebaseMode::Fresh => {
                     hints.push((
@@ -10156,8 +10180,13 @@ fn print_run_started_with_label(
 }
 
 fn print_lifecycle_hints(state: &deadreckon_core::PipelineState) {
-    let (primary, secondary) = lifecycle_actions(state);
-    print_action_block(&primary, &secondary);
+    print!(
+        "{}",
+        run_lifecycle_surface(state)
+            .render_plain(false)
+            .trim_end_matches('\n')
+    );
+    println!();
 }
 
 fn lifecycle_actions(state: &deadreckon_core::PipelineState) -> (HintLine, Vec<HintLine>) {
@@ -10290,30 +10319,71 @@ fn lifecycle_actions(state: &deadreckon_core::PipelineState) -> (HintLine, Vec<H
     )
 }
 
-fn print_action_block(primary: &HintLine, secondary: &[HintLine]) {
-    println!("{}", ui_heading("primary action:"));
-    print_primary_action_line(primary);
-    if !secondary.is_empty() {
-        println!("{}", ui_heading("secondary actions:"));
-        for action in secondary {
-            print_action_line(action);
-        }
-    }
-}
-
-fn print_primary_action_line(action: &HintLine) {
-    println!("  recommended: {}", ui_command(&action.command));
-}
-
-fn print_action_line(action: &HintLine) {
-    println!("  {}: {}", action.label, ui_command(&action.command));
+fn run_lifecycle_surface(state: &deadreckon_core::PipelineState) -> VerdictSurface {
+    let id = run_prefix(&state.run_id);
+    let (primary, secondary) = lifecycle_actions(state);
+    let (kind, what, why) = match state.status {
+        RunStatus::Completed => (
+            VerdictKind::Completed,
+            "The run has completed and DeadReckon has recorded its result state.",
+            "The recommended command is the safest next lifecycle action for inspecting, landing, or exporting this result.",
+        ),
+        RunStatus::Failed => (
+            VerdictKind::Failed,
+            "The run ended before producing a verified result.",
+            "Failure inspection is the safest next step before resuming or applying any work.",
+        ),
+        RunStatus::Killed => (
+            VerdictKind::Killed,
+            "The run was stopped before normal completion.",
+            "DeadReckon cannot treat a killed run as complete; inspect or resume it before cleanup.",
+        ),
+        RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => (
+            VerdictKind::Paused,
+            "The run has state on disk but has not reached a terminal completed result.",
+            "Attaching is the safest next command because it shows the live or resumable run state before any mutation.",
+        ),
+    };
+    VerdictSurface::try_new(
+        kind,
+        "run",
+        Some(&id),
+        ExplanationPanel::new(
+            what,
+            why,
+            vec![
+                ("run".to_string(), id.clone()),
+                (
+                    "status".to_string(),
+                    run_status_label(state.status).to_string(),
+                ),
+                (
+                    "state".to_string(),
+                    state.state_path().display().to_string(),
+                ),
+                (
+                    "working".to_string(),
+                    state.working_dir.display().to_string(),
+                ),
+            ],
+        ),
+        vec![("Recommended", primary.command.as_str())],
+        secondary
+            .iter()
+            .map(|action| ("Secondary", action.command.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("run lifecycle verdict surface must have one primary action")
 }
 
 async fn complete_run_actions(
     state: &deadreckon_core::PipelineState,
     allow_prompt: bool,
+    print_hints: bool,
 ) -> Result<()> {
-    print_lifecycle_hints(state);
+    if print_hints {
+        print_lifecycle_hints(state);
+    }
     if allow_prompt && io::stdin().is_terminal() && io::stdout().is_terminal() {
         completion_action_loop(state).await?;
     }

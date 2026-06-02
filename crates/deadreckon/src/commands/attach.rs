@@ -140,7 +140,6 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
         if state.status == RunStatus::Completed && show_hints {
             print_exit_summary_card(&state, &RunLoopOutcome::Done, args.plain);
             print_chain_context_for_working(&state.working_dir);
-            print_lifecycle_hints(&state);
         }
         return Ok(());
     }
@@ -155,7 +154,6 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     if state.status == RunStatus::Completed && show_hints {
         print_exit_summary_card(&state, &RunLoopOutcome::Done, args.plain);
         print_chain_context_for_working(&state.working_dir);
-        print_lifecycle_hints(&state);
     } else {
         print_run_summary(&state);
     }

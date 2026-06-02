@@ -240,7 +240,7 @@ fn exit_summary_subtitle(input: &ExitSummaryInput) -> String {
 
 fn exit_summary_primary_action(input: &ExitSummaryInput) -> Option<HintLine> {
     let priorities: &[&str] = match input.outcome {
-        OutcomeKind::Completed => &["apply", "export", "undo", "finish"],
+        OutcomeKind::Completed => &["finish", "apply", "export", "undo"],
         OutcomeKind::Paused => &["resume"],
         OutcomeKind::Failed | OutcomeKind::Killed => &["why", "logs"],
     };

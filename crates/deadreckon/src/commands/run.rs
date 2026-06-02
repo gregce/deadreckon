@@ -395,7 +395,7 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     }
     super::lifecycle::fire_lifecycle_notification(&paths, &state, &outcome).await;
     if completed && completion_hints_enabled(effective_no_hints) {
-        complete_run_actions(&state, !auto_confirm).await?;
+        complete_run_actions(&state, !auto_confirm, false).await?;
     }
     Ok(())
 }

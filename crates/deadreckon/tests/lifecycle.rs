@@ -1942,16 +1942,23 @@ fn finish_in_place_run_has_one_primary_action_and_demoted_secondary_actions() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("finished in-place run"), "{stdout}");
-    assert!(stdout.contains("primary action:"), "{stdout}");
-    assert_eq!(count_action_label(&stdout, "recommended"), 1, "{stdout}");
+    assert!(stdout.contains("completed run"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
     assert_eq!(count_action_label(&stdout, "next"), 0, "{stdout}");
     assert!(
-        stdout.contains(&format!("deadreckon show {}", &parent.run_id[..8])),
+        stdout.contains(&format!(
+            "Recommended\ndeadreckon show {}",
+            &parent.run_id[..8]
+        )),
         "{stdout}"
     );
-    assert!(stdout.contains("secondary actions:"), "{stdout}");
+    assert!(stdout.contains("Secondary\n"), "{stdout}");
     assert!(stdout.contains("deadreckon doc"), "{stdout}");
     assert!(stdout.contains("deadreckon undo"), "{stdout}");
+    assert!(!stdout.contains("primary action:"), "{stdout}");
+    assert!(!stdout.contains("secondary actions:"), "{stdout}");
 }
 
 #[test]
