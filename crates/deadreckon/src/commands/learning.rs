@@ -893,10 +893,11 @@ fn latest_candidate_for_proposal(
 ) -> Result<LearningCandidate> {
     let dir = paths.learning_candidates_dir();
     if !dir.exists() {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "no self-improvement candidate evidence exists",
-            &format!("deadreckon improve self {proposal_id} --yes"),
-        )));
+        return Err(missing_self_improve_candidate_error(
+            paths,
+            proposal_id,
+            "candidate store missing",
+        ));
     }
     let mut candidates = Vec::new();
     for entry in fs::read_dir(&dir)? {
@@ -917,11 +918,44 @@ fn latest_candidate_for_proposal(
         .map(|(_, candidate)| candidate)
         .next()
         .ok_or_else(|| {
-            CliError::Core(deadreckon_core::user_error(
-                "no candidate evidence exists for this proposal",
-                &format!("deadreckon improve self {proposal_id} --yes"),
-            ))
+            missing_self_improve_candidate_error(
+                paths,
+                proposal_id,
+                "no candidate matched this proposal",
+            )
         })
+}
+
+fn missing_self_improve_candidate_error(
+    paths: &DeadreckonPaths,
+    proposal_id: &str,
+    reason: &str,
+) -> CliError {
+    let primary = format!("deadreckon improve self {proposal_id} --yes");
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "improve",
+            Some("self"),
+            ExplanationPanel::new(
+                "DeadReckon could not prepare the self-improvement PR dry run because no candidate evidence exists yet.",
+                "The PR dry-run depends on a previously verified candidate, so running the isolated candidate is the safest next step.",
+                vec![
+                    ("proposal".to_string(), proposal_id.to_string()),
+                    ("reason".to_string(), reason.to_string()),
+                    (
+                        "candidate evidence".to_string(),
+                        paths.learning_candidates_dir().display().to_string(),
+                    ),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![("Secondary", "deadreckon learn report")],
+        )
+        .expect("missing self-improvement candidate verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(false)),
+    }
 }
 
 fn read_candidate_eval(paths: &DeadreckonPaths, candidate_id: &str) -> Result<LearningEval> {

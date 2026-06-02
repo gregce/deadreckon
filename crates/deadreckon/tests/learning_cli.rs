@@ -557,7 +557,7 @@ fn learn_and_improve_help_use_provider_route_and_done_criteria_vocabulary() {
 }
 
 #[test]
-fn improve_self_refusals_emit_canonical_try_footers() {
+fn improve_self_missing_candidate_refusal_uses_verdict_surface() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path());
     let proposal = LearningProposal {
@@ -591,8 +591,18 @@ fn improve_self_refusals_emit_canonical_try_footers() {
 
     assert_failure(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("try:"));
-    assert!(stderr.contains("deadreckon improve self prop-refusal --yes"));
+    assert!(stderr.contains("blocked improve self"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon improve self prop-refusal --yes"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("proposal: prop-refusal"), "{stderr}");
+    assert!(stderr.contains("candidate evidence:"), "{stderr}");
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]
