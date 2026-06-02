@@ -32,7 +32,7 @@ mod common;
 use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
 
 #[test]
-fn chain_help_topics_use_one_recommended_footer() {
+fn chain_help_topics_use_one_next_footer() {
     let temp = TempDir::new().expect("tempdir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let topics = [
@@ -54,11 +54,13 @@ fn chain_help_topics_use_one_recommended_footer() {
 
         assert_success(&output);
         let stdout = stdout(&output);
-        assert_eq!(stdout.matches("recommended:").count(), 1, "{stdout}");
-        assert!(
-            stdout.contains(&format!("recommended: {command}")),
-            "{stdout}"
-        );
+        let next_footer_count = stdout
+            .lines()
+            .filter(|line| line.starts_with("next "))
+            .count();
+        assert_eq!(stdout.matches("recommended:").count(), 0, "{stdout}");
+        assert_eq!(next_footer_count, 1, "{stdout}");
+        assert!(stdout.contains(&format!("next {command}")), "{stdout}");
         assert!(!stdout.contains("next:"), "{stdout}");
         assert!(!stdout.contains("try:"), "{stdout}");
     }

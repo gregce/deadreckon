@@ -115,7 +115,7 @@ fn print_chain_help(topic: Option<&str>) {
 }
 
 fn print_chain_help_recommended(command: &str) {
-    println!("recommended: {}", ui_command(command));
+    println!("next {}", ui_command(command));
 }
 
 pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
