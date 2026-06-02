@@ -100,41 +100,59 @@ pub(crate) fn list_command(
         return Ok(());
     }
     let header = list_header();
-    println!("{}", ui_heading(header));
+    let mut output = String::new();
+    output.push_str(&ui_heading(header));
+    output.push('\n');
     let goal_width = list_goal_width();
     for entry in entries {
         match entry {
             ListEntry::Run(run) => {
-                print_list_row(&ListRow {
-                    id: run_prefix(&run.run_id),
-                    status: run_status_label(run.status).to_string(),
-                    age: relative_age(run.updated_at),
-                    scope: run.scope.clone(),
-                    kind: "run".to_string(),
-                    mode: codebase_mode_status(&paths, &run),
-                    action: next_action_label_for_entry(&paths, &run),
-                    goal: run.goal.clone(),
-                    goal_width,
-                    orchestration: false,
-                });
+                let state = load_state(&run.state_path).ok();
+                let mode = state
+                    .as_ref()
+                    .map(|state| codebase_mode_status(&paths, state))
+                    .unwrap_or_else(|| "-".to_string());
+                let action = state
+                    .as_ref()
+                    .map(|state| next_action_label(&paths, state))
+                    .unwrap_or_else(|| "-".to_string());
+                append_list_row(
+                    &mut output,
+                    &ListRow {
+                        id: run_prefix(&run.run_id),
+                        status: run_status_label(run.status).to_string(),
+                        age: relative_age(run.updated_at),
+                        scope: run.scope.clone(),
+                        kind: "run".to_string(),
+                        mode,
+                        action,
+                        goal: run.goal.clone(),
+                        goal_width,
+                        orchestration: false,
+                    },
+                );
             }
             ListEntry::Plan(plan) => {
-                print_list_row(&ListRow {
-                    id: run_prefix(&plan.plan_id),
-                    status: plan_status_label(plan.status).to_string(),
-                    age: relative_age(plan.updated_at),
-                    scope: plan.scope.clone(),
-                    kind: "orchestrate".to_string(),
-                    mode: plan_mode_label(plan.mode).to_string(),
-                    action: plan_action_label(&plan),
-                    goal: plan.goal.clone(),
-                    goal_width,
-                    orchestration: true,
-                });
+                append_list_row(
+                    &mut output,
+                    &ListRow {
+                        id: run_prefix(&plan.plan_id),
+                        status: plan_status_label(plan.status).to_string(),
+                        age: relative_age(plan.updated_at),
+                        scope: plan.scope.clone(),
+                        kind: "orchestrate".to_string(),
+                        mode: plan_mode_label(plan.mode).to_string(),
+                        action: plan_action_label(&plan),
+                        goal: plan.goal.clone(),
+                        goal_width,
+                        orchestration: true,
+                    },
+                );
             }
         }
     }
-    print_list_action_footer();
+    append_list_action_footer(&mut output);
+    print!("{output}");
     Ok(())
 }
 
@@ -181,15 +199,15 @@ fn empty_list_surface(scope: Option<&str>, all: bool) -> VerdictSurface {
     .expect("empty list verdict surface must be valid")
 }
 
-fn print_list_action_footer() {
-    println!();
-    println!("Recommended");
-    println!("deadreckon status latest");
-    println!();
-    println!("Secondary");
-    println!("deadreckon list --all");
-    println!("deadreckon attach <id>");
-    println!("deadreckon show <id>");
+fn append_list_action_footer(output: &mut String) {
+    output.push('\n');
+    output.push_str("Recommended\n");
+    output.push_str("deadreckon status latest\n");
+    output.push('\n');
+    output.push_str("Secondary\n");
+    output.push_str("deadreckon list --all\n");
+    output.push_str("deadreckon attach <id>\n");
+    output.push_str("deadreckon show <id>\n");
 }
 
 const LIST_ID_WIDTH: usize = 8;
@@ -227,7 +245,7 @@ fn list_header() -> String {
     )
 }
 
-fn print_list_row(row: &ListRow) {
+fn append_list_row(output: &mut String, row: &ListRow) {
     let first_prefix = format!(
         "{}  {}  {}  {}  {}  {}  {}  ",
         pad_rendered(&row.id, LIST_ID_WIDTH, Some(ui_id)),
@@ -246,10 +264,13 @@ fn print_list_row(row: &ListRow) {
     let goal_lines = wrap_list_goal(&row.goal, row.goal_width);
     for (index, line) in goal_lines.iter().enumerate() {
         if index == 0 {
-            println!("{first_prefix}{line}");
+            output.push_str(&first_prefix);
+            output.push_str(line);
         } else {
-            println!("{continuation_prefix}{line}");
+            output.push_str(&continuation_prefix);
+            output.push_str(line);
         }
+        output.push('\n');
     }
 }
 

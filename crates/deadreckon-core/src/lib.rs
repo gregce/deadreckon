@@ -100,5 +100,5 @@ pub use polish_subcalls::{
 pub use promotion::{PromotionManifest, promote_completed_run, recover_promotion};
 pub use state::{
     CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, RunListEntry, RunOptions,
-    RunStatus, create_run, list_runs, load_run, save_state,
+    RunStatus, create_run, list_runs, load_run, load_state, save_state,
 };
