@@ -146,7 +146,7 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
         if completion_hints_enabled(false)
             && let Some(record) = deadreckon_runtime::read_polish_record(&state)?
         {
-            print_doc_polish_summary(&record);
+            print_doc_polish_summary(&state, &record);
         }
         save_state(&state)?;
     }
@@ -469,24 +469,70 @@ fn doc_polish_cost_label(estimate: &SpendEstimate) -> String {
     }
 }
 
-fn print_doc_polish_summary(record: &deadreckon_runtime::PolishRecord) {
-    println!("{}", ui_heading("doc polish:"));
-    println!("  status:   {}", record.status);
+fn print_doc_polish_summary(
+    state: &deadreckon_core::PipelineState,
+    record: &deadreckon_runtime::PolishRecord,
+) {
+    let id = run_prefix(&state.run_id);
+    let successful = record.status == "polished";
+    let kind = if successful {
+        VerdictKind::Completed
+    } else {
+        VerdictKind::Failed
+    };
+    let what = if successful {
+        "DeadReckon polished the run documentation."
+    } else {
+        "Doc polish did not complete cleanly."
+    };
+    let why = if successful {
+        "The polish record completed successfully; the recommended command opens the refreshed narrative through DeadReckon."
+    } else {
+        "The polish record contains an error, so rerunning polish is the primary recovery command while fallback docs remain available."
+    };
+    let primary = if successful {
+        format!("deadreckon doc {id} --kind narrative")
+    } else {
+        format!("deadreckon doc {id} --polish --no-confirm --force")
+    };
+    let mut evidence = vec![
+        ("run".to_string(), id.clone()),
+        ("status".to_string(), record.status.clone()),
+        ("cost".to_string(), format!("${:.6}", record.cost_usd)),
+        ("completed".to_string(), record.completed_at.clone()),
+    ];
     if let Some(provider) = record.provider.as_deref() {
-        println!("  provider: {provider}");
+        evidence.push(("provider".to_string(), provider.to_string()));
     }
-    println!("  cost:     ${:.6}", record.cost_usd);
-    if !record.subcalls.is_empty() {
-        println!("  subcalls:");
-        for subcall in &record.subcalls {
-            println!(
-                "    {} {:<18} {} in / {} out ${:.6}",
-                ui_status(&subcall.status),
-                subcall.skill,
-                subcall.tokens_in,
-                subcall.tokens_out,
-                subcall.cost_usd
-            );
-        }
+    if let Some(source) = record.doc_provider_source.as_deref() {
+        evidence.push(("provider source".to_string(), source.to_string()));
     }
+    if let Some(error) = record.error.as_deref() {
+        evidence.push(("error".to_string(), error.to_string()));
+    }
+    for subcall in &record.subcalls {
+        evidence.push((
+            format!("subcall {}", subcall.skill),
+            format!(
+                "{} {} in / {} out ${:.6}",
+                subcall.status, subcall.tokens_in, subcall.tokens_out, subcall.cost_usd
+            ),
+        ));
+    }
+    print!(
+        "{}",
+        VerdictSurface::try_new(
+            kind,
+            "doc",
+            Some(&id),
+            ExplanationPanel::new(what, why, evidence),
+            vec![("Recommended", primary.as_str())],
+            vec![
+                ("Secondary", format!("deadreckon doc {id} --kind as-built")),
+                ("Secondary", format!("deadreckon doc {id} --kind decisions")),
+            ],
+        )
+        .expect("doc polish verdict surface must have one primary action")
+        .render_plain(false)
+    );
 }

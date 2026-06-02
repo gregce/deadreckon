@@ -1143,7 +1143,19 @@ async fn doc_polish_triggers_fresh_call_with_confirm() {
         .expect("doc");
     assert_success(&output);
     assert_eq!(server.journal().len(), 4);
-    assert!(stdout(&output).contains("doc polish:"));
+    let out = stdout(&output);
+    assert!(out.starts_with("completed doc"), "{out}");
+    assert!(out.contains("Explanation\n"), "{out}");
+    assert!(out.contains("Evidence\n"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains(&format!(
+            "Recommended\ndeadreckon doc {} --kind narrative",
+            &state.run_id[..8]
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("doc polish:"), "{out}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1170,7 +1182,11 @@ async fn post_polish_summary_lists_each_subcall_status() {
         .expect("doc");
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("subcalls:"));
+    assert!(out.starts_with("completed doc"), "{out}");
+    assert!(out.contains("Explanation\n"), "{out}");
+    assert!(out.contains("Evidence\n"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(!out.contains("subcalls:"), "{out}");
     assert!(out.contains("narrator-overview"));
     assert!(out.contains("narrator-phases"));
     assert!(out.contains("narrator-as-built"));
