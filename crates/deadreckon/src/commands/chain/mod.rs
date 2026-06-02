@@ -1876,6 +1876,9 @@ fn chain_primary_action(chain: &Chain) -> String {
     let id = chain_prefix(&chain.chain_id);
     match chain.status {
         ChainStatus::Failed => format!("deadreckon chain show {id} --why-failed"),
+        ChainStatus::Paused if chain_paused_for_dirty_target(chain) => {
+            format!("git -C {} status --short", chain.cwd.display())
+        }
         ChainStatus::Paused if chain_paused_for_hook_refusal(chain) => {
             "deadreckon chain hooks list".to_string()
         }
@@ -1887,6 +1890,13 @@ fn chain_primary_action(chain: &Chain) -> String {
         ChainStatus::Completed | ChainStatus::Undone => format!("deadreckon chain show {id}"),
         ChainStatus::Killed => format!("deadreckon chain show {id} --why-failed"),
     }
+}
+
+fn chain_paused_for_dirty_target(chain: &Chain) -> bool {
+    chain
+        .paused_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("apply_refused_dirty_target"))
 }
 
 fn chain_paused_for_hook_refusal(chain: &Chain) -> bool {
@@ -1908,6 +1918,8 @@ fn chain_paused_what(reason: Option<&str>) -> &'static str {
         "The chain paused because the on-promote hook refused auto-apply."
     } else if reason.is_some_and(|reason| reason.starts_with("apply_paused_by_hook_on_promote")) {
         "The chain paused because the on-promote hook requested an operator pause."
+    } else if reason.is_some_and(|reason| reason.starts_with("apply_refused_dirty_target")) {
+        "The chain paused because auto-apply found uncommitted target changes."
     } else if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
         "The chain paused because auto-apply refused a file outside the apply allowlist."
     } else {
@@ -1920,6 +1932,8 @@ fn chain_paused_why(reason: Option<&str>) -> &'static str {
         "The hook policy blocked promotion, so inspecting configured chain hooks is the primary next command before resuming."
     } else if reason.is_some_and(|reason| reason.starts_with("apply_paused_by_hook_on_promote")) {
         "The hook requested a resumable pause, so resuming the chain is the primary next command after the operator check."
+    } else if reason.is_some_and(|reason| reason.starts_with("apply_refused_dirty_target")) {
+        "The source repo has local changes, so inspecting the dirty state is the primary next command before stashing, committing, or resuming."
     } else if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
         "Previewing the diff is the primary next command before widening the allowlist or manually applying the step."
     } else {

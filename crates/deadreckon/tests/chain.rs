@@ -1054,6 +1054,66 @@ fn apply_mode_auto_refuses_when_file_outside_allowlist() {
 }
 
 #[test]
+fn apply_mode_auto_dirty_target_uses_reasoned_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_hook(
+        &repo,
+        "post-step",
+        "#!/bin/sh\necho dirty > dirty-target.txt\nexit 0\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "2",
+            "dirty target",
+            "never reached",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    let chain = newest_chain(&paths);
+    assert!(stdout.contains("paused chain"), "{stdout}");
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Recommended\ngit -C {} status --short",
+            chain.cwd.display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("The chain paused because auto-apply found uncommitted target changes."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("apply_refused_dirty_target"), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
+    assert!(!stdout.contains("hint:"), "{stdout}");
+    assert_eq!(chain.status, ChainStatus::Paused);
+    assert!(
+        chain
+            .paused_reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("apply_refused_dirty_target")
+    );
+    assert_ne!(chain.steps[0].status, ChainStepStatus::Applied);
+}
+
+#[test]
 fn apply_mode_manual_pauses_chain_after_inner_completion() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
