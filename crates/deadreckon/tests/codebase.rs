@@ -740,7 +740,7 @@ fn non_tty_without_yes_refuses() {
     assert!(!output.status.success());
     let stderr = stderr(&output);
     assert!(stderr.contains("non-interactive without --yes"));
-    assert!(stderr.contains("try: --yes, --quiet, or run interactively"));
+    assert_blocked_run_surface(&stderr, "deadreckon run \"needs yes\" --yes");
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 

@@ -233,10 +233,11 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     }
     if !auto_confirm {
         if !io::stdin().is_terminal() {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                "non-interactive without --yes",
-                "--yes, --quiet, or run interactively",
-            )));
+            return Err(run_confirmation_refusal_error(
+                &goal,
+                &run_id,
+                effective_no_hints,
+            ));
         }
         if !prompt::confirm("continue?", true)? {
             println!("cancelled");
@@ -397,6 +398,31 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         complete_run_actions(&state, !auto_confirm).await?;
     }
     Ok(())
+}
+
+fn run_confirmation_refusal_error(goal: &str, run_id: &str, no_hints: bool) -> CliError {
+    let primary = format!("deadreckon run {} --yes", run_goal_argument(goal));
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "run",
+            None,
+            ExplanationPanel::new(
+                "non-interactive without --yes",
+                "DeadReckon printed the launch preview, then refused to create run state because this shell cannot answer the confirmation prompt.",
+                [
+                    ("command".to_string(), "run".to_string()),
+                    ("goal".to_string(), goal.to_string()),
+                    ("preview run".to_string(), run_id.to_string()),
+                ],
+            ),
+            [("Recommended", primary)],
+            std::iter::empty::<(&str, String)>(),
+        )
+        .expect("run confirmation refusal verdict surface must be valid")
+        .render_plain(!completion_hints_enabled(no_hints)),
+    }
 }
 
 fn run_codebase_refusal_error(err: DeadreckonError, goal: &str, no_hints: bool) -> CliError {
