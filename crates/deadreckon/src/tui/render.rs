@@ -238,14 +238,60 @@ pub(crate) fn chain_activity_lines(
 
 pub(crate) fn chain_attach_footer_text(chain: &Chain) -> String {
     if chain.status == ChainStatus::Paused {
-        let id = run_prefix(&chain.chain_id);
+        let surface = chain_paused_attach_footer_surface(chain);
         let reason = chain.paused_reason.as_deref().unwrap_or("paused");
+        let evidence = surface
+            .explanation
+            .evidence
+            .iter()
+            .map(|(key, value)| format!("{key} {value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let other = surface
+            .secondary_actions
+            .iter()
+            .map(|action| action.command.clone())
+            .collect::<Vec<_>>()
+            .join("; ");
         format!(
-            "paused: {reason} | recommended: deadreckon chain resume {id} | secondary: deadreckon chain show {id} --why-failed; deadreckon chain resume {id} --apply-mode preview; deadreckon chain undo {id} | q detach"
+            "{} | why {reason} | evidence {evidence} | next {} | other {other} | q detach",
+            surface.label(),
+            surface.primary_action.command
         )
     } else {
         "[Enter] drill  [r] redo  [e] extend  [p] pause  [k] kill  [Ctrl-D/q/Esc] detach  j/k move  PgUp/PgDn activity".to_string()
     }
+}
+
+fn chain_paused_attach_footer_surface(chain: &Chain) -> VerdictSurface {
+    let id = run_prefix(&chain.chain_id);
+    let reason = chain.paused_reason.as_deref().unwrap_or("paused");
+    VerdictSurface::try_new(
+        VerdictKind::Paused,
+        "chain",
+        Some(&id),
+        ExplanationPanel::new(
+            "The chain is paused and no child run is advancing.",
+            format!("{reason} is recorded as the pause reason."),
+            [
+                ("status", format!("{:?}", chain.status)),
+                ("paused_reason", reason.to_string()),
+            ],
+        ),
+        [("Recommended", format!("deadreckon chain resume {id}"))],
+        [
+            (
+                "Inspect",
+                format!("deadreckon chain show {id} --why-failed"),
+            ),
+            (
+                "Preview",
+                format!("deadreckon chain resume {id} --apply-mode preview"),
+            ),
+            ("Undo", format!("deadreckon chain undo {id}")),
+        ],
+    )
+    .expect("paused chain attach footer verdict surface")
 }
 
 fn chain_event_label(event: &ChainEventKind) -> &'static str {

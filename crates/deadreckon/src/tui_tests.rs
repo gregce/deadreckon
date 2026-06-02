@@ -3991,7 +3991,7 @@ fn chain_attach_activity_lists_newest_events_first() {
 }
 
 #[test]
-fn chain_attach_paused_footer_lists_one_recommended_command() {
+fn chain_attach_paused_footer_uses_compact_verdict_surface() {
     let mut chain = chain_fixture();
     chain.status = ChainStatus::Paused;
     chain.paused_reason = Some("apply_refused_conflict".to_string());
@@ -3999,11 +3999,15 @@ fn chain_attach_paused_footer_lists_one_recommended_command() {
 
     let footer = chain_attach_footer_text(&chain);
 
-    assert!(footer.contains("paused: apply_refused_conflict"));
+    assert!(footer.contains(&format!("paused chain {id}")));
+    assert!(footer.contains("why apply_refused_conflict"));
+    assert!(footer.contains("evidence status Paused"));
     assert_eq!(footer.matches("try:").count(), 0, "{footer}");
-    assert_eq!(footer.matches("recommended:").count(), 1, "{footer}");
+    assert_eq!(footer.matches("recommended:").count(), 0, "{footer}");
+    assert_eq!(footer.matches("secondary:").count(), 0, "{footer}");
+    assert_eq!(footer.matches("next ").count(), 1, "{footer}");
     assert!(
-        footer.contains(&format!("recommended: deadreckon chain resume {id}")),
+        footer.contains(&format!("next deadreckon chain resume {id}")),
         "{footer}"
     );
     assert!(
