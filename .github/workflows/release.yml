@@ -98,6 +98,9 @@ jobs:
           cargo build --release --target=${{ matrix.target }} -p deadreckon
       - name: Codesign and notarize macOS binary
         if: contains(matrix.target, 'apple-darwin')
+        # Hard backstop: fail loudly if Apple's notary service stalls
+        # (the notarytool --timeout below handles it gracefully first).
+        timeout-minutes: 45
         shell: bash
         env:
           APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
@@ -142,7 +145,8 @@ jobs:
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_PWD" \
-            --wait
+            --wait \
+            --timeout 30m
       - name: Build target artifacts
         run: |
           dist build --tag=${{ github.ref_name }} --artifacts=local --target=${{ matrix.target }} --output-format=json > dist-manifest-${{ matrix.target }}.json
