@@ -1306,7 +1306,7 @@ pub(crate) fn print_orchestrate_preflight(
 fn orchestrate_preflight_warning_recovery_line(plan_id: &str) -> String {
     format!(
         "  {} {}",
-        ui_command("recommended:"),
+        ui_command("inspect:"),
         ui_command(format!("deadreckon attach {} --plain", run_prefix(plan_id)))
     )
 }
@@ -2841,13 +2841,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preflight_warning_footer_has_one_recommended_command() {
+    fn preflight_warning_footer_uses_inspection_guidance_not_primary_action() {
         let rendered =
             orchestrate_preflight_warning_recovery_line("1234567890abcdef1234567890abcdef");
 
-        assert_eq!(rendered.matches("recommended:").count(), 1, "{rendered}");
+        assert!(!rendered.contains("recommended:"), "{rendered}");
         assert!(
-            rendered.contains("recommended: deadreckon attach 12345678 --plain"),
+            rendered.contains("inspect: deadreckon attach 12345678 --plain"),
             "{rendered}"
         );
         assert!(!rendered.contains("try:"), "{rendered}");
