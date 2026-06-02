@@ -559,17 +559,78 @@ fn history_grep_command(args: HistoryGrepRequest) -> Result<()> {
         }
     }
     if total_matches == 0 {
-        println!("no matches for {pattern:?}");
-        println!(
-            "{} try `{}` or `{}`",
-            ui_muted("hint:"),
-            ui_command("deadreckon history grep <pattern> --all"),
-            ui_command("deadreckon show <run-id>")
+        print_history_grep_no_matches_surface(
+            &pattern,
+            kind,
+            regex,
+            plan.as_deref(),
+            effective_scope.as_deref(),
+            all,
         );
     } else if total_matches > printed {
         println!("... ({} more)", total_matches - printed);
     }
     Ok(())
+}
+
+fn print_history_grep_no_matches_surface(
+    pattern: &str,
+    kind: HistoryKind,
+    regex: bool,
+    plan: Option<&str>,
+    scope: Option<&str>,
+    all: bool,
+) {
+    let primary = format!(
+        "deadreckon history grep {} --all",
+        history_grep_command_literal(pattern)
+    );
+    let search_scope = if let Some(plan) = plan {
+        format!("plan {plan}")
+    } else if all {
+        "all scopes".to_string()
+    } else if let Some(scope) = scope {
+        format!("scope {scope}")
+    } else {
+        "current scope".to_string()
+    };
+    let surface = VerdictSurface::try_new(
+        VerdictKind::Noop,
+        "history grep",
+        Some(pattern),
+        ExplanationPanel::new(
+            format!("History grep scanned {search_scope} and found no matches for {pattern:?}."),
+            "This is a no-op because no trace/provenance lines matched; broadening the search to all scopes is the safest next check.",
+            vec![
+                ("pattern".to_string(), pattern.to_string()),
+                ("scope".to_string(), search_scope),
+                ("kind".to_string(), history_kind_label(kind).to_string()),
+                (
+                    "matcher".to_string(),
+                    if regex { "regex" } else { "substring" }.to_string(),
+                ),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", "deadreckon show <run-id>")],
+    )
+    .expect("history grep no-match verdict surface must be valid");
+    print!("{}", surface.render_plain(false));
+}
+
+fn history_grep_command_literal(pattern: &str) -> String {
+    if !pattern.is_empty()
+        && pattern.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ','
+                )
+        })
+    {
+        return pattern.to_string();
+    }
+    format!("'{}'", pattern.replace('\'', "'\\''"))
 }
 
 fn history_plan_children(paths: &DeadreckonPaths, plan_id: &str) -> Result<BTreeSet<String>> {

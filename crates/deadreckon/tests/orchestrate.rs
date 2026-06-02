@@ -5830,6 +5830,43 @@ fn history_grep_substring_finds_pattern_across_library() {
 }
 
 #[test]
+fn history_grep_no_matches_has_one_primary_recovery_action() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    seed_trace_run(
+        &paths,
+        &repo,
+        "aaaabbbbccccdddd1111222233334444",
+        "trace without the searched phrase",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["history", "grep", "missing-history-needle"])
+        .output()
+        .expect("history grep");
+    assert_success(&output);
+    let out = stdout(&output);
+
+    assert!(
+        out.contains("no-op history grep missing-history-needle"),
+        "{out}"
+    );
+    assert!(out.contains("Explanation\n"), "{out}");
+    assert!(out.contains("Evidence\n"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains("Recommended\ndeadreckon history grep missing-history-needle --all"),
+        "{out}"
+    );
+    assert!(out.contains("Secondary\n"), "{out}");
+    assert!(out.contains("deadreckon show <run-id>"), "{out}");
+    assert!(!out.contains("hint:"), "{out}");
+    assert!(!out.contains("try:"), "{out}");
+}
+
+#[test]
 fn history_grep_scope_and_all_match_list_semantics() {
     let temp = repo_tempdir();
     let repo_a = clean_git_repo(&temp);
