@@ -1116,7 +1116,17 @@ async fn reimport_changed_session_requires_replace() {
     assert!(!second.status.success());
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(stderr.contains("changed content"), "{stderr}");
-    assert!(stderr.contains("try:"), "{stderr}");
+    assert!(stderr.contains("blocked import"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon import codex"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--replace"), "{stderr}");
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 
     let replaced = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("import")
@@ -1341,7 +1351,7 @@ async fn import_json_adds_verdict_and_primary_action() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn import_unknown_source_lists_supported_sources_with_try_line() {
+async fn import_unknown_source_lists_supported_sources_with_verdict_surface() {
     let temp = repo_tempdir();
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("import")
@@ -1351,13 +1361,17 @@ async fn import_unknown_source_lists_supported_sources_with_try_line() {
         .expect("import");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("blocked import"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
     assert!(stderr.contains("accepted sources"), "{stderr}");
     assert!(stderr.contains("cli:copilot"), "{stderr}");
     assert!(
-        stderr.contains("try: deadreckon import codex --list"),
+        stderr.contains("Recommended\ndeadreckon import codex --list"),
         "{stderr}"
     );
-    assert_eq!(stderr.matches("try:").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(!stderr.contains("try:"), "{stderr}");
     assert!(!stderr.contains("try: deadreckon doctor"), "{stderr}");
 }
 
@@ -1402,7 +1416,7 @@ async fn import_writes_manifest_with_source_schema_hash_and_reimport_command() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn import_ambiguous_sessions_prints_candidate_table_and_try_line() {
+async fn import_ambiguous_sessions_prints_candidate_table_and_verdict_surface() {
     let temp = repo_tempdir();
     let home = temp.path().join("home");
     let root = temp.path().join("codex");
@@ -1427,17 +1441,20 @@ async fn import_ambiguous_sessions_prints_candidate_table_and_try_line() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("try: deadreckon import codex --session"),
+        stderr.contains("Recommended\ndeadreckon import codex --session"),
         "{stderr}"
     );
-    assert_eq!(stderr.matches("try:").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert!(!stderr.contains("try:"), "{stderr}");
     assert!(!stderr.contains("try: deadreckon doctor"), "{stderr}");
     let paths = DeadreckonPaths::from_home(&home);
     assert!(list_runs(&paths, None).expect("runs").is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn import_stale_sessions_refuse_with_candidate_table_and_try_line() {
+async fn import_stale_sessions_refuse_with_candidate_table_and_verdict_surface() {
     let temp = repo_tempdir();
     let home = temp.path().join("home");
     let root = temp.path().join("codex");
@@ -1460,10 +1477,13 @@ async fn import_stale_sessions_refuse_with_candidate_table_and_try_line() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("try: deadreckon import codex --since 1d --preview"),
+        stderr.contains("Recommended\ndeadreckon import codex --since 1d --preview"),
         "{stderr}"
     );
-    assert_eq!(stderr.matches("try:").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert!(!stderr.contains("try:"), "{stderr}");
     assert!(
         !stderr.contains("try: deadreckon import codex --session"),
         "{stderr}"
@@ -1500,10 +1520,13 @@ async fn import_gemini_requires_session_when_cwd_match_is_none_and_ambiguous() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("ambiguous import candidates"), "{stderr}");
     assert!(
-        stderr.contains("try: deadreckon import cli:gemini --session"),
+        stderr.contains("Recommended\ndeadreckon import cli:gemini --session"),
         "{stderr}"
     );
-    assert_eq!(stderr.matches("try:").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert!(!stderr.contains("try:"), "{stderr}");
     assert!(!stderr.contains("try: deadreckon doctor"), "{stderr}");
 }
 

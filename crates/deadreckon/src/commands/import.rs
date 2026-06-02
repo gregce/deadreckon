@@ -182,15 +182,12 @@ pub(crate) fn import_command(options: ImportCommandOptions) -> Result<()> {
     if candidates.is_empty() {
         let stale = stale_import_candidates(&resolved, &options, &cwd, since);
         if !stale.is_empty() {
-            return Err(CliError::Exit {
-                code: 1,
-                message: format!(
-                    "no fresh import candidates for {}; stale candidates were found\n{}",
-                    resolved.alias,
-                    import_candidate_table(&stale)
-                ),
-                hint: format!("deadreckon import {} --since 1d --preview", resolved.alias),
-            });
+            return Err(import_invalid(format!(
+                "no fresh import candidates for {}; stale candidates were found\n{}\ntry: deadreckon import {} --since 1d --preview",
+                resolved.alias,
+                import_candidate_table(&stale),
+                resolved.alias
+            )));
         }
     }
 
@@ -1663,10 +1660,38 @@ fn import_invalid(message: String) -> CliError {
         }
     }
     if let Some(hint) = primary_hint {
-        CliError::Exit {
+        let reason = body
+            .first()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .unwrap_or_else(|| "DeadReckon refused the import request.".to_string());
+        let detail = body
+            .iter()
+            .skip(1)
+            .map(|line| line.trim_end())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut evidence = vec![("reason".to_string(), reason.clone())];
+        if !detail.is_empty() {
+            evidence.push(("detail".to_string(), detail));
+        }
+        CliError::Surface {
             code: 1,
-            message: body.join("\n").trim_end().to_string(),
-            hint,
+            surface: VerdictSurface::try_new(
+                VerdictKind::Blocked,
+                "import",
+                None,
+                ExplanationPanel::new(
+                    reason,
+                    "DeadReckon refused before creating import run state; the recommended command is the next safe import inspection or disambiguation path.",
+                    evidence,
+                ),
+                vec![("Recommended", hint.as_str())],
+                Vec::<(&str, &str)>::new(),
+            )
+            .expect("import refusal verdict surface must be valid")
+            .render_plain(!completion_hints_enabled(false)),
         }
     } else {
         CliError::Core(DeadreckonError::InvalidInput(message))
