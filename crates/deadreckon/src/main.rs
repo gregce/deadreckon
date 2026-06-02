@@ -2141,9 +2141,11 @@ fn config_command(command: ConfigCommand) -> Result<()> {
             match get_toml_path(&root, &key) {
                 Some(value) => println!("{}", value_to_display(value)),
                 None => {
-                    return Err(CliError::Core(DeadreckonError::NotFound(format!(
-                        "config key {key}"
-                    ))));
+                    return Err(CliError::Surface {
+                        code: 1,
+                        surface: config_missing_key_surface(&paths, &key)
+                            .render_plain(!completion_hints_enabled(false)),
+                    });
                 }
             }
         }
@@ -2271,6 +2273,27 @@ fn config_refusal_surface(
         vec![("Secondary", "deadreckon config provider")],
     )
     .expect("config refusal surface must be valid")
+}
+
+fn config_missing_key_surface(paths: &DeadreckonPaths, key: &str) -> VerdictSurface {
+    let primary = format!("deadreckon config set {key} <value>");
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "config",
+        Some(key),
+        ExplanationPanel::new(
+            format!("DeadReckon could not read config key {key}."),
+            "The key is not present in the current config file, so there is no value to display.",
+            vec![
+                ("config", paths.config_path().display().to_string()),
+                ("key", key.to_string()),
+                ("reason", "missing config key".to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", "deadreckon config provider")],
+    )
+    .expect("config missing-key surface must be valid")
 }
 
 fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> Result<()> {

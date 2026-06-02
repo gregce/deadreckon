@@ -1114,6 +1114,30 @@ fn config_set_surface_has_one_recommended_command() {
 }
 
 #[test]
+fn config_get_missing_key_uses_blocked_verdict_surface() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .args(["config", "get", "defaults.missing"])
+        .output()
+        .expect("config get missing key");
+
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("blocked config defaults.missing"), "{err}");
+    assert!(err.contains("Explanation"), "{err}");
+    assert!(err.contains("Evidence"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains("Recommended\ndeadreckon config set defaults.missing <value>"),
+        "{err}"
+    );
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+}
+
+#[test]
 fn config_provider_listing_surface_has_one_recommended_command() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
