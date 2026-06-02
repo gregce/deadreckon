@@ -125,15 +125,19 @@ pub(crate) fn list_command(
             }
         }
     }
-    println!("{} run and plan ids accept prefixes", ui_muted("hint:"));
-    println!(
-        "      use `{}`, `{}`, `{}`, or `{}`",
-        ui_command("deadreckon status latest"),
-        ui_command("deadreckon list --all"),
-        ui_command("deadreckon attach <id>"),
-        ui_command("deadreckon show <id>")
-    );
+    print_list_action_footer();
     Ok(())
+}
+
+fn print_list_action_footer() {
+    println!();
+    println!("Recommended");
+    println!("deadreckon status latest");
+    println!();
+    println!("Secondary");
+    println!("deadreckon list --all");
+    println!("deadreckon attach <id>");
+    println!("deadreckon show <id>");
 }
 
 const LIST_ID_WIDTH: usize = 8;

@@ -1859,6 +1859,25 @@ fn list_default_is_compact_and_points_to_show_for_details() {
             .all(|line| line.chars().count() <= 180),
         "{compact_stdout}"
     );
+    assert_eq!(
+        compact_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{compact_stdout}"
+    );
+    assert!(
+        compact_stdout.contains("Recommended\ndeadreckon status latest"),
+        "{compact_stdout}"
+    );
+    assert!(compact_stdout.contains("\nSecondary\n"), "{compact_stdout}");
+    assert!(
+        compact_stdout.contains("deadreckon attach <id>"),
+        "{compact_stdout}"
+    );
+    assert!(
+        compact_stdout.contains("deadreckon show <id>"),
+        "{compact_stdout}"
+    );
+    assert!(!compact_stdout.contains("hint:"), "{compact_stdout}");
 
     let help = deadreckon(&paths)
         .current_dir(temp.path())
