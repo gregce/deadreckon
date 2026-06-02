@@ -390,25 +390,36 @@ fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> 
                 .iter()
                 .any(|result| result.must_pass && !result.passed);
             if failed_required {
-                println!("{}", ui_status("done criteria failed"));
+                println!("working {}", working_dir.display());
+                if let Some(spec_path) = spec_path.as_ref() {
+                    println!("spec    {}", spec_path.display());
+                } else {
+                    println!("spec    default dr-gate behavior");
+                }
+                print_acceptance_results(&results);
+                if let Some(failed) = results
+                    .iter()
+                    .find(|result| result.must_pass && !result.passed)
+                {
+                    return Err(CliError::Surface {
+                        code: 1,
+                        surface: acceptance_check_failure_surface(
+                            &working_dir,
+                            spec_path.as_ref(),
+                            failed,
+                        )
+                        .render_plain(!completion_hints_enabled(false)),
+                    });
+                }
             } else {
                 println!("{}", ui_ok("done criteria passed"));
-            }
-            println!("working {}", working_dir.display());
-            if let Some(spec_path) = spec_path {
-                println!("spec    {}", spec_path.display());
-            } else {
-                println!("spec    default dr-gate behavior");
-            }
-            print_acceptance_results(&results);
-            if let Some(failed) = results
-                .iter()
-                .find(|result| result.must_pass && !result.passed)
-            {
-                return Err(CliError::Core(deadreckon_core::user_error(
-                    &format!("required done criterion failed: {}", failed.detail),
-                    "fix the project or run `deadreckon def-done edit \"tighten or correct the checks\"`",
-                )));
+                println!("working {}", working_dir.display());
+                if let Some(spec_path) = spec_path {
+                    println!("spec    {}", spec_path.display());
+                } else {
+                    println!("spec    default dr-gate behavior");
+                }
+                print_acceptance_results(&results);
             }
             Ok(())
         }
@@ -417,6 +428,49 @@ fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> 
             "fix the project or edit .deadreckon/acceptance.yaml, then rerun `deadreckon def-done check`",
         ))),
     }
+}
+
+fn acceptance_check_failure_surface(
+    working_dir: &Path,
+    spec_path: Option<&PathBuf>,
+    failed: &deadreckon_core::AcceptanceCheckResult,
+) -> VerdictSurface {
+    let mut evidence = vec![
+        ("working", working_dir.display().to_string()),
+        (
+            "spec",
+            spec_path
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "default dr-gate behavior".to_string()),
+        ),
+        ("check", failed.kind.clone()),
+        ("detail", one_line(&failed.detail, 140)),
+    ];
+    if let Some(command) = failed.command.as_ref() {
+        evidence.push(("command", command.clone()));
+    }
+    if let Some(stderr) = failed.stderr.as_ref() {
+        evidence.push(("stderr", one_line(stderr, 140)));
+    }
+    if let Some(stdout) = failed.stdout.as_ref() {
+        evidence.push(("stdout", one_line(stdout, 140)));
+    }
+    VerdictSurface::try_new(
+        VerdictKind::Failed,
+        "def-done",
+        Some("check"),
+        ExplanationPanel::new(
+            "A required done criterion failed during a dry-run check.",
+            "DeadReckon cannot treat the done contract as verified until the project passes the required check or the criteria are corrected.",
+            evidence,
+        ),
+        vec![(
+            "Recommended",
+            "deadreckon def-done edit \"tighten or correct the checks\"",
+        )],
+        vec![("Secondary", "deadreckon def-done check")],
+    )
+    .expect("acceptance check failure surface must be valid")
 }
 
 pub(crate) fn print_acceptance_results(results: &[deadreckon_core::AcceptanceCheckResult]) {

@@ -1526,8 +1526,20 @@ fn acceptance_check_reports_shell_failure_output() {
         .expect("acceptance check");
 
     assert!(!output.status.success());
-    assert!(stdout(&output).contains("done criteria failed"));
-    assert!(stdout(&output).contains("helpful failure"));
+    let stdout = stdout(&output);
+    let stderr = stderr(&output);
+    assert!(stdout.contains("helpful failure"), "{stdout}");
+    assert!(!stdout.contains("done criteria failed"), "{stdout}");
+    assert!(stderr.contains("failed def-done check"), "{stderr}");
+    assert!(stderr.contains("Explanation"), "{stderr}");
+    assert!(stderr.contains("Evidence"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon def-done edit \"tighten or correct the checks\""),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]
