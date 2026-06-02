@@ -6119,8 +6119,17 @@ fn history_grep_regex_invalid_pattern_errors() {
         .expect("history grep");
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
-    assert!(err.contains("invalid regex"), "{err}");
-    assert!(err.contains("try: re-quote"), "{err}");
+    assert!(err.contains("blocked history grep --regex"), "{err}");
+    assert!(err.contains("Explanation\n"), "{err}");
+    assert!(err.contains("Evidence\n"), "{err}");
+    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
+    assert!(
+        err.contains("Recommended\ndeadreckon history grep '[' --regex"),
+        "{err}"
+    );
+    assert!(err.contains("pattern: ["), "{err}");
+    assert!(!err.contains("try:"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
 }
 
 #[test]

@@ -461,12 +461,8 @@ enum HistoryMatcher {
 impl HistoryMatcher {
     fn new(pattern: String, regex: bool) -> Result<Self> {
         if regex {
-            let compiled = Regex::new(&pattern).map_err(|err| {
-                CliError::Core(deadreckon_core::user_error(
-                    &format!("invalid regex: {err}"),
-                    "re-quote or escape the pattern",
-                ))
-            })?;
+            let compiled = Regex::new(&pattern)
+                .map_err(|err| invalid_history_regex_error(&pattern, &err.to_string()))?;
             Ok(Self::Regex(compiled))
         } else {
             Ok(Self::Substring(pattern))
@@ -478,6 +474,35 @@ impl HistoryMatcher {
             Self::Substring(pattern) => line.contains(pattern),
             Self::Regex(pattern) => pattern.is_match(line),
         }
+    }
+}
+
+fn invalid_history_regex_error(pattern: &str, parser_error: &str) -> CliError {
+    let primary = format!(
+        "deadreckon history grep {} --regex",
+        command_literal(pattern)
+    );
+    let secondary = format!("deadreckon history grep {}", command_literal(pattern));
+    CliError::Surface {
+        code: 2,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "history grep",
+            Some("--regex"),
+            ExplanationPanel::new(
+                format!("History grep could not compile regex pattern {pattern:?}."),
+                "The command stopped before scanning history because --regex requires a valid Rust regular expression.",
+                vec![
+                    ("pattern".to_string(), pattern.to_string()),
+                    ("parser error".to_string(), parser_error.to_string()),
+                    ("mode".to_string(), "regex".to_string()),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![("Secondary", secondary.as_str())],
+        )
+        .expect("invalid history regex verdict surface must be valid")
+        .render_plain(false),
     }
 }
 
