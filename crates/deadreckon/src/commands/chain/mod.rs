@@ -2289,13 +2289,21 @@ fn chain_undo_command(
             return Ok(());
         }
     } else if !no_confirm {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "non-interactive chain undo requires --no-confirm",
-            &format!(
-                "deadreckon chain undo {} --no-confirm",
-                chain_prefix(&chain.chain_id)
-            ),
-        )));
+        let id = chain_prefix(&chain.chain_id);
+        return Err(CliError::Surface {
+            code: 1,
+            surface: chain_transition_surface(
+                paths,
+                &chain,
+                VerdictKind::Blocked,
+                "DeadReckon did not undo the chain because non-interactive chain undo requires --no-confirm.",
+                "Undo reverts applied commits, and this session cannot ask for confirmation, so DeadReckon stopped before changing git state.",
+                vec![("stdin".to_string(), "non-interactive".to_string())],
+                format!("deadreckon chain undo {id} --no-confirm"),
+                Vec::new(),
+            )
+            .render_plain(false),
+        });
     }
     append_chain_event(
         paths,

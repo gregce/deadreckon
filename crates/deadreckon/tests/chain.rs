@@ -1383,6 +1383,45 @@ fn chain_undo_no_applied_steps_uses_noop_verdict_surface() {
 }
 
 #[test]
+fn chain_undo_non_interactive_requires_no_confirm_with_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.scope = deadreckon_core::paths::workspace_scope(&repo).expect("scope");
+    chain.cwd = repo.clone();
+    chain.steps[0].status = ChainStepStatus::Applied;
+    chain.steps[0].applied_sha = Some(git_stdout(&repo, &["rev-parse", "HEAD"]));
+    save_test_chain(&paths, &chain);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "undo", &chain.chain_id])
+        .output()
+        .expect("undo");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
+    assert!(
+        stderr.contains("non-interactive chain undo requires --no-confirm"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Recommended\ndeadreckon chain undo {} --no-confirm",
+            &chain.chain_id[..8]
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
+}
+
+#[test]
 fn chain_undo_records_undone_step_events() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
