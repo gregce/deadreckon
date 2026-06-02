@@ -2224,16 +2224,26 @@ fn chain_run_refuses_when_lock_held_by_live_pid() {
         .output()
         .expect("run again");
 
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("already running"),
-        "{}",
-        stderr(&output)
-    );
+    let stderr = stderr(&output);
     let _ = deadreckon(&paths)
         .current_dir(&repo)
         .args(["chain", "kill", &chain.chain_id])
         .output();
+    assert!(!output.status.success());
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
+    assert!(stderr.contains("already running"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Recommended\ndeadreckon chain attach {}",
+            &chain.chain_id[..8]
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]

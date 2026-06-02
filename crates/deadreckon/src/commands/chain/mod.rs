@@ -770,14 +770,25 @@ async fn run_chain_conductor(
             });
         }
         ChainStatus::Running if chain.conductor_pid.is_some_and(pid_is_alive) => {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                &format!(
-                    "chain '{}' is already running (pid {})",
-                    chain_prefix(&chain.chain_id),
-                    chain.conductor_pid.unwrap_or_default()
-                ),
-                &format!("deadreckon chain attach {}", chain_prefix(&chain.chain_id)),
-            )));
+            let id = chain_prefix(&chain.chain_id);
+            let pid = chain.conductor_pid.unwrap_or_default();
+            return Err(CliError::Surface {
+                code: 1,
+                surface: chain_transition_surface(
+                    paths,
+                    &chain,
+                    VerdictKind::Blocked,
+                    "DeadReckon did not start another conductor because the chain is already running.",
+                    "Starting a second conductor would race the live chain state, so attaching to the existing run is the safest next command.",
+                    vec![
+                        ("requested action".to_string(), "chain run".to_string()),
+                        ("conductor pid".to_string(), pid.to_string()),
+                    ],
+                    format!("deadreckon chain attach {id}"),
+                    Vec::new(),
+                )
+                .render_plain(false),
+            });
         }
         _ => {}
     }
