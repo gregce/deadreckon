@@ -405,10 +405,46 @@ fn print_error_hint(err: &CliError) {
     let _ = ui::hint(ui::Stream::Stderr, hint);
 }
 
-fn goal_input_error(message: impl Into<String>, try_hint: impl Into<String>) -> CliError {
+fn goal_input_error(
+    command_label: &str,
+    message: impl Into<String>,
+    primary_command: impl Into<String>,
+) -> CliError {
     let message = message.into();
-    let try_hint = try_hint.into();
-    CliError::Core(deadreckon_core::user_error(&message, &try_hint))
+    let primary_command = primary_command.into();
+    CliError::Surface {
+        code: 1,
+        surface: goal_input_surface(command_label, &message, &primary_command)
+            .render_plain(!completion_hints_enabled(false)),
+    }
+}
+
+fn goal_input_surface(command_label: &str, message: &str, primary_command: &str) -> VerdictSurface {
+    let why = if message.contains("could not read") {
+        "DeadReckon cannot launch from a goal file it could not read; choose a readable goal source before starting."
+    } else if message.contains("either a positional goal or --goal-file") {
+        "DeadReckon needs exactly one goal source, so it refused to guess between inline text and a file."
+    } else if message.contains("goal is empty") {
+        "DeadReckon needs non-empty goal text before it can create run, plan, or campaign state."
+    } else {
+        "DeadReckon cannot launch until it has one non-empty goal source."
+    };
+    VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        command_label,
+        None,
+        ExplanationPanel::new(
+            message.to_string(),
+            why.to_string(),
+            [
+                ("command".to_string(), command_label.to_string()),
+                ("reason".to_string(), message.to_string()),
+            ],
+        ),
+        [("Recommended", primary_command.trim().to_string())],
+        std::iter::empty::<(&str, String)>(),
+    )
+    .expect("goal input verdict surface is valid")
 }
 
 fn resolve_required_goal_input(
@@ -419,6 +455,7 @@ fn resolve_required_goal_input(
 ) -> Result<String> {
     resolve_optional_goal_input(command_label, positional, goal_file)?.ok_or_else(|| {
         goal_input_error(
+            command_label,
             format!("{command_label} goal required"),
             missing_hint.to_string(),
         )
@@ -432,6 +469,7 @@ fn resolve_optional_goal_input(
 ) -> Result<Option<String>> {
     match (positional, goal_file) {
         (Some(_), Some(_)) => Err(goal_input_error(
+            command_label,
             format!("{command_label} accepts either a positional goal or --goal-file, not both"),
             format!("deadreckon {command_label} --goal-file docs/goal.md"),
         )),
@@ -439,6 +477,7 @@ fn resolve_optional_goal_input(
             if let Some(path) = goal.strip_prefix('@') {
                 if path.is_empty() {
                     return Err(goal_input_error(
+                        command_label,
                         format!("{command_label} @file goal is missing a path"),
                         format!("deadreckon {command_label} @docs/goal.md"),
                     ));
@@ -458,14 +497,13 @@ fn read_goal_file(command_label: &str, path: &Path) -> Result<String> {
     let resolved_path = resolve_goal_file_path(path)?;
     let contents = fs::read_to_string(&resolved_path).map_err(|err| {
         goal_input_error(
+            command_label,
             format!(
-                "could not read {command_label} goal file {}",
-                path.display()
-            ),
-            format!(
-                "check the path and permissions; resolved to {} ({err})",
+                "could not read {command_label} goal file {}; resolved to {} ({err})",
+                path.display(),
                 resolved_path.display()
             ),
+            format!("deadreckon {command_label} --goal-file docs/goal.md"),
         )
     })?;
     let goal = normalize_goal_text(contents);
@@ -531,8 +569,9 @@ fn normalize_goal_text(goal: String) -> String {
 fn validate_goal_text(command_label: &str, goal: &str) -> Result<()> {
     if goal.trim().is_empty() {
         return Err(goal_input_error(
+            command_label,
             format!("{command_label} goal is empty"),
-            format!("write a non-empty goal or use deadreckon {command_label} \"goal\""),
+            format!("deadreckon {command_label} \"goal\""),
         ));
     }
     Ok(())
@@ -809,7 +848,7 @@ async fn main_inner() -> Result<()> {
                 "campaign",
                 goal,
                 goal_file,
-                "deadreckon campaign --goal-file docs/goal.md --yes, or deadreckon campaign repair <campaign-id>",
+                "deadreckon campaign --goal-file docs/goal.md --yes",
             )?;
             commands::campaign::campaign_command(commands::campaign::CampaignArgs {
                 goal,

@@ -2067,6 +2067,16 @@ fn goal_input_rejects_positional_and_file() {
         err.to_string()
             .contains("either a positional goal or --goal-file")
     );
+    let surface = err.to_string();
+    assert!(surface.contains("blocked campaign"), "{surface}");
+    assert!(surface.contains("Explanation\n"), "{surface}");
+    assert!(surface.contains("Evidence\n"), "{surface}");
+    assert_eq!(surface.matches("\nRecommended\n").count(), 1, "{surface}");
+    assert!(
+        surface.contains("Recommended\ndeadreckon campaign --goal-file docs/goal.md"),
+        "{surface}"
+    );
+    assert!(!surface.contains("try:"), "{surface}");
 }
 
 #[test]

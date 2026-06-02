@@ -187,6 +187,34 @@ fn worktree_run_sets_working_dir_to_worktree_path() {
 }
 
 #[test]
+fn missing_run_goal_uses_blocked_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("run")
+        .arg("--smoke")
+        .arg("--yes")
+        .output()
+        .expect("run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("blocked run"), "{stderr}");
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon run --goal-file docs/goal.md --yes"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+#[test]
 fn dirty_repo_refused_with_stash_hint() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -1679,7 +1707,19 @@ fn abandon_idempotent_when_already_abandoned() {
         .expect("abandon second");
 
     assert_success(&second);
-    assert!(stdout(&second).contains(&format!("abandoned {run_id}")));
+    let text = stdout(&second);
+    let short_id = &run_id[..8];
+    assert!(
+        text.contains(&format!("completed abandon {short_id}")),
+        "{text}"
+    );
+    assert!(text.contains("Explanation\n"), "{text}");
+    assert_eq!(text.matches("\nRecommended\n").count(), 1, "{text}");
+    assert!(
+        text.contains(&format!("Recommended\ndeadreckon show {short_id}")),
+        "{text}"
+    );
+    assert!(!text.contains("try:"), "{text}");
 }
 
 #[test]
@@ -1728,9 +1768,20 @@ fn post_abandon_hint_lists_removed_paths() {
 
     assert_success(&abandon);
     let stdout = stdout(&abandon);
-    assert!(stdout.contains(&format!("abandoned {run_id}")));
-    assert!(stdout.contains(&format!("removed: {}", worktree.display())));
-    assert!(stdout.contains(&format!("removed: branch {branch}")));
+    let short_id = &run_id[..8];
+    assert!(
+        stdout.contains(&format!("completed abandon {short_id}")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!("Recommended\ndeadreckon show {short_id}")),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&worktree.display().to_string()), "{stdout}");
+    assert!(stdout.contains(&format!("branch {branch}")), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
 }
 
 #[test]
