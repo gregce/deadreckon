@@ -581,10 +581,7 @@ fn print_history_grep_no_matches_surface(
     scope: Option<&str>,
     all: bool,
 ) {
-    let primary = format!(
-        "deadreckon history grep {} --all",
-        history_grep_command_literal(pattern)
-    );
+    let primary = format!("deadreckon history grep {} --all", command_literal(pattern));
     let search_scope = if let Some(plan) = plan {
         format!("plan {plan}")
     } else if all {
@@ -616,21 +613,6 @@ fn print_history_grep_no_matches_surface(
     )
     .expect("history grep no-match verdict surface must be valid");
     print!("{}", surface.render_plain(false));
-}
-
-fn history_grep_command_literal(pattern: &str) -> String {
-    if !pattern.is_empty()
-        && pattern.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(
-                    ch,
-                    '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ','
-                )
-        })
-    {
-        return pattern.to_string();
-    }
-    format!("'{}'", pattern.replace('\'', "'\\''"))
 }
 
 fn history_plan_children(paths: &DeadreckonPaths, plan_id: &str) -> Result<BTreeSet<String>> {
@@ -787,12 +769,7 @@ pub(crate) fn library_command(command: LibraryCommand) -> Result<()> {
                 .filter(|entry| library_entry_matches_query(entry, &needle))
                 .collect::<Vec<_>>();
             if entries.is_empty() {
-                println!("no library artifacts matched {query:?}");
-                println!(
-                    "{} try `{}`",
-                    ui_muted("hint:"),
-                    ui_command("deadreckon library list --all")
-                );
+                print_library_search_no_matches_surface(&query, all);
                 return Ok(());
             }
             print_library_table(&entries, false);
@@ -803,6 +780,48 @@ pub(crate) fn library_command(command: LibraryCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_library_search_no_matches_surface(query: &str, all: bool) {
+    let primary = if all {
+        "deadreckon library list --all".to_string()
+    } else {
+        format!("deadreckon library search {} --all", command_literal(query))
+    };
+    let scope = if all { "all scopes" } else { "current scope" };
+    let surface = VerdictSurface::try_new(
+        VerdictKind::Noop,
+        "library search",
+        Some(query),
+        ExplanationPanel::new(
+            format!("Library search scanned {scope} and found no artifact matching {query:?}."),
+            "This is a no-op because no promoted artifact metadata or run documentation matched; widening to all scopes is the safest next check.",
+            vec![
+                ("query".to_string(), query.to_string()),
+                ("scope".to_string(), scope.to_string()),
+                ("source".to_string(), "promoted artifact metadata and docs".to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", "deadreckon library list --all")],
+    )
+    .expect("library search no-match verdict surface must be valid");
+    print!("{}", surface.render_plain(false));
+}
+
+fn command_literal(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ','
+                )
+        })
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 struct LibraryFilter {

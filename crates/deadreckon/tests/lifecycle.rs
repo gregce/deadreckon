@@ -781,6 +781,36 @@ fn library_search_greps_promoted_run_docs() {
     assert!(stdout(&search).contains(&parent.run_id[..8]));
 }
 
+#[test]
+fn library_search_no_match_has_one_primary_recovery_action() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "ordinary searchable parent");
+
+    let search = deadreckon(&paths)
+        .current_dir(&parent.cwd)
+        .args(["library", "search", "missing-library-needle"])
+        .output()
+        .expect("library search");
+
+    assert_success(&search);
+    let stdout = stdout(&search);
+    assert!(
+        stdout.contains("no-op library search missing-library-needle"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Explanation\n"), "{stdout}");
+    assert!(stdout.contains("Evidence\n"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon library search missing-library-needle --all"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\nSecondary\n"), "{stdout}");
+    assert!(stdout.contains("deadreckon library list --all"), "{stdout}");
+    assert!(!stdout.contains("hint:"), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn show_reveals_parent_lineage() {
     let temp = repo_tempdir();
