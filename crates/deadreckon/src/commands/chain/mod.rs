@@ -201,10 +201,18 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
     match first {
         "plan" | "expand" => {
             let root_goal = args.get(1).cloned().ok_or_else(|| {
-                CliError::Core(deadreckon_core::user_error(
-                    "chain plan needs a goal",
-                    "deadreckon chain plan \"build the app\" --n 4",
-                ))
+                chain_create_refusal_surface(
+                    VerdictKind::Blocked,
+                    None,
+                    "DeadReckon did not plan the chain because chain plan needs a goal.",
+                    "The planner needs a root goal before it can decompose work into ordered chain steps.",
+                    [
+                        ("command".to_string(), "chain plan".to_string()),
+                        ("goal".to_string(), "missing".to_string()),
+                    ],
+                    "deadreckon chain plan \"build the app\" --n 4".to_string(),
+                    no_hints,
+                )
             })?;
             chain_plan_command(ChainCreateOptions {
                 paths,
