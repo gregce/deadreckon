@@ -1827,9 +1827,10 @@ fn plan_refuses_one_task_response() {
         err.contains("provider returned 1 children; need 2"),
         "{err}"
     );
-    assert!(
-        err.contains("try: deadreckon plan ... --provider <other>"),
-        "{err}"
+    assert_verdict_surface(
+        &err,
+        "blocked plan",
+        "deadreckon plan ... --provider <other>",
     );
     assert_eq!(saved_plan_count(&paths), 0);
 }
@@ -1858,10 +1859,7 @@ fn plan_n_flag_clamped_to_2_through_6() {
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
     assert!(err.contains("plan must have >= 2 children"), "{err}");
-    assert!(
-        err.contains("try: deadreckon run \"<the only child>\""),
-        "{err}"
-    );
+    assert_verdict_surface(&err, "blocked plan", "deadreckon run \"<the only child>\"");
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
@@ -1881,8 +1879,51 @@ fn plan_n_flag_clamped_to_2_through_6() {
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = stderr(&output);
     assert!(err.contains("plan capped at 6 children; got 7"), "{err}");
-    assert!(err.contains("try: split the goal into a chain"), "{err}");
+    assert_verdict_surface(
+        &err,
+        "blocked plan",
+        "deadreckon chain plan \"tiny hello rust\" --n 7",
+    );
     assert_eq!(saved_plan_count(&paths), 0);
+}
+
+#[test]
+fn plan_refusal_json_adds_verdict_and_primary_action() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny hello rust",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "1",
+            "--quiet",
+            "--json",
+        ])
+        .output()
+        .expect("plan refusal json");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let value: Value = serde_json::from_str(&stderr(&output)).expect("json refusal surface");
+    assert_eq!(value["kind"], "plan_refusal");
+    assert_eq!(value["error"], "plan must have >= 2 children");
+    assert_eq!(value["verdict"]["kind"], "blocked");
+    assert_eq!(
+        value["primary_action"],
+        "deadreckon run \"<the only child>\""
+    );
+    assert_eq!(
+        value["primary_action"],
+        value["verdict"]["recommended_command"]
+    );
+    assert_eq!(value["next_actions"][0], value["primary_action"]);
 }
 
 #[test]
@@ -2101,11 +2142,11 @@ fn error_messages_include_recovery_guidance() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
-    let legacy_try_cases: Vec<(Vec<&str>, &str, &str)> = vec![
+    let verdict_cases: Vec<(Vec<&str>, &str, &str)> = vec![
         (
             vec!["plan", "", "--quiet"],
             "--goal must be non-empty",
-            "try: deadreckon plan \"your goal\"",
+            "deadreckon plan \"your goal\"",
         ),
         (
             vec![
@@ -2120,11 +2161,11 @@ fn error_messages_include_recovery_guidance() {
                 "--quiet",
             ],
             "plan must have >= 2 children",
-            "try: deadreckon run \"<the only child>\"",
+            "deadreckon run \"<the only child>\"",
         ),
     ];
 
-    for (args, message, hint) in legacy_try_cases {
+    for (args, message, recommended) in verdict_cases {
         let output = deadreckon(&paths)
             .current_dir(&repo)
             .args(args)
@@ -2133,7 +2174,7 @@ fn error_messages_include_recovery_guidance() {
         assert!(!output.status.success(), "{}", stdout(&output));
         let err = stderr(&output);
         assert!(err.contains(message), "{err}");
-        assert!(err.contains(hint), "{err}");
+        assert_verdict_surface(&err, "blocked plan", recommended);
     }
 
     let output = deadreckon(&paths)

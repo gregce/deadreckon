@@ -944,8 +944,18 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         None,
     )?;
     let overrides = BTreeMap::new();
-    let tasks =
-        build_full_plan_tasks(&paths, &goal, n, &providers, &overrides, &cwd, args.plain).await?;
+    let tasks = build_full_plan_tasks(
+        &paths,
+        &goal,
+        n,
+        &providers,
+        &overrides,
+        &cwd,
+        args.plain,
+        args.no_hints,
+        false,
+    )
+    .await?;
     let sub_goal_strings: Vec<String> = tasks.iter().map(|task| task.goal.clone()).collect();
     let sub_goals =
         campaign::build_sub_goals(sub_goal_strings, usize::from(n)).map_err(CliError::Core)?;
@@ -1015,7 +1025,15 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
             CampaignPreflightAction::ChangeCount(new_n) => {
                 n = new_n;
                 let tasks = build_full_plan_tasks(
-                    &paths, &goal, n, &providers, &overrides, &cwd, args.plain,
+                    &paths,
+                    &goal,
+                    n,
+                    &providers,
+                    &overrides,
+                    &cwd,
+                    args.plain,
+                    args.no_hints,
+                    false,
                 )
                 .await?;
                 let sub_goal_strings: Vec<String> =

@@ -56,18 +56,28 @@ pub(crate) async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<P
         init_git: _,
         acceptance,
         skip_acceptance_prompt,
-        no_hints: _,
+        no_hints,
         quiet,
-        json: _,
+        json: json_output,
         plain,
     } = args;
     let goal = goal.trim().to_string();
     if goal.is_empty() {
-        return Err(CliError::Core(deadreckon_core::user_error(
+        return Err(plan_refusal_error(
             "--goal must be non-empty",
-            "deadreckon plan \"your goal\"",
-        )));
+            "DeadReckon did not create a plan because the plan command needs a non-empty goal.",
+            "Planning without a goal would create misleading orchestration state, so DeadReckon refused before writing any plan files.",
+            vec![
+                ("command".to_string(), "plan".to_string()),
+                ("goal".to_string(), "empty".to_string()),
+            ],
+            "deadreckon plan \"your goal\"".to_string(),
+            Vec::new(),
+            no_hints,
+            json_output,
+        ));
     }
+    validate_plan_task_count(&goal, n, no_hints, json_output)?;
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
     let cwd = std::env::current_dir()?;
@@ -109,10 +119,20 @@ pub(crate) async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<P
     .await?;
     let mut tasks = match plan_mode {
         PlanMode::FullPlan => {
-            validate_task_count(usize::from(n)).map_err(CliError::Core)?;
             let overrides = parse_child_provider_overrides(&child_provider, n)?;
             providers.children = overrides.clone();
-            build_full_plan_tasks(&paths, &goal, n, &providers, &overrides, &cwd, plain).await?
+            build_full_plan_tasks(
+                &paths,
+                &goal,
+                n,
+                &providers,
+                &overrides,
+                &cwd,
+                plain,
+                no_hints,
+                json_output,
+            )
+            .await?
         }
         PlanMode::Review => build_review_plan_tasks(&goal, &providers),
     };
@@ -274,6 +294,8 @@ pub(crate) async fn build_full_plan_tasks(
     overrides: &BTreeMap<u32, String>,
     cwd: &Path,
     plain: bool,
+    no_hints: bool,
+    json_output: bool,
 ) -> Result<Vec<PlanTask>> {
     let drafts = if providers
         .planner
@@ -285,10 +307,27 @@ pub(crate) async fn build_full_plan_tasks(
         provider_plan_drafts(paths, goal, n, providers.planner.as_deref(), cwd, plain).await?
     };
     if drafts.len() != usize::from(n) {
-        return Err(CliError::Core(deadreckon_core::user_error(
+        return Err(plan_refusal_error(
             &format!("provider returned {} children; need {n}", drafts.len()),
-            "deadreckon plan ... --provider <other>",
-        )));
+            "DeadReckon did not save the plan because the planner returned the wrong number of child tasks.",
+            "The requested child count is part of the orchestration contract; saving a partial graph would make later fork/merge state misleading.",
+            vec![
+                ("requested children".to_string(), n.to_string()),
+                ("returned children".to_string(), drafts.len().to_string()),
+                (
+                    "planner".to_string(),
+                    providers
+                        .planner
+                        .as_deref()
+                        .unwrap_or("default planner")
+                        .to_string(),
+                ),
+            ],
+            "deadreckon plan ... --provider <other>".to_string(),
+            vec!["deadreckon providers list --all".to_string()],
+            no_hints,
+            json_output,
+        ));
     }
     let mut tasks = Vec::new();
     for (index, draft) in drafts.into_iter().enumerate() {
@@ -303,6 +342,84 @@ pub(crate) async fn build_full_plan_tasks(
         tasks.push(task);
     }
     Ok(tasks)
+}
+
+fn validate_plan_task_count(goal: &str, n: u8, no_hints: bool, json_output: bool) -> Result<()> {
+    match usize::from(n) {
+        0 | 1 => Err(plan_refusal_error(
+            "plan must have >= 2 children",
+            "DeadReckon did not create a plan because the requested child count is too small.",
+            "A full plan needs at least two child tasks; for one task, a direct run is the truthful execution shape.",
+            vec![("requested children".to_string(), n.to_string())],
+            "deadreckon run \"<the only child>\"".to_string(),
+            vec![format!(
+                "deadreckon plan {} --n 2",
+                plan_goal_argument(goal)
+            )],
+            no_hints,
+            json_output,
+        )),
+        2..=6 => Ok(()),
+        count => Err(plan_refusal_error(
+            &format!("plan capped at 6 children; got {count}"),
+            "DeadReckon did not create a plan because the requested child count is above the full-plan cap.",
+            "Full-plan orchestration is capped at six parallel children; a sequential chain is the safer shape for larger decompositions.",
+            vec![("requested children".to_string(), n.to_string())],
+            format!("deadreckon chain plan {} --n {n}", plan_goal_argument(goal)),
+            vec![format!(
+                "deadreckon plan {} --n 6",
+                plan_goal_argument(goal)
+            )],
+            no_hints,
+            json_output,
+        )),
+    }
+}
+
+fn plan_refusal_error(
+    message: impl Into<String>,
+    what_happened: impl Into<String>,
+    why_this_verdict: impl Into<String>,
+    evidence: Vec<(String, String)>,
+    primary: String,
+    secondary: Vec<String>,
+    no_hints: bool,
+    json_output: bool,
+) -> CliError {
+    let message = message.into();
+    let mut all_evidence = vec![("reason".to_string(), message)];
+    all_evidence.extend(evidence);
+    let secondary = secondary
+        .iter()
+        .map(|command| ("Secondary", command.as_str()))
+        .collect::<Vec<_>>();
+    let surface = VerdictSurface::try_new(
+        VerdictKind::Blocked,
+        "plan",
+        None,
+        ExplanationPanel::new(what_happened, why_this_verdict, all_evidence),
+        vec![("Recommended", primary.as_str())],
+        secondary,
+    )
+    .expect("plan refusal verdict surface must be valid");
+    let rendered = if json_output {
+        serde_json::to_string_pretty(&surface.add_to_json(json!({
+            "kind": "plan_refusal",
+            "error": surface.explanation.evidence[0].1.clone(),
+            "next_actions": [surface.primary_action.command.clone()],
+        })))
+        .expect("plan refusal verdict json must serialize")
+    } else {
+        surface.render_plain(!completion_hints_enabled(no_hints))
+    };
+    CliError::Surface {
+        code: 1,
+        surface: rendered,
+    }
+}
+
+fn plan_goal_argument(goal: &str) -> String {
+    format!("\"{}\"", shell_display_quote(goal))
 }
 
 fn build_review_plan_tasks(goal: &str, providers: &PlanProviders) -> Vec<PlanTask> {
