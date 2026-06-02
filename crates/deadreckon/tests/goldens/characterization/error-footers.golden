@@ -23,6 +23,16 @@ status: 1
 --- stdout ---
 using default --max-spend $10 (override with --max-spend or in config defaults.max_spend)
 --- stderr ---
-error: invalid input: <TMP>/plain is not a git repo
-try: git init or pass --from .
-  hint: try: deadreckon doctor
+blocked run
+
+Explanation
+<TMP>/plain is not a git repo
+Worktree mode requires a Git repository; initialize Git or choose an explicit copy/fresh source mode.
+
+Evidence
+command: run
+goal: plain dir refusal
+reason: <TMP>/plain is not a git repo
+
+Recommended
+git init

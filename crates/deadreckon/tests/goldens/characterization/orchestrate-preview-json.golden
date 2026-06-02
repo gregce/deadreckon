@@ -10,6 +10,7 @@ status: 0
   "next_actions": [
     "deadreckon def-done \"what should count as done\" && deadreckon start \"characterize orchestration\""
   ],
+  "primary_action": "deadreckon def-done \"what should count as done\" && deadreckon start \"characterize orchestration\"",
   "provider": "smoke (explicit_flag)",
   "provider_source": "explicit_flag",
   "reason": "explicit --mode full-plan selected multi-agent planning",
@@ -20,6 +21,51 @@ status: 0
   "try_lines": [
     "deadreckon def-done \"what should count as done\" && deadreckon start \"characterize orchestration\""
   ],
+  "verdict": {
+    "evidence": [
+      [
+        "goal",
+        "characterize orchestration"
+      ],
+      [
+        "path",
+        "full-plan orchestration"
+      ],
+      [
+        "provider",
+        "smoke (explicit_flag)"
+      ],
+      [
+        "roles",
+        "children=3, planner=smoke, child=smoke"
+      ],
+      [
+        "done",
+        "missing done contract"
+      ],
+      [
+        "workspace",
+        "missing"
+      ],
+      [
+        "override",
+        "deadreckon start <goal> --mode run"
+      ],
+      [
+        "seams",
+        "builtin"
+      ],
+      [
+        "will start",
+        "false"
+      ]
+    ],
+    "explanation": "done contract is missing for this repo The selected path cannot start until the recommended recovery command resolves the missing setup.",
+    "kind": "blocked",
+    "label": "blocked start",
+    "recommended_command": "deadreckon def-done \"what should count as done\" && deadreckon start \"characterize orchestration\"",
+    "subject": "start"
+  },
   "will_start": false
 }
 --- stderr ---

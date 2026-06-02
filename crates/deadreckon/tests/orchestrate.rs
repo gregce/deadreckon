@@ -449,10 +449,17 @@ fn plan_preview_prints_capabilities_and_provider_table() {
 
     assert_success(&output);
     let out = stdout(&output);
+    let plan = newest_plan(&paths);
+    assert_verdict_surface(
+        &out,
+        &format!("preview plan {}", &plan.plan_id[..8]),
+        &format!("deadreckon fork {}", &plan.plan_id[..8]),
+    );
     assert!(out.contains("planner=smoke"), "{out}");
     assert!(out.contains("default-child=smoke"), "{out}");
     assert!(out.contains("capabilities :"), "{out}");
     assert!(out.contains("deploy=true"), "{out}");
+    assert!(!out.contains("fork:"), "{out}");
 }
 
 #[test]
@@ -2108,10 +2115,15 @@ fn review_mode_post_action_hints_name_coder_and_reviewer() {
 
     assert_success(&output);
     let out = stdout(&output);
+    let plan = newest_plan(&paths);
+    assert_verdict_surface(
+        &out,
+        &format!("preview plan {}", &plan.plan_id[..8]),
+        &format!("deadreckon fork {}", &plan.plan_id[..8]),
+    );
     assert!(out.contains("coder=smoke:coder"), "{out}");
     assert!(out.contains("reviewer=smoke:reviewer"), "{out}");
-    assert!(out.contains("fork:"), "{out}");
-    assert!(out.contains("deadreckon fork"), "{out}");
+    assert!(!out.contains("fork:"), "{out}");
 }
 
 #[test]
@@ -2145,7 +2157,13 @@ fn plan_hints_name_capabilities_and_ready_tasks() {
         output_row_contains(&out, "children", "2 (2 ready / 0 blocked)"),
         "{out}"
     );
-    assert!(out.contains("fork:"), "{out}");
+    let plan = newest_plan(&paths);
+    assert_verdict_surface(
+        &out,
+        &format!("preview plan {}", &plan.plan_id[..8]),
+        &format!("deadreckon fork {}", &plan.plan_id[..8]),
+    );
+    assert!(!out.contains("fork:"), "{out}");
 }
 
 #[test]

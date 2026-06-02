@@ -819,10 +819,12 @@ fn plan_secondary_actions(paths: &DeadreckonPaths, plan: &Plan, primary: &str) -
             actions.push(command);
         }
     }
-    for command in [
-        format!("deadreckon attach {id}"),
-        format!("deadreckon show {id} --why-failed"),
-    ] {
+    let inspection = if plan.status == PlanStatus::Failed {
+        format!("deadreckon show {id} --why-failed")
+    } else {
+        format!("deadreckon show {id}")
+    };
+    for command in [format!("deadreckon attach {id}"), inspection] {
         if command != primary && !actions.contains(&command) {
             actions.push(command);
         }
@@ -1120,11 +1122,10 @@ pub(crate) fn print_orchestration_dependency_summary(plan: &Plan) {
 }
 
 fn print_plan_created(plan: &Plan, no_hints: bool) {
+    let paths = DeadreckonPaths::discover();
     println!(
-        "{} {} ({})",
-        ui_ok("plan"),
-        ui_id(run_prefix(&plan.plan_id)),
-        plan.plan_id
+        "{}",
+        plan_verdict_surface(&paths, plan).render_plain(!completion_hints_enabled(no_hints))
     );
     let ready = plan.ready_pending_task_indices().len();
     let pending = plan
@@ -1159,6 +1160,8 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
     );
     let source = plan_source_label(plan);
     let gate = plan_acceptance_label(plan);
+    let plan_path = paths.plan_json(&plan.plan_id);
+    let plan_path_display = plan_path.to_string_lossy().to_string();
     let items = [
         ("status", plan_status_label(plan.status)),
         ("mode", plan_mode_label(plan.mode)),
@@ -1167,6 +1170,7 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
         ("source", source.as_str()),
         (NOUN_DONE_CONTRACT, gate.as_str()),
         ("capabilities", capabilities.as_str()),
+        ("plan", plan_path_display.as_str()),
     ];
     print_kv_block(&items);
     print_orchestration_role_table(plan, true, None);
@@ -1184,19 +1188,6 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
             format!("{:?}", task.role).to_ascii_lowercase(),
             task.provider.as_deref().unwrap_or("-"),
             deps
-        );
-    }
-    if !no_hints {
-        println!(
-            "{} {}/plans/{}/plan.json",
-            ui_command("edit:"),
-            DeadreckonPaths::discover().home().display(),
-            plan.plan_id
-        );
-        println!(
-            "{} deadreckon fork {}",
-            ui_command("fork:"),
-            run_prefix(&plan.plan_id)
         );
     }
 }

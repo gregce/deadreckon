@@ -1,6 +1,24 @@
 status: 0
 --- stdout ---
-plan <ID8> (<ID32>)
+preview plan <ID8>
+
+Explanation
+DeadReckon wrote the plan graph, but no child run has started yet.
+This is a pre-fork plan state; forking is the one command that advances it.
+
+Evidence
+plan: <ID8>
+status: pending
+tasks: 0/3 completed
+events: <TMP>/home/plans/<ID32>/plan-events.jsonl
+
+Recommended
+deadreckon fork <ID8>
+
+Secondary
+deadreckon attach <ID8>
+deadreckon show <ID8>
+
 status       : pending
 mode         : full-plan
 children     : 3 (3 ready / 0 blocked)
@@ -8,6 +26,8 @@ providers    : planner=smoke default-child=smoke
 source       : <TMP>/repo (git branch=main @ <SHA7>)
 done contract: default dr-gate behavior
 capabilities : network=Deny deploy=false install=false
+plan         : <TMP>/home/plans/<ID32>/
+               plan.json
 provider roles
   role           route                  model    source       notes
   planner        smoke                  -        plan         writes child graph
@@ -24,6 +44,4 @@ dependencies
   task-0 Create foundation [child] provider=smoke deps=-
   task-1 Add behavior [child] provider=smoke deps=-
   task-2 Complete slice 3 [child] provider=smoke deps=-
-edit: <TMP>/home/plans/<ID32>/plan.json
-fork: deadreckon fork <ID8>
 --- stderr ---
