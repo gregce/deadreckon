@@ -1295,7 +1295,28 @@ fn done_check_and_show_are_user_facing() {
         .output()
         .expect("def-done check");
     assert_success(&check);
-    assert!(stdout(&check).contains("done criteria passed"));
+    let check_stdout = stdout(&check);
+    assert!(
+        check_stdout.contains("verified def-done check"),
+        "{check_stdout}"
+    );
+    assert!(check_stdout.contains("Explanation"), "{check_stdout}");
+    assert!(check_stdout.contains("Evidence"), "{check_stdout}");
+    assert_eq!(
+        check_stdout.matches("\nRecommended\n").count(),
+        1,
+        "{check_stdout}"
+    );
+    assert!(
+        check_stdout.contains("Recommended\ndeadreckon run \"goal\""),
+        "{check_stdout}"
+    );
+    assert!(
+        !check_stdout.contains("done criteria passed"),
+        "{check_stdout}"
+    );
+    assert!(!check_stdout.contains("try:"), "{check_stdout}");
+    assert!(!check_stdout.contains("hint:"), "{check_stdout}");
 
     let show = deadreckon(&paths)
         .current_dir(&workspace)
@@ -1432,7 +1453,18 @@ fn acceptance_check_dry_runs_project_spec() {
         .expect("acceptance check");
 
     assert_success(&output);
-    assert!(stdout(&output).contains("done criteria passed"));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("verified def-done check"), "{stdout}");
+    assert!(stdout.contains("Explanation"), "{stdout}");
+    assert!(stdout.contains("Evidence"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon run \"goal\""),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("done criteria passed"), "{stdout}");
+    assert!(!stdout.contains("try:"), "{stdout}");
+    assert!(!stdout.contains("hint:"), "{stdout}");
 }
 
 #[test]

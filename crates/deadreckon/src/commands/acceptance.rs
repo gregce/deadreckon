@@ -412,14 +412,11 @@ fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> 
                     });
                 }
             } else {
-                println!("{}", ui_ok("done criteria passed"));
-                println!("working {}", working_dir.display());
-                if let Some(spec_path) = spec_path {
-                    println!("spec    {}", spec_path.display());
-                } else {
-                    println!("spec    default dr-gate behavior");
-                }
-                print_acceptance_results(&results);
+                print!(
+                    "{}",
+                    acceptance_check_success_surface(&working_dir, spec_path.as_ref(), &results)
+                        .render_plain(!completion_hints_enabled(false))
+                );
             }
             Ok(())
         }
@@ -428,6 +425,47 @@ fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> 
             "fix the project or edit .deadreckon/acceptance.yaml, then rerun `deadreckon def-done check`",
         ))),
     }
+}
+
+fn acceptance_check_success_surface(
+    working_dir: &Path,
+    spec_path: Option<&PathBuf>,
+    results: &[deadreckon_core::AcceptanceCheckResult],
+) -> VerdictSurface {
+    let required = results.iter().filter(|result| result.must_pass).count();
+    let passed = results.iter().filter(|result| result.passed).count();
+    let failed_optional = results
+        .iter()
+        .filter(|result| !result.must_pass && !result.passed)
+        .count();
+    let mut evidence = vec![
+        ("working", working_dir.display().to_string()),
+        (
+            "spec",
+            spec_path
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "default dr-gate behavior".to_string()),
+        ),
+        ("checks", results.len().to_string()),
+        ("required", required.to_string()),
+        ("passed", passed.to_string()),
+    ];
+    if failed_optional > 0 {
+        evidence.push(("optional failed", failed_optional.to_string()));
+    }
+    VerdictSurface::try_new(
+        VerdictKind::Verified,
+        "def-done",
+        Some("check"),
+        ExplanationPanel::new(
+            "DeadReckon dry-ran the done criteria successfully.",
+            "All required checks passed, so the done contract is ready to gate a run.",
+            evidence,
+        ),
+        vec![("Recommended", "deadreckon run \"goal\"")],
+        vec![("Secondary", "deadreckon def-done show")],
+    )
+    .expect("acceptance check success surface must be valid")
 }
 
 fn acceptance_check_failure_surface(
