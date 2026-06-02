@@ -1095,6 +1095,20 @@ fn doc_export_writes_to_path() {
         .output()
         .expect("doc");
     assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.starts_with("completed doc"), "{out}");
+    assert!(out.contains("Explanation\n"), "{out}");
+    assert!(out.contains("Evidence\n"), "{out}");
+    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(
+        out.contains(&format!(
+            "Recommended\ndeadreckon doc {} --kind narrative",
+            &state.run_id[..8]
+        )),
+        "{out}"
+    );
+    assert!(out.contains(&dest.display().to_string()), "{out}");
+    assert!(!out.contains("exported RUN-NARRATIVE.md to"), "{out}");
     assert!(dest.exists());
 }
 

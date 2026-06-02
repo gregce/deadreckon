@@ -55,6 +55,7 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
         .await;
     }
     let mut state = loaded_state?;
+    let kind_arg = cli_doc_kind_arg(kind);
     let kind = run_doc_kind(kind)?;
     if polish {
         if state.status != RunStatus::Completed {
@@ -173,7 +174,14 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
         fs::copy(&path, &dest)?;
-        println!("exported {} to {}", kind.file_name(), dest.display());
+        print_doc_export_surface(
+            "run",
+            &state.run_id,
+            kind_arg,
+            kind.file_name(),
+            &path,
+            &dest,
+        );
     } else {
         print!("{}", fs::read_to_string(&path)?);
     }
@@ -224,6 +232,7 @@ async fn doc_plan_command(paths: &DeadreckonPaths, args: DocPlanCommandArgs) -> 
         );
     }
     let path = plan_doc_path(paths, &target.plan.plan_id, file_name);
+    let kind_arg = cli_doc_kind_arg(kind);
     if let Some(dest) = export {
         if dest.exists() && !force {
             return Err(CliError::Core(deadreckon_core::user_error(
@@ -235,11 +244,64 @@ async fn doc_plan_command(paths: &DeadreckonPaths, args: DocPlanCommandArgs) -> 
             fs::create_dir_all(parent)?;
         }
         fs::copy(&path, &dest)?;
-        println!("exported {file_name} to {}", dest.display());
+        print_doc_export_surface(
+            "plan",
+            &target.plan.plan_id,
+            kind_arg,
+            file_name,
+            &path,
+            &dest,
+        );
     } else {
         print!("{}", fs::read_to_string(&path)?);
     }
     Ok(())
+}
+
+fn cli_doc_kind_arg(kind: CliDocKind) -> &'static str {
+    match kind {
+        CliDocKind::Narrative => "narrative",
+        CliDocKind::AsBuilt => "as-built",
+        CliDocKind::Decisions => "decisions",
+        CliDocKind::Children => "children",
+        CliDocKind::Delta => "delta",
+    }
+}
+
+fn print_doc_export_surface(
+    target_kind: &str,
+    target_id: &str,
+    kind_arg: &str,
+    file_name: &str,
+    source: &std::path::Path,
+    dest: &std::path::Path,
+) {
+    let id = run_prefix(target_id);
+    let primary = format!("deadreckon doc {id} --kind {kind_arg}");
+    let secondary = format!("deadreckon show {id}");
+    print!(
+        "{}",
+        VerdictSurface::try_new(
+            VerdictKind::Completed,
+            "doc",
+            Some(&id),
+            ExplanationPanel::new(
+                format!("Exported {file_name} to {}.", dest.display()),
+                "The document copy completed successfully; the recommended command reopens the source document through DeadReckon for inspection.",
+                vec![
+                    ("target".to_string(), format!("{target_kind} {id}")),
+                    ("kind".to_string(), kind_arg.to_string()),
+                    ("file".to_string(), file_name.to_string()),
+                    ("source".to_string(), source.display().to_string()),
+                    ("dest".to_string(), dest.display().to_string()),
+                ],
+            ),
+            vec![("Recommended", primary.as_str())],
+            vec![("Secondary", secondary.as_str())],
+        )
+        .expect("doc export verdict surface must have one primary action")
+        .render_plain(false)
+    );
 }
 
 fn print_doc_polish_preview(
