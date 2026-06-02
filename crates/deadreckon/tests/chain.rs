@@ -1247,6 +1247,36 @@ fn chain_extend_appends_step_and_writes_event() {
 }
 
 #[test]
+fn chain_extend_refuses_missing_step_goal_with_verdict_surface() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "extend", "latest"])
+        .output()
+        .expect("extend");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.starts_with("blocked chain"), "{stderr}");
+    assert!(
+        stderr.contains("chain extend needs a step goal"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Explanation\n"), "{stderr}");
+    assert!(stderr.contains("Evidence\n"), "{stderr}");
+    assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain extend latest \"add tests\""),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("try:"), "{stderr}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
+}
+
+#[test]
 fn chain_redo_applied_step_requires_reapply_flag() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

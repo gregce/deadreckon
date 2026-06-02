@@ -334,10 +334,19 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
         "extend" => {
             let id = args.get(1).map(String::as_str).unwrap_or("latest");
             let step_goal = args.get(2).cloned().or(extend).ok_or_else(|| {
-                CliError::Core(deadreckon_core::user_error(
-                    "chain extend needs a step goal",
-                    "deadreckon chain extend latest \"add tests\"",
-                ))
+                chain_create_refusal_surface(
+                    VerdictKind::Blocked,
+                    None,
+                    "DeadReckon did not extend the chain because chain extend needs a step goal.",
+                    "Extending a chain mutates ordered chain state, so DeadReckon needs the new step goal before it can preview or write that change.",
+                    [
+                        ("command".to_string(), "chain extend".to_string()),
+                        ("chain".to_string(), id.to_string()),
+                        ("step goal".to_string(), "missing".to_string()),
+                    ],
+                    format!("deadreckon chain extend {id} \"add tests\""),
+                    no_hints,
+                )
             })?;
             chain_extend_command(&paths, id, step_goal, insert_at, max_spend_add)
         }
