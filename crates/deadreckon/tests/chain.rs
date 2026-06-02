@@ -2230,11 +2230,7 @@ fn chain_no_args_dispatches_to_chain_status() {
 
     assert_success(&output);
     assert!(stdout(&output).contains("CHAIN"), "{}", stdout(&output));
-    assert!(
-        stderr(&output).contains("using: chain status"),
-        "{}",
-        stderr(&output)
-    );
+    assert!(!stderr(&output).contains("using:"), "{}", stderr(&output));
 }
 
 #[test]
@@ -2243,7 +2239,7 @@ fn chain_bare_verb_dispatches_to_chain_status() {
 }
 
 #[test]
-fn chain_bare_verb_prints_using_info_line_on_stderr() {
+fn chain_bare_verb_does_not_print_dispatch_summary_on_stderr() {
     chain_no_args_dispatches_to_chain_status();
 }
 
@@ -2278,11 +2274,7 @@ fn chain_run_bare_verb_dispatches_to_chain_resume_latest() {
         .expect("chain run");
 
     assert_success(&output);
-    assert!(
-        stderr(&output).contains("using: chain resume"),
-        "{}",
-        stderr(&output)
-    );
+    assert!(!stderr(&output).contains("using:"), "{}", stderr(&output));
     assert_eq!(newest_chain(&paths).status, ChainStatus::Completed);
 }
 

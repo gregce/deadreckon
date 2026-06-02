@@ -194,7 +194,6 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
             .await
             .map(|_| ());
         }
-        eprintln!("using: chain status (scope: {})", current_scope()?);
         return chain_status_command(None, all, full, plain, json);
     };
 
@@ -246,7 +245,6 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
             let id = args.get(1).map(String::as_str).unwrap_or("latest");
             if id == "latest" || id == "last" {
                 let latest = resolve_chain_id(&paths, id, all)?;
-                eprintln!("using: chain resume {}", chain_prefix(&latest));
                 return chain_run_command(
                     &paths,
                     &latest,
