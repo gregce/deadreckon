@@ -4,6 +4,10 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.31.0"
 ci = ["github"]
+# release.yml is hand-maintained for the Release Trust pipeline (signing,
+# provenance, fail-closed lanes) and intentionally diverges from the dist
+# template, so skip the generated-CI consistency check during `dist plan`.
+allow-dirty = ["ci"]
 installers = ["shell", "powershell", "homebrew"]
 publish-jobs = ["homebrew"]
 tap = "gdc/homebrew-tap"
