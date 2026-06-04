@@ -14,6 +14,16 @@ You get a signed, auditable artifact instead of a chat transcript you have to ta
 
 ## Get started
 
+Install the latest release (macOS / Linux):
+
+```bash
+curl -fsSL https://deadreckon.sh/install.sh | sh
+```
+
+This downloads the release installer, verifies it against `SHA256SUMS`, and installs `deadreckon`. Pin a version with `DEADRECKON_TAG=v0.1.0-rc.1`.
+
+Or build from source:
+
 ```bash
 cargo build --release          # binary at ./target/release/deadreckon
 ```
