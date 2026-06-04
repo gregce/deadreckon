@@ -416,8 +416,14 @@ jobs:
             target/distrib/SHA256SUMS \
             target/distrib/release-manifest.json \
             target/distrib/release.spdx.json \
-            target/distrib/trust/*.json \
             --clobber
+          # Per-target trust status files (e.g. macOS signing) are nested under
+          # the global artifact layout, so locate them rather than globbing a
+          # fixed path, and tolerate lanes that produce none.
+          mapfile -t trust_files < <(find target/distrib -path '*/trust/*.json' -type f)
+          if [ ${#trust_files[@]} -gt 0 ]; then
+            gh release upload "${{ github.ref_name }}" "${trust_files[@]}" --clobber
+          fi
           gh release view "${{ github.ref_name }}" --json body --jq .body > target/distrib/release-body.md
           cat >> target/distrib/release-body.md <<'EOF'
 
