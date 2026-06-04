@@ -408,25 +408,31 @@ jobs:
         with:
           name: dist-trust
           path: target/distrib
-      - name: Upload and announce release
+      - name: Create and announce release
         shell: bash
         run: |
-          dist host --steps=create,upload,release,announce --tag=${{ github.ref_name }}
-          gh release upload "${{ github.ref_name }}" \
-            target/distrib/SHA256SUMS \
-            target/distrib/release-manifest.json \
-            target/distrib/release.spdx.json \
-            --clobber
-          # Per-target trust status files (e.g. macOS signing) are nested under
-          # the global artifact layout, so locate them rather than globbing a
-          # fixed path, and tolerate lanes that produce none.
-          mapfile -t trust_files < <(find target/distrib -path '*/trust/*.json' -type f)
-          if [ ${#trust_files[@]} -gt 0 ]; then
-            gh release upload "${{ github.ref_name }}" "${trust_files[@]}" --clobber
-          fi
-          gh release view "${{ github.ref_name }}" --json body --jq .body > target/distrib/release-body.md
-          cat >> target/distrib/release-body.md <<'EOF'
-
+          tag="${{ github.ref_name }}"
+          # cargo-dist's hosting backend is not wired into this hand-maintained
+          # workflow (hosting stays null, so `dist host` cannot create the
+          # release), so publish the release directly with gh. Collect every
+          # release artifact from the trust bundle, de-duplicated by basename
+          # (the global artifact layout nests some files twice).
+          declare -A seen
+          files=()
+          while IFS= read -r f; do
+            b="$(basename "$f")"
+            if [ -z "${seen[$b]:-}" ]; then
+              seen[$b]=1
+              files+=("$f")
+            fi
+          done < <(find target/distrib -type f \( \
+              -name '*.tar.xz' -o -name '*.tar.gz' -o -name '*.zip' \
+              -o -name '*.sha256' -o -name 'sha256.sum' -o -name 'SHA256SUMS' \
+              -o -name 'deadreckon-installer.sh' -o -name 'deadreckon-installer.ps1' \
+              -o -name '*.rb' -o -name 'release-manifest.json' \
+              -o -name 'release.spdx.json' -o -path '*/trust/*.json' \) | sort)
+          notes="target/distrib/release-body.md"
+          cat > "$notes" <<'EOF'
           ## Verify artifacts
 
           Download `SHA256SUMS`, `release-manifest.json`, and `release.spdx.json`
@@ -441,9 +447,15 @@ jobs:
           artifacts are Authenticode signed. The release manifest records signing,
           notarization, checksum, package-manager, and attestation policy status.
           EOF
-          gh release edit "${{ github.ref_name }}" --notes-file target/distrib/release-body.md
-          if [[ "${{ needs.release-policy.outputs.lane }}" == "rc" ]]; then
-            gh release edit "${{ github.ref_name }}" --prerelease
+          prerelease=()
+          if [ "${{ needs.release-policy.outputs.lane }}" = "rc" ]; then
+            prerelease=(--prerelease)
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$tag" --notes-file "$notes" "${prerelease[@]}"
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" --title "$tag" --notes-file "$notes" "${prerelease[@]}" "${files[@]}"
           fi
 
   publish-homebrew-formula:
