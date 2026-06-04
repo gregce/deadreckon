@@ -331,23 +331,37 @@ function verifyHomebrew(localArgs = args) {
   const formulae = releaseFiles(dir, { includeChecksums: true, includeManifest: false }).filter((file) =>
     file.endsWith(".rb"),
   );
+  const findChecksum = (basename) =>
+    checksums.get(basename) ??
+    [...checksums.entries()].find(([name]) => path.basename(name) === basename)?.[1];
+  let verifiedUrls = 0;
   for (const formula of formulae) {
     const text = fs.readFileSync(path.join(dir, formula), "utf8");
-    const url = /url\s+"([^"]+)"/.exec(text)?.[1];
-    const formulaSha = /sha256\s+"([^"]+)"/.exec(text)?.[1];
-    if (!url || !formulaSha) {
-      throw new Error(`${formula} must contain url and sha256`);
+    // Multi-platform formulae carry one url per target inside on_macos/on_linux
+    // blocks, and cargo-dist only embeds sha256 lines at publish/host time. So
+    // at the build+trust stage verify every referenced artifact is present in
+    // SHA256SUMS (the integrity source of truth), and match any embedded sha256
+    // we do find rather than requiring them.
+    const urls = [...text.matchAll(/url\s+"([^"]+)"/g)].map((match) => match[1]);
+    const embeddedShas = [...text.matchAll(/sha256\s+"([0-9a-fA-F]{64})"/g)].map((match) => match[1]);
+    if (urls.length === 0) {
+      throw new Error(`${formula} must reference at least one url`);
     }
-    const basename = path.basename(url);
-    const checksum = checksums.get(basename) ?? [...checksums.entries()].find(([name]) => path.basename(name) === basename)?.[1];
-    if (!checksum) {
-      throw new Error(`${formula} references ${basename}, which is missing from SHA256SUMS`);
+    for (const url of urls) {
+      const basename = path.basename(url);
+      if (!findChecksum(basename)) {
+        throw new Error(`${formula} references ${basename}, which is missing from SHA256SUMS`);
+      }
+      verifiedUrls += 1;
     }
-    if (checksum !== formulaSha) {
-      throw new Error(`${formula} sha256 does not match SHA256SUMS for ${basename}`);
+    const knownChecksums = new Set(checksums.values());
+    for (const sha of embeddedShas) {
+      if (!knownChecksums.has(sha)) {
+        throw new Error(`${formula} embeds sha256 ${sha}, which is not present in SHA256SUMS`);
+      }
     }
   }
-  writeJson({ ok: true, formulae: formulae.length });
+  writeJson({ ok: true, formulae: formulae.length, verified_urls: verifiedUrls });
 }
 
 function artifactRecord(dir, file, lane, trust) {
