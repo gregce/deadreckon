@@ -40,7 +40,7 @@ Users should be able to verify a downloaded artifact with:
 
 ```sh
 shasum -a 256 -c SHA256SUMS
-gh attestation verify <artifact> --repo gdc/deadreckon
+gh attestation verify <artifact> --repo gregce/deadreckon
 ```
 
 For macOS artifacts, CI extracts the cargo-dist archive, signs the packaged
@@ -160,3 +160,24 @@ attestations and npm provenance.
 9. After the RC rehearsal is clean, create and push the stable tag.
 
 The first real release remains an operator action.
+
+## Site Installer
+
+The website can host a thin bootstrap script at `https://deadreckon.sh/install.sh`.
+That script downloads `deadreckon-installer.sh` from the GitHub Release selected
+by `DEADRECKON_TAG` and then delegates to the cargo-dist installer. For the first
+RC, the intended public command is:
+
+```sh
+curl -fsSL https://deadreckon.sh/install.sh | sh
+deadreckon try
+deadreckon doctor
+```
+
+Before announcing the command, confirm that the site script's default tag points
+at the published RC and that the release has `deadreckon-installer.sh` plus
+`SHA256SUMS` attached. For a pinned rehearsal:
+
+```sh
+curl -fsSL https://deadreckon.sh/install.sh | DEADRECKON_TAG=v0.1.0-rc.1 sh
+```

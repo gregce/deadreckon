@@ -59,6 +59,7 @@ use deadreckon_core::learning::{
     read_proposal, record_pr_event, write_candidate, write_eval,
 };
 use deadreckon_core::paths::{sanitize_slug, task_key, workspace_scope};
+use deadreckon_core::state::load_state;
 use deadreckon_core::update_cache::{read_cache, write_cache};
 use deadreckon_core::{
     AcceptanceMarker, AcceptanceProgressEntry, ApplyMode, ApplyStrategy, BranchPolicy, Chain,
@@ -77,13 +78,13 @@ use deadreckon_core::{
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
     docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files, list_runs,
-    load_chain, load_plan, load_run, load_state, marker_path_for_run_root, pid_is_alive,
-    plan_status_label, plan_task_status_label, prepare_worktree_record, preview_git_state,
-    promote_completed_run, read_chain_step_marker, read_codebase_record, read_plan_messages,
-    record_for_resolved_mode, release_lock_file, resolve_mode, restore_snapshot, run_status_label,
-    save_chain, save_plan, save_state, terminate_pid, validate_acceptance_marker,
-    validate_task_count, write_acceptance_marker, write_cancel_marker, write_chain_step_marker,
-    write_child_summary, write_coordinator_state, write_plan_child_marker, write_worker_spec,
+    load_chain, load_plan, load_run, marker_path_for_run_root, pid_is_alive, plan_status_label,
+    plan_task_status_label, prepare_worktree_record, preview_git_state, promote_completed_run,
+    read_chain_step_marker, read_codebase_record, read_plan_messages, record_for_resolved_mode,
+    release_lock_file, resolve_mode, restore_snapshot, run_status_label, save_chain, save_plan,
+    save_state, terminate_pid, validate_acceptance_marker, validate_task_count,
+    write_acceptance_marker, write_cancel_marker, write_chain_step_marker, write_child_summary,
+    write_coordinator_state, write_plan_child_marker, write_worker_spec,
 };
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,

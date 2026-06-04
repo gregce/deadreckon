@@ -181,7 +181,8 @@ impl VerdictSurface {
                 actual: primary.len(),
             });
         }
-        let primary_action = primary.into_iter().next().expect("one primary action");
+        let mut primary = primary;
+        let primary_action = primary.remove(0);
         if primary_action.command.trim().is_empty() {
             return Err(VerdictSurfaceError::MissingPrimaryCommand);
         }
@@ -279,18 +280,16 @@ impl VerdictSurface {
     }
 
     pub fn add_to_json(&self, mut value: Value) -> Value {
-        let object = match value {
-            Value::Object(ref mut object) => object,
-            _ => {
-                value = Value::Object(Map::new());
-                value.as_object_mut().expect("object")
-            }
-        };
-        object.insert(
-            "primary_action".to_string(),
-            Value::String(self.primary_action.command.clone()),
-        );
-        object.insert("verdict".to_string(), self.verdict_json());
+        if !value.is_object() {
+            value = Value::Object(Map::new());
+        }
+        if let Value::Object(object) = &mut value {
+            object.insert(
+                "primary_action".to_string(),
+                Value::String(self.primary_action.command.clone()),
+            );
+            object.insert("verdict".to_string(), self.verdict_json());
+        }
         value
     }
 }
