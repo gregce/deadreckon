@@ -76,7 +76,7 @@ fn update_check_refreshes_cache_when_stale() {
             checked_at: Utc::now() - Duration::hours(25),
             latest_version: "0.1.0".to_string(),
             current_version: "0.1.0".to_string(),
-            release_url: "https://github.com/gdc/deadreckon/releases/tag/v0.1.0".to_string(),
+            release_url: "https://github.com/gregce/deadreckon/releases/tag/v0.1.0".to_string(),
             update_available: false,
         },
     )
@@ -307,7 +307,7 @@ fn update_shell_previews_before_swap() {
         .env("DEADRECKON_UPDATE_TEST_LATEST_VERSION", "0.2.3")
         .env(
             "DEADRECKON_UPDATE_TEST_ARCHIVE_URL",
-            "https://github.com/gdc/deadreckon/releases/download/v0.2.3/deadreckon.tar.xz",
+            "https://github.com/gregce/deadreckon/releases/download/v0.2.3/deadreckon.tar.xz",
         )
         .env("DEADRECKON_UPDATE_TEST_SHA256", "abc123")
         .env("DEADRECKON_UPDATE_TEST_SHELL_REPLACEMENT", &replacement)
@@ -321,7 +321,7 @@ fn update_shell_previews_before_swap() {
     assert!(out.contains("target: 0.2.3"), "{out}");
     assert!(
         out.contains(
-            "archive: https://github.com/gdc/deadreckon/releases/download/v0.2.3/deadreckon.tar.xz"
+            "archive: https://github.com/gregce/deadreckon/releases/download/v0.2.3/deadreckon.tar.xz"
         ),
         "{out}"
     );
@@ -593,7 +593,7 @@ fn receipt(channel: Channel) -> Receipt {
 fn shell_receipt(binary_path: &std::path::Path) -> Receipt {
     let mut receipt = receipt(Channel::Shell);
     receipt.binary_path = binary_path.to_path_buf();
-    receipt.install_source = Some("https://github.com/gdc/deadreckon/releases".to_string());
+    receipt.install_source = Some("https://github.com/gregce/deadreckon/releases".to_string());
     receipt
 }
 
@@ -605,7 +605,7 @@ fn write_update_available_cache(paths: &DeadreckonPaths, latest_version: &str) {
             latest_version: latest_version.to_string(),
             current_version: "0.1.0".to_string(),
             release_url: format!(
-                "https://github.com/gdc/deadreckon/releases/tag/v{latest_version}"
+                "https://github.com/gregce/deadreckon/releases/tag/v{latest_version}"
             ),
             update_available: true,
         },

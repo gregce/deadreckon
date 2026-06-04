@@ -38,7 +38,7 @@ function binaryPath(packageName) {
 const packageName = platformPackage();
 if (!packageName) {
   console.error(`deadreckon does not ship an npm binary for ${process.platform}/${process.arch}`);
-  console.error("try: curl -LsSf https://github.com/gdc/deadreckon/releases/latest/download/deadreckon-installer.sh | sh");
+  console.error("try: curl -LsSf https://github.com/gregce/deadreckon/releases/latest/download/deadreckon-installer.sh | sh");
   process.exit(1);
 }
 

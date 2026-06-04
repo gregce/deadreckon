@@ -423,7 +423,7 @@ jobs:
 
           ```sh
           shasum -a 256 -c SHA256SUMS
-          gh attestation verify <artifact> --repo gdc/deadreckon
+          gh attestation verify <artifact> --repo gregce/deadreckon
           ```
 
           macOS artifacts are Developer ID signed and notarized. Stable Windows

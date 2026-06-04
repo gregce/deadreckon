@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-const OFFICIAL_REPO = "gdc/deadreckon";
+const OFFICIAL_REPO = "gregce/deadreckon";
 const TARGETS = [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",

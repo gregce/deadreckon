@@ -79,7 +79,7 @@ fn homebrew_formula_writes_install_receipt() {
         &formula,
         r#"class Deadreckon < Formula
   version "9.8.7"
-  url "https://github.com/gdc/deadreckon/releases/download/v9.8.7/deadreckon.tar.xz"
+  url "https://github.com/gregce/deadreckon/releases/download/v9.8.7/deadreckon.tar.xz"
   sha256 "abc123"
 
   def install_binary_aliases!
@@ -141,7 +141,7 @@ fn homebrew_formula_pins_release_sha256() {
         &formula,
         r#"class Deadreckon < Formula
   version "9.8.7"
-  url "https://github.com/gdc/deadreckon/releases/download/v9.8.7/deadreckon.tar.xz"
+  url "https://github.com/gregce/deadreckon/releases/download/v9.8.7/deadreckon.tar.xz"
   sha256 "abc123"
 
   def install_binary_aliases!
@@ -180,7 +180,7 @@ fn release_lane_classifies_branch_rc_and_stable_tags() {
         "--ref",
         "refs/heads/main",
         "--repo",
-        "gdc/deadreckon",
+        "gregce/deadreckon",
     ]);
     assert_eq!(
         Some("branch"),
@@ -200,14 +200,17 @@ fn release_lane_classifies_branch_rc_and_stable_tags() {
         "--ref",
         "refs/tags/v1.2.3-rc.4",
         "--repo",
-        "gdc/deadreckon",
+        "gregce/deadreckon",
     ]);
     assert_eq!(Some("rc"), rc.get("lane").and_then(JsonValue::as_str));
     assert_eq!(
         Some("v1.2.3-rc.4"),
         rc.get("tag").and_then(JsonValue::as_str)
     );
-    assert_eq!(Some("1.2.3"), rc.get("version").and_then(JsonValue::as_str));
+    assert_eq!(
+        Some("1.2.3-rc.4"),
+        rc.get("version").and_then(JsonValue::as_str)
+    );
     assert_eq!(
         Some(true),
         rc.get("build_artifacts").and_then(JsonValue::as_bool)
@@ -231,7 +234,7 @@ fn release_lane_classifies_branch_rc_and_stable_tags() {
         "--ref",
         "refs/tags/v1.2.3",
         "--repo",
-        "gdc/deadreckon",
+        "gregce/deadreckon",
     ]);
     assert_eq!(
         Some("stable"),
@@ -266,7 +269,7 @@ fn official_release_requires_trust_material() {
         "--ref",
         "refs/tags/v1.2.3",
         "--repo",
-        "gdc/deadreckon",
+        "gregce/deadreckon",
     ]);
     assert!(
         !output.status.success(),
@@ -324,7 +327,7 @@ fn invalid_tag_never_publishes() {
         "--ref",
         "refs/tags/release-1.2.3",
         "--repo",
-        "gdc/deadreckon",
+        "gregce/deadreckon",
     ]);
     assert_eq!(
         Some("invalid_tag"),
@@ -344,7 +347,7 @@ fn invalid_tag_never_publishes() {
         "--ref",
         "refs/tags/release-1.2.3",
         "--repo",
-        "gdc/deadreckon",
+        "gregce/deadreckon",
     ]);
     assert!(
         !output.status.success(),
@@ -359,7 +362,7 @@ fn stable_tag_must_match_workspace_version() {
         "--ref",
         "refs/tags/v99.99.99",
         "--repo",
-        "gdc/deadreckon",
+        "gregce/deadreckon",
         "--skip-changelog",
     ]);
     assert!(
@@ -380,7 +383,7 @@ fn stable_tag_requires_changelog_entry() {
         "--ref",
         "refs/tags/v0.1.0",
         "--repo",
-        "gdc/deadreckon",
+        "gregce/deadreckon",
         "--changelog",
         changelog.to_str().expect("utf8 path"),
     ]);
@@ -438,7 +441,7 @@ fn release_manifest_covers_artifacts_and_checksums() {
         "--ref",
         "refs/tags/v1.2.3-rc.1",
         "--repo",
-        "gdc/deadreckon",
+        "gregce/deadreckon",
         "--commit",
         "abc123",
         "--out",
@@ -642,7 +645,7 @@ fn release_workflow_generates_trust_artifacts_and_attestations() {
         "release.spdx.json",
         "gh release upload",
         "gh release edit",
-        "gh attestation verify <artifact> --repo gdc/deadreckon",
+        "gh attestation verify <artifact> --repo gregce/deadreckon",
     ] {
         assert!(workflow.contains(needle), "{needle} missing from workflow");
     }
