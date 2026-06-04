@@ -411,7 +411,7 @@ jobs:
       - name: Upload and announce release
         shell: bash
         run: |
-          dist host --steps=upload,release,announce --tag=${{ github.ref_name }}
+          dist host --steps=create,upload,release,announce --tag=${{ github.ref_name }}
           gh release upload "${{ github.ref_name }}" \
             target/distrib/SHA256SUMS \
             target/distrib/release-manifest.json \
