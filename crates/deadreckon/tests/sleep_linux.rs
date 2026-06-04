@@ -1,4 +1,8 @@
 #![allow(clippy::expect_used)]
+// This integration test must mutate process environment variables, which are
+// `unsafe` in edition 2024. Mutations are serialized via ENV_LOCK and restored
+// before each test returns (see the SAFETY notes on each block below).
+#![allow(unsafe_code)]
 
 #[cfg(target_os = "linux")]
 use deadreckon::sleep::{SleepMode, preview_with_binary_lookup};
