@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "deadreckon"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "axoupdater",
  "axum",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "deadreckon-core"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "chrono",
  "fs2",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "deadreckon-providers"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "axum",
  "deadreckon-core",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "deadreckon-runtime"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "chrono",
  "deadreckon-core",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "deadreckon-sandbox"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "deadreckon-core",
  "nix",

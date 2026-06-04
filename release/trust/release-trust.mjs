@@ -97,7 +97,11 @@ function classifyRelease(localArgs = args) {
     version = `${stable[1]}.${stable[2]}.${stable[3]}`;
   } else if (isTag && rc) {
     lane = "rc";
-    version = `${rc[1]}.${rc[2]}.${rc[3]}`;
+    // cargo-dist binds the git tag to the package version exactly, so an rc
+    // release requires Cargo.toml to carry the full prerelease string
+    // (e.g. 0.1.0-rc.1). Keep version in lockstep with the tag rather than
+    // stripping the suffix, so `validate` and `dist host` agree.
+    version = `${rc[1]}.${rc[2]}.${rc[3]}-rc.${rc[4]}`;
     rcNumber = Number.parseInt(rc[4], 10);
   } else if (isTag) {
     lane = "invalid_tag";
