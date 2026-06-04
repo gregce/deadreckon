@@ -4,6 +4,11 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.31.0"
 ci = ["github"]
+# Let dist create and manage the GitHub release: `dist host --steps=create`
+# (dist-plan job) opens the draft that the publish job then uploads to and
+# announces. Without this, hosting is None and `dist host` errors with
+# "release not found".
+hosting = ["github"]
 # release.yml is hand-maintained for the Release Trust pipeline (signing,
 # provenance, fail-closed lanes) and intentionally diverges from the dist
 # template, so skip the generated-CI consistency check during `dist plan`.
