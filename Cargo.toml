@@ -80,3 +80,8 @@ panic = "unwind"
 
 [profile.dev]
 debug = "limited"
+
+# cargo-dist builds release artifacts with the `dist` profile; inherit the
+# tuned release profile so distributed binaries get the same optimization.
+[profile.dist]
+inherits = "release"
