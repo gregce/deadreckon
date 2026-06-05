@@ -40,7 +40,7 @@ use super::tui::{
     AttachActionNotice, AttachPanel, AttachPanelCounts, AttachPanelRows, AttachParentPlan,
     AttachTuiState, ChainAttachTuiState, build_run_narrative_projection, chain_activity_lines,
     chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
-    chain_timeline_lines, markdown_to_tui_lines, max_panel_scroll, panel_title,
+    chain_timeline_lines, footer, markdown_to_tui_lines, max_panel_scroll, panel_title,
     render_chain_attach, selection_glyph,
 };
 use super::{
@@ -3404,7 +3404,7 @@ fn run_attach_narrow_terminal_keeps_footer_visible() {
 
     assert!(text.contains("[n] Activity"), "{text}");
     assert!(text.contains("[r] Refresh"), "{text}");
-    assert!(text.contains("q detach"), "{text}");
+    assert!(text.contains("q/Esc/Ctrl-D detach"), "{text}");
 }
 
 #[test]
@@ -3721,7 +3721,7 @@ fn child_attach_from_plan_names_parent_and_back_action() {
 
     assert!(text.contains("plan 99998888 / task-1"), "{text}");
     assert!(
-        text.contains("Back to plan: b Backspace q Esc Ctrl-D"),
+        text.contains("b/Backspace/q/Esc/Ctrl-D back to plan"),
         "{text}"
     );
     assert!(text.contains("parent plan 99998888 task-1"), "{text}");
@@ -3763,7 +3763,7 @@ fn plan_attach_child_footer_includes_back_hint() {
     let text = render_attach_text_with_tui_state(&state, &[], &AttachLive::default(), tui_state);
 
     assert!(
-        text.contains("Back to plan: b Backspace q Esc Ctrl-D"),
+        text.contains("b/Backspace/q/Esc/Ctrl-D back to plan"),
         "{text}"
     );
 }
@@ -4035,6 +4035,68 @@ fn selection_glyph_identical_across_surfaces() {
         chain_lines[1].contains(glyph),
         "chain selected step uses {glyph}: {:?}",
         chain_lines[1]
+    );
+}
+
+#[test]
+fn footer_shape_identical_across_surfaces() {
+    // The shared builder joins "key label" pairs with one separator.
+    assert_eq!(
+        footer(&[("q/Esc", "detach"), ("Tab", "panel"), ("Enter", "open")]),
+        "q/Esc detach  |  Tab panel  |  Enter open"
+    );
+    // Chain, campaign and run footers all go through it: same separator, and every
+    // one offers the detach/quit affordance (Esc/q).
+    let chain = chain_attach_footer_text(&chain_fixture());
+    let (_t, state) = doc_preview_state();
+    let run = render_attach_text_with_size(
+        &state,
+        &[],
+        &AttachLive::default(),
+        AttachTuiState::default(),
+        200,
+        22,
+    );
+    for (name, text) in [("chain", &chain), ("run", &run)] {
+        assert!(text.contains("  |  "), "{name} footer separator: {text}");
+        assert!(
+            text.contains('q') && text.contains("Esc"),
+            "{name} footer offers Esc/q: {text}"
+        );
+    }
+}
+
+#[test]
+fn parent_plan_footer_replace_hack_removed() {
+    // A child run attached from a plan gets its back affordance + breadcrumb
+    // structurally (via footer items), not by string-replacing the detach text.
+    let (_temp, state) = doc_preview_state();
+    let tui_state = AttachTuiState {
+        parent_plan: Some(AttachParentPlan {
+            plan_id: "99998888777766665555444433332222".to_string(),
+            task_id: "task-1".to_string(),
+            campaign_parent: None,
+        }),
+        ..AttachTuiState::default()
+    };
+    let text =
+        render_attach_text_with_size(&state, &[], &AttachLive::default(), tui_state, 200, 22);
+    assert!(
+        text.contains("b/Backspace/q/Esc/Ctrl-D back to plan"),
+        "structural back affordance: {text}"
+    );
+    assert!(
+        text.contains("parent plan 99998888 task-1"),
+        "structural breadcrumb: {text}"
+    );
+    // The old string-replace hack's phrasings must not appear.
+    assert!(
+        !text.contains("Back to plan: b Backspace"),
+        "old hack phrasing gone: {text}"
+    );
+    assert!(
+        !text.contains("b/Backspace/q back to plan"),
+        "old hack phrasing gone: {text}"
     );
 }
 

@@ -262,6 +262,24 @@ pub(crate) fn chain_activity_lines(
         .collect()
 }
 
+/// The single footer builder for every attach surface: a uniform
+/// "<keys> <label>" affordance list joined by one separator. Each surface
+/// supplies its own (mode-specific) items; the shape is identical everywhere.
+pub(crate) fn footer<S: AsRef<str>>(items: &[(S, S)]) -> String {
+    items
+        .iter()
+        .map(|(keys, label)| {
+            let (keys, label) = (keys.as_ref(), label.as_ref());
+            if label.is_empty() {
+                keys.to_string()
+            } else {
+                format!("{keys} {label}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  |  ")
+}
+
 pub(crate) fn chain_attach_footer_text(chain: &Chain) -> String {
     if chain.status == ChainStatus::Paused {
         let surface = chain_paused_attach_footer_surface(chain);
@@ -285,7 +303,16 @@ pub(crate) fn chain_attach_footer_text(chain: &Chain) -> String {
             surface.primary_action.command
         )
     } else {
-        "[Enter] drill  [r] redo  [e] extend  [p] pause  [k] kill  [Ctrl-D/q/Esc] detach  j/k move  PgUp/PgDn activity".to_string()
+        footer(&[
+            ("[Enter]", "drill"),
+            ("[r]", "redo"),
+            ("[e]", "extend"),
+            ("[p]", "pause"),
+            ("[k]", "kill"),
+            ("[Ctrl-D/q/Esc]", "detach"),
+            ("j/k", "move"),
+            ("PgUp/PgDn", "activity"),
+        ])
     }
 }
 
@@ -587,7 +614,13 @@ fn campaign_attach_footer_text(plain: bool) -> String {
     if plain {
         "plain summary: deadreckon attach <sub-plan-id> drills in".to_string()
     } else {
-        "q/Esc/Ctrl-D detach  |  b/Backspace back  |  arrows/Tab select sub-plan  |  Enter sub-plan  |  r refresh".to_string()
+        footer(&[
+            ("q/Esc/Ctrl-D", "detach"),
+            ("b/Backspace", "back"),
+            ("arrows/Tab", "select sub-plan"),
+            ("Enter", "sub-plan"),
+            ("r", "refresh"),
+        ])
     }
 }
 
@@ -1934,89 +1967,145 @@ fn attach_header_text_for_state(
 }
 
 fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTuiState) -> String {
-    let chain_suffix = if read_chain_step_marker(&state.working_dir)
+    let mut items: Vec<(String, String)> = Vec::new();
+    let push = |items: &mut Vec<(String, String)>, pairs: &[(&str, &str)]| {
+        items.extend(pairs.iter().map(|(k, l)| (k.to_string(), l.to_string())));
+    };
+
+    // Detach (or, for a child run attached from a plan, back-to-plan + the parent
+    // breadcrumb) comes first so the exit affordance and parent context stay
+    // visible even when a narrow terminal truncates the footer tail.
+    if let Some(parent_plan) = tui_state.parent_plan.as_ref() {
+        items.push((
+            "b/Backspace/q/Esc/Ctrl-D".to_string(),
+            "back to plan".to_string(),
+        ));
+        let campaign = parent_plan
+            .campaign_parent
+            .as_ref()
+            .map(|campaign| {
+                format!(
+                    "campaign {} / {} / ",
+                    run_prefix(&campaign.campaign_id),
+                    campaign.sub_id
+                )
+            })
+            .unwrap_or_default();
+        items.push((
+            "parent".to_string(),
+            format!(
+                "{campaign}plan {} {}",
+                run_prefix(&parent_plan.plan_id),
+                parent_plan.task_id
+            ),
+        ));
+    } else {
+        items.push(("q/Esc/Ctrl-D".to_string(), "detach".to_string()));
+    }
+
+    if state.run_root.join("abandoned.json").exists() {
+        push(
+            &mut items,
+            &[
+                ("worktree", "cleaned or abandoned"),
+                ("deadreckon", "status/list"),
+            ],
+        );
+    } else if tui_state.show_completion_actions && state.status == RunStatus::Completed {
+        let actions: &[(&str, &str)] = if is_worktree_run(state) {
+            if tui_state.docs_open {
+                &[
+                    ("[d]", "Activity"),
+                    ("[a]", "Apply"),
+                    ("[b]", "Abandon"),
+                    ("[s]", "Show"),
+                    ("Tab", "focus"),
+                    ("j/k", "scroll"),
+                ]
+            } else if tui_state.view.is_narrative() {
+                &[
+                    ("[n]", "Activity"),
+                    ("[v]", "Visual"),
+                    ("[r]", "Refresh"),
+                    ("[d]", "Docs"),
+                    ("[a]", "Apply"),
+                    ("[b]", "Abandon"),
+                    ("[s]", "Show"),
+                ]
+            } else {
+                &[
+                    ("[n]", "Narrative"),
+                    ("[d]", "Docs"),
+                    ("[a]", "Apply"),
+                    ("[b]", "Abandon"),
+                    ("[s]", "Show"),
+                    ("Tab", "focus"),
+                    ("j/k", "scroll"),
+                ]
+            }
+        } else if tui_state.docs_open {
+            &[
+                ("[d]", "Activity"),
+                ("[m]", "Materialize"),
+                ("[e]", "Extend"),
+                ("[s]", "Show"),
+                ("Tab", "focus"),
+                ("j/k", "scroll"),
+            ]
+        } else if tui_state.view.is_narrative() {
+            &[
+                ("[n]", "Activity"),
+                ("[v]", "Visual"),
+                ("[r]", "Refresh"),
+                ("[d]", "Docs"),
+                ("[m]", "Materialize"),
+                ("[e]", "Extend"),
+                ("[s]", "Show"),
+            ]
+        } else {
+            &[
+                ("[n]", "Narrative"),
+                ("[d]", "Docs"),
+                ("[m]", "Materialize"),
+                ("[e]", "Extend"),
+                ("[s]", "Show"),
+                ("Tab", "focus"),
+                ("j/k", "scroll"),
+            ]
+        };
+        push(&mut items, actions);
+    } else if tui_state.view.is_narrative() {
+        push(&mut items, &[("[n]", "Activity")]);
+        items.push((
+            "[v]".to_string(),
+            format!("Visual={}", tui_state.visual.label()),
+        ));
+        push(
+            &mut items,
+            &[("[r]", "Refresh"), ("Tab", "focus"), ("j/k", "scroll")],
+        );
+    } else {
+        push(
+            &mut items,
+            &[
+                ("[n]", "Narrative"),
+                ("Tab", "focus"),
+                ("j/k Up/Down PgUp/PgDn", "scroll"),
+            ],
+        );
+    }
+
+    if read_chain_step_marker(&state.working_dir)
         .ok()
         .flatten()
         .is_some()
     {
-        "  [c] Chain"
-    } else {
-        ""
-    };
-    if state.run_root.join("abandoned.json").exists() {
-        let footer = format!(
-            "worktree cleaned or abandoned  |  q detach  |  deadreckon status/list{chain_suffix}"
-        );
-        return parent_plan_footer(footer, tui_state.parent_plan.as_ref());
+        push(&mut items, &[("[c]", "Chain")]);
     }
-    let base = if tui_state.show_completion_actions && state.status == RunStatus::Completed {
-        if is_worktree_run(state) {
-            if tui_state.docs_open {
-                "[d] Activity  [a] Apply  [b] Abandon  [s] Show  |  Tab focus  j/k scroll  q detach"
-            } else if tui_state.view.is_narrative() {
-                "[n] Activity  [v] Visual  [r] Refresh  [d] Docs  [a] Apply  [b] Abandon  [s] Show  |  q detach"
-            } else {
-                "[n] Narrative  [d] Docs  [a] Apply  [b] Abandon  [s] Show  |  Tab focus  j/k scroll  q detach"
-            }
-            .to_string()
-        } else {
-            if tui_state.docs_open {
-                "[d] Activity  [m] Materialize  [e] Extend  [s] Show  |  Tab focus  j/k scroll  q detach"
-            } else if tui_state.view.is_narrative() {
-                "[n] Activity  [v] Visual  [r] Refresh  [d] Docs  [m] Materialize  [e] Extend  [s] Show  |  q detach"
-            } else {
-                "[n] Narrative  [d] Docs  [m] Materialize  [e] Extend  [s] Show  |  Tab focus  j/k scroll  q detach"
-            }
-            .to_string()
-        }
-    } else if tui_state.view.is_narrative() {
-        format!(
-            "[n] Activity  [v] Visual={}  [r] Refresh  |  Tab focus  j/k scroll  q detach",
-            tui_state.visual.label()
-        )
-    } else {
-        "Detach: q Esc Ctrl-D  |  [n] Narrative  |  Focus: Tab  |  Scroll: j/k Up/Down PgUp/PgDn mouse".to_string()
-    };
-    parent_plan_footer(
-        format!("{base}{chain_suffix}"),
-        tui_state.parent_plan.as_ref(),
-    )
-}
 
-fn parent_plan_footer(footer: String, parent_plan: Option<&AttachParentPlan>) -> String {
-    let Some(parent_plan) = parent_plan else {
-        return footer;
-    };
-    let footer = footer
-        .replace(
-            "q/Esc/Ctrl-D detach",
-            "b/Backspace/q/Esc/Ctrl-D back to plan",
-        )
-        .replace(
-            "Detach: q Esc Ctrl-D",
-            "Back to plan: b Backspace q Esc Ctrl-D",
-        )
-        .replace("q detach", "b/Backspace/q back to plan");
-    let campaign = parent_plan
-        .campaign_parent
-        .as_ref()
-        .map(|campaign| {
-            format!(
-                "campaign {} / {} / ",
-                run_prefix(&campaign.campaign_id),
-                campaign.sub_id
-            )
-        })
-        .unwrap_or_default();
-    let parent_label = format!(
-        "parent {campaign}plan {} {}",
-        run_prefix(&parent_plan.plan_id),
-        parent_plan.task_id
-    );
-    match footer.split_once("  |  ") {
-        Some((lead, rest)) => format!("{lead}  |  {parent_label}  |  {rest}"),
-        None => format!("{footer}  |  {parent_label}"),
-    }
+    // Detach vs back-to-plan is structural (no string-replace hack): a child run
+    // attached from a plan shows the parent label and a back affordance instead.
+    footer(&items)
 }
 
 fn deadreckoning_status_line(

@@ -21,7 +21,7 @@ pub(crate) use render::{
 #[cfg(test)]
 pub(crate) use render::{
     acceptance_activity_lines, attach_header_text, chain_activity_lines, chain_attach_footer_text,
-    chain_attach_header_text, chain_timeline_lines, deadreckoning_status_text,
+    chain_attach_header_text, chain_timeline_lines, deadreckoning_status_text, footer,
     markdown_to_tui_lines, meter_color, panel_title, plan_attach_footer,
     render_campaign_attach_text, selection_glyph, threshold_color,
 };
