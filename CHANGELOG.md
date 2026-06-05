@@ -36,6 +36,10 @@
 - Added `prompt::ask_number(range)` that re-prompts on empty, non-numeric, or
   out-of-range input, and routed the campaign and orchestrate child-count prompts
   through it so a typo re-prompts instead of aborting the whole command.
+- `deadreckon start` with no goal now prompts for one interactively on a TTY
+  (and prints a one-line notice when prompts are suppressed) instead of erroring
+  out. Confirm-vs-select modality is standardized incrementally (binary
+  decisions use `confirm`, multi-way use `select_one`).
 
 ## Release Trust - 2026-06-02
 

@@ -688,12 +688,10 @@ async fn main_inner() -> Result<()> {
             json,
         } => {
             ui::set_plain_output(plain || json);
-            let goal = resolve_required_goal_input(
-                "start",
-                goal,
-                goal_file,
-                "deadreckon start --goal-file docs/goal.md --yes",
-            )?;
+            let resolved_goal = resolve_optional_goal_input("start", goal, goal_file)?;
+            let allows_prompts =
+                std::io::stdin().is_terminal() && !yes && !json && !plain && !quiet;
+            let goal = commands::start::resolve_start_goal(resolved_goal, allows_prompts)?;
             commands::start::start_command(StartCommandArgs {
                 goal,
                 mode,

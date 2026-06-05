@@ -2349,6 +2349,55 @@ fn print_start_preview_surface(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartGoalPlan {
+    Provided(String),
+    Prompt,
+    Notice(String),
+}
+
+/// Decide how to obtain the start goal: use a provided non-empty goal, prompt
+/// interactively when prompts are allowed (a TTY without --yes/--json/--plain/
+/// --quiet), or emit a notice when prompts are suppressed.
+pub(crate) fn start_goal_plan(provided: Option<&str>, allows_prompts: bool) -> StartGoalPlan {
+    match provided.map(str::trim) {
+        Some(goal) if !goal.is_empty() => StartGoalPlan::Provided(goal.to_string()),
+        _ if allows_prompts => StartGoalPlan::Prompt,
+        _ => StartGoalPlan::Notice(
+            "no goal given and prompts are off; pass a goal: deadreckon start \"<goal>\""
+                .to_string(),
+        ),
+    }
+}
+
+/// Resolve the start goal, prompting interactively for it when none was given and
+/// prompts are allowed. Returns a friendly error (after a one-line notice) when
+/// no goal is available and prompts are suppressed.
+pub(crate) fn resolve_start_goal(provided: Option<String>, allows_prompts: bool) -> Result<String> {
+    match start_goal_plan(provided.as_deref(), allows_prompts) {
+        StartGoalPlan::Provided(goal) => Ok(goal),
+        StartGoalPlan::Prompt => {
+            let entered = crate::prompt::open("goal: ", None)?;
+            let goal = entered.trim().to_string();
+            if goal.is_empty() {
+                return Err(start_goal_required_error());
+            }
+            Ok(goal)
+        }
+        StartGoalPlan::Notice(message) => {
+            let _ = ui::writeln(ui::Stream::Stderr, ui::Tone::Note, &message);
+            Err(start_goal_required_error())
+        }
+    }
+}
+
+fn start_goal_required_error() -> CliError {
+    CliError::Core(deadreckon_core::user_error(
+        "start goal required",
+        "deadreckon start \"<goal>\"",
+    ))
+}
+
 pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     let stdin_is_tty = io::stdin().is_terminal();
     let paths = DeadreckonPaths::discover();
@@ -2819,4 +2868,36 @@ fn print_start_lifecycle_footer(kind: &str, id: &str) {
         .expect("start lifecycle verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false))
     );
+}
+
+#[cfg(test)]
+mod start_goal_tests {
+    use super::{StartGoalPlan, start_goal_plan};
+
+    #[test]
+    fn start_without_goal_prompts_when_tty() {
+        assert!(matches!(start_goal_plan(None, true), StartGoalPlan::Prompt));
+        // An all-whitespace goal is treated as missing and still prompts.
+        assert!(matches!(
+            start_goal_plan(Some("   "), true),
+            StartGoalPlan::Prompt
+        ));
+        assert!(matches!(
+            start_goal_plan(Some("build the app"), true),
+            StartGoalPlan::Provided(goal) if goal == "build the app"
+        ));
+    }
+
+    #[test]
+    fn start_without_goal_prints_notice_when_prompts_suppressed() {
+        assert!(matches!(
+            start_goal_plan(None, false),
+            StartGoalPlan::Notice(_)
+        ));
+        // A provided goal is still used even when prompts are suppressed.
+        assert!(matches!(
+            start_goal_plan(Some("ship it"), false),
+            StartGoalPlan::Provided(_)
+        ));
+    }
 }
