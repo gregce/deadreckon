@@ -147,7 +147,7 @@ fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sand
         campaign.n
     );
 
-    println!("Campaign preview {}", ui_id(&id));
+    println!("{} {}", ui_heading("Campaign preview"), ui_id(&id));
     println!();
     println!("{}", ui_heading("Goal"));
     print_campaign_wrapped("  ", &campaign.root_goal, CAMPAIGN_WRAP_WIDTH);
@@ -195,7 +195,9 @@ fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sand
     println!("{}", ui_heading("Next"));
     println!("  Press Enter or choose [1] to launch. Edit the split first if it looks wrong.");
     println!("  Launch without prompting:");
-    print_campaign_wrapped("    ", &primary, CAMPAIGN_WRAP_WIDTH);
+    for line in wrap_campaign_words(&primary, CAMPAIGN_WRAP_WIDTH.saturating_sub(4)) {
+        println!("    {}", ui_command(line));
+    }
 
     println!("{}", ui_heading("Sub-goals"));
     for sub in &campaign.sub_goals {
@@ -206,7 +208,7 @@ fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sand
 const CAMPAIGN_WRAP_WIDTH: usize = 88;
 
 fn print_campaign_fact(label: &str, value: &str) {
-    println!("  {label:<9} {value}");
+    println!("  {} {value}", crate::ui::pad_visible(&ui_muted(label), 9));
 }
 
 fn print_campaign_sub_goal(sub: &deadreckon_core::campaign::SubGoal) {

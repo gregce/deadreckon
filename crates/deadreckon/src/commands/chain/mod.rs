@@ -1752,10 +1752,14 @@ fn chain_show_command(
     print_chain_header(paths, &chain);
     for step in &chain.steps {
         println!(
-            "{} step {} {:<9} {}{}",
-            chain_step_dot_for_output(step.status),
+            "{} step {} {} {}{}",
+            crate::ui::render(
+                crate::ui::Stream::Stdout,
+                crate::ui::status_tone(chain_step_status_label(step.status)),
+                chain_step_dot_for_output(step.status)
+            ),
             step.index + 1,
-            chain_step_status_label(step.status),
+            crate::ui::pad_visible(&ui_status(chain_step_status_label(step.status)), 9),
             truncate_text(&step.goal, 72),
             step.run_id
                 .as_deref()
@@ -2132,14 +2136,26 @@ fn print_chain_attach_snapshot(chain: &Chain) {
     print_chain_header(&paths, chain);
     for step in &chain.steps {
         println!(
-            "{} step {} {:<9} {}",
-            chain_step_dot_for_output(step.status),
+            "{} step {} {} {}",
+            crate::ui::render(
+                crate::ui::Stream::Stdout,
+                crate::ui::status_tone(chain_step_status_label(step.status)),
+                chain_step_dot_for_output(step.status)
+            ),
             step.index + 1,
-            chain_step_status_label(step.status),
+            crate::ui::pad_visible(&ui_status(chain_step_status_label(step.status)), 9),
             truncate_text(&step.goal, 80)
         );
     }
-    println!("[r] redo  [e] extend  [p] pause  [k] kill  [Ctrl-D] detach  [q] quit");
+    println!(
+        "{} redo  {} extend  {} pause  {} kill  {} detach  {} quit",
+        ui_command("[r]"),
+        ui_command("[e]"),
+        ui_command("[p]"),
+        ui_command("[k]"),
+        ui_command("[Ctrl-D]"),
+        ui_command("[q]")
+    );
 }
 
 pub(crate) fn chain_attach_summary_line(chain: &Chain) -> String {

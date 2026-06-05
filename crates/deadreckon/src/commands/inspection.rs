@@ -1216,9 +1216,19 @@ fn print_library_table(entries: &[LibraryEntry], full: bool) {
             ]
         })
         .collect();
+    let headers = [
+        ui_heading("run"),
+        ui_heading("age"),
+        ui_heading("scope"),
+        ui_heading("exported"),
+        ui_heading("goal"),
+    ];
     print!(
         "{}",
-        crate::columns(&["run", "age", "scope", "exported", "goal"], &rows)
+        crate::columns(
+            &headers.iter().map(String::as_str).collect::<Vec<_>>(),
+            &rows
+        )
     );
     print_library_table_action_footer();
 }

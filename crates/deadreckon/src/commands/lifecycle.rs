@@ -965,10 +965,10 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
     println!("{}", ui_heading("cleanup candidates:"));
     for candidate in &candidates {
         println!(
-            "  {:<8} {:<10} {:<16} {}",
-            run_prefix(&candidate.state.run_id),
-            candidate.state.status,
-            candidate.reason,
+            "  {} {} {} {}",
+            ui::pad_visible(&ui_id(run_prefix(&candidate.state.run_id)), 8),
+            ui::pad_visible(&ui_status(candidate.state.status.to_string()), 10),
+            ui::pad_visible(&ui_status(&candidate.reason), 16),
             one_line(&candidate.state.goal, 72)
         );
     }

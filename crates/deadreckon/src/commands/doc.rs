@@ -113,7 +113,7 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
                 &estimated_spend,
             )?;
             if !prompt::confirm("polish docs now?", true)? {
-                println!("cancelled");
+                println!("{}", ui_status("cancelled"));
                 return Ok(());
             }
         } else if !no_confirm && !io::stdin().is_terminal() {

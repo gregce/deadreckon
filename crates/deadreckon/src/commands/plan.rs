@@ -34,7 +34,7 @@ pub(crate) fn prepare_orchestration_source(init_git: bool, quiet: bool) -> Resul
         }
         NonGitChoice::Copy => Ok(true),
         NonGitChoice::Cancel => {
-            println!("cancelled");
+            println!("{}", ui_status("cancelled"));
             Ok(false)
         }
     }
@@ -995,8 +995,12 @@ fn orchestration_role_row(
 
 pub(crate) fn orchestration_role_table_lines(rows: &[OrchestrationRoleRow]) -> Vec<String> {
     let mut lines = vec![format!(
-        "{:<14} {:<22} {:<8} {:<12} {}",
-        "role", "route", "model", "source", "notes"
+        "{} {} {} {} {}",
+        ui::pad_visible(&ui_muted("role"), 14),
+        ui::pad_visible(&ui_muted("route"), 22),
+        ui::pad_visible(&ui_muted("model"), 8),
+        ui::pad_visible(&ui_muted("source"), 12),
+        ui_muted("notes")
     )];
     lines.extend(rows.iter().map(|row| {
         format!(
@@ -1110,13 +1114,21 @@ pub(crate) fn print_orchestration_dependency_summary(plan: &Plan) {
     }
     println!("{}", ui_heading("dependencies"));
     println!(
-        "  {:<10} {:<10} {:<18} {:<18} unblocks",
-        "child", "status", "starts", "waits_for"
+        "  {} {} {} {} {}",
+        ui::pad_visible(&ui_muted("child"), 10),
+        ui::pad_visible(&ui_muted("status"), 10),
+        ui::pad_visible(&ui_muted("starts"), 18),
+        ui::pad_visible(&ui_muted("waits_for"), 18),
+        ui_muted("unblocks")
     );
     for row in orchestration_dependency_rows(plan) {
         println!(
-            "  {:<10} {:<10} {:<18} {:<18} {}",
-            row.child, row.status, row.starts, row.waits_for, row.unblocks
+            "  {} {} {:<18} {:<18} {}",
+            ui::pad_visible(&ui_id(&row.child), 10),
+            ui::pad_visible(&ui_status(&row.status), 10),
+            row.starts,
+            row.waits_for,
+            row.unblocks
         );
     }
 }

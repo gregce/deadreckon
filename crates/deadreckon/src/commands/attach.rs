@@ -147,7 +147,7 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
         println!(
             "plan {} / {} -> run {}",
             ui_id(run_prefix(&parent_plan.plan_id)),
-            parent_plan.task_id,
+            ui_id(&parent_plan.task_id),
             ui_id(run_prefix(&state.run_id))
         );
     }
