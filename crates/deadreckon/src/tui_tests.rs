@@ -3951,6 +3951,61 @@ fn large_chain_timeline_still_scrolls() {
 }
 
 #[test]
+fn chain_step_nav_still_works_via_mode_hook() {
+    let chain = chain_fixture();
+    let mut s = ChainAttachTuiState::default();
+    for (code, expected) in [
+        (KeyCode::Down, 1),
+        (KeyCode::Up, 0),
+        (KeyCode::Tab, 1),
+        (KeyCode::BackTab, 0),
+        (KeyCode::Char('j'), 1),
+        (KeyCode::Char('k'), 0),
+    ] {
+        s.handle_key(KeyEvent::new(code, KeyModifiers::empty()), &chain);
+        assert_eq!(s.selected_step, expected, "{code:?} step nav");
+    }
+}
+
+#[test]
+fn chain_attach_supports_paging_keys() {
+    let chain = chain_fixture();
+    let mut s = ChainAttachTuiState::default();
+    // PgDn / PgUp scroll the events panel.
+    s.handle_key(
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+        &chain,
+    );
+    assert_eq!(s.events_scroll, 8, "PgDn scrolls events down");
+    s.handle_key(
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+        &chain,
+    );
+    assert_eq!(s.events_scroll, 16);
+    s.handle_key(
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+        &chain,
+    );
+    assert_eq!(s.events_scroll, 8, "PgUp scrolls events up");
+    // End / G jump to the last step; Home / g back to the first and reset events.
+    s.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::empty()), &chain);
+    assert_eq!(s.selected_step, 1);
+    s.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()), &chain);
+    assert_eq!(s.selected_step, 0);
+    assert_eq!(s.events_scroll, 0, "Home resets the events scroll");
+    s.handle_key(
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::empty()),
+        &chain,
+    );
+    assert_eq!(s.selected_step, 1);
+    s.handle_key(
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()),
+        &chain,
+    );
+    assert_eq!(s.selected_step, 0);
+}
+
+#[test]
 fn chain_attach_header_shows_policy_apply_mode_on_fail() {
     let chain = chain_fixture();
     let header = chain_attach_header_text(&chain);

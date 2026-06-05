@@ -20,7 +20,7 @@ use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 #[derive(Debug, Default)]
 pub(crate) struct ChainAttachTuiState {
     pub(crate) selected_step: usize,
-    events_scroll: u16,
+    pub(crate) events_scroll: u16,
     pub(crate) event_status_hint: Option<String>,
 }
 
@@ -35,23 +35,9 @@ impl ChainAttachTuiState {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent, chain: &Chain) {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.scroll(-1, chain),
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.scroll(1, chain),
-            KeyCode::PageUp => {
-                self.events_scroll = self.events_scroll.saturating_sub(8);
-            }
-            KeyCode::PageDown => {
-                self.events_scroll = self.events_scroll.saturating_add(8);
-            }
-            KeyCode::Home | KeyCode::Char('g') => {
-                self.selected_step = 0;
-                self.events_scroll = 0;
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                self.selected_step = chain.steps.len().saturating_sub(1);
-            }
-            _ => {}
+        {
+            let mut nav = ChainNav { state: self, chain };
+            crate::tui::navigation::dispatch_navigation(&mut nav, key);
         }
         self.clamp(chain);
     }
@@ -63,6 +49,46 @@ impl ChainAttachTuiState {
         let next = (self.selected_step as isize + delta)
             .clamp(0, chain.steps.len().saturating_sub(1) as isize);
         self.selected_step = next as usize;
+    }
+}
+
+/// Drives the chain attach step graph + events panel through the shared
+/// navigation core. Arrows/`jk`/`Tab` move the selected step; `PgUp`/`PgDn`
+/// scroll the events panel; `Home`/`End`/`g`/`G` jump to the first/last step
+/// (Home also resets the events scroll) — the chain mapping of the common keys.
+struct ChainNav<'a> {
+    state: &'a mut ChainAttachTuiState,
+    chain: &'a Chain,
+}
+
+impl crate::tui::navigation::NavigableSurface for ChainNav<'_> {
+    fn focus_next(&mut self) {
+        self.state.scroll(1, self.chain);
+    }
+
+    fn focus_previous(&mut self) {
+        self.state.scroll(-1, self.chain);
+    }
+
+    fn scroll_lines(&mut self, delta: isize) {
+        self.state.scroll(delta, self.chain);
+    }
+
+    fn scroll_page(&mut self, direction: isize) {
+        self.state.events_scroll = if direction < 0 {
+            self.state.events_scroll.saturating_sub(8)
+        } else {
+            self.state.events_scroll.saturating_add(8)
+        };
+    }
+
+    fn scroll_to_start(&mut self) {
+        self.state.selected_step = 0;
+        self.state.events_scroll = 0;
+    }
+
+    fn scroll_to_end(&mut self) {
+        self.state.selected_step = self.chain.steps.len().saturating_sub(1);
     }
 }
 
