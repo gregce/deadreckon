@@ -3469,7 +3469,7 @@ mod glyph_tests {
     use super::{ChainStepStatus, chain_step_glyph};
 
     #[test]
-    fn chain_step_glyphs_have_ascii_fallback_in_plain() {
+    fn chain_step_glyphs_have_ascii_fallback_in_tui_plain() {
         for status in [
             ChainStepStatus::Pending,
             ChainStepStatus::Running,

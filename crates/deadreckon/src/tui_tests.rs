@@ -38,10 +38,11 @@ use super::commands::start::{
 };
 use super::tui::{
     AttachActionNotice, AttachPanel, AttachPanelCounts, AttachPanelRows, AttachParentPlan,
-    AttachTuiState, ChainAttachTuiState, build_run_narrative_projection, chain_activity_lines,
-    chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
-    chain_timeline_lines, footer, markdown_to_tui_lines, max_panel_scroll, panel_title,
-    render_chain_attach, scroll_indicator, selection_glyph,
+    AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState, NARRATIVE_SPLIT_WIDTH,
+    build_run_narrative_projection, chain_activity_lines, chain_attach_footer_text,
+    chain_attach_header_text, chain_event_read_hint, chain_timeline_lines, footer,
+    markdown_to_tui_lines, max_panel_scroll, panel_title, render_chain_attach, scroll_indicator,
+    selection_glyph,
 };
 use super::{
     ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachJsonlTail,
@@ -4173,6 +4174,55 @@ fn scroll_indicator_present_on_all_list_panels() {
     assert!(
         plan_text.contains("deadreckon plan") && plan_text.contains("2/4"),
         "plan position indicator: {plan_text}"
+    );
+}
+
+#[test]
+fn campaign_empty_state_has_hint_and_no_filename() {
+    // The empty campaign feed offers a next step and never leaks an internal log name.
+    assert!(
+        CAMPAIGN_EMPTY_HINT.contains("sub-plan"),
+        "hint present: {CAMPAIGN_EMPTY_HINT}"
+    );
+    assert!(
+        !CAMPAIGN_EMPTY_HINT.contains(".jsonl"),
+        "no filename: {CAMPAIGN_EMPTY_HINT}"
+    );
+    assert!(
+        !CAMPAIGN_EMPTY_HINT.contains("events"),
+        "no internal log name: {CAMPAIGN_EMPTY_HINT}"
+    );
+}
+
+#[test]
+fn narrative_split_breakpoint_is_single_constant() {
+    // One constant drives both run and plan narrative split.
+    assert_eq!(NARRATIVE_SPLIT_WIDTH, 100);
+    let (_temp, state) = doc_preview_state();
+    let narrative = AttachTuiState {
+        view: AttachViewMode::Narrative,
+        visual: NarrativeVisualMode::Architecture,
+        ..AttachTuiState::default()
+    };
+    let wide = render_attach_text_with_size(
+        &state,
+        &[],
+        &AttachLive::default(),
+        narrative.clone(),
+        NARRATIVE_SPLIT_WIDTH,
+        24,
+    );
+    let narrow = render_attach_text_with_size(
+        &state,
+        &[],
+        &AttachLive::default(),
+        narrative,
+        NARRATIVE_SPLIT_WIDTH - 1,
+        24,
+    );
+    assert_ne!(
+        wide, narrow,
+        "narrative split toggles at NARRATIVE_SPLIT_WIDTH"
     );
 }
 

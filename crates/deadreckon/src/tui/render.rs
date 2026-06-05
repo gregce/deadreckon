@@ -579,6 +579,11 @@ fn campaign_feed_lines(state: &CampaignAttachState, max: usize) -> Vec<Line<'sta
         .collect()
 }
 
+/// Friendly empty-state for the campaign feed: a next step, and never an
+/// internal filename (it used to leak campaign-events.jsonl / plan-events.jsonl).
+pub(crate) const CAMPAIGN_EMPTY_HINT: &str =
+    "no campaign activity yet — sub-plans report progress as they run";
+
 fn campaign_feed_text_lines(state: &CampaignAttachState, max: usize) -> Vec<String> {
     let mut lines = state
         .feed
@@ -588,7 +593,7 @@ fn campaign_feed_text_lines(state: &CampaignAttachState, max: usize) -> Vec<Stri
         .map(campaign_feed_event_line)
         .collect::<Vec<_>>();
     if lines.is_empty() {
-        lines.push("waiting for campaign-events.jsonl and sub plan-events.jsonl".to_string());
+        lines.push(CAMPAIGN_EMPTY_HINT.to_string());
     }
     lines
 }
@@ -727,6 +732,10 @@ pub(crate) struct RunNarrativeRenderInput<'a> {
     pub(crate) tui_state: &'a AttachTuiState,
 }
 
+/// Minimum terminal width at which the narrative view splits into a body +
+/// visual-graph column. Run and plan share this single breakpoint.
+pub(crate) const NARRATIVE_SPLIT_WIDTH: u16 = 100;
+
 fn render_run_narrative(
     frame: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
@@ -736,7 +745,7 @@ fn render_run_narrative(
     let rows = area.height.saturating_sub(2) as usize;
     let projection = run_narrative_projection_for_render(input);
     let mut lines = run_narrative_lines_from_projection(&projection, tui_state);
-    if area.width >= 110 && tui_state.visual != NarrativeVisualMode::None {
+    if area.width >= NARRATIVE_SPLIT_WIDTH && tui_state.visual != NarrativeVisualMode::None {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
@@ -1180,7 +1189,7 @@ fn render_plan_narrative_attach(
     if let Some(notice) = state.narrative_notice {
         lines.insert(2, format!("[fresh] {notice}"));
     }
-    if area.width >= 100 && state.visual != NarrativeVisualMode::None {
+    if area.width >= NARRATIVE_SPLIT_WIDTH && state.visual != NarrativeVisualMode::None {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
