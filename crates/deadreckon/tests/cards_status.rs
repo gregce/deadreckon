@@ -104,7 +104,7 @@ fn list_table_is_plain_and_truncates_very_long_goal() {
     let out = stdout(&output);
     assert!(!out.starts_with('+'), "{out}");
     assert!(
-        out.lines().next().is_some_and(|line| line.contains("ID")),
+        out.lines().next().is_some_and(|line| line.contains("id")),
         "{out}"
     );
     assert!(out.contains("..."), "{out}");
@@ -124,7 +124,7 @@ fn list_full_keeps_old_layout_for_scripts() {
     assert_success(&output);
     let out = stdout(&output);
     assert!(!out.starts_with('+'), "{out}");
-    assert!(out.contains("ID        STATUS"), "{out}");
+    assert!(out.contains("id        status"), "{out}");
 }
 
 #[test]

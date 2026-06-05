@@ -10012,6 +10012,41 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
     print!("{}", kv_block_string("  ", &disk));
 }
 
+/// The shared columnar-table primitive: lowercase `headers` over `rows`, each
+/// column sized to its widest cell by display width and padded with `pad_visible`
+/// (ANSI-aware), 2-space gutters, last column unpadded. Use this instead of
+/// per-call-site const widths and `{:<N}` format-pads so colored cells align the
+/// same as plain ones.
+pub(crate) fn columns(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let col_count = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| ui::display_width(h)).collect();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate().take(col_count) {
+            widths[index] = widths[index].max(ui::display_width(cell));
+        }
+    }
+    let mut out = String::new();
+    let mut push_row = |cells: &[&str]| {
+        for (index, cell) in cells.iter().enumerate().take(col_count) {
+            if index > 0 {
+                out.push_str("  ");
+            }
+            if index + 1 == col_count {
+                out.push_str(cell);
+            } else {
+                out.push_str(&ui::pad_visible(cell, widths[index]));
+            }
+        }
+        out.push('\n');
+    };
+    push_row(headers);
+    for row in rows {
+        let cells = row.iter().map(String::as_str).collect::<Vec<_>>();
+        push_row(&cells);
+    }
+    out
+}
+
 /// The status report's `library` section, extracted as a pure function so its
 /// kv-block alignment is testable. `scope artifacts` is the widest key, so every
 /// colon lines up beneath it.
@@ -10028,7 +10063,25 @@ fn library_status_block(artifact_count: usize, current: &str, exported: &str) ->
 
 #[cfg(test)]
 mod uniform_surface_kv_tests {
-    use super::{kv_block_string, library_status_block};
+    use super::{columns, kv_block_string, library_status_block};
+
+    #[test]
+    fn columns_pads_by_display_width_with_color() {
+        let rows_plain = vec![
+            vec!["a".to_string(), "ok".to_string()],
+            vec!["bbb".to_string(), "no".to_string()],
+        ];
+        let rows_colored = vec![
+            vec!["\x1b[1;35ma\x1b[0m".to_string(), "ok".to_string()],
+            vec!["\x1b[1;35mbbb\x1b[0m".to_string(), "no".to_string()],
+        ];
+        let plain = columns(&["id", "status"], &rows_plain);
+        let colored = columns(&["id", "status"], &rows_colored);
+        // Padding is by display width, so stripping ANSI from the colored table
+        // yields exactly the plain table: color adds no visible columns.
+        assert_eq!(crate::ui::strip_ansi(&colored), plain, "{colored}");
+        assert!(plain.starts_with("id"), "lowercase header: {plain}");
+    }
 
     #[test]
     fn kv_block_aligns_dynamic_key_column() {

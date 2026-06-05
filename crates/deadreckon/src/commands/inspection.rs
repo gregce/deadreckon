@@ -235,14 +235,14 @@ struct ListRow {
 
 fn list_header() -> String {
     format!(
-        "{}  {}  {}  {}  {}  {}  {}  GOAL",
-        pad_plain("ID", LIST_ID_WIDTH),
-        pad_plain("STATUS", LIST_STATUS_WIDTH),
-        pad_plain("AGE", LIST_AGE_WIDTH),
-        pad_plain("SCOPE", LIST_SCOPE_WIDTH),
-        pad_plain("KIND", LIST_KIND_WIDTH),
-        pad_plain("MODE", LIST_MODE_WIDTH),
-        pad_plain("ACTION", LIST_ACTION_WIDTH)
+        "{}  {}  {}  {}  {}  {}  {}  goal",
+        pad_plain("id", LIST_ID_WIDTH),
+        pad_plain("status", LIST_STATUS_WIDTH),
+        pad_plain("age", LIST_AGE_WIDTH),
+        pad_plain("scope", LIST_SCOPE_WIDTH),
+        pad_plain("kind", LIST_KIND_WIDTH),
+        pad_plain("mode", LIST_MODE_WIDTH),
+        pad_plain("action", LIST_ACTION_WIDTH)
     )
 }
 
@@ -1238,24 +1238,23 @@ fn print_library_table(entries: &[LibraryEntry], full: bool) {
         return;
     }
 
-    println!(
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .map(|entry| {
+            let manifest = &entry.manifest;
+            vec![
+                ui_id(run_prefix(&manifest.run_id)),
+                relative_age(manifest.promoted_at),
+                truncate_text(&manifest.scope, 26),
+                materialized_count_label(entry.materialized_count),
+                truncate_text(&one_line(&manifest.goal, 88), 88),
+            ]
+        })
+        .collect();
+    print!(
         "{}",
-        ui_heading(format!(
-            "{:<8}  {:<7}  {:<26}  {:<12}  GOAL",
-            "RUN", "AGE", "SCOPE", "EXPORTED"
-        ))
+        crate::columns(&["run", "age", "scope", "exported", "goal"], &rows)
     );
-    for entry in entries {
-        let manifest = &entry.manifest;
-        println!(
-            "{}  {:<7}  {:<26}  {:<12}  {}",
-            crate::ui::pad_visible(&ui_id(run_prefix(&manifest.run_id)), 8),
-            relative_age(manifest.promoted_at),
-            truncate_text(&manifest.scope, 26),
-            materialized_count_label(entry.materialized_count),
-            truncate_text(&one_line(&manifest.goal, 88), 88)
-        );
-    }
     print_library_table_action_footer();
 }
 
@@ -1304,6 +1303,25 @@ fn print_library_entry(entry: &LibraryEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_and_library_use_shared_columns() {
+        // The run list header is lowercase (migrated off UPPERCASE column names).
+        let header = list_header();
+        assert_eq!(
+            header,
+            header.to_lowercase(),
+            "list header must be lowercase: {header}"
+        );
+        assert!(header.contains("id") && header.contains("goal"), "{header}");
+        // The library table renders through the shared columns helper, which
+        // emits lowercase headers.
+        let table = crate::columns(
+            &["run", "age", "scope"],
+            &[vec!["x".to_string(), "1m".to_string(), "s".to_string()]],
+        );
+        assert!(table.starts_with("run"), "{table}");
+    }
 
     #[test]
     fn no_hints_suppresses_inspection_doc_chain_hints() {

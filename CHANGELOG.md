@@ -23,6 +23,10 @@
   and migrated the status report's run-health, library, and disk sections onto
   it, fixing the misaligned `gate:` and `scope artifacts:` lines so every colon
   lines up under the widest key.
+- Added a shared `columns` table primitive (lowercase headers, display-width
+  padding so colored cells align like plain ones) and migrated the library table
+  onto it; lowercased the run-list header. Provider/plan/chain tables retain
+  their display-width-correct renderers and can adopt `columns` incrementally.
 
 ## Release Trust - 2026-06-02
 

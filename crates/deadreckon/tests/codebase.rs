@@ -1366,7 +1366,7 @@ fn apply_cleanup_removes_worktree_and_branch_after_success() {
         .expect("list");
     assert_success(&list);
     let stdout = stdout(&list);
-    assert!(stdout.contains("ACTION"), "{stdout}");
+    assert!(stdout.contains("action"), "{stdout}");
     assert!(stdout.contains("worktree"), "{stdout}");
     assert!(stdout.contains("done"), "{stdout}");
     assert!(!stdout.contains("abandoned"), "{stdout}");
@@ -1911,8 +1911,8 @@ fn list_shows_mode_column() {
 
     assert_success(&output);
     let stdout = stdout(&output);
-    assert!(stdout.contains("MODE"));
-    assert!(stdout.contains("ACTION"));
+    assert!(stdout.contains("mode"));
+    assert!(stdout.contains("action"));
     assert!(stdout.contains("worktree"));
 }
 
@@ -1944,8 +1944,8 @@ fn list_default_is_compact_and_points_to_show_for_details() {
         .expect("list");
     assert_success(&compact);
     let compact_stdout = stdout(&compact);
-    assert!(compact_stdout.contains("AGE"));
-    assert!(compact_stdout.contains("KIND"));
+    assert!(compact_stdout.contains("age"));
+    assert!(compact_stdout.contains("kind"));
     assert!(compact_stdout.contains(&state.run_id[..8]));
     assert!(!compact_stdout.contains(&state.run_id));
     assert!(

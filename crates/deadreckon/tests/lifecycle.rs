@@ -684,7 +684,7 @@ fn library_list_shows_materialized_status() {
 
     assert_success(&output);
     let stdout = stdout(&output);
-    assert!(stdout.contains("EXPORTED"));
+    assert!(stdout.contains("exported"));
     assert!(stdout.contains("yes (1)"));
 }
 
@@ -700,7 +700,7 @@ fn library_list_search_show_reads_promoted_manifests() {
         .expect("library list");
     assert_success(&list);
     let list_stdout = stdout(&list);
-    assert!(list_stdout.contains("RUN"));
+    assert!(list_stdout.contains("run"));
     assert!(list_stdout.contains(&parent.run_id[..8]));
     assert!(list_stdout.contains("gallery provenance search target"));
     assert_eq!(
