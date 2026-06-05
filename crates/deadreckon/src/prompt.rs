@@ -72,21 +72,19 @@ fn should_use_selectable_menu() -> bool {
 }
 
 fn select_one_line(prompt: &SelectPrompt) -> Result<SelectChoice> {
-    println!("{}", prompt.title);
-    if let Some(help) = prompt
-        .help
-        .as_deref()
-        .filter(|help| !help.trim().is_empty())
-    {
-        println!("  {help}");
-    }
+    print_select_header(prompt);
     for (index, choice) in prompt.choices.iter().enumerate() {
         let ordinal = index + 1;
+        let number = ui::render(Stream::Stdout, Tone::Command, format!("[{ordinal}]"));
         match choice.detail.as_deref() {
             Some(detail) if !detail.trim().is_empty() => {
-                println!("  [{ordinal}] {} - {detail}", choice.label);
+                println!(
+                    "  {number} {} - {}",
+                    choice.label,
+                    ui::render(Stream::Stdout, Tone::Muted, detail)
+                );
             }
-            _ => println!("  [{ordinal}] {}", choice.label),
+            _ => println!("  {number} {}", choice.label),
         }
     }
     let default = prompt
@@ -107,14 +105,7 @@ fn select_one_menu(prompt: &SelectPrompt) -> Result<SelectChoice> {
     if !menu_fits(prompt.choices.len(), terminal_rows()) {
         return select_one_line(prompt);
     }
-    println!("{}", prompt.title);
-    if let Some(help) = prompt
-        .help
-        .as_deref()
-        .filter(|help| !help.trim().is_empty())
-    {
-        println!("  {help}");
-    }
+    print_select_header(prompt);
     let mut selected = prompt
         .default_index
         .min(prompt.choices.len().saturating_sub(1));
@@ -170,7 +161,8 @@ fn render_select_menu(
     let width = selectable_menu_width();
     for (index, choice) in prompt.choices.iter().enumerate() {
         let ordinal = index + 1;
-        let marker = if index == selected { ">" } else { " " };
+        let selected_row = index == selected;
+        let marker = if selected_row { ">" } else { " " };
         execute!(stdout, Clear(ClearType::CurrentLine))?;
         let line = match choice.detail.as_deref() {
             Some(detail) if !detail.trim().is_empty() => {
@@ -178,7 +170,8 @@ fn render_select_menu(
             }
             _ => format!("  {marker} [{ordinal}] {}", choice.label),
         };
-        write_select_menu_line(&mut stdout, &truncate_menu_line(&line, width))?;
+        let line = style_menu_row(&truncate_menu_line(&line, width), ordinal, selected_row);
+        write_select_menu_line(&mut stdout, &line)?;
     }
     execute!(stdout, Clear(ClearType::CurrentLine))?;
     let default = prompt
@@ -192,7 +185,13 @@ fn render_select_menu(
     };
     write!(
         stdout,
-        "? choose [{default}]: arrows/Enter, number, Esc to cancel{notice} "
+        "{} {} ",
+        ui::render(Stream::Stdout, Tone::Prompt, "?"),
+        ui::render(
+            Stream::Stdout,
+            Tone::Muted,
+            format!("choose [{default}]: arrows/Enter, number, Esc to cancel{notice}"),
+        )
     )?;
     stdout.flush()?;
     Ok(())
@@ -200,6 +199,69 @@ fn render_select_menu(
 
 fn write_select_menu_line(stdout: &mut impl io::Write, line: &str) -> io::Result<()> {
     write!(stdout, "{line}\r\n")
+}
+
+fn print_select_header(prompt: &SelectPrompt) {
+    println!(
+        "{}",
+        ui::render(Stream::Stdout, Tone::Heading, &prompt.title)
+    );
+    if let Some(help) = prompt
+        .help
+        .as_deref()
+        .filter(|help| !help.trim().is_empty())
+    {
+        println!("  {}", ui::render(Stream::Stdout, Tone::Muted, help));
+    }
+}
+
+/// Colorize a normalized, already-truncated select-menu row. Color is applied
+/// only on a TTY (ui::render is gated) and only after width truncation, so the
+/// visible width is unchanged and the redraw (MoveUp by line count) math holds.
+fn style_menu_row(line: &str, ordinal: usize, selected: bool) -> String {
+    if !ui::enabled(Stream::Stdout) {
+        return line.to_string();
+    }
+    paint_menu_row(line, ordinal, selected, |tone, text| {
+        ui::render(Stream::Stdout, tone, text)
+    })
+}
+
+/// Pure painter for a select-menu row: splits the line into `lead | [n] | body`
+/// and applies `paint` to the marker, ordinal, and (for the selected row) the
+/// label, dimming the trailing detail. `paint` only ever wraps tokens, so the
+/// visible width equals the input — stripping the result yields `line` again.
+fn paint_menu_row(
+    line: &str,
+    ordinal: usize,
+    selected: bool,
+    paint: impl Fn(Tone, &str) -> String,
+) -> String {
+    let token = format!("[{ordinal}]");
+    let Some(at) = line.find(&token) else {
+        return line.to_string();
+    };
+    let lead = &line[..at];
+    let rest = &line[at + token.len()..];
+    let lead = if selected {
+        lead.replacen('>', &paint(Tone::Prompt, ">"), 1)
+    } else {
+        lead.to_string()
+    };
+    let number = paint(Tone::Command, &token);
+    let body = match rest.split_once(" - ") {
+        Some((label, detail)) => {
+            let label = if selected {
+                paint(Tone::Heading, label)
+            } else {
+                label.to_string()
+            };
+            format!("{label} - {}", paint(Tone::Muted, detail))
+        }
+        None if selected => paint(Tone::Heading, rest),
+        None => rest.to_string(),
+    };
+    format!("{lead}{number}{body}")
 }
 
 fn selectable_menu_width() -> usize {
@@ -464,8 +526,8 @@ fn parse_number_in_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        MenuStep, menu_fits, menu_step, parse_confirm_answer, parse_select_answer,
-        truncate_menu_line, write_select_menu_line,
+        MenuStep, menu_fits, menu_step, paint_menu_row, parse_confirm_answer, parse_select_answer,
+        style_menu_row, truncate_menu_line, write_select_menu_line,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -611,5 +673,46 @@ mod tests {
         let line = truncate_menu_line("  > [1] Follow up\nfrom\tprevious", 80);
 
         assert_eq!(line, " > [1] Follow up from previous");
+    }
+
+    #[test]
+    fn style_menu_row_is_plain_without_a_tty() {
+        // Tests capture stdout (non-TTY), so styling must be a no-op: this is the
+        // golden-safety guarantee that color never leaks into redirected output.
+        assert_eq!(style_menu_row(" > [1] Run", 1, true), " > [1] Run");
+        assert_eq!(
+            style_menu_row(" [2] New run - equivalent to --mode run", 2, false),
+            " [2] New run - equivalent to --mode run"
+        );
+    }
+
+    #[test]
+    fn paint_menu_row_preserves_visible_width() {
+        let force = |_: crate::ui::Tone, text: &str| format!("\x1b[31m{text}\x1b[0m");
+        for (line, ordinal, selected) in [
+            (
+                " > [1] Recommended: run - fallback suggested single",
+                1,
+                true,
+            ),
+            (" [2] New single supervised run - --mode run", 2, false),
+            (" > [3] Cancel", 3, true),
+            (" [10] Tenth option - tenth detail", 10, false),
+        ] {
+            let painted = paint_menu_row(line, ordinal, selected, force);
+            assert!(painted.contains('\x1b'), "expected ANSI in {painted:?}");
+            assert_eq!(
+                crate::ui::strip_ansi(&painted),
+                line,
+                "visible text must be unchanged for {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn paint_menu_row_without_token_is_unchanged() {
+        let force = |_: crate::ui::Tone, text: &str| format!("\x1b[31m{text}\x1b[0m");
+        // An over-truncated row whose ordinal token was cut is left alone.
+        assert_eq!(paint_menu_row(" > [1", 1, true, force), " > [1");
     }
 }
