@@ -156,12 +156,21 @@ pub(crate) fn render_chain_attach(
         ),
         rows[0],
     );
-    let timeline = chain_timeline_lines(chain, tui_state)
+    let timeline_lines = chain_timeline_lines(chain, tui_state);
+    let steps_total = timeline_lines.len();
+    let steps_rows = body[0].height.saturating_sub(2) as usize;
+    let steps_offset = list_scroll_offset(tui_state.selected_step, steps_rows, steps_total);
+    let timeline = timeline_lines
         .into_iter()
+        .skip(steps_offset)
+        .take(steps_rows.max(1))
         .map(ListItem::new)
         .collect::<Vec<_>>();
     frame.render_widget(
-        List::new(timeline).block(Block::default().borders(Borders::ALL).title("steps")),
+        List::new(timeline).block(Block::default().borders(Borders::ALL).title(format!(
+            "steps{}",
+            scroll_indicator(steps_offset, steps_rows, steps_total)
+        ))),
         body[0],
     );
     let event_lines = chain_activity_lines(events, tui_state)
@@ -383,7 +392,10 @@ pub(crate) fn render_campaign_attach(frame: &mut ratatui::Frame<'_>, state: &Cam
         Paragraph::new(campaign_attach_header_lines(state))
             .block(
                 Block::default()
-                    .title("deadreckon campaign")
+                    .title(format!(
+                        "deadreckon campaign{}",
+                        scroll_indicator(state.selected, 1, state.campaign.sub_goals.len())
+                    ))
                     .borders(Borders::ALL),
             )
             .wrap(Wrap { trim: true }),
@@ -1051,7 +1063,10 @@ pub(crate) fn render_plan_attach(
         Paragraph::new(header)
             .block(
                 Block::default()
-                    .title("deadreckon plan")
+                    .title(format!(
+                        "deadreckon plan{}",
+                        scroll_indicator(state.selected, 1, plan.tasks.len())
+                    ))
                     .borders(Borders::ALL),
             )
             .wrap(Wrap { trim: true }),
@@ -2668,6 +2683,34 @@ pub(crate) fn selection_glyph(selected: bool) -> &'static str {
     if selected { ">" } else { " " }
 }
 
+/// The single scroll-position readout shown on every list panel title:
+/// " first-last/total" for the visible window, or "" when everything fits.
+pub(crate) fn scroll_indicator(offset: usize, rows: usize, total: usize) -> String {
+    if total <= rows || total == 0 {
+        return String::new();
+    }
+    let first = offset.saturating_add(1).min(total);
+    let last = offset.saturating_add(rows).min(total);
+    if first == last {
+        // A panes-based surface (rows = 1) gets a single selection readout.
+        format!(" {first}/{total}")
+    } else {
+        format!(" {first}-{last}/{total}")
+    }
+}
+
+/// The window start that keeps `selected` visible within `rows` of `total`
+/// items (selection rides the bottom edge while scrolling down).
+pub(crate) fn list_scroll_offset(selected: usize, rows: usize, total: usize) -> usize {
+    if rows == 0 || total <= rows || selected < rows {
+        0
+    } else {
+        (selected + 1)
+            .saturating_sub(rows)
+            .min(total.saturating_sub(rows))
+    }
+}
+
 pub(crate) fn panel_title(
     title: &str,
     focused: bool,
@@ -2675,12 +2718,9 @@ pub(crate) fn panel_title(
     rows: usize,
     total: usize,
 ) -> String {
-    let marker = selection_glyph(focused);
-    if total <= rows || total == 0 {
-        format!("{marker}{title}")
-    } else {
-        let first = offset.saturating_add(1).min(total);
-        let last = offset.saturating_add(rows).min(total);
-        format!("{marker}{title} {first}-{last}/{total}")
-    }
+    format!(
+        "{}{title}{}",
+        selection_glyph(focused),
+        scroll_indicator(offset, rows, total)
+    )
 }

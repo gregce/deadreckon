@@ -41,7 +41,7 @@ use super::tui::{
     AttachTuiState, ChainAttachTuiState, build_run_narrative_projection, chain_activity_lines,
     chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
     chain_timeline_lines, footer, markdown_to_tui_lines, max_panel_scroll, panel_title,
-    render_chain_attach, selection_glyph,
+    render_chain_attach, scroll_indicator, selection_glyph,
 };
 use super::{
     ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachJsonlTail,
@@ -1930,6 +1930,30 @@ fn render_chain_attach_text(
     tui_state: &ChainAttachTuiState,
 ) -> String {
     let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_chain_attach(frame, chain, events, tui_state))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    let mut text = String::new();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            text.push_str(buffer.cell((x, y)).expect("cell").symbol());
+        }
+        text.push('\n');
+    }
+    text
+}
+
+fn render_chain_attach_text_with_size(
+    chain: &Chain,
+    events: &[ChainEvent],
+    tui_state: &ChainAttachTuiState,
+    width: u16,
+    height: u16,
+) -> String {
+    let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal
         .draw(|frame| render_chain_attach(frame, chain, events, tui_state))
@@ -4097,6 +4121,58 @@ fn parent_plan_footer_replace_hack_removed() {
     assert!(
         !text.contains("b/Backspace/q back to plan"),
         "old hack phrasing gone: {text}"
+    );
+}
+
+#[test]
+fn scroll_indicator_present_on_all_list_panels() {
+    // The shared readout: a window range, a single panes position, empty when it fits.
+    assert_eq!(scroll_indicator(0, 5, 20), " 1-5/20");
+    assert_eq!(scroll_indicator(5, 1, 10), " 6/10");
+    assert_eq!(scroll_indicator(0, 10, 5), "");
+
+    // Run: the focused panel title shows the visible window.
+    assert!(
+        panel_title("Activity", true, 0, 5, 20).contains("1-5/20"),
+        "run panel indicator"
+    );
+
+    // Chain: a 30-step chain overflows the steps panel -> "steps ...N/30".
+    let chain = Chain::new(ChainNewOptions {
+        root_goal: "long".to_string(),
+        goals: (0..8).map(|i| format!("step {i}")).collect(),
+        scope: "scope".to_string(),
+        base_branch: "main".to_string(),
+        base_sha: "abcdef123456".to_string(),
+        cwd: std::path::PathBuf::from("/tmp/project"),
+        provider: Some("smoke".to_string()),
+        model: None,
+        sandbox: "none".to_string(),
+        branch_policy: BranchPolicy::Stack,
+        apply_mode: ApplyMode::Auto,
+        apply_strategy: ApplyStrategy::Squash,
+        apply_allowlist: Vec::new(),
+        on_fail: OnFail::Stop,
+        circuit_breaker_threshold: 2,
+        max_spend_usd: Some(5.0),
+        max_wall_seconds: Some(600.0),
+        deadreckon_version: "0.1.0".to_string(),
+    })
+    .expect("chain");
+    // A short terminal makes the 8-step panel (~4 rows) overflow -> "steps ...N/8".
+    let chain_text =
+        render_chain_attach_text_with_size(&chain, &[], &ChainAttachTuiState::default(), 100, 12);
+    assert!(
+        chain_text.contains("steps") && chain_text.contains("/8"),
+        "chain steps indicator: {chain_text}"
+    );
+
+    // Plan: the header shows the selected-task position.
+    let (_temp, paths, plan) = full_plan_fixture(4);
+    let plan_text = render_plan_attach_text(&paths, &plan, &[], &[], 1);
+    assert!(
+        plan_text.contains("deadreckon plan") && plan_text.contains("2/4"),
+        "plan position indicator: {plan_text}"
     );
 }
 
