@@ -3,7 +3,7 @@ use std::io::{self, IsTerminal as _, Write as _};
 use crate::Result;
 use crate::ui::{self, Stream, Tone};
 use crossterm::cursor::{MoveToColumn, MoveUp};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, Clear, ClearType};
 
@@ -103,6 +103,10 @@ fn select_one_line(prompt: &SelectPrompt) -> Result<SelectChoice> {
 }
 
 fn select_one_menu(prompt: &SelectPrompt) -> Result<SelectChoice> {
+    // A list taller than the terminal can't be redrawn in place; use line mode.
+    if !menu_fits(prompt.choices.len(), terminal_rows()) {
+        return select_one_line(prompt);
+    }
     println!("{}", prompt.title);
     if let Some(help) = prompt
         .help
@@ -114,68 +118,51 @@ fn select_one_menu(prompt: &SelectPrompt) -> Result<SelectChoice> {
     let mut selected = prompt
         .default_index
         .min(prompt.choices.len().saturating_sub(1));
+    let cancel_index = cancel_choice_index(prompt);
+    let mut buffer = String::new();
     let _raw_mode = RawModeGuard::enable()?;
-    render_select_menu(prompt, selected, false)?;
+    render_select_menu(prompt, selected, false, false)?;
     loop {
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        if matches!(key.kind, KeyEventKind::Release) {
-            continue;
-        }
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        match menu_step(
+            prompt.choices.len(),
+            selected,
+            cancel_index,
+            &mut buffer,
+            key,
+        ) {
+            MenuStep::Move(new_selected) => {
+                selected = new_selected;
+                buffer.clear();
+                render_select_menu(prompt, selected, true, false)?;
+            }
+            MenuStep::Commit(index) => {
+                finish_select_menu_line()?;
+                return Ok(prompt.choices[index].clone());
+            }
+            MenuStep::Accumulate => {
+                render_select_menu(prompt, selected, true, false)?;
+            }
+            MenuStep::Reject => {
+                render_select_menu(prompt, selected, true, true)?;
+            }
+            MenuStep::Cancel | MenuStep::Interrupt => {
                 finish_select_menu_line()?;
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "prompt cancelled").into());
             }
-            KeyCode::Enter => {
-                finish_select_menu_line()?;
-                return Ok(prompt.choices[selected].clone());
-            }
-            KeyCode::Char('j' | 'm') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                finish_select_menu_line()?;
-                return Ok(prompt.choices[selected].clone());
-            }
-            KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
-                selected = selected.saturating_sub(1);
-                render_select_menu(prompt, selected, true)?;
-            }
-            KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
-                if selected + 1 < prompt.choices.len() {
-                    selected += 1;
-                }
-                render_select_menu(prompt, selected, true)?;
-            }
-            KeyCode::Home => {
-                selected = 0;
-                render_select_menu(prompt, selected, true)?;
-            }
-            KeyCode::End => {
-                selected = prompt.choices.len().saturating_sub(1);
-                render_select_menu(prompt, selected, true)?;
-            }
-            KeyCode::Char(value) if key.modifiers.is_empty() && value.is_ascii_digit() => {
-                if let Some(index) = select_index_from_digit(value, prompt.choices.len()) {
-                    finish_select_menu_line()?;
-                    return Ok(prompt.choices[index].clone());
-                }
-            }
-            KeyCode::Esc => {
-                if let Some(index) = prompt
-                    .choices
-                    .iter()
-                    .position(|choice| choice.id == "cancel")
-                {
-                    finish_select_menu_line()?;
-                    return Ok(prompt.choices[index].clone());
-                }
-            }
-            _ => {}
+            MenuStep::Ignore => {}
         }
     }
 }
 
-fn render_select_menu(prompt: &SelectPrompt, selected: usize, redraw: bool) -> Result<()> {
+fn render_select_menu(
+    prompt: &SelectPrompt,
+    selected: usize,
+    redraw: bool,
+    out_of_range: bool,
+) -> Result<()> {
     let mut stdout = io::stdout();
     if redraw {
         execute!(stdout, MoveUp(prompt.choices.len() as u16), MoveToColumn(0))?;
@@ -198,7 +185,15 @@ fn render_select_menu(prompt: &SelectPrompt, selected: usize, redraw: bool) -> R
         .default_index
         .min(prompt.choices.len().saturating_sub(1))
         + 1;
-    write!(stdout, "? choose [{default}]: arrows/Enter or number ")?;
+    let notice = if out_of_range {
+        format!(" — choose 1-{}", prompt.choices.len())
+    } else {
+        String::new()
+    };
+    write!(
+        stdout,
+        "? choose [{default}]: arrows/Enter, number, Esc to cancel{notice} "
+    )?;
     stdout.flush()?;
     Ok(())
 }
@@ -261,13 +256,116 @@ fn finish_select_menu_line() -> io::Result<()> {
     stdout.flush()
 }
 
-fn select_index_from_digit(value: char, len: usize) -> Option<usize> {
-    let digit = value.to_digit(10)? as usize;
-    if (1..=len).contains(&digit) {
-        Some(digit - 1)
-    } else {
-        None
+#[derive(Debug, PartialEq, Eq)]
+enum DigitResolution {
+    Commit(usize),
+    Accumulate,
+    OutOfRange,
+}
+
+/// Resolve an accumulated digit `buffer` against a menu of `len` choices. Commits
+/// as soon as no longer prefix could be valid, so single-digit menus feel instant
+/// while menus with 10+ choices accept multi-digit entry.
+fn resolve_digit_selection(buffer: &str, len: usize) -> DigitResolution {
+    let Ok(value) = buffer.parse::<usize>() else {
+        return DigitResolution::OutOfRange;
+    };
+    if value == 0 || value > len {
+        return DigitResolution::OutOfRange;
     }
+    if value.saturating_mul(10) > len {
+        DigitResolution::Commit(value - 1)
+    } else {
+        DigitResolution::Accumulate
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MenuStep {
+    Move(usize),
+    Commit(usize),
+    Accumulate,
+    Reject,
+    Cancel,
+    Interrupt,
+    Ignore,
+}
+
+/// Pure key-dispatch for the selectable menu, factored out so the keyboard and
+/// number-input behavior is unit-testable without a real TTY. `buffer` holds the
+/// in-progress multi-digit selection and is mutated as digits arrive.
+fn menu_step(
+    choice_count: usize,
+    selected: usize,
+    cancel_index: Option<usize>,
+    buffer: &mut String,
+    key: KeyEvent,
+) -> MenuStep {
+    if matches!(key.kind, KeyEventKind::Release) {
+        return MenuStep::Ignore;
+    }
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => MenuStep::Interrupt,
+        KeyCode::Char('j' | 'm') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            MenuStep::Commit(selected)
+        }
+        KeyCode::Enter => {
+            if !buffer.is_empty()
+                && let Ok(value) = buffer.parse::<usize>()
+                && (1..=choice_count).contains(&value)
+            {
+                return MenuStep::Commit(value - 1);
+            }
+            MenuStep::Commit(selected)
+        }
+        KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
+            MenuStep::Move(selected.saturating_sub(1))
+        }
+        KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
+            MenuStep::Move((selected + 1).min(choice_count.saturating_sub(1)))
+        }
+        KeyCode::Home => MenuStep::Move(0),
+        KeyCode::End => MenuStep::Move(choice_count.saturating_sub(1)),
+        KeyCode::Char(value) if key.modifiers.is_empty() && value.is_ascii_digit() => {
+            buffer.push(value);
+            match resolve_digit_selection(buffer, choice_count) {
+                DigitResolution::Commit(index) => MenuStep::Commit(index),
+                DigitResolution::Accumulate => MenuStep::Accumulate,
+                DigitResolution::OutOfRange => {
+                    buffer.clear();
+                    MenuStep::Reject
+                }
+            }
+        }
+        KeyCode::Esc => match cancel_index {
+            Some(index) => MenuStep::Commit(index),
+            None => MenuStep::Cancel,
+        },
+        _ => MenuStep::Ignore,
+    }
+}
+
+fn cancel_choice_index(prompt: &SelectPrompt) -> Option<usize> {
+    prompt
+        .choices
+        .iter()
+        .position(|choice| choice.id == "cancel")
+}
+
+/// Whether a menu of `choice_count` choices fits in a terminal `rows` tall. Tall
+/// menus fall back to line mode because the raw-mode redraw can only MoveUp
+/// within the visible region (a taller list corrupts the screen).
+fn menu_fits(choice_count: usize, rows: usize) -> bool {
+    // title + optional help + the prompt line + a little slack.
+    choice_count + 4 <= rows
+}
+
+fn terminal_rows() -> usize {
+    crossterm::terminal::size()
+        .ok()
+        .map(|(_, rows)| usize::from(rows))
+        .filter(|rows| *rows > 0)
+        .unwrap_or(24)
 }
 
 struct RawModeGuard;
@@ -327,9 +425,76 @@ fn parse_confirm_answer(answer: &str, default_yes: bool) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_confirm_answer, parse_select_answer, select_index_from_digit, truncate_menu_line,
-        write_select_menu_line,
+        MenuStep, menu_fits, menu_step, parse_confirm_answer, parse_select_answer,
+        truncate_menu_line, write_select_menu_line,
     };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(value: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(value), KeyModifiers::empty())
+    }
+
+    fn esc() -> KeyEvent {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn menu_mode_selects_choice_above_nine_by_number() {
+        // A 12-choice menu accepts multi-digit entry: "1" then "2" commits choice 12.
+        let mut buffer = String::new();
+        assert_eq!(
+            menu_step(12, 0, None, &mut buffer, key('1')),
+            MenuStep::Accumulate
+        );
+        assert_eq!(
+            menu_step(12, 0, None, &mut buffer, key('2')),
+            MenuStep::Commit(11)
+        );
+        // "1" then "0" commits choice 10 (index 9).
+        let mut buffer = String::new();
+        assert_eq!(
+            menu_step(12, 0, None, &mut buffer, key('1')),
+            MenuStep::Accumulate
+        );
+        assert_eq!(
+            menu_step(12, 0, None, &mut buffer, key('0')),
+            MenuStep::Commit(9)
+        );
+    }
+
+    #[test]
+    fn esc_cancels_without_explicit_cancel_choice() {
+        let mut buffer = String::new();
+        // No explicit cancel choice: Esc cancels gracefully anyway.
+        assert_eq!(menu_step(4, 0, None, &mut buffer, esc()), MenuStep::Cancel);
+        // With an explicit cancel choice: Esc selects it.
+        assert_eq!(
+            menu_step(4, 0, Some(3), &mut buffer, esc()),
+            MenuStep::Commit(3)
+        );
+    }
+
+    #[test]
+    fn menu_mode_reports_out_of_range() {
+        let mut buffer = String::new();
+        // 4 choices: "9" is out of range, so the buffer clears and the menu reports it.
+        assert_eq!(
+            menu_step(4, 0, None, &mut buffer, key('9')),
+            MenuStep::Reject
+        );
+        assert!(buffer.is_empty());
+        assert_eq!(
+            menu_step(4, 0, None, &mut buffer, key('0')),
+            MenuStep::Reject
+        );
+    }
+
+    #[test]
+    fn tall_menu_falls_back_or_paginates() {
+        assert!(menu_fits(5, 24), "a short menu fits");
+        assert!(!menu_fits(30, 24), "a 30-choice menu must fall back");
+        assert!(!menu_fits(21, 24), "21 choices + chrome exceeds 24 rows");
+    }
 
     #[test]
     fn confirm_answer_accepts_yes_no_and_default() {
@@ -358,14 +523,6 @@ mod tests {
         assert_eq!(parse_select_answer("0", 2, 4), None);
         assert_eq!(parse_select_answer("5", 2, 4), None);
         assert_eq!(parse_select_answer("review", 2, 4), None);
-    }
-
-    #[test]
-    fn selectable_menu_digit_shortcuts_match_numbered_rows() {
-        assert_eq!(select_index_from_digit('1', 4), Some(0));
-        assert_eq!(select_index_from_digit('4', 4), Some(3));
-        assert_eq!(select_index_from_digit('5', 4), None);
-        assert_eq!(select_index_from_digit('0', 4), None);
     }
 
     #[test]

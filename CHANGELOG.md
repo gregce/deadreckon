@@ -27,6 +27,12 @@
   padding so colored cells align like plain ones) and migrated the library table
   onto it; lowercased the run-list header. Provider/plan/chain tables retain
   their display-width-correct renderers and can adopt `columns` incrementally.
+- Hardened the selectable prompt menu: multi-digit number entry (menus with 10+
+  choices are now reachable by number), `Esc` always cancels even without an
+  explicit cancel choice, out-of-range digits show a `choose 1-N` notice, tall
+  menus fall back to line mode instead of corrupting the screen, and the footer
+  advertises the available keys. Key dispatch is factored into a pure, unit-tested
+  `menu_step`.
 
 ## Release Trust - 2026-06-02
 
