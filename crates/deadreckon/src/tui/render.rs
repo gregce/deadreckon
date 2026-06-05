@@ -1982,6 +1982,13 @@ fn attach_header_text_for_state(
 }
 
 fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTuiState) -> String {
+    if let Some(action) = tui_state.pending_confirm {
+        return footer(&[
+            (format!("confirm {}?", action.label()), String::new()),
+            ("y".to_string(), "run".to_string()),
+            ("any other key".to_string(), "cancel".to_string()),
+        ]);
+    }
     let mut items: Vec<(String, String)> = Vec::new();
     let push = |items: &mut Vec<(String, String)>, pairs: &[(&str, &str)]| {
         items.extend(pairs.iter().map(|(k, l)| (k.to_string(), l.to_string())));
@@ -2032,7 +2039,7 @@ fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTu
                 &[
                     ("[d]", "Activity"),
                     ("[a]", "Apply"),
-                    ("[b]", "Abandon"),
+                    ("[x]", "Abandon"),
                     ("[s]", "Show"),
                     ("Tab", "focus"),
                     ("j/k", "scroll"),
@@ -2044,7 +2051,7 @@ fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTu
                     ("[r]", "Refresh"),
                     ("[d]", "Docs"),
                     ("[a]", "Apply"),
-                    ("[b]", "Abandon"),
+                    ("[x]", "Abandon"),
                     ("[s]", "Show"),
                 ]
             } else {
@@ -2052,7 +2059,7 @@ fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTu
                     ("[n]", "Narrative"),
                     ("[d]", "Docs"),
                     ("[a]", "Apply"),
-                    ("[b]", "Abandon"),
+                    ("[x]", "Abandon"),
                     ("[s]", "Show"),
                     ("Tab", "focus"),
                     ("j/k", "scroll"),

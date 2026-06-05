@@ -10968,6 +10968,12 @@ impl CompletionAction {
         }
     }
 
+    /// Actions that change or discard the run's result and therefore require an
+    /// in-TUI confirmation keystroke before they fire.
+    pub(crate) fn is_destructive(self) -> bool {
+        matches!(self, Self::Apply | Self::Abandon)
+    }
+
     fn success_detail(self) -> &'static str {
         match self {
             Self::Materialize => {

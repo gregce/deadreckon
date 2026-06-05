@@ -863,12 +863,27 @@ async fn attach_tui_with_parent(
                 {
                     if key.code == KeyCode::Char('d') && key.modifiers.is_empty() {
                         tui_state.toggle_docs();
-                    } else if let Some(notice) =
-                        handle_tui_completion_key(&mut terminal, paths, &state, key).await?
-                    {
-                        tui_state.record_post_action(notice);
                     } else {
-                        tui_state.handle_key(key, panel_counts, panel_layout.rows);
+                        match resolve_completion_key(key, tui_state.pending_confirm) {
+                            CompletionKeyOutcome::Confirm(action) => {
+                                tui_state.pending_confirm = Some(action);
+                            }
+                            CompletionKeyOutcome::Cancel => {
+                                tui_state.pending_confirm = None;
+                            }
+                            CompletionKeyOutcome::Execute(action) => {
+                                tui_state.pending_confirm = None;
+                                if let Some(notice) =
+                                    run_completion_action(&mut terminal, paths, &state, action)
+                                        .await?
+                                {
+                                    tui_state.record_post_action(notice);
+                                }
+                            }
+                            CompletionKeyOutcome::Ignored => {
+                                tui_state.handle_key(key, panel_counts, panel_layout.rows);
+                            }
+                        }
                     }
                 }
                 Event::Key(key) => tui_state.handle_key(key, panel_counts, panel_layout.rows),
@@ -902,22 +917,50 @@ async fn attach_tui_with_parent(
     result
 }
 
-async fn handle_tui_completion_key(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    paths: &DeadreckonPaths,
-    state: &deadreckon_core::PipelineState,
+#[derive(Debug, PartialEq, Eq)]
+enum CompletionKeyOutcome {
+    Ignored,
+    Execute(CompletionAction),
+    Confirm(CompletionAction),
+    Cancel,
+}
+
+/// Resolve a completion-overlay keystroke given any pending confirmation.
+/// Destructive actions (Apply/Abandon) require a two-step confirm: the action
+/// key arms `pending`, then `y` runs it and any other key cancels. Abandon is
+/// `x` so that `b` is unambiguously "back" (no longer overloaded with Abandon).
+fn resolve_completion_key(
     key: KeyEvent,
-) -> Result<Option<AttachActionNotice>> {
+    pending: Option<CompletionAction>,
+) -> CompletionKeyOutcome {
+    if let Some(action) = pending {
+        return if key.code == KeyCode::Char('y') {
+            CompletionKeyOutcome::Execute(action)
+        } else {
+            CompletionKeyOutcome::Cancel
+        };
+    }
     let action = match key.code {
         KeyCode::Char('m') => CompletionAction::Materialize,
         KeyCode::Char('e') => CompletionAction::Extend,
         KeyCode::Char('a') => CompletionAction::Apply,
-        KeyCode::Char('b') => CompletionAction::Abandon,
-        KeyCode::Char('d') => CompletionAction::Docs,
+        KeyCode::Char('x') => CompletionAction::Abandon,
         KeyCode::Char('s') => CompletionAction::Show,
-        _ => return Ok(None),
+        _ => return CompletionKeyOutcome::Ignored,
     };
+    if action.is_destructive() {
+        CompletionKeyOutcome::Confirm(action)
+    } else {
+        CompletionKeyOutcome::Execute(action)
+    }
+}
 
+async fn run_completion_action(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    action: CompletionAction,
+) -> Result<Option<AttachActionNotice>> {
     suspend_tui(terminal)?;
     let action_result = match action {
         CompletionAction::Materialize => prompt_materialize_action(paths, state),
@@ -1063,7 +1106,8 @@ impl crate::tui::navigation::NavigableSurface for PlanNav<'_> {
 
 #[cfg(test)]
 mod nav_tests {
-    use super::{PLAN_LIST_PAGE, PlanNav};
+    use super::{CompletionKeyOutcome, PLAN_LIST_PAGE, PlanNav, resolve_completion_key};
+    use crate::CompletionAction;
     use crate::tui::navigation::dispatch_navigation;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -1130,5 +1174,59 @@ mod nav_tests {
         let mut selected = count - 1;
         dispatch_navigation(&mut plan_nav(&mut selected, count), key(KeyCode::Down));
         assert_eq!(selected, count - 1, "clamps at bottom");
+    }
+
+    #[test]
+    fn apply_requires_confirmation_keystroke() {
+        // 'a' only arms the confirm — it must NOT execute immediately.
+        assert_eq!(
+            resolve_completion_key(key(KeyCode::Char('a')), None),
+            CompletionKeyOutcome::Confirm(CompletionAction::Apply)
+        );
+        // 'y' then runs the armed action.
+        assert_eq!(
+            resolve_completion_key(key(KeyCode::Char('y')), Some(CompletionAction::Apply)),
+            CompletionKeyOutcome::Execute(CompletionAction::Apply)
+        );
+        // Any other key cancels.
+        assert_eq!(
+            resolve_completion_key(key(KeyCode::Char('n')), Some(CompletionAction::Apply)),
+            CompletionKeyOutcome::Cancel
+        );
+    }
+
+    #[test]
+    fn abandon_requires_confirmation_keystroke() {
+        assert_eq!(
+            resolve_completion_key(key(KeyCode::Char('x')), None),
+            CompletionKeyOutcome::Confirm(CompletionAction::Abandon)
+        );
+        assert_eq!(
+            resolve_completion_key(key(KeyCode::Char('y')), Some(CompletionAction::Abandon)),
+            CompletionKeyOutcome::Execute(CompletionAction::Abandon)
+        );
+        // A single mistyped key cannot fire Abandon.
+        assert_eq!(
+            resolve_completion_key(key(KeyCode::Esc), Some(CompletionAction::Abandon)),
+            CompletionKeyOutcome::Cancel
+        );
+    }
+
+    #[test]
+    fn back_and_abandon_are_distinct_keys() {
+        // Abandon is 'x'; 'b' is no longer Abandon (it is reserved for "back").
+        assert_eq!(
+            resolve_completion_key(key(KeyCode::Char('x')), None),
+            CompletionKeyOutcome::Confirm(CompletionAction::Abandon)
+        );
+        assert_eq!(
+            resolve_completion_key(key(KeyCode::Char('b')), None),
+            CompletionKeyOutcome::Ignored
+        );
+        // Non-destructive actions run immediately, no confirm.
+        assert_eq!(
+            resolve_completion_key(key(KeyCode::Char('s')), None),
+            CompletionKeyOutcome::Execute(CompletionAction::Show)
+        );
     }
 }

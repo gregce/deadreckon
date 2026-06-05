@@ -55,6 +55,7 @@ pub(crate) struct AttachTuiState {
     pub(crate) narrative_notice: Option<String>,
     pub(crate) narrative_projection: Option<narrative::NarrativeProjection>,
     pub(crate) parent_plan: Option<AttachParentPlan>,
+    pub(crate) pending_confirm: Option<CompletionAction>,
 }
 
 impl Default for AttachTuiState {
@@ -74,6 +75,7 @@ impl Default for AttachTuiState {
             narrative_notice: None,
             narrative_projection: None,
             parent_plan: None,
+            pending_confirm: None,
         }
     }
 }
