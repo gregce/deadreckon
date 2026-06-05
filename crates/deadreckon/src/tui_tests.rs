@@ -40,7 +40,8 @@ use super::tui::{
     AttachActionNotice, AttachPanel, AttachPanelCounts, AttachPanelRows, AttachParentPlan,
     AttachTuiState, ChainAttachTuiState, build_run_narrative_projection, chain_activity_lines,
     chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
-    chain_timeline_lines, markdown_to_tui_lines, max_panel_scroll, render_chain_attach,
+    chain_timeline_lines, markdown_to_tui_lines, max_panel_scroll, panel_title,
+    render_chain_attach, selection_glyph,
 };
 use super::{
     ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachJsonlTail,
@@ -3654,7 +3655,7 @@ fn attach_plan_back_returns_to_same_selected_task() {
         KeyCode::Backspace,
         KeyModifiers::NONE
     )));
-    assert!(text.contains("* task-1"), "{text}");
+    assert!(text.contains("> task-1"), "{text}");
 }
 
 #[test]
@@ -4003,6 +4004,38 @@ fn chain_attach_supports_paging_keys() {
         &chain,
     );
     assert_eq!(s.selected_step, 0);
+}
+
+#[test]
+fn selection_glyph_identical_across_surfaces() {
+    let glyph = selection_glyph(true);
+    assert_eq!(glyph, ">", "exactly one selection cursor");
+    assert_eq!(selection_glyph(false), " ");
+
+    // Run: the focused-panel title cursor.
+    let run_title = panel_title("Activity", true, 0, 10, 0);
+    assert!(
+        run_title.starts_with(glyph),
+        "run uses {glyph}: {run_title:?}"
+    );
+    assert!(
+        !run_title.contains('*'),
+        "no legacy * marker on the run panel"
+    );
+
+    // Chain: the selected step row uses the same cursor.
+    let chain = chain_fixture();
+    let mut chain_state = ChainAttachTuiState::default();
+    chain_state.selected_step = 1;
+    let chain_lines: Vec<String> = chain_timeline_lines(&chain, &chain_state)
+        .iter()
+        .map(line_text)
+        .collect();
+    assert!(
+        chain_lines[1].contains(glyph),
+        "chain selected step uses {glyph}: {:?}",
+        chain_lines[1]
+    );
 }
 
 #[test]

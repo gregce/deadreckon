@@ -371,7 +371,7 @@ pub(crate) fn render_campaign_attach(frame: &mut ratatui::Frame<'_>, state: &Cam
         let selected = index == state.selected;
         let title = format!(
             "{} {} {}",
-            if selected { ">" } else { " " },
+            selection_glyph(selected),
             sub.sub_id,
             campaign_sub_status_text(sub.status)
         );
@@ -505,7 +505,7 @@ fn campaign_sub_lines(state: &CampaignAttachState, index: usize, width: usize) -
     let Some(sub) = state.campaign.sub_goals.get(index) else {
         return Vec::new();
     };
-    let marker = if index == state.selected { ">" } else { " " };
+    let marker = selection_glyph(index == state.selected);
     let plan = sub
         .sub_plan_id
         .as_deref()
@@ -1034,7 +1034,7 @@ pub(crate) fn render_plan_attach(
         let is_selected = index == state.selected;
         let title = format!(
             "{} {} {}",
-            if is_selected { "*" } else { " " },
+            selection_glyph(is_selected),
             task.task_id,
             task_status_label(task.status)
         );
@@ -2573,6 +2573,12 @@ pub(crate) fn panel_border_style(focused: AttachPanel, panel: AttachPanel) -> St
     }
 }
 
+/// The single selection cursor used by every attach surface (run focused panel,
+/// plan task, campaign sub-goal, chain step). `>` marks the selection.
+pub(crate) fn selection_glyph(selected: bool) -> &'static str {
+    if selected { ">" } else { " " }
+}
+
 pub(crate) fn panel_title(
     title: &str,
     focused: bool,
@@ -2580,7 +2586,7 @@ pub(crate) fn panel_title(
     rows: usize,
     total: usize,
 ) -> String {
-    let marker = if focused { "*" } else { " " };
+    let marker = selection_glyph(focused);
     if total <= rows || total == 0 {
         format!("{marker}{title}")
     } else {
