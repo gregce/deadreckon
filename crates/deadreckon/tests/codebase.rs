@@ -768,10 +768,12 @@ fn non_git_interactive_offers_three_choices_with_init_default() {
 
     assert_success(&output);
     let text = format!("{}{}", stdout(&output), stderr(&output));
-    assert!(text.contains("this is not a git repo. options:"));
-    assert!(text.contains("[1] git init for me"));
-    assert!(text.contains("[2] copy mode"));
-    assert!(text.contains("[3] cancel"));
+    assert!(text.contains("No git repo here"));
+    assert!(text.contains("[1] Initialize git and use worktree mode"));
+    assert!(text.contains("Adds .git here"));
+    assert!(text.contains("[2] Use copy mode"));
+    assert!(text.contains("Leaves this folder alone"));
+    assert!(text.contains("[3] Cancel"));
     assert!(text.contains("choose [1]:"));
     assert!(!source.join(".git").exists());
     assert!(list_runs(&paths, None).expect("runs").is_empty());

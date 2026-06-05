@@ -333,7 +333,7 @@ fn apply_command_inner(
     _plain: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = match load_cli_run(&paths, &run_id) {
+    let mut state = match load_cli_run(&paths, &run_id) {
         Ok(state) => state,
         Err(run_error) => match resolve_plan_result_run(&paths, &run_id, "apply")? {
             Some(result) => {
@@ -346,7 +346,16 @@ fn apply_command_inner(
         },
     };
     ensure_completed_run(&state, "apply")?;
-    let record = read_codebase_record(&state.working_dir)?;
+    let record = match read_codebase_record(&state.working_dir) {
+        Ok(record) => record,
+        Err(source) => match prepare_result_run_apply_state(&paths, &state, quiet)? {
+            Some(prepared) => {
+                state = prepared;
+                read_codebase_record(&state.working_dir)?
+            }
+            None => return Err(apply_missing_codebase_error(&paths, &state, source)),
+        },
+    };
     if record.mode != CodebaseMode::Worktree {
         return Err(apply_mode_error(&state, record.mode));
     }
@@ -483,6 +492,101 @@ fn apply_command_inner(
         );
     }
     Ok(())
+}
+
+fn prepare_result_run_apply_state(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    quiet: bool,
+) -> Result<Option<deadreckon_core::PipelineState>> {
+    let Some(plan_id) = result_plan_id(paths, state)? else {
+        return Ok(None);
+    };
+    if let Ok(plan) = load_plan(paths, &plan_id) {
+        if !quiet {
+            print_plan_result_context(&plan, state);
+        }
+        return prepare_plan_result_apply_state(paths, &plan, state).map(Some);
+    }
+    if let Some((campaign_dir, campaign)) =
+        crate::commands::campaign::resolve_campaign(paths, &plan_id)?
+    {
+        let plan = crate::commands::campaign::campaign_as_apply_plan(
+            paths,
+            &campaign_dir,
+            &campaign,
+            &state.cwd,
+        )?;
+        if plan.merged_run_id.as_deref() != Some(state.run_id.as_str()) {
+            return Ok(None);
+        }
+        if !quiet {
+            print_plan_result_context(&plan, state);
+        }
+        return prepare_plan_result_apply_state(paths, &plan, state).map(Some);
+    }
+    Ok(None)
+}
+
+fn result_plan_id(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+) -> Result<Option<String>> {
+    let library = paths.library_dir(&state.scope, &state.run_id);
+    if let Some(plan_id) =
+        result_manifest_id(&library.join("deadreckon-plan-manifest.json"), "plan_id")?
+    {
+        return Ok(Some(plan_id));
+    }
+    result_manifest_id(
+        &library.join("deadreckon-campaign-manifest.json"),
+        "campaign_id",
+    )
+}
+
+fn result_manifest_id(path: &Path, key: &str) -> Result<Option<String>> {
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let value: Value = serde_json::from_slice(&bytes)?;
+            Ok(value.get(key).and_then(Value::as_str).map(str::to_string))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Core(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        })),
+    }
+}
+
+fn apply_missing_codebase_error(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    source: DeadreckonError,
+) -> CliError {
+    let id = run_prefix(&state.run_id);
+    let library = paths.library_dir(&state.scope, &state.run_id);
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::try_new(
+            VerdictKind::Blocked,
+            "apply",
+            Some(&id),
+            ExplanationPanel::new(
+                "DeadReckon could not find a worktree record for this completed run.",
+                "Apply only merges worktree-backed runs or completed plan/campaign results with recoverable source metadata; use finish/export to copy this library result.",
+                [
+                    ("run".to_string(), id.clone()),
+                    ("status".to_string(), run_status_label(state.status).to_string()),
+                    ("library".to_string(), library.display().to_string()),
+                    ("missing".to_string(), source.to_string()),
+                ],
+            ),
+            vec![("Recommended", format!("deadreckon finish {id}"))],
+            vec![("Secondary", format!("deadreckon export {id} --dest <path>"))],
+        )
+        .expect("apply missing-codebase refusal surface must be valid")
+        .render_plain(!completion_hints_enabled(false)),
+    }
 }
 
 fn print_already_applied(state: &deadreckon_core::PipelineState, branch: &str, target: &str) {

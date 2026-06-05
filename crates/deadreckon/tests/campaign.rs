@@ -3,16 +3,48 @@ use deadreckon_core::{
     DeadreckonPaths, PhaseId, PhaseStatus, RunOptions, create_run, load_run, promote_completed_run,
     save_state, write_acceptance_marker,
 };
+use std::process::Command;
 use tempfile::TempDir;
 
 mod common;
 
-use common::{deadreckon, stderr, stdout};
+use common::{assert_success, deadreckon, stderr, stdout};
 
 fn workdir(temp: &TempDir) -> std::path::PathBuf {
     let work = temp.path().join("work");
     std::fs::create_dir_all(&work).expect("workdir");
     work
+}
+
+fn clean_git_repo(temp: &TempDir) -> std::path::PathBuf {
+    let repo = workdir(temp);
+    git(&repo, &["init"]).expect("git init");
+    std::fs::write(repo.join("README.md"), "hello").expect("readme");
+    git(&repo, &["add", "-A"]).expect("git add");
+    git(&repo, &["commit", "-m", "initial"]).expect("git commit");
+    repo
+}
+
+fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
+    let output = Command::new("git").current_dir(cwd).args(args).output()?;
+    if args.first() == Some(&"init") && output.status.success() {
+        let _ = Command::new("git")
+            .current_dir(cwd)
+            .args(["config", "user.email", "deadreckon@example.invalid"])
+            .output();
+        let _ = Command::new("git")
+            .current_dir(cwd)
+            .args(["config", "user.name", "deadreckon"])
+            .output();
+    }
+    assert!(
+        output.status.success(),
+        "git {:?}\nstdout:{}\nstderr:{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }
 
 #[test]
@@ -63,7 +95,7 @@ fn campaign_preview_writes_campaign_json_and_stops() {
 }
 
 #[test]
-fn campaign_preview_uses_one_verdict_surface() {
+fn campaign_preview_uses_readable_preflight_layout() {
     let temp = TempDir::new().expect("tempdir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let work = workdir(&temp);
@@ -92,14 +124,21 @@ fn campaign_preview_uses_one_verdict_surface() {
     );
 
     let out = stdout(&output);
-    assert!(out.starts_with("preview campaign"), "{out}");
-    assert!(out.contains("Explanation\n"), "{out}");
-    assert!(out.contains("Evidence\n"), "{out}");
-    assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
+    assert!(out.starts_with("Campaign preview "), "{out}");
+    assert!(out.contains("\nGoal\n  build a thing\n"), "{out}");
+    assert!(out.contains("\nPlan\n"), "{out}");
+    assert!(out.contains("sub-goals 2"), "{out}");
+    assert!(out.contains("planner   smoke"), "{out}");
+    assert!(out.contains("workers   smoke"), "{out}");
+    assert!(out.contains("budget    unbounded"), "{out}");
+    assert!(out.contains("\nNext\n"), "{out}");
     assert!(
-        out.contains("Recommended\ndeadreckon campaign \"build a thing\" --n 2 --yes"),
+        out.contains("deadreckon campaign \"build a thing\" --n 2 --yes"),
         "{out}"
     );
+    assert!(!out.contains("Explanation\n"), "{out}");
+    assert!(!out.contains("Evidence\n"), "{out}");
+    assert!(!out.contains("\nRecommended\n"), "{out}");
     assert!(!out.contains("try:"), "{out}");
     assert!(out.contains("Sub-goals"), "{out}");
     assert!(out.contains("sub-0"), "{out}");
@@ -136,8 +175,11 @@ fn campaign_preflight_shows_depth_cap_and_tree_budget() {
         stderr(&output)
     );
     let out = stdout(&output);
-    assert!(out.contains("depth cap: 2"), "{out}");
-    assert!(out.contains("tree budget: $10.00"), "{out}");
+    assert!(out.contains("depth cap 2"), "{out}");
+    assert!(
+        out.contains("budget    $10.00 total (~$5.00 per sub)"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -215,10 +257,12 @@ fn campaign_without_n_uses_recommended_count() {
     let body = std::fs::read_to_string(campaign_json).expect("read campaign.json");
     assert!(body.contains("\"n\": 3"), "{body}");
     let out = stdout(&output);
-    assert!(out.contains("preview campaign"), "{out}");
-    assert!(out.contains("subs: 3"), "{out}");
+    assert!(out.contains("Campaign preview "), "{out}");
+    assert!(out.contains("sub-goals 3"), "{out}");
     assert!(
-        out.contains("Recommended\ndeadreckon campaign \"rebuild billing, notifications, and admin\" --n 3 --yes"),
+        out.contains(
+            "deadreckon campaign \"rebuild billing, notifications, and admin\" --n 3 --yes"
+        ),
         "{out}"
     );
 }
@@ -301,7 +345,7 @@ fn campaign_repair_promotes_failed_campaign_without_conflicts() {
 
     let temp = TempDir::new().expect("tempdir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
-    let work = workdir(&temp);
+    let work = clean_git_repo(&temp);
     let run0 = promoted_run_with_file(&paths, &work, "billing", "src/billing.rs", "billing");
     let run1 = promoted_run_with_file(&paths, &work, "notify", "src/notify.rs", "notify");
     let mut campaign = Campaign::new(
@@ -361,6 +405,25 @@ fn campaign_repair_promotes_failed_campaign_without_conflicts() {
     );
     assert_eq!(
         std::fs::read_to_string(library.join("src/notify.rs")).expect("notify"),
+        "notify"
+    );
+    assert!(
+        !library.join(".deadreckon/codebase.json").exists(),
+        "campaign result library should reproduce the missing-codebase apply case"
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&work)
+        .args(["apply", &result_run_id[..8], "--no-confirm", "--cleanup"])
+        .output()
+        .expect("apply campaign result");
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(work.join("src/billing.rs")).expect("applied billing"),
+        "billing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join("src/notify.rs")).expect("applied notify"),
         "notify"
     );
 

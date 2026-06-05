@@ -7452,10 +7452,16 @@ enum NonGitChoice {
 }
 
 fn prompt_non_git_mode() -> Result<NonGitChoice> {
-    eprintln!("deadreckon: this is not a git repo. options:");
-    eprintln!("  [1] git init for me, then run with worktree mode (recommended)");
-    eprintln!("  [2] copy mode - agent works on a copy in ~/.deadreckon/runstate/...");
-    eprintln!("  [3] cancel");
+    eprintln!("No git repo here");
+    eprintln!(
+        "  DeadReckon needs either a git worktree or a disposable copy before it lets an agent edit files."
+    );
+    eprintln!();
+    eprintln!("  [1] Initialize git and use worktree mode (recommended)");
+    eprintln!("      Adds .git here, then runs the agent in an isolated deadreckon worktree.");
+    eprintln!("  [2] Use copy mode");
+    eprintln!("      Leaves this folder alone; the agent works under ~/.deadreckon/runstate/.");
+    eprintln!("  [3] Cancel");
     let answer = prompt::open("choose [1]: ", None)?;
     Ok(match answer.trim() {
         "" | "1" => NonGitChoice::Init,

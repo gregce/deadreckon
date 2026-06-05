@@ -146,62 +146,150 @@ fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sand
         shell_display_quote(&campaign.root_goal),
         campaign.n
     );
-    let mut evidence = vec![
-        ("campaign".to_string(), id.clone()),
-        ("subs".to_string(), campaign.n.to_string()),
-        (
-            "depth cap".to_string(),
-            deadreckon_core::campaign::CAMPAIGN_MAX_DEPTH.to_string(),
-        ),
-    ];
+
+    println!("Campaign preview {id}");
+    println!();
+    println!("Goal");
+    print_campaign_wrapped("  ", &campaign.root_goal, CAMPAIGN_WRAP_WIDTH);
+    println!();
+    println!("Plan");
+    print_campaign_fact("campaign", &id);
+    print_campaign_fact("sub-goals", &campaign.n.to_string());
+    print_campaign_fact(
+        "depth cap",
+        &deadreckon_core::campaign::CAMPAIGN_MAX_DEPTH.to_string(),
+    );
+    if let Some(sandbox) = sandbox {
+        print_campaign_fact("sandbox", sandbox);
+    }
+    if let Some(planner) = campaign.providers.planner.as_deref() {
+        print_campaign_fact("planner", planner);
+    }
+    if let Some(child) = campaign.providers.default_child.as_deref() {
+        print_campaign_fact("workers", child);
+    }
     match (
         campaign.tree_budget_usd,
         per_sub.as_ref().and_then(|s| s.first()),
     ) {
         (Some(total), Some(share)) => {
-            evidence.push((
-                "tree budget".to_string(),
-                format!("${total:.2} (~${share:.2}/sub)"),
-            ));
+            print_campaign_fact(
+                "budget",
+                &format!("${total:.2} total (~${share:.2} per sub)"),
+            );
         }
         _ => {
-            if let Some(warning) =
-                deadreckon_core::campaign::unbounded_budget_warning(campaign.tree_budget_usd)
-            {
-                evidence.push(("tree budget".to_string(), warning));
-            }
+            print_campaign_fact("budget", "unbounded");
+            print_campaign_wrapped(
+                "             ",
+                "Add --max-spend <usd> to cap the whole campaign tree.",
+                CAMPAIGN_WRAP_WIDTH,
+            );
         }
     }
-    if let Some(sandbox) = sandbox {
-        evidence.push(("sandbox".to_string(), sandbox.to_string()));
+    if let Some(seconds) = campaign.tree_wall_seconds {
+        print_campaign_fact("wall cap", &format_wall_cap(Some(seconds)));
     }
-    if let Some(planner) = campaign.providers.planner.as_deref() {
-        evidence.push(("planner".to_string(), planner.to_string()));
-    }
-    println!(
-        "{}",
-        VerdictSurface::try_new(
-            VerdictKind::Preview,
-            "campaign",
-            Some(&id),
-            ExplanationPanel::new(
-                "DeadReckon prepared a campaign plan, but no sub-orchestrator has launched yet.",
-                "Launching with --yes is the one command that advances this preflight into campaign execution.",
-                evidence,
-            ),
-            vec![("Recommended", primary.as_str())],
-            vec![
-                ("Secondary", format!("deadreckon attach {id}").as_str()),
-                ("Secondary", format!("deadreckon show {id}").as_str()),
-            ],
-        )
-        .expect("campaign preflight verdict surface must have one primary action")
-        .render_plain(true)
-    );
+
+    println!();
+    println!("Next");
+    println!("  Press Enter or choose [1] to launch. Edit the split first if it looks wrong.");
+    println!("  Launch without prompting:");
+    print_campaign_wrapped("    ", &primary, CAMPAIGN_WRAP_WIDTH);
+
     println!("Sub-goals");
     for sub in &campaign.sub_goals {
-        println!("  {} {}", sub.sub_id, sub.goal);
+        print_campaign_sub_goal(sub);
     }
+}
+
+const CAMPAIGN_WRAP_WIDTH: usize = 88;
+
+fn print_campaign_fact(label: &str, value: &str) {
+    println!("  {label:<9} {value}");
+}
+
+fn print_campaign_sub_goal(sub: &deadreckon_core::campaign::SubGoal) {
+    println!("  {}", sub.sub_id);
+    if let Some((body, acceptance)) = split_acceptance_clause(&sub.goal) {
+        print_campaign_wrapped("    ", body, CAMPAIGN_WRAP_WIDTH);
+        println!("    Acceptance");
+        print_campaign_wrapped("      ", acceptance, CAMPAIGN_WRAP_WIDTH);
+    } else {
+        print_campaign_wrapped("    ", &sub.goal, CAMPAIGN_WRAP_WIDTH);
+    }
+}
+
+fn split_acceptance_clause(goal: &str) -> Option<(&str, &str)> {
+    let (body, acceptance) = goal.split_once("Acceptance:")?;
+    Some((body.trim(), acceptance.trim()))
+}
+
+fn print_campaign_wrapped(indent: &str, value: &str, width: usize) {
+    for line in wrap_campaign_words(value, width.saturating_sub(indent.chars().count())) {
+        println!("{indent}{line}");
+    }
+}
+
+fn wrap_campaign_words(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(16);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        push_campaign_word(&mut lines, &mut current, word, width);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push("-".to_string());
+    }
+    lines
+}
+
+fn push_campaign_word(lines: &mut Vec<String>, current: &mut String, word: &str, width: usize) {
+    let word_len = word.chars().count();
+    if current.is_empty() {
+        if word_len <= width {
+            current.push_str(word);
+        } else {
+            push_campaign_word_chunks(lines, current, word, width);
+        }
+        return;
+    }
+    let current_len = current.chars().count();
+    if current_len + 1 + word_len <= width {
+        current.push(' ');
+        current.push_str(word);
+        return;
+    }
+    lines.push(std::mem::take(current));
+    if word_len <= width {
+        current.push_str(word);
+    } else {
+        push_campaign_word_chunks(lines, current, word, width);
+    }
+}
+
+fn push_campaign_word_chunks(
+    lines: &mut Vec<String>,
+    current: &mut String,
+    word: &str,
+    width: usize,
+) {
+    for ch in word.chars() {
+        current.push(ch);
+        if current.chars().count() >= width {
+            lines.push(std::mem::take(current));
+        }
+    }
+}
+
+fn campaign_choice_detail(goal: &str) -> String {
+    wrap_campaign_words(goal, 72)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn confirm_campaign_start(campaign: &deadreckon_core::campaign::Campaign, yes: bool) -> Result<()> {
@@ -248,30 +336,32 @@ fn prompt_campaign_preflight_actions(
     loop {
         let mut choices = vec![start_prompt_choice(
             "launch",
-            "Launch campaign",
-            "starts the sub-orchestrators",
+            "Launch now",
+            format!("start {} sub-orchestrators", campaign.n),
         )];
         choices.push(start_prompt_choice(
             "edit",
             "Edit a sub-goal",
-            "updates one pending sub-goal before launch",
+            "fix one item before launch",
         ));
         if campaign.sub_goals.len() > 2 {
             choices.push(start_prompt_choice(
                 "drop",
                 "Drop a sub-goal",
-                "removes one pending sub-goal before launch",
+                "remove one item before launch",
             ));
         }
         choices.push(start_prompt_choice(
             "count",
-            "Change count",
-            "regenerates the proposed sub-goals",
+            "Regenerate count",
+            "ask the planner for a different split",
         ));
         choices.push(prompt::SelectChoice::new("cancel", "Cancel"));
         let choice = prompt::select_one(&prompt::SelectPrompt {
-            title: "Review campaign preflight".to_string(),
-            help: Some("Launch, edit/drop a sub-goal, change count, or cancel.".to_string()),
+            title: "Next step".to_string(),
+            help: Some(
+                "Enter launches this campaign. Edit first if the split is wrong.".to_string(),
+            ),
             choices,
             default_index: 0,
         })?;
@@ -285,7 +375,7 @@ fn prompt_campaign_preflight_actions(
                         start_prompt_choice(
                             sub.sub_id.clone(),
                             sub.sub_id.clone(),
-                            sub.goal.clone(),
+                            campaign_choice_detail(&sub.goal),
                         )
                     })
                     .chain(std::iter::once(prompt::SelectChoice::new(
@@ -319,7 +409,7 @@ fn prompt_campaign_preflight_actions(
                         start_prompt_choice(
                             sub.sub_id.clone(),
                             sub.sub_id.clone(),
-                            sub.goal.clone(),
+                            campaign_choice_detail(&sub.goal),
                         )
                     })
                     .chain(std::iter::once(prompt::SelectChoice::new(
@@ -592,6 +682,19 @@ fn campaign_as_merge_repair_plan(
     plan.status = PlanStatus::Forked;
     plan.forked_at = campaign.forked_at;
     plan.parent_cwd = Some(parent_cwd.to_path_buf());
+    Ok(plan)
+}
+
+pub(crate) fn campaign_as_apply_plan(
+    paths: &DeadreckonPaths,
+    campaign_dir: &Path,
+    campaign: &deadreckon_core::campaign::Campaign,
+    parent_cwd: &Path,
+) -> Result<Plan> {
+    let mut plan = campaign_as_merge_repair_plan(paths, campaign_dir, campaign, parent_cwd)?;
+    plan.status = PlanStatus::Merged;
+    plan.merged_at = campaign.merged_at;
+    plan.merged_run_id = campaign.merged_run_id.clone();
     Ok(plan)
 }
 
