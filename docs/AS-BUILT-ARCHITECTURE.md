@@ -2839,6 +2839,45 @@ terminals; cancel paths render a verdict surface with a Recommended next step.
 would break the byte-exact render tests. Only `unicode-width` (already transitive
 via ratatui) is added directly.
 
+## 41. Attach TUI Uniformity
+
+41.1 The shared dispatcher + per-mode hook (run is the reference)
+`tui::navigation::NavigableSurface` + `dispatch_navigation` own the common
+navigation keys (arrows/`jk`, `Tab`/`BackTab`, `PgUp`/`PgDn`, `Home`/`End`,
+`g`/`G`). Run (`RunNav`), plan (`PlanNav`), campaign (`CampaignNav`), and chain
+(`ChainNav`) each implement the movement hooks for their own content model and
+supply `mode_key` for mode-specific keys. The run panel's semantics are the
+reference; plan and campaign gained the paging keys they lacked, all by routing
+through the one dispatcher.
+
+41.2 One glyph, one footer, one scroll indicator
+`selection_glyph()` is the single selection cursor (`>`) at every call site.
+`footer(items)` is the single footer builder — a uniform `<keys> <label>` list
+joined by one separator — replacing the four prior styles; the brittle
+`parent_plan_footer` string-`replace()` hack is gone (the back affordance and
+parent breadcrumb are structural, placed first so a narrow terminal cannot
+truncate the exit affordance). `scroll_indicator(offset, rows, total)` (shared
+with the run `panel_title`) shows a `first-last/total` window on every list
+panel; the chain steps panel windows to that range and the plan/campaign
+headers show the selected-item position.
+
+41.3 Confirm-before-destructive and exit/return semantics
+`resolve_completion_key` is a pure state machine: Apply and Abandon arm a
+`pending_confirm` (the footer prompts `confirm <action>? y run / any other key
+cancel`) and only `y` fires them, so a single mistyped key is harmless. Abandon
+is `x` (leaving `b` unambiguously "back"); the dead `d`->Docs mapping is removed.
+The "press Enter to return" prompts (`wait_for_return` + `return_key_dismisses`)
+accept Enter/q/Esc/Backspace, and Enter on an unloadable child raises an
+"unavailable" notice instead of a silent no-op.
+
+41.4 Empty-state and Windows-glyph rules
+Empty list panels carry a one-line next step and never print an internal log
+filename (`CAMPAIGN_EMPTY_HINT`). Run and plan share one `NARRATIVE_SPLIT_WIDTH`
+breakpoint. `chain_step_glyph(status, plain)` substitutes an ASCII fallback
+(with an inline legend) under `--plain` / `NO_COLOR` / a non-VT or Windows
+terminal, so a step glyph never renders as a missing box. The byte-exact TUI
+render tests remain the contract; goldens were updated deliberately per phase.
+
 ---
 
 *This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

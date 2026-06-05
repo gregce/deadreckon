@@ -82,3 +82,14 @@
 - Planner-chosen per-sub breadth and per-sub provider roles: each sub-orchestrator runs a fixed small `--n` today; the planner could size each front and choose its providers.
 - Tree-budget strategies beyond even split: weighted allocation by sub size, dynamic reallocation from finished subs, and concurrent (non-sequential) sub launch once aggregate-budget accounting stays correct under concurrency.
 - Sharing campaign records across machines.
+
+## Attach TUI Uniformity (deferred)
+
+- Live in-frame prompts: the confirm-before-destructive flow and the "press
+  Enter to return" prompts run by suspending the alternate screen and reading a
+  raw key, not as an in-frame modal. A V1 could render a true in-frame
+  confirm/return overlay (a ratatui modal) without suspending the TUI.
+- A TUI text-input widget: there is no in-frame editable input today (anything
+  needing text suspends to a line prompt). A V1 could add `tui-input` /
+  `tui-textarea` once a real in-frame input/search/filter use case is designed
+  (Tier 3 in the rider until then).

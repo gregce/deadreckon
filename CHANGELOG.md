@@ -1,5 +1,26 @@
 # Changelog
 
+## Attach TUI Uniformity - 2026-06-05
+
+- One shared key dispatcher (`tui::navigation::NavigableSurface` +
+  `dispatch_navigation`) drives run, plan, campaign, and chain: arrows/jk,
+  Tab/BackTab, PgUp/PgDn, Home/End/g/G behave identically everywhere, with each
+  surface supplying only a mode hook. Plan and campaign gained the paging keys
+  they lacked.
+- One selection cursor (`selection_glyph()` -> `>`), one footer builder
+  (`footer(items)`, replacing four divergent styles and deleting the
+  parent-plan string-`replace()` hack), and one scroll-position indicator
+  (`scroll_indicator()`) on every list panel.
+- Apply and Abandon now require a two-step in-TUI confirm; a single mistyped key
+  can no longer fire them. Abandon moved off `b` (now unambiguously "back") to
+  `x`, and the dead `d`->Docs overload was removed.
+- Uniform exit/return: the "press Enter to return" prompts accept
+  Enter/q/Esc/Backspace, and Enter on an unloadable child shows an "unavailable"
+  notice instead of a silent no-op.
+- Friendly empty states (no leaked `*-events.jsonl` filenames), one
+  `NARRATIVE_SPLIT_WIDTH` breakpoint shared by run and plan, and an ASCII
+  fallback + legend for the chain step glyphs.
+
 ## Uniform Surface - 2026-06-05
 
 - Added one `display_width()` (strip ANSI, then Unicode display width) and routed
