@@ -10,6 +10,11 @@
   the same color on a line and in a frame; replaced the silent status fallback
   with an explicit `Status` classifier where an unknown status stays visible
   rather than being dimmed into the background.
+- Fixed the column-alignment bug where a colored id cell padded with `{:<N}` was
+  short by its ANSI escape length: added a shared `pad_visible` (display-width
+  padding) and routed the provider/library id columns through it, aligned the
+  provider id/symbol column order across full and summary modes, and measured the
+  run-list pad helpers by display width.
 
 ## Release Trust - 2026-06-02
 

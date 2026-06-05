@@ -111,12 +111,7 @@ pub fn truncate_visible(text: &str, width: usize) -> String {
 }
 
 pub fn pad_visible(text: &str, width: usize) -> String {
-    let len = visible_length(text);
-    if len >= width {
-        text.to_string()
-    } else {
-        format!("{text}{}", " ".repeat(width - len))
-    }
+    crate::ui::pad_visible(text, width)
 }
 
 pub fn strip_ansi(text: &str) -> String {

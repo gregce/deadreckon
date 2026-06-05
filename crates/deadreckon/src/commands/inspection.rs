@@ -297,13 +297,13 @@ fn list_goal_width() -> usize {
 
 fn pad_plain(value: &str, width: usize) -> String {
     let plain = truncate_text(value, width);
-    let padding = width.saturating_sub(plain.chars().count());
+    let padding = width.saturating_sub(crate::ui::display_width(&plain));
     format!("{plain}{}", " ".repeat(padding))
 }
 
 fn pad_rendered(value: &str, width: usize, render: Option<fn(String) -> String>) -> String {
     let plain = truncate_text(value, width);
-    let padding = width.saturating_sub(plain.chars().count());
+    let padding = width.saturating_sub(crate::ui::display_width(&plain));
     let rendered = render.map_or_else(|| plain.clone(), |render| render(plain.clone()));
     format!("{rendered}{}", " ".repeat(padding))
 }
@@ -1238,8 +1238,8 @@ fn print_library_table(entries: &[LibraryEntry], full: bool) {
     for entry in entries {
         let manifest = &entry.manifest;
         println!(
-            "{:<8}  {:<7}  {:<26}  {:<12}  {}",
-            ui_id(run_prefix(&manifest.run_id)),
+            "{}  {:<7}  {:<26}  {:<12}  {}",
+            crate::ui::pad_visible(&ui_id(run_prefix(&manifest.run_id)), 8),
             relative_age(manifest.promoted_at),
             truncate_text(&manifest.scope, 26),
             materialized_count_label(entry.materialized_count),

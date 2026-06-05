@@ -243,6 +243,20 @@ pub(crate) fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(strip_ansi(text).as_str())
 }
 
+/// Right-pad `text` with spaces to `width` DISPLAY columns (ANSI-aware). Use this
+/// for column alignment instead of `{:<N}`: a `{:<N}` format-pad counts the ANSI
+/// escape bytes of a styled cell, so a colored column ends up short and misaligns
+/// against its plain header.
+#[allow(dead_code)] // call sites adopt it across P3/P5/P6.
+pub(crate) fn pad_visible(text: &str, width: usize) -> String {
+    let used = display_width(text);
+    if used >= width {
+        text.to_string()
+    } else {
+        format!("{text}{}", " ".repeat(width - used))
+    }
+}
+
 pub(crate) fn status_tone(status: impl AsRef<str>) -> Tone {
     Status::classify(status.as_ref()).tone()
 }
@@ -399,9 +413,36 @@ fn truncate_visible_single_line(text: &str, max_visible: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Status, TUI_PALETTE, Tone, display_width, replacement_line_text, status_tone, strip_ansi,
-        truncate_visible_single_line,
+        Status, TUI_PALETTE, Tone, display_width, pad_visible, replacement_line_text, status_tone,
+        strip_ansi, truncate_visible_single_line,
     };
+
+    #[test]
+    fn colored_column_aligns_same_with_color_on_and_off() {
+        let plain = pad_visible("abc", 10);
+        let colored = pad_visible("\x1b[1;35mabc\x1b[0m", 10);
+        assert_eq!(display_width(&plain), 10);
+        assert_eq!(display_width(&colored), 10);
+        // Same trailing padding (7 = 10 - 3) regardless of styling.
+        assert!(plain.ends_with("       "), "{plain:?}");
+        assert!(colored.ends_with("       "), "{colored:?}");
+    }
+
+    #[test]
+    fn format_pad_over_ansi_is_rejected() {
+        // The bug class: `{:<N}` counts ANSI escape bytes, so a styled cell and a
+        // plain cell with identical visible text get different widths and the
+        // column misaligns. pad_visible measures display columns instead.
+        let plain = "abc";
+        let styled = "\x1b[1;35mabc\x1b[0m";
+        assert_ne!(
+            display_width(&format!("{plain:<10}")),
+            display_width(&format!("{styled:<10}")),
+            "naive format-pad misaligns colored vs plain"
+        );
+        assert_eq!(display_width(&pad_visible(plain, 10)), 10);
+        assert_eq!(display_width(&pad_visible(styled, 10)), 10);
+    }
 
     #[test]
     fn display_width_strips_ansi_then_measures_columns() {

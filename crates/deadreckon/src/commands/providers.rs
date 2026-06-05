@@ -840,8 +840,8 @@ fn print_provider_list_row(
     if full {
         println!(
             "{marker} {} {} kind={} credential={} model={} metering={} location={} version={}",
-            symbol,
             ui_id(&result.id),
+            symbol,
             descriptor_kind_label(&descriptor.kind),
             result.credential,
             model,
@@ -851,8 +851,8 @@ fn print_provider_list_row(
         );
     } else {
         println!(
-            "{marker} {:<20} {}  kind={:<10} credential={:<8} model={} metering={} location={} version={}",
-            ui_id(&result.id),
+            "{marker} {} {}  kind={:<10} credential={:<8} model={} metering={} location={} version={}",
+            crate::ui::pad_visible(&ui_id(&result.id), 20),
             symbol,
             descriptor_kind_label(&descriptor.kind),
             result.credential,
@@ -906,8 +906,8 @@ fn print_detect_results(results: &[ProviderProbeResult]) {
         let version = result.version.as_deref().unwrap_or("-");
         let message = result.message.as_deref().unwrap_or("");
         println!(
-            "{:<20} {}  kind={:<10} credential={:<14} location={:<36} version={:<18} metering={}",
-            ui_id(&result.id),
+            "{} {}  kind={:<10} credential={:<14} location={:<36} version={:<18} metering={}",
+            crate::ui::pad_visible(&ui_id(&result.id), 20),
             symbol,
             descriptor_kind_label(&result.kind),
             result.credential,
