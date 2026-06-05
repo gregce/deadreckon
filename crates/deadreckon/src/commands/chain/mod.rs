@@ -764,7 +764,7 @@ async fn run_chain_conductor(
                     format!("deadreckon chain show {id}"),
                     Vec::new(),
                 )
-                .render_plain(false),
+                .render_plain(!completion_hints_enabled(false)),
             });
         }
         ChainStatus::Running if chain.conductor_pid.is_some_and(pid_is_alive) => {
@@ -785,7 +785,7 @@ async fn run_chain_conductor(
                     format!("deadreckon chain attach {id}"),
                     Vec::new(),
                 )
-                .render_plain(false),
+                .render_plain(!completion_hints_enabled(false)),
             });
         }
         _ => {}
@@ -892,7 +892,7 @@ async fn run_chain_conductor(
                         format!("deadreckon chain redo {id} --step {step_number}"),
                         Vec::new(),
                     )
-                    .render_plain(false),
+                    .render_plain(!completion_hints_enabled(false)),
                 }
             })?;
             load_run(paths, &run_id)?
@@ -1073,7 +1073,7 @@ async fn run_chain_conductor(
         if !options.quiet {
             print!(
                 "{}",
-                chain_verdict_surface(paths, &chain).render_plain(false)
+                chain_verdict_surface(paths, &chain).render_plain(!completion_hints_enabled(false))
             );
         }
     } else if !options.quiet {
@@ -1490,7 +1490,8 @@ fn detach_chain_conductor(
     if !options.quiet {
         print!(
             "{}",
-            chain_detached_surface(paths, chain_id, child.id()).render_plain(false)
+            chain_detached_surface(paths, chain_id, child.id())
+                .render_plain(!completion_hints_enabled(false))
         );
     }
     Ok(())
@@ -1729,13 +1730,13 @@ fn chain_show_command(
     if why_failed {
         print!(
             "{}",
-            chain_verdict_surface(paths, &chain).render_plain(false)
+            chain_verdict_surface(paths, &chain).render_plain(!completion_hints_enabled(false))
         );
         return Ok(());
     }
     print!(
         "{}",
-        chain_verdict_surface(paths, &chain).render_plain(false)
+        chain_verdict_surface(paths, &chain).render_plain(!completion_hints_enabled(false))
     );
     println!();
     println!("Steps");
@@ -2291,7 +2292,7 @@ fn chain_pause_command(paths: &DeadreckonPaths, id: &str, reason: Option<String>
                 primary,
                 Vec::new(),
             )
-            .render_plain(false),
+            .render_plain(!completion_hints_enabled(false)),
         });
     }
     chain.status = ChainStatus::Paused;
@@ -2306,7 +2307,7 @@ fn chain_pause_command(paths: &DeadreckonPaths, id: &str, reason: Option<String>
     )?;
     print!(
         "{}",
-        chain_verdict_surface(paths, &chain).render_plain(false)
+        chain_verdict_surface(paths, &chain).render_plain(!completion_hints_enabled(false))
     );
     Ok(())
 }
@@ -2380,7 +2381,7 @@ pub(crate) fn chain_kill_command(paths: &DeadreckonPaths, id: &str, force: bool)
     let _ = fs::remove_file(paths.conductor_json(&chain.chain_id));
     print!(
         "{}",
-        chain_verdict_surface(paths, &chain).render_plain(false)
+        chain_verdict_surface(paths, &chain).render_plain(!completion_hints_enabled(false))
     );
     Ok(())
 }
@@ -2418,7 +2419,7 @@ fn chain_undo_command(
                 format!("deadreckon chain show {id}"),
                 Vec::new(),
             )
-            .render_plain(false),
+            .render_plain(!completion_hints_enabled(false)),
         });
     }
     if !no_confirm && io::stdin().is_terminal() {
@@ -2440,7 +2441,7 @@ fn chain_undo_command(
                 format!("deadreckon chain undo {id} --no-confirm"),
                 Vec::new(),
             )
-            .render_plain(false),
+            .render_plain(!completion_hints_enabled(false)),
         });
     }
     append_chain_event(
@@ -2480,7 +2481,7 @@ fn chain_undo_command(
             format!("deadreckon chain show {id}"),
             vec![format!("deadreckon chain redo {id}")],
         )
-        .render_plain(false)
+        .render_plain(!completion_hints_enabled(false))
     );
     Ok(())
 }
@@ -2508,7 +2509,7 @@ fn chain_extend_command(
                 format!("deadreckon chain extend {id} \"...\" --insert-at <N>"),
                 Vec::new(),
             )
-            .render_plain(false),
+            .render_plain(!completion_hints_enabled(false)),
         });
     }
     if let Some(add) = max_spend_add {
@@ -2550,7 +2551,7 @@ fn chain_extend_command(
             format!("deadreckon chain resume {id}"),
             vec![format!("deadreckon chain show {id}")],
         )
-        .render_plain(false)
+        .render_plain(!completion_hints_enabled(false))
     );
     Ok(())
 }
@@ -2595,7 +2596,7 @@ fn chain_redo_command(
                     format!("deadreckon chain show {id}"),
                     Vec::new(),
                 )
-                .render_plain(false),
+                .render_plain(!completion_hints_enabled(false)),
             }
         })? as usize;
     let selected_step = chain.steps.get(index).ok_or_else(|| {
@@ -2615,7 +2616,7 @@ fn chain_redo_command(
                 format!("deadreckon chain show {id}"),
                 Vec::new(),
             )
-            .render_plain(false),
+            .render_plain(!completion_hints_enabled(false)),
         }
     })?;
     if selected_step.status == ChainStepStatus::Applied && !reapply {
@@ -2642,7 +2643,7 @@ fn chain_redo_command(
                 primary,
                 Vec::new(),
             )
-            .render_plain(false),
+            .render_plain(!completion_hints_enabled(false)),
         });
     }
     let step = chain.steps.get_mut(index).expect("validated step index");
@@ -2678,7 +2679,7 @@ fn chain_redo_command(
             format!("deadreckon chain resume {id}"),
             vec![format!("deadreckon chain show {id}")],
         )
-        .render_plain(false)
+        .render_plain(!completion_hints_enabled(false))
     );
     Ok(())
 }
@@ -3069,7 +3070,7 @@ where
             Vec::<(&str, &str)>::new(),
         )
         .expect("chain id resolution surface must have one primary action")
-        .render_plain(false),
+        .render_plain(!completion_hints_enabled(false)),
     }
 }
 
@@ -3092,7 +3093,7 @@ fn chain_missing_scope_surface(scope: Option<&str>) -> CliError {
             Vec::<(&str, &str)>::new(),
         )
         .expect("missing chain scope surface must have one primary action")
-        .render_plain(false),
+        .render_plain(!completion_hints_enabled(false)),
     }
 }
 
@@ -3122,7 +3123,7 @@ fn chain_option_parse_surface(
             Vec::<(&str, &str)>::new(),
         )
         .expect("chain option parse surface must have one primary action")
-        .render_plain(false),
+        .render_plain(!completion_hints_enabled(false)),
     }
 }
 
@@ -3417,7 +3418,7 @@ pub(crate) fn chain_step_dot(status: ChainStepStatus) -> &'static str {
 fn print_chain_paused_footer(paths: &DeadreckonPaths, chain: &Chain) {
     print!(
         "{}",
-        chain_verdict_surface(paths, chain).render_plain(false)
+        chain_verdict_surface(paths, chain).render_plain(!completion_hints_enabled(false))
     );
 }
 

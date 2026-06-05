@@ -95,7 +95,8 @@ pub(crate) fn list_command(
     if entries.is_empty() {
         print!(
             "{}",
-            empty_list_surface(effective_scope.as_deref(), all).render_plain(false)
+            empty_list_surface(effective_scope.as_deref(), all)
+                .render_plain(!crate::completion_hints_enabled(false))
         );
         return Ok(());
     }
@@ -523,7 +524,7 @@ fn invalid_history_regex_error(pattern: &str, parser_error: &str) -> CliError {
             vec![("Secondary", secondary.as_str())],
         )
         .expect("invalid history regex verdict surface must be valid")
-        .render_plain(false),
+        .render_plain(!crate::completion_hints_enabled(false)),
     }
 }
 
@@ -552,7 +553,7 @@ fn invalid_history_limit_error(pattern: &str, value: usize) -> CliError {
             vec![("Secondary", secondary.as_str())],
         )
         .expect("invalid history limit verdict surface must be valid")
-        .render_plain(false),
+        .render_plain(!crate::completion_hints_enabled(false)),
     }
 }
 
@@ -736,7 +737,10 @@ fn print_history_grep_no_matches_surface(
         vec![("Secondary", "deadreckon show <run-id>")],
     )
     .expect("history grep no-match verdict surface must be valid");
-    print!("{}", surface.render_plain(false));
+    print!(
+        "{}",
+        surface.render_plain(!crate::completion_hints_enabled(false))
+    );
 }
 
 fn history_plan_children(paths: &DeadreckonPaths, plan_id: &str) -> Result<BTreeSet<String>> {
@@ -812,7 +816,7 @@ fn invalid_history_since_error(pattern: &str, value: &str) -> CliError {
             vec![("Secondary", secondary.as_str())],
         )
         .expect("invalid history since verdict surface must be valid")
-        .render_plain(false),
+        .render_plain(!crate::completion_hints_enabled(false)),
     }
 }
 
@@ -945,7 +949,10 @@ fn print_library_search_no_matches_surface(query: &str, all: bool) {
         vec![("Secondary", "deadreckon library list --all")],
     )
     .expect("library search no-match verdict surface must be valid");
-    print!("{}", surface.render_plain(false));
+    print!(
+        "{}",
+        surface.render_plain(!crate::completion_hints_enabled(false))
+    );
 }
 
 fn command_literal(value: &str) -> String {
@@ -1065,7 +1072,7 @@ fn invalid_library_date_error(label: &str, value: &str) -> CliError {
             vec![("Secondary", "deadreckon library list --all")],
         )
         .expect("invalid library date verdict surface must be valid")
-        .render_plain(false),
+        .render_plain(!crate::completion_hints_enabled(false)),
     }
 }
 
@@ -1204,7 +1211,10 @@ fn print_empty_library_hint(scope: Option<&str>, all: bool) {
         ],
     )
     .expect("empty library list verdict surface must be valid");
-    print!("{}", surface.render_plain(false));
+    print!(
+        "{}",
+        surface.render_plain(!crate::completion_hints_enabled(false))
+    );
 }
 
 fn print_library_table(entries: &[LibraryEntry], full: bool) {
@@ -1289,4 +1299,29 @@ fn print_library_entry(entry: &LibraryEntry) {
             run_prefix(&manifest.run_id)
         ))
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_hints_suppresses_inspection_doc_chain_hints() {
+        // empty_list_surface carries secondary "next step" actions. The inspection,
+        // doc, and chain completion surfaces all render through the same
+        // VerdictSurface::render_plain, so suppressing here covers the shared
+        // discipline: no_hints drops the Secondary block.
+        let surface = empty_list_surface(None, true);
+        assert!(
+            !surface.secondary_actions.is_empty(),
+            "empty list surface should carry secondary hints to suppress"
+        );
+        let shown = surface.render_plain(false);
+        let hidden = surface.render_plain(true);
+        assert!(shown.contains("\nSecondary\n"), "{shown}");
+        assert!(
+            !hidden.contains("\nSecondary\n"),
+            "no_hints must drop the secondary actions\n{hidden}"
+        );
+    }
 }

@@ -884,7 +884,8 @@ fn print_campaign_completion(
     }
     print!(
         "{}",
-        campaign_verdict_surface(&campaign_for_surface, Some(rollup)).render_plain(no_hints)
+        campaign_verdict_surface(&campaign_for_surface, Some(rollup))
+            .render_plain(!completion_hints_enabled(no_hints))
     );
 }
 

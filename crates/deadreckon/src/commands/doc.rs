@@ -300,7 +300,7 @@ fn print_doc_export_surface(
             vec![("Secondary", secondary.as_str())],
         )
         .expect("doc export verdict surface must have one primary action")
-        .render_plain(false)
+        .render_plain(!completion_hints_enabled(false))
     );
 }
 
@@ -539,7 +539,7 @@ fn print_doc_polish_summary(
             ],
         )
         .expect("doc polish verdict surface must have one primary action")
-        .render_plain(false)
+        .render_plain(!completion_hints_enabled(false))
     );
 }
 

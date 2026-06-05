@@ -545,6 +545,23 @@ fn campaign_cross_sub_conflict_recommends_campaign_repair_once() {
 }
 
 #[test]
+fn no_hints_suppresses_campaign_completion_hints() {
+    let (campaign, rollup) = campaign_with_rollup();
+    let surface = campaign_verdict_surface(&campaign, Some(&rollup));
+    assert!(
+        !surface.secondary_actions.is_empty(),
+        "campaign surface should carry secondary hints to suppress"
+    );
+    let shown = surface.render_plain(false);
+    let hidden = surface.render_plain(true);
+    assert!(shown.contains("\nSecondary\n"), "{shown}");
+    assert!(
+        !hidden.contains("\nSecondary\n"),
+        "no_hints must drop the campaign completion secondary actions\n{hidden}"
+    );
+}
+
+#[test]
 fn campaign_completed_surface_recommends_apply_or_finish_once() {
     let (mut campaign, rollup) = campaign_with_rollup();
     campaign.status = deadreckon_core::campaign::CampaignStatus::Merged;

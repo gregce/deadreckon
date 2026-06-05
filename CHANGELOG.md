@@ -15,6 +15,10 @@
   padding) and routed the provider/library id columns through it, aligned the
   provider id/symbol column order across full and summary modes, and measured the
   run-list pad helpers by display width.
+- Honored `--no-hints` / `DEADRECKON_HINTS=0` everywhere: fixed the campaign
+  completion surface that bypassed the hint toggle, and routed the
+  inspection/doc/chain completion surfaces through `completion_hints_enabled`
+  so the toggle is respected uniformly.
 
 ## Release Trust - 2026-06-02
 
