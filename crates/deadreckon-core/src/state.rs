@@ -364,7 +364,11 @@ pub fn find_run_state_path(paths: &DeadreckonPaths, run_id: &str) -> Result<Path
         return Err(DeadreckonError::NotFound(format!("run {run_id}")));
     }
     let mut prefix_matches = Vec::new();
+    // Bound the walk to the runstate layout depth (run dir -> state.json), matching
+    // list_runs. Without this, resolving one run descends into sibling runs' worktree
+    // and artifact subtrees (thousands of files) on every attach tick.
     for entry in WalkDir::new(&root)
+        .max_depth(4)
         .into_iter()
         .filter_map(std::result::Result::ok)
     {

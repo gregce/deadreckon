@@ -1536,10 +1536,7 @@ fn plan_child_accounting_lines(state: &deadreckon_core::PipelineState) -> Vec<St
 }
 
 fn latest_trace_line(state: &deadreckon_core::PipelineState) -> Option<String> {
-    let trace = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))
-        .unwrap_or_default()
-        .into_iter()
-        .last()?;
+    let trace = read_last_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
     Some(format!(
         "latest turn {} {} {}",
         trace.turn,

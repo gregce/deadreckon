@@ -7,6 +7,7 @@
     )
 )]
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
 use std::fs;
@@ -11071,7 +11072,7 @@ struct AttachLive {
     working_dir_exists: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct AttachLiveInventory {
     file_count: usize,
     total_bytes: u64,
@@ -11353,7 +11354,50 @@ fn collect_attach_live_with_provider_activity(
     }
 }
 
+const ATTACH_LIVE_INVENTORY_FRESHNESS: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct AttachLiveInventoryCacheEntry {
+    inventory: AttachLiveInventory,
+    walked_at: Option<Instant>,
+}
+
 fn attach_live_inventory(root: &Path) -> AttachLiveInventory {
+    // The attach draw path calls this every idle tick (~4-5 fps), and each call
+    // recursively walks + stats + sorts the entire working_dir. Cache the result
+    // per working_dir path and reuse it while it is fresh; the walk is equivalent
+    // between refreshes because the display already truncates to a fixed count.
+    thread_local! {
+        static ATTACH_LIVE_INVENTORY_CACHE: RefCell<BTreeMap<PathBuf, AttachLiveInventoryCacheEntry>> =
+            const { RefCell::new(BTreeMap::new()) };
+    }
+    let now = Instant::now();
+    let cached = ATTACH_LIVE_INVENTORY_CACHE.with(|cache| {
+        cache.borrow().get(root).and_then(|entry| {
+            entry.walked_at.and_then(|walked_at| {
+                (now.duration_since(walked_at) < ATTACH_LIVE_INVENTORY_FRESHNESS)
+                    .then(|| entry.inventory.clone())
+            })
+        })
+    });
+    if let Some(inventory) = cached {
+        return inventory;
+    }
+
+    let inventory = attach_live_inventory_walk(root);
+    ATTACH_LIVE_INVENTORY_CACHE.with(|cache| {
+        cache.borrow_mut().insert(
+            root.to_path_buf(),
+            AttachLiveInventoryCacheEntry {
+                inventory: inventory.clone(),
+                walked_at: Some(now),
+            },
+        );
+    });
+    inventory
+}
+
+fn attach_live_inventory_walk(root: &Path) -> AttachLiveInventory {
     let mut inventory = AttachLiveInventory::default();
     if !root.exists() {
         return inventory;
@@ -11596,23 +11640,16 @@ fn path_has_component(path: &Path, component: &str) -> bool {
         .any(|part| part.as_os_str().to_string_lossy() == component)
 }
 
+const LIVE_PID_COMMAND_FRESHNESS: Duration = Duration::from_secs(1);
+
 fn live_pid(pid: u32) -> LivePid {
+    // `pid_is_alive` is a non-forking liveness check and runs every tick so that
+    // process death stays prompt. Only the `ps`-derived command detail (which
+    // forks a subprocess) is throttled: refresh it at most once per
+    // LIVE_PID_COMMAND_FRESHNESS per pid and reuse the cached string otherwise.
     let alive = deadreckon_core::pid_is_alive(pid);
     let command = if alive {
-        std::process::Command::new("ps")
-            .args(["-o", "stat=,etime=,command=", "-p", &pid.to_string()])
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    String::from_utf8(output.stdout).ok()
-                } else {
-                    None
-                }
-            })
-            .map(|raw| one_line(raw.trim(), 110))
-            .filter(|line| !line.is_empty())
-            .unwrap_or_else(|| "alive".to_string())
+        live_pid_command(pid)
     } else {
         "not running".to_string()
     };
@@ -11621,6 +11658,41 @@ fn live_pid(pid: u32) -> LivePid {
         alive,
         command,
     }
+}
+
+fn live_pid_command(pid: u32) -> String {
+    thread_local! {
+        static LIVE_PID_COMMAND_CACHE: RefCell<std::collections::HashMap<u32, (String, Instant)>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    let now = Instant::now();
+    let cached = LIVE_PID_COMMAND_CACHE.with(|cache| {
+        cache.borrow().get(&pid).and_then(|(command, fetched_at)| {
+            (now.duration_since(*fetched_at) < LIVE_PID_COMMAND_FRESHNESS).then(|| command.clone())
+        })
+    });
+    if let Some(command) = cached {
+        return command;
+    }
+
+    let command = std::process::Command::new("ps")
+        .args(["-o", "stat=,etime=,command=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|raw| one_line(raw.trim(), 110))
+        .filter(|line| !line.is_empty())
+        .unwrap_or_else(|| "alive".to_string());
+    LIVE_PID_COMMAND_CACHE.with(|cache| {
+        cache.borrow_mut().insert(pid, (command.clone(), now));
+    });
+    command
 }
 
 #[derive(Debug, Default, Clone)]
@@ -13599,6 +13671,31 @@ fn read_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect::<Vec<T>>())
+}
+
+/// The last successfully-parsing row of a JSONL file, read from the end.
+/// Equivalent to `read_jsonl(path)?.into_iter().last()` but without reading or
+/// parsing the whole file — used on the per-frame attach draw path where only
+/// the latest row matters.
+fn read_last_jsonl<T: DeserializeOwned>(path: &std::path::Path) -> Option<T> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    // A JSONL row is small; the final 64 KiB always contains the last complete
+    // line. Scanning from the end finds the most recent line that parses (a
+    // partial trailing write is skipped, matching read_jsonl's filter_map).
+    let block = len.min(64 * 1024);
+    file.seek(SeekFrom::Start(len - block)).ok()?;
+    let mut bytes = Vec::with_capacity(block as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| serde_json::from_str::<T>(line).ok())
 }
 
 fn read_plan_events_lossy(paths: &DeadreckonPaths, plan_id: &str) -> Vec<PlanEvent> {

@@ -581,27 +581,9 @@ async fn attach_plan_tui(
                         Utc::now(),
                     ));
                     tick.record_since(AttachLoopStage::ProviderNarrativeRefresh, stage_started);
-                    let stage_started = Instant::now();
-                    terminal.draw(|frame| {
-                        render_plan_attach(
-                            frame,
-                            paths,
-                            &plan,
-                            &PlanAttachRenderState {
-                                messages: &messages,
-                                plan_events: &plan_events,
-                                feed_events: &feed_events,
-                                selected,
-                                show_hints,
-                                view,
-                                visual,
-                                campaign_parent: parent_campaign.as_ref(),
-                                narrative_notice: narrative_notice.as_deref(),
-                                narrative_projection: narrative_projection.as_ref(),
-                            },
-                        )
-                    })?;
-                    tick.record_since(AttachLoopStage::Draw, stage_started);
+                    // No redundant immediate redraw: the loop redraws at the top of the
+                    // next iteration (which begins right after input handling), and the
+                    // background refresh job invalidates the narrative cache on completion.
                 }
                 Event::Key(key)
                     if matches!(
@@ -741,6 +723,13 @@ async fn attach_tui_with_parent(
         tick.record_since(AttachLoopStage::EventFeed, stage_started);
         let run_event_refresh = run_narrative_refresh_trigger(&new_events);
         events.extend(new_events);
+        // Bound the in-memory activity history like the plan loop does (attach.rs:462):
+        // the Activity panel only shows a window, and an unbounded Vec makes every
+        // frame's line-build O(run length).
+        if events.len() > 1_000 {
+            let drain = events.len().saturating_sub(1_000);
+            events.drain(0..drain);
+        }
         let stage_started = Instant::now();
         let provider_activity = provider_activity_cache.refresh(&state);
         let live = collect_attach_live_with_provider_activity(&state, provider_activity);
@@ -856,11 +845,8 @@ async fn attach_tui_with_parent(
                         AttachLoopStage::ProviderNarrativeRefresh,
                         provider_stage_started,
                     );
-                    let stage_started = Instant::now();
-                    terminal.draw(|frame| {
-                        render_attach(frame, &state, spend, traces, &events, &live, &tui_state)
-                    })?;
-                    tick.record_since(AttachLoopStage::Draw, stage_started);
+                    // No redundant immediate redraw: the loop redraws at the top of the
+                    // next iteration; the background refresh job invalidates the cache.
                 }
                 Event::Key(key)
                     if key.code == KeyCode::Char('c')
