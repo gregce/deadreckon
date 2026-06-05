@@ -85,22 +85,13 @@ impl AttachTuiState {
         counts: AttachPanelCounts,
         rows: AttachPanelRows,
     ) {
-        match key.code {
-            KeyCode::Tab => self.focused_panel = self.focused_panel.next(),
-            KeyCode::BackTab => self.focused_panel = self.focused_panel.previous(),
-            KeyCode::Up | KeyCode::Char('k') => self.scroll_focused(-1, counts, rows),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll_focused(1, counts, rows),
-            KeyCode::PageUp => {
-                self.scroll_focused(-page_delta(self.focused_panel, rows), counts, rows)
-            }
-            KeyCode::PageDown => {
-                self.scroll_focused(page_delta(self.focused_panel, rows), counts, rows)
-            }
-            KeyCode::Home | KeyCode::Char('g') => self.set_focused_scroll(0),
-            KeyCode::End | KeyCode::Char('G') => {
-                self.set_focused_scroll(max_panel_scroll(self.focused_panel, counts, rows))
-            }
-            _ => {}
+        {
+            let mut nav = RunNav {
+                state: self,
+                counts,
+                rows,
+            };
+            crate::tui::navigation::dispatch_navigation(&mut nav, key);
         }
         self.clamp(counts, rows);
     }
@@ -209,6 +200,44 @@ impl AttachTuiState {
             AttachPanel::Files => self.files_scroll = offset,
             AttachPanel::Processes => self.processes_scroll = offset,
         }
+    }
+}
+
+/// Drives the run panel's multi-panel scroll model through the shared
+/// [`dispatch_navigation`](crate::tui::navigation::dispatch_navigation). The run
+/// panel is the reference; these hooks reproduce its original `handle_key`
+/// semantics exactly (same methods, same order).
+struct RunNav<'a> {
+    state: &'a mut AttachTuiState,
+    counts: AttachPanelCounts,
+    rows: AttachPanelRows,
+}
+
+impl crate::tui::navigation::NavigableSurface for RunNav<'_> {
+    fn focus_next(&mut self) {
+        self.state.focused_panel = self.state.focused_panel.next();
+    }
+
+    fn focus_previous(&mut self) {
+        self.state.focused_panel = self.state.focused_panel.previous();
+    }
+
+    fn scroll_lines(&mut self, delta: isize) {
+        self.state.scroll_focused(delta, self.counts, self.rows);
+    }
+
+    fn scroll_page(&mut self, direction: isize) {
+        let delta = direction.signum() * page_delta(self.state.focused_panel, self.rows);
+        self.state.scroll_focused(delta, self.counts, self.rows);
+    }
+
+    fn scroll_to_start(&mut self) {
+        self.state.set_focused_scroll(0);
+    }
+
+    fn scroll_to_end(&mut self) {
+        let max = max_panel_scroll(self.state.focused_panel, self.counts, self.rows);
+        self.state.set_focused_scroll(max);
     }
 }
 
@@ -396,5 +425,69 @@ fn panel_rows(panel: AttachPanel, rows: AttachPanelRows) -> usize {
         AttachPanel::Activity => rows.activity,
         AttachPanel::Files => rows.files,
         AttachPanel::Processes => rows.processes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    const COUNTS: AttachPanelCounts = AttachPanelCounts {
+        activity: 100,
+        files: 10,
+        processes: 5,
+    };
+    const ROWS: AttachPanelRows = AttachPanelRows {
+        activity: 20,
+        files: 5,
+        processes: 3,
+    };
+
+    #[test]
+    fn run_panel_key_handling_unchanged_after_extraction() {
+        let mut s = AttachTuiState::default();
+
+        // Down / j scroll the focused (activity) panel; Up / k reverse.
+        s.handle_key(key(KeyCode::Down), COUNTS, ROWS);
+        assert_eq!(s.activity_scroll, 1);
+        s.handle_key(key(KeyCode::Char('j')), COUNTS, ROWS);
+        assert_eq!(s.activity_scroll, 2);
+        s.handle_key(key(KeyCode::Up), COUNTS, ROWS);
+        assert_eq!(s.activity_scroll, 1);
+
+        // End / G jump to the bottom; Home / g back to the top.
+        s.handle_key(key(KeyCode::End), COUNTS, ROWS);
+        assert_eq!(
+            s.activity_scroll,
+            max_panel_scroll(AttachPanel::Activity, COUNTS, ROWS)
+        );
+        s.handle_key(key(KeyCode::Home), COUNTS, ROWS);
+        assert_eq!(s.activity_scroll, 0);
+
+        // PageDown advances by one page; PageUp returns.
+        s.handle_key(key(KeyCode::PageDown), COUNTS, ROWS);
+        assert_eq!(
+            s.activity_scroll,
+            page_delta(AttachPanel::Activity, ROWS) as usize
+        );
+        s.handle_key(key(KeyCode::PageUp), COUNTS, ROWS);
+        assert_eq!(s.activity_scroll, 0);
+
+        // Tab / BackTab cycle the focused panel.
+        assert_eq!(s.focused_panel, AttachPanel::Activity);
+        s.handle_key(key(KeyCode::Tab), COUNTS, ROWS);
+        assert_eq!(s.focused_panel, AttachPanel::Files);
+        s.handle_key(key(KeyCode::BackTab), COUNTS, ROWS);
+        assert_eq!(s.focused_panel, AttachPanel::Activity);
+
+        // A key the shared core does not own is a no-op.
+        s.handle_key(key(KeyCode::Char('z')), COUNTS, ROWS);
+        assert_eq!(s.activity_scroll, 0);
+        assert_eq!(s.focused_panel, AttachPanel::Activity);
     }
 }

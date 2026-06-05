@@ -1,4 +1,5 @@
 mod attach_state;
+pub(crate) mod navigation;
 mod render;
 
 pub(crate) use attach_state::{
