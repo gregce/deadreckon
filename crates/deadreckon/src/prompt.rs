@@ -422,6 +422,45 @@ fn parse_confirm_answer(answer: &str, default_yes: bool) -> Option<bool> {
     }
 }
 
+/// Prompt for a number in `range`, re-prompting (never erroring) on empty input
+/// (which takes `default`), non-numeric input, or an out-of-range value. Use this
+/// for count-style prompts instead of `open(...).parse()?`, which aborts the whole
+/// command on a typo.
+pub(crate) fn ask_number(
+    label: &str,
+    range: std::ops::RangeInclusive<usize>,
+    default: usize,
+) -> Result<usize> {
+    loop {
+        let answer = open(&format!("{label} [{default}]: "), None)?;
+        if let Some(value) = parse_number_in_range(&answer, &range, default) {
+            return Ok(value);
+        }
+        println!(
+            "Please enter a number from {} to {}.",
+            range.start(),
+            range.end()
+        );
+    }
+}
+
+fn parse_number_in_range(
+    answer: &str,
+    range: &std::ops::RangeInclusive<usize>,
+    default: usize,
+) -> Option<usize> {
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
+        return Some(default);
+    }
+    let value = trimmed.parse::<usize>().ok()?;
+    if range.contains(&value) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -494,6 +533,30 @@ mod tests {
         assert!(menu_fits(5, 24), "a short menu fits");
         assert!(!menu_fits(30, 24), "a 30-choice menu must fall back");
         assert!(!menu_fits(21, 24), "21 choices + chrome exceeds 24 rows");
+    }
+
+    #[test]
+    fn ask_number_reprompts_on_non_numeric_and_out_of_range() {
+        let range = 2..=6;
+        assert_eq!(super::parse_number_in_range("", &range, 3), Some(3));
+        assert_eq!(super::parse_number_in_range("4", &range, 3), Some(4));
+        assert_eq!(super::parse_number_in_range("9", &range, 3), None);
+        assert_eq!(super::parse_number_in_range("0", &range, 3), None);
+        assert_eq!(super::parse_number_in_range("x", &range, 3), None);
+    }
+
+    #[test]
+    fn campaign_count_prompt_loops_instead_of_exiting() {
+        // The campaign/orchestrate count prompts route through ask_number (2..=6):
+        // bad input returns None so the prompt re-prompts, where the old
+        // parse::<u8>()? aborted the whole command.
+        let range = 2..=6;
+        assert_eq!(
+            super::parse_number_in_range("not-a-number", &range, 4),
+            None
+        );
+        assert_eq!(super::parse_number_in_range("99", &range, 4), None);
+        assert_eq!(super::parse_number_in_range("3", &range, 4), Some(3));
     }
 
     #[test]

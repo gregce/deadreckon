@@ -33,6 +33,9 @@
   menus fall back to line mode instead of corrupting the screen, and the footer
   advertises the available keys. Key dispatch is factored into a pure, unit-tested
   `menu_step`.
+- Added `prompt::ask_number(range)` that re-prompts on empty, non-numeric, or
+  out-of-range input, and routed the campaign and orchestrate child-count prompts
+  through it so a typo re-prompts instead of aborting the whole command.
 
 ## Release Trust - 2026-06-02
 

@@ -429,15 +429,9 @@ fn prompt_campaign_preflight_actions(
                 print_campaign_preflight(campaign, sandbox);
             }
             "count" => {
-                let answer =
-                    prompt::open("sub-orchestrator count: ", Some(&campaign.n.to_string()))?;
-                let count = answer.trim().parse::<u8>().map_err(|_| {
-                    CliError::Core(deadreckon_core::user_error(
-                        &format!("campaign count is not a number: {answer}"),
-                        "enter a value from 2 through 6",
-                    ))
-                })?;
-                validate_task_count(usize::from(count)).map_err(CliError::Core)?;
+                // Re-prompt on bad input instead of aborting the preflight.
+                let count =
+                    prompt::ask_number("sub-orchestrator count", 2..=6, campaign.n as usize)? as u8;
                 return Ok(CampaignPreflightAction::ChangeCount(count));
             }
             _ => {

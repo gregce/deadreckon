@@ -353,18 +353,9 @@ fn prompt_orchestration_mode(default: CliPlanMode) -> Result<CliPlanMode> {
 }
 
 fn prompt_child_count(default: u8) -> Result<u8> {
-    let answer = prompt::open(&format!("children [{default}]: "), None)?;
-    if answer.trim().is_empty() {
-        return Ok(default);
-    }
-    let n = answer.trim().parse::<u8>().map_err(|_| {
-        CliError::Core(deadreckon_core::user_error(
-            &format!("child count is not a number: {answer}"),
-            "enter a value from 2 through 6",
-        ))
-    })?;
-    validate_task_count(usize::from(n)).map_err(CliError::Core)?;
-    Ok(n)
+    // Re-prompt on bad input instead of aborting the whole command.
+    let n = prompt::ask_number("children", 2..=6, usize::from(default))?;
+    Ok(n as u8)
 }
 
 fn prompt_child_provider_overrides(n: u8) -> Result<Vec<String>> {
