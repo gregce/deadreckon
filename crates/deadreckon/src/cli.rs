@@ -45,6 +45,8 @@ Subcommands:
   deadreckon config set defaults.max_spend 15
   deadreckon config provider
   deadreckon config provider cli:codex
+  deadreckon config remove-provider anthropic
+  deadreckon config remove-provider
   deadreckon config model
   deadreckon config model gpt-5.1-codex --provider cli:codex
 
@@ -2163,6 +2165,15 @@ pub(crate) enum ConfigCommand {
     #[command(about = "Show or set the default provider route")]
     Provider {
         #[arg(help = "Provider route to make default, for example cli:codex")]
+        provider: Option<String>,
+    },
+    #[command(
+        name = "remove-provider",
+        visible_alias = "rm-provider",
+        about = "Remove a provider route from configured defaults and fallback"
+    )]
+    RemoveProvider {
+        #[arg(help = "Provider route to remove; omit to choose from configured routes")]
         provider: Option<String>,
     },
     #[command(about = "Show or set the model for a provider route")]

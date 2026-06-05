@@ -5,6 +5,7 @@
 )]
 
 use std::fs;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -702,6 +703,100 @@ api_key = "anthropic-key"
     let stdout = stdout(&show);
     assert!(stdout.contains("* anthropic"), "{stdout}");
     assert!(!stdout.contains("* openai"), "{stdout}");
+}
+
+#[test]
+fn config_remove_provider_removes_defaults_fallback_and_provider_table() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(
+        paths.config_path(),
+        r#"
+default_provider = "anthropic"
+fallback = ["anthropic", "openai", "cli:codex"]
+
+[defaults]
+provider = "anthropic"
+doc_provider = "anthropic"
+
+[providers.anthropic]
+api_key_env = "ANTHROPIC_API_KEY"
+
+[providers.openai]
+api_key_env = "OPENAI_API_KEY"
+"#,
+    )
+    .expect("config");
+
+    let output = deadreckon(&paths)
+        .arg("config")
+        .arg("remove-provider")
+        .arg("anthropic")
+        .output()
+        .expect("remove provider");
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("completed config provider"), "{stdout}");
+    assert!(stdout.contains("new default: cli:codex"), "{stdout}");
+    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Recommended\ndeadreckon config provider"),
+        "{stdout}"
+    );
+
+    let raw = fs::read_to_string(paths.config_path()).expect("config");
+    assert!(!raw.contains("anthropic"), "{raw}");
+    assert!(raw.contains("default_provider = \"cli:codex\""), "{raw}");
+    assert!(raw.contains("provider = \"cli:codex\""), "{raw}");
+    assert!(raw.contains("doc_provider = \"cli:codex\""), "{raw}");
+    assert!(raw.contains("\"openai\""), "{raw}");
+    assert!(raw.contains("\"cli:codex\""), "{raw}");
+    assert!(raw.contains("[providers.openai]"), "{raw}");
+}
+
+#[test]
+fn config_remove_provider_without_arg_prompts_configured_provider_choices() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(
+        paths.config_path(),
+        r#"
+default_provider = "anthropic"
+fallback = ["anthropic", "cli:codex"]
+
+[defaults]
+provider = "anthropic"
+"#,
+    )
+    .expect("config");
+
+    let mut child = deadreckon(&paths)
+        .env("DEADRECKON_PROMPT_LINE_MODE", "1")
+        .arg("config")
+        .arg("remove-provider")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("remove provider prompt");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"1\n")
+        .expect("write answer");
+    let output = child.wait_with_output().expect("wait");
+    assert_success(&output);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(text.contains("Remove provider"), "{text}");
+    assert!(text.contains("[1] anthropic"), "{text}");
+    assert!(text.contains("completed config provider"), "{text}");
+
+    let raw = fs::read_to_string(paths.config_path()).expect("config");
+    assert!(!raw.contains("anthropic"), "{raw}");
+    assert!(raw.contains("default_provider = \"cli:codex\""), "{raw}");
 }
 
 #[test]

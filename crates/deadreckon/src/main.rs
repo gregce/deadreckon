@@ -2217,6 +2217,23 @@ fn config_command(command: ConfigCommand) -> Result<()> {
             }
             None => print_provider_selection(&paths, None)?,
         },
+        ConfigCommand::RemoveProvider { provider } => {
+            fs::create_dir_all(paths.home())?;
+            let mut root = load_config_value(&paths)?;
+            let Some(provider) = resolve_config_provider_removal_target(&paths, &root, provider)?
+            else {
+                return Ok(());
+            };
+            let removal = remove_config_provider(&paths, &mut root, &provider)?;
+            if removal.changed() {
+                fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
+            }
+            print!(
+                "{}",
+                config_remove_provider_surface(&paths, &removal)
+                    .render_plain(!completion_hints_enabled(false))
+            );
+        }
         ConfigCommand::Model { model, provider } => match model {
             Some(model) => {
                 fs::create_dir_all(paths.home())?;
@@ -2250,6 +2267,238 @@ fn config_provider_setup_selection(
     let registry = ProviderRegistry::with_overrides(paths.home())?;
     setup::select_provider_setup(&paths.config_path(), &registry, request)
         .map_err(|refusal| config_setup_refusal_surface_error(paths, "provider", provider, refusal))
+}
+
+#[derive(Debug)]
+struct ConfigProviderRemoval {
+    provider: String,
+    removed_default_provider: bool,
+    removed_defaults_provider: bool,
+    removed_doc_provider: bool,
+    removed_fallback_entries: usize,
+    removed_provider_table: bool,
+    promoted_provider: Option<String>,
+}
+
+impl ConfigProviderRemoval {
+    fn changed(&self) -> bool {
+        self.removed_default_provider
+            || self.removed_defaults_provider
+            || self.removed_doc_provider
+            || self.removed_fallback_entries > 0
+            || self.removed_provider_table
+            || self.promoted_provider.is_some()
+    }
+
+    fn removed_locations(&self) -> Vec<String> {
+        let mut locations = Vec::new();
+        if self.removed_default_provider {
+            locations.push("default_provider".to_string());
+        }
+        if self.removed_defaults_provider {
+            locations.push("defaults.provider".to_string());
+        }
+        if self.removed_doc_provider {
+            locations.push("defaults.doc_provider".to_string());
+        }
+        if self.removed_fallback_entries > 0 {
+            locations.push(format!(
+                "fallback entries={}",
+                self.removed_fallback_entries
+            ));
+        }
+        if self.removed_provider_table {
+            locations.push("providers table".to_string());
+        }
+        locations
+    }
+}
+
+fn resolve_config_provider_removal_target(
+    paths: &DeadreckonPaths,
+    root: &toml::Value,
+    provider: Option<String>,
+) -> Result<Option<String>> {
+    if let Some(provider) = provider {
+        return Ok(Some(provider));
+    }
+    let ids = configured_provider_ids_from_root(root);
+    if ids.is_empty() {
+        print!(
+            "{}",
+            config_remove_provider_empty_surface(paths)
+                .render_plain(!completion_hints_enabled(false))
+        );
+        return Ok(None);
+    }
+    let mut choices = ids
+        .iter()
+        .map(|id| {
+            prompt::SelectChoice::with_detail(
+                id.clone(),
+                id.clone(),
+                config_provider_location_labels(root, id).join(", "),
+            )
+        })
+        .collect::<Vec<_>>();
+    choices.push(prompt::SelectChoice::new("cancel", "Cancel"));
+    let choice = prompt::select_one(&prompt::SelectPrompt {
+        title: "Remove provider".to_string(),
+        help: Some(
+            "Choose a configured route to remove from defaults, fallback, and local provider config."
+                .to_string(),
+        ),
+        choices,
+        default_index: 0,
+    })?;
+    if choice.id == "cancel" {
+        println!("cancelled");
+        return Ok(None);
+    }
+    Ok(Some(choice.id))
+}
+
+fn remove_config_provider(
+    paths: &DeadreckonPaths,
+    root: &mut toml::Value,
+    provider: &str,
+) -> Result<ConfigProviderRemoval> {
+    let removed_default_provider = remove_toml_path_if_string(root, "default_provider", provider);
+    let removed_defaults_provider = remove_toml_path_if_string(root, "defaults.provider", provider);
+    let removed_doc_provider = remove_toml_path_if_string(root, "defaults.doc_provider", provider);
+    let removed_fallback_entries = remove_provider_from_fallback(root, provider);
+    let removed_provider_table = remove_provider_table(root, provider);
+    let needs_promotion =
+        removed_default_provider || removed_defaults_provider || removed_doc_provider;
+    let promoted_provider = if needs_promotion {
+        let promoted = choose_config_provider_replacement(paths, root, provider)?;
+        if let Some(promoted) = promoted.as_deref() {
+            if removed_default_provider || removed_defaults_provider {
+                set_toml_path(
+                    root,
+                    "default_provider",
+                    toml::Value::String(promoted.to_string()),
+                );
+                set_toml_path(
+                    root,
+                    "defaults.provider",
+                    toml::Value::String(promoted.to_string()),
+                );
+            }
+            if removed_doc_provider {
+                set_toml_path(
+                    root,
+                    "defaults.doc_provider",
+                    toml::Value::String(promoted.to_string()),
+                );
+            }
+        }
+        promoted
+    } else {
+        None
+    };
+
+    Ok(ConfigProviderRemoval {
+        provider: provider.to_string(),
+        removed_default_provider,
+        removed_defaults_provider,
+        removed_doc_provider,
+        removed_fallback_entries,
+        removed_provider_table,
+        promoted_provider,
+    })
+}
+
+fn choose_config_provider_replacement(
+    paths: &DeadreckonPaths,
+    root: &toml::Value,
+    removed_provider: &str,
+) -> Result<Option<String>> {
+    let mut candidates = configured_provider_ids_from_root(root)
+        .into_iter()
+        .filter(|id| id != removed_provider)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    candidates.sort_by_key(|id| config_provider_replacement_score(&registry, id));
+    Ok(candidates.into_iter().next())
+}
+
+fn config_provider_replacement_score(registry: &ProviderRegistry, id: &str) -> u8 {
+    let ready_cli = registry.get(id).is_some_and(|descriptor| {
+        descriptor.kind == DescriptorKind::Cli
+            && descriptor
+                .default_binary
+                .as_deref()
+                .is_some_and(command_exists)
+    });
+    if ready_cli {
+        return 0;
+    }
+    if id.starts_with("cli:") {
+        return 1;
+    }
+    if id == "smoke" || id.starts_with("smoke:") {
+        return 2;
+    }
+    3
+}
+
+fn configured_provider_ids_from_root(root: &toml::Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    push_toml_string_id(root, "default_provider", &mut ids);
+    push_toml_string_id(root, "defaults.provider", &mut ids);
+    push_toml_string_id(root, "defaults.doc_provider", &mut ids);
+    if let Some(fallback) = get_toml_path(root, "fallback").and_then(toml::Value::as_array) {
+        for item in fallback {
+            if let Some(provider) = item.as_str() {
+                push_unique(&mut ids, provider.to_string());
+            }
+        }
+    }
+    if let Some(providers) = get_toml_path(root, "providers").and_then(toml::Value::as_table) {
+        for provider in providers.keys() {
+            push_unique(&mut ids, provider.clone());
+        }
+    }
+    ids
+}
+
+fn push_toml_string_id(root: &toml::Value, key: &str, ids: &mut Vec<String>) {
+    if let Some(value) = get_toml_path(root, key).and_then(toml::Value::as_str) {
+        push_unique(ids, value.to_string());
+    }
+}
+
+fn config_provider_location_labels(root: &toml::Value, provider: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    if toml_path_string_equals(root, "default_provider", provider) {
+        labels.push("default".to_string());
+    }
+    if toml_path_string_equals(root, "defaults.provider", provider) {
+        labels.push("run default".to_string());
+    }
+    if toml_path_string_equals(root, "defaults.doc_provider", provider) {
+        labels.push("doc default".to_string());
+    }
+    if get_toml_path(root, "fallback")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(provider)))
+    {
+        labels.push("fallback".to_string());
+    }
+    if get_toml_path(root, "providers")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|providers| providers.contains_key(provider))
+    {
+        labels.push("local config".to_string());
+    }
+    if labels.is_empty() {
+        labels.push("configured route".to_string());
+    }
+    labels
 }
 
 fn config_setup_refusal_surface_error(
@@ -2394,6 +2643,88 @@ fn config_set_surface(paths: &DeadreckonPaths, key: &str, value: &str) -> Verdic
         vec![("Secondary", "deadreckon doctor")],
     )
     .expect("config set verdict surface must be valid")
+}
+
+fn config_remove_provider_surface(
+    paths: &DeadreckonPaths,
+    removal: &ConfigProviderRemoval,
+) -> VerdictSurface {
+    let changed = removal.changed();
+    let primary = if changed {
+        "deadreckon config provider"
+    } else {
+        "deadreckon config remove-provider"
+    };
+    let kind = if changed {
+        VerdictKind::Completed
+    } else {
+        VerdictKind::Noop
+    };
+    let mut evidence = vec![
+        (
+            "config".to_string(),
+            paths.config_path().display().to_string(),
+        ),
+        ("provider".to_string(), removal.provider.clone()),
+    ];
+    let removed = removal.removed_locations();
+    evidence.push((
+        "removed".to_string(),
+        if removed.is_empty() {
+            "none".to_string()
+        } else {
+            removed.join(", ")
+        },
+    ));
+    if let Some(promoted) = removal.promoted_provider.as_deref() {
+        evidence.push(("new default".to_string(), promoted.to_string()));
+    }
+    VerdictSurface::try_new(
+        kind,
+        "config",
+        Some("provider"),
+        ExplanationPanel::new(
+            if changed {
+                format!(
+                    "DeadReckon removed {} from configured provider selection.",
+                    removal.provider
+                )
+            } else {
+                format!(
+                    "DeadReckon found no configured reference to {}.",
+                    removal.provider
+                )
+            },
+            if changed {
+                "Built-in provider routes still appear in `providers list --all`; this only changes your local defaults, fallback chain, and local provider table."
+            } else {
+                "The provider registry is built in, but this route was not selected by the current local config."
+            },
+            evidence,
+        ),
+        vec![("Recommended", primary)],
+        vec![
+            ("Secondary", "deadreckon providers list"),
+            ("Secondary", "deadreckon start \"goal\""),
+        ],
+    )
+    .expect("config remove-provider surface must be valid")
+}
+
+fn config_remove_provider_empty_surface(paths: &DeadreckonPaths) -> VerdictSurface {
+    VerdictSurface::try_new(
+        VerdictKind::Noop,
+        "config",
+        Some("provider"),
+        ExplanationPanel::new(
+            "DeadReckon found no configured provider routes to remove.",
+            "Built-in provider routes are still available in the registry; remove-provider only edits local config selections.",
+            vec![("config".to_string(), paths.config_path().display().to_string())],
+        ),
+        vec![("Recommended", "deadreckon config provider cli:codex")],
+        vec![("Secondary", "deadreckon providers list --all")],
+    )
+    .expect("config remove-provider empty surface must be valid")
 }
 
 fn config_provider_surface(
@@ -7932,6 +8263,74 @@ fn get_toml_path<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value
     let mut cursor = root;
     for part in key.split('.') {
         cursor = cursor.get(part)?;
+    }
+    Some(cursor)
+}
+
+fn toml_path_string_equals(root: &toml::Value, key: &str, expected: &str) -> bool {
+    get_toml_path(root, key).and_then(toml::Value::as_str) == Some(expected)
+}
+
+fn remove_toml_path(root: &mut toml::Value, key: &str) -> bool {
+    let parts = key.split('.').collect::<Vec<_>>();
+    let Some((last, parents)) = parts.split_last() else {
+        return false;
+    };
+    let mut cursor = root;
+    for part in parents {
+        let Some(next) = cursor.as_table_mut().and_then(|table| table.get_mut(*part)) else {
+            return false;
+        };
+        cursor = next;
+    }
+    cursor
+        .as_table_mut()
+        .and_then(|table| table.remove(*last))
+        .is_some()
+}
+
+fn remove_toml_path_if_string(root: &mut toml::Value, key: &str, expected: &str) -> bool {
+    if !toml_path_string_equals(root, key, expected) {
+        return false;
+    }
+    remove_toml_path(root, key)
+}
+
+fn remove_provider_from_fallback(root: &mut toml::Value, provider: &str) -> usize {
+    let Some(fallback) = get_toml_path_mut(root, "fallback").and_then(toml::Value::as_array_mut)
+    else {
+        return 0;
+    };
+    let before = fallback.len();
+    fallback.retain(|item| item.as_str() != Some(provider));
+    let removed = before.saturating_sub(fallback.len());
+    if fallback.is_empty() {
+        remove_toml_path(root, "fallback");
+    }
+    removed
+}
+
+fn remove_provider_table(root: &mut toml::Value, provider: &str) -> bool {
+    let Some(root_table) = root.as_table_mut() else {
+        return false;
+    };
+    let Some(providers) = root_table
+        .get_mut("providers")
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return false;
+    };
+    let removed = providers.remove(provider).is_some();
+    if providers.is_empty() {
+        root_table.remove("providers");
+    }
+    removed
+}
+
+fn get_toml_path_mut<'a>(root: &'a mut toml::Value, key: &str) -> Option<&'a mut toml::Value> {
+    let mut cursor = root;
+    for part in key.split('.') {
+        cursor = cursor.as_table_mut()?.get_mut(part)?;
     }
     Some(cursor)
 }
