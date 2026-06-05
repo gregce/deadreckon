@@ -243,7 +243,7 @@ fn exit_input() -> ExitSummaryInput {
             files_deleted: 0,
         }),
         gate: "passed by dr-gate (2 checks)".to_string(),
-        gate_tone: Tone::Neutral,
+        gate_tone: Tone::Plain,
         tests_modified: Some(false),
         gate_caveats: Vec::new(),
         working_dir: PathBuf::from("/tmp/work"),

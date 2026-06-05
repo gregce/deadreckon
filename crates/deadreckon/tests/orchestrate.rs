@@ -2415,7 +2415,11 @@ fn fork_spawns_n_children_with_distinct_scopes() {
     assert_success(&output);
     let out = stdout(&output);
     assert!(out.contains("capabilities:"), "{out}");
-    assert!(out.contains("gate: PASSED 1/1"), "{out}");
+    assert!(
+        out.lines()
+            .any(|line| line.contains("gate") && line.contains("PASSED 1/1")),
+        "{out}"
+    );
     assert!(out.contains("latest turn"), "{out}");
     assert!(out.contains("tokens"), "{out}");
 }

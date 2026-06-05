@@ -19,6 +19,10 @@
   completion surface that bypassed the hint toggle, and routed the
   inspection/doc/chain completion surfaces through `completion_hints_enabled`
   so the toggle is respected uniformly.
+- Added a shared `kv_block` primitive (auto-sized `key: value` on display width)
+  and migrated the status report's run-health, library, and disk sections onto
+  it, fixing the misaligned `gate:` and `scope artifacts:` lines so every colon
+  lines up under the widest key.
 
 ## Release Trust - 2026-06-02
 

@@ -293,32 +293,50 @@ where
     K: AsRef<str>,
     V: AsRef<str>,
 {
-    let width = items
+    print!("{}", kv_block_string("", items));
+    io::stdout().flush()
+}
+
+/// The shared `key: value` block primitive. The key column is sized to the widest
+/// key by display width (ANSI-aware), `indent` prefixes every line, and values
+/// wrap to the terminal. Use this instead of hand-aligned `println!("  k:  v")`
+/// blocks so every kv surface aligns the same way.
+fn kv_block_string<K, V>(indent: &str, items: &[(K, V)]) -> String
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let key_width = items
         .iter()
-        .map(|(key, _)| key.as_ref().chars().count())
+        .map(|(key, _)| ui::display_width(key.as_ref()))
         .max()
         .unwrap_or(0);
-    let prefix_width = width + 2;
+    let prefix_width = ui::display_width(indent) + key_width + 2;
     let value_width = kv_value_width(prefix_width);
+    let mut out = String::new();
     for (key, value) in items {
         let mut first = true;
         for logical_line in value
             .as_ref()
             .lines()
-            .chain(value.as_ref().is_empty().then_some("").into_iter())
+            .chain(value.as_ref().is_empty().then_some(""))
         {
             for line in wrap_kv_value(logical_line, value_width) {
-                let rendered = if first {
+                if first {
                     first = false;
-                    format!("{:<width$}: {}", key.as_ref(), line)
+                    out.push_str(indent);
+                    out.push_str(&ui::pad_visible(key.as_ref(), key_width));
+                    out.push_str(": ");
+                    out.push_str(&line);
                 } else {
-                    format!("{:prefix_width$}{}", "", line)
-                };
-                ui::writeln(ui::Stream::Stdout, ui::Tone::Plain, rendered)?;
+                    out.push_str(&" ".repeat(prefix_width));
+                    out.push_str(&line);
+                }
+                out.push('\n');
             }
         }
     }
-    Ok(())
+    out
 }
 
 fn kv_value_width(prefix_width: usize) -> usize {
@@ -9921,27 +9939,33 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
     }
     println!();
     println!("{}", ui_heading("run health"));
-    println!("  action:   {next_action}");
-    println!("  stale:    {}", if stale { "yes" } else { "no" });
-    println!("  pids:     {}", supervised.len());
+    let mut health: Vec<(&str, String)> = vec![
+        ("action", next_action.to_string()),
+        ("stale", if stale { "yes" } else { "no" }.to_string()),
+        ("pids", supervised.len().to_string()),
+    ];
     if let Some(reason) = state.pause_reason.as_deref() {
-        println!("  paused:   {}", one_line(reason, 100));
+        health.push(("paused", one_line(reason, 100)));
     }
     if let Some(reason) = state.failure_reason.as_deref() {
-        println!("  failure:  {}", one_line(reason, 100));
+        health.push(("failure", one_line(reason, 100)));
     }
-    println!("  gate: {}", acceptance_status_value(state));
+    health.push(("gate", acceptance_status_value(state)));
     let docs_status = docs_status_for_state(state);
-    println!("  docs:     {docs_status}");
+    health.push(("docs", docs_status.to_string()));
     if docs_status == DocsStatus::Failed
         && let Ok(Some(record)) = deadreckon_runtime::read_polish_record(state)
     {
         let detail = record.error.as_deref().unwrap_or(record.status.as_str());
-        println!(
-            "  docs:     polish failed ({}); fallback docs are still available",
-            one_line(detail, 72)
-        );
+        health.push((
+            "docs",
+            format!(
+                "polish failed ({}); fallback docs are still available",
+                one_line(detail, 72)
+            ),
+        ));
     }
+    print!("{}", kv_block_string("  ", &health));
 
     println!();
     println!("{}", ui_heading("library"));
@@ -9951,38 +9975,87 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
         commands::inspection::library_entries(&paths, Some(state.scope.clone()), false)
             .map(|entries| entries.len())
             .unwrap_or(0);
-    println!("  scope artifacts: {artifact_count}");
-    println!(
-        "  current:  {}",
-        if manifest_present {
-            library_dir.display().to_string()
-        } else {
-            "not promoted".to_string()
-        }
+    let current = if manifest_present {
+        library_dir.display().to_string()
+    } else {
+        "not promoted".to_string()
+    };
+    let exported = commands::inspection::materialized_count_label(
+        commands::inspection::materialized_marker_count(&library_dir),
     );
-    println!(
-        "  exported: {}",
-        commands::inspection::materialized_count_label(
-            commands::inspection::materialized_marker_count(&library_dir),
-        )
+    print!(
+        "{}",
+        library_status_block(artifact_count, &current, &exported)
     );
 
     println!();
     println!("{}", ui_heading("disk"));
-    match free_kb(paths.home()) {
+    let disk: Vec<(&str, String)> = match free_kb(paths.home()) {
         Some(kb) => {
             let mb = kb / 1024;
-            println!("  home:     {} MB free in {}", mb, paths.home().display());
+            let mut rows = vec![(
+                "home",
+                format!("{} MB free in {}", mb, paths.home().display()),
+            )];
             if mb > 10_240 {
-                println!(
-                    "  tip:      {}",
-                    ui_command("deadreckon cleanup --completed")
-                );
+                rows.push(("tip", ui_command("deadreckon cleanup --completed")));
             } else {
-                println!("  warning:  low disk; clean old worktrees and artifacts soon");
+                rows.push((
+                    "warning",
+                    "low disk; clean old worktrees and artifacts soon".to_string(),
+                ));
             }
+            rows
         }
-        None => println!("  home:     unavailable; run deadreckon doctor"),
+        None => vec![("home", "unavailable; run deadreckon doctor".to_string())],
+    };
+    print!("{}", kv_block_string("  ", &disk));
+}
+
+/// The status report's `library` section, extracted as a pure function so its
+/// kv-block alignment is testable. `scope artifacts` is the widest key, so every
+/// colon lines up beneath it.
+fn library_status_block(artifact_count: usize, current: &str, exported: &str) -> String {
+    kv_block_string(
+        "  ",
+        &[
+            ("scope artifacts", artifact_count.to_string()),
+            ("current", current.to_string()),
+            ("exported", exported.to_string()),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod uniform_surface_kv_tests {
+    use super::{kv_block_string, library_status_block};
+
+    #[test]
+    fn kv_block_aligns_dynamic_key_column() {
+        let block = kv_block_string("", &[("a", "1"), ("longkey", "2"), ("mid", "3")]);
+        let colon_cols: Vec<usize> = block.lines().map(|line| line.find(':').unwrap()).collect();
+        assert!(!colon_cols.is_empty());
+        assert!(
+            colon_cols.iter().all(|&c| c == colon_cols[0]),
+            "colons must align under the widest key: {colon_cols:?}\n{block}"
+        );
+        // "longkey" (7) drives the column; the colon follows the padded key.
+        assert_eq!(colon_cols[0], 7, "{block}");
+    }
+
+    #[test]
+    fn status_report_uses_kv_block_no_manual_colons() {
+        // The library section (which had the misaligned `scope artifacts:` line)
+        // now renders through kv_block, so every colon aligns under the widest key.
+        let block = library_status_block(3, "/lib/path", "2 exported");
+        let colon_cols: Vec<usize> = block.lines().map(|line| line.find(':').unwrap()).collect();
+        assert!(
+            colon_cols.iter().all(|&c| c == colon_cols[0]),
+            "library section colons must align: {colon_cols:?}\n{block}"
+        );
+        // indent (2) + "scope artifacts" (15) places every colon at column 17.
+        assert_eq!(colon_cols[0], 17, "{block}");
+        assert!(block.contains("scope artifacts: 3"), "{block}");
     }
 }
 

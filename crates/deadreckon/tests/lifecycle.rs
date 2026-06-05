@@ -1913,7 +1913,12 @@ fn finish_exports_completed_fresh_run() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("not metered (subscription)"), "{stdout}");
-    assert!(stdout.contains("gate: PASSED 2/2"), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("gate") && line.contains("PASSED 2/2")),
+        "{stdout}"
+    );
     assert!(!stdout.contains("~$0.000000"), "{stdout}");
     assert!(stdout.contains("exported run"));
     assert!(stdout.contains("completed materialize "), "{stdout}");
@@ -2330,7 +2335,12 @@ fn status_tip_line_appears_when_disk_over_threshold() {
 
     assert_success(&status);
     let stdout = stdout(&status);
-    assert!(stdout.contains("tip:"), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("tip") && line.contains(':')),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("deadreckon cleanup --completed"),
         "{stdout}"

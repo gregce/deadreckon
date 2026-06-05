@@ -18,11 +18,11 @@ fn known_card() -> Card {
                 columns: vec![
                     MetricColumn {
                         value: "3 total".to_string(),
-                        tone: Tone::Neutral,
+                        tone: Tone::Plain,
                     },
                     MetricColumn {
                         value: "2 done".to_string(),
-                        tone: Tone::Good,
+                        tone: Tone::Ok,
                     },
                     MetricColumn {
                         value: "1 waiting".to_string(),

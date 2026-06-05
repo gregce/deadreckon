@@ -1634,7 +1634,11 @@ fn status_shows_docs_status() {
         .output()
         .expect("status");
     assert_success(&output);
-    assert!(stdout(&output).contains("docs:"));
+    assert!(
+        stdout(&output)
+            .lines()
+            .any(|line| line.contains("docs") && line.contains(':'))
+    );
 }
 
 #[test]
@@ -1667,7 +1671,11 @@ fn status_explains_failed_polish_when_fallback_docs_exist() {
 
     assert_success(&output);
     let out = stdout(&output);
-    assert!(out.contains("docs:     failed"), "{out}");
+    assert!(
+        out.lines()
+            .any(|line| line.contains("docs") && line.contains("failed")),
+        "{out}"
+    );
     assert!(
         out.contains("polish failed") && out.contains("fallback docs are still available"),
         "{out}"

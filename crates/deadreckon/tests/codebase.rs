@@ -2093,7 +2093,12 @@ fn latest_alias_resolves_to_current_scope_for_show_and_status() {
     assert!(status_stdout.contains("deadreckon status"));
     assert!(status_stdout.contains(&run_a[..8]), "{status_stdout}");
     assert!(status_stdout.contains("run health"));
-    assert!(status_stdout.contains("action:"));
+    assert!(
+        status_stdout
+            .lines()
+            .any(|line| line.contains("action") && line.contains(':')),
+        "{status_stdout}"
+    );
 }
 
 #[test]
