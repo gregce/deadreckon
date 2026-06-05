@@ -2975,9 +2975,9 @@ fn print_chain_table(chains: &[Chain], full: bool) {
             .or(chain.started_at)
             .unwrap_or(chain.created_at);
         println!(
-            "{:<9} {:<10} {:>2}/{:<2} ${:<9.6} {:<24} {}",
-            id,
-            chain_status_label(chain),
+            "{} {} {:>2}/{:<2} ${:<9.6} {:<24} {}",
+            crate::ui::pad_visible(&ui_id(&id), 9),
+            crate::ui::pad_visible(&ui_status(chain_status_label(chain)), 10),
             done,
             chain.steps.len(),
             chain.total_spend_usd,

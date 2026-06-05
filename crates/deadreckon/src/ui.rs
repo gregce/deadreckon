@@ -311,6 +311,26 @@ pub(crate) fn status_tone(status: impl AsRef<str>) -> Tone {
     Status::classify(status.as_ref()).tone()
 }
 
+/// Color the leading status token of `value` (e.g. `PASSED` in `PASSED 1/1`,
+/// `completed` in `completed -> done`) by its status tone, leaving the rest
+/// plain. A value whose leading token is not a recognized status is returned
+/// unchanged. Safe for an unpadded (last-column / kv) value.
+#[allow(dead_code)]
+pub(crate) fn color_status_word(value: &str) -> String {
+    let mut parts = value.splitn(2, ' ');
+    let Some(first) = parts.next() else {
+        return value.to_string();
+    };
+    let tone = status_tone(first);
+    if tone == Tone::Plain {
+        return value.to_string();
+    }
+    match parts.next() {
+        Some(rest) => format!("{} {}", render(Stream::Stdout, tone, first), rest),
+        None => render(Stream::Stdout, tone, first),
+    }
+}
+
 pub(crate) fn render_status(stream: Stream, status: impl AsRef<str>) -> String {
     let status = status.as_ref();
     render(stream, status_tone(status), status)

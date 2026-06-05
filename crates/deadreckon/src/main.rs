@@ -9851,7 +9851,10 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
     let supervised = supervised_pids(state);
     println!("deadreckon status");
     let run = format!("{short} ({})", state.run_id);
-    let state_line = format!("{} -> {next_action}", run_status_label(state.status));
+    let state_line = format!(
+        "{} -> {next_action}",
+        ui::render_status(ui::Stream::Stdout, run_status_label(state.status))
+    );
     let updated = format!("{} ago", relative_age(state.updated_at));
     let spend = run_spend_label(state, true);
     let wall = format!(
@@ -9905,11 +9908,19 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
         health.push(("paused", one_line(reason, 100)));
     }
     if let Some(reason) = state.failure_reason.as_deref() {
-        health.push(("failure", one_line(reason, 100)));
+        health.push((
+            "failure",
+            ui::render(
+                ui::Stream::Stdout,
+                ui::Tone::Negative,
+                one_line(reason, 100),
+            ),
+        ));
     }
-    health.push(("gate", acceptance_status_value(state)));
+    let gate = acceptance_status_value(state);
+    health.push(("gate", ui::color_status_word(&gate)));
     let docs_status = docs_status_for_state(state);
-    health.push(("docs", docs_status.to_string()));
+    health.push(("docs", ui::color_status_word(&docs_status.to_string())));
     if docs_status == DocsStatus::Failed
         && let Ok(Some(record)) = deadreckon_runtime::read_polish_record(state)
     {

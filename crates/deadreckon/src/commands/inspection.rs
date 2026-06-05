@@ -256,7 +256,7 @@ fn append_list_row(output: &mut String, row: &ListRow) {
     let first_prefix = format!(
         "{}  {}  {}  {}  {}  {}  {}  ",
         pad_rendered(&row.id, LIST_ID_WIDTH, Some(ui_id)),
-        pad_plain(&row.status, LIST_STATUS_WIDTH),
+        pad_rendered(&row.status, LIST_STATUS_WIDTH, Some(ui_status)),
         pad_plain(&row.age, LIST_AGE_WIDTH),
         pad_plain(&row.scope, LIST_SCOPE_WIDTH),
         pad_rendered(
