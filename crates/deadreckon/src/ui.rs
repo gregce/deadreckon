@@ -140,6 +140,16 @@ where
     Some((sequence, false))
 }
 
+/// Display width of `text` in terminal columns: ANSI escape sequences are
+/// stripped first, then each glyph is measured by its Unicode display width so
+/// wide (CJK / full-width) glyphs count as two columns and zero-width / combining
+/// marks count as zero. This is the single width function behind every pad,
+/// truncate, and column-alignment site.
+pub(crate) fn display_width(text: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    UnicodeWidthStr::width(strip_ansi(text).as_str())
+}
+
 pub(crate) fn status_tone(status: impl AsRef<str>) -> Tone {
     let status = status.as_ref().trim().to_ascii_lowercase();
     if status.contains("failed")
@@ -283,6 +293,7 @@ fn replacement_line_text(text: &str, terminal_width: usize) -> String {
 }
 
 fn truncate_visible_single_line(text: &str, max_visible: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
     if max_visible == 0 {
         return String::new();
     }
@@ -296,14 +307,16 @@ fn truncate_visible_single_line(text: &str, max_visible: usize) -> String {
             out.push_str(&sequence);
             continue;
         }
-        if visible >= max_visible {
+        let glyph = match ch {
+            '\n' | '\r' => ' ',
+            _ => ch,
+        };
+        let glyph_width = UnicodeWidthChar::width(glyph).unwrap_or(0);
+        if visible + glyph_width > max_visible {
             break;
         }
-        match ch {
-            '\n' | '\r' => out.push(' '),
-            _ => out.push(ch),
-        }
-        visible += 1;
+        out.push(glyph);
+        visible += glyph_width;
     }
     if style_active {
         out.push_str(ANSI_RESET);
@@ -330,7 +343,38 @@ fn tone_code(tone: Tone) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tone, replacement_line_text, status_tone, strip_ansi};
+    use super::{
+        Tone, display_width, replacement_line_text, status_tone, strip_ansi,
+        truncate_visible_single_line,
+    };
+
+    #[test]
+    fn display_width_strips_ansi_then_measures_columns() {
+        assert_eq!(display_width("\x1b[1;36mhello\x1b[0m"), 5);
+        assert_eq!(display_width("plain"), 5);
+        assert_eq!(display_width(""), 0);
+    }
+
+    #[test]
+    fn display_width_counts_wide_cjk_as_two() {
+        assert_eq!(display_width("中文"), 4);
+        assert_eq!(display_width("a中b"), 4);
+        // A zero-width combining mark adds no columns.
+        assert_eq!(display_width("e\u{0301}"), 1);
+    }
+
+    #[test]
+    fn truncate_visible_does_not_overflow_on_wide_chars() {
+        // Four full-width glyphs = 8 columns; budget 5 must not overflow the cell.
+        let out = truncate_visible_single_line("中中中中", 5);
+        assert!(
+            display_width(&out) <= 5,
+            "width {} exceeds 5",
+            display_width(&out)
+        );
+        // Two glyphs (4 cols) fit; a third (2 cols) would reach 6 > 5.
+        assert_eq!(display_width(&out), 4);
+    }
 
     #[test]
     fn status_tone_maps_known_lifecycle_words() {

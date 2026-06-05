@@ -110,7 +110,7 @@ pub fn render_card(card: &Card, opts: &CardOptions) -> String {
 }
 
 pub fn visible_length(text: &str) -> usize {
-    strip_ansi(text).chars().count()
+    crate::ui::display_width(text)
 }
 
 pub fn truncate_visible(text: &str, width: usize) -> String {
@@ -154,7 +154,7 @@ fn body_lines(card: &Card, plain: bool, color: bool) -> Vec<String> {
             Section::KeyValue { rows } => {
                 let key_width = rows
                     .iter()
-                    .map(|(key, _)| key.chars().count())
+                    .map(|(key, _)| visible_length(key))
                     .max()
                     .unwrap_or(0)
                     .max(LABEL_WIDTH - 2);
@@ -299,15 +299,26 @@ fn truncate_visible_for_mode(text: &str, width: usize, plain: bool) -> String {
 }
 
 fn truncate_visible_inner(text: &str, width: usize, ellipsis: &str) -> String {
+    use unicode_width::UnicodeWidthChar;
     if visible_length(text) <= width {
         return text.to_string();
     }
     if width == 0 {
         return String::new();
     }
-    let ellipsis_width = ellipsis.chars().count();
+    let ellipsis_width = crate::ui::display_width(ellipsis);
     if width <= ellipsis_width {
-        return ellipsis.chars().take(width).collect();
+        let mut out = String::new();
+        let mut used = 0usize;
+        for ch in ellipsis.chars() {
+            let glyph_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + glyph_width > width {
+                break;
+            }
+            out.push(ch);
+            used += glyph_width;
+        }
+        return out;
     }
 
     let target_width = width - ellipsis_width;
@@ -321,11 +332,12 @@ fn truncate_visible_inner(text: &str, width: usize, ellipsis: &str) -> String {
             out.push_str(&sequence);
             continue;
         }
-        if visible >= target_width {
+        let glyph_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if visible + glyph_width > target_width {
             break;
         }
         out.push(ch);
-        visible += 1;
+        visible += glyph_width;
     }
     out.push_str(ellipsis);
     if active_style {

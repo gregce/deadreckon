@@ -1,5 +1,11 @@
 # Changelog
 
+## Uniform Surface - 2026-06-05
+
+- Added one `display_width()` (strip ANSI, then Unicode display width) and routed
+  the line and card truncation/padding helpers through it so wide (CJK) and
+  zero-width glyphs no longer miscount terminal columns.
+
 ## Release Trust - 2026-06-02
 
 - Added a lane-aware release policy gate for branch/PR, RC, stable, and invalid
