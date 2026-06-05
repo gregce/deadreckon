@@ -2799,6 +2799,46 @@ capability negotiation, or LLM-backed semantic compaction. Built-in telemetry is
 not routed through hooks; hooks are additive observers. Those extensions are V1
 candidates.
 
+## 40. Uniform Surface (one Tone, one width, shared kv/table, hardened prompts)
+
+The non-TUI presentation layer renders through one styling vocabulary and a small
+set of shared primitives instead of per-call-site formatting. The attach TUI is a
+separate slice and is out of scope here.
+
+40.1 **One Tone, one width.** `ui::Tone` is the single tone enum, with one
+`to_ansi()` table for line output and a derived `to_tui_color()` table; the TUI
+status palette is derived from it so a status renders the same color on a line
+and in a frame. `ui_card` consumes `ui::Tone` (its separate enum is gone). A free
+status string resolves through an explicit `Status` classifier whose `Unknown`
+class renders a visible default rather than a silent dim. `ui::display_width`
+(strip ANSI, then Unicode display width) is the one width function behind every
+pad/truncate/column site; `ui::pad_visible` pads by display columns so a colored
+cell aligns like a plain one (no `{:<N}` over ANSI — a guard test enforces it).
+
+40.2 **Shared kv/table primitives.** `kv_block_string` renders auto-aligned
+`key: value` blocks (used by the status report's run-health/library/disk
+sections); `columns` renders lowercase-header tables with display-width padding
+(used by the library table; the run list shares the lowercase-header convention).
+`ui::wrap_words` is the single word-wrap engine behind the kv, list, and campaign
+wrappers.
+
+40.3 **Hint discipline.** Completion surfaces route through
+`completion_hints_enabled` so `--no-hints` / `DEADRECKON_HINTS=0` are honored
+uniformly (the campaign completion surface previously ignored them).
+
+40.4 **Hardened one-shot prompts.** `prompt::menu_step` is a pure, unit-tested key
+dispatcher: multi-digit number entry, always-available Esc cancel, out-of-range
+feedback, and a tall-list fallback to line mode. `prompt::ask_number(range)`
+re-prompts on bad count input instead of aborting the command. `deadreckon start`
+with no goal prompts interactively on a TTY (and prints a notice when prompts are
+suppressed). Chain step glyphs gain an ASCII fallback under `--plain`/non-VT
+terminals; cancel paths render a verdict surface with a Recommended next step.
+
+40.5 **Not adopted (by decision).** No `console`/`dialoguer`/`inquire`/
+`comfy-table`/`indicatif` — they introduce a second terminal stack or theme that
+would break the byte-exact render tests. Only `unicode-width` (already transitive
+via ratatui) is added directly.
+
 ---
 
 *This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

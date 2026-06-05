@@ -17,6 +17,15 @@
 - Long-lived notifier daemon: notifications are opt-in transition effects only. A daemon could batch, retry, and surface historical notifications after privacy, lifecycle, and process-supervision behavior are designed.
 - Richer guided onboarding: provider-specific and repo-specific onboarding can build on `start`, `try`, and the done contract once it can stay local-first and avoid surprise telemetry.
 
+## Uniform Surface follow-ups
+
+- Complete table adoption: the shared `columns` primitive is used by the library table; the provider, plan-preflight, and chain tables keep their display-width-correct renderers and can migrate to `columns` incrementally for full structural uniformity.
+- `comfy-table` for the plain-stdout path: reserved only if hand-rolled CJK/wrap/terminal-fit column math becomes a maintenance burden (add without the `tty` feature so it stays a pure String formatter).
+- `anstyle-wincon` legacy-Windows console-API color translation: the hand-rolled ANSI escapes rely on the terminal honoring VT (fine on Windows Terminal/modern conhost); a wincon-aware fallback is deferred.
+- Full confirm-modality audit: binary decisions use `confirm` and multi-way use `select_one`, but a complete run/finish/campaign sweep to guarantee the convention everywhere is incremental.
+- Attach TUI uniformity is its own slice (`docs/goals/2026-06-05-0010-deadreckon-attach-tui-uniformity-goal.md`): one dispatcher, glyph, footer, and scroll indicator across run/plan/campaign/chain.
+- In-frame text input / editable field: no call site today; re-evaluate `tui-input`/`tui-textarea` (pinned to ratatui-0.29-compatible releases) only when a real search/edit box is designed.
+
 ## Decompose follow-ups
 
 - Core `pub mod` tightening with flat re-exports: Decompose left library module visibility alone because tightening it would rewrite deep-path callers and the public-surface baseline for no binary-layout gain.
