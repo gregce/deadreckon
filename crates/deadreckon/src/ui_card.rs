@@ -1,3 +1,5 @@
+pub use crate::ui::Tone;
+
 const DEFAULT_CARD_WIDTH: usize = 80;
 const MIN_CARD_WIDTH: usize = 62;
 const NARROW_FALLBACK_WIDTH: usize = 40;
@@ -50,15 +52,6 @@ pub enum Section {
 pub struct MetricColumn {
     pub value: String,
     pub tone: Tone,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tone {
-    Neutral,
-    Good,
-    Warn,
-    Bad,
-    Dim,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,7 +140,7 @@ fn body_lines(card: &Card, plain: bool, color: bool) -> Vec<String> {
                     .join("  ");
                 lines.push(format!(
                     "  {}{}",
-                    pad_visible(&style_tone(label, Tone::Dim, color), LABEL_WIDTH),
+                    pad_visible(&style_tone(label, Tone::Muted, color), LABEL_WIDTH),
                     rendered_columns
                 ));
             }
@@ -161,7 +154,7 @@ fn body_lines(card: &Card, plain: bool, color: bool) -> Vec<String> {
                 for (key, value) in rows {
                     lines.push(format!(
                         "  {}  {}",
-                        pad_visible(&style_tone(key, Tone::Dim, color), key_width),
+                        pad_visible(&style_tone(key, Tone::Muted, color), key_width),
                         value
                     ));
                 }
@@ -176,8 +169,8 @@ fn body_lines(card: &Card, plain: bool, color: bool) -> Vec<String> {
             Section::Command { label, command } => {
                 lines.push(format!(
                     "  {}{}",
-                    pad_visible(&style_tone(label, Tone::Dim, color), LABEL_WIDTH),
-                    style_tone(command, Tone::Neutral, color)
+                    pad_visible(&style_tone(label, Tone::Muted, color), LABEL_WIDTH),
+                    style_tone(command, Tone::Plain, color)
                 ));
             }
         }
@@ -188,16 +181,16 @@ fn body_lines(card: &Card, plain: bool, color: bool) -> Vec<String> {
     if let Some(primary) = card.primary_action.as_ref() {
         lines.push(format!(
             "  {}{}",
-            pad_visible(&style_tone(&primary.label, Tone::Good, color), LABEL_WIDTH),
-            style_tone(&primary.command, Tone::Good, color)
+            pad_visible(&style_tone(&primary.label, Tone::Ok, color), LABEL_WIDTH),
+            style_tone(&primary.command, Tone::Ok, color)
         ));
     }
     if !card.hints.is_empty() {
         for hint in &card.hints {
             lines.push(format!(
                 "  {}{}",
-                pad_visible(&style_tone(&hint.label, Tone::Dim, color), LABEL_WIDTH),
-                style_tone(&hint.command, Tone::Neutral, color)
+                pad_visible(&style_tone(&hint.label, Tone::Muted, color), LABEL_WIDTH),
+                style_tone(&hint.command, Tone::Plain, color)
             ));
         }
     }
@@ -218,9 +211,9 @@ fn render_title(title: &TitleLine, plain: bool, color: bool) -> String {
         (TitleGlyph::Preview, true) => ">",
     };
     let tone = match title.glyph {
-        TitleGlyph::Success | TitleGlyph::Preview => Tone::Good,
+        TitleGlyph::Success | TitleGlyph::Preview => Tone::Ok,
         TitleGlyph::Paused => Tone::Warn,
-        TitleGlyph::Stopped | TitleGlyph::Failed => Tone::Bad,
+        TitleGlyph::Stopped | TitleGlyph::Failed => Tone::Negative,
     };
     format!(
         "{} {}",
@@ -280,14 +273,10 @@ fn style_tone(text: &str, tone: Tone, color: bool) -> String {
     if !color {
         return text.to_string();
     }
-    let code = match tone {
-        Tone::Neutral => "36",
-        Tone::Good => "32",
-        Tone::Warn => "33",
-        Tone::Bad => "31",
-        Tone::Dim => "2",
-    };
-    crate::ui::ansi_wrap(code, text)
+    match tone.to_ansi() {
+        Some(code) => crate::ui::ansi_wrap(code, text),
+        None => text.to_string(),
+    }
 }
 
 fn truncate_visible_for_mode(text: &str, width: usize, plain: bool) -> String {

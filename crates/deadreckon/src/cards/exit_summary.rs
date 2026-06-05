@@ -49,10 +49,10 @@ pub struct ExitSummaryInput {
 
 pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
     let (glyph, label, tone) = match input.outcome {
-        OutcomeKind::Completed => (TitleGlyph::Success, VERDICT_VERIFIED, Tone::Good),
+        OutcomeKind::Completed => (TitleGlyph::Success, VERDICT_VERIFIED, Tone::Ok),
         OutcomeKind::Paused => (TitleGlyph::Paused, "paused run", Tone::Warn),
-        OutcomeKind::Killed => (TitleGlyph::Stopped, "killed run", Tone::Bad),
-        OutcomeKind::Failed => (TitleGlyph::Failed, "failed run", Tone::Bad),
+        OutcomeKind::Killed => (TitleGlyph::Stopped, "killed run", Tone::Negative),
+        OutcomeKind::Failed => (TitleGlyph::Failed, "failed run", Tone::Negative),
     };
     let mut sections = exit_summary_explanation(input).sections();
     sections.extend([
@@ -68,11 +68,11 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
             columns: vec![
                 MetricColumn {
                     value: format!("in {}", input.input_tokens),
-                    tone: Tone::Neutral,
+                    tone: Tone::Plain,
                 },
                 MetricColumn {
                     value: format!("out {}", input.output_tokens),
-                    tone: Tone::Neutral,
+                    tone: Tone::Plain,
                 },
             ],
         },
@@ -80,7 +80,7 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
             label: "spend".to_string(),
             columns: vec![MetricColumn {
                 value: input.spend_label.clone(),
-                tone: Tone::Neutral,
+                tone: Tone::Plain,
             }],
         },
     ]);
@@ -90,18 +90,18 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
             columns: vec![
                 MetricColumn {
                     value: format!("+{}", diff.lines_added),
-                    tone: Tone::Good,
+                    tone: Tone::Ok,
                 },
                 MetricColumn {
                     value: format!("-{}", diff.lines_deleted),
-                    tone: Tone::Bad,
+                    tone: Tone::Negative,
                 },
                 MetricColumn {
                     value: format!(
                         "{} files",
                         diff.files_added + diff.files_updated + diff.files_deleted
                     ),
-                    tone: Tone::Neutral,
+                    tone: Tone::Plain,
                 },
             ],
         });
@@ -110,15 +110,15 @@ pub fn build_exit_summary_card(input: &ExitSummaryInput) -> Card {
             columns: vec![
                 MetricColumn {
                     value: format!("added {}", diff.files_added),
-                    tone: Tone::Good,
+                    tone: Tone::Ok,
                 },
                 MetricColumn {
                     value: format!("updated {}", diff.files_updated),
-                    tone: Tone::Neutral,
+                    tone: Tone::Plain,
                 },
                 MetricColumn {
                     value: format!("deleted {}", diff.files_deleted),
-                    tone: Tone::Bad,
+                    tone: Tone::Negative,
                 },
             ],
         });

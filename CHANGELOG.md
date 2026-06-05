@@ -5,6 +5,11 @@
 - Added one `display_width()` (strip ANSI, then Unicode display width) and routed
   the line and card truncation/padding helpers through it so wide (CJK) and
   zero-width glyphs no longer miscount terminal columns.
+- Collapsed the two divergent `Tone` enums into one shared enum with a single
+  tone->ANSI table and a derived tone->ratatui::Color table, so a status renders
+  the same color on a line and in a frame; replaced the silent status fallback
+  with an explicit `Status` classifier where an unknown status stays visible
+  rather than being dimmed into the background.
 
 ## Release Trust - 2026-06-02
 

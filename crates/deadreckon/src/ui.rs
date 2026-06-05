@@ -16,7 +16,7 @@ pub(crate) enum Stream {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Tone {
+pub enum Tone {
     #[allow(dead_code)]
     Plain,
     Heading,
@@ -30,6 +30,97 @@ pub(crate) enum Tone {
     Negative,
     Prompt,
     Hint,
+}
+
+impl Tone {
+    /// The single tone->ANSI SGR-parameter table for line output. `None` means
+    /// the tone carries no color (plain text).
+    pub(crate) const fn to_ansi(self) -> Option<&'static str> {
+        match self {
+            Tone::Plain => None,
+            Tone::Heading => Some("1;36"),
+            Tone::Muted => Some("2"),
+            Tone::Id => Some("1;35"),
+            Tone::Command => Some("1;34"),
+            Tone::Ok => Some("1;32"),
+            Tone::Warn => Some("1;33"),
+            Tone::Paused => Some("1;33"),
+            Tone::Note => Some("2"),
+            Tone::Negative => Some("1;31"),
+            Tone::Prompt => Some("1;36"),
+            Tone::Hint => Some("1;34"),
+        }
+    }
+
+    /// The single tone->ratatui::Color table for the TUI, derived from the same
+    /// Tone enum so a status renders the same color on a line and in a frame.
+    pub(crate) const fn to_tui_color(self) -> Color {
+        match self {
+            Tone::Plain => Color::Reset,
+            Tone::Heading | Tone::Prompt => Color::Cyan,
+            Tone::Muted | Tone::Note => Color::DarkGray,
+            Tone::Id => Color::Magenta,
+            Tone::Command | Tone::Hint => Color::Blue,
+            Tone::Ok => Color::Green,
+            Tone::Warn | Tone::Paused => Color::Yellow,
+            Tone::Negative => Color::Red,
+        }
+    }
+}
+
+/// The closed set of lifecycle status classes. `status_tone` resolves a free-form
+/// status string into exactly one of these — including an explicit `Unknown` —
+/// so an unrecognized status renders in a visible default tone rather than being
+/// silently folded into a dim catch-all, and so adding a class is a compile error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Status {
+    Ok,
+    Running,
+    Paused,
+    Warn,
+    Negative,
+    Note,
+    Unknown,
+}
+
+impl Status {
+    pub(crate) fn classify(status: &str) -> Status {
+        let status = status.trim().to_ascii_lowercase();
+        if status.contains("failed")
+            || status.contains("killed")
+            || status.contains("error")
+            || status.contains("missing")
+            || status.contains("refused")
+        {
+            return Status::Negative;
+        }
+        if status.contains("paused") {
+            return Status::Paused;
+        }
+        if status.contains("warning") || status.contains("warn") {
+            return Status::Warn;
+        }
+        match status.as_str() {
+            "ok" | "ready" | "set" | "wrote" | "updated" | "installed" | "completed" | "passed"
+            | "polished" | "applied" | "cleaned" | "exported" => Status::Ok,
+            "running" => Status::Running,
+            "pending" | "planned" | "skipped" | "undone" | "recorded" | "note" => Status::Note,
+            _ => Status::Unknown,
+        }
+    }
+
+    pub(crate) const fn tone(self) -> Tone {
+        match self {
+            Status::Ok => Tone::Ok,
+            Status::Running => Tone::Heading,
+            Status::Paused => Tone::Paused,
+            Status::Warn => Tone::Warn,
+            Status::Negative => Tone::Negative,
+            Status::Note => Tone::Note,
+            // Unknown stays a visible default rather than a dim that hides it.
+            Status::Unknown => Tone::Plain,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,9 +144,10 @@ pub(crate) struct TuiPalette {
 pub(crate) const TUI_PALETTE: TuiPalette = TuiPalette {
     border_focused: Color::Cyan,
     border_idle: Color::Reset,
-    status_running: Color::Cyan,
-    status_completed: Color::Green,
-    status_failed: Color::Red,
+    // Derived from the shared Tone so line and TUI status colors cannot drift.
+    status_running: Status::Running.tone().to_tui_color(),
+    status_completed: Status::Ok.tone().to_tui_color(),
+    status_failed: Status::Negative.tone().to_tui_color(),
     acceptance_default: Color::DarkGray,
     acceptance_configured: Color::Yellow,
     acceptance_running: Color::Cyan,
@@ -86,7 +178,7 @@ pub(crate) fn enabled(stream: Stream) -> bool {
 
 pub(crate) fn render(stream: Stream, tone: Tone, text: impl AsRef<str>) -> String {
     let text = text.as_ref();
-    let Some(code) = tone_code(tone) else {
+    let Some(code) = tone.to_ansi() else {
         return text.to_string();
     };
     if enabled(stream) {
@@ -145,34 +237,14 @@ where
 /// wide (CJK / full-width) glyphs count as two columns and zero-width / combining
 /// marks count as zero. This is the single width function behind every pad,
 /// truncate, and column-alignment site.
+#[allow(dead_code)] // used by ui_card today; kv_block/columns/prompt sites adopt it in later phases.
 pub(crate) fn display_width(text: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     UnicodeWidthStr::width(strip_ansi(text).as_str())
 }
 
 pub(crate) fn status_tone(status: impl AsRef<str>) -> Tone {
-    let status = status.as_ref().trim().to_ascii_lowercase();
-    if status.contains("failed")
-        || status.contains("killed")
-        || status.contains("error")
-        || status.contains("missing")
-        || status.contains("refused")
-    {
-        return Tone::Negative;
-    }
-    if status.contains("paused") {
-        return Tone::Paused;
-    }
-    if status.contains("warning") || status.contains("warn") {
-        return Tone::Warn;
-    }
-    match status.as_str() {
-        "ok" | "ready" | "set" | "wrote" | "updated" | "installed" | "completed" | "passed"
-        | "polished" | "applied" | "cleaned" | "exported" => Tone::Ok,
-        "running" => Tone::Heading,
-        "pending" | "planned" | "skipped" | "undone" | "recorded" | "note" => Tone::Note,
-        _ => Tone::Note,
-    }
+    Status::classify(status.as_ref()).tone()
 }
 
 pub(crate) fn render_status(stream: Stream, status: impl AsRef<str>) -> String {
@@ -324,27 +396,10 @@ fn truncate_visible_single_line(text: &str, max_visible: usize) -> String {
     out
 }
 
-fn tone_code(tone: Tone) -> Option<&'static str> {
-    match tone {
-        Tone::Plain => None,
-        Tone::Heading => Some("1;36"),
-        Tone::Muted => Some("2"),
-        Tone::Id => Some("1;35"),
-        Tone::Command => Some("1;34"),
-        Tone::Ok => Some("1;32"),
-        Tone::Warn => Some("1;33"),
-        Tone::Paused => Some("1;33"),
-        Tone::Note => Some("2"),
-        Tone::Negative => Some("1;31"),
-        Tone::Prompt => Some("1;36"),
-        Tone::Hint => Some("1;34"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Tone, display_width, replacement_line_text, status_tone, strip_ansi,
+        Status, TUI_PALETTE, Tone, display_width, replacement_line_text, status_tone, strip_ansi,
         truncate_visible_single_line,
     };
 
@@ -388,7 +443,33 @@ mod tests {
         assert_eq!(status_tone("pending"), Tone::Note);
         assert_eq!(status_tone("note"), Tone::Note);
         assert_eq!(status_tone("warning"), Tone::Warn);
-        assert_eq!(status_tone("unknown"), Tone::Note);
+    }
+
+    #[test]
+    fn same_status_maps_to_same_tone_in_line_and_tui() {
+        // A status word's line tone and its TUI color come from the same Tone.
+        assert_eq!(
+            status_tone("running").to_tui_color(),
+            TUI_PALETTE.status_running
+        );
+        assert_eq!(
+            status_tone("completed").to_tui_color(),
+            TUI_PALETTE.status_completed
+        );
+        assert_eq!(
+            status_tone("failed").to_tui_color(),
+            TUI_PALETTE.status_failed
+        );
+    }
+
+    #[test]
+    fn unknown_status_is_explicit_not_silently_dimmed() {
+        // An unrecognized status resolves to the explicit Unknown class, not a
+        // silent catch-all, and renders in a visible (non-dim) default tone.
+        assert_eq!(Status::classify("totally-made-up-state"), Status::Unknown);
+        assert_eq!(status_tone("totally-made-up-state"), Tone::Plain);
+        assert_ne!(status_tone("totally-made-up-state"), Tone::Muted);
+        assert_ne!(status_tone("totally-made-up-state"), Tone::Note);
     }
 
     #[test]

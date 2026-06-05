@@ -2993,9 +2993,9 @@ fn acceptance_display_from_gate_line(
     let gate_tone = if !caveats.is_empty() {
         Tone::Warn
     } else if gate.contains("FAILED") || gate.contains("REFUSED") {
-        Tone::Bad
+        Tone::Negative
     } else {
-        Tone::Neutral
+        Tone::Plain
     };
     AcceptanceDisplay {
         gate,
@@ -3008,7 +3008,7 @@ fn acceptance_display_from_gate_line(
 fn acceptance_configured_display(gate: String) -> AcceptanceDisplay {
     AcceptanceDisplay {
         gate,
-        gate_tone: Tone::Neutral,
+        gate_tone: Tone::Plain,
         tests_modified: None,
         caveats: Vec::new(),
     }
