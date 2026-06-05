@@ -355,54 +355,7 @@ fn kv_value_width(prefix_width: usize) -> usize {
 }
 
 fn wrap_kv_value(value: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let words = value.split_whitespace().collect::<Vec<_>>();
-    if words.is_empty() {
-        return vec![String::new()];
-    }
-
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in words {
-        push_wrapped_word(&mut lines, &mut current, word, width);
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
-}
-
-fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, word: &str, width: usize) {
-    if current.is_empty() {
-        push_word_chunks(lines, current, word, width);
-        return;
-    }
-    let current_len = current.chars().count();
-    let word_len = word.chars().count();
-    if current_len + 1 + word_len <= width {
-        current.push(' ');
-        current.push_str(word);
-        return;
-    }
-    lines.push(std::mem::take(current));
-    push_word_chunks(lines, current, word, width);
-}
-
-fn push_word_chunks(lines: &mut Vec<String>, current: &mut String, word: &str, width: usize) {
-    let mut remainder = word;
-    while remainder.chars().count() > width {
-        let chunk = remainder.chars().take(width).collect::<String>();
-        lines.push(chunk);
-        let byte_offset = remainder
-            .char_indices()
-            .nth(width)
-            .map(|(index, _)| index)
-            .unwrap_or(remainder.len());
-        remainder = &remainder[byte_offset..];
-    }
-    if !remainder.is_empty() {
-        current.push_str(remainder);
-    }
+    ui::wrap_words(value, width)
 }
 
 fn print_error(err: &CliError) {

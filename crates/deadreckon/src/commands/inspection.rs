@@ -334,51 +334,7 @@ fn ellipsize_goal_line(value: &str, width: usize) -> String {
 }
 
 fn wrap_words(value: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in value.split(' ') {
-        let word_len = word.chars().count();
-        if word_len > width {
-            if !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-            }
-            lines.extend(split_long_word(word, width));
-            continue;
-        }
-        let next_len = if current.is_empty() {
-            word_len
-        } else {
-            current.chars().count() + 1 + word_len
-        };
-        if next_len <= width {
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(word);
-        } else {
-            lines.push(std::mem::take(&mut current));
-            current.push_str(word);
-        }
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
-}
-
-fn split_long_word(word: &str, width: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for ch in word.chars() {
-        if current.chars().count() >= width {
-            chunks.push(std::mem::take(&mut current));
-        }
-        current.push(ch);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
+    crate::ui::wrap_words(value, width)
 }
 
 #[derive(Debug)]

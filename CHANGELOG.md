@@ -40,6 +40,11 @@
   (and prints a one-line notice when prompts are suppressed) instead of erroring
   out. Confirm-vs-select modality is standardized incrementally (binary
   decisions use `confirm`, multi-way use `select_one`).
+- Added one `wrap_words` engine (display-width-aware) and collapsed the kv-value,
+  run-list, and campaign-facts wrappers onto it; gave the chain step glyphs an
+  ASCII fallback under `--plain`/non-VT terminals (the Windows weak spot); and
+  replaced the bare `println!("cancelled")` run paths with a verdict surface that
+  carries a Recommended next step.
 
 ## Release Trust - 2026-06-02
 

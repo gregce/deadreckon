@@ -1744,7 +1744,7 @@ fn chain_show_command(
     for step in &chain.steps {
         println!(
             "{} step {} {:<9} {}{}",
-            chain_step_dot(step.status),
+            chain_step_dot_for_output(step.status),
             step.index + 1,
             chain_step_status_label(step.status),
             truncate_text(&step.goal, 72),
@@ -2124,7 +2124,7 @@ fn print_chain_attach_snapshot(chain: &Chain) {
     for step in &chain.steps {
         println!(
             "{} step {} {:<9} {}",
-            chain_step_dot(step.status),
+            chain_step_dot_for_output(step.status),
             step.index + 1,
             chain_step_status_label(step.status),
             truncate_text(&step.goal, 80)
@@ -3404,14 +3404,58 @@ pub(crate) fn chain_step_status_label(status: ChainStepStatus) -> &'static str {
 }
 
 pub(crate) fn chain_step_dot(status: ChainStepStatus) -> &'static str {
-    match status {
-        ChainStepStatus::Pending => "○",
-        ChainStepStatus::Running => "●",
-        ChainStepStatus::Completed => "◐",
-        ChainStepStatus::Failed => "✗",
-        ChainStepStatus::Skipped => "↷",
-        ChainStepStatus::Applied => "◉",
-        ChainStepStatus::Undone => "↶",
+    chain_step_glyph(status, false)
+}
+
+/// Step glyph for non-TUI command output, with an ASCII fallback under
+/// --plain / NO_COLOR / a non-VT or Windows terminal.
+fn chain_step_dot_for_output(status: ChainStepStatus) -> &'static str {
+    chain_step_glyph(status, !crate::ui::enabled(crate::ui::Stream::Stdout))
+}
+
+/// Step status glyph. `plain` (under --plain / NO_COLOR / a non-VT or Windows
+/// terminal) substitutes an ASCII fallback so the glyph never renders as a
+/// missing box. Legend: `.` pending, `>` running, `o` completed, `x` failed,
+/// `~` skipped, `*` applied, `<` undone.
+fn chain_step_glyph(status: ChainStepStatus, plain: bool) -> &'static str {
+    match (status, plain) {
+        (ChainStepStatus::Pending, false) => "○",
+        (ChainStepStatus::Pending, true) => ".",
+        (ChainStepStatus::Running, false) => "●",
+        (ChainStepStatus::Running, true) => ">",
+        (ChainStepStatus::Completed, false) => "◐",
+        (ChainStepStatus::Completed, true) => "o",
+        (ChainStepStatus::Failed, false) => "✗",
+        (ChainStepStatus::Failed, true) => "x",
+        (ChainStepStatus::Skipped, false) => "↷",
+        (ChainStepStatus::Skipped, true) => "~",
+        (ChainStepStatus::Applied, false) => "◉",
+        (ChainStepStatus::Applied, true) => "*",
+        (ChainStepStatus::Undone, false) => "↶",
+        (ChainStepStatus::Undone, true) => "<",
+    }
+}
+
+#[cfg(test)]
+mod glyph_tests {
+    use super::{ChainStepStatus, chain_step_glyph};
+
+    #[test]
+    fn chain_step_glyphs_have_ascii_fallback_in_plain() {
+        for status in [
+            ChainStepStatus::Pending,
+            ChainStepStatus::Running,
+            ChainStepStatus::Completed,
+            ChainStepStatus::Failed,
+            ChainStepStatus::Skipped,
+            ChainStepStatus::Applied,
+            ChainStepStatus::Undone,
+        ] {
+            let glyph = chain_step_glyph(status, true);
+            assert!(glyph.is_ascii(), "{status:?} plain glyph {glyph} not ASCII");
+        }
+        // The rich glyph stays Unicode when not plain.
+        assert!(!chain_step_glyph(ChainStepStatus::Pending, false).is_ascii());
     }
 }
 

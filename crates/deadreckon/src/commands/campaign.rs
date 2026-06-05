@@ -232,57 +232,10 @@ fn print_campaign_wrapped(indent: &str, value: &str, width: usize) {
 }
 
 fn wrap_campaign_words(value: &str, width: usize) -> Vec<String> {
-    let width = width.max(16);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in value.split_whitespace() {
-        push_campaign_word(&mut lines, &mut current, word, width);
+    if value.split_whitespace().next().is_none() {
+        return vec!["-".to_string()];
     }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    if lines.is_empty() {
-        lines.push("-".to_string());
-    }
-    lines
-}
-
-fn push_campaign_word(lines: &mut Vec<String>, current: &mut String, word: &str, width: usize) {
-    let word_len = word.chars().count();
-    if current.is_empty() {
-        if word_len <= width {
-            current.push_str(word);
-        } else {
-            push_campaign_word_chunks(lines, current, word, width);
-        }
-        return;
-    }
-    let current_len = current.chars().count();
-    if current_len + 1 + word_len <= width {
-        current.push(' ');
-        current.push_str(word);
-        return;
-    }
-    lines.push(std::mem::take(current));
-    if word_len <= width {
-        current.push_str(word);
-    } else {
-        push_campaign_word_chunks(lines, current, word, width);
-    }
-}
-
-fn push_campaign_word_chunks(
-    lines: &mut Vec<String>,
-    current: &mut String,
-    word: &str,
-    width: usize,
-) {
-    for ch in word.chars() {
-        current.push(ch);
-        if current.chars().count() >= width {
-            lines.push(std::mem::take(current));
-        }
-    }
+    crate::ui::wrap_words(value, width.max(16))
 }
 
 fn campaign_choice_detail(goal: &str) -> String {

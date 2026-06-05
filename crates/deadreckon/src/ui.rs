@@ -257,6 +257,56 @@ pub(crate) fn pad_visible(text: &str, width: usize) -> String {
     }
 }
 
+/// Word-wrap `text` to `width` display columns, breaking words longer than the
+/// width. This is the single wrap engine behind the kv block, run list, and
+/// campaign facts. Wrap RAW (unstyled) text — it is ANSI-naive.
+#[allow(dead_code)] // call sites adopt it across P10.
+pub(crate) fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if display_width(word) > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            // Break a too-long word into width-sized chunks.
+            let mut chunk = String::new();
+            let mut chunk_width = 0usize;
+            for ch in word.chars() {
+                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if chunk_width + ch_width > width {
+                    lines.push(std::mem::take(&mut chunk));
+                    chunk_width = 0;
+                }
+                chunk.push(ch);
+                chunk_width += ch_width;
+            }
+            current = chunk;
+            continue;
+        }
+        let next = if current.is_empty() {
+            display_width(word)
+        } else {
+            display_width(&current) + 1 + display_width(word)
+        };
+        if next <= width {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 pub(crate) fn status_tone(status: impl AsRef<str>) -> Tone {
     Status::classify(status.as_ref()).tone()
 }
@@ -426,6 +476,22 @@ mod tests {
         // Same trailing padding (7 = 10 - 3) regardless of styling.
         assert!(plain.ends_with("       "), "{plain:?}");
         assert!(colored.ends_with("       "), "{colored:?}");
+    }
+
+    #[test]
+    fn one_wrap_engine_used_for_kv_list_campaign() {
+        use super::wrap_words;
+        assert_eq!(
+            wrap_words("alpha beta gamma", 11),
+            vec!["alpha beta", "gamma"]
+        );
+        assert_eq!(
+            wrap_words("supercalifragilistic", 8),
+            vec!["supercal", "ifragili", "stic"]
+        );
+        // Wide (CJK) glyphs count as two columns when wrapping.
+        assert_eq!(wrap_words("中文 ok", 4), vec!["中文", "ok"]);
+        assert_eq!(wrap_words("", 10), vec![String::new()]);
     }
 
     #[test]

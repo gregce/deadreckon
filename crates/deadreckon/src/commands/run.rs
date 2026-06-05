@@ -180,7 +180,10 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             }
             NonGitChoice::Copy => mode_flags.from = Some(cwd.clone()),
             NonGitChoice::Cancel => {
-                println!("cancelled");
+                print!(
+                    "{}",
+                    cancelled_run_surface().render_plain(!completion_hints_enabled(false))
+                );
                 return Ok(());
             }
         }
@@ -240,7 +243,10 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             ));
         }
         if !prompt::confirm("continue?", true)? {
-            println!("cancelled");
+            print!(
+                "{}",
+                cancelled_run_surface().render_plain(!completion_hints_enabled(effective_no_hints))
+            );
             return Ok(());
         }
     }
@@ -574,4 +580,37 @@ fn run_cancelled_before_turn_loop(
         },
     )?;
     Ok(true)
+}
+
+/// A cancel outcome rendered through the shared verdict surface (one verdict,
+/// one Recommended next step) instead of a bare `println!("cancelled")`.
+fn cancelled_run_surface() -> VerdictSurface {
+    VerdictSurface::try_new(
+        VerdictKind::Noop,
+        "run",
+        Some("cancelled"),
+        ExplanationPanel::new(
+            "Run cancelled before launch.",
+            "This is a no-op because you declined to continue; no run state was created.",
+            [("state".to_string(), "no run started".to_string())],
+        ),
+        [("Recommended", "deadreckon run \"<goal>\"")],
+        [("Secondary", "deadreckon start \"<goal>\"")],
+    )
+    .expect("cancelled run verdict surface must be valid")
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::cancelled_run_surface;
+
+    #[test]
+    fn cancelled_run_renders_surface_with_next_step() {
+        let rendered = cancelled_run_surface().render_plain(true);
+        assert!(rendered.contains("cancelled"), "{rendered}");
+        assert!(rendered.contains("Recommended"), "{rendered}");
+        assert!(rendered.contains("deadreckon run"), "{rendered}");
+        // It is a full surface, not a bare "cancelled" line.
+        assert!(rendered.contains("Explanation"), "{rendered}");
+    }
 }
