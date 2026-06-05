@@ -45,6 +45,12 @@
   ASCII fallback under `--plain`/non-VT terminals (the Windows weak spot); and
   replaced the bare `println!("cancelled")` run paths with a verdict surface that
   carries a Recommended next step.
+- Colorized the verdict surface (doctor, status hints, and every run/finish/
+  campaign/chain/import/learning outcome): the verdict label is tone-coded by
+  kind, section headers are bold, evidence keys are dimmed with their
+  `passed`/`warning`/`failed` status words colored, and Recommended/Secondary
+  commands are styled. Dimmed the status report's kv keys. Color is gated on a
+  TTY, so `--plain`/`NO_COLOR`/piped output stays byte-identical.
 
 ## Release Trust - 2026-06-02
 

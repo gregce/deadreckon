@@ -77,6 +77,35 @@ impl VerdictKind {
             Self::Preview | Self::Noop => TitleGlyph::Preview,
         }
     }
+
+    const fn tone(self) -> crate::ui::Tone {
+        use crate::ui::Tone;
+        match self {
+            Self::Completed | Self::Verified => Tone::Ok,
+            Self::Failed | Self::Blocked | Self::Killed => Tone::Negative,
+            Self::Paused => Tone::Paused,
+            Self::Preview | Self::Noop => Tone::Heading,
+        }
+    }
+}
+
+/// Color the leading status word of an evidence value (passed / warning / failed /
+/// missing / …) when it is a recognized status, leaving the rest plain. A value
+/// that does not start with a status word is returned unchanged.
+fn color_evidence_value(value: &str) -> String {
+    use crate::ui::{self, Stream, Tone};
+    let mut parts = value.splitn(2, ' ');
+    let Some(first) = parts.next() else {
+        return value.to_string();
+    };
+    let tone = ui::status_tone(first);
+    if tone == Tone::Plain {
+        return value.to_string();
+    }
+    match parts.next() {
+        Some(rest) => format!("{} {}", ui::render(Stream::Stdout, tone, first), rest),
+        None => ui::render(Stream::Stdout, tone, first),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,26 +269,40 @@ impl VerdictSurface {
     }
 
     pub fn render_plain(&self, no_hints: bool) -> String {
+        use crate::ui::{self, Stream, Tone};
+        // Color is gated on ui::enabled (TTY, not --plain/NO_COLOR), so this stays
+        // byte-identical plain text on non-terminals and in the golden tests while
+        // a real terminal gets a readable, tone-coded surface.
+        let heading = |text: &str| ui::render(Stream::Stdout, Tone::Heading, text);
+        let command = |text: &str| ui::render(Stream::Stdout, Tone::Command, text);
         let mut out = String::new();
-        out.push_str(&self.label());
-        out.push_str("\n\nExplanation\n");
+        out.push_str(&ui::render(Stream::Stdout, self.kind.tone(), self.label()));
+        out.push_str("\n\n");
+        out.push_str(&heading("Explanation"));
+        out.push('\n');
         out.push_str(self.explanation.what_happened.trim());
         out.push('\n');
         out.push_str(self.explanation.why_this_verdict.trim());
-        out.push_str("\n\nEvidence\n");
+        out.push_str("\n\n");
+        out.push_str(&heading("Evidence"));
+        out.push('\n');
         for (key, value) in &self.explanation.evidence {
-            out.push_str(key);
+            out.push_str(&ui::render(Stream::Stdout, Tone::Muted, key));
             out.push_str(": ");
-            out.push_str(value);
+            out.push_str(&color_evidence_value(value));
             out.push('\n');
         }
-        out.push_str("\nRecommended\n");
-        out.push_str(&self.primary_action.command);
+        out.push('\n');
+        out.push_str(&heading("Recommended"));
+        out.push('\n');
+        out.push_str(&command(&self.primary_action.command));
         out.push('\n');
         if !no_hints && !self.secondary_actions.is_empty() {
-            out.push_str("\nSecondary\n");
+            out.push('\n');
+            out.push_str(&heading("Secondary"));
+            out.push('\n');
             for action in &self.secondary_actions {
-                out.push_str(&action.command);
+                out.push_str(&command(&action.command));
                 out.push('\n');
             }
         }

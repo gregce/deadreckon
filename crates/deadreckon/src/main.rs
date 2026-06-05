@@ -325,7 +325,13 @@ where
                 if first {
                     first = false;
                     out.push_str(indent);
-                    out.push_str(&ui::pad_visible(key.as_ref(), key_width));
+                    // Dim the key (label) so it reads as subordinate to its value;
+                    // ui::render is gated on a TTY, so plain output is unchanged.
+                    out.push_str(&ui::render(
+                        ui::Stream::Stdout,
+                        ui::Tone::Muted,
+                        ui::pad_visible(key.as_ref(), key_width),
+                    ));
                     out.push_str(": ");
                     out.push_str(&line);
                 } else {
