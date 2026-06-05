@@ -157,15 +157,6 @@ pub(crate) fn handle_campaign_key(
     key: KeyEvent,
 ) -> CampaignAttachKeyAction {
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.selected = state.selected.saturating_sub(1);
-            CampaignAttachKeyAction::None
-        }
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-            let max = state.campaign.sub_goals.len().saturating_sub(1);
-            state.selected = (state.selected + 1).min(max);
-            CampaignAttachKeyAction::None
-        }
         KeyCode::Enter => state
             .selected_sub_plan()
             .map(|(sub_id, plan_id)| CampaignAttachKeyAction::DrillInto { sub_id, plan_id })
@@ -177,7 +168,16 @@ pub(crate) fn handle_campaign_key(
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             CampaignAttachKeyAction::Quit
         }
-        _ => CampaignAttachKeyAction::None,
+        _ => {
+            // Navigation keys move the selection; any other key is a no-op.
+            let count = state.campaign.sub_goals.len();
+            let mut nav = CampaignNav {
+                selected: &mut state.selected,
+                count,
+            };
+            crate::tui::navigation::dispatch_navigation(&mut nav, key);
+            CampaignAttachKeyAction::None
+        }
     }
 }
 
@@ -511,5 +511,104 @@ pub(crate) fn plan_narrative_refresh_request(
         selected: input.selected,
         config: input.config.clone(),
         kind,
+    }
+}
+
+const CAMPAIGN_LIST_PAGE: usize = 10;
+
+/// Drives the campaign attach sub-goal selection through the shared navigation
+/// core ([`crate::tui::navigation`]). Arrows/`jk`/`Tab` move one; `PgUp`/`PgDn`
+/// page; `Home`/`End`/`g`/`G` jump to the first/last sub-goal — parity with run.
+struct CampaignNav<'a> {
+    selected: &'a mut usize,
+    count: usize,
+}
+
+impl crate::tui::navigation::NavigableSurface for CampaignNav<'_> {
+    fn focus_next(&mut self) {
+        self.scroll_lines(1);
+    }
+
+    fn focus_previous(&mut self) {
+        self.scroll_lines(-1);
+    }
+
+    fn scroll_lines(&mut self, delta: isize) {
+        let max = self.count.saturating_sub(1) as isize;
+        *self.selected = (*self.selected as isize + delta).clamp(0, max) as usize;
+    }
+
+    fn scroll_page(&mut self, direction: isize) {
+        self.scroll_lines(direction.signum() * CAMPAIGN_LIST_PAGE as isize);
+    }
+
+    fn scroll_to_start(&mut self) {
+        *self.selected = 0;
+    }
+
+    fn scroll_to_end(&mut self) {
+        *self.selected = self.count.saturating_sub(1);
+    }
+}
+
+#[cfg(test)]
+mod campaign_nav_tests {
+    use super::{CAMPAIGN_LIST_PAGE, CampaignNav};
+    use crate::tui::navigation::dispatch_navigation;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn nav(selected: &mut usize, count: usize) -> CampaignNav<'_> {
+        CampaignNav { selected, count }
+    }
+
+    #[test]
+    fn campaign_attach_supports_paging_keys() {
+        let count = 30;
+        let mut selected = 0;
+        dispatch_navigation(&mut nav(&mut selected, count), key(KeyCode::PageDown));
+        assert_eq!(selected, CAMPAIGN_LIST_PAGE, "PgDn pages forward");
+        dispatch_navigation(&mut nav(&mut selected, count), key(KeyCode::PageUp));
+        assert_eq!(selected, 0, "PgUp pages back");
+        for code in [KeyCode::End, KeyCode::Char('G')] {
+            let mut selected = 3;
+            dispatch_navigation(&mut nav(&mut selected, count), key(code));
+            assert_eq!(selected, count - 1, "{code:?} jumps to last");
+        }
+        for code in [KeyCode::Home, KeyCode::Char('g')] {
+            let mut selected = 7;
+            dispatch_navigation(&mut nav(&mut selected, count), key(code));
+            assert_eq!(selected, 0, "{code:?} jumps to first");
+        }
+    }
+
+    #[test]
+    fn campaign_attach_navigation_matches_run_reference() {
+        let count = 10;
+        for code in [KeyCode::Down, KeyCode::Char('j'), KeyCode::Tab] {
+            let mut selected = 4;
+            assert!(dispatch_navigation(
+                &mut nav(&mut selected, count),
+                key(code)
+            ));
+            assert_eq!(selected, 5, "{code:?} should advance one");
+        }
+        for code in [KeyCode::Up, KeyCode::Char('k'), KeyCode::BackTab] {
+            let mut selected = 4;
+            assert!(dispatch_navigation(
+                &mut nav(&mut selected, count),
+                key(code)
+            ));
+            assert_eq!(selected, 3, "{code:?} should retreat one");
+        }
+        let mut selected = 0;
+        dispatch_navigation(&mut nav(&mut selected, count), key(KeyCode::Up));
+        assert_eq!(selected, 0, "clamps at top");
+        let mut selected = count - 1;
+        dispatch_navigation(&mut nav(&mut selected, count), key(KeyCode::Down));
+        assert_eq!(selected, count - 1, "clamps at bottom");
     }
 }
