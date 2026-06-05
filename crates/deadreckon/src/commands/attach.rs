@@ -393,7 +393,8 @@ async fn attach_campaign_tui(
                     .await;
                     if let Err(err) = &child_result {
                         print_error(err);
-                        let _ = prompt::open("press Enter to return to campaign attach...", None);
+                        let _ =
+                            wait_for_return("press Enter/q/Esc to return to campaign attach...");
                     }
                     resume_tui(&mut terminal)?;
                 }
@@ -592,6 +593,7 @@ async fn attach_plan_tui(
                         .and_then(|task| task.child_run_id.as_deref())
                     {
                         if load_run(paths, run_id).is_err() {
+                            narrative_notice = Some(unloadable_child_notice(run_id));
                             continue;
                         }
                         let parent_plan = plan.tasks.get(selected).map(|task| AttachParentPlan {
@@ -617,7 +619,8 @@ async fn attach_plan_tui(
                         .await;
                         if let Err(err) = &child_result {
                             print_error(err);
-                            let _ = prompt::open("press Enter to return to plan attach...", None);
+                            let _ =
+                                wait_for_return("press Enter/q/Esc to return to plan attach...");
                         }
                         resume_tui(&mut terminal)?;
                     }
@@ -1001,7 +1004,7 @@ async fn run_completion_action(
         print_error(err);
         print_error_hint(err);
     }
-    let _ = prompt::open("press Enter to return to attach...", None);
+    let _ = wait_for_return("press Enter/q/Esc to return to attach...");
     resume_tui(terminal)?;
     Ok(Some(AttachActionNotice {
         action,
@@ -1050,6 +1053,43 @@ pub(crate) fn attach_should_return_to_plan(key: KeyEvent) -> bool {
     attach_should_quit(key)
         || matches!(key.code, KeyCode::Backspace)
         || (key.code == KeyCode::Char('b') && key.modifiers.is_empty())
+}
+
+/// Keys that dismiss a "press Enter to return" prompt: Enter, q, Esc, or
+/// Backspace — uniform with the attach exit/return controls (Enter only used to
+/// be the sole accepted key).
+fn return_key_dismisses(key: KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Enter | KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q')
+    )
+}
+
+/// Show `message` and wait for any return key instead of only Enter, so leaving
+/// a nested view is uniform across every attach surface.
+fn wait_for_return(message: &str) -> Result<()> {
+    print!("{message}");
+    io::stdout().flush()?;
+    enable_raw_mode()?;
+    let outcome = loop {
+        match event::read() {
+            Ok(Event::Key(key)) if return_key_dismisses(key) => break Ok(()),
+            Ok(_) => continue,
+            Err(err) => break Err(err.into()),
+        }
+    };
+    let _ = disable_raw_mode();
+    println!();
+    outcome
+}
+
+/// Notice shown when Enter opens a child whose run state cannot be loaded,
+/// instead of a silent no-op.
+fn unloadable_child_notice(run_id: &str) -> String {
+    format!(
+        "unavailable: child run {} could not be loaded",
+        run_prefix(run_id)
+    )
 }
 
 const PLAN_LIST_PAGE: usize = 10;
@@ -1106,7 +1146,10 @@ impl crate::tui::navigation::NavigableSurface for PlanNav<'_> {
 
 #[cfg(test)]
 mod nav_tests {
-    use super::{CompletionKeyOutcome, PLAN_LIST_PAGE, PlanNav, resolve_completion_key};
+    use super::{
+        CompletionKeyOutcome, PLAN_LIST_PAGE, PlanNav, resolve_completion_key,
+        return_key_dismisses, unloadable_child_notice,
+    };
     use crate::CompletionAction;
     use crate::tui::navigation::dispatch_navigation;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1227,6 +1270,37 @@ mod nav_tests {
         assert_eq!(
             resolve_completion_key(key(KeyCode::Char('s')), None),
             CompletionKeyOutcome::Execute(CompletionAction::Show)
+        );
+    }
+
+    #[test]
+    fn return_prompt_accepts_q_and_esc() {
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('q'),
+            KeyCode::Esc,
+            KeyCode::Backspace,
+        ] {
+            assert!(
+                return_key_dismisses(key(code)),
+                "{code:?} should dismiss the return prompt"
+            );
+        }
+        for code in [KeyCode::Char('x'), KeyCode::Down, KeyCode::Char('a')] {
+            assert!(
+                !return_key_dismisses(key(code)),
+                "{code:?} should not dismiss the return prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_on_unloadable_child_shows_notice() {
+        let notice = unloadable_child_notice("aaaaaaaabbbbbbbb");
+        assert!(notice.contains("unavailable"), "{notice}");
+        assert!(
+            notice.contains("aaaaaaaa"),
+            "shows the run prefix: {notice}"
         );
     }
 }
