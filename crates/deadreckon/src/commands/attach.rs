@@ -585,19 +585,6 @@ async fn attach_plan_tui(
                     // next iteration (which begins right after input handling), and the
                     // background refresh job invalidates the narrative cache on completion.
                 }
-                Event::Key(key)
-                    if matches!(
-                        key.code,
-                        KeyCode::Right | KeyCode::Down | KeyCode::Tab | KeyCode::Char('j')
-                    ) =>
-                {
-                    selected = (selected + 1).min(plan.tasks.len().saturating_sub(1));
-                }
-                Event::Key(key)
-                    if matches!(key.code, KeyCode::Left | KeyCode::Up | KeyCode::Char('k')) =>
-                {
-                    selected = selected.saturating_sub(1);
-                }
                 Event::Key(key) if key.code == KeyCode::Enter => {
                     if let Some(run_id) = plan
                         .tasks
@@ -634,6 +621,13 @@ async fn attach_plan_tui(
                         }
                         resume_tui(&mut terminal)?;
                     }
+                }
+                Event::Key(key) => {
+                    let mut nav = PlanNav {
+                        selected: &mut selected,
+                        count: plan.tasks.len(),
+                    };
+                    crate::tui::navigation::dispatch_navigation(&mut nav, key);
                 }
                 _ => {}
             }
@@ -1013,4 +1007,128 @@ pub(crate) fn attach_should_return_to_plan(key: KeyEvent) -> bool {
     attach_should_quit(key)
         || matches!(key.code, KeyCode::Backspace)
         || (key.code == KeyCode::Char('b') && key.modifiers.is_empty())
+}
+
+const PLAN_LIST_PAGE: usize = 10;
+
+/// Drives the plan attach task selection through the shared navigation core
+/// ([`crate::tui::navigation`]). Arrows/`jk`/`Tab` move the highlighted child by
+/// one; `PgUp`/`PgDn` page; `Home`/`End`/`g`/`G` jump to the first/last child —
+/// parity with the run panel.
+struct PlanNav<'a> {
+    selected: &'a mut usize,
+    count: usize,
+}
+
+impl crate::tui::navigation::NavigableSurface for PlanNav<'_> {
+    fn focus_next(&mut self) {
+        self.scroll_lines(1);
+    }
+
+    fn focus_previous(&mut self) {
+        self.scroll_lines(-1);
+    }
+
+    fn scroll_lines(&mut self, delta: isize) {
+        let max = self.count.saturating_sub(1) as isize;
+        *self.selected = (*self.selected as isize + delta).clamp(0, max) as usize;
+    }
+
+    fn scroll_page(&mut self, direction: isize) {
+        self.scroll_lines(direction.signum() * PLAN_LIST_PAGE as isize);
+    }
+
+    fn scroll_to_start(&mut self) {
+        *self.selected = 0;
+    }
+
+    fn scroll_to_end(&mut self) {
+        *self.selected = self.count.saturating_sub(1);
+    }
+
+    fn mode_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Left => {
+                self.scroll_lines(-1);
+                true
+            }
+            KeyCode::Right => {
+                self.scroll_lines(1);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod nav_tests {
+    use super::{PLAN_LIST_PAGE, PlanNav};
+    use crate::tui::navigation::dispatch_navigation;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn plan_nav(selected: &mut usize, count: usize) -> PlanNav<'_> {
+        PlanNav { selected, count }
+    }
+
+    #[test]
+    fn plan_attach_supports_paging_keys() {
+        let count = 30;
+        let mut selected = 0;
+        dispatch_navigation(&mut plan_nav(&mut selected, count), key(KeyCode::PageDown));
+        assert_eq!(selected, PLAN_LIST_PAGE, "PgDn pages forward");
+        dispatch_navigation(&mut plan_nav(&mut selected, count), key(KeyCode::PageUp));
+        assert_eq!(selected, 0, "PgUp pages back");
+        for code in [KeyCode::End, KeyCode::Char('G')] {
+            let mut selected = 3;
+            dispatch_navigation(&mut plan_nav(&mut selected, count), key(code));
+            assert_eq!(selected, count - 1, "{code:?} jumps to last");
+        }
+        for code in [KeyCode::Home, KeyCode::Char('g')] {
+            let mut selected = 7;
+            dispatch_navigation(&mut plan_nav(&mut selected, count), key(code));
+            assert_eq!(selected, 0, "{code:?} jumps to first");
+        }
+    }
+
+    #[test]
+    fn plan_attach_navigation_matches_run_reference() {
+        let count = 10;
+        for code in [
+            KeyCode::Down,
+            KeyCode::Char('j'),
+            KeyCode::Tab,
+            KeyCode::Right,
+        ] {
+            let mut selected = 4;
+            assert!(dispatch_navigation(
+                &mut plan_nav(&mut selected, count),
+                key(code)
+            ));
+            assert_eq!(selected, 5, "{code:?} should advance one");
+        }
+        for code in [
+            KeyCode::Up,
+            KeyCode::Char('k'),
+            KeyCode::BackTab,
+            KeyCode::Left,
+        ] {
+            let mut selected = 4;
+            assert!(dispatch_navigation(
+                &mut plan_nav(&mut selected, count),
+                key(code)
+            ));
+            assert_eq!(selected, 3, "{code:?} should retreat one");
+        }
+        let mut selected = 0;
+        dispatch_navigation(&mut plan_nav(&mut selected, count), key(KeyCode::Up));
+        assert_eq!(selected, 0, "clamps at top");
+        let mut selected = count - 1;
+        dispatch_navigation(&mut plan_nav(&mut selected, count), key(KeyCode::Down));
+        assert_eq!(selected, count - 1, "clamps at bottom");
+    }
 }
