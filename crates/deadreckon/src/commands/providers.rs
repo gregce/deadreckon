@@ -710,9 +710,10 @@ async fn providers_list_command(
             " "
         };
         println!(
-            "{marker} {} {} not registered | {}",
+            "{marker} {} {} {} | {}",
             ui_warn("✗"),
             ui_id(id),
+            ui_warn("not registered"),
             ui_command("deadreckon providers list --all")
         );
     }

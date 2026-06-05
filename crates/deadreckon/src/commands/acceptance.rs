@@ -107,7 +107,7 @@ pub(crate) async fn done_command(
 
 fn print_done_help() {
     println!("{}", ui_heading("deadreckon def-done"));
-    println!("usage:");
+    println!("{}", ui_muted("usage:"));
     println!(
         "  {}",
         ui_command("deadreckon def-done \"builds, opens in a browser, and has no console errors\"")
@@ -343,8 +343,8 @@ fn acceptance_explain_command(spec: Option<PathBuf>) -> Result<()> {
         let raw = fs::read_to_string(&path)?;
         let count = acceptance_check_count(&raw)?;
         println!("{}", ui_heading("done criteria"));
-        println!("  spec:   {}", path.display());
-        println!("  checks: {count}");
+        println!("  {}   {}", ui_muted("spec:"), path.display());
+        println!("  {} {count}", ui_muted("checks:"));
         if path == project_acceptance_yaml(&cwd)
             && let Some(markdown) = read_optional_text(&project_acceptance_md(&cwd))?
         {
@@ -355,8 +355,11 @@ fn acceptance_explain_command(spec: Option<PathBuf>) -> Result<()> {
         print_acceptance_yaml_summary(&raw)?;
     } else {
         println!("{}", ui_heading("done criteria"));
-        println!("  spec:   default dr-gate behavior");
-        println!("  checks: working directory exists, or cargo test when Cargo.toml is present");
+        println!("  {}   default dr-gate behavior", ui_muted("spec:"));
+        println!(
+            "  {} working directory exists, or cargo test when Cargo.toml is present",
+            ui_muted("checks:")
+        );
         println!();
         println!(
             "{}",
@@ -390,11 +393,11 @@ fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> 
                 .iter()
                 .any(|result| result.must_pass && !result.passed);
             if failed_required {
-                println!("working {}", working_dir.display());
+                println!("{} {}", ui_muted("working"), working_dir.display());
                 if let Some(spec_path) = spec_path.as_ref() {
-                    println!("spec    {}", spec_path.display());
+                    println!("{}    {}", ui_muted("spec"), spec_path.display());
                 } else {
-                    println!("spec    default dr-gate behavior");
+                    println!("{}    default dr-gate behavior", ui_muted("spec"));
                 }
                 print_acceptance_results(&results);
                 if let Some(failed) = results
@@ -535,13 +538,13 @@ pub(crate) fn print_acceptance_results(results: &[deadreckon_core::AcceptanceChe
         );
         if !result.passed {
             if let Some(command) = result.command.as_deref() {
-                println!("      command: {}", ui_command(command));
+                println!("      {} {}", ui_muted("command:"), ui_command(command));
             }
             if let Some(stderr) = result.stderr.as_deref() {
-                println!("      stderr:  {}", one_line(stderr, 140));
+                println!("      {}  {}", ui_muted("stderr:"), one_line(stderr, 140));
             }
             if let Some(stdout) = result.stdout.as_deref() {
-                println!("      stdout:  {}", one_line(stdout, 140));
+                println!("      {}  {}", ui_muted("stdout:"), one_line(stdout, 140));
             }
         }
     }

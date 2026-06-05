@@ -1012,7 +1012,7 @@ pub(crate) fn print_orchestration_role_table(
     repair_enabled: bool,
     repair_provider: Option<&str>,
 ) {
-    println!("provider roles");
+    println!("{}", ui_heading("provider roles"));
     for line in orchestration_role_table_lines(&orchestration_provider_role_rows(
         plan,
         repair_enabled,
@@ -1104,11 +1104,11 @@ pub(crate) fn orchestration_parallelism_lines(plan: &Plan) -> Vec<String> {
 }
 
 pub(crate) fn print_orchestration_dependency_summary(plan: &Plan) {
-    println!("parallelism");
+    println!("{}", ui_heading("parallelism"));
     for line in orchestration_parallelism_lines(plan) {
         println!("  {line}");
     }
-    println!("dependencies");
+    println!("{}", ui_heading("dependencies"));
     println!(
         "  {:<10} {:<10} {:<18} {:<18} unblocks",
         "child", "status", "starts", "waits_for"
@@ -1183,7 +1183,7 @@ fn print_plan_created(plan: &Plan, no_hints: bool) {
         };
         println!(
             "  {} {} [{}] provider={} deps={}",
-            task.task_id,
+            ui_id(&task.task_id),
             task.subject,
             format!("{:?}", task.role).to_ascii_lowercase(),
             task.provider.as_deref().unwrap_or("-"),
@@ -1277,7 +1277,7 @@ pub(crate) fn print_orchestrate_preflight(
         };
         println!(
             "  {} {} [{}] provider={} deps={}",
-            task.task_id,
+            ui_id(&task.task_id),
             task.subject,
             format!("{:?}", task.role).to_ascii_lowercase(),
             task.provider.as_deref().unwrap_or("-"),
@@ -1893,7 +1893,7 @@ fn print_plan_child_run_line(plan: &Plan, task_index: usize, run_id: &str, plain
         "{} {} {} -> run {}  {}",
         ui_heading("plan"),
         ui_id(run_prefix(&plan.plan_id)),
-        task.task_id,
+        ui_id(&task.task_id),
         ui_id(run_prefix(run_id)),
         ui_command(format!(
             "deadreckon attach {}:{}",
@@ -1921,8 +1921,8 @@ fn print_plan_child_finished_line(
         "{} {} {} {} run {}",
         ui_heading("plan"),
         ui_id(run_prefix(&plan.plan_id)),
-        task.task_id,
-        task_status_label(status),
+        ui_id(&task.task_id),
+        ui_status(task_status_label(status)),
         ui_id(run_prefix(run_id))
     );
     let _ = io::stdout().flush();

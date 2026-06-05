@@ -128,7 +128,7 @@ pub(crate) fn finish_command(
                 ui_ok("finished in-place run"),
                 ui_id(&state.run_id)
             );
-            println!("  working: {}", state.working_dir.display());
+            println!("  {} {}", ui_muted("working:"), state.working_dir.display());
             println!(
                 "{}",
                 VerdictSurface::try_new(
@@ -163,8 +163,8 @@ pub(crate) fn finish_command(
 
 fn print_finish_consistency_summary(state: &deadreckon_core::PipelineState) {
     println!("{}", ui_heading("run summary"));
-    println!("  spend: {}", run_spend_label(state, false));
-    println!("  gate: {}", acceptance_status_value(state));
+    println!("  {} {}", ui_muted("spend:"), run_spend_label(state, false));
+    println!("  {} {}", ui_muted("gate:"), acceptance_status_value(state));
 }
 
 #[derive(Debug)]
@@ -400,7 +400,7 @@ fn apply_command_inner(
 
     if !no_confirm && io::stdin().is_terminal() {
         if !prompt::confirm("apply these changes?", true)? {
-            println!("cancelled");
+            println!("{}", ui_muted("cancelled"));
             return Ok(());
         }
     } else if !no_confirm && !io::stdin().is_terminal() {
@@ -596,9 +596,12 @@ fn print_already_applied(state: &deadreckon_core::PipelineState, branch: &str, t
         ui_id(&state.run_id),
         target
     );
-    println!("  run branch:    {branch}");
-    println!("  target branch: {target}");
-    println!("  reason: no file changes remain between the run branch and target branch");
+    println!("  {}    {branch}", ui_muted("run branch:"));
+    println!("  {} {target}", ui_muted("target branch:"));
+    println!(
+        "  {} no file changes remain between the run branch and target branch",
+        ui_muted("reason:")
+    );
 }
 
 fn apply_completed_surface(
@@ -734,7 +737,10 @@ fn prepare_apply_autostash(
             "git stash succeeded but the new stash could not be found".to_string(),
         ))
     })?;
-    eprintln!("stashed local changes as {refname}");
+    eprintln!(
+        "stashed local changes as {}",
+        ui::render(ui::Stream::Stderr, ui::Tone::Id, &refname)
+    );
     Ok(Some(ApplyAutoStash { refname }))
 }
 
@@ -956,7 +962,7 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
         return Ok(());
     }
 
-    println!("cleanup candidates:");
+    println!("{}", ui_heading("cleanup candidates:"));
     for candidate in &candidates {
         println!(
             "  {:<8} {:<10} {:<16} {}",
@@ -974,7 +980,7 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
             )));
         }
         if !prompt::confirm("clean these runs?", false)? {
-            println!("cancelled");
+            println!("{}", ui_muted("cancelled"));
             return Ok(());
         }
     }

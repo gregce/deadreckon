@@ -147,12 +147,12 @@ fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sand
         campaign.n
     );
 
-    println!("Campaign preview {id}");
+    println!("Campaign preview {}", ui_id(&id));
     println!();
-    println!("Goal");
+    println!("{}", ui_heading("Goal"));
     print_campaign_wrapped("  ", &campaign.root_goal, CAMPAIGN_WRAP_WIDTH);
     println!();
-    println!("Plan");
+    println!("{}", ui_heading("Plan"));
     print_campaign_fact("campaign", &id);
     print_campaign_fact("sub-goals", &campaign.n.to_string());
     print_campaign_fact(
@@ -192,12 +192,12 @@ fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sand
     }
 
     println!();
-    println!("Next");
+    println!("{}", ui_heading("Next"));
     println!("  Press Enter or choose [1] to launch. Edit the split first if it looks wrong.");
     println!("  Launch without prompting:");
     print_campaign_wrapped("    ", &primary, CAMPAIGN_WRAP_WIDTH);
 
-    println!("Sub-goals");
+    println!("{}", ui_heading("Sub-goals"));
     for sub in &campaign.sub_goals {
         print_campaign_sub_goal(sub);
     }
@@ -210,10 +210,10 @@ fn print_campaign_fact(label: &str, value: &str) {
 }
 
 fn print_campaign_sub_goal(sub: &deadreckon_core::campaign::SubGoal) {
-    println!("  {}", sub.sub_id);
+    println!("  {}", ui_id(&sub.sub_id));
     if let Some((body, acceptance)) = split_acceptance_clause(&sub.goal) {
         print_campaign_wrapped("    ", body, CAMPAIGN_WRAP_WIDTH);
-        println!("    Acceptance");
+        println!("    {}", ui_heading("Acceptance"));
         print_campaign_wrapped("      ", acceptance, CAMPAIGN_WRAP_WIDTH);
     } else {
         print_campaign_wrapped("    ", &sub.goal, CAMPAIGN_WRAP_WIDTH);
@@ -1791,18 +1791,19 @@ pub(crate) fn campaign_attach_summary(
         campaign_verdict_surface(campaign, rollup).render_plain(false)
     );
     let _ = writeln!(out);
-    let _ = writeln!(out, "Details");
+    let _ = writeln!(out, "{}", ui_heading("Details"));
     let _ = writeln!(
         out,
-        "campaign: {} ({})",
+        "{} {} ({})",
+        ui_muted("campaign:"),
         campaign.root_goal,
-        campaign_status_text(campaign.status)
+        ui_status(campaign_status_text(campaign.status))
     );
     if let Some(rollup) = rollup {
         let _ = writeln!(
             out,
             "roll-up {}",
-            rollup_verdict_text(rollup.rollup_verdict)
+            ui_status(rollup_verdict_text(rollup.rollup_verdict))
         );
     }
     for sub in &campaign.sub_goals {
@@ -1814,9 +1815,9 @@ pub(crate) fn campaign_attach_summary(
         let _ = writeln!(
             out,
             "  {} {} result={} {}",
-            sub.sub_id,
-            sub_status_text(sub.status),
-            result,
+            ui_id(&sub.sub_id),
+            ui_status(sub_status_text(sub.status)),
+            ui_id(&result),
             sub.goal
         );
         if let Some(paths) = paths
@@ -1824,7 +1825,12 @@ pub(crate) fn campaign_attach_summary(
             && let Ok(state) = load_run(paths, run_id)
         {
             let _ = writeln!(out, "    spend {}", run_spend_label(&state, false));
-            let _ = writeln!(out, "    gate: {}", acceptance_status_value(&state));
+            let _ = writeln!(
+                out,
+                "    {} {}",
+                ui_muted("gate:"),
+                ui_status(acceptance_status_value(&state))
+            );
         }
     }
     let _ = writeln!(
@@ -1847,24 +1853,34 @@ pub(crate) fn campaign_why_failed_report(
         campaign_verdict_surface(campaign, rollup).render_plain(false)
     );
     let _ = writeln!(out);
-    let _ = writeln!(out, "Details");
+    let _ = writeln!(out, "{}", ui_heading("Details"));
     let _ = writeln!(
         out,
         "campaign {} {}",
-        run_prefix(&campaign.campaign_id),
-        campaign_status_text(campaign.status)
+        ui_id(run_prefix(&campaign.campaign_id)),
+        ui_status(campaign_status_text(campaign.status))
     );
     if let Some(rollup) = rollup {
         let _ = writeln!(
             out,
             "roll-up {}",
-            rollup_verdict_text(rollup.rollup_verdict)
+            ui_status(rollup_verdict_text(rollup.rollup_verdict))
         );
         if !rollup.refused_subs.is_empty() {
-            let _ = writeln!(out, "refused subs: {}", rollup.refused_subs.join(", "));
+            let _ = writeln!(
+                out,
+                "{} {}",
+                ui_muted("refused subs:"),
+                ui_id(rollup.refused_subs.join(", "))
+            );
         }
         if !rollup.caveat_subs.is_empty() {
-            let _ = writeln!(out, "caveat subs: {}", rollup.caveat_subs.join(", "));
+            let _ = writeln!(
+                out,
+                "{} {}",
+                ui_muted("caveat subs:"),
+                ui_id(rollup.caveat_subs.join(", "))
+            );
         }
     }
     for sub in &campaign.sub_goals {
@@ -1874,8 +1890,8 @@ pub(crate) fn campaign_why_failed_report(
         let _ = writeln!(
             out,
             "  {} {} {}",
-            sub.sub_id,
-            sub_status_text(sub.status),
+            ui_id(&sub.sub_id),
+            ui_status(sub_status_text(sub.status)),
             sub.goal
         );
     }

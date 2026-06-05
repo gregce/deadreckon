@@ -105,7 +105,7 @@ fn print_chain_help(topic: Option<&str>) {
             println!("{}", ui_heading("deadreckon chain"));
             println!("{CHAIN_HELP}");
             println!();
-            println!("More help:");
+            println!("{}", ui_heading("More help:"));
             println!("  {}", ui_command("deadreckon chain help plan"));
             println!("  {}", ui_command("deadreckon chain help run"));
             println!("  {}", ui_command("deadreckon chain help pause"));
@@ -605,17 +605,26 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
     if draft {
         if completion_hints_enabled(no_hints) && !quiet {
             println!(
-                "drafted: {} with {} steps",
-                chain.chain_id,
+                "{} {} with {} steps",
+                ui_muted("drafted:"),
+                ui_id(&chain.chain_id),
                 chain.steps.len()
             );
             println!(
-                "edit:    vim {}",
-                paths.chain_json(&chain.chain_id).display()
+                "{}    {}",
+                ui_muted("edit:"),
+                ui_command(format!(
+                    "vim {}",
+                    paths.chain_json(&chain.chain_id).display()
+                ))
             );
             println!(
-                "run:     deadreckon chain run {}",
-                chain_prefix(&chain.chain_id)
+                "{}     {}",
+                ui_muted("run:"),
+                ui_command(format!(
+                    "deadreckon chain run {}",
+                    chain_prefix(&chain.chain_id)
+                ))
             );
         }
         return Ok(chain.chain_id);
@@ -637,7 +646,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
             ));
         }
         if !prompt::confirm("start the chain?", true)? {
-            println!("cancelled");
+            println!("{}", ui_status("cancelled"));
             return Ok(chain.chain_id);
         }
     }
@@ -1739,7 +1748,7 @@ fn chain_show_command(
         chain_verdict_surface(paths, &chain).render_plain(!completion_hints_enabled(false))
     );
     println!();
-    println!("Steps");
+    println!("{}", ui_heading("Steps"));
     print_chain_header(paths, &chain);
     for step in &chain.steps {
         println!(
@@ -1750,7 +1759,7 @@ fn chain_show_command(
             truncate_text(&step.goal, 72),
             step.run_id
                 .as_deref()
-                .map(|run_id| format!(" run={}", run_prefix(run_id)))
+                .map(|run_id| format!(" run={}", ui_id(run_prefix(run_id))))
                 .unwrap_or_default()
         );
     }
@@ -2424,7 +2433,7 @@ fn chain_undo_command(
     }
     if !no_confirm && io::stdin().is_terminal() {
         if !prompt::confirm("undo applied chain commits?", false)? {
-            println!("cancelled");
+            println!("{}", ui_status("cancelled"));
             return Ok(());
         }
     } else if !no_confirm {
@@ -2946,7 +2955,10 @@ fn chain_preview(chain: &Chain) -> String {
 }
 
 fn print_chain_table(chains: &[Chain], full: bool) {
-    println!("CHAIN     STATUS     STEPS  SPEND       UPDATED                  GOAL");
+    println!(
+        "{}",
+        ui_heading("CHAIN     STATUS     STEPS  SPEND       UPDATED                  GOAL")
+    );
     for chain in chains {
         let id = if full {
             chain.chain_id.clone()

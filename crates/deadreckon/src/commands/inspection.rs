@@ -202,13 +202,19 @@ fn empty_list_surface(scope: Option<&str>, all: bool) -> VerdictSurface {
 
 fn append_list_action_footer(output: &mut String) {
     output.push('\n');
-    output.push_str("Recommended\n");
-    output.push_str("deadreckon status latest\n");
+    output.push_str(&ui_heading("Recommended"));
     output.push('\n');
-    output.push_str("Secondary\n");
-    output.push_str("deadreckon list --all\n");
-    output.push_str("deadreckon attach <id>\n");
-    output.push_str("deadreckon show <id>\n");
+    output.push_str(&ui_command("deadreckon status latest"));
+    output.push('\n');
+    output.push('\n');
+    output.push_str(&ui_heading("Secondary"));
+    output.push('\n');
+    output.push_str(&ui_command("deadreckon list --all"));
+    output.push('\n');
+    output.push_str(&ui_command("deadreckon attach <id>"));
+    output.push('\n');
+    output.push_str(&ui_command("deadreckon show <id>"));
+    output.push('\n');
 }
 
 const LIST_ID_WIDTH: usize = 8;
@@ -602,7 +608,7 @@ fn history_grep_command(args: HistoryGrepRequest) -> Result<()> {
             println!(
                 "{} {} plan-events | {}",
                 ui_id(run_prefix(&plan_id)),
-                event.timestamp.to_rfc3339(),
+                ui_muted(event.timestamp.to_rfc3339()),
                 one_line(&line, 220)
             );
             printed += 1;
@@ -632,7 +638,7 @@ fn history_grep_command(args: HistoryGrepRequest) -> Result<()> {
             println!(
                 "{} {} {} | {}",
                 ui_id(run_prefix(&run.run_id)),
-                timestamp.to_rfc3339(),
+                ui_muted(timestamp.to_rfc3339()),
                 run.scope,
                 one_line(line.trim(), 220)
             );
@@ -649,7 +655,10 @@ fn history_grep_command(args: HistoryGrepRequest) -> Result<()> {
             all,
         );
     } else if total_matches > printed {
-        println!("... ({} more)", total_matches - printed);
+        println!(
+            "{}",
+            ui_muted(format!("... ({} more)", total_matches - printed))
+        );
     }
     Ok(())
 }
@@ -1216,11 +1225,11 @@ fn print_library_table(entries: &[LibraryEntry], full: bool) {
 
 fn print_library_table_action_footer() {
     println!();
-    println!("Recommended");
-    println!("deadreckon library show <run-id>");
+    println!("{}", ui_heading("Recommended"));
+    println!("{}", ui_command("deadreckon library show <run-id>"));
     println!();
-    println!("Secondary");
-    println!("deadreckon export <run-id> --dest <path>");
+    println!("{}", ui_heading("Secondary"));
+    println!("{}", ui_command("deadreckon export <run-id> --dest <path>"));
 }
 
 pub(crate) fn materialized_count_label(count: usize) -> String {
@@ -1234,19 +1243,28 @@ pub(crate) fn materialized_count_label(count: usize) -> String {
 fn print_library_entry(entry: &LibraryEntry) {
     let manifest = &entry.manifest;
     println!("{}", ui_heading("library artifact"));
-    println!("run:        {}", ui_id(&manifest.run_id));
-    println!("scope:      {}", manifest.scope);
-    println!("promoted:   {}", manifest.promoted_at);
+    println!("{}        {}", ui_muted("run:"), ui_id(&manifest.run_id));
+    println!("{}      {}", ui_muted("scope:"), manifest.scope);
+    println!("{}   {}", ui_muted("promoted:"), manifest.promoted_at);
     println!(
-        "exported:   {}",
+        "{}   {}",
+        ui_muted("exported:"),
         materialized_count_label(entry.materialized_count)
     );
-    println!("path:       {}", entry.path.display());
-    println!("source:     {}", manifest.source_working_dir.display());
-    println!("provenance: {}", manifest.provenance_hash);
-    println!("goal:       {}", manifest.goal);
+    println!("{}       {}", ui_muted("path:"), entry.path.display());
+    println!(
+        "{}     {}",
+        ui_muted("source:"),
+        manifest.source_working_dir.display()
+    );
+    println!(
+        "{} {}",
+        ui_muted("provenance:"),
+        ui_id(&manifest.provenance_hash)
+    );
+    println!("{}       {}", ui_muted("goal:"), manifest.goal);
     println!();
-    println!("Recommended");
+    println!("{}", ui_heading("Recommended"));
     println!(
         "{}",
         ui_command(format!(

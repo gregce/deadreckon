@@ -51,6 +51,11 @@
   `passed`/`warning`/`failed` status words colored, and Recommended/Secondary
   commands are styled. Dimmed the status report's kv keys. Color is gated on a
   TTY, so `--plain`/`NO_COLOR`/piped output stays byte-identical.
+- Swept the per-command raw output (chain, inspection, lifecycle, acceptance,
+  plan, providers, campaign, doc, attach): 85 additional colorizations — section
+  headings, ids/hashes, runnable commands, status words, and dimmed labels — all
+  through the TTY-gated helpers. Fixed-width/padded table columns were left plain
+  to preserve alignment (the ANSI-padding bug class).
 
 ## Release Trust - 2026-06-02
 

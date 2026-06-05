@@ -418,25 +418,37 @@ pub(crate) fn doc_polish_preview_text(
     let mut out = String::new();
     out.push_str(&format!("{}\n", ui_heading("polish preview:")));
     out.push_str(&format!(
-        "  provider:  {} ({provider_source})\n",
+        "  {}  {} ({provider_source})\n",
+        ui_muted("provider:"),
         ui_id(provider)
     ));
-    out.push_str(&format!("  subskills: {}\n", subskills.join(", ")));
     out.push_str(&format!(
-        "  budget:    {} tokens per subcall\n",
+        "  {} {}\n",
+        ui_muted("subskills:"),
+        subskills.join(", ")
+    ));
+    out.push_str(&format!(
+        "  {}    {} tokens per subcall\n",
+        ui_muted("budget:"),
         token_budget
     ));
     out.push_str(&format!(
-        "  estimate:  {}\n",
+        "  {}  {}\n",
+        ui_muted("estimate:"),
         doc_polish_cost_label(estimated_spend)
     ));
     out.push_str(&format!(
-        "  cost cap:  {}\n",
+        "  {}  {}\n",
+        ui_muted("cost cap:"),
         budget_cap
             .map(|cap| format!("${cap:.2}"))
             .unwrap_or_else(|| "provider/account default".to_string())
     ));
-    out.push_str(&format!("  inputs:    {}\n", &hash[..hash.len().min(12)]));
+    out.push_str(&format!(
+        "  {}    {}\n",
+        ui_muted("inputs:"),
+        &hash[..hash.len().min(12)]
+    ));
     Ok(out)
 }
 

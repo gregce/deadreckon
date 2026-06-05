@@ -146,9 +146,9 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     if let Some(parent_plan) = parent_plan.as_ref() {
         println!(
             "plan {} / {} -> run {}",
-            run_prefix(&parent_plan.plan_id),
+            ui_id(run_prefix(&parent_plan.plan_id)),
             parent_plan.task_id,
-            run_prefix(&state.run_id)
+            ui_id(run_prefix(&state.run_id))
         );
     }
     if state.status == RunStatus::Completed && show_hints {
