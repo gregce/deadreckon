@@ -434,6 +434,7 @@ async fn attach_plan_tui(
     let mut feed = PlanEventBus::file_tail(paths.clone(), plan_id.to_string());
     let mut view = initial_view;
     let mut visual = initial_visual;
+    let mut narrative_scroll = 0_usize;
     let mut narrative_notice = None;
     let mut quiet_tracker = NarrativeQuietRefreshTracker::new(Utc::now());
     let mut narrative_refresh_job: Option<AttachPlanNarrativeRefreshJob> = None;
@@ -542,6 +543,7 @@ async fn attach_plan_tui(
                     campaign_parent: parent_campaign.as_ref(),
                     narrative_notice: narrative_notice.as_deref(),
                     narrative_projection: narrative_projection.as_ref(),
+                    narrative_scroll,
                 },
             )
         })?;
@@ -557,6 +559,7 @@ async fn attach_plan_tui(
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
                     view = toggle_attach_view(view);
+                    narrative_scroll = 0;
                 }
                 Event::Key(key) if key.code == KeyCode::Char('v') && key.modifiers.is_empty() => {
                     visual = visual.next();
@@ -624,6 +627,22 @@ async fn attach_plan_tui(
                         }
                         resume_tui(&mut terminal)?;
                     }
+                }
+                Event::Key(key) if view.is_narrative() => {
+                    let total = narrative_projection.as_ref().map_or(0, |projection| {
+                        let mut lines = narrative::narrative_plain_lines(projection, visual).len();
+                        if narrative_notice.is_some() {
+                            lines += 1;
+                        }
+                        lines
+                    });
+                    let rows =
+                        usize::from(crate::tui::PLAN_NARRATIVE_AREA_HEIGHT.saturating_sub(2));
+                    let mut nav = NarrativeScrollNav {
+                        scroll: &mut narrative_scroll,
+                        max: total.saturating_sub(rows),
+                    };
+                    crate::tui::navigation::dispatch_navigation(&mut nav, key);
                 }
                 Event::Key(key) => {
                     let mut nav = PlanNav {
@@ -1144,11 +1163,47 @@ impl crate::tui::navigation::NavigableSurface for PlanNav<'_> {
     }
 }
 
+const PLAN_NARRATIVE_PAGE: usize = 5;
+
+/// Scrolls the plan narrative panel through the shared navigation core. The
+/// narrative is a single fixed-height window, so `Tab` is a no-op; arrows/`jk`
+/// scroll one line, `PgUp`/`PgDn` page, and `Home`/`End`/`g`/`G` jump to the
+/// first/last screen — parity with the run narrative panel. `max` is the
+/// largest in-bounds offset (`total - visible_rows`), so the window never
+/// scrolls past the final line.
+struct NarrativeScrollNav<'a> {
+    scroll: &'a mut usize,
+    max: usize,
+}
+
+impl crate::tui::navigation::NavigableSurface for NarrativeScrollNav<'_> {
+    fn scroll_lines(&mut self, delta: isize) {
+        let next = if delta.is_negative() {
+            self.scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.scroll.saturating_add(delta as usize)
+        };
+        *self.scroll = next.min(self.max);
+    }
+
+    fn scroll_page(&mut self, direction: isize) {
+        self.scroll_lines(direction.signum() * PLAN_NARRATIVE_PAGE as isize);
+    }
+
+    fn scroll_to_start(&mut self) {
+        *self.scroll = 0;
+    }
+
+    fn scroll_to_end(&mut self) {
+        *self.scroll = self.max;
+    }
+}
+
 #[cfg(test)]
 mod nav_tests {
     use super::{
-        CompletionKeyOutcome, PLAN_LIST_PAGE, PlanNav, resolve_completion_key,
-        return_key_dismisses, unloadable_child_notice,
+        CompletionKeyOutcome, NarrativeScrollNav, PLAN_LIST_PAGE, PLAN_NARRATIVE_PAGE, PlanNav,
+        resolve_completion_key, return_key_dismisses, unloadable_child_notice,
     };
     use crate::CompletionAction;
     use crate::tui::navigation::dispatch_navigation;
@@ -1160,6 +1215,59 @@ mod nav_tests {
 
     fn plan_nav(selected: &mut usize, count: usize) -> PlanNav<'_> {
         PlanNav { selected, count }
+    }
+
+    #[test]
+    fn plan_narrative_scroll_clamps_to_window() {
+        let mut scroll = 0usize;
+        // Down advances one line.
+        dispatch_navigation(
+            &mut NarrativeScrollNav {
+                scroll: &mut scroll,
+                max: 7,
+            },
+            key(KeyCode::Down),
+        );
+        assert_eq!(scroll, 1, "Down scrolls one line");
+        // End jumps to the last in-bounds offset, and further Down is clamped there.
+        dispatch_navigation(
+            &mut NarrativeScrollNav {
+                scroll: &mut scroll,
+                max: 7,
+            },
+            key(KeyCode::End),
+        );
+        assert_eq!(scroll, 7, "End jumps to the window bottom");
+        dispatch_navigation(
+            &mut NarrativeScrollNav {
+                scroll: &mut scroll,
+                max: 7,
+            },
+            key(KeyCode::Down),
+        );
+        assert_eq!(scroll, 7, "Down past the bottom stays clamped");
+        // PageUp pages back by one visible window.
+        dispatch_navigation(
+            &mut NarrativeScrollNav {
+                scroll: &mut scroll,
+                max: 7,
+            },
+            key(KeyCode::PageUp),
+        );
+        assert_eq!(
+            scroll,
+            7 - PLAN_NARRATIVE_PAGE,
+            "PgUp pages back one screen"
+        );
+        // Home returns to the top.
+        dispatch_navigation(
+            &mut NarrativeScrollNav {
+                scroll: &mut scroll,
+                max: 7,
+            },
+            key(KeyCode::Home),
+        );
+        assert_eq!(scroll, 0, "Home returns to the top");
     }
 
     #[test]

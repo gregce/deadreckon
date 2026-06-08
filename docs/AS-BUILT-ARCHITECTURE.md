@@ -2859,7 +2859,13 @@ parent breadcrumb are structural, placed first so a narrow terminal cannot
 truncate the exit affordance). `scroll_indicator(offset, rows, total)` (shared
 with the run `panel_title`) shows a `first-last/total` window on every list
 panel; the chain steps panel windows to that range and the plan/campaign
-headers show the selected-item position.
+headers show the selected-item position. The narrative views are also windowed:
+the run narrative panel uses `panel_title`, and the plan narrative panel uses
+`plan_narrative_title` over a fixed `PLAN_NARRATIVE_AREA_HEIGHT` row — so an
+overflowing plan narrative shows `plan narrative first-last/total` and scrolls
+instead of silently clipping. In plan narrative view the shared nav keys drive a
+`NarrativeScrollNav` (clamped to `total - visible_rows`) that scrolls the prose
+rather than moving the task cursor.
 
 41.3 Confirm-before-destructive and exit/return semantics
 `resolve_completion_key` is a pure state machine: Apply and Abandon arm a

@@ -1,5 +1,15 @@
 # Changelog
 
+## Attach TUI Uniformity: narrative panels - 2026-06-08
+
+- The plan narrative panel now windows its fixed-height view and shows a
+  `plan narrative first-last/total` scroll indicator (`plan_narrative_title`),
+  matching the run narrative panel — an overflowing plan narrative scrolls
+  instead of silently clipping. In plan narrative view the shared nav keys drive
+  a `NarrativeScrollNav` (clamped to `total - visible_rows`) that scrolls the
+  prose rather than moving the task cursor. Closes the one "every list panel"
+  gap left by the uniformity slice.
+
 ## Attach TUI Uniformity - 2026-06-05
 
 - One shared key dispatcher (`tui::navigation::NavigableSurface` +

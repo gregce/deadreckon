@@ -586,6 +586,7 @@ fn render_plan_attach_text_with_campaign_for_test(
                     campaign_parent: campaign_parent.as_ref(),
                     narrative_notice: None,
                     narrative_projection: None,
+                    narrative_scroll: 0,
                 },
             )
         })

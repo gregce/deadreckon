@@ -736,6 +736,11 @@ pub(crate) struct RunNarrativeRenderInput<'a> {
 /// visual-graph column. Run and plan share this single breakpoint.
 pub(crate) const NARRATIVE_SPLIT_WIDTH: u16 = 100;
 
+/// Height of the plan-attach narrative/activity row (`vertical[2]`). The inner
+/// list is two rows shorter (top/bottom border); the attach loop relies on this
+/// to clamp the narrative scroll consistently with the renderer.
+pub(crate) const PLAN_NARRATIVE_AREA_HEIGHT: u16 = 7;
+
 fn render_run_narrative(
     frame: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
@@ -1006,6 +1011,7 @@ pub(crate) struct PlanAttachRenderState<'a> {
     pub(crate) campaign_parent: Option<&'a AttachCampaignParent>,
     pub(crate) narrative_notice: Option<&'a str>,
     pub(crate) narrative_projection: Option<&'a narrative::NarrativeProjection>,
+    pub(crate) narrative_scroll: usize,
 }
 
 pub(crate) fn render_plan_attach(
@@ -1020,7 +1026,7 @@ pub(crate) fn render_plan_attach(
         .constraints([
             Constraint::Length(7),
             Constraint::Min(10),
-            Constraint::Length(7),
+            Constraint::Length(PLAN_NARRATIVE_AREA_HEIGHT),
             Constraint::Length(2),
         ])
         .split(area);
@@ -1168,6 +1174,21 @@ pub(crate) fn render_plan_attach(
     frame.render_widget(Paragraph::new(footer), vertical[3]);
 }
 
+pub(crate) fn plan_narrative_title(
+    visual: NarrativeVisualMode,
+    scroll: usize,
+    rows: usize,
+    total: usize,
+    split: bool,
+) -> String {
+    let base = if split {
+        "plan narrative".to_string()
+    } else {
+        format!("plan narrative / {}", visual.label())
+    };
+    format!("{base}{}", scroll_indicator(scroll, rows, total))
+}
+
 fn render_plan_narrative_attach(
     frame: &mut ratatui::Frame<'_>,
     paths: &DeadreckonPaths,
@@ -1189,6 +1210,7 @@ fn render_plan_narrative_attach(
     if let Some(notice) = state.narrative_notice {
         lines.insert(2, format!("[fresh] {notice}"));
     }
+    let rows = area.height.saturating_sub(2) as usize;
     if area.width >= NARRATIVE_SPLIT_WIDTH && state.visual != NarrativeVisualMode::None {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -1196,10 +1218,17 @@ fn render_plan_narrative_attach(
             .split(area);
         let visual_lines = narrative::graph_ascii_lines(&projection.graph, state.visual);
         lines.retain(|line| !line.starts_with("Visual:"));
+        let scroll = state.narrative_scroll.min(lines.len().saturating_sub(rows));
         frame.render_widget(
-            List::new(lines.into_iter().map(narrative_list_item)).block(
+            List::new(visible_narrative_items(&lines, scroll, rows)).block(
                 Block::default()
-                    .title("plan narrative")
+                    .title(plan_narrative_title(
+                        state.visual,
+                        scroll,
+                        rows,
+                        lines.len(),
+                        true,
+                    ))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(ui::TUI_PALETTE.border_focused)),
             ),
@@ -1214,10 +1243,17 @@ fn render_plan_narrative_attach(
             chunks[1],
         );
     } else {
+        let scroll = state.narrative_scroll.min(lines.len().saturating_sub(rows));
         frame.render_widget(
-            List::new(lines.into_iter().map(narrative_list_item)).block(
+            List::new(visible_narrative_items(&lines, scroll, rows)).block(
                 Block::default()
-                    .title(format!("plan narrative / {}", state.visual.label()))
+                    .title(plan_narrative_title(
+                        state.visual,
+                        scroll,
+                        rows,
+                        lines.len(),
+                        false,
+                    ))
                     .borders(Borders::ALL),
             ),
             area,

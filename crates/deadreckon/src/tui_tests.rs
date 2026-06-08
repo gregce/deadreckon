@@ -41,8 +41,8 @@ use super::tui::{
     AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState, NARRATIVE_SPLIT_WIDTH,
     build_run_narrative_projection, chain_activity_lines, chain_attach_footer_text,
     chain_attach_header_text, chain_event_read_hint, chain_timeline_lines, footer,
-    markdown_to_tui_lines, max_panel_scroll, panel_title, render_chain_attach, scroll_indicator,
-    selection_glyph,
+    markdown_to_tui_lines, max_panel_scroll, panel_title, plan_narrative_title,
+    render_chain_attach, scroll_indicator, selection_glyph,
 };
 use super::{
     ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachJsonlTail,
@@ -1825,6 +1825,7 @@ fn render_plan_attach_text_with_view(
             campaign_parent: None,
             narrative_notice: None,
             narrative_projection: None,
+            narrative_scroll: 0,
         },
     )
 }
@@ -1854,6 +1855,7 @@ fn render_plan_attach_text_with_feed(
             campaign_parent: None,
             narrative_notice: None,
             narrative_projection: None,
+            narrative_scroll: 0,
         },
     )
 }
@@ -3462,6 +3464,34 @@ fn plan_attach_narrative_renders_agent_table_and_visual() {
     assert!(text.contains("smoke:child"), "{text}");
     assert!(text.contains("deps=1"), "{text}");
     assert!(text.contains("n narrative/activity"), "{text}");
+}
+
+#[test]
+fn plan_narrative_panel_shows_scroll_indicator() {
+    // The plan narrative is a fixed 7-row (5 visible) window. Like the run
+    // narrative panel it must window its lines and show a position readout
+    // rather than silently clipping an overflowing narrative.
+
+    // A narrative that fits shows no indicator (bare title).
+    assert_eq!(
+        plan_narrative_title(NarrativeVisualMode::Architecture, 0, 5, 4, true),
+        "plan narrative"
+    );
+    // An overflowing narrative at the top shows the windowed readout.
+    assert_eq!(
+        plan_narrative_title(NarrativeVisualMode::Architecture, 0, 5, 12, true),
+        "plan narrative 1-5/12"
+    );
+    // Scrolling three lines advances the window.
+    assert_eq!(
+        plan_narrative_title(NarrativeVisualMode::Architecture, 3, 5, 12, true),
+        "plan narrative 4-8/12"
+    );
+    // The non-split layout keeps the visual label and still shows the readout.
+    assert_eq!(
+        plan_narrative_title(NarrativeVisualMode::Architecture, 0, 5, 12, false),
+        "plan narrative / architecture 1-5/12"
+    );
 }
 
 #[test]
