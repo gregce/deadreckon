@@ -3,8 +3,26 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{DeadreckonError, Result};
 
-pub const DEFAULT_DEADRECKON_HOME: &str = "/Users/gdc/.deadreckon";
-pub const SOURCE_ROOT: &str = "/Users/gdc/deadreckon";
+/// The durable-state home: `$DEADRECKON_HOME`, else `~/.deadreckon`.
+pub fn default_deadreckon_home() -> PathBuf {
+    std::env::home_dir()
+        .map(|home| home.join(".deadreckon"))
+        .unwrap_or_else(|| PathBuf::from(".deadreckon"))
+}
+
+/// The deadreckon source checkout, when one is reachable. `$DEADRECKON_SOURCE_ROOT`
+/// wins; otherwise the workspace this binary was compiled from is probed. Installed
+/// release binaries return a path that does not exist on the user's machine, so
+/// callers must treat this as an optional last-tier fallback, never a requirement.
+pub fn source_root() -> Option<PathBuf> {
+    if let Some(root) = env::var_os("DEADRECKON_SOURCE_ROOT") {
+        return Some(PathBuf::from(root));
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .map(Path::to_path_buf)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadreckonPaths {
@@ -15,7 +33,7 @@ impl DeadreckonPaths {
     pub fn discover() -> Self {
         let home = env::var_os("DEADRECKON_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_DEADRECKON_HOME));
+            .unwrap_or_else(default_deadreckon_home);
         Self { home }
     }
 

@@ -10,7 +10,14 @@ const AUDIT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../docs/AUDIT-2026-05-11.md"
 );
-const REPORT: &str = "/Users/gdc/stoa/docs/research/2026-05-10-unmet-needs/REPORT.md";
+// The needs report is a source research doc outside this repository; resolve
+// it relative to the running user's home so the cross-reference runs on the
+// author's machine and skips cleanly everywhere else (e.g. CI).
+fn report_path() -> std::path::PathBuf {
+    std::env::home_dir()
+        .unwrap_or_default()
+        .join("stoa/docs/research/2026-05-10-unmet-needs/REPORT.md")
+}
 
 #[test]
 fn audit_doc_lists_all_25_needs_with_status() {
@@ -23,7 +30,10 @@ fn audit_doc_lists_all_25_needs_with_status() {
     // the cross-reference can only run on a machine that has it (e.g. the
     // author's). Skip it cleanly elsewhere, such as in CI.
     let Some(needs) = report_need_titles() else {
-        eprintln!("skipping external REPORT.md cross-reference: {REPORT} not present");
+        eprintln!(
+            "skipping external REPORT.md cross-reference: {} not present",
+            report_path().display()
+        );
         return;
     };
     for (idx, need) in needs.iter().enumerate() {
@@ -120,7 +130,7 @@ fn audit_rows(audit: &str) -> Vec<AuditRow> {
 }
 
 fn report_need_titles() -> Option<Vec<String>> {
-    let contents = std::fs::read_to_string(REPORT).ok()?;
+    let contents = std::fs::read_to_string(report_path()).ok()?;
     Some(
         contents
             .lines()

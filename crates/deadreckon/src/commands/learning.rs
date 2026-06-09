@@ -875,7 +875,7 @@ fn load_self_improve_proposal(paths: &DeadreckonPaths, target: &str) -> Result<L
             stimulus: Vec::<LearningStimulus>::new(),
             hypothesis: "manual goal file".to_string(),
             target: LearningProposalTarget {
-                repo: "/Users/gdc/deadreckon".to_string(),
+                repo: deadreckon_core::learning::proposal_target_repo(),
                 scope: "manual".to_string(),
             },
             goal_text,

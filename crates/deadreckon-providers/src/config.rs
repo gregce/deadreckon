@@ -7,7 +7,15 @@ use crate::registry::{
 };
 use crate::{ProviderConfigFile, ProviderEntry, ProviderError, ProviderKind, Result};
 
-pub const DEFAULT_CONFIG_PATH: &str = "/Users/gdc/.deadreckon/config.toml";
+/// The config file under the deadreckon home: `$DEADRECKON_HOME/config.toml`,
+/// else `~/.deadreckon/config.toml`.
+pub fn default_config_path() -> std::path::PathBuf {
+    let home = std::env::var_os("DEADRECKON_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|home| home.join(".deadreckon")))
+        .unwrap_or_else(|| std::path::PathBuf::from(".deadreckon"));
+    home.join("config.toml")
+}
 
 pub fn read_config(path: &Path) -> Result<ProviderConfigFile> {
     match std::fs::read_to_string(path) {

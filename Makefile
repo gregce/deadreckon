@@ -1,6 +1,6 @@
 SHELL := /bin/zsh
 
-ROOT := /Users/gdc/deadreckon
+ROOT := $(CURDIR)
 BIN := $(ROOT)/target/release/deadreckon
 DEADRECKON_HOME ?= $(ROOT)/.deadreckon-smoke
 STRESS_SECONDS ?= 600
@@ -86,8 +86,8 @@ doctor: build
 	$(BIN) doctor
 
 alias-zsh: build
-	@tmp=$$(mktemp); awk '!/^# deadreckon CLI alias$$/ && !/^alias deadreckon=/' /Users/gdc/.zshrc > $$tmp; printf '\n# deadreckon CLI alias\nalias deadreckon='\''/Users/gdc/deadreckon/target/release/deadreckon'\''\n' >> $$tmp; mv $$tmp /Users/gdc/.zshrc
-	@printf '%s\n' 'alias installed: open a new shell or run `source /Users/gdc/.zshrc`'
+	@tmp=$$(mktemp); awk '!/^# deadreckon CLI alias$$/ && !/^alias deadreckon=/' $(HOME)/.zshrc > $$tmp; printf '\n# deadreckon CLI alias\nalias deadreckon='\''$(BIN)'\''\n' >> $$tmp; mv $$tmp $(HOME)/.zshrc
+	@printf '%s\n' 'alias installed: open a new shell or run `source ~/.zshrc`'
 
 completion-install: build
 	$(BIN) completion install

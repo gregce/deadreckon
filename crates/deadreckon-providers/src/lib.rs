@@ -17,7 +17,7 @@ pub mod cli_codex;
 pub mod registry;
 pub mod taxonomy;
 
-pub use config::{DEFAULT_CONFIG_PATH, read_config};
+pub use config::{default_config_path, read_config};
 pub use error::{ProviderError, Result};
 pub use http::ProviderAdapter;
 pub use registry::{ModelCatalogOverride, ModelEntry};

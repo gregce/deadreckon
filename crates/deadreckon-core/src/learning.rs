@@ -16,7 +16,7 @@ use crate::flight::{FLIGHT_EVENTS_JSONL, FLIGHT_MANIFEST_JSON, read_rewind_event
 use crate::gate::{
     ACCEPTANCE_PROGRESS_JSONL, AcceptanceProgressEntry, acceptance_spec_path_for_run_root,
 };
-use crate::paths::{DeadreckonPaths, SOURCE_ROOT};
+use crate::paths::{DeadreckonPaths, source_root};
 use crate::state::{
     PipelineState, RunStatus, append_json_line, atomic_write_json, load_state, spend_summary,
 };
@@ -557,6 +557,14 @@ pub fn learning_report(paths: &DeadreckonPaths, scope: Option<&str>) -> Result<L
     })
 }
 
+/// The repo a self-improvement proposal targets: the source checkout when the
+/// binary can see one, otherwise a placeholder the operator must resolve.
+pub fn proposal_target_repo() -> String {
+    source_root()
+        .map(|root| root.display().to_string())
+        .unwrap_or_else(|| "<project-root>".to_string())
+}
+
 pub fn build_reflection_prompt(
     paths: &DeadreckonPaths,
     scope: Option<&str>,
@@ -584,7 +592,7 @@ pub fn build_reflection_prompt(
                 "insights": ["insight summary or generated local id reference"],
                 "stimulus": [{"signal_id": "sig-...", "run_id": "dr-..."}],
                 "hypothesis": "testable hypothesis",
-                "target": {"repo": "/Users/gdc/deadreckon", "scope": "cli-friendliness"},
+                "target": {"repo": proposal_target_repo(), "scope": "cli-friendliness"},
                 "goal_text": "implementation goal",
                 "done_criteria": ["focused tests pass"],
                 "expected_risk": "low|medium|high",
@@ -1304,9 +1312,12 @@ fn redact_learning_string(
         findings.push("deadreckon home path redacted".to_string());
         redacted = redacted.replace(home.as_ref(), "<deadreckon-home>");
     }
-    if redacted.contains(SOURCE_ROOT) {
-        findings.push("project root path redacted".to_string());
-        redacted = redacted.replace(SOURCE_ROOT, "<project-root>");
+    if let Some(root) = source_root() {
+        let root = root.to_string_lossy();
+        if !root.is_empty() && redacted.contains(root.as_ref()) {
+            findings.push("project root path redacted".to_string());
+            redacted = redacted.replace(root.as_ref(), "<project-root>");
+        }
     }
     if let Ok(user_home) = std::env::var("HOME")
         && !user_home.is_empty()
@@ -1965,7 +1976,7 @@ mod tests {
             }],
             hypothesis: "helps".to_string(),
             target: LearningProposalTarget {
-                repo: "/Users/gdc/deadreckon".to_string(),
+                repo: "/repo/deadreckon".to_string(),
                 scope: "cli".to_string(),
             },
             goal_text: "goal".to_string(),
@@ -2266,7 +2277,7 @@ mod tests {
                 "title": "Improve setup footer",
                 "stimulus": [{"signal_id": sig.signal_id, "run_id": state.run_id}],
                 "hypothesis": "better footer helps",
-                "target": {"repo": "/Users/gdc/deadreckon", "scope": "cli"},
+                "target": {"repo": "/repo/deadreckon", "scope": "cli"},
                 "goal_text": "Add a clearer setup footer.",
                 "done_criteria": ["focused test covers footer"],
                 "expected_risk": "low"
@@ -2470,7 +2481,7 @@ mod tests {
             }],
             hypothesis: "helps".to_string(),
             target: LearningProposalTarget {
-                repo: "/Users/gdc/deadreckon".to_string(),
+                repo: "/repo/deadreckon".to_string(),
                 scope: "cli".to_string(),
             },
             goal_text: "goal".to_string(),
@@ -2547,7 +2558,7 @@ mod tests {
             }],
             hypothesis: "helps".to_string(),
             target: LearningProposalTarget {
-                repo: "/Users/gdc/deadreckon".to_string(),
+                repo: "/repo/deadreckon".to_string(),
                 scope: "cli".to_string(),
             },
             goal_text: "goal".to_string(),

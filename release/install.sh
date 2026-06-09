@@ -2,9 +2,13 @@
 set -eu
 
 repo="${DEADRECKON_REPO:-gregce/deadreckon}"
-tag="${DEADRECKON_TAG:-v0.1.0-rc.1}"
+tag="${DEADRECKON_TAG:-latest}"
 asset="${DEADRECKON_INSTALLER_ASSET:-deadreckon-installer.sh}"
-base_url="https://github.com/${repo}/releases/download/${tag}"
+if [ "$tag" = "latest" ]; then
+  base_url="https://github.com/${repo}/releases/latest/download"
+else
+  base_url="https://github.com/${repo}/releases/download/${tag}"
+fi
 tmp="${TMPDIR:-/tmp}/deadreckon-install.$$"
 
 die() {

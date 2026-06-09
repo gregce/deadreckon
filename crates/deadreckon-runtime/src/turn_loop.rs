@@ -1731,7 +1731,7 @@ fn git_status(cwd: &Path, args: &[&str]) -> Result<()> {
 
 fn gate_binary_path() -> Result<PathBuf> {
     let current = std::env::current_exe().map_err(|source| DeadreckonError::Io {
-        path: PathBuf::from("/Users/gdc/deadreckon/target"),
+        path: PathBuf::from("current-exe"),
         source,
     })?;
     let gate = current.with_file_name("dr-gate");
@@ -3172,7 +3172,7 @@ storage = "jsonl"
     #[test]
     fn per_tool_policy_refuses_write_outside_working_dir() {
         let root = PathBuf::from("/tmp/deadreckon-safe-root");
-        let absolute = safe_working_path(&root, Path::new("/Users/gdc/.ssh/id_rsa"))
+        let absolute = safe_working_path(&root, Path::new("/Users/victim/.ssh/id_rsa"))
             .expect_err("absolute path refused");
         let parent =
             safe_working_path(&root, Path::new("../outside.txt")).expect_err("parent path refused");

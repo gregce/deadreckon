@@ -59,9 +59,9 @@ pub(crate) async fn run_cli_with_options(
     options: CliRunOptions,
 ) -> Result<CliOutput> {
     if let Some(backend) = options.sandbox_backend {
-        let cwd = options.cwd.unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/Users/gdc/deadreckon"))
-        });
+        let cwd = options
+            .cwd
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
         let resolved = resolve_cli_binary(binary);
         let mut env = BTreeMap::new();
         if let Some(path) = std::env::var_os("PATH") {

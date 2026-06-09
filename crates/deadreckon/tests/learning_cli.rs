@@ -569,7 +569,7 @@ fn improve_self_missing_candidate_refusal_uses_verdict_surface() {
         stimulus: Vec::new(),
         hypothesis: "test".to_string(),
         target: LearningProposalTarget {
-            repo: "/Users/gdc/deadreckon".to_string(),
+            repo: "/repo/deadreckon".to_string(),
             scope: "cli".to_string(),
         },
         goal_text: "goal".to_string(),
@@ -676,7 +676,7 @@ fn write_synthetic_pr_fixture(paths: &DeadreckonPaths) {
         }],
         hypothesis: "dry-run path works".to_string(),
         target: LearningProposalTarget {
-            repo: "/Users/gdc/deadreckon".to_string(),
+            repo: "/repo/deadreckon".to_string(),
             scope: "cli".to_string(),
         },
         goal_text: "Make PR dry-run testable.".to_string(),
@@ -772,7 +772,7 @@ fn write_fake_learning_reflection_provider(
                 }],
                 "hypothesis": "Learning propose output should lead with one action.",
                 "target": {
-                    "repo": "/Users/gdc/deadreckon",
+                    "repo": "/repo/deadreckon",
                     "scope": "cli-friendliness"
                 },
                 "goal_text": "Normalize learning propose output to the verdict surface.",

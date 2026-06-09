@@ -93,17 +93,17 @@ orchestration machinery when you want the guided front door first.
 ## Build And Install Alias
 
 ```bash
-cd /Users/gdc/deadreckon
+cd /path/to/deadreckon
 make build
 make alias-zsh
-source /Users/gdc/.zshrc
+source ~/.zshrc
 deadreckon --help
 ```
 
 The alias points to:
 
 ```bash
-/Users/gdc/deadreckon/target/release/deadreckon
+<your checkout>/target/release/deadreckon
 ```
 
 ## Shell Tab Completion
@@ -149,13 +149,13 @@ STRESS_SECONDS=30 make stress
 By default, deadreckon writes runtime state to:
 
 ```bash
-/Users/gdc/.deadreckon
+~/.deadreckon
 ```
 
-For disposable tests, set:
+For disposable tests, point it somewhere throwaway:
 
 ```bash
-export DEADRECKON_HOME=/Users/gdc/deadreckon/.try-deadreckon
+export DEADRECKON_HOME=/tmp/try-deadreckon
 ```
 
 Per-run artifacts include:
@@ -175,7 +175,7 @@ working/ or library/<scope>/<run-id>/
 Completed accepted runs are promoted to:
 
 ```bash
-/Users/gdc/.deadreckon/library/<scope>/<run-id>/
+~/.deadreckon/library/<scope>/<run-id>/
 ```
 
 The directory where you launch `deadreckon run` is recorded as `launch-dir`.
@@ -217,7 +217,7 @@ deadreckon config set providers.anthropic.api_key "$ANTHROPIC_API_KEY"
 Use this to prove the harness works without provider keys:
 
 ```bash
-export DEADRECKON_HOME=/Users/gdc/deadreckon/.try-deadreckon
+export DEADRECKON_HOME=/tmp/try-deadreckon
 rm -rf "$DEADRECKON_HOME"
 
 deadreckon run "tiny hello rust" --smoke --sandbox none --max-spend 1
@@ -569,9 +569,9 @@ deadreckon import cursor
 Default source roots:
 
 ```text
-/Users/gdc/.claude/projects/
-/Users/gdc/.codex/sessions/
-/Users/gdc/.cursor/chats/
+~/.claude/projects/
+~/.codex/sessions/
+~/.cursor/chats/
 ```
 
 Override source roots for testing:
@@ -767,6 +767,6 @@ deadreckon resume <run-id>
 If the alias does not exist in the current shell:
 
 ```bash
-source /Users/gdc/.zshrc
+source ~/.zshrc
 alias deadreckon
 ```

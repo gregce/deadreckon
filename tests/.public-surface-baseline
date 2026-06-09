@@ -159,8 +159,8 @@ crate: deadreckon-core
   lock::release_lock_file
   lock::terminate_pid
   paths::DeadreckonPaths
-  paths::DEFAULT_DEADRECKON_HOME
-  paths::SOURCE_ROOT
+  paths::default_deadreckon_home
+  paths::source_root
   plan::append_plan_event
   plan::append_plan_message
   plan::CapabilityPreview
@@ -221,7 +221,7 @@ crate: deadreckon-core
   state::RunStatus
   state::save_state
 crate: deadreckon-providers
-  config::DEFAULT_CONFIG_PATH
+  config::default_config_path
   config::read_config
   error::ProviderError
   error::Result

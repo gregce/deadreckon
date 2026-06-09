@@ -2137,6 +2137,9 @@ fn normalize_import_show(
         }
         text = text.replace(&from.display().to_string(), to);
     }
+    if let Some(source_root) = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2) {
+        text = text.replace(&source_root.display().to_string(), "<SOURCE_ROOT>");
+    }
     text = text.replace(run_id, "<RUN_ID>");
     text = text.replace(scope, "<SCOPE>");
     text = normalize_wrapped_import_show_paths(&text);

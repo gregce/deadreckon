@@ -17,7 +17,7 @@ Acceptance default dr-gate behavior
   "run_root": "<HOME>/runstate/<SCOPE>/runs/<RUN_ID>",
   "working_dir": "<HOME>/runstate/<SCOPE>/runs/<RUN_ID>/working",
   "skill_name": "default-coding",
-  "skill_path": "/Users/gdc/deadreckon/skills/default-coding/SKILL.md",
+  "skill_path": "<SOURCE_ROOT>/skills/default-coding/SKILL.md",
   "sandbox": "none",
   "provider": "import:cursor",
   "max_spend_usd": null,

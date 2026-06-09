@@ -1633,13 +1633,14 @@ fn invoke_chain_hook(
 }
 
 fn resolve_chain_hook(paths: &DeadreckonPaths, cwd: &Path, hook: &str) -> Option<PathBuf> {
-    [
+    let mut candidates = vec![
         cwd.join(".deadreckon/hooks/chain").join(hook),
         paths.home().join("hooks/chain").join(hook),
-        PathBuf::from("/Users/gdc/deadreckon/hooks/chain").join(hook),
-    ]
-    .into_iter()
-    .find(|path| path.exists())
+    ];
+    if let Some(root) = deadreckon_core::source_root() {
+        candidates.push(root.join("hooks/chain").join(hook));
+    }
+    candidates.into_iter().find(|path| path.exists())
 }
 
 fn chain_status_command(
@@ -2716,12 +2717,12 @@ fn chain_hooks_list_command() -> Result<()> {
             .join(".deadreckon/hooks/chain")
             .join(hook);
         let user = paths.home().join("hooks/chain").join(hook);
-        let repo = PathBuf::from("/Users/gdc/deadreckon/hooks/chain").join(hook);
+        let repo = deadreckon_core::source_root().map(|root| root.join("hooks/chain").join(hook));
         let (tier, path) = if project.exists() {
             ("project", project)
         } else if user.exists() {
             ("user", user)
-        } else if repo.exists() {
+        } else if let Some(repo) = repo.filter(|path| path.exists()) {
             ("repo", repo)
         } else {
             ("missing", user)

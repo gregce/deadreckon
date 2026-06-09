@@ -1,5 +1,26 @@
 # Changelog
 
+## Portability: no developer-machine paths in the shipped surface - 2026-06-09
+
+- `DEADRECKON_HOME` now defaults to `~/.deadreckon` derived from the running
+  user's home (`default_deadreckon_home()`), and the provider config default
+  follows it (`default_config_path()`). The compiled-in `/Users/gdc/...`
+  constants (`DEFAULT_DEADRECKON_HOME`, `SOURCE_ROOT`, `DEFAULT_CONFIG_PATH`)
+  are gone; installed binaries work on any machine without env setup.
+- Source-tree fallbacks (run/doc skills, chain hooks, self-improvement targets,
+  learning redaction) resolve through `source_root()` — `$DEADRECKON_SOURCE_ROOT`
+  override first, then the compile-time workspace — and degrade cleanly to the
+  user tier when no checkout is visible.
+- `release/install.sh` defaults to the latest GitHub release instead of a
+  pinned RC tag; `DEADRECKON_TAG` still pins. The Makefile derives `ROOT` from
+  `CURDIR` and `alias-zsh` edits `$HOME/.zshrc`.
+- HOWTO.md is written for any machine (`~/.deadreckon`, `~/.zshrc`,
+  `/tmp/try-deadreckon`) instead of the author's.
+- New guard test (`tests/portability.rs`) fails the build if a
+  developer-machine path reappears anywhere in crates, release scripts, the npm
+  wrapper, the Makefile, or user-facing docs. Import goldens normalize the
+  workspace as `<SOURCE_ROOT>`.
+
 ## Attach TUI Uniformity: narrative panels - 2026-06-08
 
 - The plan narrative panel now windows its fixed-height view and shows a

@@ -13,7 +13,7 @@ use crate::artifacts::SpendRecord;
 use crate::codebase::{CodebaseMode, CodebaseRecord, write_codebase_record};
 use crate::docs::ensure_docs_started;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
-use crate::paths::{DeadreckonPaths, SOURCE_ROOT, task_key, workspace_scope};
+use crate::paths::{DeadreckonPaths, source_root, task_key, workspace_scope};
 
 pub const STATE_VERSION: u32 = 1;
 
@@ -177,6 +177,21 @@ impl PipelineState {
     }
 }
 
+fn resolve_skill_path(paths: &DeadreckonPaths, skill_name: &str) -> PathBuf {
+    let relative = Path::new("skills").join(skill_name).join("SKILL.md");
+    let user = paths.home().join(&relative);
+    if user.exists() {
+        return user;
+    }
+    if let Some(root) = source_root() {
+        let repo = root.join(&relative);
+        if repo.exists() {
+            return repo;
+        }
+    }
+    user
+}
+
 pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<PipelineState> {
     let scope = workspace_scope(&options.cwd)?;
     let task_key = task_key(&options.goal);
@@ -194,11 +209,10 @@ pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<Pipeli
         .with_path(gate_dir.join("nonce"))?;
 
     // AS-BUILT §3: the binary owns deterministic paths while the skill stays a
-    // markdown subprocess boundary under the source tree.
-    let skill_path = PathBuf::from(SOURCE_ROOT)
-        .join("skills")
-        .join(&options.skill_name)
-        .join("SKILL.md");
+    // markdown subprocess boundary. User skills (<home>/skills) win over the
+    // source checkout; a missing file falls back to the built-in contract at read
+    // time, so installed binaries without either tier still run.
+    let skill_path = resolve_skill_path(paths, &options.skill_name);
     let now = Utc::now();
     let mut state = PipelineState {
         version: STATE_VERSION,

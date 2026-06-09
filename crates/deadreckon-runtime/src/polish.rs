@@ -20,7 +20,7 @@ use deadreckon_core::docs::{
     source_layout, tool_stdio_markdown,
 };
 use deadreckon_core::error::{DeadreckonError, Result};
-use deadreckon_core::paths::SOURCE_ROOT;
+use deadreckon_core::paths::source_root;
 use deadreckon_core::polish_subcalls::{
     DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, PolishDiffCoverage, PolishSubcallRecord,
 };
@@ -1058,13 +1058,12 @@ pub fn resolve_skill(name: &str, state: &PipelineState, home: &Path) -> Result<R
         home.join("skills").join(name).join("SKILL.md"),
         SkillSource::User,
     ));
-    candidates.push((
-        PathBuf::from(SOURCE_ROOT)
-            .join("skills")
-            .join(name)
-            .join("SKILL.md"),
-        SkillSource::Repo,
-    ));
+    if let Some(root) = source_root() {
+        candidates.push((
+            root.join("skills").join(name).join("SKILL.md"),
+            SkillSource::Repo,
+        ));
+    }
     for (path, source) in candidates {
         if path.exists() {
             return Ok(ResolvedSkill { path, source });

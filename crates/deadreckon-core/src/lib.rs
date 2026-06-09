@@ -82,7 +82,7 @@ pub use lock::{
     LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,
     terminate_pid,
 };
-pub use paths::{DEFAULT_DEADRECKON_HOME, DeadreckonPaths, SOURCE_ROOT};
+pub use paths::{DeadreckonPaths, default_deadreckon_home, source_root};
 pub use plan::{
     COORDINATOR_JSON, CapabilityPreview, CoordinatorChild, CoordinatorState, NetworkCapability,
     PLAN_CHILD_PARENT_JSON, PLAN_EVENTS_JSONL, PLAN_JSON, PLAN_MESSAGES_JSONL, Plan,
