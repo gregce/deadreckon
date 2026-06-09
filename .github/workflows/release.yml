@@ -124,6 +124,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Install verification prerequisites
+        shell: bash
+        run: |
+          # expect(1) drives the interactive-prompt tests; the suite fails
+          # loudly in CI when it is missing rather than skipping coverage.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq expect
       - name: Full release verification
         shell: bash
         run: |

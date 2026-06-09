@@ -146,7 +146,7 @@ fn improve_self_refuses_dirty_base_and_sandbox_none() {
     let temp = repo_tempdir();
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
-    run_git(&repo, &["init"]);
+    run_git(&repo, &["init", "--initial-branch=main"]);
     fs::write(repo.join("README.md"), "# repo\n").expect("readme");
     run_git(&repo, &["add", "README.md"]);
     run_git(

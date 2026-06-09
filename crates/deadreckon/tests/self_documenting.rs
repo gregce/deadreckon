@@ -1748,7 +1748,7 @@ fn worktree_state(
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
-    git(&repo, &["init"]);
+    git(&repo, &["init", "--initial-branch=main"]);
     git(&repo, &["config", "user.email", "test@example.invalid"]);
     git(&repo, &["config", "user.name", "tester"]);
     fs::write(repo.join("base.txt"), "base").expect("base");

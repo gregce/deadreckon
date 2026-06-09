@@ -1,5 +1,17 @@
 # Changelog
 
+## Host-coupling sweep for the test suite - 2026-06-09
+
+- Swept the suite for works-on-the-author-machine couplings after rc.4's
+  verify gate caught three more: every test `git init` now pins
+  `--initial-branch=main` (branch-name assertions no longer depend on the
+  host's `init.defaultBranch`); the config provider/model shortcut test
+  resolves a stub `codex` from a prepended PATH instead of requiring a real
+  install; and the interactive prompt tests probe for `expect(1)` — skipping
+  with a notice on dev machines, failing loudly when CI lacks it. The release
+  verify job installs `expect` so the interactive coverage actually runs on
+  the Linux gate.
+
 ## Platform-stable characterization goldens - 2026-06-09
 
 - The characterization goldens embedded environment noise: raw temp-path

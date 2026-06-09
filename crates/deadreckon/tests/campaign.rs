@@ -18,7 +18,7 @@ fn workdir(temp: &TempDir) -> std::path::PathBuf {
 
 fn clean_git_repo(temp: &TempDir) -> std::path::PathBuf {
     let repo = workdir(temp);
-    git(&repo, &["init"]).expect("git init");
+    git(&repo, &["init", "--initial-branch=main"]).expect("git init");
     std::fs::write(repo.join("README.md"), "hello").expect("readme");
     git(&repo, &["add", "-A"]).expect("git add");
     git(&repo, &["commit", "-m", "initial"]).expect("git commit");

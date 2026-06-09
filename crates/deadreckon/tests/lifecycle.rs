@@ -2431,7 +2431,7 @@ fn parent_json(dest: &std::path::Path) -> Value {
 fn clean_git_repo(temp: &TempDir) -> std::path::PathBuf {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
-    git(&repo, &["init"]).expect("git init");
+    git(&repo, &["init", "--initial-branch=main"]).expect("git init");
     fs::write(repo.join("README.md"), "hello").expect("readme");
     git(&repo, &["add", "-A"]).expect("add");
     git(&repo, &["commit", "-m", "initial"]).expect("commit");

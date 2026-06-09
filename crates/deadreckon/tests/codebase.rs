@@ -26,7 +26,7 @@ use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
 #[test]
 fn mode_resolution_in_git_repo_defaults_to_worktree() {
     let temp = repo_tempdir();
-    git(temp.path(), &["init"]).expect("git init");
+    git(temp.path(), &["init", "--initial-branch=main"]).expect("git init");
 
     let resolved = resolve_mode(&ModeFlags::default(), temp.path(), false).expect("resolve mode");
 
@@ -263,7 +263,7 @@ fn no_commits_refused_with_initial_commit_hint() {
     let temp = repo_tempdir();
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
-    git(&repo, &["init"]).expect("git init");
+    git(&repo, &["init", "--initial-branch=main"]).expect("git init");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
 
     let output = deadreckon(&paths)
@@ -598,8 +598,12 @@ model = "configured-model"
 fn config_provider_and_model_are_user_friendly_shortcuts() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    // The host may not have a real codex install (CI runners don't); the
+    // shortcut contract under test only needs the binary to be resolvable.
+    let path_env = prepend_fake_cli_to_path(&temp, "codex");
 
     let provider = deadreckon(&paths)
+        .env("PATH", &path_env)
         .arg("config")
         .arg("provider")
         .arg("cli:codex")
@@ -608,6 +612,7 @@ fn config_provider_and_model_are_user_friendly_shortcuts() {
     assert_success(&provider);
 
     let model = deadreckon(&paths)
+        .env("PATH", &path_env)
         .arg("config")
         .arg("model")
         .arg("gpt-5.1-codex")
@@ -621,6 +626,7 @@ fn config_provider_and_model_are_user_friendly_shortcuts() {
     assert!(raw.contains("model = \"gpt-5.1-codex\""), "{raw}");
 
     let show = deadreckon(&paths)
+        .env("PATH", &path_env)
         .arg("config")
         .arg("model")
         .output()
@@ -849,6 +855,9 @@ fn non_tty_without_yes_refuses() {
 
 #[test]
 fn non_git_interactive_offers_three_choices_with_init_default() {
+    if !expect_available_or_skip() {
+        return;
+    }
     let temp = TempDir::new().expect("tempdir");
     let source = temp.path().join("plain");
     fs::create_dir_all(&source).expect("source");
@@ -876,6 +885,9 @@ fn non_git_interactive_offers_three_choices_with_init_default() {
 
 #[test]
 fn non_git_choice_init_runs_git_init_then_worktree() {
+    if !expect_available_or_skip() {
+        return;
+    }
     let temp = TempDir::new().expect("tempdir");
     let source = temp.path().join("plain");
     fs::create_dir_all(&source).expect("source");
@@ -917,6 +929,9 @@ fn non_git_choice_init_runs_git_init_then_worktree() {
 
 #[test]
 fn non_git_choice_copy_resolves_to_copy_mode() {
+    if !expect_available_or_skip() {
+        return;
+    }
     let temp = TempDir::new().expect("tempdir");
     let source = temp.path().join("plain");
     fs::create_dir_all(&source).expect("source");
@@ -958,6 +973,9 @@ fn non_git_choice_copy_resolves_to_copy_mode() {
 
 #[test]
 fn non_git_choice_cancel_exits_zero_no_changes() {
+    if !expect_available_or_skip() {
+        return;
+    }
     let temp = TempDir::new().expect("tempdir");
     let source = temp.path().join("plain");
     fs::create_dir_all(&source).expect("source");
@@ -2316,11 +2334,53 @@ fn clean_git_repo(temp: &TempDir) -> PathBuf {
 fn clean_git_repo_in(temp: &TempDir, name: &str) -> PathBuf {
     let repo = temp.path().join(name);
     fs::create_dir_all(&repo).expect("repo");
-    git(&repo, &["init"]).expect("git init");
+    git(&repo, &["init", "--initial-branch=main"]).expect("git init");
     fs::write(repo.join("README.md"), "hello").expect("readme");
     git(&repo, &["add", "-A"]).expect("add");
     git(&repo, &["commit", "-m", "initial"]).expect("commit");
     repo
+}
+
+/// Write an executable stub named `binary` into a temp `bin/` dir and return
+/// a PATH with it prepended, so provider-presence checks resolve without a
+/// real install on the host.
+fn prepend_fake_cli_to_path(temp: &TempDir, binary: &str) -> String {
+    let bin = temp.path().join("fake-bin");
+    fs::create_dir_all(&bin).expect("fake bin dir");
+    let path = bin.join(binary);
+    fs::write(&path, "#!/bin/sh\nexit 0\n").expect("fake cli");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// `expect(1)` drives the interactive prompts. It ships with macOS but not
+/// every host; in CI its absence must fail loudly (the gate would otherwise
+/// silently lose the interactive coverage), while a dev machine skips.
+fn expect_available_or_skip() -> bool {
+    let available = Command::new("expect")
+        .arg("-v")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !available {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "expect(1) is required in CI: install it (apt-get install expect) so the \
+             interactive prompt tests actually run"
+        );
+        eprintln!("skipping interactive prompt test: expect(1) is unavailable");
+    }
+    available
 }
 
 fn deadreckon_pty(

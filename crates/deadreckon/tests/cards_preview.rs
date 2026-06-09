@@ -153,7 +153,7 @@ fn preview_card_aesthetic_matches_exit_card_fixture() {
 fn clean_git_repo(temp: &TempDir) -> PathBuf {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
-    git(&repo, &["init"]).expect("git init");
+    git(&repo, &["init", "--initial-branch=main"]).expect("git init");
     git(
         &repo,
         &["config", "user.email", "deadreckon@example.invalid"],

@@ -6135,7 +6135,7 @@ fn history_grep_scope_and_all_match_list_semantics() {
     let repo_a = clean_git_repo(&temp);
     let repo_b = temp.path().join("repo-b");
     fs::create_dir_all(&repo_b).expect("repo b");
-    git(&repo_b, &["init"]).expect("git init b");
+    git(&repo_b, &["init", "--initial-branch=main"]).expect("git init b");
     fs::write(repo_b.join("README.md"), "hello b").expect("readme b");
     git(&repo_b, &["add", "-A"]).expect("add b");
     git(&repo_b, &["commit", "-m", "initial b"]).expect("commit b");
@@ -6941,7 +6941,7 @@ esac
 fn clean_git_repo(temp: &TempDir) -> PathBuf {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
-    git(&repo, &["init"]).expect("git init");
+    git(&repo, &["init", "--initial-branch=main"]).expect("git init");
     fs::write(repo.join("README.md"), "hello").expect("readme");
     git(&repo, &["add", "-A"]).expect("add");
     git(&repo, &["commit", "-m", "initial"]).expect("commit");

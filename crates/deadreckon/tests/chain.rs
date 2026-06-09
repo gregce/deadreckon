@@ -4146,7 +4146,7 @@ fn read_run_events(state: &deadreckon_core::PipelineState) -> Vec<RunEvent> {
 fn clean_git_repo(temp: &TempDir) -> PathBuf {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
-    git(&repo, &["init"]).expect("git init");
+    git(&repo, &["init", "--initial-branch=main"]).expect("git init");
     fs::write(repo.join("README.md"), "hello").expect("readme");
     git(&repo, &["add", "-A"]).expect("add");
     git(&repo, &["commit", "-m", "initial"]).expect("commit");
