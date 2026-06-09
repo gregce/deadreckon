@@ -6989,6 +6989,19 @@ fn create_test_run(
 
 fn git(cwd: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
     let output = Command::new("git").arg("-C").arg(cwd).args(args).output()?;
+    // Commits need an identity; CI runners have no global git config.
+    if args.first() == Some(&"init") && output.status.success() {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["config", "user.email", "deadreckon@example.invalid"])
+            .output();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["config", "user.name", "deadreckon"])
+            .output();
+    }
     assert!(
         output.status.success(),
         "git {:?}\n{}{}",

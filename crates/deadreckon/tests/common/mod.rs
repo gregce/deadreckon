@@ -7,6 +7,26 @@ use std::process::{Command, Output};
 use deadreckon_core::DeadreckonPaths;
 use tempfile::TempDir;
 
+/// Write an executable stub named `binary` into a temp `fake-bin/` dir and
+/// return a PATH with it prepended, so provider-presence checks resolve
+/// without a real install on the host (CI runners have no agent CLIs).
+pub fn prepend_fake_cli_to_path(temp: &TempDir, binary: &str) -> String {
+    let bin = temp.path().join("fake-bin");
+    fs::create_dir_all(&bin).expect("fake bin dir");
+    let path = bin.join(binary);
+    fs::write(&path, "#!/bin/sh\nexit 0\n").expect("fake cli");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
 pub fn repo_tempdir() -> TempDir {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.test-tmp");
     fs::create_dir_all(&root).expect("test tmp root");

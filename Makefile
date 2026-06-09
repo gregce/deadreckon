@@ -1,4 +1,5 @@
-SHELL := /bin/zsh
+# bash, not zsh: recipes are POSIX-compatible and CI runners ship no zsh.
+SHELL := /bin/bash
 
 ROOT := $(CURDIR)
 BIN := $(ROOT)/target/release/deadreckon

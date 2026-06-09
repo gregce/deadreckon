@@ -31,7 +31,7 @@ use tokio::net::TcpListener;
 
 mod common;
 
-use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
+use common::{assert_success, deadreckon, prepend_fake_cli_to_path, repo_tempdir, stderr, stdout};
 
 #[test]
 fn materialize_copies_library_to_dest() {
@@ -1275,12 +1275,14 @@ fn completion_install_detects_zsh_writes_script_and_managed_rc_block() {
 fn init_installs_shell_completion_by_default() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    // CI runners have no codex install and HOME is redirected, so a real
+    // codex would truthfully report logged-out; this test is about completion
+    // install, not provider state.
+    let path_env = prepend_fake_cli_to_path(&temp, "codex");
     let output = deadreckon(&paths)
         .env("HOME", temp.path())
         .env("SHELL", "/bin/zsh")
-        // HOME is redirected, so a real codex on PATH would truthfully report
-        // logged-out for this hermetic home; this test is about completion
-        // install, not login state.
+        .env("PATH", &path_env)
         .env("DEADRECKON_AUTH_PROBE", "0")
         .args([
             "init",
