@@ -179,5 +179,5 @@ at the published RC and that the release has `deadreckon-installer.sh` plus
 `SHA256SUMS` attached. For a pinned rehearsal:
 
 ```sh
-curl -fsSL https://deadreckon.sh/install.sh | DEADRECKON_TAG=v0.1.0-rc.3 sh
+curl -fsSL https://deadreckon.sh/install.sh | DEADRECKON_TAG=<tag-under-test> sh
 ```
