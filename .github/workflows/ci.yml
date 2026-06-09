@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: fmt + workspace tests (ubuntu)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install test prerequisites
+        shell: bash
+        run: |
+          # expect(1) drives the interactive-prompt tests; the suite fails
+          # loudly in CI when it is missing rather than skipping coverage.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq expect
+      - name: Format check
+        shell: bash
+        run: cargo fmt --check
+      - name: Workspace tests
+        shell: bash
+        run: cargo test --workspace --locked --no-fail-fast

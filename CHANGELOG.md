@@ -1,5 +1,18 @@
 # Changelog
 
+## CI on every push; platform-scoped hygiene baselines - 2026-06-09
+
+- New `ci.yml` runs `cargo fmt --check` and the full workspace suite
+  (`--no-fail-fast`, with `expect` installed) on ubuntu for every push and
+  pull request — completing the release-trust-closure item so host couplings
+  surface in branch feedback instead of release-candidate tags. The release
+  verify step also uses `--no-fail-fast` so one red binary cannot hide the
+  rest.
+- The release-binary size baseline is per-OS (`tests/.size-baseline-macos`,
+  `tests/.size-baseline-linux` — Mach-O and ELF sizes are not comparable),
+  and the rustfmt-commit archaeology test skips on shallow clones, which
+  cannot see repo history. Both failed rc.5's verify gate.
+
 ## Host-coupling sweep for the test suite - 2026-06-09
 
 - Swept the suite for works-on-the-author-machine couplings after rc.4's

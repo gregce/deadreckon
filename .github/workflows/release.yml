@@ -138,7 +138,7 @@ jobs:
           # by tests/portability.rs — and the PTY test handles util-linux
           # script): no release ships on a suite that never ran.
           cargo fmt --check
-          cargo test --workspace --locked
+          cargo test --workspace --locked --no-fail-fast
           cargo build --release --workspace --locked
 
   build-local-artifacts:
