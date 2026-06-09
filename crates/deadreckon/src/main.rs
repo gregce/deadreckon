@@ -10952,8 +10952,11 @@ fn completion_hints_enabled(no_hints: bool) -> bool {
 async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     loop {
+        // `x` is the abandon key everywhere (the attach TUI reserves `b` for
+        // "back"); `b` stays accepted here for muscle memory but is not
+        // advertised, so the documented keymap is one keymap.
         let prompt_text = if is_worktree_run(state) {
-            "completed action [a apply, b abandon, d docs, s show, q quit]: "
+            "completed action [a apply, x abandon, d docs, s show, q quit]: "
         } else {
             "completed action [m export, e extend, d docs, s show, q quit]: "
         };
@@ -11051,7 +11054,7 @@ fn completion_action_from_input(input: &str) -> Option<CompletionAction> {
         "m" | "export" | "materialize" => Some(CompletionAction::Materialize),
         "e" | "extend" => Some(CompletionAction::Extend),
         "a" | "apply" => Some(CompletionAction::Apply),
-        "b" | "abandon" => Some(CompletionAction::Abandon),
+        "x" | "b" | "abandon" => Some(CompletionAction::Abandon),
         "d" | "doc" | "docs" => Some(CompletionAction::Docs),
         "s" | "show" => Some(CompletionAction::Show),
         "q" | "quit" | "" => Some(CompletionAction::Quit),

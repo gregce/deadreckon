@@ -37,12 +37,13 @@ use super::commands::start::{
     start_launch_preview_facts, start_provider_role_summary,
 };
 use super::tui::{
-    AttachActionNotice, AttachPanel, AttachPanelCounts, AttachPanelRows, AttachParentPlan,
-    AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState, NARRATIVE_SPLIT_WIDTH,
-    build_run_narrative_projection, chain_activity_lines, chain_attach_footer_text,
-    chain_attach_header_text, chain_event_read_hint, chain_timeline_lines, footer,
-    markdown_to_tui_lines, max_panel_scroll, panel_title, plan_narrative_title,
-    render_chain_attach, scroll_indicator, selection_glyph,
+    AttachActionNotice, AttachHelpMode, AttachPanel, AttachPanelCounts, AttachPanelRows,
+    AttachParentPlan, AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState,
+    NARRATIVE_SPLIT_WIDTH, build_run_narrative_projection, chain_activity_lines,
+    chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
+    chain_timeline_lines, footer, help_overlay_lines, markdown_to_tui_lines, max_panel_scroll,
+    panel_title, plan_narrative_title, render_chain_attach, render_help_overlay,
+    scroll_indicator, selection_glyph,
 };
 use super::{
     ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachJsonlTail,
@@ -5339,4 +5340,78 @@ fn live_files_explain_cleaned_worktree() {
         live_file_lines(&live),
         vec!["working tree was removed after cleanup".to_string()]
     );
+}
+
+#[test]
+fn help_overlay_lists_complete_bindings_per_mode() {
+    for mode in [
+        AttachHelpMode::Run,
+        AttachHelpMode::Plan,
+        AttachHelpMode::Campaign,
+        AttachHelpMode::Chain,
+    ] {
+        let lines = help_overlay_lines(mode);
+        let keys = lines.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        assert!(
+            keys.iter().any(|key| key.contains('q')),
+            "{mode:?} must document detach"
+        );
+        assert_eq!(
+            keys.last().copied(),
+            Some("?"),
+            "{mode:?} must document the help toggle itself"
+        );
+        let actions = lines.iter().map(|(_, action)| *action).collect::<Vec<_>>();
+        assert!(
+            actions.iter().all(|action| !action.is_empty()),
+            "{mode:?} has an unlabeled key"
+        );
+    }
+
+    // One keymap: abandon is x (with confirm) in run attach, and the chain
+    // surface documents that k means kill, not scroll.
+    let run = help_overlay_lines(AttachHelpMode::Run);
+    assert!(
+        run.iter()
+            .any(|(key, action)| *key == "x" && action.contains("abandon")),
+        "run overlay must document x abandon"
+    );
+    let chain = help_overlay_lines(AttachHelpMode::Chain);
+    assert!(
+        chain
+            .iter()
+            .any(|(key, action)| *key == "k" && action.contains("kill")),
+        "chain overlay must document k kill"
+    );
+}
+
+#[test]
+fn help_overlay_renders_centered_popup_with_title() {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_help_overlay(frame, AttachHelpMode::Run))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    let mut text = String::new();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            text.push_str(buffer.cell((x, y)).expect("cell").symbol());
+        }
+        text.push('\n');
+    }
+
+    assert!(text.contains("run attach keys"), "{text}");
+    assert!(text.contains("any key closes"), "{text}");
+    assert!(text.contains("abandon completed run"), "{text}");
+}
+
+#[test]
+fn help_overlay_survives_narrow_terminals() {
+    let backend = TestBackend::new(24, 8);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_help_overlay(frame, AttachHelpMode::Chain))
+        .expect("draw");
 }

@@ -15,7 +15,7 @@ use pulldown_cmark::{
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 
 #[derive(Debug, Default)]
 pub(crate) struct ChainAttachTuiState {
@@ -321,6 +321,7 @@ pub(crate) fn chain_attach_footer_text(chain: &Chain) -> String {
             ("[Ctrl-D/q/Esc]", "detach"),
             ("j/k", "move"),
             ("PgUp/PgDn", "activity"),
+            ("?", "help"),
         ])
     }
 }
@@ -637,6 +638,7 @@ fn campaign_attach_footer_text(plain: bool) -> String {
             ("arrows/Tab", "select sub-plan"),
             ("Enter", "sub-plan"),
             ("r", "refresh"),
+            ("?", "help"),
         ])
     }
 }
@@ -1311,6 +1313,7 @@ pub(crate) fn plan_attach_footer(
     if show_hints && !has_primary_footer_action {
         footer.push_str("  |  merge after fork");
     }
+    footer.push_str("  |  ? help");
     footer
 }
 
@@ -2172,7 +2175,140 @@ fn footer_for_state(state: &deadreckon_core::PipelineState, tui_state: &AttachTu
 
     // Detach vs back-to-plan is structural (no string-replace hack): a child run
     // attached from a plan shows the parent label and a back affordance instead.
+    items.push(("?".to_string(), "help".to_string()));
     footer(&items)
+}
+
+/// Which attach surface the `?` help overlay describes. Uniform chrome,
+/// mode-specific content: every surface gets the same overlay frame and close
+/// semantics, with only the binding list varying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachHelpMode {
+    Run,
+    Plan,
+    Campaign,
+    Chain,
+}
+
+impl AttachHelpMode {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Run => "run attach keys",
+            Self::Plan => "plan attach keys",
+            Self::Campaign => "campaign attach keys",
+            Self::Chain => "chain attach keys",
+        }
+    }
+}
+
+/// The complete binding list per attach surface — the footer shows the
+/// load-bearing subset and truncates on narrow terminals; this overlay is the
+/// full reference, one keystroke away.
+pub(crate) fn help_overlay_lines(mode: AttachHelpMode) -> Vec<(&'static str, &'static str)> {
+    match mode {
+        AttachHelpMode::Run => vec![
+            ("q / Esc / Ctrl-D", "detach (run keeps going)"),
+            ("b / Backspace", "back to plan (when drilled in)"),
+            ("n", "toggle narrative / activity panels"),
+            ("v", "cycle visual map mode (narrative view)"),
+            ("r", "refresh narrative"),
+            ("Tab / Shift-Tab", "switch focused panel"),
+            ("j k / Up Down", "scroll focused panel"),
+            ("PgUp / PgDn", "page"),
+            ("Home End / g G", "jump to start / end"),
+            ("c", "open chain context (chain-step runs)"),
+            ("a", "apply completed run (y confirms)"),
+            ("x", "abandon completed run (y confirms)"),
+            ("m / e", "materialize / extend completed run"),
+            ("s / d", "show details / toggle docs"),
+            ("?", "toggle this help"),
+        ],
+        AttachHelpMode::Plan => vec![
+            ("q / Esc / Ctrl-D", "detach (plan keeps going)"),
+            ("b / Backspace", "back to campaign (when drilled in)"),
+            ("Enter", "open the selected child run"),
+            ("n", "toggle narrative / task cards"),
+            ("v", "cycle visual map mode (narrative view)"),
+            ("r", "refresh narrative"),
+            ("j k / Up Down", "select task / scroll narrative"),
+            ("PgUp / PgDn", "page"),
+            ("Home End / g G", "jump to start / end"),
+            ("?", "toggle this help"),
+        ],
+        AttachHelpMode::Campaign => vec![
+            ("q / Ctrl-D", "detach (campaign keeps going)"),
+            ("b / Esc / Backspace", "back"),
+            ("Enter", "drill into the selected sub-plan"),
+            ("r", "refresh"),
+            ("j k / Up Down / Tab", "select sub-plan"),
+            ("PgUp / PgDn", "page"),
+            ("Home End / g G", "jump to start / end"),
+            ("?", "toggle this help"),
+        ],
+        AttachHelpMode::Chain => vec![
+            ("q / Esc / Ctrl-D", "detach (chain keeps going)"),
+            ("Enter", "show the selected step's run"),
+            ("r", "redo the selected step"),
+            ("e", "extend the chain with a new step"),
+            ("p", "pause the chain"),
+            ("k", "kill the chain (asks to confirm)"),
+            ("Up / Down", "select step"),
+            ("PgUp / PgDn", "scroll activity"),
+            ("?", "toggle this help"),
+        ],
+    }
+}
+
+/// Draw the `?` help overlay: a centered popup over the current frame. Any
+/// key closes it.
+pub(crate) fn render_help_overlay(frame: &mut ratatui::Frame<'_>, mode: AttachHelpMode) {
+    let lines = help_overlay_lines(mode);
+    let key_width = lines
+        .iter()
+        .map(|(key, _)| key.len())
+        .max()
+        .unwrap_or(0);
+    let body: Vec<Line<'static>> = lines
+        .iter()
+        .map(|(key, action)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {key:key_width$}  "),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw((*action).to_string()),
+            ])
+        })
+        .collect();
+    let width = (key_width + 44).min(frame.area().width.saturating_sub(2) as usize) as u16;
+    let height = (body.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+    let area = centered_rect(frame.area(), width.max(20), height.max(3));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("{} — any key closes", mode.title())),
+        ),
+        area,
+    );
+}
+
+fn centered_rect(
+    outer: ratatui::layout::Rect,
+    width: u16,
+    height: u16,
+) -> ratatui::layout::Rect {
+    let width = width.min(outer.width);
+    let height = height.min(outer.height);
+    ratatui::layout::Rect {
+        x: outer.x + (outer.width.saturating_sub(width)) / 2,
+        y: outer.y + (outer.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
 }
 
 fn deadreckoning_status_line(

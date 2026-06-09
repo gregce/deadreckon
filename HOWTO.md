@@ -354,13 +354,14 @@ Esc      quit
 Tab      move focus between panels
 j/k      scroll focused panel
 PgUp/PgDn scroll focused panel by a page
+?        full key reference overlay (any key closes)
 ```
 
 After a run completes, the TUI footer adds lifecycle actions:
 
 ```text
-a        apply a completed worktree run
-b        abandon/discard a completed worktree run
+a        apply a completed worktree run (y confirms)
+x        abandon/discard a completed worktree run (y confirms)
 d        toggle formatted RUN-NARRATIVE.md docs in the main panel
 m        export a completed copy/fresh artifact
 e        extend a completed copy/fresh run with a follow-up goal
@@ -403,11 +404,11 @@ The TUI does not start, kill, resume, or undo runs. Use CLI commands for those c
 Completed `run` and `extend` commands show the same lifecycle actions in the CLI:
 
 ```text
-completed action [a apply, b abandon, d docs, s show, q quit]:
+completed action [a apply, x abandon, d docs, s show, q quit]:
 completed action [m export, e extend, d docs, s show, q quit]:
 ```
 
-Worktree runs use `a` to squash-apply changes to the current branch or `b` to
+Worktree runs use `a` to squash-apply changes to the current branch or `x` to
 abandon the worktree and temporary branch. Copy/fresh runs use `m` to export the
 library artifact into a normal directory, `e` to start a child run from the
 completed artifact, `d` to read `RUN-NARRATIVE.md`, or `s` to inspect state and lineage. Pass `--no-hints` to

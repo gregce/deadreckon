@@ -1,5 +1,20 @@
 # Changelog
 
+## Attach TUI help overlay and one abandon key - 2026-06-09
+
+- Every attach surface (run, plan, campaign, chain) gains a `?` help overlay:
+  a centered popup with the complete key reference for that surface; any key
+  closes it. The footer shows the load-bearing subset and truncates on narrow
+  terminals — the overlay is the full reference, one keystroke away, and every
+  footer now advertises `? help`.
+- One shared help-key rule (`handle_help_key`): `?` opens, any key while open
+  closes, everything else flows to the surface's normal handling — a key
+  pressed with the overlay open can never fire an action underneath it.
+- One abandon key: the CLI completion prompt now advertises `x abandon`
+  matching the attach TUI (where `b` is "back"); `b` stays accepted for muscle
+  memory but is no longer documented. HOWTO's TUI key table caught up
+  (`x abandon`, confirm keystrokes, the `?` overlay).
+
 ## Honest spend and a wall cap that binds mid-turn - 2026-06-09
 
 - Subscription run spend now reads as the budget it really is —

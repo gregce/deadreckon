@@ -1,9 +1,10 @@
 use super::super::*;
 use super::attach_runtime::*;
+use crate::tui::navigation::{HelpKeyAction, handle_help_key};
 use crate::tui::{
-    AttachActionNotice, AttachParentPlan, AttachTuiState, RunNarrativeRenderInput,
-    attach_panel_counts, build_run_narrative_projection, run_narrative_projection,
-    toggle_attach_view,
+    AttachActionNotice, AttachHelpMode, AttachParentPlan, AttachTuiState,
+    RunNarrativeRenderInput, attach_panel_counts, build_run_narrative_projection,
+    render_help_overlay, run_narrative_projection, toggle_attach_view,
 };
 
 #[derive(Debug)]
@@ -335,6 +336,7 @@ async fn attach_campaign_tui(
         state.campaign.campaign_id.clone(),
     );
 
+    let mut show_help = false;
     let result = loop {
         let mut tick = AttachTickTiming::new(AttachSurface::Campaign, AttachTickBudget::default());
         let stage_started = Instant::now();
@@ -353,7 +355,12 @@ async fn attach_campaign_tui(
         tick.record_since(AttachLoopStage::LoadState, stage_started);
 
         let stage_started = Instant::now();
-        terminal.draw(|frame| render_campaign_attach(frame, &state))?;
+        terminal.draw(|frame| {
+            render_campaign_attach(frame, &state);
+            if show_help {
+                render_help_overlay(frame, AttachHelpMode::Campaign);
+            }
+        })?;
         tick.record_since(AttachLoopStage::Draw, stage_started);
 
         let stage_started = Instant::now();
@@ -364,6 +371,17 @@ async fn attach_campaign_tui(
         let _ = tick.frame_exceeded();
 
         if input_ready && let Event::Key(key) = event::read()? {
+            match handle_help_key(show_help, key) {
+                HelpKeyAction::Open => {
+                    show_help = true;
+                    continue;
+                }
+                HelpKeyAction::Close => {
+                    show_help = false;
+                    continue;
+                }
+                HelpKeyAction::NotHandled => {}
+            }
             match handle_campaign_key(&mut state, key) {
                 CampaignAttachKeyAction::None | CampaignAttachKeyAction::Refresh => {}
                 CampaignAttachKeyAction::Back | CampaignAttachKeyAction::Quit => break Ok(()),
@@ -439,6 +457,7 @@ async fn attach_plan_tui(
     let mut quiet_tracker = NarrativeQuietRefreshTracker::new(Utc::now());
     let mut narrative_refresh_job: Option<AttachPlanNarrativeRefreshJob> = None;
     let mut narrative_projection_cache = AttachNarrativeProjectionCache::default();
+    let mut show_help = false;
 
     let result = loop {
         let mut tick = AttachTickTiming::new(AttachSurface::Plan, AttachTickBudget::default());
@@ -545,7 +564,10 @@ async fn attach_plan_tui(
                     narrative_projection: narrative_projection.as_ref(),
                     narrative_scroll,
                 },
-            )
+            );
+            if show_help {
+                render_help_overlay(frame, AttachHelpMode::Plan);
+            }
         })?;
         tick.record_since(AttachLoopStage::Draw, stage_started);
         let stage_started = Instant::now();
@@ -555,7 +577,21 @@ async fn attach_plan_tui(
         drop(tick.slow_stage_labels());
         let _ = tick.frame_exceeded();
         if input_ready {
-            match event::read()? {
+            let event = event::read()?;
+            if let Event::Key(key) = event {
+                match handle_help_key(show_help, key) {
+                    HelpKeyAction::Open => {
+                        show_help = true;
+                        continue;
+                    }
+                    HelpKeyAction::Close => {
+                        show_help = false;
+                        continue;
+                    }
+                    HelpKeyAction::NotHandled => {}
+                }
+            }
+            match event {
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
                     view = toggle_attach_view(view);
@@ -721,6 +757,7 @@ async fn attach_tui_with_parent(
         AttachJsonlTail::<TraceRecord>::new(initial_state.run_root.join("traces.jsonl"));
     let mut provider_activity_cache = AttachProviderActivityCache::new(&initial_state);
     let mut narrative_projection_cache = AttachNarrativeProjectionCache::default();
+    let mut show_help = false;
 
     let result = loop {
         let mut tick = AttachTickTiming::new(AttachSurface::Run, AttachTickBudget::default());
@@ -812,7 +849,10 @@ async fn attach_tui_with_parent(
         }
         let stage_started = Instant::now();
         terminal.draw(|frame| {
-            render_attach(frame, &state, spend, traces, &events, &live, &tui_state)
+            render_attach(frame, &state, spend, traces, &events, &live, &tui_state);
+            if show_help {
+                render_help_overlay(frame, AttachHelpMode::Run);
+            }
         })?;
         tick.record_since(AttachLoopStage::Draw, stage_started);
 
@@ -823,7 +863,21 @@ async fn attach_tui_with_parent(
         drop(tick.slow_stage_labels());
         let _ = tick.frame_exceeded();
         if input_ready {
-            match event::read()? {
+            let event = event::read()?;
+            if let Event::Key(key) = event {
+                match handle_help_key(show_help, key) {
+                    HelpKeyAction::Open => {
+                        show_help = true;
+                        continue;
+                    }
+                    HelpKeyAction::Close => {
+                        show_help = false;
+                        continue;
+                    }
+                    HelpKeyAction::NotHandled => {}
+                }
+            }
+            match event {
                 Event::Key(key)
                     if tui_state.parent_plan.is_some() && attach_should_return_to_plan(key) =>
                 {

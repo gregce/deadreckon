@@ -26,6 +26,26 @@ pub(crate) trait NavigableSurface {
     }
 }
 
+/// What a key means for the `?` help overlay. One shared rule for every
+/// attach surface: `?` opens, any key while open closes, everything else
+/// flows through to the surface's normal handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelpKeyAction {
+    Open,
+    Close,
+    NotHandled,
+}
+
+pub(crate) fn handle_help_key(help_open: bool, key: KeyEvent) -> HelpKeyAction {
+    if help_open {
+        return HelpKeyAction::Close;
+    }
+    if key.code == KeyCode::Char('?') {
+        return HelpKeyAction::Open;
+    }
+    HelpKeyAction::NotHandled
+}
+
 /// Route `key` through the shared navigation keys, falling back to the surface's
 /// mode-specific hook. Returns `true` if the key was handled.
 pub(crate) fn dispatch_navigation<S: NavigableSurface + ?Sized>(
@@ -124,5 +144,38 @@ mod tests {
         assert!(!dispatch_navigation(&mut surface, key(KeyCode::Char('x'))));
         assert_eq!(surface.mode_keys, vec![KeyCode::Char('x')]);
         assert!(surface.log.is_empty());
+    }
+
+    #[test]
+    fn question_mark_opens_help_and_any_key_closes_it() {
+        assert_eq!(
+            handle_help_key(false, key(KeyCode::Char('?'))),
+            HelpKeyAction::Open
+        );
+        // SHIFT is how most keyboards type '?' — it must still open.
+        assert_eq!(
+            handle_help_key(
+                false,
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)
+            ),
+            HelpKeyAction::Open
+        );
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Esc,
+            KeyCode::Char('?'),
+            KeyCode::Enter,
+            KeyCode::Char('x'),
+        ] {
+            assert_eq!(
+                handle_help_key(true, key(code)),
+                HelpKeyAction::Close,
+                "{code:?} must close the open overlay instead of acting"
+            );
+        }
+        assert_eq!(
+            handle_help_key(false, key(KeyCode::Char('q'))),
+            HelpKeyAction::NotHandled
+        );
     }
 }

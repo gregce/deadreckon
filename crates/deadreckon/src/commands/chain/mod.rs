@@ -2,7 +2,11 @@ use super::super::*;
 use super::attach_runtime::*;
 use crate::commands::acceptance::ensure_acceptance_before_start;
 use crate::commands::attach::{attach_should_quit, resume_tui, suspend_tui};
-use crate::tui::{ChainAttachTuiState, chain_event_read_hint, render_chain_attach};
+use crate::tui::navigation::{HelpKeyAction, handle_help_key};
+use crate::tui::{
+    AttachHelpMode, ChainAttachTuiState, chain_event_read_hint, render_chain_attach,
+    render_help_overlay,
+};
 
 fn print_chain_help(topic: Option<&str>) {
     let topic = topic.unwrap_or("overview");
@@ -2178,6 +2182,7 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     let mut tui_state = ChainAttachTuiState::default();
     let mut event_tail = AttachJsonlTail::<ChainEvent>::new(paths.chain_events(chain_id));
+    let mut show_help = false;
 
     let result = loop {
         let budget = AttachTickBudget::default();
@@ -2201,7 +2206,12 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
         let events = event_tail.rows();
         tui_state.clamp(&chain);
         let stage_started = Instant::now();
-        terminal.draw(|frame| render_chain_attach(frame, &chain, events, &tui_state))?;
+        terminal.draw(|frame| {
+            render_chain_attach(frame, &chain, events, &tui_state);
+            if show_help {
+                render_help_overlay(frame, AttachHelpMode::Chain);
+            }
+        })?;
         tick.record_since(AttachLoopStage::Draw, stage_started);
 
         let stage_started = Instant::now();
@@ -2211,7 +2221,21 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
         drop(tick.slow_stage_labels());
         let _ = tick.frame_exceeded();
         if input_ready {
-            match event::read()? {
+            let event = event::read()?;
+            if let Event::Key(key) = event {
+                match handle_help_key(show_help, key) {
+                    HelpKeyAction::Open => {
+                        show_help = true;
+                        continue;
+                    }
+                    HelpKeyAction::Close => {
+                        show_help = false;
+                        continue;
+                    }
+                    HelpKeyAction::NotHandled => {}
+                }
+            }
+            match event {
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key) => match key.code {
                     KeyCode::Enter => {

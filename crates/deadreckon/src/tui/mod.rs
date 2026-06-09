@@ -10,14 +10,17 @@ pub(crate) use attach_state::{
 #[cfg(test)]
 pub(crate) use attach_state::{AttachPanelCounts, AttachPanelRows, max_panel_scroll};
 pub(crate) use render::{
-    ChainAttachTuiState, PLAN_NARRATIVE_AREA_HEIGHT, PlanAttachRenderState,
+    AttachHelpMode, ChainAttachTuiState, PLAN_NARRATIVE_AREA_HEIGHT, PlanAttachRenderState,
     RunNarrativeRenderInput, attach_activity_lines_for_tui, build_run_narrative_projection,
     chain_event_read_hint, ensure_run_narrative_projection, live_file_lines, plan_event_line,
     plan_event_summary, plan_final_gate_line, plan_provider_summary, plan_repair_label,
     plan_task_detail_lines, process_lines, provider_is_metered, render_attach,
-    render_campaign_attach, render_chain_attach, render_plan_attach, run_narrative_projection,
-    run_narrative_projection_signature,
+    render_campaign_attach, render_chain_attach, render_help_overlay, render_plan_attach,
+    run_narrative_projection, run_narrative_projection_signature,
 };
+
+#[cfg(test)]
+pub(crate) use render::help_overlay_lines;
 
 #[cfg(test)]
 pub(crate) use render::{
