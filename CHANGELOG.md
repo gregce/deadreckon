@@ -1,5 +1,13 @@
 # Changelog
 
+## Sleep-preview test race fix - 2026-06-09
+
+- `prevent_sleep_linux_falls_back_when_systemd_inhibit_missing` read
+  `DEADRECKON_SLEEP_INHIBITED`-dependent state without holding the test
+  binary's `ENV_LOCK` while a sibling test mutates that variable under it —
+  parallel scheduling decided the verdict (green in two CI runs, red in
+  rc.6's verify). Both env-sensitive preview tests now hold the lock.
+
 ## CI on every push; platform-scoped hygiene baselines - 2026-06-09
 
 - New `ci.yml` runs `cargo fmt --check` and the full workspace suite

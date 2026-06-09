@@ -83,6 +83,10 @@ fn prevent_sleep_linux_writes_ready_file_when_under_inhibitor() {
 #[cfg(target_os = "linux")]
 #[test]
 fn prevent_sleep_linux_falls_back_when_systemd_inhibit_missing() {
+    // preview consults DEADRECKON_SLEEP_INHIBITED before the injected lookup,
+    // and a sibling test mutates that variable under ENV_LOCK: every reader
+    // must hold the same lock or parallel scheduling decides the verdict.
+    let _guard = ENV_LOCK.lock().expect("env lock");
     let preview = preview_with_binary_lookup(SleepPrefs::On, true, |_| None);
 
     assert_eq!(preview.mode, SleepMode::Unsupported);
@@ -91,6 +95,7 @@ fn prevent_sleep_linux_falls_back_when_systemd_inhibit_missing() {
 #[cfg(target_os = "linux")]
 #[test]
 fn prevent_sleep_linux_timeout_after_five_seconds_does_not_hang_run() {
+    let _guard = ENV_LOCK.lock().expect("env lock");
     let preview = preview_with_binary_lookup(SleepPrefs::On, true, |_| {
         Some(std::path::PathBuf::from("/usr/bin/systemd-inhibit"))
     });
