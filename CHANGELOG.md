@@ -1,5 +1,17 @@
 # Changelog
 
+## Platform-stable characterization goldens - 2026-06-09
+
+- The characterization goldens embedded environment noise: raw temp-path
+  *length* decided kv wrap points, path truncation points, and the smoke
+  provider's prompt-length-derived token counts, so two goldens generated on
+  macOS failed on the Linux release runner (the v0.1.0-rc.3 verify gate).
+  Characterization workspaces now live at one fixed canonical path length on
+  every platform and the goldens are regenerated to match.
+- `DEADRECKON_UPDATE_GOLDENS=1` regenerates the characterization goldens
+  instead of asserting, for the next time the pinned surface intentionally
+  changes.
+
 ## Chain hook EPIPE fix - 2026-06-09
 
 - A chain hook that exits (or closes stdin) without reading its advisory JSON

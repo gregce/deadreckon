@@ -8,9 +8,29 @@ use deadreckon_core::DeadreckonPaths;
 use regex::Regex;
 use tempfile::TempDir;
 
+/// Golden output embeds absolute paths, and the *length* of the raw path
+/// decides kv wrap points, path truncation points, and even the smoke
+/// provider's prompt-length-derived token counts. Build every test workspace
+/// at one fixed canonical path length on every platform (`/tmp` is
+/// `/private/tmp` on macOS, `/tmp` on Linux — pad to a shared prefix) so the
+/// goldens are byte-stable across operating systems.
+fn fixed_length_tempdir() -> TempDir {
+    let base = Path::new("/tmp").canonicalize().expect("canonical /tmp");
+    const PREFIX_LEN: usize = 24;
+    let pad_len = PREFIX_LEN
+        .checked_sub(base.as_os_str().len() + 1)
+        .expect("/tmp canonical prefix too long for the fixed-length test root");
+    let root = base.join("d".repeat(pad_len.max(1)));
+    fs::create_dir_all(&root).expect("padded test root");
+    tempfile::Builder::new()
+        .prefix("c")
+        .tempdir_in(root)
+        .expect("tempdir")
+}
+
 #[test]
 fn plan_draft_stdout_matches_golden() {
-    let temp = TempDir::new().expect("tempdir");
+    let temp = fixed_length_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
 
@@ -34,7 +54,7 @@ fn plan_draft_stdout_matches_golden() {
 
 #[test]
 fn plan_quiet_stdout_matches_golden() {
-    let temp = TempDir::new().expect("tempdir");
+    let temp = fixed_length_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
 
@@ -59,7 +79,7 @@ fn plan_quiet_stdout_matches_golden() {
 
 #[test]
 fn orchestrate_preview_json_matches_golden() {
-    let temp = TempDir::new().expect("tempdir");
+    let temp = fixed_length_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
 
@@ -87,7 +107,7 @@ fn orchestrate_preview_json_matches_golden() {
 
 #[test]
 fn chain_status_table_matches_golden() {
-    let temp = TempDir::new().expect("tempdir");
+    let temp = fixed_length_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
 
@@ -120,7 +140,7 @@ fn chain_status_table_matches_golden() {
 
 #[test]
 fn attach_off_tty_frame_matches_golden() {
-    let temp = TempDir::new().expect("tempdir");
+    let temp = fixed_length_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
 
@@ -156,7 +176,7 @@ fn attach_off_tty_frame_matches_golden() {
 
 #[test]
 fn error_footers_match_canonical_goldens() {
-    let temp = TempDir::new().expect("tempdir");
+    let temp = fixed_length_tempdir();
     let plain = temp.path().join("plain");
     fs::create_dir_all(&plain).expect("plain dir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -249,6 +269,10 @@ fn assert_capture_matches_golden(name: &str, temp: &TempDir, output: &Output) {
 
 fn assert_text_matches_golden(name: &str, actual: &str) {
     let path = golden_path(name);
+    if std::env::var_os("DEADRECKON_UPDATE_GOLDENS").is_some() {
+        fs::write(&path, actual).expect("update golden");
+        return;
+    }
     let expected = fs::read_to_string(&path).unwrap_or_else(|err| {
         panic!(
             "missing golden {}: {err}\n--- actual ---\n{}",

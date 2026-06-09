@@ -26,8 +26,7 @@ providers    : planner=smoke default-child=smoke
 source       : <TMP>/repo (git branch=main @ <SHA7>)
 done contract: default dr-gate behavior
 capabilities : network=Deny deploy=false install=false
-plan         : <TMP>/home/plans/<ID32>/
-               plan.json
+plan         : <TMP>/home/plans/<ID32>/plan.json
 provider roles
   role           route                  model    source       notes
   planner        smoke                  -        plan         writes child graph
