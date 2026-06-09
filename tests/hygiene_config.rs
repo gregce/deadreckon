@@ -395,19 +395,24 @@ fn provider_error_no_route_is_fatal() {
 }
 
 #[test]
-fn provider_error_http_is_fatal_with_v1_followup_noted() {
-    let error = ProviderError::Http {
+fn provider_error_http_retryability_is_explicit_per_construction_site() {
+    // The former V1 candidate ("Http has no status field, so it's always
+    // fatal") is implemented: each construction site tags transience, and
+    // 408/429/5xx/transport failures get one bounded retry in the turn loop.
+    let transient = ProviderError::Http {
         provider: "openai".to_string(),
-        detail: "429".to_string(),
+        detail: "HTTP 429: slow down".to_string(),
+        retryable: true,
     };
-    assert!(!error.is_retryable());
-    assert!(error.is_fatal());
-    let notes =
-        fs::read_to_string(workspace_root().join("docs/V1-CANDIDATES.md")).expect("read V1 notes");
-    assert!(
-        notes.contains("ProviderError::Http") && notes.contains("status"),
-        "V1 notes must record ProviderError::Http needs a status field"
-    );
+    assert!(transient.is_retryable());
+    assert!(!transient.is_fatal());
+    let auth = ProviderError::Http {
+        provider: "openai".to_string(),
+        detail: "HTTP 401: bad key".to_string(),
+        retryable: false,
+    };
+    assert!(!auth.is_retryable());
+    assert!(auth.is_fatal());
 }
 
 #[test]
@@ -506,6 +511,7 @@ fn provider_error_variants() -> Vec<ProviderError> {
         ProviderError::Http {
             provider: "openai".to_string(),
             detail: "detail".to_string(),
+            retryable: false,
         },
         ProviderError::Cli {
             provider: "cli".to_string(),

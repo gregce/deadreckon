@@ -1,5 +1,26 @@
 # Changelog
 
+## Self-healing turn loop - 2026-06-09
+
+- The retryability taxonomy is finally load-bearing: transient provider
+  errors (408/429/5xx, transport blips, CLI rate-limit phrasings) get one
+  bounded retry with a 2s backoff inside the turn loop. The retry is audited —
+  events.jsonl records "turn N hit a transient provider error; retrying once"
+  and "retry succeeded; continuing" — so recovery is visible in attach, never
+  silent. `ProviderError::Http` carries an explicit `retryable` flag set at
+  construction; `is_fatal()` is now its exact complement.
+- The router preserves the typed error when exactly one route was attempted,
+  so retryability survives instead of being flattened into an opaque
+  `NoRoute` string; multi-route fallthrough still aggregates.
+- The HTTP client has real timeouts (30s connect / 600s request) — a stalled
+  API connection can no longer hang an unattended run forever. HTTP error
+  bodies are trimmed on a char boundary (the old byte slice could panic on
+  multibyte error text exactly while reporting a failure).
+- A provider error that survives the retry now persists `Failed` plus a
+  `failure_reason` and emits the run-completed event before surfacing — a
+  dead run shows as failed in `list`/`status` immediately instead of
+  lingering as a zombie `Executing` until pid liveness is probed.
+
 ## Attach TUI help overlay and one abandon key - 2026-06-09
 
 - Every attach surface (run, plan, campaign, chain) gains a `?` help overlay:

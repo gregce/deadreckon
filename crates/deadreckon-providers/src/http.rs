@@ -36,7 +36,14 @@ impl ProviderAdapter {
             api_key,
             input_cost_per_million: entry.input_cost_per_million.unwrap_or(0.0),
             output_cost_per_million: entry.output_cost_per_million.unwrap_or(0.0),
-            client: reqwest::Client::new(),
+            // A stalled connection must never hang an unattended run: bound
+            // connect and total request time. Long completions stream within
+            // the request window; the turn loop's wall budget is the outer cap.
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -122,6 +129,7 @@ impl ProviderAdapter {
                     return Err(ProviderError::Http {
                         provider: self.name.clone(),
                         detail: "request cancelled".to_string(),
+                        retryable: false,
                     });
                 }
                 response = request_future => response
@@ -132,16 +140,21 @@ impl ProviderAdapter {
         .map_err(|err| ProviderError::Http {
             provider: self.name.clone(),
             detail: err.to_string(),
+            // Transport failures (connect, timeout, reset) are the canonical
+            // retry case.
+            retryable: true,
         })?;
         let status = response.status();
         let body = response.text().await.map_err(|err| ProviderError::Http {
             provider: self.name.clone(),
             detail: err.to_string(),
+            retryable: true,
         })?;
         if !status.is_success() {
             return Err(ProviderError::Http {
                 provider: self.name.clone(),
                 detail: format!("HTTP {status}: {}", trim_for_error(&body)),
+                retryable: matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504),
             });
         }
         self.parse_response(&body)
@@ -151,6 +164,8 @@ impl ProviderAdapter {
         let value: Value = serde_json::from_str(body).map_err(|err| ProviderError::Http {
             provider: self.name.clone(),
             detail: err.to_string(),
+            // A 2xx with a malformed body won't improve on retry.
+            retryable: false,
         })?;
         let (content, usage) = match &self.kind {
             ProviderKind::Anthropic => parse_anthropic_response(&value),
@@ -279,10 +294,12 @@ fn parse_anthropic_response(value: &Value) -> (String, ProviderUsage) {
 fn trim_for_error(body: &str) -> String {
     const MAX: usize = 240;
     if body.len() <= MAX {
-        body.to_string()
-    } else {
-        format!("{}...", &body[..MAX])
+        return body.to_string();
     }
+    // Cut on a char boundary: error bodies can carry multibyte text, and a
+    // byte slice would panic exactly while reporting a provider failure.
+    let cut = (0..=MAX).rev().find(|i| body.is_char_boundary(*i)).unwrap_or(0);
+    format!("{}...", &body[..cut])
 }
 
 fn round_usd(value: f64) -> f64 {

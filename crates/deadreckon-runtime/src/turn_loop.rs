@@ -240,12 +240,54 @@ pub async fn run_turn_loop(
         let wall_remaining = config
             .max_wall_seconds
             .map(|cap| Duration::from_secs_f64((cap - state.total_wall_seconds).max(1.0)));
-        let completion = complete_within_wall_budget(
+        let mut completion = complete_within_wall_budget(
             router.complete(&request),
             wall_remaining,
             &turn_token,
         )
         .await;
+        // Self-healing: one bounded retry on transient provider errors (429,
+        // 5xx, transport blips, CLI rate limits). The retry is recorded in
+        // events.jsonl so "turn N hit a transient error; retried" is visible
+        // in attach and the audit trail, and the wall budget shrinks by the
+        // time the failed attempt and backoff consumed.
+        if let Some(Err(err)) = &completion
+            && err.is_retryable()
+            && !should_cancel_run(state, &run_token)
+        {
+            emit_event(
+                state,
+                config.event_sender.as_ref(),
+                RunEventKind::Error {
+                    turn: Some(turn),
+                    message: format!(
+                        "turn {turn} hit a transient provider error; retrying once: {err}"
+                    ),
+                },
+            )?;
+            tokio::time::sleep(PROVIDER_RETRY_BACKOFF).await;
+            let wall_remaining = config.max_wall_seconds.map(|cap| {
+                Duration::from_secs_f64(
+                    (cap - state.total_wall_seconds - started.elapsed().as_secs_f64()).max(1.0),
+                )
+            });
+            completion = complete_within_wall_budget(
+                router.complete(&request),
+                wall_remaining,
+                &turn_token,
+            )
+            .await;
+            if matches!(&completion, Some(Ok(_))) {
+                emit_event(
+                    state,
+                    config.event_sender.as_ref(),
+                    RunEventKind::Error {
+                        turn: Some(turn),
+                        message: format!("turn {turn} retry succeeded; continuing"),
+                    },
+                )?;
+            }
+        }
         let response = match completion {
             None => {
                 if let Some(recorder) = flight_recorder.take() {
@@ -304,6 +346,13 @@ pub async fn run_turn_loop(
                 if let Some(recorder) = flight_recorder.take() {
                     recorder.finish(state, FlightSessionStatus::Failed).await?;
                 }
+                // Persist the failure before surfacing it: a dead run must
+                // show as Failed with a reason in list/status, never linger
+                // as a zombie Executing until someone probes pid liveness.
+                state.failure_reason = Some(format!("provider error: {err}"));
+                let _ = state.set_phase_status(PhaseId(40), PhaseStatus::Failed);
+                save_state(state)?;
+                emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
                 return Err(provider_error(&err));
             }
         };
@@ -884,6 +933,10 @@ fn should_cancel_run(state: &PipelineState, token: &CancellationToken) -> bool {
     state.status == RunStatus::Killed || token.is_cancelled() || cancel_marker_present(state)
 }
 
+/// Backoff before the single transient-error retry: long enough for a rate
+/// limit window to move, short enough to be negligible against a turn.
+const PROVIDER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
 /// Run a provider completion bounded by the remaining wall budget. `None`
 /// means the budget elapsed first: the turn token is cancelled so the
 /// provider subprocess is reaped, with a bounded grace period for cleanup
@@ -900,13 +953,12 @@ where
     let Some(remaining) = wall_remaining else {
         return Some(completion.await);
     };
-    match tokio::time::timeout(remaining, &mut completion).await {
-        Ok(result) => Some(result),
-        Err(_) => {
-            turn_token.cancel();
-            let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
-            None
-        }
+    if let Ok(result) = tokio::time::timeout(remaining, &mut completion).await {
+        Some(result)
+    } else {
+        turn_token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
+        None
     }
 }
 

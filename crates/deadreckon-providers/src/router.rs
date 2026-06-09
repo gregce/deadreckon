@@ -231,15 +231,30 @@ impl ProviderRouter {
 
     pub async fn complete(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let mut failures = Vec::new();
+        let mut attempted = 0_usize;
+        let mut last_error = None;
         for route in &self.routes {
             if !route.has_credential() {
                 failures.push(format!("{}: missing credential", route.name()));
                 continue;
             }
+            attempted += 1;
             match route.complete(request).await {
                 Ok(response) => return Ok(response),
-                Err(err) => failures.push(format!("{}: {err}", route.name())),
+                Err(err) => {
+                    failures.push(format!("{}: {err}", route.name()));
+                    last_error = Some(err);
+                }
             }
+        }
+        // A single attempted route surfaces its typed error so callers keep
+        // the retryability signal (429/5xx/transport) instead of an opaque
+        // NoRoute wrapper; multiple attempts mean fallthrough already
+        // happened and the aggregate is final.
+        if attempted == 1
+            && let Some(err) = last_error
+        {
+            return Err(err);
         }
         Err(ProviderError::NoRoute(failures.join("; ")))
     }

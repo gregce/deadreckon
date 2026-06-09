@@ -83,6 +83,97 @@ async fn mock_provider_records_three_turns_and_artifacts_match() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_provider_error_retries_once_and_run_completes() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let server = MockServer::start(transient_then_success_script()).await;
+    write_config(temp.path(), &server.base_url());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
+        .arg("mock transient retry task")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--no-docs")
+        .env("DEADRECKON_HOME", temp.path().join("home"))
+        .output()
+        .expect("run deadreckon");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("completed run"));
+
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    assert_eq!(state.status, RunStatus::Completed);
+    // The retry is part of the audit trail, not a silent recovery.
+    let events = fs::read_to_string(state.run_root.join("events.jsonl")).expect("events");
+    assert!(
+        events.contains("transient provider error; retrying once"),
+        "{events}"
+    );
+    assert!(events.contains("retry succeeded; continuing"), "{events}");
+    // The failed attempt plus the full script: every fixture was consumed.
+    assert!(server.journal().len() >= 6, "{}", server.journal().len());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_retries_persist_failed_status_with_reason() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let server = MockServer::start(always_failing_script()).await;
+    write_config(temp.path(), &server.base_url());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
+        .arg("mock always failing task")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--no-docs")
+        .env("DEADRECKON_HOME", temp.path().join("home"))
+        .output()
+        .expect("run deadreckon");
+    assert!(
+        !output.status.success(),
+        "a run whose provider never recovers must not exit 0"
+    );
+
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    // No zombie Executing: the failure is durable and explained.
+    assert_eq!(state.status, RunStatus::Failed);
+    let reason = state.failure_reason.as_deref().expect("failure reason");
+    assert!(reason.contains("provider error"), "{reason}");
+    // Both fixtures consumed: the single bounded retry really happened.
+    assert_eq!(server.journal().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_run_fires_notification_when_enabled() {
     let _gate = env!("CARGO_BIN_EXE_dr-gate");
     let temp = repo_tempdir();
@@ -2249,6 +2340,7 @@ fn kill_storm_script(count: usize) -> Vec<FixtureResponse> {
                 "{\"action\":\"bash\",\"tool_call_id\":\"tool-slow\",\"command\":\"sleep 30\"}"
                     .to_string(),
             delay_ms: Some(30000),
+            status: None,
             prompt_tokens: 100,
             completion_tokens: 20,
         })
@@ -2350,6 +2442,9 @@ struct MockState {
 struct FixtureResponse {
     content: String,
     delay_ms: Option<u64>,
+    /// Non-2xx makes the fixture an error response with `content` as the
+    /// error message — for exercising retry/failure paths.
+    status: Option<u16>,
     prompt_tokens: u64,
     completion_tokens: u64,
 }
@@ -2407,6 +2502,14 @@ async fn chat_completions(
     if let Some(delay_ms) = fixture.delay_ms {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
+    if let Some(status) = fixture.status
+        && status >= 400
+    {
+        return (
+            StatusCode::from_u16(status).expect("fixture status"),
+            Json(json!({"error": {"message": fixture.content}})),
+        );
+    }
     (
         StatusCode::OK,
         Json(json!({
@@ -2425,6 +2528,33 @@ async fn chat_completions(
             }
         })),
     )
+}
+
+/// A 503 in front of the normal three-turn script: the loop must retry once
+/// and complete as if nothing happened.
+fn transient_then_success_script() -> Vec<FixtureResponse> {
+    let mut script = three_turn_script();
+    script.insert(
+        0,
+        serde_json::from_value(json!({
+            "content": "mock overloaded",
+            "status": 503,
+            "prompt_tokens": 0,
+            "completion_tokens": 0
+        }))
+        .expect("fixture"),
+    );
+    script
+}
+
+/// Nothing but 503s: the retry must also fail and the run must persist a
+/// Failed status with a reason instead of lingering as Executing.
+fn always_failing_script() -> Vec<FixtureResponse> {
+    serde_json::from_value(json!([
+        {"content": "mock overloaded", "status": 503, "prompt_tokens": 0, "completion_tokens": 0},
+        {"content": "mock overloaded", "status": 503, "prompt_tokens": 0, "completion_tokens": 0}
+    ]))
+    .expect("script")
 }
 
 fn three_turn_script() -> Vec<FixtureResponse> {
