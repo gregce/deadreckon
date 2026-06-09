@@ -20,7 +20,7 @@ Install the latest release (macOS / Linux):
 curl -fsSL https://deadreckon.sh/install.sh | sh
 ```
 
-This downloads the release installer, verifies it against `SHA256SUMS`, and installs `deadreckon`. Pin a version with `DEADRECKON_TAG=v0.1.0-rc.1`.
+This downloads the release installer, verifies it against `SHA256SUMS`, and installs `deadreckon`. Pin a version with `DEADRECKON_TAG=v0.1.0-rc.2`.
 
 Or build from source:
 

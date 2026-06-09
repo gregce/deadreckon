@@ -10,8 +10,8 @@ use deadreckon_providers::registry::{
     AuthKind, DescriptorKind, ProviderDescriptor, ProviderRegistry,
 };
 use deadreckon_providers::{
-    CliAuthStatus, ProviderError, ProviderKind, ProviderRouteInfo, ProviderRouter,
-    probe_cli_auth, read_config,
+    CliAuthStatus, ProviderError, ProviderKind, ProviderRouteInfo, ProviderRouter, probe_cli_auth,
+    read_config,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,7 +318,11 @@ fn selection_for_route(
         && let Some(binary) = cli_binary_for(config_path, selection.provider.as_deref(), descriptor)
         && let CliAuthStatus::NotLoggedIn { detail } = probe_cli_auth(&binary, probe)
     {
-        let provider_label = selection.provider.as_deref().or(provider).unwrap_or("provider");
+        let provider_label = selection
+            .provider
+            .as_deref()
+            .or(provider)
+            .unwrap_or("provider");
         return Err(SetupRefusal {
             message: format!("provider {provider_label} is installed but not logged in ({detail})"),
             try_line: probe

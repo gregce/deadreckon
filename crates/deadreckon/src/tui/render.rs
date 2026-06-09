@@ -2263,11 +2263,7 @@ pub(crate) fn help_overlay_lines(mode: AttachHelpMode) -> Vec<(&'static str, &'s
 /// key closes it.
 pub(crate) fn render_help_overlay(frame: &mut ratatui::Frame<'_>, mode: AttachHelpMode) {
     let lines = help_overlay_lines(mode);
-    let key_width = lines
-        .iter()
-        .map(|(key, _)| key.len())
-        .max()
-        .unwrap_or(0);
+    let key_width = lines.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
     let body: Vec<Line<'static>> = lines
         .iter()
         .map(|(key, action)| {
@@ -2296,11 +2292,7 @@ pub(crate) fn render_help_overlay(frame: &mut ratatui::Frame<'_>, mode: AttachHe
     );
 }
 
-fn centered_rect(
-    outer: ratatui::layout::Rect,
-    width: u16,
-    height: u16,
-) -> ratatui::layout::Rect {
+fn centered_rect(outer: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
     let width = width.min(outer.width);
     let height = height.min(outer.height);
     ratatui::layout::Rect {

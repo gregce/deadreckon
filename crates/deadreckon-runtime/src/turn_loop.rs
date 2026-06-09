@@ -240,12 +240,9 @@ pub async fn run_turn_loop(
         let wall_remaining = config
             .max_wall_seconds
             .map(|cap| Duration::from_secs_f64((cap - state.total_wall_seconds).max(1.0)));
-        let mut completion = complete_within_wall_budget(
-            router.complete(&request),
-            wall_remaining,
-            &turn_token,
-        )
-        .await;
+        let mut completion =
+            complete_within_wall_budget(router.complete(&request), wall_remaining, &turn_token)
+                .await;
         // Self-healing: one bounded retry on transient provider errors (429,
         // 5xx, transport blips, CLI rate limits). The retry is recorded in
         // events.jsonl so "turn N hit a transient error; retried" is visible
@@ -271,12 +268,9 @@ pub async fn run_turn_loop(
                     (cap - state.total_wall_seconds - started.elapsed().as_secs_f64()).max(1.0),
                 )
             });
-            completion = complete_within_wall_budget(
-                router.complete(&request),
-                wall_remaining,
-                &turn_token,
-            )
-            .await;
+            completion =
+                complete_within_wall_budget(router.complete(&request), wall_remaining, &turn_token)
+                    .await;
             if matches!(&completion, Some(Ok(_))) {
                 emit_event(
                     state,
@@ -3494,7 +3488,10 @@ network = []
             complete_within_wall_budget(hung, Some(Duration::from_millis(50)), &token).await;
 
         assert!(result.is_none(), "budget exhaustion must report None");
-        assert!(token.is_cancelled(), "turn token must cancel the subprocess");
+        assert!(
+            token.is_cancelled(),
+            "turn token must cancel the subprocess"
+        );
     }
 
     #[tokio::test]
@@ -3506,8 +3503,7 @@ network = []
             )
         };
 
-        let result =
-            complete_within_wall_budget(quick, Some(Duration::from_secs(5)), &token).await;
+        let result = complete_within_wall_budget(quick, Some(Duration::from_secs(5)), &token).await;
 
         assert!(matches!(
             result,
@@ -3570,7 +3566,10 @@ network = []
         .expect("loop");
 
         assert_eq!(outcome, RunLoopOutcome::PausedAtCap);
-        assert_eq!(state.pause_reason.as_deref(), Some("wall-clock cap reached"));
+        assert_eq!(
+            state.pause_reason.as_deref(),
+            Some("wall-clock cap reached")
+        );
         assert!(
             state.total_wall_seconds > 0.0,
             "elapsed wall time must accrue even when the provider reports none"

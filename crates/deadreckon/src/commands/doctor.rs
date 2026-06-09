@@ -440,9 +440,7 @@ async fn collect_doctor_provider_findings(
                     Some((probe, CliAuthStatus::NotLoggedIn { detail })) => {
                         findings.push(DoctorFinding::failed(
                             subject,
-                            format!(
-                                "CLI binary {binary} installed but not logged in ({detail})"
-                            ),
+                            format!("CLI binary {binary} installed but not logged in ({detail})"),
                             probe
                                 .login_try_lines
                                 .first()

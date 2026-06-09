@@ -298,7 +298,10 @@ fn trim_for_error(body: &str) -> String {
     }
     // Cut on a char boundary: error bodies can carry multibyte text, and a
     // byte slice would panic exactly while reporting a provider failure.
-    let cut = (0..=MAX).rev().find(|i| body.is_char_boundary(*i)).unwrap_or(0);
+    let cut = (0..=MAX)
+        .rev()
+        .find(|i| body.is_char_boundary(*i))
+        .unwrap_or(0);
     format!("{}...", &body[..cut])
 }
 

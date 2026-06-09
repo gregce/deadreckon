@@ -42,8 +42,8 @@ use super::tui::{
     NARRATIVE_SPLIT_WIDTH, build_run_narrative_projection, chain_activity_lines,
     chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
     chain_timeline_lines, footer, help_overlay_lines, markdown_to_tui_lines, max_panel_scroll,
-    panel_title, plan_narrative_title, render_chain_attach, render_help_overlay,
-    scroll_indicator, selection_glyph,
+    panel_title, plan_narrative_title, render_chain_attach, render_help_overlay, scroll_indicator,
+    selection_glyph,
 };
 use super::{
     ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachJsonlTail,

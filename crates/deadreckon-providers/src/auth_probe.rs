@@ -70,10 +70,7 @@ pub fn probe_cli_auth(binary: &str, probe: &AuthProbe) -> CliAuthStatus {
                     let _ = child.kill();
                     let _ = child.wait();
                     return CliAuthStatus::Unknown {
-                        reason: format!(
-                            "auth probe timed out after {}s",
-                            timeout.as_secs()
-                        ),
+                        reason: format!("auth probe timed out after {}s", timeout.as_secs()),
                     };
                 }
                 std::thread::sleep(PROBE_POLL_INTERVAL);
@@ -156,7 +153,10 @@ mod tests {
             "{\n  \"loggedIn\": true,\n  \"authMethod\": \"claude.ai\"\n}",
             "{\"loggedIn\":true}",
         ] {
-            assert_eq!(classify_probe_output(&probe(), raw), CliAuthStatus::LoggedIn);
+            assert_eq!(
+                classify_probe_output(&probe(), raw),
+                CliAuthStatus::LoggedIn
+            );
         }
     }
 

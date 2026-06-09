@@ -2,9 +2,9 @@ use super::super::*;
 use super::attach_runtime::*;
 use crate::tui::navigation::{HelpKeyAction, handle_help_key};
 use crate::tui::{
-    AttachActionNotice, AttachHelpMode, AttachParentPlan, AttachTuiState,
-    RunNarrativeRenderInput, attach_panel_counts, build_run_narrative_projection,
-    render_help_overlay, run_narrative_projection, toggle_attach_view,
+    AttachActionNotice, AttachHelpMode, AttachParentPlan, AttachTuiState, RunNarrativeRenderInput,
+    attach_panel_counts, build_run_narrative_projection, render_help_overlay,
+    run_narrative_projection, toggle_attach_view,
 };
 
 #[derive(Debug)]
