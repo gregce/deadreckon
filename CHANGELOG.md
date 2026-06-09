@@ -1,5 +1,22 @@
 # Changelog
 
+## Honest spend and a wall cap that binds mid-turn - 2026-06-09
+
+- Subscription run spend now reads as the budget it really is —
+  `not metered (subscription) · 23m of cli:claude-code · 7 turns` — instead of
+  a raw seconds count; `status` adds a `billing` row ("subscription: cost is
+  not metered, time is the budget") and the JSON gains an additive `billing`
+  field.
+- `--max-wall-seconds` now binds DURING a turn, for every provider kind: the
+  provider call is bounded by the remaining wall budget, the in-flight
+  subprocess is cancelled (not orphaned) with a bounded grace period, the cut
+  turn's elapsed time is recorded honestly in `spend.jsonl`, and the run
+  pauses at cap exactly like the spend cap. Previously the cap was checked
+  only between turns and only for subscription-billed turns, so an API-billed
+  run had no wall cap at all and a single hung turn was uncapped for everyone.
+- Direct-API turns that report no wall time now accrue measured elapsed wall
+  time, so wall accounting (and the cap) is universal.
+
 ## Provider login preflight - 2026-06-09
 
 - Subscription CLI descriptors may declare an `[auth_probe]` (a local status

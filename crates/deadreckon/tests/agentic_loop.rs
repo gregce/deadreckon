@@ -696,9 +696,13 @@ printf 'changed notes\n'
         .next()
         .expect("run");
     let state = load_run(&paths, &run.run_id).expect("state");
-    assert_eq!(
-        state.pause_reason.as_deref(),
-        Some("wall-clock cap reached")
+    let pause_reason = state.pause_reason.as_deref().expect("pause reason");
+    // Depending on timing the cap binds mid-turn (provider call cut at the
+    // remaining budget) or at the post-turn check; both are the wall cap.
+    assert!(
+        pause_reason == "wall-clock cap reached"
+            || pause_reason == "wall-clock cap reached mid-turn",
+        "{pause_reason}"
     );
     let spend = fs::read_to_string(state.run_root.join("spend.jsonl")).expect("spend");
     assert!(spend.contains("wall_time_seconds"));

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderResponse, ProviderRouter};
@@ -234,9 +234,63 @@ pub async fn run_turn_loop(
                 _ => None,
             };
         let started = Instant::now();
-        let response = match router.complete(&request).await {
-            Ok(response) => response,
-            Err(err) if should_cancel_run(state, &run_token) => {
+        // The wall cap binds DURING the turn, not only between turns: a hung
+        // or over-long provider call is cut at the remaining budget and the
+        // in-flight subprocess is cancelled rather than orphaned.
+        let wall_remaining = config
+            .max_wall_seconds
+            .map(|cap| Duration::from_secs_f64((cap - state.total_wall_seconds).max(1.0)));
+        let completion = complete_within_wall_budget(
+            router.complete(&request),
+            wall_remaining,
+            &turn_token,
+        )
+        .await;
+        let response = match completion {
+            None => {
+                if let Some(recorder) = flight_recorder.take() {
+                    recorder.finish(state, FlightSessionStatus::Killed).await?;
+                }
+                // The cut turn produced no provider result, but its wall time
+                // was really consumed: account for it honestly.
+                let elapsed = started.elapsed().as_secs_f64();
+                state.total_wall_seconds += elapsed;
+                append_spend(
+                    state,
+                    &SpendRecord {
+                        timestamp: Utc::now(),
+                        turn,
+                        provider: selected_provider
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        model: selected_route
+                            .as_ref()
+                            .map(|route| route.model.clone())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_usd: 0.0,
+                        total_cost_usd: state.total_spend_usd,
+                        cap_usd: config.max_spend_usd,
+                        subscription: selected_provider
+                            .as_deref()
+                            .is_some_and(is_cli_provider_name),
+                        estimated: false,
+                        wall_time_seconds: Some(elapsed),
+                        wall_time_cap_seconds: config.max_wall_seconds,
+                    },
+                )?;
+                state.pause_reason = Some("wall-clock cap reached mid-turn".to_string());
+                save_state(state)?;
+                emit_run_completed(
+                    state,
+                    config.event_sender.as_ref(),
+                    RunLoopOutcome::PausedAtCap,
+                )?;
+                return Ok(RunLoopOutcome::PausedAtCap);
+            }
+            Some(Ok(response)) => response,
+            Some(Err(err)) if should_cancel_run(state, &run_token) => {
                 if let Some(recorder) = flight_recorder.take() {
                     recorder.finish(state, FlightSessionStatus::Killed).await?;
                 }
@@ -246,7 +300,7 @@ pub async fn run_turn_loop(
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
                 return Ok(RunLoopOutcome::Killed);
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 if let Some(recorder) = flight_recorder.take() {
                     recorder.finish(state, FlightSessionStatus::Failed).await?;
                 }
@@ -286,7 +340,12 @@ pub async fn run_turn_loop(
             },
         )?;
         state.total_spend_usd += response.spend.cost_usd;
-        state.total_wall_seconds += response.spend.wall_time_seconds.unwrap_or(0.0);
+        // Providers that don't self-report wall time (direct API routes) still
+        // consume it; accrue measured elapsed so the wall cap is universal.
+        state.total_wall_seconds += response
+            .spend
+            .wall_time_seconds
+            .unwrap_or_else(|| started.elapsed().as_secs_f64());
         append_spend(
             state,
             &SpendRecord {
@@ -337,10 +396,9 @@ pub async fn run_turn_loop(
             )?;
             return Ok(RunLoopOutcome::PausedAtCap);
         }
-        if response.spend.subscription
-            && config
-                .max_wall_seconds
-                .is_some_and(|cap| state.total_wall_seconds > cap)
+        if config
+            .max_wall_seconds
+            .is_some_and(|cap| state.total_wall_seconds > cap)
         {
             state.pause_reason = Some("wall-clock cap reached".to_string());
             save_state(state)?;
@@ -824,6 +882,32 @@ pub async fn run_turn_loop(
 
 fn should_cancel_run(state: &PipelineState, token: &CancellationToken) -> bool {
     state.status == RunStatus::Killed || token.is_cancelled() || cancel_marker_present(state)
+}
+
+/// Run a provider completion bounded by the remaining wall budget. `None`
+/// means the budget elapsed first: the turn token is cancelled so the
+/// provider subprocess is reaped, with a bounded grace period for cleanup
+/// before the future is dropped.
+async fn complete_within_wall_budget<F>(
+    completion: F,
+    wall_remaining: Option<Duration>,
+    turn_token: &CancellationToken,
+) -> Option<deadreckon_providers::Result<ProviderResponse>>
+where
+    F: std::future::Future<Output = deadreckon_providers::Result<ProviderResponse>>,
+{
+    tokio::pin!(completion);
+    let Some(remaining) = wall_remaining else {
+        return Some(completion.await);
+    };
+    match tokio::time::timeout(remaining, &mut completion).await {
+        Ok(result) => Some(result),
+        Err(_) => {
+            turn_token.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
+            None
+        }
+    }
 }
 
 fn provider_error(err: &deadreckon_providers::ProviderError) -> DeadreckonError {
@@ -1768,7 +1852,7 @@ mod tests {
 
     use super::{
         RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, append_tool_refusal, bash_policy_refusal,
-        build_cli_subagent_prompt, build_prompt, ensure_sandbox_toml,
+        build_cli_subagent_prompt, build_prompt, complete_within_wall_budget, ensure_sandbox_toml,
         implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
         load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, policy_seam_refusal,
         policy_seam_refusal_message, provider_output_name, run_turn_loop, safe_working_path,
@@ -3338,5 +3422,106 @@ network = []
         assert!(prompt.contains("Acceptance criteria:"));
         assert!(prompt.contains("acceptance.yaml:"));
         assert!(prompt.contains("README.md"));
+    }
+
+    #[tokio::test]
+    async fn wall_budget_cuts_hung_provider_call_and_cancels_turn_token() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let observer = token.clone();
+        // A provider call that only finishes once cancelled, like a CLI
+        // subprocess select()ing on the cancellation token.
+        let hung = async move {
+            observer.cancelled().await;
+            Err(deadreckon_providers::ProviderError::Cli {
+                provider: "test".to_string(),
+                detail: "cancelled".to_string(),
+            })
+        };
+
+        let result =
+            complete_within_wall_budget(hung, Some(Duration::from_millis(50)), &token).await;
+
+        assert!(result.is_none(), "budget exhaustion must report None");
+        assert!(token.is_cancelled(), "turn token must cancel the subprocess");
+    }
+
+    #[tokio::test]
+    async fn wall_budget_passes_through_completions_within_budget() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let quick = async {
+            Err::<deadreckon_providers::ProviderResponse, _>(
+                deadreckon_providers::ProviderError::NoRoute("test".to_string()),
+            )
+        };
+
+        let result =
+            complete_within_wall_budget(quick, Some(Duration::from_secs(5)), &token).await;
+
+        assert!(matches!(
+            result,
+            Some(Err(deadreckon_providers::ProviderError::NoRoute(_)))
+        ));
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn wall_budget_without_cap_never_times_out() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let quick = async {
+            Err::<deadreckon_providers::ProviderResponse, _>(
+                deadreckon_providers::ProviderError::NoRoute("test".to_string()),
+            )
+        };
+
+        let result = complete_within_wall_budget(quick, None, &token).await;
+
+        assert!(result.is_some());
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn wall_cap_pauses_runs_without_provider_reported_wall_time() {
+        // The smoke provider reports no wall time (like direct-API routes);
+        // the loop must accrue measured elapsed and honor the cap anyway.
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "wall capped smoke");
+        state.max_wall_seconds = Some(0.0001);
+        let router = ProviderRouter::smoke();
+
+        let outcome = run_turn_loop(
+            &mut state,
+            &router,
+            RunLoopConfig {
+                provider: Some("smoke".to_string()),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(0.0001),
+                sandbox_backend: SandboxBackend::None,
+                no_seams: true,
+                max_turns: 3,
+                from_turn: None,
+                event_sender: None,
+                cancellation_token: None,
+                docs: RunLoopDocsConfig {
+                    home: paths.home().to_path_buf(),
+                    config_path: None,
+                    doc_provider: None,
+                    doc_provider_source: None,
+                    doc_subskills: Vec::new(),
+                    token_budget: 0,
+                    budget_cap_usd: None,
+                    doc_skill: "run-narrator".to_string(),
+                    no_docs: true,
+                },
+            },
+        )
+        .await
+        .expect("loop");
+
+        assert_eq!(outcome, RunLoopOutcome::PausedAtCap);
+        assert_eq!(state.pause_reason.as_deref(), Some("wall-clock cap reached"));
+        assert!(
+            state.total_wall_seconds > 0.0,
+            "elapsed wall time must accrue even when the provider reports none"
+        );
     }
 }

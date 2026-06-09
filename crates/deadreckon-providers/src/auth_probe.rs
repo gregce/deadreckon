@@ -30,8 +30,18 @@ pub enum CliAuthStatus {
 
 /// Run the descriptor's auth probe against `binary` and classify the output.
 /// Never errors: every failure mode collapses into `Unknown` so the caller
-/// can fall back to presence-only behavior.
+/// can fall back to presence-only behavior. `DEADRECKON_AUTH_PROBE=0` (or
+/// `off`) disables probing entirely — for hermetic test environments that
+/// redirect `HOME`, where the real CLI would truthfully report logged-out.
 pub fn probe_cli_auth(binary: &str, probe: &AuthProbe) -> CliAuthStatus {
+    if matches!(
+        std::env::var("DEADRECKON_AUTH_PROBE").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    ) {
+        return CliAuthStatus::Unknown {
+            reason: "auth probe disabled by DEADRECKON_AUTH_PROBE".to_string(),
+        };
+    }
     let timeout = Duration::from_secs(
         probe
             .timeout_seconds

@@ -1278,6 +1278,10 @@ fn init_installs_shell_completion_by_default() {
     let output = deadreckon(&paths)
         .env("HOME", temp.path())
         .env("SHELL", "/bin/zsh")
+        // HOME is redirected, so a real codex on PATH would truthfully report
+        // logged-out for this hermetic home; this test is about completion
+        // install, not login state.
+        .env("DEADRECKON_AUTH_PROBE", "0")
         .args([
             "init",
             "--provider",

@@ -7713,6 +7713,30 @@ fn read_json_value(path: &Path) -> Option<Value> {
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
 }
 
+/// Humanize a wall-clock duration for budget displays: `42s`, `23m`, `1h 5m`.
+fn human_duration(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    if total >= 3600 {
+        let hours = total / 3600;
+        let minutes = (total % 3600) / 60;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        }
+    } else if total >= 60 {
+        let minutes = total / 60;
+        let secs = total % 60;
+        if secs == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m {secs}s")
+        }
+    } else {
+        format!("{total}s")
+    }
+}
+
 fn format_wall_cap(max_wall_seconds: Option<f64>) -> String {
     let Some(seconds) = max_wall_seconds else {
         return "uncapped".to_string();
@@ -7969,6 +7993,17 @@ fn run_spend_label(state: &deadreckon_core::PipelineState, include_metered_cap: 
     spend_summary_label(state, &summary, include_metered_cap)
 }
 
+fn run_is_subscription_only(state: &deadreckon_core::PipelineState) -> bool {
+    let Ok(summary) = deadreckon_core::state::spend_summary(state) else {
+        return false;
+    };
+    let turns = summary.turns.max(state.turn as usize);
+    turns > 0
+        && summary.subscription_turns == summary.turns
+        && summary.total_usd == 0.0
+        && (summary.any_subscription_turn || !provider_is_metered(state))
+}
+
 fn spend_summary_label(
     state: &deadreckon_core::PipelineState,
     summary: &deadreckon_core::state::SpendSummary,
@@ -7985,9 +8020,13 @@ fn spend_summary_label(
         && summary.total_usd == 0.0
         && (summary.any_subscription_turn || !provider_is_metered(state));
     if subscription_only {
+        // Subscription runs are billed in time, not dollars: lead with the
+        // wall-time budget instead of a $0.00 the harness knows is false.
+        let provider = state.provider.as_deref().unwrap_or("subscription CLI");
         return format!(
-            "not metered (subscription) · wall {:.1}s · {} turns",
-            wall_seconds, turns
+            "not metered (subscription) · {} of {provider} · {} turns",
+            human_duration(wall_seconds),
+            turns
         );
     }
     let mut label = format!(
@@ -10230,6 +10269,11 @@ fn status_command(run_id: Option<String>, all: bool, plain: bool, json_output: b
                 "run": &state,
                 "status_label": status,
                 "next_action": next_action,
+                "billing": if run_is_subscription_only(&state) {
+                    "subscription: cost is not metered, time is the budget"
+                } else {
+                    "metered"
+                },
             }))?
         );
         return Ok(());
@@ -10276,6 +10320,15 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
         ("wall".to_string(), wall),
         ("goal".to_string(), goal),
     ];
+    if run_is_subscription_only(state) {
+        rows.insert(
+            rows.len() - 1,
+            (
+                "billing".to_string(),
+                "subscription: cost is not metered, time is the budget".to_string(),
+            ),
+        );
+    }
     if let Some(sleep) = sleep_status_for_working(&state.working_dir) {
         rows.push(("sleep".to_string(), sleep));
     }
