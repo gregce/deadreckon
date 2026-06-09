@@ -4,11 +4,6 @@ set -eu
 repo="${DEADRECKON_REPO:-gregce/deadreckon}"
 tag="${DEADRECKON_TAG:-latest}"
 asset="${DEADRECKON_INSTALLER_ASSET:-deadreckon-installer.sh}"
-if [ "$tag" = "latest" ]; then
-  base_url="https://github.com/${repo}/releases/latest/download"
-else
-  base_url="https://github.com/${repo}/releases/download/${tag}"
-fi
 tmp="${TMPDIR:-/tmp}/deadreckon-install.$$"
 
 die() {
@@ -27,6 +22,39 @@ download() {
     die "install curl or wget, then rerun this installer"
   fi
 }
+
+fetch_stdout() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- "$1"
+  else
+    die "install curl or wget, then rerun this installer"
+  fi
+}
+
+# Resolve "latest" through the GitHub API: prefer the latest stable release,
+# and fall back to the newest release of any kind — during the
+# release-candidate era only prereleases exist, and GitHub's
+# releases/latest endpoint excludes those.
+resolve_latest_tag() {
+  for api in \
+    "https://api.github.com/repos/${repo}/releases/latest" \
+    "https://api.github.com/repos/${repo}/releases?per_page=1"; do
+    resolved=$(fetch_stdout "$api" 2>/dev/null | sed -n 's/.*"tag_name"[^"]*"\([^"]*\)".*/\1/p' | head -n 1)
+    if [ -n "$resolved" ]; then
+      printf '%s\n' "$resolved"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ "$tag" = "latest" ]; then
+  tag=$(resolve_latest_tag) \
+    || die "could not resolve the latest release tag; pin one with DEADRECKON_TAG=vX.Y.Z"
+fi
+base_url="https://github.com/${repo}/releases/download/${tag}"
 
 cleanup() {
   rm -rf "$tmp"
