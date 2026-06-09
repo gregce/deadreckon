@@ -10492,9 +10492,10 @@ mod uniform_surface_kv_tests {
             vec!["a".to_string(), "ok".to_string()],
             vec!["bbb".to_string(), "no".to_string()],
         ];
+        let esc = char::from(27);
         let rows_colored = vec![
-            vec!["\x1b[1;35ma\x1b[0m".to_string(), "ok".to_string()],
-            vec!["\x1b[1;35mbbb\x1b[0m".to_string(), "no".to_string()],
+            vec![format!("{esc}[1;35ma{esc}[0m"), "ok".to_string()],
+            vec![format!("{esc}[1;35mbbb{esc}[0m"), "no".to_string()],
         ];
         let plain = columns(&["id", "status"], &rows_plain);
         let colored = columns(&["id", "status"], &rows_colored);

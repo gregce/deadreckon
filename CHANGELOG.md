@@ -1,5 +1,20 @@
 # Changelog
 
+## Workspace suite green; releases gated on it - 2026-06-09
+
+- `cargo test --workspace` passes end to end (53 binaries) and the release
+  workflow's verification step now runs the full suite —
+  `cargo fmt --check && cargo test --workspace --locked` plus the release
+  build — completing the release-trust-closure contract that
+  `release_workflow_verification_matches_release_trust_contract` pins. No
+  release ships on a suite that never ran.
+- Fixed the three standing failures: the chain TTY test strips ANSI (the
+  PTY-attached binary colorizes now) and invokes `script(1)` portably (BSD
+  positional args on macOS, `-qec` on util-linux); the README first-screen
+  coherence window covers the command table that moved below the install
+  instructions; and two test fixtures in `prompt.rs`/`main.rs` build their
+  ANSI escapes at runtime so `raw_ansi_escapes_stay_in_ui_module` holds.
+
 ## Self-healing turn loop - 2026-06-09
 
 - The retryability taxonomy is finally load-bearing: transient provider

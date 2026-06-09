@@ -688,7 +688,10 @@ mod tests {
 
     #[test]
     fn paint_menu_row_preserves_visible_width() {
-        let force = |_: crate::ui::Tone, text: &str| format!("\x1b[31m{text}\x1b[0m");
+        let force = |_: crate::ui::Tone, text: &str| {
+            let esc = char::from(27);
+            format!("{esc}[31m{text}{esc}[0m")
+        };
         for (line, ordinal, selected) in [
             (
                 " > [1] Recommended: run - fallback suggested single",
@@ -711,7 +714,10 @@ mod tests {
 
     #[test]
     fn paint_menu_row_without_token_is_unchanged() {
-        let force = |_: crate::ui::Tone, text: &str| format!("\x1b[31m{text}\x1b[0m");
+        let force = |_: crate::ui::Tone, text: &str| {
+            let esc = char::from(27);
+            format!("{esc}[31m{text}{esc}[0m")
+        };
         // An over-truncated row whose ordinal token was cut is left alone.
         assert_eq!(paint_menu_row(" > [1", 1, true, force), " > [1");
     }

@@ -528,9 +528,11 @@ fn public_docs_first_screen_explains_harness_of_harnesses() {
 
 #[test]
 fn readme_first_screen_mentions_start_watch_finish() {
+    // The install instructions sit above the command table now; 45 lines is
+    // still one screen and must show the whole production command model.
     let first_screen = repo_file_text("README.md")
         .lines()
-        .take(35)
+        .take(45)
         .collect::<Vec<_>>()
         .join("\n");
     for text in [

@@ -42,9 +42,8 @@ fn workspace_root() -> PathBuf {
 }
 
 fn scan_tree(dir: &Path, findings: &mut Vec<String>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
     };
     for entry in entries.flatten() {
         let path = entry.path();

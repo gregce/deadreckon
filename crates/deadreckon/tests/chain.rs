@@ -479,30 +479,69 @@ fn chain_from_stdin_parses_when_stdin_is_pipe() {
     assert_eq!(chain.steps[0].goal, "alpha");
 }
 
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[test]
 fn chain_from_stdin_refuses_when_stdin_is_tty() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let script_probe = Command::new("script").arg("--version").output();
-    if script_probe.is_err() {
+    let Ok(probe) = script_probe else {
         eprintln!("skipping TTY stdin test because script(1) is unavailable");
         return;
-    }
+    };
+    // util-linux script (Linux) accepts --version and takes the command via
+    // -c; BSD script (macOS) rejects --version and takes the command as
+    // positional args after the typescript file.
+    let output = if probe.status.success() {
+        Command::new("script")
+            .current_dir(&repo)
+            .env("DEADRECKON_HOME", paths.home())
+            .arg("-qec")
+            .arg(format!(
+                "{} chain --draft --from-stdin",
+                env!("CARGO_BIN_EXE_deadreckon")
+            ))
+            .arg("/dev/null")
+            .output()
+            .expect("script")
+    } else {
+        Command::new("script")
+            .current_dir(&repo)
+            .env("DEADRECKON_HOME", paths.home())
+            .arg("-q")
+            .arg("/dev/null")
+            .arg(env!("CARGO_BIN_EXE_deadreckon"))
+            .args(["chain", "--draft", "--from-stdin"])
+            .output()
+            .expect("script")
+    };
 
-    let output = Command::new("script")
-        .current_dir(&repo)
-        .env("DEADRECKON_HOME", paths.home())
-        .arg("-q")
-        .arg("/dev/null")
-        .arg(env!("CARGO_BIN_EXE_deadreckon"))
-        .args(["chain", "--draft", "--from-stdin"])
-        .output()
-        .expect("script");
-
-    let combined = format!("{}{}", stdout(&output), stderr(&output))
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    // Under script(1) the binary sees a TTY and colorizes; the contract under
+    // test is the text, so strip ANSI before asserting.
+    let combined = strip_ansi(
+        &format!("{}{}", stdout(&output), stderr(&output))
+            .replace("\r\n", "\n")
+            .replace('\r', "\n"),
+    );
     assert!(
         combined.contains("--from-stdin needs a pipe")
             || combined.contains("chain must have >= 2 steps"),
