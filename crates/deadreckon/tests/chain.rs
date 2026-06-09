@@ -907,6 +907,58 @@ fn chain_on_promote_hook_refuse_blocks_apply() {
 }
 
 #[test]
+fn hook_that_never_reads_stdin_still_reports_its_exit_code() {
+    // Regression: a hook that exits (or closes stdin) without reading its
+    // advisory payload raced the parent's JSON write on Linux, surfacing as
+    // "JSON error: Broken pipe" instead of the hook's refusal. Closing stdin
+    // before exiting makes the EPIPE deterministic on every platform.
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_hook(
+        &repo,
+        "on-promote",
+        "#!/bin/sh\nexec <&-\nsleep 0.2\nexit 2\n",
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "2",
+            "blocked promote epipe",
+            "never reached",
+        ])
+        .output()
+        .expect("chain run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    let chain = newest_chain(&paths);
+    assert!(stdout.contains("paused chain"), "{stdout}");
+    assert!(
+        !stdout.contains("Broken pipe") && !stdout.contains("broken_pipe"),
+        "EPIPE on the advisory payload must not become the verdict: {stdout}"
+    );
+    assert_eq!(chain.status, ChainStatus::Paused);
+    assert!(
+        chain
+            .paused_reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("apply_refused_by_hook_on_promote"),
+        "{:?}",
+        chain.paused_reason
+    );
+}
+
+#[test]
 fn chain_on_promote_hook_pause_uses_reasoned_verdict_surface() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

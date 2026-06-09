@@ -1,5 +1,14 @@
 # Changelog
 
+## Chain hook EPIPE fix - 2026-06-09
+
+- A chain hook that exits (or closes stdin) without reading its advisory JSON
+  payload no longer turns into `apply_refused_json_error__broken_pipe` — the
+  payload write tolerates EPIPE and the hook's exit code stays the contract.
+  This raced reliably on Linux CI runners (it broke the v0.1.0-rc.2 release
+  verify gate) and is now pinned by a deterministic closed-pipe unit test plus
+  a stdin-closing hook integration test.
+
 ## Workspace suite green; releases gated on it - 2026-06-09
 
 - `cargo test --workspace` passes end to end (53 binaries) and the release

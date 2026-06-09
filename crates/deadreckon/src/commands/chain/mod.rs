@@ -1587,6 +1587,23 @@ fn update_conductor_live(
     write_conductor_state(paths, &conductor)
 }
 
+/// Write the advisory JSON payload to a hook's stdin. The payload is
+/// advisory and the exit code is the contract: a hook that exits (or closes
+/// stdin) without reading is legal, and on Linux that surfaces as EPIPE on
+/// this write — losing the race must not turn a refusal exit code into a
+/// JSON error.
+fn write_hook_payload(stdin: &mut dyn std::io::Write, payload: &Value) -> Result<()> {
+    match serde_json::to_writer(&mut *stdin, payload) {
+        Ok(()) => match stdin.write_all(b"\n") {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(err) => Err(err.into()),
+        },
+        Err(err) if err.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 // SAFETY: Hook payloads are owned JSON messages written once to child process stdin.
 #[allow(clippy::needless_pass_by_value)]
 fn invoke_chain_hook(
@@ -1613,8 +1630,7 @@ fn invoke_chain_hook(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
     if let Some(stdin) = child.stdin.as_mut() {
-        serde_json::to_writer(&mut *stdin, &payload)?;
-        stdin.write_all(b"\n")?;
+        write_hook_payload(stdin, &payload)?;
     }
     let output = child.wait_with_output()?;
     let stdout = truncate_text(&String::from_utf8_lossy(&output.stdout), 4096);
@@ -3486,6 +3502,32 @@ fn chain_step_glyph(status: ChainStepStatus, plain: bool) -> &'static str {
         (ChainStepStatus::Applied, true) => "*",
         (ChainStepStatus::Undone, false) => "↶",
         (ChainStepStatus::Undone, true) => "<",
+    }
+}
+
+#[cfg(test)]
+mod hook_payload_tests {
+    use super::write_hook_payload;
+    use serde_json::json;
+
+    #[test]
+    fn closed_pipe_is_tolerated_payload_is_advisory() {
+        // Deterministic EPIPE: the read end is dropped before the write.
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        drop(reader);
+        write_hook_payload(&mut writer, &json!({"hook": "on-promote"}))
+            .expect("EPIPE on the advisory payload must not be an error");
+    }
+
+    #[test]
+    fn open_pipe_receives_the_payload() {
+        use std::io::Read;
+        let (mut reader, mut writer) = std::io::pipe().expect("pipe");
+        write_hook_payload(&mut writer, &json!({"hook": "pre-step"})).expect("write");
+        drop(writer);
+        let mut received = String::new();
+        reader.read_to_string(&mut received).expect("read");
+        assert_eq!(received, "{\"hook\":\"pre-step\"}\n");
     }
 }
 
