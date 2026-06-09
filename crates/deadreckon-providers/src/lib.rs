@@ -3,6 +3,7 @@
 
 //! Provider routing and adapters for deadreckon.
 
+mod auth_probe;
 mod cli_common;
 mod cli_generic;
 mod config;
@@ -17,6 +18,7 @@ pub mod cli_codex;
 pub mod registry;
 pub mod taxonomy;
 
+pub use auth_probe::{CliAuthStatus, probe_cli_auth};
 pub use config::{default_config_path, read_config};
 pub use error::{ProviderError, Result};
 pub use http::ProviderAdapter;

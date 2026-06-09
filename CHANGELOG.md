@@ -1,5 +1,21 @@
 # Changelog
 
+## Provider login preflight - 2026-06-09
+
+- Subscription CLI descriptors may declare an `[auth_probe]` (a local status
+  subcommand, e.g. `claude auth status` / `codex login status`) with
+  logged-in/logged-out markers and `login_try_lines`. Matching strips
+  whitespace so JSON pretty-printing differences don't matter, and is
+  fail-open: unsupported subcommands, stubs, and unexpected output classify as
+  Unknown and behave exactly as binary presence did before.
+- `deadreckon doctor` now distinguishes "CLI binary found; logged in" from
+  "installed but not logged in (<detail>)", with the provider's own login
+  command as the action.
+- The shared provider-setup resolver probes login state on the launch path
+  (`require_usable_route`) and refuses up front — `try: claude login` —
+  instead of failing mid-run with raw subprocess stderr. Previews stay
+  presence-only and never spawn the probe.
+
 ## Portability: no developer-machine paths in the shipped surface - 2026-06-09
 
 - `DEADRECKON_HOME` now defaults to `~/.deadreckon` derived from the running

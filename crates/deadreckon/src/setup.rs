@@ -10,7 +10,8 @@ use deadreckon_providers::registry::{
     AuthKind, DescriptorKind, ProviderDescriptor, ProviderRegistry,
 };
 use deadreckon_providers::{
-    ProviderError, ProviderKind, ProviderRouteInfo, ProviderRouter, read_config,
+    CliAuthStatus, ProviderError, ProviderKind, ProviderRouteInfo, ProviderRouter,
+    probe_cli_auth, read_config,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,7 +306,46 @@ fn selection_for_route(
             });
         }
     }
+    // An installed subscription CLI is not necessarily a usable one: probe
+    // login state on the launch path (not previews) and refuse up front with
+    // the provider's own login command instead of failing mid-run with raw
+    // subprocess stderr. Unknown probe results fall through unchanged.
+    if require_usable_route
+        && route.as_ref().is_some_and(|route| route.has_credential)
+        && let Some(descriptor) = descriptor
+        && descriptor.kind == DescriptorKind::Cli
+        && let Some(probe) = descriptor.auth_probe.as_ref()
+        && let Some(binary) = cli_binary_for(config_path, selection.provider.as_deref(), descriptor)
+        && let CliAuthStatus::NotLoggedIn { detail } = probe_cli_auth(&binary, probe)
+    {
+        let provider_label = selection.provider.as_deref().or(provider).unwrap_or("provider");
+        return Err(SetupRefusal {
+            message: format!("provider {provider_label} is installed but not logged in ({detail})"),
+            try_line: probe
+                .login_try_lines
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "deadreckon doctor".to_string()),
+        });
+    }
     Ok(selection)
+}
+
+/// The binary a CLI route will actually execute: config override first, then
+/// the descriptor default.
+fn cli_binary_for(
+    config_path: &Path,
+    provider: Option<&str>,
+    descriptor: &ProviderDescriptor,
+) -> Option<String> {
+    let configured = provider.and_then(|provider| {
+        read_config(config_path)
+            .ok()?
+            .providers
+            .get(provider)
+            .and_then(|entry| entry.binary.clone())
+    });
+    configured.or_else(|| descriptor.default_binary.clone())
 }
 
 fn provider_candidate<'a>(
@@ -771,5 +811,108 @@ model = "second-model"
                 .try_lines
                 .contains(&"deadreckon def-done \"what should count as done\"".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    fn write_fake_cli(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-claude");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake cli");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    #[cfg(unix)]
+    fn cli_request(require_usable_route: bool) -> ProviderSetupRequest<'static> {
+        ProviderSetupRequest {
+            role: SetupProviderRoleRef::PrimaryRun,
+            explicit_provider: Some("cli:claude-code"),
+            explicit_model: None,
+            config_default_provider: None,
+            config_doc_provider: None,
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: false,
+            allow_auto_subscription: false,
+            require_usable_route,
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_cli_config(dir: &Path, binary: &Path) -> PathBuf {
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[providers.\"cli:claude-code\"]\nkind = \"cli-claude-code\"\nbinary = \"{}\"\n",
+                binary.display()
+            ),
+        )
+        .expect("write config");
+        config_path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_path_refuses_installed_but_logged_out_cli_with_login_try_line() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let binary = write_fake_cli(temp.path(), "echo '{\"loggedIn\": false}'; exit 1");
+        let config_path = write_cli_config(temp.path(), &binary);
+        let registry = builtin_registry();
+
+        let refusal = select_provider_setup(&config_path, &registry, cli_request(true))
+            .expect_err("logged-out CLI must refuse on the launch path");
+
+        assert!(
+            refusal.message.contains("installed but not logged in"),
+            "{}",
+            refusal.message
+        );
+        assert_eq!(refusal.try_line, "claude login");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_path_accepts_logged_in_cli() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let binary = write_fake_cli(temp.path(), "echo '{\"loggedIn\": true}'");
+        let config_path = write_cli_config(temp.path(), &binary);
+        let registry = builtin_registry();
+
+        let selection = select_provider_setup(&config_path, &registry, cli_request(true))
+            .expect("logged-in CLI is usable");
+
+        assert_eq!(selection.provider.as_deref(), Some("cli:claude-code"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_probe_output_falls_back_to_presence_only() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        // A fake CLI that doesn't understand `auth status` (e.g. an older
+        // release or a test stub) must not be misread as logged out.
+        let binary = write_fake_cli(temp.path(), "echo 'usage: fake-claude <prompt>'; exit 2");
+        let config_path = write_cli_config(temp.path(), &binary);
+        let registry = builtin_registry();
+
+        let selection = select_provider_setup(&config_path, &registry, cli_request(true))
+            .expect("unknown login state must stay usable");
+
+        assert_eq!(selection.provider.as_deref(), Some("cli:claude-code"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_path_does_not_probe_login_state() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let binary = write_fake_cli(temp.path(), "echo '{\"loggedIn\": false}'; exit 1");
+        let config_path = write_cli_config(temp.path(), &binary);
+        let registry = builtin_registry();
+
+        let selection = select_provider_setup(&config_path, &registry, cli_request(false))
+            .expect("previews stay presence-only");
+
+        assert_eq!(selection.provider.as_deref(), Some("cli:claude-code"));
     }
 }

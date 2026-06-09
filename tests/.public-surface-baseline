@@ -221,6 +221,8 @@ crate: deadreckon-core
   state::RunStatus
   state::save_state
 crate: deadreckon-providers
+  auth_probe::CliAuthStatus
+  auth_probe::probe_cli_auth
   config::default_config_path
   config::read_config
   error::ProviderError

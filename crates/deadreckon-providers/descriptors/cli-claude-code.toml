@@ -17,6 +17,12 @@ kind = "subscription"
 args = ["-v"]
 expect_substring = "Claude Code"
 
+[auth_probe]
+args = ["auth", "status"]
+logged_in_substring = '"loggedIn": true'
+logged_out_substring = '"loggedIn": false'
+login_try_lines = ["claude login"]
+
 [exec_template]
 args_template = ["--dangerously-skip-permissions", "-p", "{prompt}"]
 model_arg = "--model"

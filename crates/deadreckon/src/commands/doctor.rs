@@ -1,4 +1,5 @@
 use super::super::*;
+use deadreckon_providers::{CliAuthStatus, probe_cli_auth};
 use std::path::Path;
 
 pub(crate) async fn doctor_command(json_output: bool) -> Result<()> {
@@ -420,13 +421,45 @@ async fn collect_doctor_provider_findings(
                     }
                 });
             if command_exists(binary) || PathBuf::from(binary).exists() {
-                findings.push(DoctorFinding::passed(
-                    subject,
-                    format!("CLI binary {binary} found"),
-                    Some(format!(
-                        "deadreckon run \"goal\" --provider {name} --preview"
-                    )),
-                ));
+                // Presence says "installed", the auth probe says "usable":
+                // surface installed-but-logged-out here instead of mid-run.
+                let probe_status = registry
+                    .get(name)
+                    .and_then(|descriptor| descriptor.auth_probe.as_ref())
+                    .map(|probe| (probe, probe_cli_auth(binary, probe)));
+                match probe_status {
+                    Some((_, CliAuthStatus::LoggedIn)) => {
+                        findings.push(DoctorFinding::passed(
+                            subject,
+                            format!("CLI binary {binary} found; logged in"),
+                            Some(format!(
+                                "deadreckon run \"goal\" --provider {name} --preview"
+                            )),
+                        ));
+                    }
+                    Some((probe, CliAuthStatus::NotLoggedIn { detail })) => {
+                        findings.push(DoctorFinding::failed(
+                            subject,
+                            format!(
+                                "CLI binary {binary} installed but not logged in ({detail})"
+                            ),
+                            probe
+                                .login_try_lines
+                                .first()
+                                .cloned()
+                                .or_else(|| Some("deadreckon config provider".to_string())),
+                        ));
+                    }
+                    _ => {
+                        findings.push(DoctorFinding::passed(
+                            subject,
+                            format!("CLI binary {binary} found"),
+                            Some(format!(
+                                "deadreckon run \"goal\" --provider {name} --preview"
+                            )),
+                        ));
+                    }
+                }
             } else {
                 findings.push(DoctorFinding::failed(
                     subject,

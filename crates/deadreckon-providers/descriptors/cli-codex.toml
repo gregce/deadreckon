@@ -16,6 +16,12 @@ kind = "subscription"
 [version_probe]
 args = ["--version"]
 
+[auth_probe]
+args = ["login", "status"]
+logged_in_substring = "Logged in"
+logged_out_substring = "Not logged in"
+login_try_lines = ["codex login"]
+
 [exec_template]
 args_template = [
   "--ask-for-approval",

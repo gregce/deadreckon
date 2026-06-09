@@ -95,6 +95,20 @@ pub struct VersionProbe {
     pub min_known_good: Option<String>,
 }
 
+/// A local, no-cost login-state probe for subscription CLI providers
+/// (`<binary> <args>`, e.g. `claude auth status`). Matching is fail-open: when
+/// neither marker appears the state is Unknown and callers behave exactly as
+/// they did before the probe existed (binary presence only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AuthProbe {
+    pub args: Vec<String>,
+    pub logged_in_substring: Option<String>,
+    pub logged_out_substring: Option<String>,
+    pub login_try_lines: Vec<String>,
+    pub timeout_seconds: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RequestShape {
@@ -229,6 +243,7 @@ pub struct ProviderDescriptor {
     pub default_endpoint: Option<String>,
     pub auth: AuthDescriptor,
     pub version_probe: Option<VersionProbe>,
+    pub auth_probe: Option<AuthProbe>,
     pub exec_template: ExecTemplate,
     pub sandbox_writes: Vec<PathBuf>,
     pub sandbox_reads: Vec<PathBuf>,
