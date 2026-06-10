@@ -94,7 +94,8 @@ pub fn acquire_lock(
     run_id: &str,
     scope: &str,
     phase: &str,
-    stale_after: Duration,
+    // Kept for status displays via lock_status; never authorizes reclaim.
+    _stale_after: Duration,
 ) -> Result<LockGuard> {
     // REPORT.md: Multi-Agent Worktree Coordination Layer starts with scoped
     // locks so parallel agents do not claim the same task at once.
@@ -114,6 +115,7 @@ pub fn acquire_lock(
             if let Some(existing) = read_lock_state(&path)? {
                 return Err(DeadreckonError::LockHeld {
                     task_key: task_key.to_string(),
+                    heartbeat_age_seconds: heartbeat_age_seconds(&existing),
                     run_id: existing.run_id,
                     phase: existing.phase,
                 });
@@ -125,13 +127,17 @@ pub fn acquire_lock(
 
     let existing = read_lock_state_from_file(&mut file, &path)?;
     if let Some(existing) = existing {
-        let stale = lock_is_stale(&existing, stale_after);
         let alive = pid_is_alive(existing.pid);
         let same_owner = existing.run_id == run_id;
-        if !same_owner && !stale && alive {
+        // An alive holder is never usurped, however stale its heartbeat —
+        // a wedged-but-running owner still owns its working tree. Reclaim
+        // requires a dead pid; `deadreckon kill <run-id> --force` is the
+        // operator path past a wedged holder.
+        if !same_owner && alive {
             file.unlock().with_path(&path)?;
             return Err(DeadreckonError::LockHeld {
                 task_key: task_key.to_string(),
+                heartbeat_age_seconds: heartbeat_age_seconds(&existing),
                 run_id: existing.run_id,
                 phase: existing.phase,
             });
@@ -193,12 +199,22 @@ pub fn release_lock_file(paths: &DeadreckonPaths, scope: &str, task_key: &str) -
     }
 }
 
+/// Advisory staleness for status displays. A stale heartbeat never
+/// authorizes reclaiming the lock — only a dead holder pid does.
 pub fn lock_is_stale(state: &LockState, stale_after: Duration) -> bool {
     let age = Utc::now()
         .signed_duration_since(state.updated_at)
         .to_std()
         .unwrap_or(Duration::ZERO);
     age > stale_after || !pid_is_alive(state.pid)
+}
+
+pub fn heartbeat_age_seconds(state: &LockState) -> u64 {
+    Utc::now()
+        .signed_duration_since(state.updated_at)
+        .to_std()
+        .map(|age| age.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn pid_is_alive(pid: u32) -> bool {
@@ -400,6 +416,99 @@ mod tests {
         )
         .expect("reclaim");
         assert_eq!(guard.state().run_id, "new-run");
+    }
+
+    #[test]
+    fn alive_holder_with_ancient_heartbeat_is_not_reclaimed() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path());
+        fs::create_dir_all(paths.locks_dir()).expect("locks dir");
+        let path = lock_path(&paths, "scope-x", "task");
+        let busy = LockState {
+            task_key: "task".to_string(),
+            run_id: "busy-run".to_string(),
+            scope: "scope-x".to_string(),
+            phase: "execute".to_string(),
+            pid: std::process::id(),
+            acquired_at: Utc::now() - ChronoDuration::minutes(90),
+            updated_at: Utc::now() - ChronoDuration::minutes(90),
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&busy).expect("json")).expect("write busy");
+
+        let err = acquire_lock(
+            &paths,
+            "task",
+            "usurper-run",
+            "scope-x",
+            "execute",
+            Duration::from_secs(60),
+        )
+        .expect_err("alive holder must never be usurped, however old the heartbeat");
+        assert!(matches!(err, DeadreckonError::LockHeld { .. }));
+    }
+
+    #[test]
+    fn dead_holder_is_reclaimed_regardless_of_heartbeat_age() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path());
+        fs::create_dir_all(paths.locks_dir()).expect("locks dir");
+        let path = lock_path(&paths, "scope-y", "task");
+        let dead = LockState {
+            task_key: "task".to_string(),
+            run_id: "dead-run".to_string(),
+            scope: "scope-y".to_string(),
+            phase: "execute".to_string(),
+            pid: 999_999,
+            acquired_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&dead).expect("json")).expect("write dead");
+
+        let guard = acquire_lock(
+            &paths,
+            "task",
+            "successor-run",
+            "scope-y",
+            "execute",
+            Duration::from_secs(3600),
+        )
+        .expect("dead holder reclaims even with a fresh heartbeat");
+        assert_eq!(guard.state().run_id, "successor-run");
+    }
+
+    #[test]
+    fn lockheld_refusal_names_heartbeat_age_and_force_kill_try_line() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path());
+        fs::create_dir_all(paths.locks_dir()).expect("locks dir");
+        let path = lock_path(&paths, "scope-z", "task");
+        let busy = LockState {
+            task_key: "task".to_string(),
+            run_id: "busy-run".to_string(),
+            scope: "scope-z".to_string(),
+            phase: "verify".to_string(),
+            pid: std::process::id(),
+            acquired_at: Utc::now() - ChronoDuration::minutes(2),
+            updated_at: Utc::now() - ChronoDuration::minutes(2),
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&busy).expect("json")).expect("write busy");
+
+        let err = acquire_lock(
+            &paths,
+            "task",
+            "usurper-run",
+            "scope-z",
+            "execute",
+            Duration::from_secs(60),
+        )
+        .expect_err("refused");
+        let message = err.to_string();
+        assert!(message.contains("busy-run"), "{message}");
+        assert!(message.contains("heartbeat"), "{message}");
+        assert!(
+            message.contains("s ago") || message.contains("seconds"),
+            "{message}"
+        );
     }
 
     #[test]

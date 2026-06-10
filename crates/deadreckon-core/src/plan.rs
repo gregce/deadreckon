@@ -777,6 +777,7 @@ mod tests {
                 coder: None,
                 reviewer: None,
                 children: BTreeMap::from([(1, "cli:codex".to_string())]),
+                ..PlanProviders::default()
             },
             Some("scope-a".to_string()),
             "0.1.0",

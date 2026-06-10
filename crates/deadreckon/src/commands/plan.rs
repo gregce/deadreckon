@@ -179,24 +179,13 @@ pub(crate) async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<P
     Ok(plan)
 }
 
+#[derive(Default)]
 pub(crate) struct PlanModelOverrides {
     pub(crate) planner_model: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) coder_model: Option<String>,
     pub(crate) reviewer_model: Option<String>,
     pub(crate) child_models: std::collections::BTreeMap<u32, String>,
-}
-
-impl PlanModelOverrides {
-    pub(crate) fn none() -> Self {
-        Self {
-            planner_model: None,
-            model: None,
-            coder_model: None,
-            reviewer_model: None,
-            child_models: std::collections::BTreeMap::new(),
-        }
-    }
 }
 
 /// Per-role model resolution: per-role flag -> generic --model -> config

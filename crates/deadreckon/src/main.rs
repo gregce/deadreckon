@@ -226,9 +226,10 @@ fn error_hint(err: &CliError) -> String {
         CliError::Core(DeadreckonError::NotFound(_)) => {
             "run `deadreckon list` to find valid run ids or config keys".to_string()
         }
-        CliError::Core(DeadreckonError::LockHeld { .. }) => {
-            "run `deadreckon list`, then `deadreckon attach <run-id>` or `deadreckon kill <run-id>`"
-                .to_string()
+        CliError::Core(DeadreckonError::LockHeld { run_id, .. }) => {
+            format!(
+                "`deadreckon attach {run_id}` to watch it, or `deadreckon kill {run_id} --force` if it is wedged"
+            )
         }
         CliError::Sandbox(_) => {
             "run `deadreckon doctor` to inspect sandbox availability".to_string()

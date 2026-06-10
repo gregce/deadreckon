@@ -18,11 +18,14 @@ pub enum DeadreckonError {
     InvalidInput(String),
     #[error("not found: {0}")]
     NotFound(String),
-    #[error("lock held for {task_key} by run {run_id} in phase {phase}")]
+    #[error(
+        "lock held for {task_key} by run {run_id} in phase {phase} (heartbeat {heartbeat_age_seconds}s ago)"
+    )]
     LockHeld {
         task_key: String,
         run_id: String,
         phase: String,
+        heartbeat_age_seconds: u64,
     },
 }
 
