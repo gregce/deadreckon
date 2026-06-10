@@ -2149,6 +2149,7 @@ struct LaunchPreviewFacts<'a> {
     path: &'a str,
     suggestion: Option<String>,
     provider: &'a str,
+    model: Option<String>,
     roles: Option<String>,
     base: Option<String>,
     history: Option<String>,
@@ -2169,6 +2170,9 @@ fn launch_preview_rows(facts: &LaunchPreviewFacts<'_>) -> Vec<(String, String)> 
         rows.push(("suggestion".to_string(), suggestion.clone()));
     }
     rows.push(("provider".to_string(), facts.provider.to_string()));
+    if let Some(model) = facts.model.as_ref().filter(|model| !model.is_empty()) {
+        rows.push(("model".to_string(), model.clone()));
+    }
     if let Some(roles) = facts.roles.as_ref() {
         rows.push(("roles".to_string(), roles.clone()));
     }
@@ -3800,6 +3804,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         path: "run",
         suggestion: None,
         provider: agent,
+        model: Some(model.to_string()).filter(|model| model != "provider default"),
         roles: None,
         base: None,
         history: None,

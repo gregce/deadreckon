@@ -36,6 +36,7 @@ use super::commands::start::{
     resolve_start_orchestration_options, start_done_materialization_request, start_launch_decision,
     start_launch_preview_facts, start_provider_role_summary,
 };
+use super::commands::start::{StartLaunchDecision, prompt_start_model};
 use super::tui::{
     AttachActionNotice, AttachHelpMode, AttachPanel, AttachPanelCounts, AttachPanelRows,
     AttachParentPlan, AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState,
@@ -5417,4 +5418,67 @@ fn help_overlay_survives_narrow_terminals() {
     terminal
         .draw(|frame| render_help_overlay(frame, AttachHelpMode::Chain))
         .expect("draw");
+}
+
+fn model_picker_decision() -> StartLaunchDecision {
+    let mut decision = start_launch_decision(StartLaunchInput {
+        goal: "model picker test",
+        stdin_is_tty: true,
+        requested_mode: crate::cli::CliStartMode::Run,
+    });
+    decision.provider_route = Some("cli:claude-code".to_string());
+    decision
+}
+
+#[test]
+fn start_with_model_flag_skips_the_picker() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut decision = model_picker_decision();
+    decision.model = Some("opus".to_string());
+    let mut prompter = ScriptedStartPrompter::new(&[]);
+
+    prompt_start_model(&mut decision, &paths, "cli:claude-code", &mut prompter).expect("no prompt");
+
+    assert!(prompter.prompt_titles.is_empty());
+    assert_eq!(decision.model.as_deref(), Some("opus"));
+}
+
+#[test]
+fn start_model_picker_appears_after_provider_and_stores_choice() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut decision = model_picker_decision();
+    let mut prompter = ScriptedStartPrompter::new(&["sonnet"]);
+
+    prompt_start_model(&mut decision, &paths, "cli:claude-code", &mut prompter).expect("prompt");
+
+    assert_eq!(prompter.prompt_titles, vec!["Choose model".to_string()]);
+    assert_eq!(decision.model.as_deref(), Some("sonnet"));
+}
+
+#[test]
+fn start_model_picker_provider_default_means_no_override() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut decision = model_picker_decision();
+    let mut prompter = ScriptedStartPrompter::new(&["provider default"]);
+
+    prompt_start_model(&mut decision, &paths, "cli:claude-code", &mut prompter).expect("prompt");
+
+    assert_eq!(decision.model, None);
+}
+
+#[test]
+fn start_model_picker_skips_catalogless_providers() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut decision = model_picker_decision();
+    decision.provider_route = Some("smoke".to_string());
+    let mut prompter = ScriptedStartPrompter::new(&[]);
+
+    prompt_start_model(&mut decision, &paths, "smoke", &mut prompter).expect("no prompt");
+
+    assert!(prompter.prompt_titles.is_empty());
+    assert_eq!(decision.model, None);
 }

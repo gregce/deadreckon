@@ -11,7 +11,7 @@ use serde_json::Value;
 
 mod common;
 
-use common::{assert_success, deadreckon, repo_tempdir, stdout};
+use common::{assert_success, deadreckon, prepend_fake_cli_to_path, repo_tempdir, stdout};
 
 #[test]
 fn models_lists_catalog_for_explicit_provider_with_recommended_marker() {
@@ -93,4 +93,38 @@ fn models_without_provider_lists_every_credentialed_route() {
     let out = stdout(&output);
     assert!(out.contains("cli:claude-code"), "{out}");
     assert!(out.contains("anthropic"), "{out}");
+}
+
+#[test]
+fn run_preview_names_resolved_model_for_cli_provider() {
+    let temp = repo_tempdir();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let path_env = prepend_fake_cli_to_path(&temp, "codex");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .env("PATH", &path_env)
+        .env("DEADRECKON_AUTH_PROBE", "0")
+        .args([
+            "run",
+            "preview model echo",
+            "--provider",
+            "cli:codex",
+            "--fresh",
+            "--preview",
+            "--model",
+            "preview-mx",
+        ])
+        .output()
+        .expect("preview");
+
+    let text = format!(
+        "{}{}",
+        stdout(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("preview-mx"), "{text}");
 }

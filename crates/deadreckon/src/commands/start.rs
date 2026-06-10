@@ -239,6 +239,7 @@ pub(crate) struct StartLaunchDecision {
     pub(crate) provider_source: StartProviderSource,
     pub(crate) provider_route: Option<String>,
     pub(crate) provider_label: String,
+    pub(crate) model: Option<String>,
     pub(crate) child_count: Option<u8>,
     pub(crate) planner_provider_route: Option<String>,
     pub(crate) child_provider_route: Option<String>,
@@ -298,6 +299,7 @@ pub(crate) fn start_launch_decision(input: StartLaunchInput<'_>) -> StartLaunchD
         reason,
         provider_source: StartProviderSource::Missing,
         provider_route: None,
+        model: None,
         provider_label: StartProviderSource::Missing.label().to_string(),
         child_count: None,
         planner_provider_route: None,
@@ -950,6 +952,65 @@ fn prompt_start_provider(
     };
     decision.provider_route = Some(provider.clone());
     decision.provider_label = format!("{provider} ({})", decision.provider_source.label());
+    prompt_start_model(decision, paths, &provider, prompter)?;
+    Ok(())
+}
+
+/// After an interactive provider choice, offer the provider's model catalog.
+/// Enter keeps the default (configured defaults.model when it names this
+/// provider's entry, else the descriptor's recommended entry); choosing
+/// "provider default" launches with no model override at all. Skipped when
+/// the catalog has at most one entry or the model was already pinned.
+pub(crate) fn prompt_start_model(
+    decision: &mut StartLaunchDecision,
+    paths: &DeadreckonPaths,
+    provider: &str,
+    prompter: &mut dyn StartPrompter,
+) -> Result<()> {
+    if decision.model.is_some() {
+        return Ok(());
+    }
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let Some(descriptor) = registry.get(provider) else {
+        return Ok(());
+    };
+    if descriptor.model_catalog.len() < 2 {
+        return Ok(());
+    }
+    let configured = config_defaults(paths)?.model;
+    let mut default_index = 0;
+    let choices = descriptor
+        .model_catalog
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            if configured.as_deref() == Some(entry.id.as_str())
+                || (configured.is_none() && entry.recommended && default_index == 0)
+            {
+                default_index = index;
+            }
+            let mut details = Vec::new();
+            if let Some(window) = entry.context_window {
+                details.push(format!("context {}k", window / 1000));
+            }
+            if let (Some(input), Some(output)) = (entry.input_per_million, entry.output_per_million)
+                && (input > 0.0 || output > 0.0)
+            {
+                details.push(format!("${input}/{output} per M"));
+            }
+            if entry.recommended {
+                details.push("recommended".to_string());
+            }
+            prompt::SelectChoice::with_detail(&entry.id, &entry.id, details.join(" · "))
+        })
+        .collect::<Vec<_>>();
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Choose model".to_string(),
+        help: Some("Enter keeps the default; this launch only".to_string()),
+        choices,
+        default_index,
+    })?;
+    decision.model = (choice.id != "provider default").then(|| choice.id.clone());
     Ok(())
 }
 
@@ -1662,6 +1723,7 @@ pub(crate) fn start_launch_preview_facts(decision: &StartLaunchDecision) -> Laun
         path: decision.selected_mode.path_label(),
         suggestion,
         provider: &decision.provider_label,
+        model: decision.model.clone(),
         roles: start_provider_role_summary(decision),
         base: decision.base_run_label.clone(),
         history: decision.history_action_label.clone(),
@@ -2408,6 +2470,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         requested_mode: args.mode,
         stdin_is_tty,
     });
+    decision.model = args.model.clone();
     add_start_history_actions(&mut decision, latest_extendable_run.as_ref());
     let eligibility = StartPromptEligibility::from_args(&args, stdin_is_tty);
     if start_goal_shape_should_classify(&args, eligibility) {
@@ -2576,7 +2639,7 @@ async fn dispatch_start_command(
                 max_wall_seconds: None,
                 sandbox: None,
                 provider: decision.provider_route.clone(),
-                model: None,
+                model: decision.model.clone().or_else(|| args.model.clone()),
                 doc_provider: None,
                 acceptance: None,
                 skill: "deadreckon".to_string(),
@@ -2623,7 +2686,7 @@ async fn dispatch_start_command(
                 max_spend: None,
                 max_wall_seconds: None,
                 provider: decision.provider_route.clone(),
-                model: None,
+                model: decision.model.clone().or_else(|| args.model.clone()),
                 sandbox: None,
                 no_docs: false,
                 doc_skill: None,

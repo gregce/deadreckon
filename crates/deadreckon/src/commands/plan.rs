@@ -1350,6 +1350,7 @@ pub(crate) fn print_orchestrate_preflight(
         path,
         suggestion: None,
         provider: &providers,
+        model: plan.providers.default_child_model.clone(),
         roles: None,
         base: None,
         history: None,
