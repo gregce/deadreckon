@@ -23,6 +23,35 @@ candidates; the sections below carry the full per-change record.
   rc/stable lanes, self-update re-homed and proven live, CI on every push
   with the full 54-binary suite green.
 
+## Stable Readiness - 2026-06-10
+
+- Populated model catalogs for every built-in provider descriptor, each with
+  exactly one recommended entry; custom descriptors fail closed on multiple
+  recommendations.
+- `deadreckon models [PROVIDER] [--all] [--json]` — the catalog surface for
+  choosing a model, marking the recommended entry and the configured default.
+- Per-role model flags: `--model` on start/run/chain, `--planner-model` /
+  `--model` / `--child-model IDX=MODEL` on orchestrate full-plan,
+  `--coder-model` / `--reviewer-model` on orchestrate review, campaign
+  equivalents — additive serde-default fields on plan.json, echoed in
+  previews and the provider-roles table; "provider default" sends no model
+  argv.
+- Interactive `start` gains a model picker after the provider choice.
+- Never-dead-end launches: unusable resolved routes on a TTY drop into the
+  provider picker (keep/cancel reproduce the original refusal); off-TTY
+  refusals byte-identical.
+- history.json corruption falls back to traces.jsonl reconstruction with an
+  atomic re-save; save_history writes via tempfile + rename.
+- Lock reclaim never usurps an alive holder pid; LockHeld names the
+  heartbeat age and the kill --force escape hatch.
+- Stable-lane gates: `## 0.1.0` CHANGELOG section, lane-asymmetry depth
+  tests (changelog + npm wrapper pins are stable-only), explicit
+  checksum = "sha256", embedded-checksum upgrade path recorded.
+- `release/preflight-real.sh` real-provider proof harness +
+  `release/known-good-providers.json` (schema_version 1); stable v0.1.0
+  operator checklist and Windows smoke checklist in docs/RELEASE.md;
+  models/picker/rescue documented in HOWTO.md.
+
 ## Self-update that actually updates - 2026-06-10
 
 - The axoupdater-backed `deadreckon update` pointed at the pre-re-home

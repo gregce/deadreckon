@@ -1592,7 +1592,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Unattended git hardening: production git invocations route through `deadreckon-core::git`, export `GIT_TERMINAL_PROMPT=0`, and disable commit/tag GPG signing for commit-family verbs so global signing cannot hang on pinentry.
 - Honest spend summaries: `spend.jsonl` replay renders subscription-only CLI routes as not metered with wall time and turns, and renders mixed routes as metered total plus `+ subscription turns` rather than pretending a subscription turn cost `$0.000000`.
 - Distribution and self-update: install receipts and update-check caches live under `~/.deadreckon/`; `deadreckon update --check` and `deadreckon update` honor npm, Homebrew, shell, cargo, and source channels; shell installs preview the target/archive/checksum/backup path, require confirmation or `--yes`, keep the latest three backups, and print a post-update `deadreckon doctor` hint.
-- Release packaging: `cargo-dist` configuration covers five OS/architecture targets, shell and PowerShell installers, Linux glibc 2.28 metadata, lane-aware fail-closed macOS signing/notarization for official RC/stable tags, Authenticode signing for stable Windows artifacts, `SHA256SUMS`, `release-manifest.json`, `release.spdx.json`, GitHub artifact attestations, npm provenance, a no-network npm wrapper with five platform packages, and Homebrew tap publishing through `gdc/homebrew-tap`.
+- Release packaging: `cargo-dist` configuration covers five OS/architecture targets, shell and PowerShell installers, Linux glibc 2.28 metadata, lane-aware fail-closed macOS signing/notarization for official RC/stable tags, Authenticode signing for stable Windows artifacts, `SHA256SUMS`, `release-manifest.json`, `release.spdx.json`, GitHub artifact attestations, npm provenance, a no-network npm wrapper with five platform packages, and Homebrew tap publishing through `gregce/homebrew-tap`.
 - Codebase-default running: worktree mode, copy mode, in-place mode, fresh-mode preservation, preflight + preview UX, and `codebase.json` files-not-fields metadata.
 - `apply` and `abandon` for worktree rollback/apply lifecycle.
 - `materialize`, `extend`, `undo`, `list`, and `show` integration with codebase mode metadata, including worktree extension branches chained from parent `dr/...` branches.
@@ -2146,7 +2146,7 @@ After local/global artifacts are built, the workflow generates `release.spdx.jso
 
 The npm distribution uses a small `deadreckon` wrapper package with optional dependencies on five platform packages: darwin-arm64, darwin-x64, linux-arm64, linux-x64, and win32-x64. `npm/scripts/prepare-release.mjs` repacks cargo-dist artifacts into those platform package directories and updates versions from the tag. The wrapper `postinstall` (`npm/deadreckon/scripts/postinstall.js`) runs at install time, detects which platform package was selected, and writes an `install-receipt.json` with `channel: "npm"`, `install_source: "npm:deadreckon@<version>"`, and `platform_package: "<detected>"` — no network needed at update time. `.github/workflows/publish-npm.yml` validates the stable release lane, then publishes the platform packages first and wrapper last with `npm publish --provenance`; it supports npm trusted publishing through OIDC or `NPM_TOKEN` plus provenance.
 
-Homebrew publishing uses cargo-dist's generated formula as the starting point. `release/homebrew/patch-formula.mjs` then injects a `write_deadreckon_receipt!` method into the formula and calls it from the `install` block; the injected code writes `install-receipt.json` with `channel: "brew"` and `install_source: "brew:gdc/tap/deadreckon"` at install time. cargo-dist itself still owns release-archive SHA-256 pinning. The release workflow publishes the patched formula into `gdc/homebrew-tap` with `HOMEBREW_TAP_TOKEN`.
+Homebrew publishing uses cargo-dist's generated formula as the starting point. `release/homebrew/patch-formula.mjs` then injects a `write_deadreckon_receipt!` method into the formula and calls it from the `install` block; the injected code writes `install-receipt.json` with `channel: "brew"` and `install_source: "brew:gregce/tap/deadreckon"` at install time. cargo-dist itself still owns release-archive SHA-256 pinning. The release workflow publishes the patched formula into `gregce/homebrew-tap` with `HOMEBREW_TAP_TOKEN`.
 
 ### 31.5 Current Limits
 
@@ -2919,6 +2919,93 @@ render tests remain the contract; goldens were updated deliberately per phase.
 - **Dependency**: `inquire 0.9.4` (Tier 2, DEPENDENCIES.md) — crossterm
   backend; it dual-links crossterm 0.28 beside the workspace 0.29, which is
   acceptable because prompts and the ratatui TUI never run concurrently.
+
+## 43. Stable Readiness (models, rescue, durability, release gates)
+
+### 43.1 Model catalogs and resolution order
+
+Every provider descriptor (`crates/deadreckon-providers/descriptors/*.toml`)
+carries a populated `[[model_catalog]]` with exactly one `recommended = true`
+entry per built-in descriptor (pinned by depth test; custom descriptors may
+omit a recommendation, and more than one fails parsing closed). Entries are
+`ModelEntry { id, context_window, aliases, recommended, .. }` — `recommended`
+is serde-default so pre-existing descriptors parse unchanged. Resolution is
+one rule everywhere: per-role flag → generic `--model` → `defaults.model`
+(config) → the catalog's recommended entry → provider default. "provider
+default" is a real catalog entry meaning *no* `--model` argv reaches the
+CLI — pinned by argv test.
+
+### 43.2 The models verb and picker surfaces
+
+`deadreckon models [PROVIDER] [--all] [--json]`
+(`commands/providers.rs::models_command`) renders the catalog with the
+recommended entry, the configured default (`deadreckon config model`), cost
+and context-window notes; `--json` emits `{provider, configured_default,
+models: [{id, recommended, context_window, aliases, default}]}`. Interactive
+`start` offers a model picker (`prompt_start_model`, start.rs) immediately
+after the provider choice — skipped when `--model` was given or the catalog
+has fewer than two entries; the cursor defaults to `defaults.model`, else
+the recommended entry; choosing "provider default" stores `None`. Launch
+previews and the orchestrate provider-roles table echo the resolved model.
+
+### 43.3 Per-role models in plan.json (additive)
+
+`PlanProviders` gained five serde-default fields — `planner_model`,
+`default_child_model`, `coder_model`, `reviewer_model`, and `child_models`
+(BTreeMap<u32, String>) — populated only when the matching role provider is
+set; a pre-rider plan.json fixture parses unchanged (compat test).
+`PipelineState` is untouched. Flags: `--planner-model` / `--model` /
+`--child-model IDX=MODEL` on `orchestrate full-plan`, `--coder-model` /
+`--reviewer-model` on `orchestrate review`, `--planner-model` / `--model`
+on `campaign run`, `--model` on `start`/`run`/`chain`. Child spawns append
+`--model` argv via `child_model_for_task`, which filters "provider default"
+and empty strings; campaign sub-launches forward `--planner-model`/`--model`
+(argv-pinned in campaign_spawn_tests).
+
+### 43.4 TTY rescue at refusal sites
+
+`provider_setup_selection` (main.rs) is the single funnel for
+`setup::select_provider_setup`; when a `require_usable_route` request
+refuses with a rescueable message ("needs credentials" / "not logged in")
+and `prompt::is_tty()` holds (stdin+stdout TTYs — deliberately independent
+of line mode so PTY tests drive it), the refusal becomes a
+probe-before-ask picker: detected CLIs with live login hints, a "keep"
+choice carrying the refusal's `try:` line, and cancel — keep/cancel
+reproduce today's refusal verbatim. One rescue per launch; the retried
+selection pins `explicit_provider` to the picked route. Off-TTY refusals
+are byte-identical (pinned). All twenty call sites inherit the rescue with
+zero per-site changes.
+
+### 43.5 history.json reconstruction + atomic save; lock reclaim rules
+
+`load_or_reconstruct_history` (turn_loop.rs) treats any history.json read
+or parse failure like a missing file: warn on stderr (the flight recorder
+is not open yet), rebuild from `traces.jsonl`, advance `state.turn` to the
+last complete turn if ahead, and atomically re-save. `save_history` writes
+through tempfile + rename (same pattern as `state.rs::atomic_write_json`),
+pinned by an inode-change test. Lock reclaim (`lock.rs::acquire_lock`) now
+requires a dead holder pid: an alive holder is never usurped however stale
+its heartbeat (staleness is advisory, for `lock_status` displays only),
+and the `LockHeld` refusal names the heartbeat age with
+`deadreckon kill <run-id> --force` as the operator escape hatch.
+
+### 43.6 Stable-lane gates and the operator checklist
+
+`CHANGELOG.md` carries the `## 0.1.0` section, so
+`release-trust.mjs validate --ref refs/tags/v0.1.0` fails only on the
+cut-time version bumps; depth tests pin the lane asymmetry (stable
+requires the changelog section and the npm-wrapper version match, rc
+requires neither). `dist-workspace.toml` pins `checksum = "sha256"`;
+the inner installer's embedded-sum verification for tar.xz is a
+V1-CANDIDATES upgrade path, with `release/install.sh`'s SHA256SUMS
+die-on-mismatch as the shipped integrity story (pinned).
+`release/preflight-real.sh` (POSIX sh, refuses under CI) is the
+operator-run stable-cut proof: per route, a real start to completion,
+signed `turn-acceptance.json`, `apply`, then kill/resume — recording
+binary versions in `release/known-good-providers.json` (schema_version 1).
+`docs/RELEASE.md` holds the one-time "Stable v0.1.0 operator checklist"
+(tap repo + token, npm trusted publishing, Windows Authenticode or a
+consciously narrowed lane, version bumps, preflight, Windows smoke, tag).
 
 ---
 

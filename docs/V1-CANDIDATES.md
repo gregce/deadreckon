@@ -6,7 +6,7 @@
 - Richer multi-piece goal classification: the production path has one bounded provider-backed goal-shape recommendation with deterministic fallback. V1 can add deeper LLM-backed multi-piece classification/decomposition once evidence limits, cost policy, explainability, and fixtures are explicit.
 - Personalized onboarding: adapt setup copy and examples to a user's observed provider/source/done-contract patterns without adding telemetry or background profiling by default.
 - Provider-specific setup wizards: offer richer guided configuration for individual CLIs or APIs once their install/auth flows are stable enough to document without making `start` brand-specific.
-- Advanced `start` role pickers: the current picker reuses one selected provider route for review coder/reviewer or full-plan planner/child roles. V1 can add role-specific and per-child provider selection once the simple picker proves useful.
+- Advanced `start` role pickers: the current picker reuses one selected provider route for review coder/reviewer or full-plan planner/child roles (per-role model flags landed in the stable-readiness pass; interactive per-role pickers did not). V1 can add role-specific and per-child provider/model selection once the simple picker proves useful.
 - Production command release policy: after the default model proves itself, decide whether advanced verbs stay flat forever, move under namespaces, gain stronger aliases, or get deprecation windows. The production-release command model keeps every command callable and discoverable through `help-all`.
 
 ## Effortless follow-ups
