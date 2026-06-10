@@ -396,6 +396,108 @@ fn stable_tag_requires_changelog_entry() {
 }
 
 #[test]
+fn stable_validate_requires_changelog_section_and_rc_does_not() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let changelog = temp.path().join("CHANGELOG.md");
+    fs::write(&changelog, "# Changelog\n\n## Some Other Release\n").expect("fixture changelog");
+    let changelog_arg = changelog.to_str().expect("utf8 path");
+
+    let stable = release_trust([
+        "validate",
+        "--ref",
+        "refs/tags/v0.1.0",
+        "--repo",
+        "gregce/deadreckon",
+        "--changelog",
+        changelog_arg,
+    ]);
+    assert!(
+        !stable.status.success(),
+        "stable lane must gate on the changelog"
+    );
+    let stderr = String::from_utf8_lossy(&stable.stderr);
+    assert!(stderr.contains("CHANGELOG.md"), "{stderr}");
+
+    let rc_tag = format!("refs/tags/v{}", workspace_version_string());
+    let rc = release_trust([
+        "validate",
+        "--ref",
+        rc_tag.as_str(),
+        "--repo",
+        "gregce/deadreckon",
+        "--changelog",
+        changelog_arg,
+    ]);
+    let rc_stderr = String::from_utf8_lossy(&rc.stderr);
+    assert!(
+        rc.status.success(),
+        "rc lane must not require a changelog section: {rc_stderr}"
+    );
+}
+
+#[test]
+fn stable_validate_requires_npm_wrapper_version_match() {
+    let stable = release_trust([
+        "validate",
+        "--ref",
+        "refs/tags/v0.2.0",
+        "--repo",
+        "gregce/deadreckon",
+        "--skip-changelog",
+    ]);
+    assert!(!stable.status.success());
+    let stderr = String::from_utf8_lossy(&stable.stderr);
+    assert!(stderr.contains("npm wrapper version"), "{stderr}");
+
+    let rc = release_trust([
+        "validate",
+        "--ref",
+        "refs/tags/v0.2.0-rc.1",
+        "--repo",
+        "gregce/deadreckon",
+        "--skip-changelog",
+    ]);
+    let rc_stderr = String::from_utf8_lossy(&rc.stderr);
+    assert!(
+        !rc_stderr.contains("npm wrapper version"),
+        "the npm wrapper gate must fire on the stable lane only: {rc_stderr}"
+    );
+}
+
+#[test]
+fn installer_artifact_checksum_verification_is_documented_or_embedded() {
+    let install = fs::read_to_string(workspace_root().join("release/install.sh"))
+        .expect("release/install.sh");
+    assert!(
+        install.contains("SHA256SUMS") && install.contains("checksum verification failed"),
+        "the wrapper installer must verify artifacts against SHA256SUMS and die on mismatch"
+    );
+
+    let dist = dist_config();
+    let embedded = dist
+        .get("checksum")
+        .and_then(Value::as_str)
+        .is_some_and(|algo| algo == "sha256");
+    let candidates = fs::read_to_string(workspace_root().join("docs/V1-CANDIDATES.md"))
+        .expect("docs/V1-CANDIDATES.md");
+    let documented_fallback = candidates.contains("embedded checksum");
+    assert!(
+        embedded && documented_fallback,
+        "pin the checksum algorithm in dist-workspace.toml and document the \
+         inner-installer embedded-checksum upgrade path in V1-CANDIDATES"
+    );
+}
+
+fn workspace_version_string() -> String {
+    let manifest = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("Cargo.toml");
+    let value: toml::Table = manifest.parse().expect("workspace toml");
+    value["workspace"]["package"]["version"]
+        .as_str()
+        .expect("workspace version")
+        .to_string()
+}
+
+#[test]
 fn release_manifest_covers_artifacts_and_checksums() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let distrib = temp.path().join("target/distrib");

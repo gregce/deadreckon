@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.0 — Stable
+
+Release highlights distilled from the 0.1.0-rc.2 through 0.1.0-rc.11
+candidates; the sections below carry the full per-change record.
+
+- First-class model selection: populated per-provider model catalogs, a
+  `deadreckon models` verb, an interactive model picker in `start`, and
+  per-role model flags (`--model`, `--planner-model`, `--coder-model`,
+  `--reviewer-model`, `--child-model IDX=MODEL`) across run, chain,
+  orchestrate, and campaign — echoed on previews and provider-role tables.
+- Never-dead-end launches: an unusable resolved provider on a TTY drops into
+  the probe-before-ask provider picker instead of refusing; off-TTY refusals
+  are unchanged.
+- Durability: history.json corruption falls back to traces.jsonl
+  reconstruction with atomic re-save; lock reclaim never usurps an alive
+  holder pid regardless of heartbeat age.
+- One prompt engine (inquire) behind every interactive surface, a gradient
+  wordmark banner, smart bare invocation, and a visually informative
+  installer with SHA256SUMS verification.
+- Release trust end to end: signed + notarized macOS archives, fail-closed
+  rc/stable lanes, self-update re-homed and proven live, CI on every push
+  with the full 54-binary suite green.
+
 ## Self-update that actually updates - 2026-06-10
 
 - The axoupdater-backed `deadreckon update` pointed at the pre-re-home

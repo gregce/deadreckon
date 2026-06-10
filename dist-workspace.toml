@@ -23,6 +23,11 @@ targets = [
   "x86_64-unknown-linux-gnu",
   "x86_64-pc-windows-msvc",
 ]
+# Explicit checksum algorithm for the *.sha256 siblings and SHA256SUMS the
+# release lane aggregates; the wrapper installer dies on mismatch. The inner
+# cargo-dist installer does not yet verify embedded sums for tar.xz — that
+# upgrade path is tracked in docs/V1-CANDIDATES.md.
+checksum = "sha256"
 install-path = "~/.local/share/deadreckon/bin"
 install-updater = false
 precise-builds = true

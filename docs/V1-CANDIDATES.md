@@ -93,3 +93,15 @@
   needing text suspends to a line prompt). A V1 could add `tui-input` /
   `tui-textarea` once a real in-frame input/search/filter use case is designed
   (Tier 3 in the rider until then).
+
+## Release integrity (embedded checksum verification)
+
+- Inner-installer embedded checksums: the cargo-dist 0.31 generated shell
+  installer prints "no checksums to verify" for tar.xz artifacts; integrity
+  today is enforced one layer up, where `release/install.sh` verifies every
+  downloaded artifact against the release's SHA256SUMS and dies on mismatch
+  (and macOS archives are Developer ID signed + notarized). The upgrade path
+  is a cargo-dist version whose shell installer verifies the embedded
+  per-artifact sha256 fragments for tar.xz, at which point a fresh
+  `curl | sh` transcript should show the inner installer verifying the
+  artifact hash and the wrapper check becomes defense in depth.
