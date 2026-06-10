@@ -390,12 +390,36 @@ async fn collect_doctor_provider_findings(
     paths: &DeadreckonPaths,
     root: &toml::Value,
 ) -> Result<Vec<DoctorFinding>> {
-    let Some(providers) = root.get("providers").and_then(toml::Value::as_table) else {
-        return Ok(vec![DoctorFinding::failed(
-            "providers",
-            "providers table missing",
-            Some("deadreckon init".to_string()),
-        )]);
+    // A config without a [providers] table is legitimate: built-in registry
+    // descriptors cover every default route (e.g. after `config
+    // remove-provider` deletes the last override). Check the configured
+    // default and fallback routes instead of failing a healthy setup.
+    let empty = toml::map::Map::new();
+    let owned_table;
+    let providers = match root.get("providers").and_then(toml::Value::as_table) {
+        Some(table) if !table.is_empty() => table,
+        _ => {
+            let mut synthesized = toml::map::Map::new();
+            // Only the default route must be usable; fallback routes are
+            // best-effort by design (the router skips credential-less ones),
+            // so a keyless fallback entry must not block a healthy setup.
+            let mut route_names = Vec::new();
+            if let Some(name) = root.get("default_provider").and_then(toml::Value::as_str) {
+                route_names.push(name.to_string());
+            }
+            if route_names.is_empty() {
+                return Ok(vec![DoctorFinding::failed(
+                    "providers",
+                    "no providers configured",
+                    Some("deadreckon init".to_string()),
+                )]);
+            }
+            for name in route_names {
+                synthesized.insert(name, toml::Value::Table(empty.clone()));
+            }
+            owned_table = synthesized;
+            &owned_table
+        }
     };
     let registry = ProviderRegistry::with_overrides(paths.home())?;
     let mut findings = Vec::new();

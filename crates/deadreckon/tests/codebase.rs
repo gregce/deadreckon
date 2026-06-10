@@ -595,6 +595,38 @@ model = "configured-model"
 }
 
 #[test]
+fn doctor_accepts_registry_backed_default_without_providers_table() {
+    // `config remove-provider` can delete the last [providers.*] override;
+    // built-in registry descriptors still cover the default route, and a
+    // keyless fallback entry is best-effort, so doctor must stay green.
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(
+        paths.config_path(),
+        "default_provider = \"cli:claude-code\"\nfallback = [\"openai\", \"cli:claude-code\"]\n",
+    )
+    .expect("config");
+    let path_env = prepend_fake_cli_to_path(&temp, "claude");
+
+    let output = deadreckon(&paths)
+        .env("PATH", &path_env)
+        .env("DEADRECKON_AUTH_PROBE", "0")
+        .arg("doctor")
+        .output()
+        .expect("doctor");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(!out.contains("providers table missing"), "{out}");
+    assert!(out.contains("provider cli:claude-code"), "{out}");
+    assert!(
+        !out.contains("provider openai"),
+        "keyless fallback routes are best-effort, not doctor findings: {out}"
+    );
+}
+
+#[test]
 fn config_provider_and_model_are_user_friendly_shortcuts() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
