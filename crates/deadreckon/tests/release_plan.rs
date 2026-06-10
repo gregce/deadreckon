@@ -873,6 +873,28 @@ fn rc_release_does_not_publish_stable_package_managers() {
 }
 
 #[test]
+fn release_runbook_contains_stable_operator_checklist() {
+    let doc =
+        fs::read_to_string(workspace_root().join("docs/RELEASE.md")).expect("read docs/RELEASE.md");
+    assert!(
+        doc.contains("Stable v0.1.0 operator checklist"),
+        "docs/RELEASE.md needs the stable operator checklist section"
+    );
+    for item in [
+        "gregce/homebrew-tap",
+        "HOMEBREW_TAP_TOKEN",
+        "NPM_TOKEN",
+        "WINDOWS_CERT_PFX",
+        "WINDOWS_CERT_PWD",
+        "npm/deadreckon/package.json",
+        "preflight-real.sh",
+        "Windows smoke",
+    ] {
+        assert!(doc.contains(item), "{item} missing from docs/RELEASE.md");
+    }
+}
+
+#[test]
 fn release_doc_lists_all_five_apple_secrets() {
     let doc =
         fs::read_to_string(workspace_root().join("docs/RELEASE.md")).expect("read docs/RELEASE.md");

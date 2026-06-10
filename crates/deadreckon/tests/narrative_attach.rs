@@ -145,6 +145,7 @@ fn narrative_attach_plan_plain_smoke_lists_agents_and_dependencies() {
             coder: None,
             reviewer: None,
             children: [(1, "smoke:reviewer".to_string())].into(),
+            ..PlanProviders::default()
         },
         None,
         "0.1.0",
@@ -204,6 +205,7 @@ fn narrative_attach_plan_child_ref_plain_smoke_carries_parent_context() {
             coder: None,
             reviewer: None,
             children: Default::default(),
+            ..PlanProviders::default()
         },
         None,
         "0.1.0",

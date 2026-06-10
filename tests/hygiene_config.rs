@@ -505,6 +505,7 @@ fn deadreckon_error_variants() -> Vec<DeadreckonError> {
             task_key: "task".to_string(),
             run_id: "run".to_string(),
             phase: "phase".to_string(),
+            heartbeat_age_seconds: 5,
         },
     ]
 }

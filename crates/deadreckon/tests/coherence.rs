@@ -237,6 +237,16 @@ fn strategy_flags_use_scoped_vocabulary() {
 }
 
 #[test]
+fn help_all_lists_models_verb_in_inspection_group() {
+    let all = help(["help-all"]);
+    assert!(all.contains("models"), "{all}");
+    assert!(
+        all.contains("list selectable models per provider route"),
+        "{all}"
+    );
+}
+
+#[test]
 fn prompt_output_and_machine_flags_have_one_policy() {
     let all = help(["help-all"]);
     assert!(all.contains("output and scripting policy"), "{all}");
@@ -1123,6 +1133,7 @@ fn attach_plan_plain_displays_running_for_inflight_child() {
             coder: None,
             reviewer: None,
             children: Default::default(),
+            ..PlanProviders::default()
         },
         Some("scope".to_string()),
         "0.1.0",

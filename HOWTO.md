@@ -585,6 +585,45 @@ DEADRECKON_IMPORT_CURSOR_ROOT=/tmp/cursor deadreckon import cursor
 
 Imports create synthetic `imported-<hash>` runs with normalized traces and provenance.
 
+## Choosing Models
+
+Every provider route ships a model catalog. List it:
+
+```sh
+deadreckon models                  # catalog for your default provider
+deadreckon models cli:codex        # catalog for a specific route
+deadreckon models --all            # every credentialed route
+deadreckon models cli:codex --json # machine-readable
+```
+
+Each catalog has one recommended entry and marks your configured default
+(`deadreckon config model <id>` sets it). "provider default" means
+deadreckon passes no model argument and the CLI decides.
+
+Pick a model at launch:
+
+- `start`, `run`, and `chain` take `--model <id>`.
+- Interactive `start` offers a model picker right after the provider
+  choice (skipped when `--model` is given or the catalog has one entry).
+- `orchestrate full-plan` adds per-role flags: `--planner-model`,
+  `--model` (children), and `--child-model IDX=MODEL` per child index.
+- `orchestrate review` takes `--coder-model` and `--reviewer-model`.
+- `campaign run` takes `--planner-model` and `--model`.
+
+Resolution order everywhere: per-role flag, then generic `--model`, then
+`defaults.model` from config, then the catalog's recommended entry, then
+the provider default. Previews and the provider-roles table echo the
+resolved model so you can confirm before any spend.
+
+## When A Provider Refuses To Launch
+
+On a terminal, a launch that resolves to an unusable route (missing
+credentials, logged-out CLI) does not dead-end: deadreckon opens the
+provider picker with detected CLIs and their live login state, so you can
+pick another route for that launch, keep the original route anyway, or
+cancel to see the original refusal with its `try:` line. Off a terminal
+(scripts, CI), the refusal is unchanged and exits nonzero.
+
 ## Sandboxes
 
 Backends:

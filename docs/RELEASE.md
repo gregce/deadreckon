@@ -129,6 +129,32 @@ gate and refuses manual dispatches that are not official stable release tags.
 The release workflows require `id-token: write` for GitHub artifact
 attestations and npm provenance.
 
+## Stable v0.1.0 operator checklist
+
+Everything the operator does once, in order, before cutting `v0.1.0`:
+
+1. Create the `gregce/homebrew-tap` repository (public, empty is fine) and
+   add a `HOMEBREW_TAP_TOKEN` repo secret with `repo` scope so the publish
+   job can push the formula.
+2. Configure npm trusted publishing for the six packages (`deadreckon` plus
+   the five platform packages) — or add an `NPM_TOKEN` secret with publish
+   rights as the fallback the workflow accepts.
+3. Stage Windows Authenticode signing: add `WINDOWS_CERT_PFX` and
+   `WINDOWS_CERT_PWD` secrets. If signing is consciously deferred, narrow
+   the lane instead — the workflow already fails closed without them.
+4. Bump `npm/deadreckon/package.json` to `0.1.0` (final, no `-rc.N`) and
+   bump the workspace version in `Cargo.toml` to match the tag.
+5. Confirm `CHANGELOG.md` has the `## 0.1.0` section (it does; refresh the
+   highlights if later rcs shipped more).
+6. `make build`, then run `release/preflight-real.sh` and commit the
+   refreshed `release/known-good-providers.json`.
+7. Run the Windows smoke checklist below on the signed zip and record the
+   result under route `windows-smoke`.
+8. `node release/trust/release-trust.mjs validate --ref refs/tags/v0.1.0
+   --repo gregce/deadreckon` must pass clean locally.
+9. Tag `v0.1.0` and push the tag. Tags are operator actions — never let
+   automation create them.
+
 ## Operator Release Flow
 
 1. Confirm the target tag is valid:
