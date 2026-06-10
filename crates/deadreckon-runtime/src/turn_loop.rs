@@ -1438,32 +1438,55 @@ fn save_history(state: &PipelineState, history: &[String]) -> Result<()> {
         path: path.clone(),
         source,
     })?;
-    std::fs::write(&path, data).with_path(&path)
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent).with_path(parent)?;
+    std::io::Write::write_all(&mut temp, &data).with_path(&path)?;
+    temp.as_file_mut().sync_all().with_path(&path)?;
+    temp.persist(&path).map_err(|err| DeadreckonError::Io {
+        path: path.clone(),
+        source: err.error,
+    })?;
+    Ok(())
 }
 
 fn history_path(state: &PipelineState) -> PathBuf {
     state.run_root.join("history.json")
 }
 
+// stderr is the only surface available this early in resume: the flight
+// recorder for the run is not open yet when history.json proves unreadable.
+#[allow(clippy::print_stderr)]
 fn load_or_reconstruct_history(
     state: &mut PipelineState,
     from_turn: Option<u32>,
 ) -> Result<Vec<String>> {
     let trace_reconstruction = reconstruct_history_from_traces(state)?;
-    let history_exists = history_path(state).exists();
-    let mut history = if history_exists {
-        load_history(state)?
+    let loaded = if history_path(state).exists() {
+        match load_history(state) {
+            Ok(history) => Some(history),
+            Err(error) => {
+                eprintln!(
+                    "warning: {} is unreadable ({error}); reconstructing history from traces.jsonl",
+                    history_path(state).display()
+                );
+                None
+            }
+        }
     } else {
-        trace_reconstruction.history
+        None
     };
+    let recovered_from_traces = loaded.is_none();
+    let mut history = loaded.unwrap_or(trace_reconstruction.history);
     if let Some(from_turn) = from_turn {
         history.truncate(from_turn as usize);
         state.turn = from_turn;
         truncate_run_artifacts_after_turn(state, from_turn)?;
         save_history(state, &history)?;
         save_state(state)?;
-    } else if !history_exists && trace_reconstruction.last_complete_turn > state.turn {
-        state.turn = trace_reconstruction.last_complete_turn;
+    } else if recovered_from_traces {
+        if trace_reconstruction.last_complete_turn > state.turn {
+            state.turn = trace_reconstruction.last_complete_turn;
+        }
         save_history(state, &history)?;
         save_state(state)?;
     }
@@ -3150,6 +3173,125 @@ storage = "jsonl"
                 .iter()
                 .any(|change| change.path == Path::new("src/lib.rs"))
         );
+    }
+
+    #[test]
+    fn truncated_history_json_resumes_via_trace_reconstruction() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "truncated history".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(
+            state.run_root.join("traces.jsonl"),
+            r#"{"timestamp":"2026-05-11T00:00:00Z","run_id":"r","turn":1,"event":"tool.bash","latency_ms":1,"detail":{"tool_call_id":"tool-1"}}
+"#,
+        )
+        .expect("trace");
+        std::fs::write(state.run_root.join("history.json"), "[\"half an entr")
+            .expect("truncated history");
+
+        let history = load_or_reconstruct_history(&mut state, None).expect("history");
+        assert_eq!(history.len(), 1);
+        assert!(history[0].contains("tool-1"));
+    }
+
+    #[test]
+    fn garbage_history_json_resumes_via_trace_reconstruction_and_resaves() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "garbage history".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(
+            state.run_root.join("traces.jsonl"),
+            r#"{"timestamp":"2026-05-11T00:00:00Z","run_id":"r","turn":1,"event":"tool.bash","latency_ms":1,"detail":{"tool_call_id":"tool-9"}}
+"#,
+        )
+        .expect("trace");
+        let history_file = state.run_root.join("history.json");
+        std::fs::write(&history_file, "not json at all \u{0}\u{1}").expect("garbage history");
+
+        let history = load_or_reconstruct_history(&mut state, None).expect("history");
+        assert_eq!(history.len(), 1);
+        let resaved = std::fs::read_to_string(&history_file).expect("resaved");
+        let parsed: Vec<String> =
+            serde_json::from_str(&resaved).expect("history.json is valid again");
+        assert_eq!(parsed, history);
+    }
+
+    #[test]
+    fn history_save_is_atomic_tempfile_rename() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "atomic history".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: Some("mock".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let history_file = state.run_root.join("history.json");
+        save_history(&state, &["first".to_string()]).expect("first save");
+        #[cfg(unix)]
+        let before_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&history_file).expect("meta").ino()
+        };
+
+        save_history(&state, &["first".to_string(), "second".to_string()]).expect("second save");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let after_inode = std::fs::metadata(&history_file).expect("meta").ino();
+            assert_ne!(
+                before_inode, after_inode,
+                "save_history must replace via tempfile rename, not write in place"
+            );
+        }
+        let parsed: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(&history_file).expect("read"))
+                .expect("valid json");
+        assert_eq!(parsed.len(), 2);
+        let stray_temps = std::fs::read_dir(&state.run_root)
+            .expect("run root")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp"))
+            .count();
+        assert_eq!(stray_temps, 0, "no leftover temp files");
     }
 
     #[test]

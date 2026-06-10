@@ -17,8 +17,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tempfile.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
