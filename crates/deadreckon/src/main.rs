@@ -11167,16 +11167,20 @@ fn completion_hints_enabled(no_hints: bool) -> bool {
 async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     loop {
-        // `x` is the abandon key everywhere (the attach TUI reserves `b` for
-        // "back"); `b` stays accepted here for muscle memory but is not
-        // advertised, so the documented keymap is one keymap.
-        let prompt_text = if is_worktree_run(state) {
-            "completed action [a apply, x abandon, d docs, s show, q quit]: "
+        let action = if prompt::is_interactive() {
+            completion_action_select(state)?
         } else {
-            "completed action [m export, e extend, d docs, s show, q quit]: "
+            // `x` is the abandon key everywhere (the attach TUI reserves `b`
+            // for "back"); `b` stays accepted here for muscle memory but is
+            // not advertised, so the documented keymap is one keymap.
+            let prompt_text = if is_worktree_run(state) {
+                "completed action [a apply, x abandon, d docs, s show, q quit]: "
+            } else {
+                "completed action [m export, e extend, d docs, s show, q quit]: "
+            };
+            completion_action_from_input(&prompt::open(prompt_text, None)?)
         };
-        let answer = prompt::open(prompt_text, None)?;
-        match completion_action_from_input(&answer) {
+        match action {
             Some(CompletionAction::Materialize) => prompt_materialize_action(&paths, state)?,
             Some(CompletionAction::Extend) => prompt_extend_action(state).await?,
             Some(CompletionAction::Apply) => commands::lifecycle::apply_command(
@@ -11213,6 +11217,66 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
         }
     }
     Ok(())
+}
+
+/// The interactive completion menu: same actions as the lettered line REPL,
+/// with each consequence spelled out. Esc maps to Quit via the cancel id.
+fn completion_action_select(
+    state: &deadreckon_core::PipelineState,
+) -> Result<Option<CompletionAction>> {
+    let mut choices = if is_worktree_run(state) {
+        vec![
+            prompt::SelectChoice::with_detail(
+                "apply",
+                "Apply",
+                "squash-apply the run's changes to your branch",
+            ),
+            prompt::SelectChoice::with_detail(
+                "abandon",
+                "Abandon",
+                "remove the worktree and temporary branch",
+            ),
+        ]
+    } else {
+        vec![
+            prompt::SelectChoice::with_detail(
+                "export",
+                "Export",
+                "copy the artifact to a directory you choose",
+            ),
+            prompt::SelectChoice::with_detail(
+                "extend",
+                "Extend",
+                "start a follow-up run from this artifact",
+            ),
+        ]
+    };
+    choices.push(prompt::SelectChoice::with_detail(
+        "docs",
+        "Docs",
+        "read RUN-NARRATIVE.md in the terminal",
+    ));
+    choices.push(prompt::SelectChoice::with_detail(
+        "show",
+        "Show",
+        "inspect state, spend, and lineage",
+    ));
+    choices.push(prompt::SelectChoice::new("cancel", "Quit"));
+    let selection = prompt::select_one(&prompt::SelectPrompt {
+        title: "completed run — what next?".to_string(),
+        help: None,
+        choices,
+        default_index: 0,
+    })?;
+    Ok(match selection.id.as_str() {
+        "apply" => Some(CompletionAction::Apply),
+        "abandon" => Some(CompletionAction::Abandon),
+        "export" => Some(CompletionAction::Materialize),
+        "extend" => Some(CompletionAction::Extend),
+        "docs" => Some(CompletionAction::Docs),
+        "show" => Some(CompletionAction::Show),
+        _ => Some(CompletionAction::Quit),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

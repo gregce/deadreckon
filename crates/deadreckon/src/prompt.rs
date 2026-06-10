@@ -95,6 +95,12 @@ fn render_config() -> RenderConfig<'static> {
         .with_answer(StyleSheet::new().with_fg(Color::LightCyan))
 }
 
+/// Whether prompts render interactively (inquire) rather than as numbered
+/// line prompts — callers can branch when the two modes need different copy.
+pub(crate) fn is_interactive() -> bool {
+    interactive()
+}
+
 fn interactive() -> bool {
     io::stdin().is_terminal()
         && io::stdout().is_terminal()
