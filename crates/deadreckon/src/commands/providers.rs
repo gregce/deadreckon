@@ -114,10 +114,15 @@ async fn update_shell_channel(
     }
     let current = update_current_version(receipt);
     let latest = resolve_latest_update(paths, &current, allow_prerelease).await?;
+    // When the newest release is itself a prerelease (the RC era has no
+    // stable), the updater must be allowed to install it without requiring
+    // --pre — otherwise update reports nothing to do while the check above
+    // names a newer version.
+    let effective_prerelease = allow_prerelease || latest.version.contains('-');
     let backup_dir = unique_shell_backup_dir(&shell_backup_root(paths));
     confirm_shell_update(yes, &current, &latest, receipt)?;
     let backup_dir = create_shell_update_backup(paths, receipt, backup_dir)?;
-    match run_shell_swap(receipt, force, allow_prerelease, quiet).await {
+    match run_shell_swap(receipt, force, effective_prerelease, quiet).await {
         Ok(()) => {
             prune_shell_backups(paths)?;
             if !quiet {
@@ -294,7 +299,7 @@ async fn run_axoupdater_shell_update(
     let mut updater = axoupdater::AxoUpdater::new_for("deadreckon");
     updater.set_release_source(axoupdater::ReleaseSource {
         release_type: axoupdater::ReleaseSourceType::GitHub,
-        owner: "gdc".to_string(),
+        owner: "gregce".to_string(),
         name: "deadreckon".to_string(),
         app_name: "deadreckon".to_string(),
     });
@@ -474,7 +479,7 @@ fn update_source_surface(current: &str) -> VerdictSurface {
 fn channel_native_update_command(channel: Channel) -> &'static str {
     match channel {
         Channel::Npm => "bun update -g deadreckon",
-        Channel::Brew => "brew upgrade gdc/tap/deadreckon",
+        Channel::Brew => "brew upgrade gregce/tap/deadreckon",
         Channel::Cargo => "cargo binstall --force deadreckon",
         Channel::Shell => "deadreckon update",
         Channel::Source => "cargo install --path crates/deadreckon",
@@ -493,10 +498,14 @@ pub(crate) struct LatestUpdate {
 impl LatestUpdate {
     fn archive_url(&self) -> String {
         self.archive_url.clone().unwrap_or_else(|| {
-            format!(
-                "{}/download/deadreckon-installer.sh",
-                self.release_url.trim_end_matches('/')
-            )
+            // release_url is the human tag page
+            // (…/releases/tag/vX); assets live under
+            // …/releases/download/vX/<asset>.
+            let download_base = self
+                .release_url
+                .trim_end_matches('/')
+                .replace("/releases/tag/", "/releases/download/");
+            format!("{download_base}/deadreckon-installer.sh")
         })
     }
 
@@ -542,7 +551,7 @@ pub(crate) async fn resolve_latest_update(
         Err(_) => Ok(cache.map_or_else(
             || LatestUpdate {
                 version: current.to_string(),
-                release_url: "https://github.com/gdc/deadreckon/releases".to_string(),
+                release_url: "https://github.com/gregce/deadreckon/releases".to_string(),
                 archive_url: None,
                 sha256: None,
                 update_available: false,
@@ -570,7 +579,7 @@ async fn fetch_latest_update(allow_prerelease: bool) -> std::result::Result<Late
     if let Ok(version) = std::env::var("DEADRECKON_UPDATE_TEST_LATEST_VERSION") {
         let release_url =
             std::env::var("DEADRECKON_UPDATE_TEST_RELEASE_URL").unwrap_or_else(|_| {
-                format!("https://github.com/gdc/deadreckon/releases/tag/v{version}")
+                format!("https://github.com/gregce/deadreckon/releases/tag/v{version}")
             });
         return Ok(LatestUpdate {
             version,
@@ -586,29 +595,38 @@ async fn fetch_latest_update(allow_prerelease: bool) -> std::result::Result<Late
         .build()
         .map_err(|err| err.to_string())?;
     if allow_prerelease {
-        let url = std::env::var("DEADRECKON_UPDATE_RELEASES_URL")
-            .unwrap_or_else(|_| "https://api.github.com/repos/gdc/deadreckon/releases".to_string());
-        let releases = client
-            .get(url)
-            .header(reqwest::header::USER_AGENT, "deadreckon-update")
-            .send()
-            .await
-            .map_err(|err| err.to_string())?
-            .error_for_status()
-            .map_err(|err| err.to_string())?
-            .json::<Vec<GithubRelease>>()
-            .await
-            .map_err(|err| err.to_string())?;
-        let Some(release) = releases.into_iter().next() else {
-            return Err("no releases found".to_string());
-        };
-        return Ok(release.into_latest_update());
+        return fetch_newest_any_release(&client).await;
     }
 
     let url = std::env::var("DEADRECKON_UPDATE_RELEASES_URL").unwrap_or_else(|_| {
-        "https://api.github.com/repos/gdc/deadreckon/releases/latest".to_string()
+        "https://api.github.com/repos/gregce/deadreckon/releases/latest".to_string()
     });
-    client
+    let stable = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "deadreckon-update")
+        .send()
+        .await
+        .map_err(|err| err.to_string())
+        .and_then(|response| response.error_for_status().map_err(|err| err.to_string()));
+    match stable {
+        Ok(response) => response
+            .json::<GithubRelease>()
+            .await
+            .map(GithubRelease::into_latest_update)
+            .map_err(|err| err.to_string()),
+        // The release-candidate era has no stable release, so releases/latest
+        // 404s. Mirror the installer: fall back to the newest release of any
+        // kind instead of silently reporting "up to date".
+        Err(_) => fetch_newest_any_release(&client).await,
+    }
+}
+
+async fn fetch_newest_any_release(
+    client: &reqwest::Client,
+) -> std::result::Result<LatestUpdate, String> {
+    let url = std::env::var("DEADRECKON_UPDATE_RELEASES_URL")
+        .unwrap_or_else(|_| "https://api.github.com/repos/gregce/deadreckon/releases".to_string());
+    let releases = client
         .get(url)
         .header(reqwest::header::USER_AGENT, "deadreckon-update")
         .send()
@@ -616,10 +634,13 @@ async fn fetch_latest_update(allow_prerelease: bool) -> std::result::Result<Late
         .map_err(|err| err.to_string())?
         .error_for_status()
         .map_err(|err| err.to_string())?
-        .json::<GithubRelease>()
+        .json::<Vec<GithubRelease>>()
         .await
-        .map(GithubRelease::into_latest_update)
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    let Some(release) = releases.into_iter().next() else {
+        return Err("no releases found".to_string());
+    };
+    Ok(release.into_latest_update())
 }
 
 #[derive(Debug, Deserialize)]

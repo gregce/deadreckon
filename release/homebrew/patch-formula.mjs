@@ -41,7 +41,7 @@ function withReceiptMethod(formula) {
         "channel_version" => version.to_s,
         "binary_path" => File.join(bin, "deadreckon"),
         "installed_at" => Time.now.utc.iso8601,
-        "install_source" => "brew:gdc/tap/deadreckon",
+        "install_source" => "brew:gregce/tap/deadreckon",
         "platform_package" => nil,
         "receipt_version" => 1,
       }) + "\\n",

@@ -158,7 +158,7 @@ fn update_brew_prints_brew_upgrade_hint() {
     assert!(out.contains("blocked update brew"), "{out}");
     assert_eq!(out.matches("\nRecommended\n").count(), 1, "{out}");
     assert!(
-        out.contains("Recommended\nbrew upgrade gdc/tap/deadreckon"),
+        out.contains("Recommended\nbrew upgrade gregce/tap/deadreckon"),
         "{out}"
     );
     assert!(!out.contains("try:"), "{out}");

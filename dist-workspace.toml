@@ -15,7 +15,7 @@ hosting = ["github"]
 allow-dirty = ["ci"]
 installers = ["shell", "powershell", "homebrew"]
 publish-jobs = ["homebrew"]
-tap = "gdc/homebrew-tap"
+tap = "gregce/homebrew-tap"
 targets = [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",

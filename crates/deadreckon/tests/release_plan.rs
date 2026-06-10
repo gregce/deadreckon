@@ -108,7 +108,7 @@ end
     assert!(patched.contains("install-receipt.json"), "{patched}");
     assert!(patched.contains(r#""channel" => "brew""#), "{patched}");
     assert!(
-        patched.contains(r#""install_source" => "brew:gdc/tap/deadreckon""#),
+        patched.contains(r#""install_source" => "brew:gregce/tap/deadreckon""#),
         "{patched}"
     );
     assert!(patched.contains("write_deadreckon_receipt!"), "{patched}");
@@ -118,7 +118,7 @@ end
 fn homebrew_formula_pins_release_sha256() {
     let dist = dist_config();
     assert_eq!(
-        Some("gdc/homebrew-tap"),
+        Some("gregce/homebrew-tap"),
         dist.get("tap").and_then(Value::as_str)
     );
     let publish_jobs = string_array(&dist, "publish-jobs");
@@ -130,7 +130,7 @@ fn homebrew_formula_pins_release_sha256() {
         "{workflow}"
     );
     assert!(
-        workflow.contains("repository: gdc/homebrew-tap"),
+        workflow.contains("repository: gregce/homebrew-tap"),
         "{workflow}"
     );
     assert!(workflow.contains("HOMEBREW_TAP_TOKEN"), "{workflow}");

@@ -1,5 +1,26 @@
 # Changelog
 
+## Self-update that actually updates - 2026-06-10
+
+- The axoupdater-backed `deadreckon update` pointed at the pre-re-home
+  `gdc/deadreckon` repository in six places (release source, API URLs, brew
+  tap hint), so every real update would 404. All update surfaces now point at
+  `gregce/deadreckon`, and the portability guard gained a repo-slug list so
+  `gdc/` references cannot return — which immediately caught the Homebrew tap
+  still reading `gdc/homebrew-tap` in dist-workspace.toml, the release
+  workflow, the formula patcher, and the manifest.
+- Latest-release resolution is RC-era aware, mirroring the installer:
+  `releases/latest` (stable) first, newest release of any kind as fallback —
+  no more silent "up to date" while newer release candidates exist. When the
+  resolved latest is itself a prerelease, the updater installs it without
+  requiring `--pre`.
+- Proven live end to end: a sandboxed shell install with an rc.7 receipt
+  resolved rc.10 via `update --check`, swapped binaries with `update --yes`
+  (rollback backup retained), and the cached startup hint
+  ("deadreckon X is available...") fires on the next TTY command. The
+  evidence panel's installer-asset URL is also fixed
+  (releases/tag -> releases/download).
+
 ## Visual interaction overhaul: banner, smart bare invocation, one prompt engine - 2026-06-09
 
 - Help surfaces gain a figlet wordmark with a per-character 256-color

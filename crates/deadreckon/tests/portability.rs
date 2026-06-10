@@ -11,6 +11,15 @@ use std::path::{Path, PathBuf};
 
 const FORBIDDEN: &str = concat!("/Users/", "gdc");
 
+/// Repo-slug leftovers from the gdc -> gregce re-home: releases, API calls,
+/// and tap references must point at the official repository.
+const FORBIDDEN_SLUGS: &[&str] = &[
+    concat!("github.com/", "gdc/"),
+    concat!("repos/", "gdc/"),
+    concat!("gdc", "/tap/"),
+    concat!("gdc", "/homebrew-tap"),
+];
+
 const TEXT_EXTENSIONS: &[&str] = &[
     "rs", "toml", "sh", "js", "mjs", "json", "md", "golden", "sql", "yml", "yaml", "txt", "cast",
 ];
@@ -71,7 +80,7 @@ fn scan_file(path: &Path, findings: &mut Vec<String>) {
         return;
     };
     for (idx, line) in contents.lines().enumerate() {
-        if line.contains(FORBIDDEN) {
+        if line.contains(FORBIDDEN) || FORBIDDEN_SLUGS.iter().any(|slug| line.contains(slug)) {
             findings.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
         }
     }

@@ -263,7 +263,7 @@ function writeManifest(localArgs = args) {
         package_managers: {
           homebrew: {
             publish: lane.publish_homebrew,
-            tap: "gdc/homebrew-tap",
+            tap: "gregce/homebrew-tap",
             checksum_verified: lane.publish_homebrew,
           },
           npm: {

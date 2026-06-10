@@ -115,7 +115,7 @@ repacks the zip and records Authenticode status in `release-manifest.json`.
 ## Package Manager Trust
 
 Homebrew stable publication requires `HOMEBREW_TAP_TOKEN`, a token with push
-rights to `gdc/homebrew-tap`. The workflow verifies that the generated formula
+rights to `gregce/homebrew-tap`. The workflow verifies that the generated formula
 checksum matches `SHA256SUMS` before committing the formula.
 
 npm stable publication prefers npm trusted publishing. Configure trusted

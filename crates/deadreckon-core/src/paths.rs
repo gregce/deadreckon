@@ -31,7 +31,10 @@ pub struct DeadreckonPaths {
 
 impl DeadreckonPaths {
     pub fn discover() -> Self {
+        // An empty env value (a shell mishap like DEADRECKON_HOME="$unset")
+        // must not yield a relative home that scatters state into the cwd.
         let home = env::var_os("DEADRECKON_HOME")
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(default_deadreckon_home);
         Self { home }

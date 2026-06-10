@@ -478,12 +478,12 @@ jobs:
         shell: bash
         run: |
           if [[ -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
-            echo "::error::HOMEBREW_TAP_TOKEN is required to publish gdc/homebrew-tap formulae"
+            echo "::error::HOMEBREW_TAP_TOKEN is required to publish gregce/homebrew-tap formulae"
             exit 1
           fi
       - uses: actions/checkout@v4
         with:
-          repository: gdc/homebrew-tap
+          repository: gregce/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
       - name: Download release trust bundle

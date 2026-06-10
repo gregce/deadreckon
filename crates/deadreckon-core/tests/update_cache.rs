@@ -12,7 +12,7 @@ fn update_cache_is_stale_after_24h() {
         checked_at: now - Duration::hours(25),
         latest_version: "0.2.3".to_string(),
         current_version: "0.2.0".to_string(),
-        release_url: "https://github.com/gdc/deadreckon/releases/tag/v0.2.3".to_string(),
+        release_url: "https://github.com/gregce/deadreckon/releases/tag/v0.2.3".to_string(),
         update_available: true,
     };
 
@@ -27,7 +27,7 @@ fn update_cache_round_trips_release_url() {
         checked_at: Utc::now(),
         latest_version: "0.2.3".to_string(),
         current_version: "0.2.0".to_string(),
-        release_url: "https://github.com/gdc/deadreckon/releases/tag/v0.2.3".to_string(),
+        release_url: "https://github.com/gregce/deadreckon/releases/tag/v0.2.3".to_string(),
         update_available: true,
     };
 
