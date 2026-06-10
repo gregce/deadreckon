@@ -1029,6 +1029,11 @@ async fn main_inner() -> Result<()> {
             commands::providers::detect_command(id, json, ping).await
         }
         Commands::Providers { command } => commands::providers::providers_command(command).await,
+        Commands::Models {
+            provider,
+            all,
+            json,
+        } => commands::providers::models_command(provider.as_deref(), all, json),
         Commands::Update {
             check,
             force,
@@ -1453,6 +1458,14 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         display: "providers",
         clap_name: Some("providers"),
         purpose: "list provider routes and models",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::SetupProviders),
+    },
+    CommandHelpEntry {
+        display: "models",
+        clap_name: Some("models"),
+        purpose: "list selectable models per provider route",
         audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::SetupProviders),

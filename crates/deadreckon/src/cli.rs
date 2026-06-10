@@ -1206,6 +1206,18 @@ pub(crate) enum Commands {
         command: ProvidersCommand,
     },
     #[command(
+        next_help_heading = "Inspection",
+        about = "List selectable models per provider route"
+    )]
+    Models {
+        #[arg(help = "Provider route (omit to list every credentialed route)")]
+        provider: Option<String>,
+        #[arg(long, help = "Include providers without credentials")]
+        all: bool,
+        #[arg(long, help = "Machine-readable JSON output")]
+        json: bool,
+    },
+    #[command(
         next_help_heading = "Setup",
         about = "Check for updates or route through the install channel",
         after_help = UPDATE_HELP

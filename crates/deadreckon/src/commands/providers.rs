@@ -1087,3 +1087,175 @@ mod tests {
         }
     }
 }
+
+/// `deadreckon models [PROVIDER]` — the catalog surface for choosing a model
+/// before any launch. Lists each route's selectable model ids with context,
+/// cost, the descriptor's recommended entry, and the configured default.
+pub(crate) fn models_command(provider: Option<&str>, all: bool, json: bool) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let defaults = config_defaults(&paths)?;
+    let configured_model = configured_default_model(&paths)?;
+    let descriptors: Vec<&deadreckon_providers::registry::ProviderDescriptor> = match provider {
+        Some(name) => {
+            let Some(descriptor) = registry.get(name) else {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    &format!("no provider '{name}' in registry"),
+                    "deadreckon providers list --all",
+                )));
+            };
+            vec![descriptor]
+        }
+        None => registry
+            .iter()
+            .filter(|descriptor| descriptor.id != "smoke")
+            .filter(|descriptor| all || descriptor_route_has_credential(descriptor))
+            .collect(),
+    };
+    if descriptors.is_empty() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "no providers configured",
+            "deadreckon init",
+        )));
+    }
+
+    if json {
+        let providers = descriptors
+            .iter()
+            .map(|descriptor| models_provider_json(descriptor, &defaults, &configured_model))
+            .collect::<Vec<_>>();
+        let value = match provider {
+            Some(_) => providers
+                .into_iter()
+                .next()
+                .unwrap_or(serde_json::json!({})),
+            None => serde_json::json!({ "providers": providers }),
+        };
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    for descriptor in &descriptors {
+        println!(
+            "{} {}",
+            ui_heading(&descriptor.id),
+            ui_muted(&descriptor.display_name)
+        );
+        let rows = descriptor
+            .model_catalog
+            .iter()
+            .map(|entry| {
+                vec![
+                    entry.id.clone(),
+                    entry
+                        .context_window
+                        .map(|window| format!("{}k", window / 1000))
+                        .unwrap_or_else(|| "-".to_string()),
+                    model_cost_label(entry),
+                    model_notes_label(entry, descriptor, &defaults, &configured_model),
+                ]
+            })
+            .collect::<Vec<_>>();
+        println!("{}", columns(&["model", "context", "cost", "notes"], &rows));
+        println!();
+    }
+    println!(
+        "  {} {}",
+        ui_muted("set a default:"),
+        ui_command("deadreckon config model <id>")
+    );
+    println!(
+        "  {} {}",
+        ui_muted("one run only:  "),
+        ui_command("deadreckon run \"goal\" --model <id>")
+    );
+    Ok(())
+}
+
+fn configured_default_model(paths: &DeadreckonPaths) -> Result<Option<String>> {
+    let root = load_config_value(paths)?;
+    Ok(get_toml_path(&root, "defaults.model")
+        .and_then(toml::Value::as_str)
+        .map(ToString::to_string))
+}
+
+fn descriptor_route_has_credential(
+    descriptor: &deadreckon_providers::registry::ProviderDescriptor,
+) -> bool {
+    use deadreckon_providers::registry::DescriptorKind;
+    match descriptor.kind {
+        DescriptorKind::Cli => descriptor
+            .default_binary
+            .as_deref()
+            .is_some_and(command_exists),
+        DescriptorKind::Http => descriptor
+            .auth
+            .env_var
+            .as_deref()
+            .is_some_and(|var| std::env::var_os(var).is_some()),
+        DescriptorKind::LocalHttp | DescriptorKind::Scripted => true,
+    }
+}
+
+fn model_is_configured_default(
+    entry: &deadreckon_providers::ModelEntry,
+    descriptor: &deadreckon_providers::registry::ProviderDescriptor,
+    defaults: &ConfigDefaults,
+    configured_model: &Option<String>,
+) -> bool {
+    let provider_is_default = defaults.provider.as_deref() == Some(descriptor.id.as_str());
+    provider_is_default && configured_model.as_deref() == Some(entry.id.as_str())
+}
+
+fn model_cost_label(entry: &deadreckon_providers::ModelEntry) -> String {
+    match (entry.input_per_million, entry.output_per_million) {
+        (Some(input), Some(output)) if input > 0.0 || output > 0.0 => {
+            format!("${input}/{output} per M")
+        }
+        _ => "-".to_string(),
+    }
+}
+
+fn model_notes_label(
+    entry: &deadreckon_providers::ModelEntry,
+    descriptor: &deadreckon_providers::registry::ProviderDescriptor,
+    defaults: &ConfigDefaults,
+    configured_model: &Option<String>,
+) -> String {
+    let mut notes = Vec::new();
+    if model_is_configured_default(entry, descriptor, defaults, configured_model) {
+        notes.push("default".to_string());
+    }
+    if entry.recommended {
+        notes.push("recommended".to_string());
+    }
+    if !entry.aliases.is_empty() {
+        notes.push(format!("aka {}", entry.aliases.join(", ")));
+    }
+    if notes.is_empty() {
+        "-".to_string()
+    } else {
+        notes.join(" · ")
+    }
+}
+
+fn models_provider_json(
+    descriptor: &deadreckon_providers::registry::ProviderDescriptor,
+    defaults: &ConfigDefaults,
+    configured_model: &Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "provider": descriptor.id,
+        "display_name": descriptor.display_name,
+        "configured_default": configured_model
+            .as_deref()
+            .filter(|_| defaults.provider.as_deref() == Some(descriptor.id.as_str())),
+        "models": descriptor.model_catalog.iter().map(|entry| serde_json::json!({
+            "id": entry.id,
+            "recommended": entry.recommended,
+            "context_window": entry.context_window,
+            "aliases": entry.aliases,
+            "default": model_is_configured_default(entry, descriptor, defaults, configured_model),
+        })).collect::<Vec<_>>(),
+    })
+}
