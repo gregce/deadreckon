@@ -124,6 +124,12 @@ verb.
 | `providers` | One-command rollback | n-a | Read-only listing. |
 | `providers` | One verdict + ONE primary action | pass | Provider list/setup/update surfaces expose one `primary_action`; provider listing JSON guards this. |
 | `providers` | Lifecycle hint | pass | Help points to start/run with provider flags. |
+| `models` | Auto-detect, don't ask | pass | Defaults to the configured provider's catalog; recommended and configured defaults are marked automatically. |
+| `models` | Preview before mutate | n-a | Read-only listing. |
+| `models` | Refuse with try: | pass | Unknown routes point at `deadreckon providers list --all`. |
+| `models` | One-command rollback | n-a | Read-only listing. |
+| `models` | One verdict + ONE primary action | pass | Catalog listing renders one surface with one primary action. |
+| `models` | Lifecycle hint | pass | Output points at `deadreckon config model <id>` and launch `--model` flags. |
 | `update` | Auto-detect, don't ask | pass | Install channel is read from the receipt. |
 | `update` | Preview before mutate | pass | Update checks and shell swaps preview before replacing binaries. |
 | `update` | Refuse with try: | pass | Unsupported channels and failed swaps print recovery. |

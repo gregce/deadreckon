@@ -329,7 +329,7 @@ pub(crate) fn chain_attach_footer_text(chain: &Chain) -> String {
 fn chain_paused_attach_footer_surface(chain: &Chain) -> VerdictSurface {
     let id = run_prefix(&chain.chain_id);
     let reason = chain.paused_reason.as_deref().unwrap_or("paused");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Paused,
         "chain",
         Some(&id),
@@ -354,7 +354,6 @@ fn chain_paused_attach_footer_surface(chain: &Chain) -> VerdictSurface {
             ("Undo", format!("deadreckon chain undo {id}")),
         ],
     )
-    .expect("paused chain attach footer verdict surface")
 }
 
 fn chain_event_label(event: &ChainEventKind) -> &'static str {

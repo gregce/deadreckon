@@ -198,6 +198,7 @@ fn resolve_role_model(
     role_flag.or(generic).or(configured).cloned()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_plan_providers(
     paths: &DeadreckonPaths,
     defaults: &ConfigDefaults,
@@ -344,6 +345,7 @@ pub(crate) fn parse_child_provider_overrides(
     Ok(overrides)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_full_plan_tasks(
     paths: &DeadreckonPaths,
     goal: &str,
@@ -366,7 +368,7 @@ pub(crate) async fn build_full_plan_tasks(
     };
     if drafts.len() != usize::from(n) {
         return Err(plan_refusal_error(
-            &format!("provider returned {} children; need {n}", drafts.len()),
+            format!("provider returned {} children; need {n}", drafts.len()),
             "DeadReckon did not save the plan because the planner returned the wrong number of child tasks.",
             "The requested child count is part of the orchestration contract; saving a partial graph would make later fork/merge state misleading.",
             vec![
@@ -419,7 +421,7 @@ fn validate_plan_task_count(goal: &str, n: u8, no_hints: bool, json_output: bool
         )),
         2..=6 => Ok(()),
         count => Err(plan_refusal_error(
-            &format!("plan capped at 6 children; got {count}"),
+            format!("plan capped at 6 children; got {count}"),
             "DeadReckon did not create a plan because the requested child count is above the full-plan cap.",
             "Full-plan orchestration is capped at six parallel children; a sequential chain is the safer shape for larger decompositions.",
             vec![("requested children".to_string(), n.to_string())],
@@ -434,6 +436,7 @@ fn validate_plan_task_count(goal: &str, n: u8, no_hints: bool, json_output: bool
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_refusal_error(
     message: impl Into<String>,
     what_happened: impl Into<String>,
@@ -448,25 +451,24 @@ fn plan_refusal_error(
     let mut all_evidence = vec![("reason".to_string(), message)];
     all_evidence.extend(evidence);
     let secondary = secondary
-        .iter()
-        .map(|command| ("Secondary", command.as_str()))
+        .into_iter()
+        .map(|command| ("Secondary", command))
         .collect::<Vec<_>>();
-    let surface = VerdictSurface::try_new(
+    let surface = VerdictSurface::must_new(
         VerdictKind::Blocked,
         "plan",
         None,
         ExplanationPanel::new(what_happened, why_this_verdict, all_evidence),
-        vec![("Recommended", primary.as_str())],
+        vec![("Recommended", primary)],
         secondary,
-    )
-    .expect("plan refusal verdict surface must be valid");
+    );
     let rendered = if json_output {
-        serde_json::to_string_pretty(&surface.add_to_json(json!({
+        let payload = surface.add_to_json(json!({
             "kind": "plan_refusal",
             "error": surface.explanation.evidence[0].1.clone(),
             "next_actions": [surface.primary_action.command.clone()],
-        })))
-        .expect("plan refusal verdict json must serialize")
+        }));
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
     } else {
         surface.render_plain(!completion_hints_enabled(no_hints))
     };
@@ -855,7 +857,7 @@ pub(crate) fn plan_verdict_surface(paths: &DeadreckonPaths, plan: &Plan) -> Verd
         .next()
         .unwrap_or_else(|| format!("deadreckon show {id}"));
     let secondary = plan_secondary_actions(paths, plan, &primary);
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "plan",
         Some(&id),
@@ -863,10 +865,8 @@ pub(crate) fn plan_verdict_surface(paths: &DeadreckonPaths, plan: &Plan) -> Verd
         vec![("Recommended", primary.as_str())],
         secondary
             .iter()
-            .map(|command| ("Secondary", command.as_str()))
-            .collect::<Vec<_>>(),
+            .map(|command| ("Secondary", command.as_str())),
     )
-    .expect("plan verdict surface must have one primary action")
 }
 
 fn plan_secondary_actions(paths: &DeadreckonPaths, plan: &Plan, primary: &str) -> Vec<String> {
@@ -1562,7 +1562,7 @@ fn orchestrate_confirmation_refusal_error(plan: &Plan, no_hints: bool) -> CliErr
     ];
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "orchestrate",
             Some(&id),
@@ -1584,10 +1584,8 @@ fn orchestrate_confirmation_refusal_error(plan: &Plan, no_hints: bool) -> CliErr
             vec![("Recommended", primary.as_str())],
             secondary
                 .iter()
-                .map(|command| ("Secondary", command.as_str()))
-                .collect::<Vec<_>>(),
+                .map(|command| ("Secondary", command.as_str())),
         )
-        .expect("orchestrate confirmation refusal verdict surface must be valid")
         .render_plain(!completion_hints_enabled(no_hints)),
     }
 }
@@ -1900,12 +1898,15 @@ fn fork_refusal_surface(paths: &DeadreckonPaths, plan: &Plan) -> VerdictSurface 
         .iter()
         .filter(|task| task.status == PlanTaskStatus::Completed)
         .count();
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Noop,
         "plan",
         Some(&id),
         ExplanationPanel::new(
-            format!("DeadReckon did not fork the plan because it is already {}.", plan_status_label(plan.status)),
+            format!(
+                "DeadReckon did not fork the plan because it is already {}.",
+                plan_status_label(plan.status)
+            ),
             "Fork only starts pending plans; the recommended command follows the current plan state instead.",
             [
                 ("plan".to_string(), id.clone()),
@@ -1922,7 +1923,6 @@ fn fork_refusal_surface(paths: &DeadreckonPaths, plan: &Plan) -> VerdictSurface 
         [("Recommended", primary.as_str())],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("fork refusal surface must have one primary action")
 }
 
 #[derive(Debug)]

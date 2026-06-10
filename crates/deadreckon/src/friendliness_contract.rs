@@ -135,6 +135,10 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
         marks: [P, N, P, N, P, P],
     },
     VerbFriendliness {
+        verb: "models",
+        marks: [P, N, P, N, P, P],
+    },
+    VerbFriendliness {
         verb: "update",
         marks: [P, P, P, P, P, P],
     },

@@ -295,7 +295,7 @@ pub(crate) fn chain_narrative_refusal_text(run_ref: &str, json_output: bool) -> 
 
 fn chain_narrative_refusal_surface(run_ref: &str) -> VerdictSurface {
     let primary = format!("deadreckon chain status {run_ref}");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "chain narrative",
         Some(run_ref),
@@ -314,7 +314,6 @@ fn chain_narrative_refusal_surface(run_ref: &str) -> VerdictSurface {
             ("Secondary", "deadreckon attach <plan-id> --view narrative"),
         ],
     )
-    .expect("chain narrative refusal surface must be valid")
 }
 
 async fn attach_campaign_tui(

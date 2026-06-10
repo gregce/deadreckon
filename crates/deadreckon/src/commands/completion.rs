@@ -100,7 +100,7 @@ fn completion_install_surface(outcome: &CompletionInstallOutcome) -> VerdictSurf
     let shell = completion_shell_name(outcome.shell);
     let primary = "deadreckon doctor";
     let rc_evidence = outcome.rc_status.evidence_value();
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         "completion",
         Some(shell),
@@ -119,7 +119,6 @@ fn completion_install_surface(outcome: &CompletionInstallOutcome) -> VerdictSurf
         vec![("Recommended", primary)],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("completion install verdict surface must be valid")
 }
 
 fn completion_shell_name(shell: Shell) -> &'static str {

@@ -409,7 +409,7 @@ fn goal_input_surface(command_label: &str, message: &str, primary_command: &str)
     } else {
         "DeadReckon cannot launch until it has one non-empty goal source."
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         command_label,
         None,
@@ -424,7 +424,6 @@ fn goal_input_surface(command_label: &str, message: &str, primary_command: &str)
         [("Recommended", primary_command.trim().to_string())],
         std::iter::empty::<(&str, String)>(),
     )
-    .expect("goal input verdict surface is valid")
 }
 
 fn resolve_required_goal_input(
@@ -464,7 +463,7 @@ fn resolve_optional_goal_input(
                 }
                 return read_goal_file(command_label, Path::new(path)).map(Some);
             }
-            let goal = normalize_goal_text(goal);
+            let goal = normalize_goal_text(&goal);
             validate_goal_text(command_label, &goal)?;
             Ok(Some(goal))
         }
@@ -486,7 +485,7 @@ fn read_goal_file(command_label: &str, path: &Path) -> Result<String> {
             format!("deadreckon {command_label} --goal-file docs/goal.md"),
         )
     })?;
-    let goal = normalize_goal_text(contents);
+    let goal = normalize_goal_text(&contents);
     validate_goal_text(command_label, &goal)?;
     Ok(goal)
 }
@@ -539,9 +538,9 @@ fn expand_goal_file_home(path: &Path, home: Option<&Path>) -> PathBuf {
     path.to_path_buf()
 }
 
-fn normalize_goal_text(goal: String) -> String {
+fn normalize_goal_text(goal: &str) -> String {
     goal.strip_prefix('\u{feff}')
-        .unwrap_or(&goal)
+        .unwrap_or(goal)
         .trim_matches(|ch| ch == '\r' || ch == '\n')
         .to_string()
 }
@@ -650,7 +649,8 @@ async fn main_inner() -> Result<()> {
             let resolved_goal = resolve_optional_goal_input("start", goal, goal_file)?;
             let allows_prompts =
                 std::io::stdin().is_terminal() && !yes && !json && !plain && !quiet;
-            let goal = commands::start::resolve_start_goal(resolved_goal, allows_prompts)?;
+            let goal =
+                commands::start::resolve_start_goal(resolved_goal.as_deref(), allows_prompts)?;
             commands::start::start_command(StartCommandArgs {
                 goal,
                 mode,
@@ -2743,7 +2743,7 @@ fn config_refusal_surface(
     message: &str,
     primary: &str,
 ) -> VerdictSurface {
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "config",
         Some(subject),
@@ -2759,12 +2759,11 @@ fn config_refusal_surface(
         vec![("Recommended", primary)],
         vec![("Secondary", "deadreckon config provider")],
     )
-    .expect("config refusal surface must be valid")
 }
 
 fn config_missing_key_surface(paths: &DeadreckonPaths, key: &str) -> VerdictSurface {
     let primary = format!("deadreckon config set {key} <value>");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "config",
         Some(key),
@@ -2780,7 +2779,6 @@ fn config_missing_key_surface(paths: &DeadreckonPaths, key: &str) -> VerdictSurf
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", "deadreckon config provider")],
     )
-    .expect("config missing-key surface must be valid")
 }
 
 fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> Result<()> {
@@ -2847,7 +2845,7 @@ fn print_provider_selection(paths: &DeadreckonPaths, provider: Option<&str>) -> 
 
 fn config_set_surface(paths: &DeadreckonPaths, key: &str, value: &str) -> VerdictSurface {
     let primary = format!("deadreckon config get {key}");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         "config",
         Some(key),
@@ -2863,7 +2861,6 @@ fn config_set_surface(paths: &DeadreckonPaths, key: &str, value: &str) -> Verdic
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", "deadreckon doctor")],
     )
-    .expect("config set verdict surface must be valid")
 }
 
 fn config_remove_provider_surface(
@@ -2900,7 +2897,7 @@ fn config_remove_provider_surface(
     if let Some(promoted) = removal.promoted_provider.as_deref() {
         evidence.push(("new default".to_string(), promoted.to_string()));
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "config",
         Some("provider"),
@@ -2929,23 +2926,24 @@ fn config_remove_provider_surface(
             ("Secondary", "deadreckon start \"goal\""),
         ],
     )
-    .expect("config remove-provider surface must be valid")
 }
 
 fn config_remove_provider_empty_surface(paths: &DeadreckonPaths) -> VerdictSurface {
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Noop,
         "config",
         Some("provider"),
         ExplanationPanel::new(
             "DeadReckon found no configured provider routes to remove.",
             "Built-in provider routes are still available in the registry; remove-provider only edits local config selections.",
-            vec![("config".to_string(), paths.config_path().display().to_string())],
+            vec![(
+                "config".to_string(),
+                paths.config_path().display().to_string(),
+            )],
         ),
         vec![("Recommended", "deadreckon config provider cli:codex")],
         vec![("Secondary", "deadreckon providers list --all")],
     )
-    .expect("config remove-provider empty surface must be valid")
 }
 
 fn config_provider_surface(
@@ -2981,7 +2979,7 @@ fn config_provider_surface(
     if !selection.warnings.is_empty() {
         evidence.push(("warnings".to_string(), selection.warnings.join("; ")));
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "config",
         Some("provider"),
@@ -2992,12 +2990,11 @@ fn config_provider_surface(
             ("Secondary", "deadreckon run \"goal\""),
         ],
     )
-    .expect("config provider verdict surface must be valid")
 }
 
 fn config_model_surface(paths: &DeadreckonPaths, provider: &str, model: &str) -> VerdictSurface {
     let primary = format!("deadreckon config model --provider {provider}");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         "config",
         Some("model"),
@@ -3013,16 +3010,17 @@ fn config_model_surface(paths: &DeadreckonPaths, provider: &str, model: &str) ->
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", "deadreckon doctor")],
     )
-    .expect("config model verdict surface must be valid")
 }
 
 fn config_model_missing_provider_surface(paths: &DeadreckonPaths, model: &str) -> VerdictSurface {
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "config",
         Some("model"),
         ExplanationPanel::new(
-            format!("DeadReckon could not write model {model} because no active provider is configured."),
+            format!(
+                "DeadReckon could not write model {model} because no active provider is configured."
+            ),
             "Model overrides are provider-scoped; configure the default provider before saving a model without --provider.",
             vec![
                 ("config", paths.config_path().display().to_string()),
@@ -3033,7 +3031,6 @@ fn config_model_missing_provider_surface(paths: &DeadreckonPaths, model: &str) -
         vec![("Recommended", "deadreckon config provider cli:codex")],
         vec![("Secondary", "deadreckon config provider")],
     )
-    .expect("config model missing-provider surface must be valid")
 }
 
 fn provider_selection_surface(
@@ -3092,7 +3089,7 @@ fn provider_selection_surface(
             format!("deadreckon config model <model> --provider {}", route.name),
         ));
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "config",
         Some("provider"),
@@ -3100,10 +3097,8 @@ fn provider_selection_surface(
         vec![("Recommended", primary.as_str())],
         secondary
             .iter()
-            .map(|(label, command)| (*label, command.as_str()))
-            .collect::<Vec<_>>(),
+            .map(|(label, command)| (*label, command.as_str())),
     )
-    .expect("provider selection verdict surface must be valid")
 }
 
 fn print_provider_setup_rows(selections: &[setup::ProviderSetupSelection]) {
@@ -4118,7 +4113,7 @@ fn sleep_skipped_surface(
     let reason_label = sleep::skip_reason_label(reason);
     let primary = sleep_primary_command(reason);
     let secondary = sleep_secondary_commands(reason);
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Noop,
         "sleep prevention",
         Some(&id),
@@ -4141,7 +4136,6 @@ fn sleep_skipped_surface(
         vec![("Recommended", primary)],
         secondary,
     )
-    .expect("sleep skipped verdict surface must have one primary action")
 }
 
 fn sleep_primary_command(reason: sleep::SkipReason) -> &'static str {
@@ -4286,7 +4280,7 @@ fn merged_run_id_for_completed_plan(plan: &Plan, verb: &str) -> Result<Option<St
 fn pending_plan_result_surface(plan: &Plan, verb: &str) -> VerdictSurface {
     let id = run_prefix(&plan.plan_id);
     let primary = format!("deadreckon fork {id}");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "plan",
         Some(&id),
@@ -4308,7 +4302,6 @@ fn pending_plan_result_surface(plan: &Plan, verb: &str) -> VerdictSurface {
         [("Recommended", primary.as_str())],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("pending plan result surface must have one primary action")
 }
 
 fn forked_plan_result_surface(plan: &Plan, verb: &str, ready_to_merge: bool) -> VerdictSurface {
@@ -4337,7 +4330,7 @@ fn forked_plan_result_surface(plan: &Plan, verb: &str, ready_to_merge: bool) -> 
             "DeadReckon has no completed result to {verb} while child tasks are still running or waiting."
         )
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "plan",
         Some(&id),
@@ -4364,7 +4357,6 @@ fn forked_plan_result_surface(plan: &Plan, verb: &str, ready_to_merge: bool) -> 
         [("Recommended", primary.as_str())],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("forked plan result surface must have one primary action")
 }
 
 fn failed_plan_result_surface(plan: &Plan, verb: &str) -> VerdictSurface {
@@ -4389,7 +4381,7 @@ fn failed_plan_result_surface(plan: &Plan, verb: &str) -> VerdictSurface {
     }
 
     let primary = format!("deadreckon show {id} --why-failed");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Failed,
         "plan",
         Some(&id),
@@ -4403,7 +4395,6 @@ fn failed_plan_result_surface(plan: &Plan, verb: &str) -> VerdictSurface {
         [("Recommended", primary.as_str())],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("failed plan result surface must have one primary action")
 }
 
 fn default_plan_materialize_dest(plan: &Plan) -> PathBuf {
@@ -7578,7 +7569,7 @@ fn print_merge_finished(
         .count();
     println!(
         "{}",
-        VerdictSurface::try_new(
+        VerdictSurface::must_new(
             VerdictKind::Completed,
             "plan",
             Some(&id),
@@ -7602,10 +7593,8 @@ fn print_merge_finished(
             vec![("Recommended", finish.as_str())],
             secondary
                 .iter()
-                .map(|command| ("Secondary", command.as_str()))
-                .collect::<Vec<_>>(),
+                .map(|command| ("Secondary", command.as_str())),
         )
-        .expect("merge completion verdict surface must have one primary action")
         .render_plain(!completion_hints_enabled(no_hints))
     );
     commands::plan::print_orchestration_role_table(plan, true, None);
@@ -8882,7 +8871,7 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 }
 
 fn codebase_mode_status(paths: &DeadreckonPaths, state: &deadreckon_core::PipelineState) -> String {
-    read_run_codebase_record(paths, &state)
+    read_run_codebase_record(paths, state)
         .map(|record| record.mode.to_string())
         .unwrap_or_else(|_| "-".to_string())
 }
@@ -9121,7 +9110,7 @@ fn kill_plan_command(paths: &DeadreckonPaths, plan_id: &str, force: bool) -> Res
     let secondary = format!("deadreckon attach {id}");
     print!(
         "{}",
-        VerdictSurface::try_new(
+        VerdictSurface::must_new(
             VerdictKind::Killed,
             "plan",
             Some(&id),
@@ -9133,7 +9122,6 @@ fn kill_plan_command(paths: &DeadreckonPaths, plan_id: &str, force: bool) -> Res
             vec![("Recommended", primary.as_str())],
             vec![("Secondary", secondary.as_str())],
         )
-        .expect("plan kill verdict surface must be valid")
         .render_plain(false)
     );
     Ok(())
@@ -9254,7 +9242,7 @@ async fn resume_command(
         let primary = format!("deadreckon show {id}");
         print!(
             "{}",
-            VerdictSurface::try_new(
+            VerdictSurface::must_new(
                 VerdictKind::Noop,
                 "run",
                 Some(&id),
@@ -9270,7 +9258,6 @@ async fn resume_command(
                 vec![("Recommended", primary.as_str())],
                 Vec::<(&str, &str)>::new(),
             )
-            .expect("completed resume no-op verdict surface must be valid")
             .render_plain(!completion_hints_enabled(false))
         );
         return Ok(());
@@ -9395,7 +9382,7 @@ fn undo_command(run: Option<String>, turn: Option<u32>) -> Result<()> {
     let primary = format!("deadreckon show {id}");
     print!(
         "{}",
-        VerdictSurface::try_new(
+        VerdictSurface::must_new(
             VerdictKind::Completed,
             "undo",
             Some(&id),
@@ -9423,7 +9410,6 @@ fn undo_command(run: Option<String>, turn: Option<u32>) -> Result<()> {
             vec![("Recommended", primary.as_str())],
             Vec::<(&str, &str)>::new(),
         )
-        .expect("undo verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false))
     );
     Ok(())
@@ -9588,7 +9574,7 @@ fn rewind_verdict_surface(
         ),
     };
 
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "rewind",
         Some(&id),
@@ -9596,7 +9582,6 @@ fn rewind_verdict_surface(
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", secondary.as_str())],
     )
-    .expect("rewind verdict surface must be valid")
 }
 
 fn rewind_mode(options: &RewindCliOptions) -> Result<RewindMode> {
@@ -9846,8 +9831,8 @@ struct WhyFailedReport {
     try_lines: Vec<String>,
 }
 
-fn render_why_failed(report: WhyFailedReport) {
-    print!("{}", why_failed_surface(&report).render_plain(false));
+fn render_why_failed(report: &WhyFailedReport) {
+    print!("{}", why_failed_surface(report).render_plain(false));
 }
 
 fn why_failed_surface(report: &WhyFailedReport) -> VerdictSurface {
@@ -9867,7 +9852,7 @@ fn why_failed_surface(report: &WhyFailedReport) -> VerdictSurface {
         .reason
         .as_deref()
         .unwrap_or("no explicit failure reason was recorded");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Failed,
         report.kind,
         Some(&report.id),
@@ -9882,7 +9867,6 @@ fn why_failed_surface(report: &WhyFailedReport) -> VerdictSurface {
         vec![("Recommended", primary.as_str())],
         secondary,
     )
-    .expect("why-failed verdict surface must have one primary action")
 }
 
 fn why_failed_evidence(report: &WhyFailedReport) -> Vec<(String, String)> {
@@ -9904,7 +9888,7 @@ fn render_no_failures(kind: &'static str, id: &str, status: impl Into<String>) {
     let primary = format!("deadreckon show {id}");
     print!(
         "{}",
-        VerdictSurface::try_new(
+        VerdictSurface::must_new(
             VerdictKind::Noop,
             kind,
             Some(id),
@@ -9916,7 +9900,6 @@ fn render_no_failures(kind: &'static str, id: &str, status: impl Into<String>) {
             vec![("Recommended", primary.as_str())],
             Vec::<(&str, &str)>::new(),
         )
-        .expect("no-failure verdict surface must have one primary action")
         .render_plain(false)
     );
 }
@@ -9994,7 +9977,7 @@ fn show_plan_why_failed(paths: &DeadreckonPaths, plan: &Plan) {
             proofs.join("repair-request.json").display()
         ));
     }
-    render_why_failed(WhyFailedReport {
+    render_why_failed(&WhyFailedReport {
         kind: "plan",
         id: run_prefix(&plan.plan_id),
         status: plan_status_label(plan.status).to_string(),
@@ -10035,7 +10018,7 @@ fn show_run_why_failed(state: &deadreckon_core::PipelineState) -> Result<()> {
                 )
             }),
     );
-    render_why_failed(WhyFailedReport {
+    render_why_failed(&WhyFailedReport {
         kind: "run",
         id: run_prefix(&state.run_id),
         status: run_status_label(state.status).to_string(),
@@ -10258,7 +10241,7 @@ fn flight_unavailable_surface(
     if let Some(file) = file {
         evidence.push(("file".to_string(), file.display().to_string()));
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Noop,
         "flight",
         Some(&id),
@@ -10270,7 +10253,6 @@ fn flight_unavailable_surface(
         vec![("Recommended", primary.as_str())],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("flight unavailable verdict surface must have one primary action")
 }
 
 fn normalize_flight_file_filter(path: &Path, working_dir: &Path) -> Option<PathBuf> {
@@ -10667,7 +10649,7 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
     println!();
     println!("{}", ui_heading("run health"));
     let mut health: Vec<(&str, String)> = vec![
-        ("action", next_action.to_string()),
+        ("action", next_action),
         ("stale", if stale { "yes" } else { "no" }.to_string()),
         ("pids", supervised.len().to_string()),
     ];
@@ -11206,7 +11188,7 @@ fn run_lifecycle_surface(state: &deadreckon_core::PipelineState) -> VerdictSurfa
             "Attaching is the safest next command because it shows the live or resumable run state before any mutation.",
         ),
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "run",
         Some(&id),
@@ -11232,10 +11214,8 @@ fn run_lifecycle_surface(state: &deadreckon_core::PipelineState) -> VerdictSurfa
         vec![("Recommended", primary.command.as_str())],
         secondary
             .iter()
-            .map(|action| ("Secondary", action.command.as_str()))
-            .collect::<Vec<_>>(),
+            .map(|action| ("Secondary", action.command.as_str())),
     )
-    .expect("run lifecycle verdict surface must have one primary action")
 }
 
 async fn complete_run_actions(

@@ -283,7 +283,7 @@ fn doctor_verdict_surface(report: &DoctorReport) -> VerdictSurface {
         .into_iter()
         .map(|action| ("Secondary", action))
         .collect::<Vec<_>>();
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "doctor",
         None,
@@ -291,7 +291,6 @@ fn doctor_verdict_surface(report: &DoctorReport) -> VerdictSurface {
         vec![("Recommended", primary.as_str())],
         secondary,
     )
-    .expect("doctor verdict surface must be valid")
 }
 
 fn doctor_explanation(

@@ -89,7 +89,7 @@ fn learn_index_surface(summary: &LearningIndexSummary) -> VerdictSurface {
     } else {
         vec![("Secondary", "deadreckon learn report")]
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         "learn",
         Some("index"),
@@ -106,7 +106,6 @@ fn learn_index_surface(summary: &LearningIndexSummary) -> VerdictSurface {
         vec![("Recommended", primary)],
         secondary,
     )
-    .expect("learn index verdict surface must be valid")
 }
 
 fn learn_report_command(scope: Option<&str>, limit: usize, json_output: bool) -> Result<()> {
@@ -148,7 +147,7 @@ fn learn_report_surface(report: &LearningReport) -> VerdictSurface {
             vec![("Secondary", "deadreckon learn report")],
         )
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "learn",
         Some("report"),
@@ -167,7 +166,6 @@ fn learn_report_surface(report: &LearningReport) -> VerdictSurface {
         vec![("Recommended", primary)],
         secondary,
     )
-    .expect("learn report verdict surface must be valid")
 }
 
 fn learn_export_command(
@@ -200,7 +198,7 @@ fn learn_export_surface(report: &LearningBundleExportReport) -> VerdictSurface {
         "deadreckon learn import-bundle {} --preview",
         report.output.display()
     );
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         "learn",
         Some("export"),
@@ -224,7 +222,6 @@ fn learn_export_surface(report: &LearningBundleExportReport) -> VerdictSurface {
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", "deadreckon learn report")],
     )
-    .expect("learn export verdict surface must be valid")
 }
 
 fn learn_import_bundle_command(
@@ -273,7 +270,7 @@ fn learn_import_bundle_surface(path: &Path, report: &LearningBundleImportReport)
             "This is a preview because no learning records were written; the recommended command applies the same bundle.",
         )
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "learn",
         Some("import-bundle"),
@@ -296,7 +293,6 @@ fn learn_import_bundle_surface(path: &Path, report: &LearningBundleImportReport)
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", "deadreckon learn report")],
     )
-    .expect("learn import-bundle verdict surface must be valid")
 }
 
 async fn learn_propose_command(
@@ -398,7 +394,7 @@ fn learn_propose_surface(
         .first()
         .map(|proposal| one_line(&proposal.title, 100))
         .unwrap_or_else(|| "none".to_string());
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "learn",
         Some("propose"),
@@ -416,7 +412,6 @@ fn learn_propose_surface(
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", "deadreckon learn report")],
     )
-    .expect("learn propose verdict surface must be valid")
 }
 
 fn resolve_learning_scope(scope: Option<String>, all: bool) -> Result<Option<String>> {
@@ -534,7 +529,7 @@ fn improve_self_pr_dry_run_surface(
     } else {
         "The PR gate blocked live opening; the recommended command is the safest recovery path for the current candidate state."
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "improve",
         Some("self"),
@@ -553,7 +548,6 @@ fn improve_self_pr_dry_run_surface(
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", "deadreckon status")],
     )
-    .expect("improve self PR dry-run verdict surface must be valid")
 }
 
 fn improve_self_open_pr_surface(
@@ -562,7 +556,7 @@ fn improve_self_open_pr_surface(
     dry_run: &PrDryRun,
     pr_url: &str,
 ) -> VerdictSurface {
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         "improve",
         Some("self"),
@@ -580,7 +574,6 @@ fn improve_self_open_pr_surface(
         vec![("Recommended", "deadreckon status")],
         vec![("Secondary", "deadreckon learn report")],
     )
-    .expect("improve self open-pr verdict surface must be valid")
 }
 
 fn improve_self_preview(proposal: &LearningProposal, json_output: bool) -> Result<()> {
@@ -612,7 +605,7 @@ fn improve_self_preview_surface(proposal: &LearningProposal) -> VerdictSurface {
         "deadreckon improve self {} --pr-dry-run",
         proposal.proposal_id
     );
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Preview,
         "improve",
         Some("self"),
@@ -630,7 +623,6 @@ fn improve_self_preview_surface(proposal: &LearningProposal) -> VerdictSurface {
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", secondary.as_str())],
     )
-    .expect("improve self preview verdict surface must be valid")
 }
 
 async fn run_self_improve_candidate(
@@ -835,7 +827,7 @@ fn improve_self_candidate_surface(
     } else {
         "The isolated candidate did not satisfy the evidence gate; the PR dry-run explains the blocking reasons without pushing anything."
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "improve",
         Some("self"),
@@ -855,7 +847,6 @@ fn improve_self_candidate_surface(
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", "deadreckon status")],
     )
-    .expect("improve self candidate verdict surface must be valid")
 }
 
 fn load_self_improve_proposal(paths: &DeadreckonPaths, target: &str) -> Result<LearningProposal> {
@@ -934,7 +925,7 @@ fn missing_self_improve_candidate_error(
     let primary = format!("deadreckon improve self {proposal_id} --yes");
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "improve",
             Some("self"),
@@ -953,7 +944,6 @@ fn missing_self_improve_candidate_error(
             vec![("Recommended", primary.as_str())],
             vec![("Secondary", "deadreckon learn report")],
         )
-        .expect("missing self-improvement candidate verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false)),
     }
 }

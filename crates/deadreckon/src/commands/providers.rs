@@ -156,7 +156,7 @@ fn create_shell_update_backup(
 
 fn update_native_surface(channel: Channel, current: &str) -> VerdictSurface {
     let primary = channel_native_update_command(channel);
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "update",
         Some(channel.as_str()),
@@ -175,7 +175,6 @@ fn update_native_surface(channel: Channel, current: &str) -> VerdictSurface {
         vec![("Recommended", primary)],
         vec![("Secondary", "deadreckon update --check")],
     )
-    .expect("native update verdict surface must be valid")
 }
 
 fn update_shell_completed_surface(
@@ -184,7 +183,7 @@ fn update_shell_completed_surface(
     backup_dir: &Path,
     receipt: &deadreckon_core::install_receipt::Receipt,
 ) -> VerdictSurface {
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         "update",
         Some("shell"),
@@ -204,7 +203,6 @@ fn update_shell_completed_surface(
         vec![("Recommended", "deadreckon doctor")],
         vec![("Secondary", "deadreckon update --check")],
     )
-    .expect("shell update verdict surface must be valid")
 }
 
 fn confirm_shell_update(
@@ -237,7 +235,7 @@ fn update_shell_requires_yes_surface(
     latest: &LatestUpdate,
     receipt: &deadreckon_core::install_receipt::Receipt,
 ) -> VerdictSurface {
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "update",
         Some("shell"),
@@ -249,13 +247,15 @@ fn update_shell_requires_yes_surface(
                 ("current".to_string(), current.to_string()),
                 ("target".to_string(), latest.version.clone()),
                 ("archive".to_string(), latest.archive_url()),
-                ("updated".to_string(), receipt.binary_path.display().to_string()),
+                (
+                    "updated".to_string(),
+                    receipt.binary_path.display().to_string(),
+                ),
             ],
         ),
         vec![("Recommended", "deadreckon update --yes")],
         vec![("Secondary", "deadreckon update --check")],
     )
-    .expect("shell update --yes refusal verdict surface must be valid")
 }
 
 fn shell_backup_root(paths: &DeadreckonPaths) -> PathBuf {
@@ -363,7 +363,7 @@ fn shell_update_failure(
     );
     CliError::Surface {
         code: 2,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Failed,
             "update",
             Some("shell"),
@@ -380,7 +380,6 @@ fn shell_update_failure(
             vec![("Recommended", primary.as_str())],
             vec![("Secondary", "deadreckon update --check")],
         )
-        .expect("shell update failure verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false)),
     }
 }
@@ -426,7 +425,7 @@ fn update_check_surface(channel: Channel, current: &str, latest: &LatestUpdate) 
         ("release", latest.release_url.clone()),
     ];
     if latest.update_available {
-        return VerdictSurface::try_new(
+        return VerdictSurface::must_new(
             VerdictKind::Preview,
             "update",
             Some(channel.as_str()),
@@ -437,11 +436,10 @@ fn update_check_surface(channel: Channel, current: &str, latest: &LatestUpdate) 
             ),
             vec![("Recommended", channel_native_update_command(channel))],
             vec![("Secondary", "deadreckon doctor")],
-        )
-        .expect("update-check preview verdict surface must be valid");
+        );
     }
 
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Noop,
         "update",
         Some(channel.as_str()),
@@ -453,11 +451,10 @@ fn update_check_surface(channel: Channel, current: &str, latest: &LatestUpdate) 
         vec![("Recommended", "deadreckon doctor")],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("update-check no-op verdict surface must be valid")
 }
 
 fn update_source_surface(current: &str) -> VerdictSurface {
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "update",
         Some("source"),
@@ -473,7 +470,6 @@ fn update_source_surface(current: &str) -> VerdictSurface {
         vec![("Recommended", "cargo install --path crates/deadreckon")],
         vec![("Secondary", "deadreckon update --check")],
     )
-    .expect("source update verdict surface must be valid")
 }
 
 fn channel_native_update_command(channel: Channel) -> &'static str {
@@ -742,7 +738,7 @@ async fn providers_list_command(
         let Some(descriptor) = registry.get(&result.id) else {
             continue;
         };
-        print_provider_list_row(&result, descriptor, active.as_deref(), full);
+        print_provider_list_row(result, descriptor, active.as_deref(), full);
         if models {
             print_provider_models(descriptor);
         }
@@ -825,7 +821,7 @@ fn providers_list_verdict_surface(
     if let Some(first) = missing.first() {
         evidence.push(("first missing".to_string(), first.clone()));
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "providers",
         Some(subject),
@@ -837,7 +833,6 @@ fn providers_list_verdict_surface(
             ("Secondary", "deadreckon config provider cli:codex"),
         ],
     )
-    .expect("providers list verdict surface must be valid")
 }
 
 fn print_provider_list_row(
@@ -1032,7 +1027,7 @@ fn detect_verdict_surface(
     {
         secondary.push(("Secondary".to_string(), line.clone()));
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "detect",
         Some(subject),
@@ -1040,10 +1035,8 @@ fn detect_verdict_surface(
         vec![("Recommended", primary.as_str())],
         secondary
             .iter()
-            .map(|(label, command)| (label.as_str(), command.as_str()))
-            .collect::<Vec<_>>(),
+            .map(|(label, command)| (label.as_str(), command.as_str())),
     )
-    .expect("detect verdict surface must be valid")
 }
 
 #[cfg(test)]

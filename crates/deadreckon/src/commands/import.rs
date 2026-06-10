@@ -1678,7 +1678,7 @@ fn import_invalid(message: String) -> CliError {
         }
         CliError::Surface {
             code: 1,
-            surface: VerdictSurface::try_new(
+            surface: VerdictSurface::must_new(
                 VerdictKind::Blocked,
                 "import",
                 None,
@@ -1690,7 +1690,6 @@ fn import_invalid(message: String) -> CliError {
                 vec![("Recommended", hint.as_str())],
                 Vec::<(&str, &str)>::new(),
             )
-            .expect("import refusal verdict surface must be valid")
             .render_plain(!completion_hints_enabled(false)),
         }
     } else {
@@ -1793,7 +1792,7 @@ fn import_candidates_surface(
     } else {
         "The command is read-only; choose a concrete session before importing transcript state."
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "import",
         None,
@@ -1809,7 +1808,6 @@ fn import_candidates_surface(
         vec![("Recommended", primary.as_str())],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("import candidates verdict surface must be valid")
 }
 
 fn import_selection_surface(
@@ -1827,7 +1825,7 @@ fn import_selection_surface(
     if !selected.is_empty() {
         evidence.push(("candidate table", compact_candidate_table(selected)));
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Preview,
         "import",
         None,
@@ -1843,7 +1841,6 @@ fn import_selection_surface(
         vec![("Recommended", primary.as_str())],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("import preview verdict surface must be valid")
 }
 
 fn import_completed_surface(
@@ -1877,7 +1874,7 @@ fn import_completed_surface(
                 .join("; "),
         ));
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         "import",
         Some(run_id),
@@ -1885,7 +1882,11 @@ fn import_completed_surface(
             format!(
                 "DeadReckon imported {} event{} into run {run_id}.",
                 manifest.events_imported,
-                if manifest.events_imported == 1 { "" } else { "s" }
+                if manifest.events_imported == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ),
             "The transcript was normalized into completed run state and its import manifest was written for repeatable reimport.",
             evidence,
@@ -1893,7 +1894,6 @@ fn import_completed_surface(
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", manifest.reimport_command.as_str())],
     )
-    .expect("import completed verdict surface must be valid")
 }
 
 fn compact_candidate_table(candidates: &[ImportCandidate]) -> String {

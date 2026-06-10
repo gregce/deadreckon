@@ -281,7 +281,7 @@ fn print_doc_export_surface(
     let secondary = format!("deadreckon show {id}");
     print!(
         "{}",
-        VerdictSurface::try_new(
+        VerdictSurface::must_new(
             VerdictKind::Completed,
             "doc",
             Some(&id),
@@ -299,7 +299,6 @@ fn print_doc_export_surface(
             vec![("Recommended", primary.as_str())],
             vec![("Secondary", secondary.as_str())],
         )
-        .expect("doc export verdict surface must have one primary action")
         .render_plain(!completion_hints_enabled(false))
     );
 }
@@ -342,7 +341,7 @@ fn missing_doc_provider_error(
     }
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "doc",
             Some("polish"),
@@ -361,7 +360,6 @@ fn missing_doc_provider_error(
             vec![("Recommended", primary)],
             secondary,
         )
-        .expect("missing doc provider verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false)),
     }
 }
@@ -379,7 +377,7 @@ fn doc_polish_budget_cap_error(
     );
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "doc",
             Some("polish"),
@@ -400,7 +398,6 @@ fn doc_polish_budget_cap_error(
             vec![("Recommended", primary.as_str())],
             vec![("Secondary", "deadreckon doctor")],
         )
-        .expect("doc polish budget cap verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false)),
     }
 }
@@ -539,7 +536,7 @@ fn print_doc_polish_summary(
     }
     print!(
         "{}",
-        VerdictSurface::try_new(
+        VerdictSurface::must_new(
             kind,
             "doc",
             Some(&id),
@@ -550,7 +547,6 @@ fn print_doc_polish_summary(
                 ("Secondary", format!("deadreckon doc {id} --kind decisions")),
             ],
         )
-        .expect("doc polish verdict surface must have one primary action")
         .render_plain(!completion_hints_enabled(false))
     );
 }

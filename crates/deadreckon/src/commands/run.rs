@@ -430,7 +430,7 @@ fn run_confirmation_refusal_error(goal: &str, run_id: &str, no_hints: bool) -> C
     let primary = format!("deadreckon run {} --yes", run_goal_argument(goal));
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "run",
             None,
@@ -446,7 +446,6 @@ fn run_confirmation_refusal_error(goal: &str, run_id: &str, no_hints: bool) -> C
             [("Recommended", primary)],
             std::iter::empty::<(&str, String)>(),
         )
-        .expect("run confirmation refusal verdict surface must be valid")
         .render_plain(!completion_hints_enabled(no_hints)),
     }
 }
@@ -462,7 +461,7 @@ fn run_codebase_refusal_error(err: DeadreckonError, goal: &str, no_hints: bool) 
     let evidence_reason = run_codebase_refusal_reason(&message);
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "run",
             None,
@@ -478,7 +477,6 @@ fn run_codebase_refusal_error(err: DeadreckonError, goal: &str, no_hints: bool) 
             [("Recommended", primary)],
             std::iter::empty::<(&str, String)>(),
         )
-        .expect("run codebase refusal verdict surface must be valid")
         .render_plain(!completion_hints_enabled(no_hints)),
     }
 }
@@ -585,7 +583,7 @@ fn run_cancelled_before_turn_loop(
 /// A cancel outcome rendered through the shared verdict surface (one verdict,
 /// one Recommended next step) instead of a bare `println!("cancelled")`.
 fn cancelled_run_surface() -> VerdictSurface {
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Noop,
         "run",
         Some("cancelled"),
@@ -597,7 +595,6 @@ fn cancelled_run_surface() -> VerdictSurface {
         [("Recommended", "deadreckon run \"<goal>\"")],
         [("Secondary", "deadreckon start \"<goal>\"")],
     )
-    .expect("cancelled run verdict surface must be valid")
 }
 
 #[cfg(test)]

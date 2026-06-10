@@ -178,6 +178,35 @@ pub struct VerdictSurface {
 }
 
 impl VerdictSurface {
+    /// `try_new` for surfaces whose shape is fixed at the call site —
+    /// every input is a literal or already-validated value, so a
+    /// validation failure is a programming error, not a runtime state.
+    #[allow(clippy::expect_used)]
+    pub fn must_new<L, C, SL, SC>(
+        kind: VerdictKind,
+        subject_kind: impl Into<String>,
+        subject: Option<&str>,
+        explanation: ExplanationPanel,
+        primary_actions: impl IntoIterator<Item = (L, C)>,
+        secondary_actions: impl IntoIterator<Item = (SL, SC)>,
+    ) -> Self
+    where
+        L: Into<String>,
+        C: Into<String>,
+        SL: Into<String>,
+        SC: Into<String>,
+    {
+        Self::try_new(
+            kind,
+            subject_kind,
+            subject,
+            explanation,
+            primary_actions,
+            secondary_actions,
+        )
+        .expect("statically-shaped verdict surface must be valid")
+    }
+
     pub fn try_new<L, C, SL, SC>(
         kind: VerdictKind,
         subject_kind: impl Into<String>,

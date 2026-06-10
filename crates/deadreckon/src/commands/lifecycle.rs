@@ -131,7 +131,7 @@ pub(crate) fn finish_command(
             println!("  {} {}", ui_muted("working:"), state.working_dir.display());
             println!(
                 "{}",
-                VerdictSurface::try_new(
+                VerdictSurface::must_new(
                     VerdictKind::Completed,
                     "run",
                     Some(&prefix),
@@ -153,7 +153,6 @@ pub(crate) fn finish_command(
                         ("Secondary", format!("deadreckon undo --run {prefix}")),
                     ],
                 )
-                .expect("in-place finish verdict surface must have one primary action")
                 .render_plain(false)
             );
             Ok(())
@@ -253,7 +252,7 @@ fn materialized_surface(materialized: &MaterializedRun) -> VerdictSurface {
     let id = run_prefix(&materialized.run_id);
     let primary = format!("deadreckon show {id}");
     let secondary = "deadreckon status".to_string();
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         "materialize",
         Some(&id),
@@ -262,14 +261,16 @@ fn materialized_surface(materialized: &MaterializedRun) -> VerdictSurface {
             "Materialize completed because the run was already completed, the destination was safe to write, and the library artifact was copied.",
             vec![
                 ("run".to_string(), id.clone()),
-                ("source".to_string(), materialized.source.display().to_string()),
+                (
+                    "source".to_string(),
+                    materialized.source.display().to_string(),
+                ),
                 ("dest".to_string(), materialized.dest.display().to_string()),
             ],
         ),
-        vec![("Recommended", primary.as_str())],
+        vec![("Recommended", primary)],
         vec![("Secondary", secondary.as_str())],
     )
-    .expect("materialize verdict surface must be valid")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,7 +354,7 @@ fn apply_command_inner(
                 state = prepared;
                 read_codebase_record(&state.working_dir)?
             }
-            None => return Err(apply_missing_codebase_error(&paths, &state, source)),
+            None => return Err(apply_missing_codebase_error(&paths, &state, &source)),
         },
     };
     if record.mode != CodebaseMode::Worktree {
@@ -545,7 +546,7 @@ fn result_plan_id(
 }
 
 fn result_manifest_id(path: &Path, key: &str) -> Result<Option<String>> {
-    match fs::read(&path) {
+    match fs::read(path) {
         Ok(bytes) => {
             let value: Value = serde_json::from_slice(&bytes)?;
             Ok(value.get(key).and_then(Value::as_str).map(str::to_string))
@@ -561,13 +562,13 @@ fn result_manifest_id(path: &Path, key: &str) -> Result<Option<String>> {
 fn apply_missing_codebase_error(
     paths: &DeadreckonPaths,
     state: &deadreckon_core::PipelineState,
-    source: DeadreckonError,
+    source: &DeadreckonError,
 ) -> CliError {
     let id = run_prefix(&state.run_id);
     let library = paths.library_dir(&state.scope, &state.run_id);
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "apply",
             Some(&id),
@@ -584,7 +585,6 @@ fn apply_missing_codebase_error(
             vec![("Recommended", format!("deadreckon finish {id}"))],
             vec![("Secondary", format!("deadreckon export {id} --dest <path>"))],
         )
-        .expect("apply missing-codebase refusal surface must be valid")
         .render_plain(!completion_hints_enabled(false)),
     }
 }
@@ -652,7 +652,7 @@ fn apply_completed_surface(
     } else {
         "The apply transition is complete, but the temporary worktree resources remain; cleanup is the safest next command."
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         "apply",
         Some(&id),
@@ -661,10 +661,9 @@ fn apply_completed_surface(
             why,
             evidence,
         ),
-        vec![("Recommended", primary.as_str())],
+        vec![("Recommended", primary)],
         vec![("Secondary", secondary.as_str())],
     )
-    .expect("apply completion verdict surface must be valid")
 }
 
 fn finish_apply_cleanup(
@@ -758,7 +757,7 @@ fn apply_dirty_error(git_root: &Path, run_id: &str, no_confirm: bool, dirty: &st
     let primary = apply_dirty_hint(run_id, no_confirm);
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "apply",
             Some(&id),
@@ -774,7 +773,6 @@ fn apply_dirty_error(git_root: &Path, run_id: &str, no_confirm: bool, dirty: &st
             vec![("Recommended", primary.as_str())],
             Vec::<(&str, &str)>::new(),
         )
-        .expect("apply dirty refusal verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false)),
     }
 }
@@ -814,7 +812,7 @@ fn apply_merge_error(run_id: &str, autostash: &Option<ApplyAutoStash>, err: &Cli
     }
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Failed,
             "apply",
             Some(&id),
@@ -836,7 +834,6 @@ fn apply_merge_error(run_id: &str, autostash: &Option<ApplyAutoStash>, err: &Cli
             vec![("Recommended", "git status")],
             secondary,
         )
-        .expect("apply conflict verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false)),
     }
 }
@@ -1154,7 +1151,7 @@ fn print_cleanup_results(results: &[CleanupRunResult]) {
     }
     print!(
         "{}",
-        VerdictSurface::try_new(
+        VerdictSurface::must_new(
             VerdictKind::Completed,
             "cleanup",
             Some(&subject),
@@ -1166,7 +1163,6 @@ fn print_cleanup_results(results: &[CleanupRunResult]) {
             vec![("Recommended", primary.as_str())],
             vec![("Secondary", secondary.as_str())],
         )
-        .expect("aggregate cleanup verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false))
     );
 }
@@ -1226,7 +1222,7 @@ fn cleanup_result_surface(result: &CleanupRunResult) -> VerdictSurface {
             "This is completed cleanup; inspect the run record before further recovery or deletion."
         }
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Completed,
         result.reason.subject(),
         Some(&id),
@@ -1234,7 +1230,6 @@ fn cleanup_result_surface(result: &CleanupRunResult) -> VerdictSurface {
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", secondary.as_str())],
     )
-    .expect("cleanup verdict surface must be valid")
 }
 
 fn cleanup_no_candidates_surface(completed: bool, all: bool) -> VerdictSurface {
@@ -1273,18 +1268,17 @@ fn cleanup_noop_surface(
     secondary: Vec<String>,
 ) -> VerdictSurface {
     let secondary = secondary
-        .iter()
-        .map(|command| ("Secondary", command.as_str()))
+        .into_iter()
+        .map(|command| ("Secondary", command))
         .collect::<Vec<_>>();
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Noop,
         subject_kind,
         subject,
         ExplanationPanel::new(what, why, evidence),
-        vec![("Recommended", primary.as_str())],
+        vec![("Recommended", primary)],
         secondary,
     )
-    .expect("cleanup no-op verdict surface must be valid")
 }
 
 fn codebase_mode_refusal_error(
@@ -1298,7 +1292,7 @@ fn codebase_mode_refusal_error(
     let id = run_prefix(&state.run_id);
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             subject_kind,
             Some(&id),
@@ -1318,10 +1312,9 @@ fn codebase_mode_refusal_error(
                     ),
                 ],
             ),
-            vec![("Recommended", primary.as_str())],
+            vec![("Recommended", primary)],
             Vec::<(&str, &str)>::new(),
         )
-        .expect("codebase mode refusal verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false)),
     }
 }
@@ -1628,23 +1621,28 @@ fn incomplete_parent_extend_surface(parent: &deadreckon_core::PipelineState) -> 
     let id = run_prefix(&parent.run_id);
     let primary = format!("deadreckon resume {id}");
     let secondary = format!("deadreckon show {id}");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "extend",
         Some(&id),
         ExplanationPanel::new(
-            format!("Parent run {id} is {} and cannot be extended yet.", parent.status),
+            format!(
+                "Parent run {id} is {} and cannot be extended yet.",
+                parent.status
+            ),
             "Extend requires a completed parent with promoted artifacts; an incomplete run may still change if it is resumed.",
             vec![
                 ("run".to_string(), id.clone()),
                 ("status".to_string(), parent.status.to_string()),
-                ("state".to_string(), parent.state_path().display().to_string()),
+                (
+                    "state".to_string(),
+                    parent.state_path().display().to_string(),
+                ),
             ],
         ),
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", secondary.as_str())],
     )
-    .expect("incomplete parent extend verdict surface must be valid")
 }
 
 fn in_place_parent_extend_surface(
@@ -1654,7 +1652,7 @@ fn in_place_parent_extend_surface(
     let id = run_prefix(&parent.run_id);
     let primary = format!("deadreckon run --in-place --i-know-its-a-lot {new_goal:?}");
     let secondary = format!("deadreckon show {id}");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "extend",
         Some("in-place"),
@@ -1662,16 +1660,18 @@ fn in_place_parent_extend_surface(
             format!("Parent run {id} is in-place and cannot be extended."),
             "Extend creates a follow-up from promoted copy or worktree artifacts; in-place work should continue as a new in-place run from the current checkout.",
             vec![
-                ("run".to_string(), id.clone()),
+                ("run".to_string(), id),
                 ("mode".to_string(), "in-place".to_string()),
                 ("new goal".to_string(), new_goal.to_string()),
-                ("state".to_string(), parent.state_path().display().to_string()),
+                (
+                    "state".to_string(),
+                    parent.state_path().display().to_string(),
+                ),
             ],
         ),
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", secondary.as_str())],
     )
-    .expect("in-place parent extend verdict surface must be valid")
 }
 
 struct ExtendWorktreeArgs {
@@ -2111,23 +2111,28 @@ fn incomplete_run_required_surface(
     let id = run_prefix(&state.run_id);
     let primary = format!("deadreckon resume {id}");
     let secondary = format!("deadreckon show {id}");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         verb,
         Some(&id),
         ExplanationPanel::new(
-            format!("{verb} requires a completed run, but run {id} is {}.", state.status),
+            format!(
+                "{verb} requires a completed run, but run {id} is {}.",
+                state.status
+            ),
             "This command needs stable completed artifacts; an incomplete run may still change if it is resumed.",
             vec![
                 ("run".to_string(), id.clone()),
                 ("status".to_string(), state.status.to_string()),
-                ("state".to_string(), state.state_path().display().to_string()),
+                (
+                    "state".to_string(),
+                    state.state_path().display().to_string(),
+                ),
             ],
         ),
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", secondary.as_str())],
     )
-    .expect("incomplete run requirement verdict surface must be valid")
 }
 
 fn materialized_parent_marker(state: &deadreckon_core::PipelineState) -> ParentMarker {

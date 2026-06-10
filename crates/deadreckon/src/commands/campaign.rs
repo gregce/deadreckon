@@ -178,24 +178,21 @@ fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sand
     if let Some(child) = campaign.providers.default_child.as_deref() {
         print_campaign_fact("workers", child);
     }
-    match (
+    if let (Some(total), Some(share)) = (
         campaign.tree_budget_usd,
         per_sub.as_ref().and_then(|s| s.first()),
     ) {
-        (Some(total), Some(share)) => {
-            print_campaign_fact(
-                "budget",
-                &format!("${total:.2} total (~${share:.2} per sub)"),
-            );
-        }
-        _ => {
-            print_campaign_fact("budget", "unbounded");
-            print_campaign_wrapped(
-                "             ",
-                "Add --max-spend <usd> to cap the whole campaign tree.",
-                CAMPAIGN_WRAP_WIDTH,
-            );
-        }
+        print_campaign_fact(
+            "budget",
+            &format!("${total:.2} total (~${share:.2} per sub)"),
+        );
+    } else {
+        print_campaign_fact("budget", "unbounded");
+        print_campaign_wrapped(
+            "             ",
+            "Add --max-spend <usd> to cap the whole campaign tree.",
+            CAMPAIGN_WRAP_WIDTH,
+        );
     }
     if let Some(seconds) = campaign.tree_wall_seconds {
         print_campaign_fact("wall cap", &format_wall_cap(Some(seconds)));
@@ -922,7 +919,7 @@ pub(crate) fn campaign_verdict_surface(
         }
     }
     let secondary = campaign_secondary_actions(campaign, &primary);
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "campaign",
         Some(&id),
@@ -930,10 +927,8 @@ pub(crate) fn campaign_verdict_surface(
         vec![("Recommended", primary.as_str())],
         secondary
             .iter()
-            .map(|command| ("Secondary", command.as_str()))
-            .collect::<Vec<_>>(),
+            .map(|command| ("Secondary", command.as_str())),
     )
-    .expect("campaign verdict surface must have one primary action")
 }
 
 fn campaign_primary_action(
@@ -1299,7 +1294,7 @@ fn campaign_depth_refusal_surface(
         primary.push_str(&format!(" --provider {provider}"));
     }
 
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Blocked,
         "campaign",
         None,
@@ -1314,13 +1309,15 @@ fn campaign_depth_refusal_surface(
                     deadreckon_core::campaign::CAMPAIGN_MAX_DEPTH.to_string(),
                 ),
                 ("requested subs", n.to_string()),
-                ("reason", "sub-orchestrators cannot campaign again".to_string()),
+                (
+                    "reason",
+                    "sub-orchestrators cannot campaign again".to_string(),
+                ),
             ],
         ),
         [("Recommended", primary.as_str())],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("campaign depth refusal must have one primary action")
 }
 
 fn campaign_repair_refusal_surface(
@@ -1356,18 +1353,16 @@ fn campaign_repair_refusal_surface(
             secondary.push(command);
         }
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "campaign",
         Some(&id),
         ExplanationPanel::new(what, why, evidence),
-        vec![("Recommended", primary.as_str())],
+        vec![("Recommended", primary)],
         secondary
             .iter()
-            .map(|command| ("Secondary", command.as_str()))
-            .collect::<Vec<_>>(),
+            .map(|command| ("Secondary", command.as_str())),
     )
-    .expect("campaign repair refusal surface must have one primary action")
 }
 
 pub(crate) async fn campaign_repair_command(args: CampaignRepairArgs) -> Result<()> {

@@ -236,7 +236,7 @@ fn merge_unavailable_plan_surface(paths: &DeadreckonPaths, plan: &Plan) -> Verdi
         .into_iter()
         .next()
         .unwrap_or_else(|| format!("deadreckon show {id}"));
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "plan",
         Some(&id),
@@ -252,7 +252,6 @@ fn merge_unavailable_plan_surface(paths: &DeadreckonPaths, plan: &Plan) -> Verdi
         [("Recommended", primary.as_str())],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("merge unavailable plan surface must have one primary action")
 }
 
 fn merge_plan_status_word(status: PlanStatus) -> &'static str {
@@ -271,7 +270,7 @@ fn merge_incomplete_plan_surface(plan: &Plan, task: &PlanTask) -> VerdictSurface
         .count();
     let primary = format!("deadreckon attach {id}");
     let secondary = format!("deadreckon kill {id}");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Paused,
         "plan",
         Some(&id),
@@ -302,7 +301,6 @@ fn merge_incomplete_plan_surface(plan: &Plan, task: &PlanTask) -> VerdictSurface
         [("Recommended", primary.as_str())],
         [("Secondary", secondary.as_str())],
     )
-    .expect("merge incomplete plan surface must have one primary action")
 }
 
 fn merge_repair_disabled_surface(
@@ -320,7 +318,7 @@ fn merge_repair_disabled_surface(
     let conflicts_path = paths.merge_proofs(&plan.plan_id).join("conflicts.json");
     let primary = format!("deadreckon merge {id}");
     let secondary = format!("deadreckon show {id} --why-failed");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Failed,
         "plan",
         Some(&id),
@@ -332,13 +330,15 @@ fn merge_repair_disabled_surface(
                 ("conflict count".to_string(), conflicts.len().to_string()),
                 ("conflict paths".to_string(), conflict_paths),
                 ("automatic repair".to_string(), "disabled".to_string()),
-                ("conflicts".to_string(), conflicts_path.display().to_string()),
+                (
+                    "conflicts".to_string(),
+                    conflicts_path.display().to_string(),
+                ),
             ],
         ),
         [("Recommended", primary.as_str())],
         [("Secondary", secondary.as_str())],
     )
-    .expect("merge repair disabled surface must have one primary action")
 }
 
 fn merge_repair_provider_missing_surface(
@@ -356,7 +356,7 @@ fn merge_repair_provider_missing_surface(
     let conflicts_path = paths.merge_proofs(&plan.plan_id).join("conflicts.json");
     let primary = "deadreckon providers list --all";
     let secondary = format!("deadreckon show {id} --why-failed");
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Failed,
         "plan",
         Some(&id),
@@ -368,13 +368,15 @@ fn merge_repair_provider_missing_surface(
                 ("conflict count".to_string(), conflicts.len().to_string()),
                 ("conflict paths".to_string(), conflict_paths),
                 ("provider".to_string(), "none".to_string()),
-                ("conflicts".to_string(), conflicts_path.display().to_string()),
+                (
+                    "conflicts".to_string(),
+                    conflicts_path.display().to_string(),
+                ),
             ],
         ),
         [("Recommended", primary)],
         [("Secondary", secondary.as_str())],
     )
-    .expect("merge missing repair provider surface must have one primary action")
 }
 
 fn parse_merge_strategy(
@@ -458,15 +460,14 @@ fn merge_argument_surface_error(
     ));
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "plan",
             Some(&id),
             ExplanationPanel::new(what_happened, why_this_verdict, evidence),
-            [("Recommended", primary.as_str())],
+            [("Recommended", primary)],
             Vec::<(&str, &str)>::new(),
         )
-        .expect("merge argument surface must have one primary action")
         .render_plain(!completion_hints_enabled(no_hints)),
     }
 }

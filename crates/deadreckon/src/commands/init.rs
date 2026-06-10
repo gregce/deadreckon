@@ -109,7 +109,7 @@ fn init_completion_surface(
             vec![("Secondary", "deadreckon doctor")],
         )
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "init",
         None,
@@ -127,7 +127,6 @@ fn init_completion_surface(
         vec![("Recommended", primary)],
         secondary,
     )
-    .expect("init verdict surface must be valid")
 }
 
 fn preferred_init_subscription_cli_provider(registry: &ProviderRegistry) -> Option<String> {

@@ -456,7 +456,7 @@ fn acceptance_check_success_surface(
     if failed_optional > 0 {
         evidence.push(("optional failed", failed_optional.to_string()));
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Verified,
         "def-done",
         Some("check"),
@@ -468,7 +468,6 @@ fn acceptance_check_success_surface(
         vec![("Recommended", "deadreckon run \"goal\"")],
         vec![("Secondary", "deadreckon def-done show")],
     )
-    .expect("acceptance check success surface must be valid")
 }
 
 fn acceptance_check_failure_surface(
@@ -496,7 +495,7 @@ fn acceptance_check_failure_surface(
     if let Some(stdout) = failed.stdout.as_ref() {
         evidence.push(("stdout", one_line(stdout, 140)));
     }
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Failed,
         "def-done",
         Some("check"),
@@ -511,7 +510,6 @@ fn acceptance_check_failure_surface(
         )],
         vec![("Secondary", "deadreckon def-done check")],
     )
-    .expect("acceptance check failure surface must be valid")
 }
 
 pub(crate) fn print_acceptance_results(results: &[deadreckon_core::AcceptanceCheckResult]) {
@@ -1101,7 +1099,7 @@ fn print_acceptance_written(cwd: &Path, source: &str, checks: usize) {
     let primary = "deadreckon def-done check";
     print!(
         "{}",
-        VerdictSurface::try_new(
+        VerdictSurface::must_new(
             VerdictKind::Completed,
             "def-done",
             None,
@@ -1118,7 +1116,6 @@ fn print_acceptance_written(cwd: &Path, source: &str, checks: usize) {
             vec![("Recommended", primary)],
             vec![("Secondary", "deadreckon run \"goal\"")],
         )
-        .expect("acceptance written verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false))
     );
 }

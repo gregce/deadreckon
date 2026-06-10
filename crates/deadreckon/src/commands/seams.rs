@@ -133,7 +133,7 @@ async fn validate_seam_report(
     let _ = fs::remove_dir_all(run_root);
 
     Ok(classify_validation_outcome(
-        kind, &command, &fixture, sandbox, outcome,
+        kind, &command, &fixture, &sandbox, outcome,
     ))
 }
 
@@ -141,7 +141,7 @@ fn classify_validation_outcome(
     kind: SeamKind,
     command: &SeamCommandConfig,
     fixture: &Path,
-    sandbox: String,
+    sandbox: &str,
     outcome: SeamOutcome,
 ) -> SeamValidationReport {
     let command_name = seam_command_basename(&command.command);
@@ -155,7 +155,7 @@ fn classify_validation_outcome(
             kind: cli_kind_label(kind).to_string(),
             command: command_name.clone(),
             fixture: display_path(fixture),
-            sandbox: sandbox.clone(),
+            sandbox: sandbox.to_string(),
             outcome: outcome.to_string(),
             fail_policy: fail_policy.clone(),
             source: "external".to_string(),
@@ -252,7 +252,7 @@ fn seam_validation_surface(report: &SeamValidationReport) -> VerdictSurface {
             (line.starts_with("deadreckon ") && line != primary).then_some(("Secondary", line))
         })
         .collect::<Vec<_>>();
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "seam",
         Some(&report.kind),
@@ -260,7 +260,6 @@ fn seam_validation_surface(report: &SeamValidationReport) -> VerdictSurface {
         vec![("Recommended", primary.as_str())],
         secondary,
     )
-    .expect("seam validation verdict surface must be valid")
 }
 
 fn seam_validation_primary_action(report: &SeamValidationReport) -> String {

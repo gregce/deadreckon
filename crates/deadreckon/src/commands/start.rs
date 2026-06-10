@@ -2387,15 +2387,14 @@ fn start_preview_surface(
         .iter()
         .map(|command| (secondary_label, command.as_str()))
         .collect::<Vec<_>>();
-    Ok(VerdictSurface::try_new(
+    Ok(VerdictSurface::must_new(
         kind,
         "start",
         None,
         ExplanationPanel::new(what, why, evidence),
         vec![("Recommended", primary.as_str())],
         secondary,
-    )
-    .expect("start preview verdict surface must be valid"))
+    ))
 }
 
 fn print_start_preview_surface(
@@ -2435,8 +2434,8 @@ pub(crate) fn start_goal_plan(provided: Option<&str>, allows_prompts: bool) -> S
 /// Resolve the start goal, prompting interactively for it when none was given and
 /// prompts are allowed. Returns a friendly error (after a one-line notice) when
 /// no goal is available and prompts are suppressed.
-pub(crate) fn resolve_start_goal(provided: Option<String>, allows_prompts: bool) -> Result<String> {
-    match start_goal_plan(provided.as_deref(), allows_prompts) {
+pub(crate) fn resolve_start_goal(provided: Option<&str>, allows_prompts: bool) -> Result<String> {
+    match start_goal_plan(provided, allows_prompts) {
         StartGoalPlan::Provided(goal) => Ok(goal),
         StartGoalPlan::Prompt => {
             let entered = crate::prompt::open("goal: ", None)?;
@@ -2916,7 +2915,7 @@ fn print_start_lifecycle_footer(kind: &str, id: &str) {
     let finish = format!("deadreckon finish {id}");
     print!(
         "{}",
-        VerdictSurface::try_new(
+        VerdictSurface::must_new(
             VerdictKind::Completed,
             "start",
             Some(&id),
@@ -2935,7 +2934,6 @@ fn print_start_lifecycle_footer(kind: &str, id: &str) {
                 ("Secondary", finish.as_str()),
             ],
         )
-        .expect("start lifecycle verdict surface must be valid")
         .render_plain(!completion_hints_enabled(false))
     );
 }

@@ -228,7 +228,7 @@ fn orchestrate_mode_refusal_error(goal: &str, message: &str, no_hints: bool) -> 
     let secondary = [secondary_command.as_str()];
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "orchestrate",
             None,
@@ -252,10 +252,8 @@ fn orchestrate_mode_refusal_error(goal: &str, message: &str, no_hints: bool) -> 
             vec![("Recommended", primary.as_str())],
             secondary
                 .iter()
-                .map(|command| ("Secondary", *command))
-                .collect::<Vec<_>>(),
+                .map(|command| ("Secondary", *command)),
         )
-        .expect("orchestrate mode refusal verdict surface must be valid")
         .render_plain(!completion_hints_enabled(no_hints)),
     }
 }

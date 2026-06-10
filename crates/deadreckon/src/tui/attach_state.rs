@@ -287,7 +287,7 @@ impl AttachActionNotice {
                 vec![("Secondary", "retry the action after fixing the error")],
             )
         };
-        VerdictSurface::try_new(
+        VerdictSurface::must_new(
             kind,
             format!("{} action", self.action.label()),
             None,
@@ -295,7 +295,6 @@ impl AttachActionNotice {
             vec![("Recommended", "q detach")],
             secondary,
         )
-        .expect("attach action notice must have one primary action")
         .render_plain(false)
         .lines()
         .map(ToString::to_string)

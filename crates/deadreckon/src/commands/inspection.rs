@@ -163,10 +163,9 @@ fn empty_list_surface(scope: Option<&str>, all: bool) -> VerdictSurface {
     } else {
         "current-project"
     };
-    let scope_label = if all || scope.is_none() {
-        "all scopes".to_string()
-    } else {
-        format!("current project ({})", scope.expect("scope"))
+    let scope_label = match scope {
+        Some(scope) if !all => format!("current project ({scope})"),
+        _ => "all scopes".to_string(),
     };
     let primary = if all || scope.is_none() {
         "deadreckon start \"goal\""
@@ -181,7 +180,7 @@ fn empty_list_surface(scope: Option<&str>, all: bool) -> VerdictSurface {
             ("Secondary", "deadreckon run \"goal\""),
         ]
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Noop,
         "list",
         Some(subject),
@@ -191,13 +190,15 @@ fn empty_list_surface(scope: Option<&str>, all: bool) -> VerdictSurface {
             vec![
                 ("scope".to_string(), scope_label),
                 ("inventory".to_string(), "runs and plans".to_string()),
-                ("state".to_string(), "no matching runstate entries".to_string()),
+                (
+                    "state".to_string(),
+                    "no matching runstate entries".to_string(),
+                ),
             ],
         ),
         vec![("Recommended", primary)],
         secondary,
     )
-    .expect("empty list verdict surface must be valid")
 }
 
 fn append_list_action_footer(output: &mut String) {
@@ -469,7 +470,7 @@ fn invalid_history_regex_error(pattern: &str, parser_error: &str) -> CliError {
     let secondary = format!("deadreckon history grep {}", command_literal(pattern));
     CliError::Surface {
         code: 2,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "history grep",
             Some("--regex"),
@@ -485,7 +486,6 @@ fn invalid_history_regex_error(pattern: &str, parser_error: &str) -> CliError {
             vec![("Recommended", primary.as_str())],
             vec![("Secondary", secondary.as_str())],
         )
-        .expect("invalid history regex verdict surface must be valid")
         .render_plain(!crate::completion_hints_enabled(false)),
     }
 }
@@ -498,7 +498,7 @@ fn invalid_history_limit_error(pattern: &str, value: usize) -> CliError {
     let secondary = format!("deadreckon history grep {}", command_literal(pattern));
     CliError::Surface {
         code: 2,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "history grep",
             Some("--limit"),
@@ -514,7 +514,6 @@ fn invalid_history_limit_error(pattern: &str, value: usize) -> CliError {
             vec![("Recommended", primary.as_str())],
             vec![("Secondary", secondary.as_str())],
         )
-        .expect("invalid history limit verdict surface must be valid")
         .render_plain(!crate::completion_hints_enabled(false)),
     }
 }
@@ -681,7 +680,7 @@ fn print_history_grep_no_matches_surface(
     } else {
         "current scope".to_string()
     };
-    let surface = VerdictSurface::try_new(
+    let surface = VerdictSurface::must_new(
         VerdictKind::Noop,
         "history grep",
         Some(pattern),
@@ -700,8 +699,7 @@ fn print_history_grep_no_matches_surface(
         ),
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", "deadreckon show <run-id>")],
-    )
-    .expect("history grep no-match verdict surface must be valid");
+    );
     print!(
         "{}",
         surface.render_plain(!crate::completion_hints_enabled(false))
@@ -764,7 +762,7 @@ fn invalid_history_since_error(pattern: &str, value: &str) -> CliError {
     let secondary = format!("deadreckon history grep {} --all", command_literal(pattern));
     CliError::Surface {
         code: 2,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "history grep",
             Some("--since"),
@@ -780,7 +778,6 @@ fn invalid_history_since_error(pattern: &str, value: &str) -> CliError {
             vec![("Recommended", primary.as_str())],
             vec![("Secondary", secondary.as_str())],
         )
-        .expect("invalid history since verdict surface must be valid")
         .render_plain(!crate::completion_hints_enabled(false)),
     }
 }
@@ -897,7 +894,7 @@ fn print_library_search_no_matches_surface(query: &str, all: bool) {
         format!("deadreckon library search {} --all", command_literal(query))
     };
     let scope = if all { "all scopes" } else { "current scope" };
-    let surface = VerdictSurface::try_new(
+    let surface = VerdictSurface::must_new(
         VerdictKind::Noop,
         "library search",
         Some(query),
@@ -907,13 +904,15 @@ fn print_library_search_no_matches_surface(query: &str, all: bool) {
             vec![
                 ("query".to_string(), query.to_string()),
                 ("scope".to_string(), scope.to_string()),
-                ("source".to_string(), "promoted artifact metadata and docs".to_string()),
+                (
+                    "source".to_string(),
+                    "promoted artifact metadata and docs".to_string(),
+                ),
             ],
         ),
         vec![("Recommended", primary.as_str())],
         vec![("Secondary", "deadreckon library list --all")],
-    )
-    .expect("library search no-match verdict surface must be valid");
+    );
     print!(
         "{}",
         surface.render_plain(!crate::completion_hints_enabled(false))
@@ -1020,7 +1019,7 @@ fn invalid_library_date_error(label: &str, value: &str) -> CliError {
     let primary = format!("deadreckon library list {label} 2026-05-11");
     CliError::Surface {
         code: 2,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "library list",
             Some(label),
@@ -1036,7 +1035,6 @@ fn invalid_library_date_error(label: &str, value: &str) -> CliError {
             vec![("Recommended", primary.as_str())],
             vec![("Secondary", "deadreckon library list --all")],
         )
-        .expect("invalid library date verdict surface must be valid")
         .render_plain(!crate::completion_hints_enabled(false)),
     }
 }
@@ -1153,7 +1151,7 @@ fn print_empty_library_hint(scope: Option<&str>, all: bool) {
         None if all => "all scopes".to_string(),
         None => "current project".to_string(),
     };
-    let surface = VerdictSurface::try_new(
+    let surface = VerdictSurface::must_new(
         VerdictKind::Noop,
         "library list",
         Some(&subject),
@@ -1174,8 +1172,7 @@ fn print_empty_library_hint(scope: Option<&str>, all: bool) {
             ("Secondary", "deadreckon run \"goal\""),
             ("Secondary", "deadreckon finish <run-id>"),
         ],
-    )
-    .expect("empty library list verdict surface must be valid");
+    );
     print!(
         "{}",
         surface.render_plain(!crate::completion_hints_enabled(false))

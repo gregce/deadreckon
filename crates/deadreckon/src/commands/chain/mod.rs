@@ -473,7 +473,7 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
         chain_create_refusal_surface(
             VerdictKind::Blocked,
             None,
-            &format!("chain planner provider failed: {err}"),
+            format!("chain planner provider failed: {err}"),
             "DeadReckon could not get a valid decomposition from the configured provider, so it refused before writing chain state.",
             [
                 ("goal".to_string(), options.root_goal.clone()),
@@ -693,15 +693,14 @@ where
     let subject = chain_id.map(chain_prefix);
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             kind,
             "chain",
             subject.as_deref(),
             ExplanationPanel::new(what_happened, why_this_verdict, evidence),
-            [("Recommended", primary.as_str())],
+            [("Recommended", primary)],
             Vec::<(&str, &str)>::new(),
         )
-        .expect("chain creation refusal surface must have one primary action")
         .render_plain(!completion_hints_enabled(no_hints)),
     }
 }
@@ -1521,7 +1520,7 @@ fn chain_detached_surface(
         format!("deadreckon chain status {id}"),
         format!("deadreckon chain show {id}"),
     ];
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Verified,
         "chain",
         Some(&id),
@@ -1531,19 +1530,12 @@ fn chain_detached_surface(
             vec![
                 ("chain", id.clone()),
                 ("conductor pid", conductor_pid.to_string()),
-                (
-                    "state",
-                    paths.chain_json(chain_id).display().to_string(),
-                ),
+                ("state", paths.chain_json(chain_id).display().to_string()),
             ],
         ),
-        vec![("Recommended", primary.as_str())],
-        secondary
-            .iter()
-            .map(|command| ("Secondary", command.as_str()))
-            .collect::<Vec<_>>(),
+        vec![("Recommended", primary)],
+        secondary.into_iter().map(|command| ("Secondary", command)),
     )
-    .expect("chain detached verdict surface must have one primary action")
 }
 
 fn read_conductor_state(paths: &DeadreckonPaths, chain_id: &str) -> Result<Option<ConductorState>> {
@@ -1714,7 +1706,7 @@ fn chain_empty_surface(command: &str, scoped: bool) -> VerdictSurface {
     } else {
         "all scopes"
     };
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         VerdictKind::Noop,
         format!("chain {command}"),
         None,
@@ -1730,7 +1722,6 @@ fn chain_empty_surface(command: &str, scoped: bool) -> VerdictSurface {
         vec![("Recommended", "deadreckon chain \"step one\" \"step two\"")],
         Vec::<(&str, &str)>::new(),
     )
-    .expect("empty chain verdict surface must have one primary action")
 }
 
 fn chain_show_command(
@@ -1866,7 +1857,7 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
     }
     let primary = chain_primary_action(chain);
     let secondary = chain_secondary_actions(chain, &primary);
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "chain",
         Some(&id),
@@ -1874,10 +1865,8 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
         vec![("Recommended", primary.as_str())],
         secondary
             .iter()
-            .map(|command| ("Secondary", command.as_str()))
-            .collect::<Vec<_>>(),
+            .map(|command| ("Secondary", command.as_str())),
     )
-    .expect("chain verdict surface must have one primary action")
 }
 
 fn latest_chain_preview_diff_summary(paths: &DeadreckonPaths, chain: &Chain) -> Option<String> {
@@ -1921,6 +1910,7 @@ fn compact_chain_diff_summary(summary: &str) -> String {
     lines[0].to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chain_transition_surface(
     paths: &DeadreckonPaths,
     chain: &Chain,
@@ -1934,18 +1924,14 @@ fn chain_transition_surface(
     let id = chain_prefix(&chain.chain_id);
     let mut all_evidence = chain_base_evidence(paths, chain);
     all_evidence.append(&mut evidence);
-    VerdictSurface::try_new(
+    VerdictSurface::must_new(
         kind,
         "chain",
         Some(&id),
         ExplanationPanel::new(what, why, all_evidence),
-        vec![("Recommended", primary.as_str())],
-        secondary
-            .iter()
-            .map(|command| ("Secondary", command.as_str()))
-            .collect::<Vec<_>>(),
+        vec![("Recommended", primary)],
+        secondary.into_iter().map(|command| ("Secondary", command)),
     )
-    .expect("chain transition verdict surface must have one primary action")
 }
 
 fn chain_base_evidence(paths: &DeadreckonPaths, chain: &Chain) -> Vec<(String, String)> {
@@ -2712,7 +2698,7 @@ fn chain_redo_command(
             .render_plain(!completion_hints_enabled(false)),
         });
     }
-    let step = chain.steps.get_mut(index).expect("validated step index");
+    let step = &mut chain.steps[index];
     if reapply && let Some(sha) = step.applied_sha.as_deref() {
         git_status(&chain.cwd, &["revert", "--no-edit", sha])?;
     }
@@ -2857,7 +2843,7 @@ fn parse_planner_goals(raw: &str, n: u8, root_goal: &str, no_hints: bool) -> Res
         chain_create_refusal_surface(
             VerdictKind::Blocked,
             None,
-            &format!("chain plan returned invalid JSON: {err}"),
+            format!("chain plan returned invalid JSON: {err}"),
             "DeadReckon refused the provider-produced plan because the planner response could not be parsed as the required JSON step list.",
             [
                 ("parse error".to_string(), err.to_string()),
@@ -2926,7 +2912,7 @@ fn parse_planner_goals(raw: &str, n: u8, root_goal: &str, no_hints: bool) -> Res
         chain_create_refusal_surface(
             VerdictKind::Blocked,
             None,
-            &format!("decomposition produced {} goals; need >= 2", goals.len()),
+            format!("decomposition produced {} goals; need >= 2", goals.len()),
             "DeadReckon refused the provider-produced plan because a chain needs at least two ordered steps.",
             [
                 ("produced goals".to_string(), goals.len().to_string()),
@@ -3086,7 +3072,7 @@ pub(crate) fn resolve_chain_id(paths: &DeadreckonPaths, id: &str, all: bool) -> 
         1 => Ok(matches[0].clone()),
         0 => Err(chain_id_resolution_surface(
             id,
-            &format!("DeadReckon could not resolve the chain because no chain '{id}' was found."),
+            format!("DeadReckon could not resolve the chain because no chain '{id}' was found."),
             "The command needs one concrete chain id, but no chain in the selected scope starts with the requested id.",
             [
                 ("requested id".to_string(), id.to_string()),
@@ -3100,7 +3086,7 @@ pub(crate) fn resolve_chain_id(paths: &DeadreckonPaths, id: &str, all: bool) -> 
         )),
         _ => Err(chain_id_resolution_surface(
             id,
-            &format!(
+            format!(
                 "DeadReckon could not resolve the chain because chain id prefix {id} is ambiguous."
             ),
             "The command needs one concrete chain id, but the requested prefix matches multiple chains.",
@@ -3130,7 +3116,7 @@ where
 {
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "chain",
             Some(id),
@@ -3138,7 +3124,6 @@ where
             [("Recommended", primary)],
             Vec::<(&str, &str)>::new(),
         )
-        .expect("chain id resolution surface must have one primary action")
         .render_plain(!completion_hints_enabled(false)),
     }
 }
@@ -3146,7 +3131,7 @@ where
 fn chain_missing_scope_surface(scope: Option<&str>) -> CliError {
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "chain",
             None,
@@ -3161,7 +3146,6 @@ fn chain_missing_scope_surface(scope: Option<&str>) -> CliError {
             [("Recommended", "deadreckon chain \"step one\" \"step two\"")],
             Vec::<(&str, &str)>::new(),
         )
-        .expect("missing chain scope surface must have one primary action")
         .render_plain(!completion_hints_enabled(false)),
     }
 }
@@ -3175,7 +3159,7 @@ fn chain_option_parse_surface(
 ) -> CliError {
     CliError::Surface {
         code: 1,
-        surface: VerdictSurface::try_new(
+        surface: VerdictSurface::must_new(
             VerdictKind::Blocked,
             "chain",
             None,
@@ -3191,7 +3175,6 @@ fn chain_option_parse_surface(
             [("Recommended", primary)],
             Vec::<(&str, &str)>::new(),
         )
-        .expect("chain option parse surface must have one primary action")
         .render_plain(!completion_hints_enabled(false)),
     }
 }
