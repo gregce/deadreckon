@@ -154,12 +154,37 @@ attestations and npm provenance.
    dist plan --output-format=json
    ```
 
-8. Create and push an RC tag first. Review the GitHub Actions run, artifacts,
+8. For a stable cut, run the real-provider proof harness (operator-only;
+   it refuses under CI and burns a few real provider turns per route —
+   expect a small spend):
+
+   ```sh
+   make build
+   release/preflight-real.sh            # cli:claude-code cli:codex
+   release/preflight-real.sh cli:gemini # extend by argument
+   ```
+
+   On success it records the probed binary versions in
+   `release/known-good-providers.json` (schema_version 1); commit that file
+   so the release notes can reference known-good CLI versions.
+9. Create and push an RC tag first. Review the GitHub Actions run, artifacts,
    `SHA256SUMS`, `release-manifest.json`, `release.spdx.json`, macOS signing
    evidence, and attestations.
-9. After the RC rehearsal is clean, create and push the stable tag.
+10. After the RC rehearsal is clean, create and push the stable tag.
 
 The first real release remains an operator action.
+
+### Windows smoke (operator checklist, stable cut)
+
+On a Windows machine or VM, before announcing a stable release:
+
+1. Download the signed `deadreckon-x86_64-pc-windows-msvc.zip` from the
+   release page and run `signtool verify /pa deadreckon.exe` after unzip.
+2. Run `deadreckon.exe --version` and confirm it matches the tag.
+3. Run `deadreckon.exe doctor` and confirm no failed checks.
+4. Run `deadreckon.exe try --sandbox none` in a scratch git repo.
+5. Record the result in `release/known-good-providers.json` under route
+   `windows-smoke` with the Windows build used as `binary_version`.
 
 ## Site Installer
 

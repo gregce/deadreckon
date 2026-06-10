@@ -488,6 +488,58 @@ fn installer_artifact_checksum_verification_is_documented_or_embedded() {
     );
 }
 
+#[test]
+fn preflight_real_script_refuses_under_ci_env() {
+    let script = workspace_root().join("release/preflight-real.sh");
+    let output = Command::new("sh")
+        .arg(&script)
+        .env("CI", "1")
+        .current_dir(workspace_root())
+        .output()
+        .expect("run preflight-real.sh");
+    assert!(
+        !output.status.success(),
+        "preflight-real.sh must refuse to run under CI"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("real providers") && stderr.contains("CI"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn known_good_providers_schema_round_trips() {
+    let fixture = serde_json::json!({
+        "schema_version": 1,
+        "recorded_at": "2026-06-10T00:00:00Z",
+        "providers": [
+            {
+                "route": "cli:claude-code",
+                "binary_version": "2.1.172 (Claude Code)",
+                "proof": "start -> 2+ real turns -> gate signed -> apply -> kill/resume",
+                "run_id": "abc123",
+                "operator": "greg"
+            }
+        ]
+    });
+    let text = serde_json::to_string_pretty(&fixture).expect("serialize");
+    let parsed: JsonValue = serde_json::from_str(&text).expect("parse");
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["providers"][0]["route"], "cli:claude-code");
+
+    if let Ok(committed) =
+        fs::read_to_string(workspace_root().join("release/known-good-providers.json"))
+    {
+        let value: JsonValue = serde_json::from_str(&committed).expect("committed file parses");
+        assert_eq!(
+            value["schema_version"], 1,
+            "release/known-good-providers.json must stay on schema_version 1"
+        );
+        assert!(value["providers"].is_array(), "{value}");
+    }
+}
+
 fn workspace_version_string() -> String {
     let manifest = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("Cargo.toml");
     let value: toml::Table = manifest.parse().expect("workspace toml");
