@@ -10,7 +10,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0-rc.8"
+version = "0.1.0-rc.9"
 license = "MIT"
 repository = "https://github.com/gregce/deadreckon"
 categories = ["development-tools"]
@@ -22,6 +22,7 @@ axum = "0.8.7"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.53", features = ["derive", "env"] }
 clap_complete = "4.5"
+inquire = { version = "0.9.4", default-features = false, features = ["crossterm"] }
 crossterm = "0.29.0"
 deadreckon-core = { path = "crates/deadreckon-core" }
 deadreckon-providers = { path = "crates/deadreckon-providers" }
