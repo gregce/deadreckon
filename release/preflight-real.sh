@@ -90,6 +90,9 @@ for route in $routes; do
   echo "    start: full run to completion"
   (
     cd "$repo"
+    DEADRECKON_HOME="$home" "$deadreckon_bin" def-done \
+      "README.md gains a comment header naming the file's purpose"
+    git add -A && git commit -qm "done criteria"
     DEADRECKON_HOME="$home" "$deadreckon_bin" start "$goal" \
       --mode run --provider "$route" --yes --plain
   )
@@ -105,7 +108,7 @@ for route in $routes; do
 
   (
     cd "$repo"
-    DEADRECKON_HOME="$home" "$deadreckon_bin" apply "$run_id" --plain
+    DEADRECKON_HOME="$home" "$deadreckon_bin" apply "$run_id" --plain --no-confirm
   )
   echo "    apply: succeeded"
 
@@ -113,6 +116,9 @@ for route in $routes; do
   repo2=$(fresh_repo "${route#cli:}-resume")
   (
     cd "$repo2"
+    DEADRECKON_HOME="$home" "$deadreckon_bin" def-done \
+      "README.md gains a comment header naming the file's purpose"
+    git add -A && git commit -qm "done criteria"
     DEADRECKON_HOME="$home" "$deadreckon_bin" start "$goal" \
       --mode run --provider "$route" --yes --plain
   ) &
