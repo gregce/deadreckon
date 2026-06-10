@@ -800,7 +800,10 @@ fn checksums_record_flat_basenames_and_collapse_nested_duplicates() {
         line.ends_with("  deadreckon-installer.sh"),
         "entry must be a flat basename: {line}"
     );
-    assert!(!line.contains('/'), "no path segments in SHA256SUMS: {line}");
+    assert!(
+        !line.contains('/'),
+        "no path segments in SHA256SUMS: {line}"
+    );
 }
 
 #[test]
