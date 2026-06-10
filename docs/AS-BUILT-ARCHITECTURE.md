@@ -2884,6 +2884,42 @@ breakpoint. `chain_step_glyph(status, plain)` substitutes an ASCII fallback
 terminal, so a step glyph never renders as a missing box. The byte-exact TUI
 render tests remain the contract; goldens were updated deliberately per phase.
 
+## 42. Interaction Model (banner, smart bare invocation, prompt engine)
+
+- **Banner**: `ui.rs` owns a figlet "standard" wordmark (`BANNER_ART`) rendered
+  with a per-character 256-color horizontal gradient (`BANNER_PALETTES`,
+  twelve palettes, picked from the clock's subsecond nanos per invocation).
+  `ui::print_banner` prints only when stdout is a terminal, and colors only
+  when the stdout color gate is open — pipes, `--plain`, `NO_COLOR`, and
+  `TERM=dumb` stay byte-clean. Shown by `print_top_help`, `print_help_all`,
+  and the smart bare-invocation routes; never by clap subcommand `--help`.
+- **Smart bare invocation** (`smart_bare_invocation`, main.rs): no
+  `config.toml` → `first_run_welcome` (detected agent CLIs from
+  `KNOWN_AGENT_CLIS`, the three get-going commands, and an on-TTY confirm
+  that runs `init` directly); config present but the current scope has no
+  runs → `directory_orientation` (source-mode note, production flow,
+  `list --all` / `doctor` pointers); runs in scope → `status_command`, the
+  prior default. Pinned by `tests/smart_default.rs`.
+- **Prompt engine** (`prompt.rs`): one API — `select_one` / `confirm` /
+  `ask_number` / `open` — with two render paths. Interactive (stdin+stdout
+  TTYs and `DEADRECKON_PROMPT_LINE_MODE` unset): `inquire` renders arrow-key
+  selects (`label — detail` items, default preselected, 12-row paging),
+  styled confirms, validated `CustomType` number input, and text prompts,
+  themed via one `RenderConfig` derived from the Tone palette and colorless
+  when the stdout gate is off. Esc resolves to a choice whose id is
+  `"cancel"` when present, else errors `Interrupted` ("prompt cancelled"),
+  preserving the pre-inquire contract. Line mode (off-TTY or the env var):
+  the original numbered prompts, byte-stable for scripts and the PTY test
+  harnesses (which pin `DEADRECKON_PROMPT_LINE_MODE=1` and send `\r`).
+- **Probe-before-ask**: `prompt_provider` (init) builds its menu from the
+  registry — detected subscription CLIs first with live login-state hints
+  via `probe_cli_auth`, API routes annotated with whether their env key is
+  set, `openai-compatible` and a typed route as escape hatches. The legacy
+  stderr non-git menu was unified into `select_one` with the same copy.
+- **Dependency**: `inquire 0.9.4` (Tier 2, DEPENDENCIES.md) — crossterm
+  backend; it dual-links crossterm 0.28 beside the workspace 0.29, which is
+  acceptable because prompts and the ratatui TUI never run concurrently.
+
 ---
 
 *This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
