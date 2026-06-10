@@ -6877,7 +6877,8 @@ fn deadreckon_pty(
     let mut interactions = String::new();
     for answer in answers {
         interactions.push_str("expect -re {choose \\[[0-9]+\\]:}\n");
-        interactions.push_str(&format!("send -- \"{}\"\n", tcl_string_escape(answer)));
+        // Line mode reads whole lines: every answer needs Enter.
+        interactions.push_str(&format!("send -- \"{}\\r\"\n", tcl_string_escape(answer)));
     }
     let path_setup = path_prefix
         .map(|path| {
@@ -6888,7 +6889,7 @@ fn deadreckon_pty(
         })
         .unwrap_or_default();
     let script = format!(
-        "set timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\n{}spawn {}\n{}catch {{ expect eof }}\nexit 0\n",
+        "set timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\nset env(DEADRECKON_PROMPT_LINE_MODE) 1\n{}spawn {}\n{}catch {{ expect eof }}\nexit 0\n",
         tcl_brace_quote(&cwd.display().to_string()),
         tcl_brace_quote(&paths.home().display().to_string()),
         path_setup,
