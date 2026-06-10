@@ -400,16 +400,34 @@ fn release_manifest_covers_artifacts_and_checksums() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let distrib = temp.path().join("target/distrib");
     fs::create_dir_all(&distrib).expect("distrib dir");
-    fs::write(
-        distrib.join("deadreckon-aarch64-apple-darwin.tar.xz"),
-        b"mac archive",
-    )
-    .expect("mac artifact");
-    fs::write(
-        distrib.join("deadreckon-x86_64-unknown-linux-gnu.tar.xz"),
-        b"linux archive",
-    )
-    .expect("linux artifact");
+    // Real archives: verify-manifest fails closed on unreadable or
+    // "./"-prefixed archives, so placeholder bytes are not valid fixtures.
+    for stem in [
+        "deadreckon-aarch64-apple-darwin",
+        "deadreckon-x86_64-unknown-linux-gnu",
+    ] {
+        let payload = temp.path().join("payload").join(stem);
+        fs::create_dir_all(&payload).expect("payload");
+        fs::write(payload.join("deadreckon"), stem).expect("binary");
+        let output = Command::new("tar")
+            .args([
+                "-cJf",
+                distrib
+                    .join(format!("{stem}.tar.xz"))
+                    .to_str()
+                    .expect("utf8 path"),
+                "-C",
+                temp.path().join("payload").to_str().expect("utf8 path"),
+                stem,
+            ])
+            .output()
+            .expect("tar");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     fs::create_dir_all(distrib.join("trust")).expect("trust dir");
     fs::write(
         distrib.join("trust/macos-aarch64-apple-darwin.json"),
@@ -749,6 +767,175 @@ fn read_json(path: &Path) -> JsonValue {
         &fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display())),
     )
     .unwrap_or_else(|err| panic!("parse {}: {err}", path.display()))
+}
+
+#[test]
+fn checksums_record_flat_basenames_and_collapse_nested_duplicates() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let distrib = temp.path().join("target/distrib");
+    fs::create_dir_all(distrib.join("target/distrib")).expect("nested dir");
+    fs::write(distrib.join("deadreckon-installer.sh"), b"#!/bin/sh\n").expect("installer");
+    // The CI global-artifact layout nests some files twice with identical
+    // content; SHA256SUMS must record one flat basename per asset so users
+    // can run `shasum -a 256 -c SHA256SUMS` next to downloaded files.
+    fs::write(
+        distrib.join("target/distrib/deadreckon-installer.sh"),
+        b"#!/bin/sh\n",
+    )
+    .expect("nested duplicate");
+    let sums = distrib.join("SHA256SUMS");
+
+    assert_release_trust_success([
+        "checksums",
+        "--dir",
+        distrib.to_str().expect("utf8 path"),
+        "--out",
+        sums.to_str().expect("utf8 path"),
+    ]);
+
+    let raw = fs::read_to_string(&sums).expect("sums");
+    assert_eq!(raw.lines().count(), 1, "{raw}");
+    let line = raw.lines().next().expect("entry");
+    assert!(
+        line.ends_with("  deadreckon-installer.sh"),
+        "entry must be a flat basename: {line}"
+    );
+    assert!(!line.contains('/'), "no path segments in SHA256SUMS: {line}");
+}
+
+#[test]
+fn checksums_fail_closed_on_conflicting_duplicate_basenames() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let distrib = temp.path().join("target/distrib");
+    fs::create_dir_all(distrib.join("nested")).expect("nested dir");
+    fs::write(distrib.join("deadreckon.rb"), b"formula one").expect("formula");
+    fs::write(distrib.join("nested/deadreckon.rb"), b"formula two").expect("conflict");
+
+    let output = release_trust([
+        "checksums",
+        "--dir",
+        distrib.to_str().expect("utf8 path"),
+        "--out",
+        distrib.join("SHA256SUMS").to_str().expect("utf8 path"),
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "conflicting duplicate basenames must fail closed"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("conflicting contents"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn verify_manifest_rejects_dot_slash_prefixed_archive_members() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let distrib = temp.path().join("target/distrib");
+    fs::create_dir_all(&distrib).expect("distrib dir");
+    let payload = temp.path().join("payload/deadreckon-aarch64-apple-darwin");
+    fs::create_dir_all(&payload).expect("payload");
+    fs::write(payload.join("deadreckon"), b"binary").expect("binary");
+
+    let run_tar = |args: &[&str]| {
+        let output = Command::new("tar")
+            .args(args)
+            .current_dir(temp.path())
+            .output()
+            .expect("tar");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let archive = distrib.join("deadreckon-aarch64-apple-darwin.tar.xz");
+    let archive_str = archive.to_str().expect("utf8 path").to_string();
+    // The broken rc.7 shape: members prefixed with "./" from `tar -C dir .`.
+    run_tar(&["-cJf", &archive_str, "-C", "payload", "."]);
+
+    let manifest = distrib.join("release-manifest.json");
+    let sums = distrib.join("SHA256SUMS");
+    assert_release_trust_success([
+        "checksums",
+        "--dir",
+        distrib.to_str().expect("utf8 path"),
+        "--out",
+        sums.to_str().expect("utf8 path"),
+    ]);
+    assert_release_trust_success([
+        "manifest",
+        "--dir",
+        distrib.to_str().expect("utf8 path"),
+        "--ref",
+        "refs/tags/v9.9.9-rc.1",
+        "--repo",
+        "gregce/deadreckon",
+        "--commit",
+        "0000000000000000000000000000000000000000",
+        "--out",
+        manifest.to_str().expect("utf8 path"),
+    ]);
+
+    let broken = release_trust([
+        "verify-manifest",
+        "--dir",
+        distrib.to_str().expect("utf8 path"),
+        "--manifest",
+        manifest.to_str().expect("utf8 path"),
+        "--checksums",
+        sums.to_str().expect("utf8 path"),
+    ]);
+    assert!(
+        !broken.status.success(),
+        "'./'-prefixed members must fail verify-manifest"
+    );
+    assert!(
+        String::from_utf8_lossy(&broken.stderr).contains("'./'-prefixed member"),
+        "{}",
+        String::from_utf8_lossy(&broken.stderr)
+    );
+
+    // The fixed shape — explicit top-level names — passes the same gate.
+    fs::remove_file(&archive).expect("remove broken archive");
+    run_tar(&[
+        "-cJf",
+        &archive_str,
+        "-C",
+        "payload",
+        "deadreckon-aarch64-apple-darwin",
+    ]);
+    assert_release_trust_success([
+        "checksums",
+        "--dir",
+        distrib.to_str().expect("utf8 path"),
+        "--out",
+        sums.to_str().expect("utf8 path"),
+    ]);
+    assert_release_trust_success([
+        "manifest",
+        "--dir",
+        distrib.to_str().expect("utf8 path"),
+        "--ref",
+        "refs/tags/v9.9.9-rc.1",
+        "--repo",
+        "gregce/deadreckon",
+        "--commit",
+        "0000000000000000000000000000000000000000",
+        "--out",
+        manifest.to_str().expect("utf8 path"),
+    ]);
+    assert_release_trust_success([
+        "verify-manifest",
+        "--dir",
+        distrib.to_str().expect("utf8 path"),
+        "--manifest",
+        manifest.to_str().expect("utf8 path"),
+        "--checksums",
+        sums.to_str().expect("utf8 path"),
+    ]);
 }
 
 fn release_trust<const N: usize>(args: [&str; N]) -> std::process::Output {

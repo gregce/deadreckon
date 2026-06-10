@@ -94,12 +94,21 @@ function extractArchive(archive, destination) {
 
 function repackArchive(archive, sourceDir) {
   fs.rmSync(archive, { force: true });
+  // Pack the top-level entries by name. Packing "." prefixes every member
+  // with "./", and the cargo-dist shell installer resolves binaries through
+  // the archive's top-level directory name — rc.7's macOS curl|sh failed
+  // with mv ENOENT because of exactly that. The trust verify step now also
+  // fails closed on "./"-prefixed members.
+  const entries = fs.readdirSync(sourceDir).filter((name) => name !== ".DS_Store");
+  if (entries.length === 0) {
+    throw new Error(`nothing to repack in ${sourceDir}`);
+  }
   if (archive.endsWith(".zip")) {
     run("ditto", ["-c", "-k", sourceDir, archive]);
   } else if (archive.endsWith(".tar.xz")) {
-    run("tar", ["-cJf", archive, "-C", sourceDir, "."]);
+    run("tar", ["-cJf", archive, "-C", sourceDir, ...entries]);
   } else {
-    run("tar", ["-czf", archive, "-C", sourceDir, "."]);
+    run("tar", ["-czf", archive, "-C", sourceDir, ...entries]);
   }
 }
 

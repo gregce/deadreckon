@@ -1,5 +1,18 @@
 # Changelog
 
+## Installable macOS archives and user-verifiable SHA256SUMS - 2026-06-09
+
+- rc.7's macOS `curl | sh` failed at the final `mv`: the signing step
+  repacked archives with `tar -C dir .`, prefixing every member with `./`,
+  which breaks the cargo-dist shell installer's layout resolution. The repack
+  now packs explicit top-level names, and `verify-manifest` fails closed on
+  any `./`-prefixed archive member so this cannot ship again.
+- `SHA256SUMS` now records flat basenames (one entry per published asset,
+  identical nested CI duplicates collapse, divergent content fails closed),
+  so the runbook's documented `shasum -a 256 -c SHA256SUMS` works next to
+  downloaded files — and the install wrapper's integrity check of
+  `deadreckon-installer.sh` actually engages instead of always warning.
+
 ## Sleep-preview test race fix - 2026-06-09
 
 - `prevent_sleep_linux_falls_back_when_systemd_inhibit_missing` read

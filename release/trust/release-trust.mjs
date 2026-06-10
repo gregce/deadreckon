@@ -235,7 +235,7 @@ function writeChecksums(localArgs = args) {
   const dir = required(localArgs.dir, "--dir");
   const out = required(localArgs.out, "--out");
   const lines = releaseFiles(dir, { includeChecksums: false, includeManifest: false })
-    .map((file) => `${sha256(path.join(dir, file))}  ${file}`)
+    .map((entry) => `${sha256(path.join(dir, entry.relative))}  ${entry.name}`)
     .join("\n");
   fs.writeFileSync(out, lines.length > 0 ? `${lines}\n` : "");
 }
@@ -246,7 +246,7 @@ function writeManifest(localArgs = args) {
   const lane = classifyRelease(localArgs);
   const trust = readTrustStatus(dir);
   const files = releaseFiles(dir, { includeChecksums: true, includeManifest: false });
-  const artifacts = files.map((file) => artifactRecord(dir, file, lane, trust));
+  const artifacts = files.map((entry) => artifactRecord(dir, entry, lane, trust));
   fs.writeFileSync(
     out,
     `${JSON.stringify(
@@ -294,16 +294,19 @@ function verifyManifest(localArgs = args) {
   }
   const checksumMap = parseChecksums(checksumsPath);
   const manifestMap = new Map(manifest.artifacts.map((artifact) => [artifact.name, artifact]));
-  for (const file of releaseFiles(dir, { includeChecksums: true, includeManifest: false })) {
-    if (!manifestMap.has(file)) {
-      throw new Error(`release-manifest.json is missing ${file}`);
+  const entries = releaseFiles(dir, { includeChecksums: true, includeManifest: false });
+  const relativeByName = new Map(entries.map((entry) => [entry.name, entry.relative]));
+  for (const entry of entries) {
+    if (!manifestMap.has(entry.name)) {
+      throw new Error(`release-manifest.json is missing ${entry.name}`);
     }
   }
   for (const [name, artifact] of manifestMap) {
-    const file = path.join(dir, name);
-    if (!fs.existsSync(file)) {
+    const relative = relativeByName.get(name);
+    if (relative === undefined) {
       throw new Error(`manifest entry has no file: ${name}`);
     }
+    const file = path.join(dir, relative);
     const digest = sha256(file);
     if (artifact.sha256 !== digest) {
       throw new Error(`manifest sha mismatch for ${name}`);
@@ -312,6 +315,7 @@ function verifyManifest(localArgs = args) {
     if (artifact.bytes !== bytes) {
       throw new Error(`manifest byte count mismatch for ${name}`);
     }
+    assertInstallableArchiveLayout(name, file);
   }
   for (const [name, digest] of checksumMap) {
     const artifact = manifestMap.get(name);
@@ -325,12 +329,33 @@ function verifyManifest(localArgs = args) {
   writeJson({ ok: true, artifacts: manifest.artifacts.length });
 }
 
+// The cargo-dist shell installer resolves binaries through the archive's
+// top-level directory name; "./"-prefixed members (from `tar -C dir .`)
+// break it with mv ENOENT. rc.7 shipped that breakage from the macOS
+// signing repack — fail closed if it ever reappears.
+function assertInstallableArchiveLayout(name, file) {
+  if (!(name.endsWith(".tar.xz") || name.endsWith(".tar.gz") || name.endsWith(".tgz"))) {
+    return;
+  }
+  const listing = spawnSync("tar", ["-tf", file], { encoding: "utf8" });
+  if (listing.status !== 0) {
+    throw new Error(`tar -tf failed for ${name}: ${listing.stderr}`);
+  }
+  for (const member of listing.stdout.split("\n").filter(Boolean)) {
+    if (member === "." || member === "./" || member.startsWith("./")) {
+      throw new Error(
+        `${name} contains './'-prefixed member ${member}; repack with explicit top-level names or the shell installer breaks`,
+      );
+    }
+  }
+}
+
 function verifyHomebrew(localArgs = args) {
   const dir = required(localArgs.dir, "--dir");
   const checksums = parseChecksums(required(localArgs.checksums, "--checksums"));
-  const formulae = releaseFiles(dir, { includeChecksums: true, includeManifest: false }).filter((file) =>
-    file.endsWith(".rb"),
-  );
+  const formulae = releaseFiles(dir, { includeChecksums: true, includeManifest: false })
+    .filter((entry) => entry.name.endsWith(".rb"))
+    .map((entry) => entry.relative);
   const findChecksum = (basename) =>
     checksums.get(basename) ??
     [...checksums.entries()].find(([name]) => path.basename(name) === basename)?.[1];
@@ -364,28 +389,28 @@ function verifyHomebrew(localArgs = args) {
   writeJson({ ok: true, formulae: formulae.length, verified_urls: verifiedUrls });
 }
 
-function artifactRecord(dir, file, lane, trust) {
-  const absolute = path.join(dir, file);
-  const target = TARGETS.find((candidate) => file.includes(candidate)) ?? null;
+function artifactRecord(dir, entry, lane, trust) {
+  const absolute = path.join(dir, entry.relative);
+  const target = TARGETS.find((candidate) => entry.name.includes(candidate)) ?? null;
   const targetTrust = target ? trust.get(target) : null;
   return {
-    name: file,
+    name: entry.name,
     target,
-    kind: artifactKind(file),
+    kind: artifactKind(entry.relative),
     sha256: sha256(absolute),
     bytes: fs.statSync(absolute).size,
     signed: Boolean(targetTrust?.signed),
     signature_kind: targetTrust?.signature_kind ?? null,
     notarized: Boolean(targetTrust?.notarized),
     attested: lane.requires_attestation,
-    sbom: file.endsWith(".spdx.json") ? file : null,
+    sbom: entry.name.endsWith(".spdx.json") ? entry.name : null,
   };
 }
 
 function artifactKind(file) {
-  if (file === "SHA256SUMS") return "checksums";
+  if (file === "SHA256SUMS" || file.endsWith("/SHA256SUMS")) return "checksums";
   if (file.endsWith(".spdx.json")) return "sbom";
-  if (file.startsWith("trust/")) return "trust-status";
+  if (file.startsWith("trust/") || file.includes("/trust/")) return "trust-status";
   if (file.endsWith(".rb")) return "homebrew-formula";
   if (file.endsWith(".sh") || file.endsWith(".ps1")) return "installer";
   if (file.endsWith(".zip") || file.endsWith(".tar.xz") || file.endsWith(".tar.gz") || file.endsWith(".tgz")) {
@@ -414,21 +439,42 @@ function readTrustStatus(dir) {
 }
 
 function releaseFiles(dir, options) {
-  const files = [];
+  const entries = [];
   walk(dir, (file) => {
     const relative = path.relative(dir, file).replaceAll(path.sep, "/");
     if (relative === ".DS_Store" || relative.endsWith("/.DS_Store")) {
       return;
     }
-    if (!options.includeChecksums && relative === "SHA256SUMS") {
+    const name = relative.split("/").pop();
+    if (!options.includeChecksums && name === "SHA256SUMS") {
       return;
     }
-    if (!options.includeManifest && relative === "release-manifest.json") {
+    if (!options.includeManifest && name === "release-manifest.json") {
       return;
     }
-    files.push(relative);
+    entries.push({ name, relative });
   });
-  return files.sort();
+  entries.sort((a, b) => a.relative.localeCompare(b.relative));
+  // Published release assets are flat, so every artifact is recorded by its
+  // basename — users verify downloads with `shasum -a 256 -c SHA256SUMS`
+  // next to flat files. The CI global-artifact layout nests some files
+  // twice; identical duplicates collapse, divergent content fails closed.
+  const byName = new Map();
+  for (const entry of entries) {
+    const existing = byName.get(entry.name);
+    if (existing === undefined) {
+      byName.set(entry.name, entry);
+      continue;
+    }
+    const existingDigest = sha256(path.join(dir, existing.relative));
+    const duplicateDigest = sha256(path.join(dir, entry.relative));
+    if (existingDigest !== duplicateDigest) {
+      throw new Error(
+        `conflicting contents for release asset ${entry.name}: ${existing.relative} vs ${entry.relative}`,
+      );
+    }
+  }
+  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function walk(dir, visitor) {
