@@ -22,6 +22,10 @@ candidates; the sections below carry the full per-change record.
 - Release trust end to end: signed + notarized macOS archives, fail-closed
   rc/stable lanes, self-update re-homed and proven live, CI on every push
   with the full 54-binary suite green.
+- Consciously narrowed for this cut: npm publishing (no npmjs token yet)
+  and Windows Authenticode signing (no certificate yet) are deferred via
+  explicit policy flags; the Windows zip ships unsigned, and Homebrew +
+  curl-installer + GitHub release are the supported channels.
 
 ## Stable Readiness - 2026-06-10
 

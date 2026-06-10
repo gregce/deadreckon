@@ -245,8 +245,16 @@ fn release_lane_classifies_branch_rc_and_stable_tags() {
         stable.get("publish_homebrew").and_then(JsonValue::as_bool)
     );
     assert_eq!(
-        Some(true),
-        stable.get("publish_npm").and_then(JsonValue::as_bool)
+        Some(false),
+        stable.get("publish_npm").and_then(JsonValue::as_bool),
+        "npm publishing is consciously deferred until an npmjs token exists"
+    );
+    assert_eq!(
+        Some(false),
+        stable
+            .get("requires_windows_signing")
+            .and_then(JsonValue::as_bool),
+        "Windows Authenticode is consciously deferred until a certificate exists"
     );
     assert_eq!(
         Some(true),
@@ -283,13 +291,20 @@ fn official_release_requires_trust_material() {
         "APPLE_TEAM_ID",
         "APPLE_APP_PWD",
         "HOMEBREW_TAP_TOKEN",
+    ] {
+        assert!(
+            stderr.contains(required),
+            "{required} missing from {stderr}"
+        );
+    }
+    for deferred in [
         "npm trusted publishing or NPM_TOKEN",
         "WINDOWS_CERT_PFX",
         "WINDOWS_CERT_PWD",
     ] {
         assert!(
-            stderr.contains(required),
-            "{required} missing from {stderr}"
+            !stderr.contains(deferred),
+            "{deferred} should be deferred from the narrowed v0.1.0 lane: {stderr}"
         );
     }
 }
@@ -418,7 +433,13 @@ fn stable_validate_requires_changelog_section_and_rc_does_not() {
     let stderr = String::from_utf8_lossy(&stable.stderr);
     assert!(stderr.contains("CHANGELOG.md"), "{stderr}");
 
-    let rc_tag = format!("refs/tags/v{}", workspace_version_string());
+    let workspace = workspace_version_string();
+    let rc_version = if workspace.contains("-rc.") {
+        workspace.clone()
+    } else {
+        format!("{workspace}-rc.999")
+    };
+    let rc_tag = format!("refs/tags/v{rc_version}");
     let rc = release_trust([
         "validate",
         "--ref",
@@ -429,10 +450,17 @@ fn stable_validate_requires_changelog_section_and_rc_does_not() {
         changelog_arg,
     ]);
     let rc_stderr = String::from_utf8_lossy(&rc.stderr);
-    assert!(
-        rc.status.success(),
-        "rc lane must not require a changelog section: {rc_stderr}"
-    );
+    if rc_version == workspace {
+        assert!(
+            rc.status.success(),
+            "rc lane must not require a changelog section: {rc_stderr}"
+        );
+    } else {
+        assert!(
+            !rc_stderr.contains("CHANGELOG.md"),
+            "rc lane must not require a changelog section: {rc_stderr}"
+        );
+    }
 }
 
 #[test]

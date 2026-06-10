@@ -136,12 +136,15 @@ Everything the operator does once, in order, before cutting `v0.1.0`:
 1. Create the `gregce/homebrew-tap` repository (public, empty is fine) and
    add a `HOMEBREW_TAP_TOKEN` repo secret with `repo` scope so the publish
    job can push the formula.
-2. Configure npm trusted publishing for the six packages (`deadreckon` plus
-   the five platform packages) — or add an `NPM_TOKEN` secret with publish
-   rights as the fallback the workflow accepts.
-3. Stage Windows Authenticode signing: add `WINDOWS_CERT_PFX` and
-   `WINDOWS_CERT_PWD` secrets. If signing is consciously deferred, narrow
-   the lane instead — the workflow already fails closed without them.
+2. npm publishing is DEFERRED for v0.1.0 (no npmjs token yet) — the lane is
+   consciously narrowed via `npmPublishingDeferred` in
+   `release/trust/release-trust.mjs`. To re-widen for 0.1.1: configure npm
+   trusted publishing for the six packages (`deadreckon` plus the five
+   platform packages) or add an `NPM_TOKEN` secret, then flip the flag.
+3. Windows Authenticode signing is DEFERRED for v0.1.0 (no certificate yet)
+   — narrowed via `windowsSigningDeferred` in the same policy; the Windows
+   zip ships unsigned (expect a SmartScreen prompt). To re-widen: add
+   `WINDOWS_CERT_PFX` and `WINDOWS_CERT_PWD` secrets and flip the flag.
 4. Bump `npm/deadreckon/package.json` to `0.1.0` (final, no `-rc.N`) and
    bump the workspace version in `Cargo.toml` to match the tag.
 5. Confirm `CHANGELOG.md` has the `## 0.1.0` section (it does; refresh the
