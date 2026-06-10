@@ -3012,6 +3012,7 @@ mod tests {
                 coder: None,
                 reviewer: None,
                 children: BTreeMap::new(),
+                ..PlanProviders::default()
             },
             None,
             "0.1.0",

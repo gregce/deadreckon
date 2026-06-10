@@ -628,6 +628,7 @@ async fn main_inner() -> Result<()> {
             goal_file,
             mode,
             provider,
+            model,
             children,
             planner_provider,
             child_provider,
@@ -653,6 +654,7 @@ async fn main_inner() -> Result<()> {
                 goal,
                 mode,
                 provider,
+                model,
                 children,
                 planner_provider,
                 child_provider,
@@ -790,6 +792,8 @@ async fn main_inner() -> Result<()> {
             n,
             planner_provider,
             provider,
+            planner_model,
+            model,
             max_spend,
             max_wall_seconds,
             sandbox,
@@ -829,6 +833,8 @@ async fn main_inner() -> Result<()> {
                 n,
                 planner_provider,
                 provider,
+                planner_model,
+                model,
                 max_spend,
                 max_wall_seconds,
                 sandbox,
@@ -869,6 +875,11 @@ async fn main_inner() -> Result<()> {
                 child_provider,
                 coder_provider,
                 reviewer_provider,
+                planner_model: None,
+                model: None,
+                child_model: Vec::new(),
+                coder_model: None,
+                reviewer_model: None,
                 init_git,
                 acceptance,
                 skip_acceptance_prompt: quiet || json,
@@ -3523,6 +3534,7 @@ fn gate_line_from_results(
 #[derive(Debug, Default)]
 struct ConfigDefaults {
     provider: Option<String>,
+    model: Option<String>,
     sandbox: Option<String>,
     max_spend: Option<f64>,
     cli_max_wall_seconds: Option<f64>,
@@ -3540,6 +3552,9 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
     Ok(ConfigDefaults {
         provider: get_toml_path(&root, "defaults.provider")
             .or_else(|| get_toml_path(&root, "default_provider"))
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string),
+        model: get_toml_path(&root, "defaults.model")
             .and_then(toml::Value::as_str)
             .map(ToString::to_string),
         sandbox: get_toml_path(&root, "defaults.sandbox")

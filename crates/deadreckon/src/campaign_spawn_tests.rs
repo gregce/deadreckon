@@ -22,6 +22,8 @@ fn sub_orchestrator_launch_sets_lineage_env_and_isolated_scope() {
         plain: true,
         planner_provider: Some("smoke"),
         child_provider: Some("smoke"),
+        planner_model: Some("planner-mx"),
+        child_model: None,
         ancestor_task_keys: &ancestors,
         ancestor_scopes: &[],
     };

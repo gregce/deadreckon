@@ -102,6 +102,19 @@ pub struct PlanProviders {
     pub reviewer: Option<String>,
     #[serde(default)]
     pub children: BTreeMap<u32, String>,
+    // Per-role models (additive; pre-rider plan.json deserializes with all
+    // of these empty). None means the provider's own default — no --model
+    // argument reaches the child.
+    #[serde(default)]
+    pub planner_model: Option<String>,
+    #[serde(default)]
+    pub default_child_model: Option<String>,
+    #[serde(default)]
+    pub coder_model: Option<String>,
+    #[serde(default)]
+    pub reviewer_model: Option<String>,
+    #[serde(default)]
+    pub child_models: BTreeMap<u32, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1058,5 +1071,34 @@ mod tests {
         assert!(summary_path.starts_with(paths.plan_dir(plan_id)));
         assert!(!spec_path.to_string_lossy().contains(".."));
         assert!(!summary_path.to_string_lossy().contains(".."));
+    }
+}
+
+#[cfg(test)]
+mod plan_providers_compat_tests {
+    use super::PlanProviders;
+
+    #[test]
+    fn pre_rider_plan_providers_json_deserializes_with_empty_model_fields() {
+        // plan.json written before per-role models existed must parse with
+        // every model field defaulted.
+        let raw = r#"{
+            "planner": "smoke",
+            "default_child": "smoke",
+            "coder": null,
+            "reviewer": null,
+            "children": {"1": "cli:codex"}
+        }"#;
+        let providers: PlanProviders = serde_json::from_str(raw).expect("parse");
+        assert_eq!(providers.planner.as_deref(), Some("smoke"));
+        assert_eq!(providers.planner_model, None);
+        assert_eq!(providers.default_child_model, None);
+        assert_eq!(providers.coder_model, None);
+        assert_eq!(providers.reviewer_model, None);
+        assert!(providers.child_models.is_empty());
+        assert_eq!(
+            providers.children.get(&1).map(String::as_str),
+            Some("cli:codex")
+        );
     }
 }

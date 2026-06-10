@@ -949,6 +949,43 @@ fn start_non_git_tty_can_choose_init_git_copy_or_fresh() {
 }
 
 #[test]
+fn full_plan_preview_provider_roles_table_echoes_per_role_models() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "orchestrate",
+            "full-plan",
+            "model echo goal",
+            "--n",
+            "2",
+            "--preview",
+            "--yes",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--planner-model",
+            "planner-mx",
+            "--model",
+            "child-mx",
+            "--child-model",
+            "1=override-mx",
+        ])
+        .output()
+        .expect("preview");
+
+    assert_success(&output);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(text.contains("planner-mx"), "{text}");
+    assert!(text.contains("child-mx"), "{text}");
+    assert!(text.contains("override-mx"), "{text}");
+}
+
+#[test]
 fn pty_start_picker_choose_full_plan_preview() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

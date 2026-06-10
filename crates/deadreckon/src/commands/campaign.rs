@@ -27,6 +27,8 @@ pub(crate) struct CampaignSubLaunch<'a> {
     pub(crate) plain: bool,
     pub(crate) planner_provider: Option<&'a str>,
     pub(crate) child_provider: Option<&'a str>,
+    pub(crate) planner_model: Option<&'a str>,
+    pub(crate) child_model: Option<&'a str>,
     pub(crate) ancestor_task_keys: &'a [String],
     pub(crate) ancestor_scopes: &'a [String],
 }
@@ -79,6 +81,12 @@ pub(crate) fn build_sub_orchestrator_command(
     if let Some(provider) = launch.child_provider {
         command.arg("--provider").arg(provider);
     }
+    if let Some(planner_model) = launch.planner_model {
+        command.arg("--planner-model").arg(planner_model);
+    }
+    if let Some(child_model) = launch.child_model {
+        command.arg("--model").arg(child_model);
+    }
     Ok(command)
 }
 
@@ -117,6 +125,8 @@ pub(crate) struct CampaignArgs {
     pub(crate) n: Option<u8>,
     pub(crate) planner_provider: Option<String>,
     pub(crate) provider: Option<String>,
+    pub(crate) planner_model: Option<String>,
+    pub(crate) model: Option<String>,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
     pub(crate) sandbox: Option<String>,
@@ -1028,6 +1038,13 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         args.provider.clone(),
         None,
         None,
+        commands::plan::PlanModelOverrides {
+            planner_model: args.planner_model.clone(),
+            model: args.model.clone(),
+            coder_model: None,
+            reviewer_model: None,
+            child_models: BTreeMap::new(),
+        },
     )?;
     let overrides = BTreeMap::new();
     let tasks = build_full_plan_tasks(
@@ -1190,6 +1207,8 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
                 plain,
                 planner_provider: planner.as_deref(),
                 child_provider: child_provider.as_deref(),
+                planner_model: providers.planner_model.as_deref(),
+                child_model: providers.default_child_model.as_deref(),
                 ancestor_task_keys: &ancestor_task_keys,
                 ancestor_scopes: &ancestor_scopes,
             })?;
@@ -2051,4 +2070,43 @@ where
         campaign::write_campaign(campaign_dir, campaign)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod model_argv_tests {
+    use super::{CampaignSubLaunch, build_sub_orchestrator_command};
+    use std::path::Path;
+
+    #[test]
+    fn campaign_planner_model_flows_to_sub_orchestrator_argv() {
+        let command = build_sub_orchestrator_command(&CampaignSubLaunch {
+            home: Path::new("/tmp/home"),
+            source_dir: Path::new("/tmp/src"),
+            launch_dir: Path::new("/tmp/launch"),
+            campaign_id: "cmp-1",
+            sub_goal: "sub goal",
+            sub_n: 2,
+            sandbox: "none",
+            max_spend: None,
+            plain: false,
+            planner_provider: Some("smoke"),
+            child_provider: Some("smoke"),
+            planner_model: Some("planner-mx"),
+            child_model: Some("child-mx"),
+            ancestor_task_keys: &[],
+            ancestor_scopes: &[],
+        })
+        .expect("command");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let pair = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .map(|at| args[at + 1].clone())
+        };
+        assert_eq!(pair("--planner-model").as_deref(), Some("planner-mx"));
+        assert_eq!(pair("--model").as_deref(), Some("child-mx"));
+    }
 }

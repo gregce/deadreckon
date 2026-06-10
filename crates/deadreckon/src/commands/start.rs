@@ -2667,6 +2667,8 @@ async fn dispatch_start_command(
                 n: decision.child_count,
                 planner_provider,
                 provider: child_provider,
+                planner_model: None,
+                model: args.model.clone(),
                 max_spend: None,
                 max_wall_seconds: None,
                 sandbox: None,
@@ -2759,6 +2761,11 @@ async fn dispatch_start_command(
                         } else {
                             None
                         },
+                        planner_model: None,
+                        model: args.model.clone(),
+                        child_model: Vec::new(),
+                        coder_model: None,
+                        reviewer_model: None,
                         init_git: decision.source_init_git,
                         acceptance: None,
                         skip_acceptance_prompt: auto_confirm

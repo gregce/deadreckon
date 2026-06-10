@@ -1345,6 +1345,7 @@ fn full_plan_fixture(task_count: usize) -> (tempfile::TempDir, DeadreckonPaths, 
             coder: None,
             reviewer: None,
             children: [(1, "smoke:reviewer".to_string())].into(),
+            ..PlanProviders::default()
         },
         Some("scope".to_string()),
         "0.1.0",
@@ -1388,6 +1389,7 @@ fn review_plan_fixture() -> (tempfile::TempDir, DeadreckonPaths, Plan) {
             coder: Some("smoke:coder".to_string()),
             reviewer: Some("smoke:reviewer".to_string()),
             children: Default::default(),
+            ..PlanProviders::default()
         },
         Some("scope".to_string()),
         "0.1.0",
@@ -2022,6 +2024,7 @@ fn start_args_for_test(goal: &str) -> StartCommandArgs {
         goal: goal.to_string(),
         mode: CliStartMode::Auto,
         provider: None,
+        model: None,
         children: None,
         planner_provider: None,
         child_provider: Vec::new(),

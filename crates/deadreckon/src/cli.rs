@@ -679,6 +679,8 @@ pub(crate) enum Commands {
         mode: CliStartMode,
         #[arg(long, help = "Provider route for this start launch")]
         provider: Option<String>,
+        #[arg(long, help = "Model for this start launch (per-role flags override)")]
+        model: Option<String>,
         #[arg(long, value_name = "N", help = "Full-plan child count, 2 through 6")]
         children: Option<u8>,
         #[arg(long, help = "Planner provider route for full-plan start")]
@@ -902,6 +904,10 @@ pub(crate) enum Commands {
         planner_provider: Option<String>,
         #[arg(long, help = "Default child provider route for the sub-orchestrators")]
         provider: Option<String>,
+        #[arg(long, help = "Planner model for sub-goal decomposition")]
+        planner_model: Option<String>,
+        #[arg(long, help = "Default child model for the sub-orchestrators")]
+        model: Option<String>,
         #[arg(
             long,
             help = "Tree-wide spend cap in USD, split across sub-orchestrators"
@@ -1827,6 +1833,10 @@ pub(crate) struct OrchestrateReviewArgs {
     pub(crate) coder_provider: Option<String>,
     #[arg(long, help = "Reviewer provider route for review mode")]
     pub(crate) reviewer_provider: Option<String>,
+    #[arg(long, help = "Coder model for review mode")]
+    pub(crate) coder_model: Option<String>,
+    #[arg(long, help = "Reviewer model for review mode")]
+    pub(crate) reviewer_model: Option<String>,
     #[arg(
         long,
         help = "Initialize git in a plain directory before orchestrating"
@@ -1880,6 +1890,16 @@ pub(crate) struct OrchestrateFullPlanArgs {
     pub(crate) planner_provider: Option<String>,
     #[arg(long, help = "Default child provider route for full-plan work")]
     pub(crate) provider: Option<String>,
+    #[arg(long, help = "Planner model for full-plan decomposition")]
+    pub(crate) planner_model: Option<String>,
+    #[arg(long, help = "Default child model for full-plan work")]
+    pub(crate) model: Option<String>,
+    #[arg(
+        long,
+        value_name = "IDX=MODEL",
+        help = "Per-child model override (like --child-provider)"
+    )]
+    pub(crate) child_model: Vec<String>,
     #[arg(
         long,
         value_name = "IDX=PROVIDER",
@@ -2372,6 +2392,7 @@ pub(crate) struct StartCommandArgs {
     pub(crate) goal: String,
     pub(crate) mode: CliStartMode,
     pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
     pub(crate) children: Option<u8>,
     pub(crate) planner_provider: Option<String>,
     pub(crate) child_provider: Vec<String>,
@@ -2401,6 +2422,11 @@ pub(crate) struct PlanCommandArgs {
     pub(crate) child_provider: Vec<String>,
     pub(crate) coder_provider: Option<String>,
     pub(crate) reviewer_provider: Option<String>,
+    pub(crate) planner_model: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) child_model: Vec<String>,
+    pub(crate) coder_model: Option<String>,
+    pub(crate) reviewer_model: Option<String>,
     pub(crate) init_git: bool,
     pub(crate) acceptance: Option<PathBuf>,
     pub(crate) skip_acceptance_prompt: bool,

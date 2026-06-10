@@ -53,6 +53,11 @@ pub(crate) async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<P
         child_provider,
         coder_provider,
         reviewer_provider,
+        planner_model,
+        model,
+        child_model,
+        coder_model,
+        reviewer_model,
         init_git: _,
         acceptance,
         skip_acceptance_prompt,
@@ -95,6 +100,13 @@ pub(crate) async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<P
         provider,
         coder_provider,
         reviewer_provider,
+        PlanModelOverrides {
+            planner_model,
+            model,
+            coder_model,
+            reviewer_model,
+            child_models: parse_child_model_overrides(&child_model, n)?,
+        },
     )?;
     let acceptance_provider = match plan_mode {
         PlanMode::FullPlan => providers
@@ -167,6 +179,36 @@ pub(crate) async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<P
     Ok(plan)
 }
 
+pub(crate) struct PlanModelOverrides {
+    pub(crate) planner_model: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) coder_model: Option<String>,
+    pub(crate) reviewer_model: Option<String>,
+    pub(crate) child_models: std::collections::BTreeMap<u32, String>,
+}
+
+impl PlanModelOverrides {
+    pub(crate) fn none() -> Self {
+        Self {
+            planner_model: None,
+            model: None,
+            coder_model: None,
+            reviewer_model: None,
+            child_models: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// Per-role model resolution: per-role flag -> generic --model -> config
+/// defaults.model -> None (the provider's own default; no --model argv).
+fn resolve_role_model(
+    role_flag: Option<&String>,
+    generic: Option<&String>,
+    configured: Option<&String>,
+) -> Option<String> {
+    role_flag.or(generic).or(configured).cloned()
+}
+
 pub(crate) fn resolve_plan_providers(
     paths: &DeadreckonPaths,
     defaults: &ConfigDefaults,
@@ -175,6 +217,7 @@ pub(crate) fn resolve_plan_providers(
     provider: Option<String>,
     coder_provider: Option<String>,
     reviewer_provider: Option<String>,
+    models: PlanModelOverrides,
 ) -> Result<PlanProviders> {
     let default_child = resolve_provider_name(
         paths,
@@ -211,7 +254,25 @@ pub(crate) fn resolve_plan_providers(
         )?,
         PlanMode::FullPlan => None,
     };
+    let configured_model = defaults.model.as_ref();
     Ok(PlanProviders {
+        planner_model: planner.as_ref().and(resolve_role_model(
+            models.planner_model.as_ref(),
+            models.model.as_ref(),
+            configured_model,
+        )),
+        default_child_model: resolve_role_model(None, models.model.as_ref(), configured_model),
+        coder_model: coder.as_ref().and(resolve_role_model(
+            models.coder_model.as_ref(),
+            models.model.as_ref(),
+            configured_model,
+        )),
+        reviewer_model: reviewer.as_ref().and(resolve_role_model(
+            models.reviewer_model.as_ref(),
+            models.model.as_ref(),
+            configured_model,
+        )),
+        child_models: models.child_models,
         planner,
         default_child,
         coder,
@@ -248,6 +309,14 @@ pub(crate) fn resolve_provider_name(
         },
     )?;
     Ok(selection.provider.or(provider))
+}
+
+/// `IDX=MODEL` pairs, exactly like `--child-provider`'s parser.
+pub(crate) fn parse_child_model_overrides(
+    values: &[String],
+    n: u8,
+) -> Result<std::collections::BTreeMap<u32, String>> {
+    parse_child_provider_overrides(values, n)
 }
 
 pub(crate) fn parse_child_provider_overrides(
@@ -897,21 +966,32 @@ pub(crate) fn orchestration_provider_role_rows(
             rows.push(orchestration_role_row(
                 "planner",
                 plan.providers.planner.as_deref(),
+                plan.providers.planner_model.as_deref(),
                 "plan",
                 "writes child graph",
             ));
             rows.push(orchestration_role_row(
                 "default child",
                 plan.providers.default_child.as_deref(),
+                plan.providers.default_child_model.as_deref(),
                 "plan",
                 "runs ready children",
             ));
             let mut seen_overrides = BTreeSet::new();
-            for (index, route) in &plan.providers.children {
-                seen_overrides.insert(*index);
+            let mut override_indexes: BTreeSet<u32> =
+                plan.providers.children.keys().copied().collect();
+            override_indexes.extend(plan.providers.child_models.keys().copied());
+            for index in override_indexes {
+                seen_overrides.insert(index);
+                let route = plan.providers.children.get(&index);
                 rows.push(orchestration_role_row(
                     format!("child task-{index}"),
-                    Some(route.as_str()),
+                    route.map(String::as_str),
+                    plan.providers
+                        .child_models
+                        .get(&index)
+                        .or(plan.providers.default_child_model.as_ref())
+                        .map(String::as_str),
                     "override",
                     "per-child route",
                 ));
@@ -925,6 +1005,11 @@ pub(crate) fn orchestration_provider_role_rows(
                     rows.push(orchestration_role_row(
                         format!("child {}", task.task_id),
                         task.provider.as_deref(),
+                        plan.providers
+                            .child_models
+                            .get(&task.index)
+                            .or(plan.providers.default_child_model.as_ref())
+                            .map(String::as_str),
                         "task",
                         one_line(&task.subject, 30),
                     ));
@@ -935,12 +1020,14 @@ pub(crate) fn orchestration_provider_role_rows(
             rows.push(orchestration_role_row(
                 "coder",
                 plan.providers.coder.as_deref(),
+                plan.providers.coder_model.as_deref(),
                 "plan",
                 "implementation pass",
             ));
             rows.push(orchestration_role_row(
                 "reviewer",
                 plan.providers.reviewer.as_deref(),
+                plan.providers.reviewer_model.as_deref(),
                 "plan",
                 "independent review",
             ));
@@ -955,6 +1042,7 @@ pub(crate) fn orchestration_provider_role_rows(
         rows.push(orchestration_role_row(
             "repair",
             derived,
+            plan.providers.planner_model.as_deref(),
             if repair_provider.is_some() {
                 "flag"
             } else {
@@ -974,16 +1062,32 @@ pub(crate) fn orchestration_provider_role_rows(
     rows
 }
 
+/// The model a child run launches with: per-index override, else the
+/// default-child model. None (or the literal "provider default") means the
+/// provider's own default — no --model argument reaches the child.
+pub(crate) fn child_model_for_task<'a>(
+    providers: &'a PlanProviders,
+    task: &deadreckon_core::plan::PlanTask,
+) -> Option<&'a str> {
+    providers
+        .child_models
+        .get(&task.index)
+        .or(providers.default_child_model.as_ref())
+        .map(String::as_str)
+        .filter(|model| *model != "provider default" && !model.trim().is_empty())
+}
+
 fn orchestration_role_row(
     role: impl Into<String>,
     route: Option<&str>,
+    model: Option<&str>,
     source: impl Into<String>,
     notes: impl Into<String>,
 ) -> OrchestrationRoleRow {
     OrchestrationRoleRow {
         role: role.into(),
         route: route.unwrap_or("config default").to_string(),
-        model: "-".to_string(),
+        model: model.unwrap_or("-").to_string(),
         source: if route.is_some() {
             source.into()
         } else {
@@ -2537,6 +2641,9 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
     } else if let Some(provider) = task.provider.as_deref() {
         command.arg("--provider").arg(provider);
     }
+    if let Some(model) = child_model_for_task(&plan.providers, task) {
+        command.arg("--model").arg(model);
+    }
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -2863,5 +2970,67 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("try:"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod model_routing_tests {
+    use super::child_model_for_task;
+    use deadreckon_core::plan::{PlanProviders, PlanTask, PlanTaskStatus};
+
+    fn task(index: u32) -> PlanTask {
+        PlanTask {
+            index,
+            task_id: format!("task-{index}"),
+            subject: "subject".to_string(),
+            goal: "goal".to_string(),
+            active_form: "working".to_string(),
+            provider: None,
+            role: deadreckon_core::plan::PlanRole::Child,
+            depends_on: Vec::new(),
+            worker_spec: std::path::PathBuf::new(),
+            summary_path: None,
+            review_status: None,
+            child_run_id: None,
+            child_scope: None,
+            status: PlanTaskStatus::Pending,
+        }
+    }
+
+    fn providers(default_model: Option<&str>, overrides: &[(u32, &str)]) -> PlanProviders {
+        PlanProviders {
+            planner: None,
+            default_child: Some("smoke".to_string()),
+            coder: None,
+            reviewer: None,
+            children: Default::default(),
+            planner_model: None,
+            default_child_model: default_model.map(ToString::to_string),
+            coder_model: None,
+            reviewer_model: None,
+            child_models: overrides
+                .iter()
+                .map(|(index, model)| (*index, (*model).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn child_model_idx_flag_overrides_default_child_model_in_spawn_argv() {
+        let providers = providers(Some("child-default"), &[(1, "override-mx")]);
+        assert_eq!(
+            child_model_for_task(&providers, &task(1)),
+            Some("override-mx")
+        );
+        assert_eq!(
+            child_model_for_task(&providers, &task(0)),
+            Some("child-default")
+        );
+    }
+
+    #[test]
+    fn provider_default_model_means_no_model_argv() {
+        let providers = providers(Some("provider default"), &[]);
+        assert_eq!(child_model_for_task(&providers, &task(0)), None);
     }
 }

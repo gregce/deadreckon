@@ -678,6 +678,7 @@ mod tests {
                 coder: None,
                 reviewer: None,
                 children: Default::default(),
+                ..PlanProviders::default()
             },
             Some("scope".to_string()),
             "0.1.0",
