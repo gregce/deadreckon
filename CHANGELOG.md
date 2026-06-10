@@ -1,5 +1,27 @@
 # Changelog
 
+## Visual interaction overhaul: banner, smart bare invocation, one prompt engine - 2026-06-09
+
+- Help surfaces gain a figlet wordmark with a per-character 256-color
+  gradient (twelve palettes, picked per invocation) and a version tagline —
+  TTY-only, so pipes and every output contract stay byte-clean.
+- Bare `deadreckon` reads the room: no config on the machine → a first-run
+  welcome listing detected agent CLIs with an on-TTY offer to run guided
+  setup; configured but no runs in this directory → orientation (source mode
+  start would use here, the production flow, where other runs live); runs
+  present → status, as a returning operator expects.
+- One prompt engine (inquire) powers every interactive surface: arrow-key
+  selects with detection hints, styled confirms, validated number input, and
+  text prompts, themed to the shared Tone palette and colorless under
+  --plain/NO_COLOR. Off-TTY and DEADRECKON_PROMPT_LINE_MODE keep the
+  original numbered line prompts byte-stable for scripts and tests. Existing
+  pickers (start, campaign, orchestrate, config) inherit the upgrade through
+  the shared API.
+- The init provider prompt is a probe-before-ask menu: detected subscription
+  CLIs lead with live login-state hints, API routes show whether their key is
+  already exported, and a typed route stays reachable. The legacy hand-rolled
+  stderr non-git menu is unified into the same engine.
+
 ## Installable macOS archives and user-verifiable SHA256SUMS - 2026-06-09
 
 - rc.7's macOS `curl | sh` failed at the final `mv`: the signing step
