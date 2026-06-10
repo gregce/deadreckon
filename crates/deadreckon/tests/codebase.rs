@@ -871,16 +871,39 @@ fn non_git_interactive_offers_three_choices_with_init_default() {
     );
 
     assert_success(&output);
-    let text = format!("{}{}", stdout(&output), stderr(&output));
-    assert!(text.contains("No git repo here"));
-    assert!(text.contains("[1] Initialize git and use worktree mode"));
-    assert!(text.contains("Adds .git here"));
-    assert!(text.contains("[2] Use copy mode"));
-    assert!(text.contains("Leaves this folder alone"));
-    assert!(text.contains("[3] Cancel"));
-    assert!(text.contains("choose [1]:"));
+    // The PTY colorizes menu ordinals; assert on the ANSI-stripped text.
+    let text = strip_ansi(&format!("{}{}", stdout(&output), stderr(&output)));
+    assert!(text.contains("No git repo here"), "{text}");
+    assert!(
+        text.contains("[1] Initialize git and use worktree mode (recommended)"),
+        "{text}"
+    );
+    assert!(text.contains("adds .git here"), "{text}");
+    assert!(text.contains("[2] Use copy mode"), "{text}");
+    assert!(text.contains("leaves this folder alone"), "{text}");
+    assert!(text.contains("[3] Cancel"), "{text}");
+    assert!(text.contains("choose [1]:"), "{text}");
     assert!(!source.join(".git").exists());
     assert!(list_runs(&paths, None).expect("runs").is_empty());
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[test]
@@ -2398,7 +2421,7 @@ fn deadreckon_pty(
     let log_dir = TempDir::new().expect("expect log dir");
     let log_path = log_dir.path().join("expect.log");
     let script = format!(
-        "log_user 0\nlog_file -a {}\nset timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\nspawn {}\nexpect \"choose \\[1\\]:\"\nsend -- \"{}\"\nexpect {{\n  \"completed run\" {{ exit 0 }}\n  \"cancelled\" {{ exit 0 }}\n  eof {{ exit 125 }}\n  timeout {{ exit 124 }}\n}}\n",
+        "log_user 0\nlog_file -a {}\nset timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\nset env(DEADRECKON_PROMPT_LINE_MODE) 1\nspawn {}\nexpect \"choose \\[1\\]:\"\nsend -- \"{}\"\nexpect {{\n  \"completed run\" {{ exit 0 }}\n  \"cancelled\" {{ exit 0 }}\n  eof {{ exit 125 }}\n  timeout {{ exit 124 }}\n}}\n",
         tcl_brace_quote(&log_path.display().to_string()),
         tcl_brace_quote(&cwd.display().to_string()),
         tcl_brace_quote(&paths.home().display().to_string()),

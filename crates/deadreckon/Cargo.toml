@@ -21,6 +21,7 @@ axoupdater = { workspace = true, optional = true }
 chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+inquire.workspace = true
 crossterm.workspace = true
 deadreckon-core = { workspace = true }
 deadreckon-providers = { workspace = true }

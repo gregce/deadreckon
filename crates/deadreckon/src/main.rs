@@ -7896,17 +7896,89 @@ fn free_kb(path: &std::path::Path) -> Option<u64> {
     text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()
 }
 
+/// Pick a provider with a menu that already knows the machine: detected
+/// subscription CLIs lead (probed for login state), API routes show whether a
+/// key is already in the environment, and a free-input escape hatch keeps
+/// every route reachable. Probe-before-ask: the detection is in the hints,
+/// the best candidate is preselected.
 fn prompt_provider() -> Result<String> {
     let paths = DeadreckonPaths::discover();
     let registry = ProviderRegistry::with_overrides(paths.home())?;
-    let detected =
-        auto_subscription_cli_provider(&registry).unwrap_or_else(|| "anthropic".to_string());
-    let answer = prompt::open(&format!("provider [{detected}]: "), None)?;
-    Ok(if answer.trim().is_empty() {
-        detected
-    } else {
-        answer.trim().to_string()
-    })
+    let mut choices = Vec::new();
+    for descriptor in registry.iter() {
+        if descriptor.kind != deadreckon_providers::registry::DescriptorKind::Cli
+            || !descriptor.subscription
+        {
+            continue;
+        }
+        let Some(binary) = descriptor.default_binary.as_deref() else {
+            continue;
+        };
+        if !command_exists(binary) {
+            continue;
+        }
+        let detail = match descriptor
+            .auth_probe
+            .as_ref()
+            .map(|probe| deadreckon_providers::probe_cli_auth(binary, probe))
+        {
+            Some(deadreckon_providers::CliAuthStatus::LoggedIn) => {
+                "installed, logged in".to_string()
+            }
+            Some(deadreckon_providers::CliAuthStatus::NotLoggedIn { .. }) => {
+                format!("installed, not logged in (run `{binary} login` before starting)")
+            }
+            _ => "installed".to_string(),
+        };
+        choices.push(prompt::SelectChoice::with_detail(
+            &descriptor.id,
+            format!("{} ({})", descriptor.display_name, descriptor.id),
+            detail,
+        ));
+    }
+    for (id, label, env_key) in [
+        ("anthropic", "Anthropic API", "ANTHROPIC_API_KEY"),
+        ("openai", "OpenAI API", "OPENAI_API_KEY"),
+    ] {
+        let detail = if std::env::var_os(env_key).is_some() {
+            format!("{env_key} found in environment")
+        } else {
+            format!("needs an API key ({env_key} or typed next)")
+        };
+        choices.push(prompt::SelectChoice::with_detail(
+            id,
+            format!("{label} ({id})"),
+            detail,
+        ));
+    }
+    choices.push(prompt::SelectChoice::with_detail(
+        "openai-compatible",
+        "OpenAI-compatible endpoint (openai-compatible)",
+        "any local or hosted compatible API (base URL + key)",
+    ));
+    choices.push(prompt::SelectChoice::with_detail(
+        "other",
+        "Type another provider route",
+        "for example a providers.d descriptor id",
+    ));
+    let selection = prompt::select_one(&prompt::SelectPrompt {
+        title: "Choose a provider".to_string(),
+        help: Some(
+            "detected agent CLIs first; everything stays changeable via deadreckon config provider"
+                .to_string(),
+        ),
+        choices,
+        default_index: 0,
+    })?;
+    if selection.id == "other" {
+        let typed = prompt::open("provider route: ", None)?;
+        if typed.trim().is_empty() {
+            return Ok(auto_subscription_cli_provider(&registry)
+                .unwrap_or_else(|| "anthropic".to_string()));
+        }
+        return Ok(typed.trim().to_string());
+    }
+    Ok(selection.id)
 }
 
 enum NonGitChoice {
@@ -7916,21 +7988,30 @@ enum NonGitChoice {
 }
 
 fn prompt_non_git_mode() -> Result<NonGitChoice> {
-    eprintln!("No git repo here");
-    eprintln!(
-        "  DeadReckon needs either a git worktree or a disposable copy before it lets an agent edit files."
-    );
-    eprintln!();
-    eprintln!("  [1] Initialize git and use worktree mode (recommended)");
-    eprintln!("      Adds .git here, then runs the agent in an isolated deadreckon worktree.");
-    eprintln!("  [2] Use copy mode");
-    eprintln!("      Leaves this folder alone; the agent works under ~/.deadreckon/runstate/.");
-    eprintln!("  [3] Cancel");
-    let answer = prompt::open("choose [1]: ", None)?;
-    Ok(match answer.trim() {
-        "" | "1" => NonGitChoice::Init,
-        "2" => NonGitChoice::Copy,
-        "3" => NonGitChoice::Cancel,
+    let selection = prompt::select_one(&prompt::SelectPrompt {
+        title: "No git repo here".to_string(),
+        help: Some(
+            "DeadReckon needs either a git worktree or a disposable copy before it lets an agent edit files."
+                .to_string(),
+        ),
+        choices: vec![
+            prompt::SelectChoice::with_detail(
+                "init",
+                "Initialize git and use worktree mode (recommended)",
+                "adds .git here, then runs the agent in an isolated deadreckon worktree",
+            ),
+            prompt::SelectChoice::with_detail(
+                "copy",
+                "Use copy mode",
+                "leaves this folder alone; the agent works under ~/.deadreckon/runstate/",
+            ),
+            prompt::SelectChoice::new("cancel", "Cancel"),
+        ],
+        default_index: 0,
+    })?;
+    Ok(match selection.id.as_str() {
+        "init" => NonGitChoice::Init,
+        "copy" => NonGitChoice::Copy,
         _ => NonGitChoice::Cancel,
     })
 }
