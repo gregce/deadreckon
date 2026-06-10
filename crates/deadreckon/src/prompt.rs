@@ -101,6 +101,13 @@ pub(crate) fn is_interactive() -> bool {
     interactive()
 }
 
+/// TTY presence regardless of line mode: rescue prompts render through
+/// `select_one`, which handles both inquire and numbered-line rendering, so
+/// the gate is only "is a human attached".
+pub(crate) fn is_tty() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
 fn interactive() -> bool {
     io::stdin().is_terminal()
         && io::stdout().is_terminal()

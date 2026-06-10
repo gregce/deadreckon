@@ -2228,8 +2228,66 @@ fn provider_setup_selection(
             .or(auto_subscription_provider.as_deref()),
         ..request
     };
-    setup::select_provider_setup(&paths.config_path(), &registry, request)
-        .map_err(setup_refusal_error)
+    match setup::select_provider_setup(&paths.config_path(), &registry, request) {
+        Ok(selection) => Ok(selection),
+        // Never dead-end where a menu can rescue: an unusable route on a TTY
+        // offers the probe-before-ask picker instead of refusing. Off-TTY
+        // (scripts, pipes, CI) the refusal below is byte-identical to before
+        // the rescue existed. One rescue per launch — a second failure
+        // refuses exactly as today.
+        Err(refusal)
+            if request.require_usable_route
+                && prompt::is_tty()
+                && refusal_is_rescueable(&refusal) =>
+        {
+            match rescue_provider_selection(&refusal, &registry)? {
+                Some(route) => setup::select_provider_setup(
+                    &paths.config_path(),
+                    &registry,
+                    setup::ProviderSetupRequest {
+                        explicit_provider: Some(route.as_str()),
+                        ..request
+                    },
+                )
+                .map_err(setup_refusal_error),
+                None => Err(setup_refusal_error(refusal)),
+            }
+        }
+        Err(refusal) => Err(setup_refusal_error(refusal)),
+    }
+}
+
+fn refusal_is_rescueable(refusal: &setup::SetupRefusal) -> bool {
+    refusal.message.contains("needs credentials") || refusal.message.contains("not logged in")
+}
+
+/// The rescue menu: the same detected-CLI/API-route choices init shows, with
+/// the failing route's escape hatches appended. Returns None for keep/cancel
+/// (the original refusal is then surfaced verbatim).
+fn rescue_provider_selection(
+    refusal: &setup::SetupRefusal,
+    registry: &ProviderRegistry,
+) -> Result<Option<String>> {
+    let mut choices = provider_picker_choices(registry);
+    choices.push(prompt::SelectChoice::with_detail(
+        "keep",
+        "Keep the configured route anyway",
+        refusal.try_line.clone(),
+    ));
+    choices.push(prompt::SelectChoice::new("cancel", "Cancel"));
+    let selection = prompt::select_one(&prompt::SelectPrompt {
+        title: format!("{} — pick another route for this launch", refusal.message),
+        help: Some(
+            "this launch only; make it permanent with: deadreckon config provider <route>"
+                .to_string(),
+        ),
+        choices,
+        default_index: 0,
+    })?;
+    Ok(match selection.id.as_str() {
+        "keep" | "cancel" => None,
+        route => Some(route.to_string()),
+    })
 }
 
 fn doc_provider_setup_selection(
@@ -7937,6 +7995,36 @@ fn free_kb(path: &std::path::Path) -> Option<u64> {
 fn prompt_provider() -> Result<String> {
     let paths = DeadreckonPaths::discover();
     let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let mut choices = provider_picker_choices(&registry);
+    choices.push(prompt::SelectChoice::with_detail(
+        "other",
+        "Type another provider route",
+        "for example a providers.d descriptor id",
+    ));
+    let selection = prompt::select_one(&prompt::SelectPrompt {
+        title: "Choose a provider".to_string(),
+        help: Some(
+            "detected agent CLIs first; everything stays changeable via deadreckon config provider"
+                .to_string(),
+        ),
+        choices,
+        default_index: 0,
+    })?;
+    if selection.id == "other" {
+        let typed = prompt::open("provider route: ", None)?;
+        if typed.trim().is_empty() {
+            return Ok(auto_subscription_cli_provider(&registry)
+                .unwrap_or_else(|| "anthropic".to_string()));
+        }
+        return Ok(typed.trim().to_string());
+    }
+    Ok(selection.id)
+}
+
+/// The probe-before-ask provider menu shared by init's picker and the launch
+/// rescue: detected subscription CLIs first (live login-state hints), then
+/// API routes annotated with whether their key is already exported.
+pub(crate) fn provider_picker_choices(registry: &ProviderRegistry) -> Vec<prompt::SelectChoice> {
     let mut choices = Vec::new();
     for descriptor in registry.iter() {
         if descriptor.kind != deadreckon_providers::registry::DescriptorKind::Cli
@@ -7989,29 +8077,7 @@ fn prompt_provider() -> Result<String> {
         "OpenAI-compatible endpoint (openai-compatible)",
         "any local or hosted compatible API (base URL + key)",
     ));
-    choices.push(prompt::SelectChoice::with_detail(
-        "other",
-        "Type another provider route",
-        "for example a providers.d descriptor id",
-    ));
-    let selection = prompt::select_one(&prompt::SelectPrompt {
-        title: "Choose a provider".to_string(),
-        help: Some(
-            "detected agent CLIs first; everything stays changeable via deadreckon config provider"
-                .to_string(),
-        ),
-        choices,
-        default_index: 0,
-    })?;
-    if selection.id == "other" {
-        let typed = prompt::open("provider route: ", None)?;
-        if typed.trim().is_empty() {
-            return Ok(auto_subscription_cli_provider(&registry)
-                .unwrap_or_else(|| "anthropic".to_string()));
-        }
-        return Ok(typed.trim().to_string());
-    }
-    Ok(selection.id)
+    choices
 }
 
 enum NonGitChoice {

@@ -949,6 +949,68 @@ fn start_non_git_tty_can_choose_init_git_copy_or_fresh() {
 }
 
 #[test]
+fn rescue_never_fires_off_tty_refusal_is_byte_identical() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(
+        paths.config_path(),
+        "default_provider = \"anthropic\"\n\n[providers.anthropic]\nkind = \"anthropic\"\n",
+    )
+    .expect("config");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["start", "rescue off tty", "--mode", "run", "--yes"])
+        .output()
+        .expect("start");
+
+    assert!(!output.status.success());
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("provider anthropic needs credentials or an installed binary"),
+        "{text}"
+    );
+    assert!(text.contains("export ANTHROPIC_API_KEY"), "{text}");
+    assert!(
+        !text.contains("pick another route"),
+        "rescue leaked into a non-TTY flow: {text}"
+    );
+}
+
+#[test]
+fn start_pty_with_unusable_default_offers_provider_picker_then_launches() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(paths.home()).expect("home");
+    fs::write(
+        paths.config_path(),
+        "default_provider = \"anthropic\"\n\n[providers.anthropic]\nkind = \"anthropic\"\n",
+    )
+    .expect("config");
+    let bin = temp.path().join("bin");
+    write_fake_path_binary(&bin, "codex", "printf 'codex-cli 9.9.9\\n'\n");
+
+    let output = deadreckon_pty(
+        &paths,
+        &repo,
+        &["1", "1", "1"],
+        &["start", "rescue then preview", "--mode", "run", "--preview"],
+        "pick another route",
+        Some(&bin),
+    );
+
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("pick another route for this launch"),
+        "{text}"
+    );
+    assert!(text.contains("cli:codex"), "{text}");
+}
+
+#[test]
 fn full_plan_preview_provider_roles_table_echoes_per_role_models() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
