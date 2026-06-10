@@ -40,7 +40,11 @@ storage = "jsonl"
 
 [[model_catalog]]
 id = "provider default"
-context_window = 258400
 aliases = ["copilot-default"]
-input_per_million = 0.0
-output_per_million = 0.0
+recommended = true
+
+[[model_catalog]]
+id = "claude-sonnet-4.5"
+
+[[model_catalog]]
+id = "gpt-5.1"

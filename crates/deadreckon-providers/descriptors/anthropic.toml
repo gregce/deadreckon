@@ -25,6 +25,21 @@ try_lines = ["export ANTHROPIC_API_KEY=sk-ant-..."]
 [[model_catalog]]
 id = "claude-sonnet-4-5"
 context_window = 200000
+recommended = true
 input_per_million = 3.0
 output_per_million = 15.0
 aliases = ["sonnet", "sonnet-4.5"]
+
+[[model_catalog]]
+id = "claude-opus-4-1"
+context_window = 200000
+input_per_million = 15.0
+output_per_million = 75.0
+aliases = ["opus", "opus-4.1"]
+
+[[model_catalog]]
+id = "claude-haiku-4-5"
+context_window = 200000
+input_per_million = 1.0
+output_per_million = 5.0
+aliases = ["haiku", "haiku-4.5"]

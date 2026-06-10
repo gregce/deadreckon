@@ -272,6 +272,7 @@ api_key = "anthropic-key"
             input_per_million: Some(2.0),
             output_per_million: Some(3.0),
             aliases: vec!["custom-alias".to_string()],
+            recommended: false,
         }])
         .expect("catalog");
         let router = ProviderRouter::from_config_with_model_and_catalog_override(

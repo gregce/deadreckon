@@ -25,7 +25,8 @@ try_lines = [
 ]
 
 [[model_catalog]]
-id = "local-model"
-aliases = ["local"]
-input_per_million = 0.0
-output_per_million = 0.0
+id = "local"
+recommended = true
+
+[[model_catalog]]
+id = "provider default"

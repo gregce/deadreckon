@@ -38,7 +38,13 @@ storage = "jsonl"
 
 [[model_catalog]]
 id = "provider default"
-context_window = 1000000
 aliases = ["pi-default"]
-input_per_million = 0.0
-output_per_million = 0.0
+recommended = true
+
+[[model_catalog]]
+id = "claude-sonnet-4-5"
+context_window = 200000
+
+[[model_catalog]]
+id = "claude-opus-4-1"
+context_window = 200000

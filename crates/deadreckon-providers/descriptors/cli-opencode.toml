@@ -39,5 +39,12 @@ storage = "opencode-storage"
 [[model_catalog]]
 id = "provider default"
 aliases = ["opencode-default"]
-input_per_million = 0.0
-output_per_million = 0.0
+recommended = true
+
+[[model_catalog]]
+id = "anthropic/claude-sonnet-4-5"
+context_window = 200000
+
+[[model_catalog]]
+id = "anthropic/claude-opus-4-1"
+context_window = 200000

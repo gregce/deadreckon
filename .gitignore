@@ -11,3 +11,4 @@
 *.pem
 *.mobileprovision
 developer-id*
+.playwright-mcp/

@@ -47,3 +47,24 @@ context_window = 200000
 aliases = ["claude-default"]
 input_per_million = 0.0
 output_per_million = 0.0
+recommended = true
+
+[[model_catalog]]
+id = "fable"
+context_window = 200000
+aliases = ["claude-fable-5"]
+
+[[model_catalog]]
+id = "opus"
+context_window = 200000
+aliases = ["claude-opus"]
+
+[[model_catalog]]
+id = "sonnet"
+context_window = 200000
+aliases = ["claude-sonnet"]
+
+[[model_catalog]]
+id = "haiku"
+context_window = 200000
+aliases = ["claude-haiku"]

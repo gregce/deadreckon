@@ -25,6 +25,7 @@ try_lines = ["export OPENAI_API_KEY=sk-..."]
 [[model_catalog]]
 id = "gpt-5.1-codex"
 context_window = 400000
+recommended = true
 input_per_million = 1.25
 output_per_million = 10.0
 aliases = ["codex", "gpt-codex"]

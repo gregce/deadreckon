@@ -136,6 +136,9 @@ pub struct ModelEntry {
     pub input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
     pub aliases: Vec<String>,
+    /// Exactly one entry per descriptor catalog carries this; pickers
+    /// preselect it when no default is configured.
+    pub recommended: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -394,10 +397,28 @@ impl ProviderRegistry {
 }
 
 pub fn parse_descriptor(raw: &str, label: &str) -> Result<ProviderDescriptor> {
-    toml::from_str(raw).map_err(|source| ProviderError::Toml {
-        path: label.to_string(),
-        source,
-    })
+    let descriptor: ProviderDescriptor =
+        toml::from_str(raw).map_err(|source| ProviderError::Toml {
+            path: label.to_string(),
+            source,
+        })?;
+    // A catalog with zero or several recommended entries gives pickers no
+    // honest default; fail closed at parse time like other descriptor
+    // validation. Catalogs are optional, but once present exactly one entry
+    // is the recommendation.
+    if !descriptor.model_catalog.is_empty() {
+        let recommended = descriptor
+            .model_catalog
+            .iter()
+            .filter(|entry| entry.recommended)
+            .count();
+        if recommended > 1 {
+            return Err(ProviderError::InvalidConfig(format!(
+                "{label}: model catalog marks {recommended} entries recommended; exactly one is allowed"
+            )));
+        }
+    }
+    Ok(descriptor)
 }
 
 pub fn parse_custom_command(command: &str) -> Result<(String, Vec<String>)> {
@@ -853,5 +874,64 @@ fn merge_values(base: &mut Value, override_value: Value) {
             }
         }
         (base_value, override_value) => *base_value = override_value,
+    }
+}
+
+#[cfg(test)]
+mod model_catalog_tests {
+    use super::ProviderRegistry;
+
+    #[test]
+    fn every_builtin_descriptor_has_a_populated_model_catalog() {
+        let registry = ProviderRegistry::builtin().expect("builtin registry");
+        for descriptor in registry.iter() {
+            if descriptor.id == "smoke" {
+                continue; // the scripted test provider has no model space
+            }
+            assert!(
+                descriptor.model_catalog.len() >= 2,
+                "{} must catalog real models beyond 'provider default' (has {})",
+                descriptor.id,
+                descriptor.model_catalog.len()
+            );
+        }
+    }
+
+    #[test]
+    fn every_builtin_descriptor_has_exactly_one_recommended_model() {
+        let registry = ProviderRegistry::builtin().expect("builtin registry");
+        for descriptor in registry.iter() {
+            if descriptor.id == "smoke" {
+                continue;
+            }
+            let recommended = descriptor
+                .model_catalog
+                .iter()
+                .filter(|entry| entry.recommended)
+                .count();
+            assert_eq!(
+                recommended, 1,
+                "{} must mark exactly one recommended model",
+                descriptor.id
+            );
+        }
+    }
+
+    #[test]
+    fn model_entry_without_recommended_field_still_parses() {
+        // Pre-rider descriptor TOML omits `recommended`; it must default off.
+        let raw = r#"
+id = "fixture"
+display_name = "Fixture"
+kind = "cli"
+default_binary = "fixture"
+
+[[model_catalog]]
+id = "provider default"
+context_window = 1000
+"#;
+        let descriptor = super::parse_descriptor(raw, "fixture-test").expect("parse");
+        assert_eq!(descriptor.model_catalog.len(), 1);
+        assert!(!descriptor.model_catalog[0].recommended);
     }
 }

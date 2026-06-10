@@ -37,7 +37,13 @@ storage = "json-or-jsonl"
 
 [[model_catalog]]
 id = "provider default"
-context_window = 1000000
 aliases = ["gemini-default"]
-input_per_million = 0.0
-output_per_million = 0.0
+recommended = true
+
+[[model_catalog]]
+id = "gemini-2.5-pro"
+context_window = 1048576
+
+[[model_catalog]]
+id = "gemini-2.5-flash"
+context_window = 1048576
