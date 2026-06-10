@@ -438,6 +438,30 @@ function readTrustStatus(dir) {
   return result;
 }
 
+// The shapes the publish step uploads. Anything else under the artifact
+// tree (extracted per-target directories, loose binaries, READMEs) is a
+// build intermediate, not a release asset — listing those in SHA256SUMS or
+// the manifest would reference files users can never download.
+function isReleaseAsset(name, relative) {
+  if (relative.startsWith("trust/") || relative.includes("/trust/")) {
+    return name.endsWith(".json");
+  }
+  return (
+    name.endsWith(".tar.xz") ||
+    name.endsWith(".tar.gz") ||
+    name.endsWith(".tgz") ||
+    name.endsWith(".zip") ||
+    name.endsWith(".sha256") ||
+    name === "sha256.sum" ||
+    name === "deadreckon-installer.sh" ||
+    name === "deadreckon-installer.ps1" ||
+    name.endsWith(".rb") ||
+    name === "SHA256SUMS" ||
+    name === "release-manifest.json" ||
+    name === "release.spdx.json"
+  );
+}
+
 function releaseFiles(dir, options) {
   const entries = [];
   walk(dir, (file) => {
@@ -446,6 +470,9 @@ function releaseFiles(dir, options) {
       return;
     }
     const name = relative.split("/").pop();
+    if (!isReleaseAsset(name, relative)) {
+      return;
+    }
     if (!options.includeChecksums && name === "SHA256SUMS") {
       return;
     }

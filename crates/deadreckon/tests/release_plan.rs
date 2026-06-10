@@ -775,6 +775,12 @@ fn checksums_record_flat_basenames_and_collapse_nested_duplicates() {
     let distrib = temp.path().join("target/distrib");
     fs::create_dir_all(distrib.join("target/distrib")).expect("nested dir");
     fs::write(distrib.join("deadreckon-installer.sh"), b"#!/bin/sh\n").expect("installer");
+    // Build intermediates (extracted per-target dirs with loose binaries)
+    // are not published assets and must never appear in SHA256SUMS — their
+    // basenames collide across targets with different content.
+    let loose = distrib.join("deadreckon-aarch64-apple-darwin");
+    fs::create_dir_all(&loose).expect("loose dir");
+    fs::write(loose.join("deadreckon"), b"mac binary").expect("loose binary");
     // The CI global-artifact layout nests some files twice with identical
     // content; SHA256SUMS must record one flat basename per asset so users
     // can run `shasum -a 256 -c SHA256SUMS` next to downloaded files.
