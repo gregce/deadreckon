@@ -579,12 +579,9 @@ async fn main_inner() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Commands::Status {
-        run_id: None,
-        all: false,
-        plain: false,
-        json: false,
-    });
+    let Some(command) = cli.command else {
+        return smart_bare_invocation().await;
+    };
     let startup_update_check = start_startup_update_check(&command);
     let result = match command {
         Commands::Init {
@@ -1869,7 +1866,142 @@ fn print_top_help_group(title: &str, group: TopHelpGroup) {
     );
 }
 
+/// Bare `deadreckon` reads the room instead of assuming: a machine with no
+/// setup gets a welcome and the guided path, a configured machine in a
+/// directory with no runs gets oriented help, and a directory with runs gets
+/// its status — the command a returning operator actually wants.
+async fn smart_bare_invocation() -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    if !paths.config_path().exists() {
+        return first_run_welcome().await;
+    }
+    let scope_has_runs = current_scope()
+        .ok()
+        .and_then(|scope| deadreckon_core::state::list_runs(&paths, Some(&scope)).ok())
+        .is_some_and(|runs| !runs.is_empty());
+    if scope_has_runs {
+        return status_command(None, false, false, false);
+    }
+    directory_orientation();
+    Ok(())
+}
+
+const KNOWN_AGENT_CLIS: &[(&str, &str)] = &[
+    ("claude", "Claude Code"),
+    ("codex", "Codex"),
+    ("gemini", "Gemini CLI"),
+    ("copilot", "GitHub Copilot CLI"),
+    ("opencode", "OpenCode"),
+    ("pi", "Pi"),
+];
+
+/// First contact on this machine: greet, show what was detected, and point at
+/// (or directly offer) the guided setup. Never errors — a welcome that fails
+/// is worse than no welcome.
+async fn first_run_welcome() -> Result<()> {
+    ui::print_banner(env!("CARGO_PKG_VERSION"));
+    println!(
+        "{}",
+        ui_heading("Welcome — this machine has no deadreckon setup yet.")
+    );
+    println!("{}", product::PRODUCT_AUDIENCE);
+    println!("{}", product::PRODUCT_HARNESS);
+    println!();
+    println!("{}", ui_heading("Detected agent CLIs:"));
+    let mut found_any = false;
+    for (binary, label) in KNOWN_AGENT_CLIS {
+        if command_exists(binary) {
+            found_any = true;
+            println!("  {} {label} ({binary})", ui_ok("✓"));
+        }
+    }
+    if !found_any {
+        println!(
+            "  {}",
+            ui_muted("none found — BYO API key works too (anthropic / openai routes)")
+        );
+    }
+    println!();
+    println!("{}", ui_heading("Get going:"));
+    println!(
+        "  {}   {}",
+        ui_command("deadreckon init"),
+        ui_muted("guided setup (about a minute)")
+    );
+    println!(
+        "  {}    {}",
+        ui_command("deadreckon try"),
+        ui_muted("keyless proof run of the whole harness")
+    );
+    println!(
+        "  {}   {}",
+        ui_command("deadreckon help"),
+        ui_muted("the command map")
+    );
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        println!();
+        if prompt::confirm("run guided setup now?", true)? {
+            return commands::init::init_command(
+                None,
+                None,
+                None,
+                10.0,
+                "auto".to_string(),
+                false,
+                false,
+            )
+            .await;
+        }
+        println!("{}", ui_muted("whenever you're ready: deadreckon init"));
+    }
+    Ok(())
+}
+
+/// Configured machine, but this directory has no runs: orient instead of
+/// erroring. Explains what start would do *here* and how to find runs made
+/// elsewhere.
+fn directory_orientation() {
+    ui::print_banner(env!("CARGO_PKG_VERSION"));
+    println!(
+        "{}",
+        ui_heading("No deadreckon runs in this directory yet.")
+    );
+    let in_git = std::env::current_dir()
+        .map(|cwd| cwd.join(".git").exists())
+        .unwrap_or(false);
+    if in_git {
+        println!(
+            "{}",
+            ui_muted(
+                "source: git repo — start works in an isolated worktree; your checkout only changes on apply"
+            )
+        );
+    } else {
+        println!(
+            "{}",
+            ui_muted("source: plain directory — start will offer git init, copy, or fresh")
+        );
+    }
+    println!();
+    println!("{}", ui_heading("The flow:"));
+    for command in TYPICAL_FLOW_COMMANDS {
+        println!("  {}", ui_command(command));
+    }
+    println!();
+    println!(
+        "  {} {}",
+        ui_muted("runs from other directories:"),
+        ui_command("deadreckon list --all")
+    );
+    println!(
+        "  {} {}",
+        ui_muted("setup and health:        "),
+        ui_command("deadreckon doctor")
+    );
+}
+
 fn print_top_help() {
+    ui::print_banner(env!("CARGO_PKG_VERSION"));
     println!(
         "{} {}",
         ui_heading("deadreckon"),
@@ -1911,6 +2043,7 @@ fn print_top_help() {
 }
 
 fn print_help_all() {
+    ui::print_banner(env!("CARGO_PKG_VERSION"));
     println!("{}", ui_heading("deadreckon full command map"));
     if COMMAND_HELP_CATALOG
         .iter()

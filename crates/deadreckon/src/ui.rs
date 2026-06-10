@@ -159,6 +159,91 @@ pub(crate) const TUI_PALETTE: TuiPalette = TuiPalette {
     spend_pause_cap: Color::Magenta,
 };
 
+/// The figlet "standard" wordmark, rendered with a per-character 256-color
+/// horizontal gradient at print time. Palettes are 256-color (not 24-bit) for
+/// Terminal.app compatibility; one is picked pseudo-randomly per invocation
+/// so the banner feels alive without any new dependency.
+const BANNER_ART: [&str; 5] = [
+    r"  ____                 _ ____           _               ",
+    r" |  _ \  ___  __ _  __| |  _ \ ___  ___| | _____  _ __  ",
+    r" | | | |/ _ \/ _` |/ _` | |_) / _ \/ __| |/ / _ \| '_ \ ",
+    r" | |_| |  __/ (_| | (_| |  _ <  __/ (__|   < (_) | | | |",
+    r" |____/ \___|\__,_|\__,_|_| \_\___|\___|_|\_\___/|_| |_|",
+];
+
+const BANNER_PALETTES: [&[u8]; 12] = [
+    &[75, 81, 87, 93, 99, 105],      // grad blue -> purple
+    &[203, 209, 210, 215, 216],      // sunset
+    &[33, 34, 35, 37, 38, 39],       // dawn blues
+    &[61, 97, 103, 139, 181],        // nebula violet
+    &[24, 30, 37, 44, 51],           // ocean
+    &[197, 203, 204, 210, 216, 217], // fire
+    &[23, 24, 30, 66, 72, 108],      // forest
+    &[172, 178, 184, 220, 226],      // gold
+    &[31, 32, 33, 67, 103],          // purple-steel
+    &[32, 38, 44, 45, 68],           // mint
+    &[181, 182, 188, 217, 224],      // coral
+    &[28, 34, 40, 41, 47],           // matrix
+];
+
+/// Render the wordmark with a horizontal gradient from one palette.
+/// Plain (no color) when the stream's color gate is off.
+pub(crate) fn banner_text(stream: Stream, palette_index: usize) -> String {
+    let mut out = String::new();
+    if !enabled(stream) {
+        for line in BANNER_ART {
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        return out;
+    }
+    let palette = BANNER_PALETTES[palette_index % BANNER_PALETTES.len()];
+    let width = BANNER_ART
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    for line in BANNER_ART {
+        let trimmed = line.trim_end();
+        for (column, ch) in trimmed.chars().enumerate() {
+            if ch == ' ' {
+                out.push(ch);
+                continue;
+            }
+            let slot = column * palette.len() / width;
+            let color = palette[slot.min(palette.len() - 1)];
+            out.push_str(&format!("\x1b[38;5;{color}m{ch}\x1b[39m"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Print the banner block (wordmark + tagline + version) on interactive
+/// stdout. Pipes, --plain, NO_COLOR-with-no-TTY, and dumb terminals stay
+/// byte-clean: nothing prints unless stdout is a terminal.
+pub(crate) fn print_banner(version: &str) {
+    if !stream_is_terminal(Stream::Stdout) {
+        return;
+    }
+    let palette_index = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as usize)
+        .unwrap_or(0);
+    println!();
+    print!("{}", banner_text(Stream::Stdout, palette_index));
+    println!(
+        "{}",
+        render(
+            Stream::Stdout,
+            Tone::Muted,
+            format!(" v{version} · run your coding agent unattended, and trust the result"),
+        )
+    );
+    println!();
+}
+
 pub(crate) fn set_plain_output(plain: bool) {
     PLAIN_OUTPUT.store(plain, Ordering::Relaxed);
 }
