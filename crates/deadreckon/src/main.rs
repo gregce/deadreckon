@@ -240,7 +240,16 @@ fn error_hint(err: &CliError) -> String {
         ),
         CliError::Io(_) => "check that the referenced path exists and is writable".to_string(),
         CliError::Json(_) => "inspect the referenced JSON file for invalid syntax".to_string(),
-        CliError::Core(_) | CliError::Provider(_) => "deadreckon doctor".to_string(),
+        // Errors that already carry a specific `try:` line (user_error packs
+        // one into the message) must not get the generic doctor hint stacked
+        // on top — it reads as a second, usually wrong, recommendation.
+        CliError::Core(_) | CliError::Provider(_) => {
+            if err.to_string().contains("\ntry: ") {
+                String::new()
+            } else {
+                "deadreckon doctor".to_string()
+            }
+        }
     };
     if hint.trim().is_empty() {
         String::new()
@@ -6057,6 +6066,8 @@ fn resolve_plan_child_task<'a>(plan: &'a Plan, child_ref: &str) -> Option<&'a Pl
 
 #[cfg(test)]
 mod campaign_spawn_tests;
+#[cfg(test)]
+mod failure_surfacing_tests;
 
 #[cfg(test)]
 mod effortless_consistency_tests;
@@ -8743,6 +8754,47 @@ fn refuse_dest_inside_home(paths: &DeadreckonPaths, dest: &Path, verb: &str) -> 
     Ok(())
 }
 
+/// First non-empty line of a failed run's stored failure reason, for
+/// bubbling into the plan- and campaign-level refusal surfaces that today
+/// only report their own layer's status.
+fn child_failure_reason(paths: &DeadreckonPaths, run_id: &str) -> Option<String> {
+    let entry = deadreckon_core::state::list_runs(paths, None)
+        .ok()?
+        .into_iter()
+        .find(|run| run.run_id == run_id)?;
+    let state = deadreckon_core::state::load_state(&entry.state_path).ok()?;
+    let reason = state.failure_reason.or(state.pause_reason)?;
+    let line = reason.lines().find(|line| !line.trim().is_empty())?.trim();
+    Some(if line.chars().count() > 200 {
+        let mut clipped: String = line.chars().take(200).collect();
+        clipped.push('…');
+        clipped
+    } else {
+        line.to_string()
+    })
+}
+
+/// A failure reason naming a provider session/usage/rate limit is resumable
+/// once the limit resets — surface that instead of a generic failure.
+fn provider_quota_note(reason: &str) -> Option<String> {
+    let lower = reason.to_lowercase();
+    let quota = ["session limit", "usage limit", "rate limit", "quota"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    if !quota {
+        return None;
+    }
+    let resets = reason
+        .lines()
+        .flat_map(|line| line.split('\u{b7}'))
+        .map(str::trim)
+        .find(|part| part.to_lowercase().starts_with("resets"));
+    Some(match resets {
+        Some(resets) => format!("provider limit hit; {resets}"),
+        None => "provider limit hit; resumable after it resets".to_string(),
+    })
+}
+
 fn run_prefix(run_id: &str) -> String {
     id_prefix(run_id)
 }
@@ -8956,7 +9008,8 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
         )?;
         print!(
             "{}",
-            commands::campaign::campaign_verdict_surface(&campaign, None).render_plain(false)
+            commands::campaign::campaign_verdict_surface(Some(&paths), &campaign, None)
+                .render_plain(false)
         );
         return Ok(());
     }
@@ -10309,12 +10362,16 @@ fn show_command(
     if let Some((campaign_dir, campaign)) = commands::campaign::resolve_campaign(&paths, run_id)? {
         let rollup = deadreckon_core::campaign::read_campaign_rollup(&campaign_dir).ok();
         let report = if why_failed {
-            commands::campaign::campaign_why_failed_report(&campaign, rollup.as_ref())
+            commands::campaign::campaign_why_failed_report(&paths, &campaign, rollup.as_ref())
         } else {
             commands::campaign::campaign_attach_summary(Some(&paths), &campaign, rollup.as_ref())
         };
         if json_output {
-            let surface = commands::campaign::campaign_verdict_surface(&campaign, rollup.as_ref());
+            let surface = commands::campaign::campaign_verdict_surface(
+                Some(&paths),
+                &campaign,
+                rollup.as_ref(),
+            );
             let value = surface.add_to_json(json!({
                 "campaign_id": campaign.campaign_id,
                 "status": commands::campaign::campaign_status_text(campaign.status),

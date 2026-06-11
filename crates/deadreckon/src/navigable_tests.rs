@@ -452,7 +452,7 @@ fn attach_campaign_json_has_subs_rollup_and_budget() {
     let campaign_dir = paths.plan_dir(&campaign.campaign_id);
     let state = campaign_attach_state_from_dir(&paths, &campaign_dir).expect("state");
 
-    let text = campaign_attach_json_text(&state).expect("json");
+    let text = campaign_attach_json_text(None, &state).expect("json");
     let value: serde_json::Value = serde_json::from_str(&text).expect("json value");
 
     assert_eq!(value["kind"], "campaign");

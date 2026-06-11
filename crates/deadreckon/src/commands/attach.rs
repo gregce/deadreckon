@@ -31,7 +31,10 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     {
         let state = commands::campaign::CampaignAttachState::new(&paths, &campaign_dir, campaign);
         if args.json {
-            print!("{}", commands::campaign::campaign_attach_json_text(&state)?);
+            print!(
+                "{}",
+                commands::campaign::campaign_attach_json_text(Some(&paths), &state)?
+            );
         } else if io::stdout().is_terminal() && !args.plain {
             let show_hints = completion_hints_enabled(args.no_hints);
             print_attach_banner("campaign", &state.campaign.campaign_id);

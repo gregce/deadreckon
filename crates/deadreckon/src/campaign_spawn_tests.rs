@@ -496,7 +496,11 @@ fn campaign_with_rollup() -> (
 #[test]
 fn why_failed_reports_refused_and_caveat_subs() {
     let (campaign, rollup) = campaign_with_rollup();
-    let report = campaign_why_failed_report(&campaign, Some(&rollup));
+    let report = campaign_why_failed_report(
+        &DeadreckonPaths::from_home(std::env::temp_dir().join("dr-test-none")),
+        &campaign,
+        Some(&rollup),
+    );
     assert!(report.contains("refused subs: sub-0"), "{report}");
     assert!(report.contains("caveat subs: sub-1"), "{report}");
     assert!(report.contains("refused"), "{report}");
@@ -507,7 +511,7 @@ fn campaign_cross_sub_conflict_recommends_campaign_repair_once() {
     let (mut campaign, rollup) = campaign_with_rollup();
     campaign.status = deadreckon_core::campaign::CampaignStatus::Failed;
 
-    let surface = campaign_verdict_surface(&campaign, Some(&rollup));
+    let surface = campaign_verdict_surface(None, &campaign, Some(&rollup));
     let rendered = surface.render_plain(false);
 
     assert!(rendered.starts_with("blocked campaign "), "{rendered}");
@@ -549,7 +553,7 @@ fn campaign_cross_sub_conflict_recommends_campaign_repair_once() {
 #[test]
 fn no_hints_suppresses_campaign_completion_hints() {
     let (campaign, rollup) = campaign_with_rollup();
-    let surface = campaign_verdict_surface(&campaign, Some(&rollup));
+    let surface = campaign_verdict_surface(None, &campaign, Some(&rollup));
     assert!(
         !surface.secondary_actions.is_empty(),
         "campaign surface should carry secondary hints to suppress"
@@ -569,7 +573,7 @@ fn campaign_completed_surface_recommends_apply_or_finish_once() {
     campaign.status = deadreckon_core::campaign::CampaignStatus::Merged;
     campaign.merged_run_id = Some("d01795896e854713a51211cb7491f716".to_string());
 
-    let surface = campaign_verdict_surface(&campaign, Some(&rollup));
+    let surface = campaign_verdict_surface(None, &campaign, Some(&rollup));
     let rendered = surface.render_plain(false);
 
     assert!(rendered.starts_with("completed campaign "), "{rendered}");
@@ -586,7 +590,7 @@ fn campaign_json_primary_action_matches_human_primary_action() {
     let (mut campaign, rollup) = campaign_with_rollup();
     campaign.status = deadreckon_core::campaign::CampaignStatus::Failed;
 
-    let surface = campaign_verdict_surface(&campaign, Some(&rollup));
+    let surface = campaign_verdict_surface(None, &campaign, Some(&rollup));
     let value = surface.add_to_json(serde_json::json!({
         "kind": "campaign",
         "id": &campaign.campaign_id,

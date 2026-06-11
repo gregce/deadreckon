@@ -33,7 +33,7 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
     {
         return Err(CliError::Surface {
             code: 1,
-            surface: merge_incomplete_plan_surface(&plan, task)
+            surface: merge_incomplete_plan_surface(&paths, &plan, task)
                 .render_plain(!completion_hints_enabled(no_hints)),
         });
     }
@@ -261,15 +261,63 @@ fn merge_plan_status_word(status: PlanStatus) -> &'static str {
     }
 }
 
-fn merge_incomplete_plan_surface(plan: &Plan, task: &PlanTask) -> VerdictSurface {
+pub(crate) fn merge_incomplete_plan_surface(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task: &PlanTask,
+) -> VerdictSurface {
     let id = run_prefix(&plan.plan_id);
     let completed = plan
         .tasks
         .iter()
         .filter(|task| task.status == PlanTaskStatus::Completed)
         .count();
-    let primary = format!("deadreckon attach {id}");
-    let secondary = format!("deadreckon kill {id}");
+    let mut evidence = vec![
+        ("plan".to_string(), id.clone()),
+        (
+            "status".to_string(),
+            plan_status_label(plan.status).to_string(),
+        ),
+        ("child".to_string(), task.index.to_string()),
+        (
+            "child status".to_string(),
+            task_status_label(task.status).to_string(),
+        ),
+        (
+            "tasks".to_string(),
+            format!("{completed}/{} completed", plan.tasks.len()),
+        ),
+    ];
+    let child_prefix = task.child_run_id.as_deref().map(run_prefix);
+    let reason = task
+        .child_run_id
+        .as_deref()
+        .and_then(|run_id| child_failure_reason(paths, run_id));
+    let quota = reason.as_deref().and_then(provider_quota_note);
+    if let (Some(child), Some(reason)) = (child_prefix.as_deref(), reason.as_deref()) {
+        evidence.push((format!("child {} reason", task.index), reason.to_string()));
+        if let Some(quota) = quota.as_deref() {
+            evidence.push(("resumable".to_string(), quota.to_string()));
+        }
+        let _ = child;
+    }
+    let mut why =
+        "The merge step requires every child task to complete before composing a result run."
+            .to_string();
+    let primary = match (child_prefix.as_deref(), quota.is_some()) {
+        (Some(child), true) => {
+            why.push_str(
+                " The failed child hit a provider limit; resume it once the limit resets.",
+            );
+            format!("deadreckon resume {child}")
+        }
+        _ => format!("deadreckon attach {id}"),
+    };
+    let mut secondary = Vec::new();
+    if let Some(child) = child_prefix.as_deref() {
+        secondary.push(format!("deadreckon show {child} --why-failed"));
+    }
+    secondary.push(format!("deadreckon kill {id}"));
     VerdictSurface::must_new(
         VerdictKind::Paused,
         "plan",
@@ -280,26 +328,13 @@ fn merge_incomplete_plan_surface(plan: &Plan, task: &PlanTask) -> VerdictSurface
                 task.index,
                 task_status_label(task.status)
             ),
-            "The merge step requires every child task to complete before composing a result run.",
-            [
-                ("plan".to_string(), id.clone()),
-                (
-                    "status".to_string(),
-                    plan_status_label(plan.status).to_string(),
-                ),
-                ("child".to_string(), task.index.to_string()),
-                (
-                    "child status".to_string(),
-                    task_status_label(task.status).to_string(),
-                ),
-                (
-                    "tasks".to_string(),
-                    format!("{completed}/{} completed", plan.tasks.len()),
-                ),
-            ],
+            why,
+            evidence,
         ),
         [("Recommended", primary.as_str())],
-        [("Secondary", secondary.as_str())],
+        secondary
+            .iter()
+            .map(|command| ("Secondary", command.as_str())),
     )
 }
 

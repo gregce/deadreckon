@@ -667,15 +667,63 @@ fn parse_campaign_repair_mode(mode: &str) -> Result<MergeRepairMode> {
     }
 }
 
-fn campaign_rollup_refusal_message(rollup: &deadreckon_core::campaign::CampaignRollup) -> String {
+fn campaign_rollup_refusal_message(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+    rollup: &deadreckon_core::campaign::CampaignRollup,
+) -> String {
     if rollup.refused_subs.is_empty() {
-        "campaign failed: one or more sub-orchestrators did not merge".to_string()
-    } else {
-        format!(
-            "campaign failed: refused sub(s) {}",
-            rollup.refused_subs.join(", ")
-        )
+        return "campaign failed: one or more sub-orchestrators did not merge".to_string();
     }
+    let mut message = format!(
+        "campaign failed: refused sub(s) {}",
+        rollup.refused_subs.join(", ")
+    );
+    for sub_id in &rollup.refused_subs {
+        if let Some(summary) = sub_failure_summary(paths, campaign, sub_id) {
+            message.push('\n');
+            message.push_str(&summary);
+        }
+    }
+    message
+}
+
+/// The first failed child's stored failure reason for a refused sub —
+/// resolved sub -> plan -> failed task -> child run state, so the campaign
+/// surface can say WHY instead of only WHICH.
+fn sub_failure_summary(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+    sub_id: &str,
+) -> Option<String> {
+    let sub = campaign.sub_goals.iter().find(|sub| sub.sub_id == sub_id)?;
+    // sub_plan_id is only persisted on merge; a refused sub's plan id lives in
+    // the launch sidecar its sub-orchestrator wrote before failing.
+    let plan_id = sub.sub_plan_id.clone().or_else(|| {
+        let launch_dir = paths
+            .home()
+            .join("plans")
+            .join(&campaign.campaign_id)
+            .join("launch")
+            .join(sub_id);
+        deadreckon_core::campaign::read_sub_result(&launch_dir)
+            .ok()
+            .flatten()
+            .and_then(|result| result.plan_id)
+    })?;
+    let plan = deadreckon_core::plan::load_plan(paths, &plan_id).ok()?;
+    // A failed task is the usual shape, but a kill or cap can leave the task
+    // recorded as running — so any non-completed task whose child run stored a
+    // failure or pause reason explains the refusal.
+    let (task, reason) = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status != deadreckon_core::plan::PlanTaskStatus::Completed)
+        .find_map(|task| {
+            let run_id = task.child_run_id.as_deref()?;
+            child_failure_reason(paths, run_id).map(|reason| (task, reason))
+        })?;
+    Some(format!("{sub_id}: child {} — {reason}", task.index))
 }
 
 struct CampaignRepairExecution<'a> {
@@ -715,9 +763,10 @@ async fn repair_and_promote_campaign_result(
             "rollup_refused",
             serde_json::json!({ "refused_subs": rollup.refused_subs }),
         )?;
+        let id = run_prefix(&campaign_obj.campaign_id);
         return Err(CliError::Core(deadreckon_core::user_error(
-            &campaign_rollup_refusal_message(rollup),
-            "deadreckon show <campaign-id> --why-failed",
+            &campaign_rollup_refusal_message(paths, campaign_obj, rollup),
+            &format!("deadreckon show {id} --why-failed"),
         )));
     }
 
@@ -829,6 +878,7 @@ async fn repair_and_promote_campaign_result(
 }
 
 fn print_campaign_completion(
+    paths: &DeadreckonPaths,
     campaign: &deadreckon_core::campaign::Campaign,
     rollup: &deadreckon_core::campaign::CampaignRollup,
     result_state: &deadreckon_core::PipelineState,
@@ -840,12 +890,13 @@ fn print_campaign_completion(
     }
     print!(
         "{}",
-        campaign_verdict_surface(&campaign_for_surface, Some(rollup))
+        campaign_verdict_surface(Some(paths), &campaign_for_surface, Some(rollup))
             .render_plain(!completion_hints_enabled(no_hints))
     );
 }
 
 pub(crate) fn campaign_verdict_surface(
+    paths: Option<&DeadreckonPaths>,
     campaign: &deadreckon_core::campaign::Campaign,
     rollup: Option<&deadreckon_core::campaign::CampaignRollup>,
 ) -> VerdictSurface {
@@ -913,6 +964,19 @@ pub(crate) fn campaign_verdict_surface(
         ));
         if !rollup.refused_subs.is_empty() {
             evidence.push(("refused subs".to_string(), rollup.refused_subs.join(", ")));
+            for sub_id in &rollup.refused_subs {
+                if let Some(summary) =
+                    paths.and_then(|paths| sub_failure_summary(paths, campaign, sub_id))
+                {
+                    let reason = summary
+                        .split_once(": ")
+                        .map_or(summary.as_str(), |(_, rest)| rest);
+                    evidence.push((sub_id.clone(), reason.to_string()));
+                    if let Some(quota) = provider_quota_note(reason) {
+                        evidence.push(("resumable".to_string(), quota));
+                    }
+                }
+            }
         }
         if !rollup.caveat_subs.is_empty() {
             evidence.push(("caveat subs".to_string(), rollup.caveat_subs.join(", ")));
@@ -1270,7 +1334,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     })
     .await?;
     if !args.quiet {
-        print_campaign_completion(&campaign_obj, &rollup, &result_state, args.no_hints);
+        print_campaign_completion(&paths, &campaign_obj, &rollup, &result_state, args.no_hints);
     }
     Ok(())
 }
@@ -1449,7 +1513,7 @@ pub(crate) async fn campaign_repair_command(args: CampaignRepairArgs) -> Result<
     .await?;
 
     if !args.quiet {
-        print_campaign_completion(&campaign_obj, &rollup, &result_state, args.no_hints);
+        print_campaign_completion(&paths, &campaign_obj, &rollup, &result_state, args.no_hints);
     }
     Ok(())
 }
@@ -1763,9 +1827,12 @@ fn campaign_spend(
     (total, by_sub)
 }
 
-pub(crate) fn campaign_attach_json_text(state: &CampaignAttachState) -> Result<String> {
+pub(crate) fn campaign_attach_json_text(
+    paths: Option<&DeadreckonPaths>,
+    state: &CampaignAttachState,
+) -> Result<String> {
     let rollup = state.rollup.as_ref();
-    let surface = campaign_verdict_surface(&state.campaign, rollup);
+    let surface = campaign_verdict_surface(paths, &state.campaign, rollup);
     let value = surface.add_to_json(serde_json::json!({
         "kind": "campaign",
         "id": &state.campaign.campaign_id,
@@ -1804,7 +1871,7 @@ pub(crate) fn campaign_attach_summary(
     let _ = write!(
         out,
         "{}",
-        campaign_verdict_surface(campaign, rollup).render_plain(false)
+        campaign_verdict_surface(paths, campaign, rollup).render_plain(false)
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "{}", ui_heading("Details"));
@@ -1858,6 +1925,7 @@ pub(crate) fn campaign_attach_summary(
 
 /// `show <campaign-id> --why-failed` report: surfaces refused and caveat subs.
 pub(crate) fn campaign_why_failed_report(
+    paths: &DeadreckonPaths,
     campaign: &deadreckon_core::campaign::Campaign,
     rollup: Option<&deadreckon_core::campaign::CampaignRollup>,
 ) -> String {
@@ -1866,7 +1934,7 @@ pub(crate) fn campaign_why_failed_report(
     let _ = write!(
         out,
         "{}",
-        campaign_verdict_surface(campaign, rollup).render_plain(false)
+        campaign_verdict_surface(Some(paths), campaign, rollup).render_plain(false)
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "{}", ui_heading("Details"));
@@ -1889,6 +1957,11 @@ pub(crate) fn campaign_why_failed_report(
                 ui_muted("refused subs:"),
                 ui_id(rollup.refused_subs.join(", "))
             );
+            for sub_id in &rollup.refused_subs {
+                if let Some(summary) = sub_failure_summary(paths, campaign, sub_id) {
+                    let _ = writeln!(out, "  {summary}");
+                }
+            }
         }
         if !rollup.caveat_subs.is_empty() {
             let _ = writeln!(
