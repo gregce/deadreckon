@@ -696,6 +696,25 @@ fn sub_failure_summary(
     campaign: &deadreckon_core::campaign::Campaign,
     sub_id: &str,
 ) -> Option<String> {
+    sub_failure_details(paths, campaign, sub_id).map(|details| {
+        format!(
+            "{sub_id}: child {} — {}",
+            details.task_index, details.reason
+        )
+    })
+}
+
+struct SubFailureDetails {
+    task_index: u32,
+    child_run_id: String,
+    reason: String,
+}
+
+fn sub_failure_details(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+    sub_id: &str,
+) -> Option<SubFailureDetails> {
     let sub = campaign.sub_goals.iter().find(|sub| sub.sub_id == sub_id)?;
     // sub_plan_id is only persisted on merge; a refused sub's plan id lives in
     // the launch sidecar its sub-orchestrator wrote before failing.
@@ -715,15 +734,67 @@ fn sub_failure_summary(
     // A failed task is the usual shape, but a kill or cap can leave the task
     // recorded as running — so any non-completed task whose child run stored a
     // failure or pause reason explains the refusal.
-    let (task, reason) = plan
-        .tasks
+    plan.tasks
         .iter()
         .filter(|task| task.status != deadreckon_core::plan::PlanTaskStatus::Completed)
         .find_map(|task| {
             let run_id = task.child_run_id.as_deref()?;
-            child_failure_reason(paths, run_id).map(|reason| (task, reason))
-        })?;
-    Some(format!("{sub_id}: child {} — {reason}", task.index))
+            child_failure_reason(paths, run_id).map(|reason| SubFailureDetails {
+                task_index: task.index,
+                child_run_id: run_id.to_string(),
+                reason,
+            })
+        })
+}
+
+/// The resume commands that recover a refused roll-up: one per interrupted
+/// child a refused sub traces to. Empty when nothing resolves (no paths, no
+/// sidecars), in which case inspection is the only honest recommendation.
+fn refused_sub_resume_commands(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+    rollup: &deadreckon_core::campaign::CampaignRollup,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    for sub_id in &rollup.refused_subs {
+        if let Some(details) = sub_failure_details(paths, campaign, sub_id) {
+            let command = format!("deadreckon resume {}", run_prefix(&details.child_run_id));
+            if !commands.contains(&command) {
+                commands.push(command);
+            }
+        }
+    }
+    commands
+}
+
+/// Repair composes merged sub results; a refused roll-up means some subs never
+/// merged, so repair has nothing to compose and must refuse with the resume
+/// path instead of re-stating the roll-up error.
+pub(crate) fn campaign_repair_unmerged_refusal(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+    rollup: &deadreckon_core::campaign::CampaignRollup,
+) -> Option<VerdictSurface> {
+    if rollup.refused_subs.is_empty() {
+        return None;
+    }
+    let resumes = refused_sub_resume_commands(paths, campaign, rollup);
+    let primary = resumes.first().cloned().unwrap_or_else(|| {
+        format!(
+            "deadreckon show {} --why-failed",
+            run_prefix(&campaign.campaign_id)
+        )
+    });
+    Some(campaign_repair_refusal_surface(
+        campaign,
+        VerdictKind::Blocked,
+        format!(
+            "DeadReckon cannot repair this campaign because {} never merged.",
+            rollup.refused_subs.join(", ")
+        ),
+        "Repair composes merged sub results, and an unmerged sub has nothing to compose. Resume the interrupted children so their plans can complete, then re-run the campaign.",
+        primary,
+    ))
 }
 
 struct CampaignRepairExecution<'a> {
@@ -908,23 +979,37 @@ pub(crate) fn campaign_verdict_surface(
         .iter()
         .filter(|sub| sub.status == SubGoalStatus::Merged)
         .count();
+    // Repair only composes merged sub results, so it is the recommendation
+    // for the caveat shape alone; a refused roll-up means unmerged subs and
+    // repair is guaranteed to refuse there.
     let repairable = campaign.status == CampaignStatus::Failed
-        && rollup.is_some_and(|rollup| rollup.rollup_verdict != RollupVerdict::Clean);
+        && rollup.is_some_and(|rollup| rollup.rollup_verdict == RollupVerdict::Caveat);
+    let resume_commands = match (paths, rollup) {
+        (Some(paths), Some(rollup)) if campaign.status == CampaignStatus::Failed => {
+            refused_sub_resume_commands(paths, campaign, rollup)
+        }
+        _ => Vec::new(),
+    };
     let (kind, what, why) = match campaign.status {
         CampaignStatus::Merged => (
             VerdictKind::Completed,
             "The campaign assembled its sub-orchestrator results into one result run.",
             "DeadReckon has a campaign artifact; the recommended command lands or inspects that result.",
         ),
+        CampaignStatus::Failed if !resume_commands.is_empty() => (
+            VerdictKind::Blocked,
+            "The campaign stopped because interrupted sub-orchestrator children never completed.",
+            "Each refused sub traces to a child run that was interrupted; resuming those children lets their plans finish so the campaign can roll up.",
+        ),
         CampaignStatus::Failed if repairable => (
             VerdictKind::Blocked,
-            "The campaign stopped after sub-orchestrator work produced a refused roll-up.",
+            "The campaign stopped after merged sub results produced a caveat roll-up.",
             "This is a deterministic campaign-level refusal, not a provider crash; repair can inspect the sub-results and produce a consolidated artifact.",
         ),
         CampaignStatus::Failed => (
             VerdictKind::Failed,
             "The campaign stopped before producing a merged result.",
-            "No repairable roll-up evidence is available, so failure inspection is the safest next command.",
+            "No resumable child or repairable roll-up evidence resolved, so failure inspection is the safest next command.",
         ),
         CampaignStatus::Killed => (
             VerdictKind::Killed,
@@ -942,7 +1027,10 @@ pub(crate) fn campaign_verdict_surface(
             "Attaching or launching the stored campaign state is the next non-destructive step.",
         ),
     };
-    let primary = campaign_primary_action(campaign, repairable);
+    let primary = resume_commands
+        .first()
+        .cloned()
+        .unwrap_or_else(|| campaign_primary_action(campaign, repairable));
     let mut evidence = vec![
         ("campaign".to_string(), id.clone()),
         (
@@ -982,7 +1070,16 @@ pub(crate) fn campaign_verdict_surface(
             evidence.push(("caveat subs".to_string(), rollup.caveat_subs.join(", ")));
         }
     }
-    let secondary = campaign_secondary_actions(campaign, &primary);
+    let mut secondary: Vec<String> = resume_commands
+        .iter()
+        .filter(|command| **command != primary)
+        .cloned()
+        .collect();
+    for command in campaign_secondary_actions(campaign, &primary) {
+        if !secondary.contains(&command) {
+            secondary.push(command);
+        }
+    }
     VerdictSurface::must_new(
         kind,
         "campaign",
@@ -1497,6 +1594,12 @@ pub(crate) async fn campaign_repair_command(args: CampaignRepairArgs) -> Result<
             .render_plain(!completion_hints_enabled(args.no_hints)),
         }
     })?;
+    if let Some(surface) = campaign_repair_unmerged_refusal(&paths, &campaign_obj, &rollup) {
+        return Err(CliError::Surface {
+            code: 1,
+            surface: surface.render_plain(!completion_hints_enabled(args.no_hints)),
+        });
+    }
     let repair_mode = parse_campaign_repair_mode(&args.repair_mode)?;
     let cwd = std::env::current_dir()?;
     let result_state = repair_and_promote_campaign_result(CampaignRepairExecution {

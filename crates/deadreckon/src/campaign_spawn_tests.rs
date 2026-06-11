@@ -506,9 +506,34 @@ fn why_failed_reports_refused_and_caveat_subs() {
     assert!(report.contains("refused"), "{report}");
 }
 
+fn merged_caveat_campaign_with_rollup() -> (
+    deadreckon_core::campaign::Campaign,
+    deadreckon_core::campaign::CampaignRollup,
+) {
+    use deadreckon_core::campaign::build_rollup;
+    let mut campaign = fixture_campaign();
+    for (index, sub) in campaign.sub_goals.iter_mut().enumerate() {
+        sub.result_run_id = Some(format!("run-{index}"));
+        sub.sub_plan_id = Some(format!("plan-{index}"));
+        sub.status = deadreckon_core::campaign::SubGoalStatus::Merged;
+    }
+    let rollup = build_rollup(&campaign, |_run_id| {
+        (
+            "signed".to_string(),
+            deadreckon_core::tamper::AcceptanceTamperVerdict::Caveat,
+            vec!["agent modified tests/x.rs".to_string()],
+        )
+    });
+    (campaign, rollup)
+}
+
 #[test]
 fn campaign_cross_sub_conflict_recommends_campaign_repair_once() {
-    let (mut campaign, rollup) = campaign_with_rollup();
+    // The true conflict shape: every sub merged, the roll-up carries caveats.
+    // (A refused roll-up means unmerged subs, where repair is guaranteed to
+    // refuse — that state recommends resuming the interrupted children, pinned
+    // in failure_surfacing_tests.)
+    let (mut campaign, rollup) = merged_caveat_campaign_with_rollup();
     campaign.status = deadreckon_core::campaign::CampaignStatus::Failed;
 
     let surface = campaign_verdict_surface(None, &campaign, Some(&rollup));

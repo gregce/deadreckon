@@ -164,6 +164,97 @@ fn campaign_why_failed_names_per_sub_child_failure_reason() {
 }
 
 #[test]
+fn refused_campaign_recommends_resuming_interrupted_children_not_repair() {
+    let (temp, paths) = temp_paths();
+    let run_id = failed_child_run(&temp, &paths, QUOTA_REASON);
+    let (campaign, rollup) = refused_campaign_fixture(&paths, &run_id);
+
+    let surface =
+        commands::campaign::campaign_verdict_surface(Some(&paths), &campaign, Some(&rollup));
+    let child = run_prefix(&run_id);
+    assert_eq!(
+        surface.primary_action.command,
+        format!("deadreckon resume {child}"),
+        "a refused roll-up means unmerged subs, which repair cannot compose"
+    );
+    let rendered = surface.render_plain(false);
+    assert!(
+        !rendered.contains("campaign repair"),
+        "repair is guaranteed to refuse here and must not be recommended: {rendered}"
+    );
+}
+
+#[test]
+fn repair_refusal_for_unmerged_subs_names_resume_path() {
+    let (temp, paths) = temp_paths();
+    let run_id = failed_child_run(&temp, &paths, QUOTA_REASON);
+    let (campaign, rollup) = refused_campaign_fixture(&paths, &run_id);
+
+    let surface = commands::campaign::campaign_repair_unmerged_refusal(&paths, &campaign, &rollup)
+        .expect("unmerged subs must refuse repair with the resume path");
+    let rendered = surface.render_plain(false);
+    assert!(rendered.contains("never merged"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("deadreckon resume {}", run_prefix(&run_id))),
+        "{rendered}"
+    );
+}
+
+fn refused_campaign_fixture(
+    paths: &DeadreckonPaths,
+    child_run_id: &str,
+) -> (
+    deadreckon_core::campaign::Campaign,
+    deadreckon_core::campaign::CampaignRollup,
+) {
+    let plan = plan_with_failed_child(Some(child_run_id.to_string()));
+    save_plan(paths, &plan).expect("save plan");
+    let subs = build_sub_goals(
+        vec!["rebuild billing".to_string(), "rebuild docs".to_string()],
+        2,
+    )
+    .expect("subs");
+    let mut campaign = Campaign::new(
+        "rebuild everything",
+        subs,
+        PlanProviders::default(),
+        0,
+        Some(10.0),
+        None,
+        "0.1.0",
+    )
+    .expect("campaign");
+    campaign.status = deadreckon_core::campaign::CampaignStatus::Failed;
+    let launch_dir = paths
+        .home()
+        .join("plans")
+        .join(&campaign.campaign_id)
+        .join("launch")
+        .join(&campaign.sub_goals[0].sub_id);
+    std::fs::create_dir_all(&launch_dir).expect("launch dir");
+    deadreckon_core::campaign::write_sub_result(
+        &launch_dir,
+        &deadreckon_core::campaign::SubResult {
+            schema_version: 1,
+            sub_id: campaign.sub_goals[0].sub_id.clone(),
+            plan_id: Some(plan.plan_id.clone()),
+            result_run_id: None,
+            ok: false,
+        },
+    )
+    .expect("sub result");
+    campaign.sub_goals[1].result_run_id = Some("run-1".to_string());
+    let rollup = build_rollup(&campaign, |_run_id| {
+        (
+            "signed".to_string(),
+            deadreckon_core::tamper::AcceptanceTamperVerdict::Clean,
+            Vec::new(),
+        )
+    });
+    (campaign, rollup)
+}
+
+#[test]
 fn provider_quota_note_extracts_reset_phrase() {
     let note = provider_quota_note(QUOTA_REASON).expect("quota recognized");
     assert!(note.contains("resets 10:50pm"), "{note}");
