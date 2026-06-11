@@ -486,11 +486,19 @@ jobs:
           repository: gregce/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
-      - name: Download release trust bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: dist-trust
-          path: target/distrib
+      # The formula is an asset of the just-published GitHub release (the
+      # patched .rb from the installers job); the dist-trust artifact bundle
+      # does not carry it — proven by the v0.1.0 cut.
+      - name: Download published formula
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p target/distrib
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.rb' \
+            --dir target/distrib
       - name: Commit formula
         shell: bash
         run: |
