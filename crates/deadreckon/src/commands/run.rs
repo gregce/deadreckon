@@ -111,7 +111,7 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     let effective_max_spend = max_spend.or(defaults.max_spend).or(Some(10.0));
     let effective_max_wall_seconds = max_wall_seconds
         .or(defaults.cli_max_wall_seconds)
-        .or(Some(3600.0));
+        .or(Some(36_000.0));
     let effective_doc_skill = doc_skill
         .or(defaults.doc_skill.clone())
         .unwrap_or_else(|| "run-narrator".to_string());

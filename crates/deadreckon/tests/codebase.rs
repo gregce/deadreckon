@@ -550,7 +550,7 @@ fn brief_mode_is_one_line() {
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(stderr.starts_with("mode=worktree branch=dr/brief-preview-"));
     assert!(stderr.contains(" provider=smoke model=local-scripted-smoke"));
-    assert!(stderr.contains(" cap=$10/1h"));
+    assert!(stderr.contains(" cap=$10/10h"));
 }
 
 #[test]

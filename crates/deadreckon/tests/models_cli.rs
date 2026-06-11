@@ -96,6 +96,42 @@ fn models_without_provider_lists_every_credentialed_route() {
 }
 
 #[test]
+fn cli_run_preview_defaults_to_a_ten_hour_wall_cap() {
+    let temp = repo_tempdir();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let path_env = prepend_fake_cli_to_path(&temp, "codex");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .env("PATH", &path_env)
+        .env("DEADRECKON_AUTH_PROBE", "0")
+        .args([
+            "run",
+            "wall default preview",
+            "--provider",
+            "cli:codex",
+            "--fresh",
+            "--preview",
+        ])
+        .output()
+        .expect("preview");
+
+    let text = format!(
+        "{}{}",
+        stdout(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("10h"),
+        "subscription CLI runs default to a ten-hour wall cap: {text}"
+    );
+    assert!(!text.contains("1h\n"), "{text}");
+}
+
+#[test]
 fn run_preview_names_resolved_model_for_cli_provider() {
     let temp = repo_tempdir();
     let repo = temp.path().join("repo");

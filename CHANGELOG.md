@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.1
+
+- Subscription CLI runs default to a ten-hour wall cap (was one hour):
+  the fallback in run/extend resolution and the `cli_max_wall_seconds`
+  value written by `init` are now 36000 seconds. Explicit
+  `--max-wall-seconds` and configured `defaults.cli_max_wall_seconds`
+  still win.
+- Failure surfacing: plan- and campaign-level refusals name the
+  underlying child failure reason (session limits, wall caps) instead of
+  only their own layer's status; provider quota errors surface as
+  resumable with the provider's stated reset time; refused campaign
+  roll-ups recommend resuming the interrupted children, and
+  `campaign repair` refuses honestly when subs never merged. Error
+  footers interpolate real ids and drop the generic doctor hint when a
+  specific try line exists.
+- Homebrew publish job pulls the formula from the release assets (the
+  v0.1.0 cut proved the artifact-bundle path wrong).
+
 ## 0.1.0 — Stable
 
 Release highlights distilled from the 0.1.0-rc.2 through 0.1.0-rc.11
