@@ -12,3 +12,8 @@
 *.mobileprovision
 developer-id*
 .playwright-mcp/
+
+# SpecStory local files
+.specstory/statistics.json
+.specstory/.project.json
+.specstory/cli/config.toml
