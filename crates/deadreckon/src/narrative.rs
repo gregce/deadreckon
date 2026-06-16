@@ -1358,6 +1358,206 @@ pub(crate) fn projection_with_provider_failure(
     next
 }
 
+/// One turn fed to the live narrator's continuity prompt. Populated from a
+/// `TurnRecord` by the windowing layer (P5); each carries the evidence id
+/// `turn:{turn}` that a beat may cite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // wired into the narrator task in P5/P6
+pub(crate) struct LiveTurnInput {
+    pub(crate) turn: u32,
+    pub(crate) title: String,
+    pub(crate) summary: String,
+    pub(crate) tool_kind: String,
+    pub(crate) outcome: String,
+    pub(crate) files: Vec<String>,
+}
+
+impl LiveTurnInput {
+    #[allow(dead_code)] // wired into the narrator task in P5/P6
+    pub(crate) fn evidence_id(&self) -> String {
+        format!("turn:{}", self.turn)
+    }
+}
+
+/// Continuity metadata for a live beat: where it sits in the rolling story and
+/// which provider produced it.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // wired into the narrator task in P5/P6
+pub(crate) struct LiveBeatMeta {
+    pub(crate) beat_seq: u64,
+    pub(crate) covers_turn: u32,
+    pub(crate) rolling_summary: Option<String>,
+    pub(crate) provider: NarrativeProviderRefresh,
+}
+
+/// Evidence ids a live beat may cite: the prior snapshot's citations and claim
+/// evidence (continuity) plus one `turn:{n}` id per windowed new turn (so the
+/// narrator may assert genuinely new beats, not only relabel prior claims).
+#[allow(dead_code)] // wired into the narrator task in P5/P6
+pub(crate) fn live_allowed_evidence(
+    previous: &NarrativeSnapshot,
+    new_turns: &[LiveTurnInput],
+) -> BTreeSet<String> {
+    let mut ids = previous
+        .citations
+        .iter()
+        .map(|citation| citation.id.clone())
+        .collect::<BTreeSet<_>>();
+    for claim in previous
+        .current_work
+        .iter()
+        .chain(&previous.architecture_notes)
+        .chain(&previous.risks)
+        .chain(&previous.next_likely)
+    {
+        for evidence in &claim.evidence {
+            ids.insert(evidence.clone());
+        }
+    }
+    for turn in new_turns {
+        ids.insert(turn.evidence_id());
+    }
+    ids
+}
+
+/// Build the live continuity prompt: amend and EXTEND the previous narrative
+/// using only the windowed new turns plus the carried rolling summary. Unlike
+/// the attach projector prompt, the model may add new beats tied to new-turn
+/// evidence ids rather than only relabel a deterministic snapshot.
+#[allow(dead_code)] // wired into the narrator task in P5/P6
+pub(crate) fn build_live_narrator_prompt(
+    previous: &NarrativeSnapshot,
+    new_turns: &[LiveTurnInput],
+    rolling_summary: Option<&str>,
+) -> crate::Result<NarrativePromptBundle> {
+    let evidence_ids = live_allowed_evidence(previous, new_turns)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let previous_narrative = json!({
+        "headline": previous.headline,
+        "current_work": previous.current_work,
+        "architecture_notes": previous.architecture_notes,
+        "risks": previous.risks,
+        "next_likely": previous.next_likely,
+    });
+    let new_turns_json = new_turns
+        .iter()
+        .map(|turn| {
+            json!({
+                "turn": turn.turn,
+                "evidence_id": turn.evidence_id(),
+                "title": turn.title,
+                "summary": turn.summary,
+                "tool": turn.tool_kind,
+                "outcome": turn.outcome,
+                "files": turn.files,
+            })
+        })
+        .collect::<Vec<_>>();
+    let prompt_value = json!({
+        "task": "amend_and_extend",
+        "output_schema": {
+            "headline": "string",
+            "current_work": [{"text": "string", "evidence": ["known evidence id"], "confidence": "high|medium|low"}],
+            "architecture_notes": [{"text": "string", "evidence": ["known evidence id"], "confidence": "high|medium|low"}],
+            "risks": [{"text": "string", "evidence": ["known evidence id"], "confidence": "high|medium|low"}],
+            "next_likely": [{"text": "string", "evidence": ["known evidence id"], "confidence": "low"}]
+        },
+        "allowed_evidence_ids": evidence_ids,
+        "previous_narrative": previous_narrative,
+        "rolling_summary": rolling_summary.unwrap_or(""),
+        "new_turns": new_turns_json,
+    });
+    let payload = serde_json::to_string_pretty(&prompt_value)?;
+    let raw = format!(
+        "You are the live narrator for a coding run. Amend and EXTEND the previous narrative using only the new turns and the rolling summary — never regenerate from scratch.\n\
+Append a beat describing what the latest turn(s) did; revise the headline, current_work, and next_likely; keep prior architecture_notes and risks unless the new turns contradict them.\n\
+Return exactly one raw JSON object matching output_schema and nothing else. No Markdown, code fences, commentary, or prose outside the JSON object.\n\
+Cite every claim with ids from allowed_evidence_ids (each new turn's evidence id is turn:N). Do not invent evidence, files, or actions.\n\n\
+Payload:\n{payload}\n"
+    );
+    let redaction = redact_for_provider(&raw);
+    Ok(NarrativePromptBundle {
+        prompt: redaction.text.clone(),
+        redaction,
+        evidence_ids,
+        graph_ids: Vec::new(),
+    })
+}
+
+/// Merge a live provider response onto the previous snapshot, producing a NEW
+/// beat snapshot (the caller appends it — the prior beat is never overwritten).
+/// Claims are validated against [`live_allowed_evidence`], so a beat citing a
+/// turn outside the window is rejected.
+#[allow(dead_code)] // wired into the narrator task in P5/P6
+pub(crate) fn apply_live_narrator_response(
+    previous: &NarrativeSnapshot,
+    new_turns: &[LiveTurnInput],
+    raw_content: &str,
+    meta: LiveBeatMeta,
+) -> crate::Result<NarrativeSnapshot> {
+    let redacted_output = redact_for_provider(raw_content);
+    if !redacted_output.findings.is_empty() {
+        return Err(crate::CliError::Exit {
+            code: 1,
+            message: "live narrator output contained sensitive or unsafe text".to_string(),
+            hint: "rely on the deterministic narrative floor for this beat".to_string(),
+        });
+    }
+    let output = parse_provider_narrative_output(raw_content)?;
+    let allowed_evidence = live_allowed_evidence(previous, new_turns);
+    validate_provider_claims(&output, &allowed_evidence)?;
+
+    let mut next = previous.clone();
+    if let Some(headline) = non_empty_redacted_line(output.headline.as_deref()) {
+        next.headline = headline;
+    }
+    if !output.current_work.is_empty() {
+        next.current_work = output.current_work;
+    }
+    if !output.architecture_notes.is_empty() {
+        next.architecture_notes = output.architecture_notes;
+    }
+    if !output.risks.is_empty() {
+        next.risks = output.risks;
+    }
+    if !output.next_likely.is_empty() {
+        next.next_likely = output.next_likely;
+    }
+    next.status = NarrativeStatus::Fresh;
+    next.created_at = Utc::now();
+    next.live = Some(LiveBeat {
+        beat_seq: meta.beat_seq,
+        covers_turn: meta.covers_turn,
+        source: NarrativeSource::Live,
+        rolling_summary: meta.rolling_summary,
+    });
+    next.snapshot_id = snapshot_id(&(
+        &next.scope,
+        &next.target_id,
+        &next.headline,
+        &next.current_work,
+        &next.architecture_notes,
+        &next.risks,
+        &next.next_likely,
+        meta.beat_seq,
+        meta.covers_turn,
+        &meta.provider.route,
+    ));
+    Ok(next)
+}
+
+/// Append a live beat to `snapshots.jsonl`, never rewriting prior beats — the
+/// rolling story is an append-only audit trail.
+#[allow(dead_code)] // wired into the narrator task in P5/P6
+pub(crate) fn append_narrative_snapshot(
+    narrative_dir: &Path,
+    snapshot: &NarrativeSnapshot,
+) -> crate::Result<()> {
+    fs::create_dir_all(narrative_dir)?;
+    append_json_line(&narrative_dir.join(NARRATIVE_SNAPSHOTS_JSONL), snapshot)
+}
+
 fn read_current_projection_if_covered(
     candidate: &NarrativeProjection,
     narrative_dir: &Path,
@@ -2805,6 +3005,132 @@ mod tests {
         assert_eq!(beat.beat_seq, 7);
         assert_eq!(beat.covers_turn, 14);
         assert_eq!(beat.source, NarrativeSource::Live);
+    }
+
+    fn live_previous_snapshot() -> NarrativeSnapshot {
+        serde_json::from_str(
+            r#"{
+                "version": 2,
+                "snapshot_id": "beat-0",
+                "scope": "run",
+                "target_id": "run-x",
+                "created_at": "2026-06-15T00:00:00Z",
+                "status": "deterministic",
+                "source_window": {},
+                "coverage": {"skipped_events": 0, "redacted_events": 0, "known_gaps": []},
+                "headline": "Started run",
+                "current_work": [],
+                "architecture_notes": [],
+                "risks": [],
+                "next_likely": [],
+                "citations": [{"id": "state", "kind": "state", "path": null, "summary": "run state"}]
+            }"#,
+        )
+        .expect("previous snapshot parses")
+    }
+
+    fn live_turns() -> Vec<LiveTurnInput> {
+        vec![LiveTurnInput {
+            turn: 14,
+            title: "Wire bus".to_string(),
+            summary: "Added narrator task to run.rs".to_string(),
+            tool_kind: "write_file".to_string(),
+            outcome: "ok".to_string(),
+            files: vec!["run.rs".to_string()],
+        }]
+    }
+
+    fn live_meta() -> LiveBeatMeta {
+        LiveBeatMeta {
+            beat_seq: 1,
+            covers_turn: 14,
+            rolling_summary: Some("Through turn 14: wired the bus.".to_string()),
+            provider: NarrativeProviderRefresh {
+                route: "cli:claude-code".to_string(),
+                model: "haiku".to_string(),
+                cost_usd: 0.0,
+                subscription_seconds: None,
+            },
+        }
+    }
+
+    #[test]
+    fn live_prompt_includes_previous_narrative_and_only_window_turns() {
+        let bundle = build_live_narrator_prompt(
+            &live_previous_snapshot(),
+            &live_turns(),
+            Some("Through turn 13: set up plumbing."),
+        )
+        .expect("live prompt builds");
+        assert!(
+            bundle.prompt.contains("Started run"),
+            "carries the previous narrative forward"
+        );
+        assert!(
+            bundle.prompt.contains("Added narrator task to run.rs"),
+            "includes the windowed new turn"
+        );
+        assert!(bundle.evidence_ids.contains(&"turn:14".to_string()));
+        assert!(
+            !bundle.evidence_ids.contains(&"turn:99".to_string()),
+            "only window turns are citable"
+        );
+        assert!(!bundle.prompt.contains("turn:99"));
+    }
+
+    #[test]
+    fn apply_live_response_appends_beat_does_not_overwrite() {
+        let temp = TempDir::new().expect("tempdir");
+        let dir = temp.path().join("narrative");
+        let previous = live_previous_snapshot();
+        append_narrative_snapshot(&dir, &previous).expect("write previous beat");
+
+        let response = r#"{"headline":"Wired the bus","current_work":[{"text":"Added the narrator task","evidence":["turn:14"],"confidence":"high"}]}"#;
+        let beat = apply_live_narrator_response(&previous, &live_turns(), response, live_meta())
+            .expect("apply live response");
+        assert_ne!(beat.snapshot_id, previous.snapshot_id, "new beat id");
+        let live = beat.live.as_ref().expect("live beat metadata");
+        assert_eq!(live.beat_seq, 1);
+        assert_eq!(live.covers_turn, 14);
+        assert_eq!(live.source, NarrativeSource::Live);
+        assert_eq!(previous.headline, "Started run", "previous left untouched");
+
+        append_narrative_snapshot(&dir, &beat).expect("append beat");
+        let raw = std::fs::read_to_string(dir.join("snapshots.jsonl")).expect("read jsonl");
+        assert_eq!(
+            raw.lines().filter(|line| !line.trim().is_empty()).count(),
+            2,
+            "appended, not overwritten"
+        );
+        let latest = read_latest_snapshot(&dir).snapshot.expect("latest beat");
+        assert_eq!(latest.snapshot_id, beat.snapshot_id);
+    }
+
+    #[test]
+    fn live_beat_rejects_evidence_id_for_nonexistent_turn() {
+        let response = r#"{"headline":"x","current_work":[{"text":"y","evidence":["turn:999"],"confidence":"high"}]}"#;
+        let result = apply_live_narrator_response(
+            &live_previous_snapshot(),
+            &live_turns(),
+            response,
+            live_meta(),
+        );
+        assert!(
+            result.is_err(),
+            "a beat citing a turn outside the window is rejected"
+        );
+    }
+
+    #[test]
+    fn live_beat_accepts_new_turn_evidence_id() {
+        let response = r#"{"headline":"x","current_work":[{"text":"y","evidence":["turn:14"],"confidence":"high"}]}"#;
+        let result = apply_live_narrator_response(
+            &live_previous_snapshot(),
+            &live_turns(),
+            response,
+            live_meta(),
+        );
+        assert!(result.is_ok(), "a beat citing a windowed turn is accepted");
     }
 
     #[test]

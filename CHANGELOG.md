@@ -17,6 +17,13 @@
   in-process narrator sidecar that drains run events and stops cleanly when the
   run finishes or is cancelled. On a TTY narration is on by default; off-TTY
   without `--narrate` the run is wired exactly as before (no bus, no task).
+- P4: continuity — `build_live_narrator_prompt` feeds the model the prior
+  narrative + only the windowed new turns + a rolling summary and asks it to
+  amend/extend; `apply_live_narrator_response` merges the reply into a NEW
+  appended beat (never overwriting the prior beat) and validates claims against
+  prior-citation + new-turn (`turn:N`) evidence, so beats may add genuine new
+  claims but never cite a turn outside the window. New `skills/live-narrator`
+  prompt skill carries the voice.
 
 ## 0.1.1
 
