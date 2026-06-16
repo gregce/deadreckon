@@ -35,6 +35,12 @@
   to a beat via the quiet timer. Between model beats a deterministic $0 ticker
   (`turn N · tool (elapsed)`) keeps a long turn from looking frozen, with no
   provider call.
+- P7: narrator spend isolation — `NarratorLedger` tracks the narrator's own
+  spend against its per-run budget cap, fully separate from the run loop's
+  totals; `narrator_should_use_model` degrades to the deterministic floor once
+  the cap is hit (or the backend is the floor); `narrator_spend_record` writes
+  `kind: "narrator"` rows so the run's spend math (which filters `kind: "loop"`)
+  never counts narration. Subscription backends record $0.
 
 ## 0.1.1
 

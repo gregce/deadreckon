@@ -7,7 +7,9 @@
 //! calls, and rendering land in later phases; here the task is a clean drain
 //! that stops the instant the run finishes (cancellation) or the bus closes.
 
-use deadreckon_core::{RunEvent, RunEventBus};
+use chrono::Utc;
+use deadreckon_core::{RunEvent, RunEventBus, SpendRecord};
+use deadreckon_providers::{NarratorBackend, ProviderResponse};
 use deadreckon_runtime::NarratorConfig;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -160,6 +162,75 @@ fn format_elapsed(seconds: u64) -> String {
     }
 }
 
+/// Tracks the narrator's own spend against its per-run cap. Kept entirely
+/// separate from the run loop's `state.total_spend_usd` so narration never
+/// inflates or races the run's accounting.
+#[allow(dead_code)] // wired into the narrator task in P8
+pub(crate) struct NarratorLedger {
+    budget_usd: f64,
+    spent_usd: f64,
+}
+
+#[allow(dead_code)] // wired into the narrator task in P8
+impl NarratorLedger {
+    pub(crate) fn new(budget_usd: f64) -> Self {
+        Self {
+            budget_usd,
+            spent_usd: 0.0,
+        }
+    }
+
+    pub(crate) fn budget_available(&self) -> bool {
+        self.spent_usd < self.budget_usd
+    }
+
+    pub(crate) fn record_spend(&mut self, cost_usd: f64) {
+        self.spent_usd += cost_usd.max(0.0);
+    }
+
+    pub(crate) fn spent_usd(&self) -> f64 {
+        self.spent_usd
+    }
+}
+
+/// Whether the narrator should make a model call: only when it has a model
+/// backend AND its budget is not exhausted. Otherwise it degrades to the
+/// deterministic floor — the run is never affected.
+#[allow(dead_code)] // wired into the narrator task in P8
+pub(crate) fn narrator_should_use_model(
+    backend: &NarratorBackend,
+    ledger: &NarratorLedger,
+) -> bool {
+    matches!(backend, NarratorBackend::Model { .. }) && ledger.budget_available()
+}
+
+/// Build a `kind: "narrator"` spend row from a provider response, carrying the
+/// narrator's own running total and cap. Subscription backends report $0.
+#[allow(dead_code)] // wired into the narrator task in P8
+pub(crate) fn narrator_spend_record(
+    turn: u32,
+    response: &ProviderResponse,
+    narrator_total_usd: f64,
+    cap_usd: f64,
+) -> SpendRecord {
+    SpendRecord {
+        timestamp: Utc::now(),
+        turn,
+        provider: response.spend.provider.clone(),
+        model: response.spend.model.clone(),
+        input_tokens: response.spend.input_tokens,
+        output_tokens: response.spend.output_tokens,
+        cost_usd: response.spend.cost_usd,
+        total_cost_usd: narrator_total_usd,
+        cap_usd: Some(cap_usd),
+        subscription: response.spend.subscription,
+        estimated: false,
+        wall_time_seconds: response.spend.wall_time_seconds,
+        wall_time_cap_seconds: None,
+        kind: "narrator".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -268,5 +339,80 @@ mod tests {
             cadence_decision(&config, config.max_beats, 8, Some(120), None),
             BeatDecision::CapReached
         );
+    }
+
+    fn provider_response(cost_usd: f64, subscription: bool) -> ProviderResponse {
+        use deadreckon_providers::{ProviderUsage, SpendEstimate};
+        ProviderResponse {
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+            content: "{}".to_string(),
+            usage: ProviderUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+            },
+            spend: SpendEstimate {
+                provider: "anthropic".to_string(),
+                model: "claude-haiku-4-5".to_string(),
+                input_tokens: 100,
+                output_tokens: 20,
+                cost_usd,
+                subscription,
+                wall_time_seconds: Some(1.0),
+            },
+            trace: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn narrator_spend_rows_tagged_and_separate_from_loop_totals() {
+        let narrator_row = narrator_spend_record(5, &provider_response(0.01, false), 0.01, 0.50);
+        assert_eq!(narrator_row.kind, "narrator");
+        // A loop row alongside it; the run's spend math filters kind=="loop"
+        // and so never counts narrator cost.
+        let loop_row = SpendRecord {
+            kind: "loop".to_string(),
+            cost_usd: 0.02,
+            ..narrator_row.clone()
+        };
+        let rows = vec![loop_row, narrator_row];
+        let loop_total: f64 = rows
+            .iter()
+            .filter(|row| row.kind == "loop")
+            .map(|row| row.cost_usd)
+            .sum();
+        assert_eq!(loop_total, 0.02, "narrator cost excluded from loop totals");
+    }
+
+    #[test]
+    fn narrator_degrades_to_floor_at_budget_cap() {
+        let backend = NarratorBackend::Model {
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+        };
+        let mut ledger = NarratorLedger::new(0.50);
+        assert!(narrator_should_use_model(&backend, &ledger));
+        ledger.record_spend(0.30);
+        assert!(narrator_should_use_model(&backend, &ledger));
+        ledger.record_spend(0.25); // 0.55 >= 0.50 cap
+        assert!(
+            !narrator_should_use_model(&backend, &ledger),
+            "narrator degrades to the deterministic floor at its budget cap"
+        );
+        assert!(
+            !narrator_should_use_model(
+                &NarratorBackend::DeterministicFloor,
+                &NarratorLedger::new(0.50)
+            ),
+            "a floor backend never makes a model call"
+        );
+    }
+
+    #[test]
+    fn narrator_subscription_backend_records_zero_cost() {
+        let row = narrator_spend_record(3, &provider_response(0.0, true), 0.0, 0.50);
+        assert_eq!(row.cost_usd, 0.0);
+        assert!(row.subscription);
+        assert_eq!(row.kind, "narrator");
     }
 }
