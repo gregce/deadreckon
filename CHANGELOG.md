@@ -7,6 +7,12 @@
   as absent; `SpendRecord.kind` (defaulted "loop", narrator rows write
   "narrator"); additive `RunLoopConfig.narrate: Option<NarratorConfig>` (None
   preserves every existing constructor).
+- P2: narrator backend selection — subscription-first preference
+  (claude-code/haiku → codex/gpt-5.1-codex-mini → anthropic/claude-haiku-4-5 →
+  openai/gpt-4o-mini → deterministic floor). Pure `select_narrator_route` over
+  an availability predicate, plus a registry-backed predicate that gates CLIs
+  on binary presence + login state and HTTP on a non-empty API-key env var.
+  `--narrator-model` overrides the model without changing provider order.
 
 ## 0.1.1
 

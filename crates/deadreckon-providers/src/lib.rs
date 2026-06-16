@@ -15,6 +15,7 @@ mod types;
 
 pub mod cli_claude_code;
 pub mod cli_codex;
+pub mod narrator;
 pub mod registry;
 pub mod taxonomy;
 
@@ -22,6 +23,10 @@ pub use auth_probe::{CliAuthStatus, probe_cli_auth};
 pub use config::{default_config_path, read_config};
 pub use error::{ProviderError, Result};
 pub use http::ProviderAdapter;
+pub use narrator::{
+    NarratorBackend, NarratorCandidate, narrator_route_available, select_narrator_backend,
+    select_narrator_route,
+};
 pub use registry::{ModelCatalogOverride, ModelEntry};
 pub use router::{ModelContextWindowSource, ProviderRouter};
 pub use types::{
