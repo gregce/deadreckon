@@ -1434,7 +1434,7 @@ checks:
             &state.working_dir,
         )
         .expect("clean signs with seam sidecars");
-        let signature = marker.signature.clone();
+        let signature = marker.signature;
         validate_acceptance_marker(&state).expect("marker validates before sidecar edit");
 
         std::fs::write(state.run_root.join("seams.json"), "{\"tampered\":true}\n")
