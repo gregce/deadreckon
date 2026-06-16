@@ -24,6 +24,11 @@
   prior-citation + new-turn (`turn:N`) evidence, so beats may add genuine new
   claims but never cite a turn outside the window. New `skills/live-narrator`
   prompt skill carries the voice.
+- P5: `NarratorWindow` accumulates only the turns since the last beat (never the
+  full trace) and folds them into a rolling summary bounded to 1200 chars by
+  eliding older content — so each beat's model input is a constant ceiling and
+  total narration cost is O(turns), not O(turns²). `turn_record_to_input` maps a
+  persisted `TurnRecord` into the per-turn narrator input.
 
 ## 0.1.1
 
