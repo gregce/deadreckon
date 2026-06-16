@@ -1135,7 +1135,12 @@ fn polish_prompt(state: &PipelineState, skill_path: &Path, suffix: &str) -> Resu
             ("run_summary", run_summary(state, &records)?),
             ("trace_jsonl", traces),
             ("incremental_jsonl", incremental),
-            ("current_narrative", narrative),
+            // Q2 convergence: seed from the full accumulated live narration when
+            // present, falling back to the templated draft.
+            (
+                "current_narrative",
+                live_narrative_digest(&state.run_root).unwrap_or(narrative),
+            ),
             ("implementation_notes", implementation_notes),
             ("changed_files", files),
             ("diff_samples", diff_samples_markdown(&records)),
@@ -1197,6 +1202,67 @@ fn parent_narrative(state: &PipelineState) -> String {
         .join("docs")
         .join(RUN_NARRATIVE);
     fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Minimal view of a live narration beat, just enough to seed the post-hoc
+/// `RUN-NARRATIVE.md` from the accumulated story (Live Narrator rider, Q2).
+#[derive(Deserialize)]
+struct LiveBeatRow {
+    #[serde(default)]
+    headline: String,
+    #[serde(default)]
+    current_work: Vec<LiveClaimRow>,
+    #[serde(default)]
+    live: Option<LiveBeatMetaRow>,
+}
+
+#[derive(Deserialize)]
+struct LiveClaimRow {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct LiveBeatMetaRow {
+    #[serde(default)]
+    covers_turn: u32,
+    #[serde(default)]
+    rolling_summary: Option<String>,
+}
+
+/// Render the full accumulated live narration (every beat in
+/// `<run_root>/narrative/snapshots.jsonl`) into a markdown digest. The post-hoc
+/// polish consolidates this rather than re-deriving from the raw trace, so the
+/// final narrative refines the story the run already told. `None` when no live
+/// beats were written (then the templated draft is used).
+fn live_narrative_digest(run_root: &Path) -> Option<String> {
+    let raw = fs::read_to_string(run_root.join("narrative").join("snapshots.jsonl")).ok()?;
+    let beats: Vec<LiveBeatRow> = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<LiveBeatRow>(line).ok())
+        .filter(|row| row.live.is_some())
+        .collect();
+    if beats.is_empty() {
+        return None;
+    }
+    let mut out = String::from("## Live narration (accumulated beats)\n\n");
+    if let Some(summary) = beats
+        .last()
+        .and_then(|beat| beat.live.as_ref())
+        .and_then(|meta| meta.rolling_summary.as_deref())
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        out.push_str(&format!("Rolling summary: {summary}\n\n"));
+    }
+    for beat in &beats {
+        let covers = beat.live.as_ref().map(|meta| meta.covers_turn).unwrap_or(0);
+        out.push_str(&format!("- [turn {covers}] {}\n", beat.headline));
+        for claim in &beat.current_work {
+            out.push_str(&format!("  - {}\n", claim.text));
+        }
+    }
+    Some(out)
 }
 
 fn write_polished_docs(state: &PipelineState, docs: &PolishedDocs) -> Result<()> {
@@ -1327,4 +1393,45 @@ fn public_file_name(file: &str, state: &PipelineState) -> String {
 #[allow(dead_code)]
 fn required_doc_names() -> [&'static str; 3] {
     [RUN_NARRATIVE, RUN_AS_BUILT, RUN_DECISIONS]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::live_narrative_digest;
+    use tempfile::TempDir;
+
+    #[test]
+    fn posthoc_run_narrative_seeds_from_full_live_beat_history() {
+        let temp = TempDir::new().expect("tempdir");
+        let run_root = temp.path().to_path_buf();
+        let narrative = run_root.join("narrative");
+        std::fs::create_dir_all(&narrative).expect("mkdir");
+        // Two accumulated live beats plus a non-live (legacy) row that must be
+        // ignored by the seeding digest.
+        let lines = [
+            r#"{"headline":"Started run","current_work":[]}"#,
+            r#"{"headline":"Wired the bus","current_work":[{"text":"added narrator task"}],"live":{"covers_turn":3,"rolling_summary":"Through turn 3: plumbing."}}"#,
+            r#"{"headline":"Continuity landed","current_work":[{"text":"amend-merge beats"}],"live":{"covers_turn":7,"rolling_summary":"Through turn 7: continuity + windowing."}}"#,
+        ];
+        std::fs::write(narrative.join("snapshots.jsonl"), lines.join("\n")).expect("write");
+
+        let digest = live_narrative_digest(&run_root).expect("digest from live beats");
+        assert!(digest.contains("Wired the bus"), "includes earlier beat");
+        assert!(digest.contains("Continuity landed"), "includes later beat");
+        assert!(digest.contains("[turn 7]"), "carries beat turn stamps");
+        assert!(
+            digest.contains("Through turn 7"),
+            "carries the latest rolling summary"
+        );
+        assert!(
+            !digest.contains("Started run"),
+            "non-live legacy rows are not part of the live story"
+        );
+    }
+
+    #[test]
+    fn live_narrative_digest_absent_without_beats() {
+        let temp = TempDir::new().expect("tempdir");
+        assert!(live_narrative_digest(temp.path()).is_none());
+    }
 }

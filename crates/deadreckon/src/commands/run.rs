@@ -36,10 +36,8 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         no_narrate,
         narrator_model,
     } = args;
-    if narrate && no_narrate {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(
-            "pass only one of --narrate / --no-narrate".to_string(),
-        )));
+    if let Err(message) = crate::narrator::validate_narration_flags(narrate, no_narrate) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(message)));
     }
     let auto_confirm = yes || no_confirm || quiet;
     let effective_no_hints = no_hints || quiet;
@@ -55,6 +53,15 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
+    if let Some(model) = narrator_model.as_deref()
+        && let Ok(registry) =
+            deadreckon_providers::registry::ProviderRegistry::with_overrides(paths.home())
+        && !crate::narrator::narrator_model_known(&registry, model)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            crate::narrator::narrator_model_refusal(model),
+        )));
+    }
     let plain = crate::narrator::effective_plain(
         plain,
         defaults.plain.unwrap_or(false),

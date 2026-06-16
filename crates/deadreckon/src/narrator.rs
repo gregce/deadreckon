@@ -161,6 +161,33 @@ pub(crate) fn effective_plain(
     plain_flag || configured || no_color || !stdout_is_tty
 }
 
+/// Refuse conflicting narration flags with a `try:`-style message.
+pub(crate) fn validate_narration_flags(narrate: bool, no_narrate: bool) -> Result<(), String> {
+    if narrate && no_narrate {
+        Err("pass only one of --narrate / --no-narrate".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether a `--narrator-model` id appears in any provider catalog (id or alias).
+pub(crate) fn narrator_model_known(
+    registry: &deadreckon_providers::registry::ProviderRegistry,
+    model: &str,
+) -> bool {
+    registry.iter().any(|descriptor| {
+        descriptor
+            .model_catalog
+            .iter()
+            .any(|entry| entry.id == model || entry.aliases.iter().any(|alias| alias == model))
+    })
+}
+
+/// Refusal message for an unknown narrator model, pointing at `deadreckon models`.
+pub(crate) fn narrator_model_refusal(model: &str) -> String {
+    format!("unknown narrator model '{model}'; try: deadreckon models")
+}
+
 /// The narrator engine: holds the rolling story and turns run events into beats
 /// via the window + cadence + continuity machinery. Sync logic; the async task
 /// drives it and performs the provider call between prompt and commit.
@@ -649,6 +676,33 @@ mod tests {
         assert!(
             !text.as_bytes().contains(&0x1b),
             "append-only: no in-place cursor escapes"
+        );
+    }
+
+    #[test]
+    fn narrate_conflicting_flags_refuse_with_try_line() {
+        let err = validate_narration_flags(true, true).expect_err("conflict refused");
+        assert!(err.contains("--narrate") && err.contains("--no-narrate"));
+        assert!(validate_narration_flags(true, false).is_ok());
+        assert!(validate_narration_flags(false, true).is_ok());
+        assert!(validate_narration_flags(false, false).is_ok());
+    }
+
+    #[test]
+    fn bad_narrator_model_refuses_with_models_hint() {
+        let registry =
+            deadreckon_providers::registry::ProviderRegistry::builtin().expect("registry");
+        assert!(
+            narrator_model_known(&registry, "haiku"),
+            "catalog id is known"
+        );
+        assert!(
+            !narrator_model_known(&registry, "totally-bogus-model"),
+            "a typo is unknown"
+        );
+        assert!(
+            narrator_model_refusal("totally-bogus-model").contains("deadreckon models"),
+            "the refusal points at the models command"
         );
     }
 

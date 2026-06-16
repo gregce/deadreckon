@@ -52,6 +52,14 @@
   Piped runs now drive plain progress (stdout-TTY auto-detect) so a run is never
   silent between the start and exit cards. Raw cursor-control ANSI moved to the
   `ui` module to honor the source coherence contract.
+- P10: attach + post-hoc convergence — the attach Narrative view renders the
+  live beats the run already wrote to `snapshots.jsonl` with no provider call;
+  the post-hoc `RUN-NARRATIVE.md` seeds `current_narrative` from the full
+  accumulated live narration (digest of every beat + the latest rolling
+  summary), consolidating the live story rather than re-deriving from the raw
+  trace. `--narrator-model` is validated against the catalog and refused with a
+  `try: deadreckon models` hint; conflicting `--narrate`/`--no-narrate` is
+  refused.
 
 ## 0.1.1
 
