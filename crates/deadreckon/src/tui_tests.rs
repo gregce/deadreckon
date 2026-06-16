@@ -1030,6 +1030,7 @@ fn spend_record(turn: u32) -> SpendRecord {
         estimated: false,
         wall_time_seconds: None,
         wall_time_cap_seconds: None,
+        kind: "loop".to_string(),
     }
 }
 

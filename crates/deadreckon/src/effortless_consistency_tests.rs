@@ -43,6 +43,7 @@ fn subscription_state(temp: &TempDir) -> (DeadreckonPaths, deadreckon_core::Pipe
             estimated: false,
             wall_time_seconds: Some(3.0),
             wall_time_cap_seconds: None,
+            kind: "loop".to_string(),
         },
     )
     .expect("spend");

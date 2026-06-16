@@ -53,6 +53,50 @@ pub struct RunLoopConfig {
     pub event_sender: Option<broadcast::Sender<RunEvent>>,
     pub cancellation_token: Option<CancellationToken>,
     pub docs: RunLoopDocsConfig,
+    /// Live-narration settings. `None` disables narration (every existing
+    /// constructor leaves it `None`); the CLI sets `Some(..)` to spawn the
+    /// in-process narrator sidecar that subscribes to `event_sender`.
+    pub narrate: Option<NarratorConfig>,
+}
+
+/// Settings for the live narrator sidecar. Defaults mirror the
+/// `[defaults] narrate_*` config knobs documented in the Live Narrator rider.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NarratorConfig {
+    /// Foreground calm block on a TTY (default on for run/orchestrate/campaign).
+    pub foreground: bool,
+    /// Headless append-only beats to stderr (the `--narrate` opt-in).
+    pub headless_append: bool,
+    /// Pin a narrator model id; `None` uses the subscription-first preference order.
+    pub model_override: Option<String>,
+    /// Per-run narrator spend cap (subscription backends record $0).
+    pub budget_usd: f64,
+    /// Max lines in the calm foreground block.
+    pub lines: usize,
+    /// Minimum seconds between model beats.
+    pub min_gap_seconds: u64,
+    /// Force a beat after this many turns even under the gap.
+    pub turn_burst: u32,
+    /// A long single turn gets a beat after this many quiet seconds.
+    pub quiet_seconds: u64,
+    /// Per-run beat cap.
+    pub max_beats: u32,
+}
+
+impl Default for NarratorConfig {
+    fn default() -> Self {
+        Self {
+            foreground: true,
+            headless_append: false,
+            model_override: None,
+            budget_usd: 0.50,
+            lines: 4,
+            min_gap_seconds: 30,
+            turn_burst: 8,
+            quiet_seconds: 45,
+            max_beats: 200,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +358,7 @@ pub async fn run_turn_loop(
                         estimated: false,
                         wall_time_seconds: Some(elapsed),
                         wall_time_cap_seconds: config.max_wall_seconds,
+                        kind: "loop".to_string(),
                     },
                 )?;
                 state.pause_reason = Some("wall-clock cap reached mid-turn".to_string());
@@ -405,6 +450,7 @@ pub async fn run_turn_loop(
                 estimated: false,
                 wall_time_seconds: response.spend.wall_time_seconds,
                 wall_time_cap_seconds: config.max_wall_seconds,
+                kind: "loop".to_string(),
             },
         )?;
         emit_event(
@@ -1920,13 +1966,63 @@ mod tests {
     use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
 
     use super::{
-        RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, append_tool_refusal, bash_policy_refusal,
-        build_cli_subagent_prompt, build_prompt, complete_within_wall_budget, ensure_sandbox_toml,
-        implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
-        load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, policy_seam_refusal,
-        policy_seam_refusal_message, provider_output_name, run_turn_loop, safe_working_path,
-        safe_working_path_with_policy, save_history,
+        NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, append_tool_refusal,
+        bash_policy_refusal, build_cli_subagent_prompt, build_prompt, complete_within_wall_budget,
+        ensure_sandbox_toml, implementation_notes_ready_or_request_followup,
+        is_direct_api_provider_kind, load_or_reconstruct_history,
+        load_tool_policy_from_sandbox_toml, policy_seam_refusal, policy_seam_refusal_message,
+        provider_output_name, run_turn_loop, safe_working_path, safe_working_path_with_policy,
+        save_history,
     };
+
+    fn base_run_loop_config() -> RunLoopConfig {
+        RunLoopConfig {
+            provider: Some("smoke".to_string()),
+            max_spend_usd: None,
+            max_wall_seconds: None,
+            sandbox_backend: SandboxBackend::None,
+            no_seams: true,
+            max_turns: 1,
+            from_turn: None,
+            event_sender: None,
+            cancellation_token: None,
+            docs: RunLoopDocsConfig {
+                home: PathBuf::from("/tmp"),
+                config_path: None,
+                doc_provider: None,
+                doc_provider_source: None,
+                doc_subskills: Vec::new(),
+                token_budget: 0,
+                budget_cap_usd: None,
+                doc_skill: "run-narrator".to_string(),
+                no_docs: true,
+            },
+            narrate: None,
+        }
+    }
+
+    #[test]
+    fn run_loop_config_narrate_defaults_none_keeps_existing_constructors() {
+        // The additive field is None by default, so prior constructors compile
+        // unchanged; the CLI opts in by setting Some(..).
+        let off = base_run_loop_config();
+        assert!(off.narrate.is_none());
+
+        let defaults = NarratorConfig::default();
+        assert!(defaults.foreground);
+        assert!(!defaults.headless_append);
+        assert_eq!(defaults.lines, 4);
+        assert_eq!(defaults.min_gap_seconds, 30);
+        assert_eq!(defaults.turn_burst, 8);
+        assert_eq!(defaults.quiet_seconds, 45);
+        assert_eq!(defaults.max_beats, 200);
+
+        let on = RunLoopConfig {
+            narrate: Some(NarratorConfig::default()),
+            ..base_run_loop_config()
+        };
+        assert!(on.narrate.expect("narrate set").foreground);
+    }
 
     fn create_smoke_run(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -2004,6 +2100,7 @@ mod tests {
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
                     config_path,
@@ -2041,6 +2138,7 @@ mod tests {
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
                     config_path: Some(config_path),
@@ -2541,6 +2639,7 @@ fallback_context_window = 80
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
                     config_path: Some(config_path),
@@ -2906,6 +3005,7 @@ fallback_context_window = 80
                     from_turn: None,
                     event_sender: Some(bus.sender()),
                     cancellation_token: Some(cancel_for_loop),
+                    narrate: None,
                     docs: RunLoopDocsConfig {
                         home: paths.home().to_path_buf(),
                         config_path: None,
@@ -2974,6 +3074,7 @@ fallback_context_window = 80
                     from_turn: None,
                     event_sender: Some(bus.sender()),
                     cancellation_token: None,
+                    narrate: None,
                     docs: RunLoopDocsConfig {
                         home: paths.home().to_path_buf(),
                         config_path: None,
@@ -3031,6 +3132,7 @@ fallback_context_window = 80
                 from_turn: None,
                 event_sender: Some(bus.sender()),
                 cancellation_token: None,
+                narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
                     config_path: None,
@@ -3134,6 +3236,7 @@ storage = "jsonl"
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
                     config_path: Some(config_path),
@@ -3691,6 +3794,7 @@ network = []
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
                     config_path: None,

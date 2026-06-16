@@ -8,6 +8,12 @@ use walkdir::WalkDir;
 use crate::error::{DeadreckonError, IoContext, Result};
 use crate::state::{PipelineState, append_json_line};
 
+/// Default `kind` for spend rows written before the field existed and for the
+/// run loop's own turns. The live narrator writes `"narrator"` instead.
+pub fn spend_kind_loop() -> String {
+    "loop".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpendRecord {
     pub timestamp: DateTime<Utc>,
@@ -27,6 +33,10 @@ pub struct SpendRecord {
     pub wall_time_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_time_cap_seconds: Option<f64>,
+    /// `"loop"` for the run loop's own turns, `"narrator"` for live-narration
+    /// calls. Defaulted so legacy spend.jsonl rows still parse.
+    #[serde(default = "spend_kind_loop")]
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +162,24 @@ mod tests {
     use crate::state::{RunOptions, create_run};
 
     use super::{inventory_files, restore_snapshot, snapshot_working};
+
+    #[test]
+    fn spend_record_kind_defaults_to_loop_when_absent() {
+        // A legacy spend.jsonl row written before `kind` existed must still
+        // parse, defaulting to "loop"; a narrator row round-trips as "narrator".
+        let legacy = r#"{"timestamp":"2026-06-15T00:00:00Z","turn":3,"provider":"anthropic","model":"claude-sonnet-4-5","input_tokens":10,"output_tokens":20,"cost_usd":0.01,"total_cost_usd":0.05,"cap_usd":null}"#;
+        let parsed: super::SpendRecord = serde_json::from_str(legacy).expect("legacy row parses");
+        assert_eq!(parsed.kind, "loop");
+        assert_eq!(super::spend_kind_loop(), "loop");
+
+        let narrator = super::SpendRecord {
+            kind: "narrator".to_string(),
+            ..parsed
+        };
+        let encoded = serde_json::to_string(&narrator).expect("encode");
+        let round: super::SpendRecord = serde_json::from_str(&encoded).expect("round-trip");
+        assert_eq!(round.kind, "narrator");
+    }
 
     #[test]
     fn snapshot_and_restore_working_tree() {

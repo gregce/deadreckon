@@ -1585,6 +1585,7 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
                     config_path: Some(paths.config_path()),
@@ -1842,6 +1843,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
                     config_path: Some(paths.config_path()),

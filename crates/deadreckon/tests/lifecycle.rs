@@ -1874,6 +1874,7 @@ fn finish_exports_completed_fresh_run() {
             estimated: false,
             wall_time_seconds: Some(4.0),
             wall_time_cap_seconds: None,
+            kind: "loop".to_string(),
         },
     )
     .expect("spend");

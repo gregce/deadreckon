@@ -202,6 +202,26 @@ pub(crate) struct NarrativeProviderState {
     pub(crate) subscription_seconds: f64,
 }
 
+/// Who wrote a snapshot. `Live` = the in-process narrator the run spawns;
+/// `Attach` = an on-demand refresh issued from the attach TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NarrativeSource {
+    Live,
+    Attach,
+}
+
+/// Schema-2 continuity fields carried by a live narration beat. Absent on
+/// legacy schema-1 snapshots (which deserialize with `live: None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveBeat {
+    pub(crate) beat_seq: u64,
+    pub(crate) covers_turn: u32,
+    pub(crate) source: NarrativeSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rolling_summary: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct NarrativeSnapshot {
     pub(crate) version: u32,
@@ -224,6 +244,8 @@ pub(crate) struct NarrativeSnapshot {
     pub(crate) agent_table: Vec<NarrativeAgentRow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) coordination_notes: Vec<NarrativeClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) live: Option<LiveBeat>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -727,6 +749,7 @@ pub(crate) fn build_run_projection(input: &RunNarrativeInput<'_>) -> NarrativePr
         plan_status: None,
         agent_table: Vec::new(),
         coordination_notes: Vec::new(),
+        live: None,
     };
     let narrative_state = NarrativeState {
         version: 1,
@@ -969,6 +992,7 @@ pub(crate) fn build_plan_projection(input: &PlanNarrativeInput<'_>) -> Narrative
         plan_status: Some(plan_status_label(plan.status).to_string()),
         agent_table,
         coordination_notes,
+        live: None,
     };
     let mut latest_covered = coverage;
     latest_covered.architecture_graph_hash = Some(graph_hash);
@@ -2736,6 +2760,52 @@ mod tests {
         PlanTask, PlanTaskStatus, RunOptions, acceptance_progress_path_for_run_root, create_run,
     };
     use tempfile::TempDir;
+
+    #[test]
+    fn narrative_snapshot_schema2_roundtrips_and_reads_legacy_schema1() {
+        // A legacy schema-1 snapshot (no `live` field) must still deserialize,
+        // with `live` defaulting to None.
+        let legacy = r#"{
+            "version": 1,
+            "snapshot_id": "snap-1",
+            "scope": "run",
+            "target_id": "run-abc",
+            "created_at": "2026-06-15T00:00:00Z",
+            "status": "deterministic",
+            "source_window": {},
+            "coverage": {"skipped_events": 0, "redacted_events": 0, "known_gaps": []},
+            "headline": "Started",
+            "current_work": [],
+            "architecture_notes": [],
+            "risks": [],
+            "next_likely": [],
+            "citations": []
+        }"#;
+        let parsed: NarrativeSnapshot =
+            serde_json::from_str(legacy).expect("legacy schema-1 snapshot parses");
+        assert!(
+            parsed.live.is_none(),
+            "legacy snapshot carries no live beat"
+        );
+
+        // A schema-2 live beat round-trips byte-for-byte through serde.
+        let live = NarrativeSnapshot {
+            live: Some(LiveBeat {
+                beat_seq: 7,
+                covers_turn: 14,
+                source: NarrativeSource::Live,
+                rolling_summary: Some("Through turn 14: wired the bus.".to_string()),
+            }),
+            ..parsed
+        };
+        let encoded = serde_json::to_string(&live).expect("encode schema-2");
+        let round: NarrativeSnapshot = serde_json::from_str(&encoded).expect("round-trip");
+        assert_eq!(round.live, live.live);
+        let beat = round.live.expect("live beat present");
+        assert_eq!(beat.beat_seq, 7);
+        assert_eq!(beat.covers_turn, 14);
+        assert_eq!(beat.source, NarrativeSource::Live);
+    }
 
     #[test]
     fn architecture_graph_requires_evidence_on_nodes_and_edges() {
