@@ -1714,6 +1714,88 @@ impl NarratorWindow {
     }
 }
 
+/// A minimal starting snapshot for the live rolling story. The first beat
+/// amends this; until then it is the calm "starting" state.
+pub(crate) fn seed_live_snapshot(run_id: &str) -> NarrativeSnapshot {
+    NarrativeSnapshot {
+        version: 2,
+        snapshot_id: format!("live-seed-{run_id}"),
+        scope: NarrativeScope::Run,
+        target_id: run_id.to_string(),
+        created_at: Utc::now(),
+        status: NarrativeStatus::Deterministic,
+        source_window: NarrativeSourceWindow::default(),
+        coverage: NarrativeSnapshotCoverage::default(),
+        headline: "Run starting…".to_string(),
+        current_work: Vec::new(),
+        architecture_notes: Vec::new(),
+        risks: Vec::new(),
+        next_likely: Vec::new(),
+        citations: Vec::new(),
+        plan_status: None,
+        agent_table: Vec::new(),
+        coordination_notes: Vec::new(),
+        live: None,
+    }
+}
+
+/// Build a deterministic floor beat from the window with no provider call —
+/// the always-available narration when no provider is credentialed, the budget
+/// is exhausted, or a model beat failed. Each claim cites its turn evidence id.
+pub(crate) fn build_live_floor_beat(
+    previous: &NarrativeSnapshot,
+    new_turns: &[LiveTurnInput],
+    meta: LiveBeatMeta,
+) -> NarrativeSnapshot {
+    let mut next = previous.clone();
+    if let Some(last) = new_turns.last() {
+        next.headline = format!("turn {}: {}", last.turn, last.title);
+    }
+    if !new_turns.is_empty() {
+        next.current_work = new_turns
+            .iter()
+            .map(|turn| NarrativeClaim {
+                text: truncate_chars(turn.summary.trim(), 160),
+                evidence: vec![turn.evidence_id()],
+                confidence: "medium".to_string(),
+            })
+            .collect();
+    }
+    next.status = NarrativeStatus::Deterministic;
+    next.created_at = Utc::now();
+    next.live = Some(LiveBeat {
+        beat_seq: meta.beat_seq,
+        covers_turn: meta.covers_turn,
+        source: NarrativeSource::Live,
+        rolling_summary: meta.rolling_summary,
+    });
+    next.snapshot_id = snapshot_id(&(
+        &next.scope,
+        &next.target_id,
+        &next.headline,
+        &next.current_work,
+        meta.beat_seq,
+        meta.covers_turn,
+        "floor",
+    ));
+    next
+}
+
+/// Read the `TurnRecord` for `turn` from an incremental docs JSONL file (the
+/// path carried by a `DocsCheckpoint` event). Returns the last matching record.
+pub(crate) fn read_turn_record(incremental_path: &Path, turn: u32) -> Option<TurnRecord> {
+    let raw = fs::read_to_string(incremental_path).ok()?;
+    let mut found = None;
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        if let Ok(record) = serde_json::from_str::<TurnRecord>(line)
+            && record.turn == turn
+        {
+            found = Some(record);
+        }
+    }
+    found
+}
+
 fn read_current_projection_if_covered(
     candidate: &NarrativeProjection,
     narrative_dir: &Path,

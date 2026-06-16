@@ -373,13 +373,29 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         run_prefix(&state.run_id)
     );
     let run_id_for_plain = state.run_id.clone();
-    // Live narrator (P3 wiring): on a TTY, narration is on by default; the bus
-    // sender feeds the loop and a sidecar task drains it. Off-TTY without
+    // Live narrator: on a TTY, narration is on by default; the bus sender feeds
+    // the loop and the sidecar engine turns events into beats. Off-TTY without
     // --narrate, resolve returns None and the run is wired exactly as before.
     let narrator_config =
         crate::narrator::resolve_narrator_config(io::stdin().is_terminal(), false, false, None);
-    let (narrate_event_sender, narrator_handle) =
-        crate::narrator::build_narration(narrator_config.clone());
+    let (narrate_event_sender, narrator_handle) = match narrator_config.clone() {
+        Some(config) => {
+            let backend = crate::narrator::resolve_narrator_backend(
+                paths.home(),
+                config.model_override.as_deref(),
+            );
+            let ctx = crate::narrator::NarratorCtx {
+                run_id: state.run_id.clone(),
+                run_root: state.run_root.clone(),
+                config_path: Some(paths.config_path()),
+                backend,
+                config,
+            };
+            let (sender, handle) = crate::narrator::build_narration(ctx);
+            (Some(sender), Some(handle))
+        }
+        None => (None, None),
+    };
     let turn_loop = run_turn_loop(
         &mut state,
         &router,
