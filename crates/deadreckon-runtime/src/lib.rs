@@ -24,4 +24,6 @@ pub use seam::{
     FailPolicy, SeamCommandConfig, SeamKind, SeamOutcome, SeamRunCtx, SeamsConfig, dispatch_seam,
     parse_seams_config, read_seams_config, resolve_catalog_override, write_seams_audit,
 };
-pub use turn_loop::{RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, run_turn_loop};
+pub use turn_loop::{
+    NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, run_turn_loop,
+};

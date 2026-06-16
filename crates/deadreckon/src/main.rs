@@ -116,6 +116,7 @@ mod cli;
 mod commands;
 mod friendliness_contract;
 mod narrative;
+mod narrator;
 mod plan_event_bus;
 mod product;
 mod prompt;
