@@ -1027,6 +1027,26 @@ pub(crate) fn build_plan_projection(input: &PlanNarrativeInput<'_>) -> Narrative
     }
 }
 
+/// The calm foreground block: the headline plus the top `current_work` claims,
+/// bounded to `max_lines`. The few-lines-max counterpart to
+/// [`narrative_plain_lines`] for the live run surface (P8).
+#[allow(dead_code)] // wired into the narrator task's foreground render in P8 integration
+pub(crate) fn live_block_lines(snapshot: &NarrativeSnapshot, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::with_capacity(max_lines);
+    lines.push(snapshot.headline.clone());
+    for claim in &snapshot.current_work {
+        if lines.len() >= max_lines {
+            break;
+        }
+        lines.push(format!("· {}", claim.text));
+    }
+    lines.truncate(max_lines);
+    lines
+}
+
 pub(crate) fn narrative_plain_lines(
     projection: &NarrativeProjection,
     visual: NarrativeVisualMode,
@@ -3278,6 +3298,22 @@ mod tests {
             outcome: "ok".to_string(),
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn foreground_block_is_bounded_to_narrate_lines() {
+        let mut snapshot = live_previous_snapshot();
+        snapshot.headline = "Working".to_string();
+        snapshot.current_work = (0..10)
+            .map(|index| NarrativeClaim {
+                text: format!("claim {index}"),
+                evidence: vec!["state".to_string()],
+                confidence: "high".to_string(),
+            })
+            .collect();
+        let lines = live_block_lines(&snapshot, 4);
+        assert!(lines.len() <= 4, "never exceeds narrate_lines");
+        assert_eq!(lines[0], "Working", "leads with the headline");
     }
 
     #[test]

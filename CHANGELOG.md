@@ -41,6 +41,11 @@
   the cap is hit (or the backend is the floor); `narrator_spend_record` writes
   `kind: "narrator"` rows so the run's spend math (which filters `kind: "loop"`)
   never counts narration. Subscription backends record $0.
+- P8: foreground calm block — `live_block_lines` renders the headline plus the
+  top current_work claims bounded to `narrate_lines` (a few lines max, never a
+  stream); `ForegroundBlock` redraws in place (clearing the prior block) so the
+  block updates rather than scrolls. Foreground narration is on by default on a
+  TTY and off under `--no-narrate`.
 
 ## 0.1.1
 
