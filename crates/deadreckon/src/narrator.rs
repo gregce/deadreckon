@@ -231,6 +231,39 @@ pub(crate) fn narrator_spend_record(
     }
 }
 
+/// In-place renderer for the calm foreground block. Each render first clears
+/// the previously drawn lines (cursor up + clear line) and then draws the new
+/// ones, so the block updates in place rather than scrolling — calm, not a
+/// stream.
+#[allow(dead_code)] // wired into the narrator task's foreground render in P8 integration
+pub(crate) struct ForegroundBlock {
+    drawn_lines: usize,
+}
+
+#[allow(dead_code)] // wired into the narrator task's foreground render in P8 integration
+impl ForegroundBlock {
+    pub(crate) fn new() -> Self {
+        Self { drawn_lines: 0 }
+    }
+
+    pub(crate) fn render(&mut self, lines: &[String]) -> String {
+        let mut out = String::new();
+        for _ in 0..self.drawn_lines {
+            out.push_str("\x1b[1A\x1b[2K");
+        }
+        for line in lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+        self.drawn_lines = lines.len();
+        out
+    }
+
+    pub(crate) fn drawn_lines(&self) -> usize {
+        self.drawn_lines
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -414,5 +447,37 @@ mod tests {
         assert_eq!(row.cost_usd, 0.0);
         assert!(row.subscription);
         assert_eq!(row.kind, "narrator");
+    }
+
+    #[test]
+    fn foreground_block_updates_in_place_not_appends() {
+        let mut block = ForegroundBlock::new();
+        let first = block.render(&["headline".to_string(), "· work".to_string()]);
+        assert!(
+            !first.contains("\x1b[1A"),
+            "the first render draws without clearing anything"
+        );
+        assert_eq!(block.drawn_lines(), 2);
+
+        let second = block.render(&["new headline".to_string()]);
+        assert_eq!(
+            second.matches("\x1b[1A").count(),
+            2,
+            "the next render clears the two prior lines in place rather than appending"
+        );
+        assert_eq!(block.drawn_lines(), 1);
+    }
+
+    #[test]
+    fn foreground_on_by_default_off_with_no_narrate() {
+        assert!(
+            resolve_narrator_config(true, false, false, None)
+                .expect("tty narrates by default")
+                .foreground
+        );
+        assert!(
+            resolve_narrator_config(true, false, true, None).is_none(),
+            "--no-narrate turns the foreground block off"
+        );
     }
 }
