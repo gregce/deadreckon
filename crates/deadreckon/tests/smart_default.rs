@@ -8,7 +8,6 @@
 use std::fs;
 
 use deadreckon_core::{DeadreckonPaths, RunOptions, create_run};
-use tempfile::TempDir;
 
 mod common;
 
