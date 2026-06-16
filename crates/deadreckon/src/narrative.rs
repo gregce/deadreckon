@@ -9,8 +9,8 @@ use deadreckon_core::flight::{FlightEvent, read_flight_events};
 use deadreckon_core::{
     DeadreckonPaths, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind, PlanStatus,
     PlanTaskStatus, RUN_EVENTS_JSONL, RunEvent, RunEventKind, RunStatus, SpendRecord, TraceRecord,
-    acceptance_progress_path_for_run_root, load_run, marker_path_for_run_root, plan_status_label,
-    plan_task_status_label, run_status_label,
+    TurnRecord, acceptance_progress_path_for_run_root, load_run, marker_path_for_run_root,
+    plan_status_label, plan_task_status_label, run_status_label,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1556,6 +1556,142 @@ pub(crate) fn append_narrative_snapshot(
 ) -> crate::Result<()> {
     fs::create_dir_all(narrative_dir)?;
     append_json_line(&narrative_dir.join(NARRATIVE_SNAPSHOTS_JSONL), snapshot)
+}
+
+/// Hard cap on the carried rolling summary. Bounding the carry — not the beat
+/// history — is what keeps per-beat model input O(1) and total cost O(turns).
+pub(crate) const ROLLING_SUMMARY_CAP: usize = 1200;
+
+#[allow(dead_code)] // wired into the narrator task in P6
+fn truncate_chars(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+/// Fold the windowed turns into the prior rolling summary, bounded to `cap`
+/// chars by keeping the most recent content (older context is elided). The
+/// beat history in snapshots.jsonl stays whole; only this carry is bounded.
+#[allow(dead_code)] // wired into the narrator task in P6
+fn fold_rolling_summary(prev: Option<&str>, turns: &[LiveTurnInput], cap: usize) -> String {
+    let mut summary = prev.unwrap_or_default().to_string();
+    for turn in turns {
+        if !summary.is_empty() {
+            summary.push(' ');
+        }
+        summary.push_str(&format!(
+            "t{}: {}",
+            turn.turn,
+            truncate_chars(turn.summary.trim(), 80)
+        ));
+    }
+    let count = summary.chars().count();
+    if count <= cap || cap == 0 {
+        return summary;
+    }
+    let tail: String = summary.chars().skip(count - (cap - 1)).collect();
+    format!("…{tail}")
+}
+
+/// Map a persisted `TurnRecord` to the live narrator's per-turn input.
+#[allow(dead_code)] // wired into the narrator task in P6
+pub(crate) fn turn_record_to_input(record: &TurnRecord) -> LiveTurnInput {
+    let summary = if record.response_summary.trim().is_empty() {
+        record.outcome.clone()
+    } else {
+        record.response_summary.clone()
+    };
+    LiveTurnInput {
+        turn: record.turn,
+        title: record.title.clone(),
+        summary,
+        tool_kind: record.tool_kind.clone(),
+        outcome: record.outcome.clone(),
+        files: record.files.iter().map(|file| file.path.clone()).collect(),
+    }
+}
+
+/// Accumulates the turns seen since the last beat. The narrator feeds the model
+/// only this window (plus the carried rolling summary), never the full trace —
+/// so each beat's input is bounded and total cost is O(turns), not O(turns²).
+#[allow(dead_code)] // wired into the narrator task in P6
+pub(crate) struct NarratorWindow {
+    last_covered_turn: u32,
+    pending: Vec<LiveTurnInput>,
+    rolling_summary: Option<String>,
+    cap: usize,
+}
+
+#[allow(dead_code)] // wired into the narrator task in P6
+impl NarratorWindow {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_covered_turn: 0,
+            pending: Vec::new(),
+            rolling_summary: None,
+            cap: ROLLING_SUMMARY_CAP,
+        }
+    }
+
+    /// Record a turn, ignoring ones already covered by a prior beat or already
+    /// pending (so re-observed checkpoints never double-count).
+    pub(crate) fn observe(&mut self, input: LiveTurnInput) {
+        if input.turn <= self.last_covered_turn {
+            return;
+        }
+        if self.pending.iter().any(|turn| turn.turn == input.turn) {
+            return;
+        }
+        self.pending.push(input);
+    }
+
+    pub(crate) fn pending(&self) -> &[LiveTurnInput] {
+        &self.pending
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub(crate) fn rolling_summary(&self) -> Option<&str> {
+        self.rolling_summary.as_deref()
+    }
+
+    pub(crate) fn covers_turn(&self) -> Option<u32> {
+        self.pending.iter().map(|turn| turn.turn).max()
+    }
+
+    /// Commit a beat: fold the window into the bounded rolling summary, advance
+    /// the covered watermark, and clear the window. Returns the covered turn.
+    pub(crate) fn commit_beat(&mut self) -> Option<u32> {
+        let covers = self.covers_turn()?;
+        self.rolling_summary = Some(fold_rolling_summary(
+            self.rolling_summary.as_deref(),
+            &self.pending,
+            self.cap,
+        ));
+        self.last_covered_turn = covers;
+        self.pending.clear();
+        Some(covers)
+    }
+
+    /// Chars of model input this beat would carry: the bounded rolling summary
+    /// plus the pending window — independent of how many turns the run has run.
+    pub(crate) fn beat_input_chars(&self) -> usize {
+        let summary = self
+            .rolling_summary
+            .as_deref()
+            .map(|text| text.chars().count())
+            .unwrap_or(0);
+        let turns: usize = self
+            .pending
+            .iter()
+            .map(|turn| turn.title.chars().count() + turn.summary.chars().count())
+            .sum();
+        summary + turns
+    }
 }
 
 fn read_current_projection_if_covered(
@@ -3131,6 +3267,76 @@ mod tests {
             live_meta(),
         );
         assert!(result.is_ok(), "a beat citing a windowed turn is accepted");
+    }
+
+    fn window_turn(turn: u32, summary: &str) -> LiveTurnInput {
+        LiveTurnInput {
+            turn,
+            title: format!("turn {turn}"),
+            summary: summary.to_string(),
+            tool_kind: "bash".to_string(),
+            outcome: "ok".to_string(),
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn narrator_window_feeds_only_new_turns_not_full_trace() {
+        let mut window = NarratorWindow::new();
+        for turn in 1..=3 {
+            window.observe(window_turn(turn, "did work"));
+        }
+        assert_eq!(
+            window.pending().iter().map(|t| t.turn).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(window.commit_beat(), Some(3));
+        assert!(!window.has_pending());
+
+        window.observe(window_turn(3, "already covered")); // <= watermark, ignored
+        window.observe(window_turn(4, "new work"));
+        assert_eq!(
+            window.pending().iter().map(|t| t.turn).collect::<Vec<_>>(),
+            vec![4],
+            "the window carries only the new turn, never the whole 1..4 trace"
+        );
+    }
+
+    #[test]
+    fn rolling_summary_stays_under_cap_over_120_turns() {
+        let mut window = NarratorWindow::new();
+        let long = "a fairly long per-turn summary sentence ".repeat(8);
+        for turn in 1..=120u32 {
+            window.observe(window_turn(turn, &long));
+            window.commit_beat();
+            let len = window
+                .rolling_summary()
+                .map(|s| s.chars().count())
+                .unwrap_or(0);
+            assert!(
+                len <= ROLLING_SUMMARY_CAP,
+                "rolling summary stays bounded at turn {turn}: {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrator_input_token_estimate_is_o_turns_not_o_turns_squared() {
+        let mut window = NarratorWindow::new();
+        let summary = "summary fragment ".repeat(16);
+        let mut max_estimate = 0usize;
+        for turn in 1..=120u32 {
+            window.observe(window_turn(turn, &summary));
+            max_estimate = max_estimate.max(window.beat_input_chars());
+            window.commit_beat();
+        }
+        // Per-beat input is the bounded rolling summary plus a single window
+        // turn — a constant ceiling regardless of run length. Accumulating the
+        // full trace would be ~120x larger; this bound rules that out.
+        assert!(
+            max_estimate <= ROLLING_SUMMARY_CAP + 1000,
+            "per-beat input stays O(1): {max_estimate}"
+        );
     }
 
     #[test]
