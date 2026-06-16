@@ -1,19 +1,38 @@
 //! The live narrator sidecar: an in-process task the run spawns to narrate
 //! progress in plain English while the turn loop works.
 //!
-//! P3 establishes the plumbing — resolve whether narration is on, build a
-//! [`RunEventBus`] whose sender feeds `RunLoopConfig.event_sender`, and spawn a
-//! cancellable task that drains run events. Continuity, cadence, provider
-//! calls, and rendering land in later phases; here the task is a clean drain
-//! that stops the instant the run finishes (cancellation) or the bus closes.
+//! A [`RunEventBus`] sender feeds `RunLoopConfig.event_sender`; the spawned
+//! [`NarratorEngine`] subscribes and, on each turn checkpoint, windows the new
+//! turn, decides cadence, and (when due) builds a continuity prompt, calls the
+//! cheap narrator model, and appends an amended beat to `snapshots.jsonl` —
+//! falling back to a deterministic floor beat when no provider is available,
+//! the budget is spent, or a model call fails. Between beats a $0 ticker keeps
+//! a long turn from looking frozen. The task stops the instant the run finishes
+//! (cancellation) or the bus closes, flushing a final beat.
 
-use chrono::Utc;
-use deadreckon_core::{RunEvent, RunEventBus, SpendRecord};
-use deadreckon_providers::{NarratorBackend, ProviderResponse};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use deadreckon_core::{RunEvent, RunEventBus, RunEventKind, SpendRecord};
+use deadreckon_providers::{
+    NarratorBackend, ProviderRequest, ProviderResponse, ProviderRouter, select_narrator_backend,
+};
 use deadreckon_runtime::NarratorConfig;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+use crate::narrative::{
+    LiveBeatMeta, NarrativeProviderRefresh, NarrativeSnapshot, NarratorWindow,
+    append_narrative_snapshot, apply_live_narrator_response, build_live_floor_beat,
+    build_live_narrator_prompt, live_block_lines, read_turn_record, seed_live_snapshot,
+    turn_record_to_input,
+};
+
+const NARRATOR_MAX_TOKENS: u32 = 1024;
+const QUIET_TICK: Duration = Duration::from_secs(10);
 
 /// Decide whether to narrate and how, from the run's surface and flags.
 ///
@@ -59,44 +78,297 @@ impl NarratorHandle {
     }
 }
 
-/// Build the narration wiring for an (optional) config. When narration is on,
-/// returns the broadcast sender to hand to `RunLoopConfig.event_sender` and a
-/// handle to the spawned task; when off, returns `(None, None)` so the run is
-/// wired exactly as before.
-pub(crate) fn build_narration(
-    config: Option<NarratorConfig>,
-) -> (Option<broadcast::Sender<RunEvent>>, Option<NarratorHandle>) {
-    let Some(_config) = config else {
-        return (None, None);
-    };
+const NARRATOR_BUS_CAPACITY: usize = 256;
+
+/// Everything the narrator sidecar needs about the run it is narrating.
+pub(crate) struct NarratorCtx {
+    pub(crate) run_id: String,
+    pub(crate) run_root: PathBuf,
+    pub(crate) config_path: Option<PathBuf>,
+    pub(crate) backend: NarratorBackend,
+    pub(crate) config: NarratorConfig,
+}
+
+/// Resolve the narrator backend for a run from the provider registry, honoring
+/// a model override. Falls back to the deterministic floor if the registry
+/// cannot be loaded.
+pub(crate) fn resolve_narrator_backend(
+    home: &Path,
+    model_override: Option<&str>,
+) -> NarratorBackend {
+    match deadreckon_providers::registry::ProviderRegistry::with_overrides(home) {
+        Ok(registry) => select_narrator_backend(&registry, model_override),
+        Err(_) => NarratorBackend::DeterministicFloor,
+    }
+}
+
+/// Build the narration wiring: a bus whose sender feeds the run loop, plus a
+/// spawned engine task subscribed to it. Returns the sender and a handle that
+/// stops the task after the run.
+pub(crate) fn build_narration(ctx: NarratorCtx) -> (broadcast::Sender<RunEvent>, NarratorHandle) {
     let bus = RunEventBus::new(NARRATOR_BUS_CAPACITY);
     let receiver = bus.subscribe();
     let sender = bus.sender();
     let cancel = CancellationToken::new();
-    let join = spawn_narrator(receiver, cancel.clone());
-    (Some(sender), Some(NarratorHandle { cancel, join }))
+    let router = build_narrator_router(&ctx);
+    let engine = NarratorEngine::new(ctx);
+    let join = tokio::spawn(run_engine(engine, receiver, cancel.clone(), router));
+    (sender, NarratorHandle { cancel, join })
 }
 
-const NARRATOR_BUS_CAPACITY: usize = 256;
+fn build_narrator_router(ctx: &NarratorCtx) -> Option<ProviderRouter> {
+    match &ctx.backend {
+        NarratorBackend::Model { provider, model } => ctx.config_path.as_ref().and_then(|path| {
+            ProviderRouter::from_config_path_with_model(path, Some(provider), Some(model)).ok()
+        }),
+        NarratorBackend::DeterministicFloor => None,
+    }
+}
 
-/// Spawn the narrator loop. P3: drain events until cancelled or the bus closes,
-/// tolerating lag (a slow narrator must never block or crash the run).
-pub(crate) fn spawn_narrator(
-    mut receiver: broadcast::Receiver<RunEvent>,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                received = receiver.recv() => match received {
-                    Ok(_event) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
+fn append_narrator_spend(run_root: &Path, record: &SpendRecord) {
+    let Ok(line) = serde_json::to_string(record) else {
+        return;
+    };
+    let path = run_root.join("spend.jsonl");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// The narrator engine: holds the rolling story and turns run events into beats
+/// via the window + cadence + continuity machinery. Sync logic; the async task
+/// drives it and performs the provider call between prompt and commit.
+struct NarratorEngine {
+    ctx: NarratorCtx,
+    narrative_dir: PathBuf,
+    window: NarratorWindow,
+    ledger: NarratorLedger,
+    current: NarrativeSnapshot,
+    beats_emitted: u32,
+    last_beat_at: Option<DateTime<Utc>>,
+    turn_started: Option<(u32, DateTime<Utc>)>,
+    block: ForegroundBlock,
+}
+
+impl NarratorEngine {
+    fn new(ctx: NarratorCtx) -> Self {
+        let narrative_dir = ctx.run_root.join("narrative");
+        let current = seed_live_snapshot(&ctx.run_id);
+        let ledger = NarratorLedger::new(ctx.config.budget_usd);
+        Self {
+            ctx,
+            narrative_dir,
+            window: NarratorWindow::new(),
+            ledger,
+            current,
+            beats_emitted: 0,
+            last_beat_at: None,
+            turn_started: None,
+            block: ForegroundBlock::new(),
+        }
+    }
+
+    fn use_model(&self) -> bool {
+        narrator_should_use_model(&self.ctx.backend, &self.ledger)
+    }
+
+    fn decision(&self, now: DateTime<Utc>, in_flight: Option<u64>) -> BeatDecision {
+        let since = self
+            .last_beat_at
+            .map(|last| (now - last).num_seconds().max(0) as u64);
+        cadence_decision(
+            &self.ctx.config,
+            self.beats_emitted,
+            self.window.pending().len() as u32,
+            since,
+            in_flight,
+        )
+    }
+
+    fn render_ticker(&mut self, turn: u32, tool: &str, now: DateTime<Utc>) {
+        if !self.ctx.config.foreground {
+            return;
+        }
+        let elapsed = self
+            .turn_started
+            .filter(|(t, _)| *t == turn)
+            .map(|(_, started)| (now - started).num_seconds().max(0) as u64)
+            .unwrap_or(0);
+        let line = deterministic_ticker_line(turn, tool, elapsed);
+        self.draw(&[line]);
+    }
+
+    fn render_block(&mut self) {
+        if !self.ctx.config.foreground {
+            return;
+        }
+        let lines = live_block_lines(&self.current, self.ctx.config.lines);
+        self.draw(&lines);
+    }
+
+    fn draw(&mut self, lines: &[String]) {
+        let out = self.block.render(lines);
+        eprint!("{out}");
+        let _ = std::io::stderr().flush();
+    }
+
+    async fn emit(&mut self, now: DateTime<Utc>, router: Option<&ProviderRouter>) {
+        if !self.window.has_pending() {
+            return;
+        }
+        if self.use_model()
+            && let Some(router) = router
+            && let Ok(bundle) = build_live_narrator_prompt(
+                &self.current,
+                self.window.pending(),
+                self.window.rolling_summary(),
+            )
+        {
+            let request = ProviderRequest {
+                prompt: bundle.prompt,
+                max_output_tokens: NARRATOR_MAX_TOKENS,
+                cwd: None,
+                output_path: None,
+                sandbox_backend: None,
+                pid_file: None,
+                cancellation_token: None,
+            };
+            if let Ok(response) = router.complete(&request).await
+                && self.commit_model_beat(&response, now).is_ok()
+            {
+                return;
             }
         }
-    })
+        let _ = self.commit_floor_beat(now);
+    }
+
+    fn commit_model_beat(
+        &mut self,
+        response: &ProviderResponse,
+        now: DateTime<Utc>,
+    ) -> crate::Result<()> {
+        let pending = self.window.pending().to_vec();
+        let beat_seq = u64::from(self.beats_emitted) + 1;
+        let covers = self.window.commit_beat().unwrap_or(0);
+        let refresh = NarrativeProviderRefresh {
+            route: response.spend.provider.clone(),
+            model: response.spend.model.clone(),
+            cost_usd: response.spend.cost_usd,
+            subscription_seconds: if response.spend.subscription {
+                response.spend.wall_time_seconds
+            } else {
+                None
+            },
+        };
+        let meta = LiveBeatMeta {
+            beat_seq,
+            covers_turn: covers,
+            rolling_summary: self.window.rolling_summary().map(str::to_string),
+            provider: refresh,
+        };
+        let beat = apply_live_narrator_response(&self.current, &pending, &response.content, meta)?;
+        append_narrative_snapshot(&self.narrative_dir, &beat)?;
+        self.ledger.record_spend(response.spend.cost_usd);
+        let spend = narrator_spend_record(
+            covers,
+            response,
+            self.ledger.spent_usd(),
+            self.ctx.config.budget_usd,
+        );
+        append_narrator_spend(&self.ctx.run_root, &spend);
+        self.current = beat;
+        self.beats_emitted += 1;
+        self.last_beat_at = Some(now);
+        self.render_block();
+        Ok(())
+    }
+
+    fn commit_floor_beat(&mut self, now: DateTime<Utc>) -> crate::Result<()> {
+        let pending = self.window.pending().to_vec();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let beat_seq = u64::from(self.beats_emitted) + 1;
+        let covers = self.window.commit_beat().unwrap_or(0);
+        let meta = LiveBeatMeta {
+            beat_seq,
+            covers_turn: covers,
+            rolling_summary: self.window.rolling_summary().map(str::to_string),
+            provider: NarrativeProviderRefresh {
+                route: "deterministic".to_string(),
+                model: "none".to_string(),
+                cost_usd: 0.0,
+                subscription_seconds: None,
+            },
+        };
+        let beat = build_live_floor_beat(&self.current, &pending, meta);
+        append_narrative_snapshot(&self.narrative_dir, &beat)?;
+        self.current = beat;
+        self.beats_emitted += 1;
+        self.last_beat_at = Some(now);
+        self.render_block();
+        Ok(())
+    }
+
+    async fn on_event(&mut self, event: RunEvent, router: Option<&ProviderRouter>) {
+        let now = event.timestamp;
+        match event.event {
+            RunEventKind::TurnStarted { turn } => self.turn_started = Some((turn, now)),
+            RunEventKind::ToolCallStarted {
+                turn, tool_name, ..
+            } => self.render_ticker(turn, &tool_name, now),
+            RunEventKind::DocsCheckpoint { turn, path, .. } => {
+                if let Some(record) = read_turn_record(&path, turn) {
+                    self.window.observe(turn_record_to_input(&record));
+                }
+                if matches!(self.decision(now, None), BeatDecision::Emit) {
+                    self.emit(now, router).await;
+                }
+            }
+            RunEventKind::RunCompleted { .. } | RunEventKind::RunPromoted { .. } => {
+                self.emit(now, router).await;
+            }
+            _ => {}
+        }
+    }
+
+    fn on_quiet_tick(&mut self, now: DateTime<Utc>) {
+        if let Some((turn, _)) = self.turn_started {
+            self.render_ticker(turn, "working", now);
+        }
+    }
+}
+
+async fn run_engine(
+    mut engine: NarratorEngine,
+    mut receiver: broadcast::Receiver<RunEvent>,
+    cancel: CancellationToken,
+    router: Option<ProviderRouter>,
+) {
+    let router = router.as_ref();
+    let mut quiet = tokio::time::interval(QUIET_TICK);
+    quiet.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                engine.emit(Utc::now(), router).await;
+                break;
+            }
+            _ = quiet.tick() => engine.on_quiet_tick(Utc::now()),
+            received = receiver.recv() => match received {
+                Ok(event) => engine.on_event(event, router).await,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    engine.emit(Utc::now(), router).await;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// What the cadence should do at a decision point.
@@ -268,7 +540,23 @@ impl ForegroundBlock {
 mod tests {
     use std::time::Duration;
 
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::narrative::LiveTurnInput;
+
+    fn floor_ctx(run_root: PathBuf) -> NarratorCtx {
+        NarratorCtx {
+            run_id: "run-x".to_string(),
+            run_root,
+            config_path: None,
+            backend: NarratorBackend::DeterministicFloor,
+            config: NarratorConfig {
+                foreground: false,
+                ..NarratorConfig::default()
+            },
+        }
+    }
 
     #[test]
     fn resolve_narrator_config_decisions() {
@@ -293,30 +581,43 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_wires_event_bus_when_narration_enabled() {
-        // Narration on -> a sender is produced (and a task subscribed to it).
-        let config = resolve_narrator_config(true, false, false, None);
-        let (sender, handle) = build_narration(config);
-        let sender = sender.expect("narration on yields an event sender");
+        // Narration on -> a sender is produced and the engine subscribes to it.
+        let temp = TempDir::new().expect("tempdir");
+        let (sender, handle) = build_narration(floor_ctx(temp.path().to_path_buf()));
         assert!(
             sender.receiver_count() >= 1,
-            "the spawned narrator subscribed to the bus"
+            "the spawned narrator engine subscribed to the bus"
         );
-        handle.expect("handle present").shutdown().await;
-
-        // Narration off -> wired exactly as before (no sender, no task).
-        let (sender_off, handle_off) = build_narration(None);
-        assert!(sender_off.is_none());
-        assert!(handle_off.is_none());
+        handle.shutdown().await;
     }
 
     #[tokio::test]
     async fn narrator_task_stops_on_run_cancellation() {
-        let bus = RunEventBus::new(8);
-        let cancel = CancellationToken::new();
-        let join = spawn_narrator(bus.subscribe(), cancel.clone());
-        cancel.cancel();
-        let stopped = tokio::time::timeout(Duration::from_secs(1), join).await;
+        let temp = TempDir::new().expect("tempdir");
+        let (_sender, handle) = build_narration(floor_ctx(temp.path().to_path_buf()));
+        let stopped = tokio::time::timeout(Duration::from_secs(2), handle.shutdown()).await;
         assert!(stopped.is_ok(), "narrator task exits promptly on cancel");
+    }
+
+    #[tokio::test]
+    async fn narrator_engine_writes_floor_beat_from_window() {
+        let temp = TempDir::new().expect("tempdir");
+        let run_root = temp.path().to_path_buf();
+        let mut engine = NarratorEngine::new(floor_ctx(run_root.clone()));
+        engine.window.observe(LiveTurnInput {
+            turn: 1,
+            title: "first step".to_string(),
+            summary: "did a thing".to_string(),
+            tool_kind: "bash".to_string(),
+            outcome: "ok".to_string(),
+            files: Vec::new(),
+        });
+        // No router -> deterministic floor beat, written to snapshots.jsonl.
+        engine.emit(Utc::now(), None).await;
+        let snapshots = run_root.join("narrative").join("snapshots.jsonl");
+        assert!(snapshots.exists(), "a floor beat was written");
+        let raw = std::fs::read_to_string(&snapshots).expect("read snapshots");
+        assert!(raw.contains("turn 1"), "the beat narrates the turn");
     }
 
     #[test]
