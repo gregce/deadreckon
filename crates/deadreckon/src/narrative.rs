@@ -3406,6 +3406,31 @@ mod tests {
     }
 
     #[test]
+    fn attach_renders_live_written_beats_without_provider_call() {
+        // The run writes live beats to snapshots.jsonl; attach renders the
+        // latest by reading the file — no provider call involved.
+        let temp = TempDir::new().expect("tempdir");
+        let dir = temp.path().join("narrative");
+        let mut beat = live_previous_snapshot();
+        beat.headline = "Wired the bus".to_string();
+        beat.live = Some(LiveBeat {
+            beat_seq: 1,
+            covers_turn: 3,
+            source: NarrativeSource::Live,
+            rolling_summary: Some("Through turn 3.".to_string()),
+        });
+        append_narrative_snapshot(&dir, &beat).expect("write live beat");
+
+        let latest = read_latest_snapshot(&dir).snapshot.expect("latest beat");
+        assert_eq!(
+            latest.live.as_ref().expect("live").source,
+            NarrativeSource::Live
+        );
+        let lines = live_block_lines(&latest, 4);
+        assert_eq!(lines[0], "Wired the bus", "attach renders the live beat");
+    }
+
+    #[test]
     fn foreground_block_is_bounded_to_narrate_lines() {
         let mut snapshot = live_previous_snapshot();
         snapshot.headline = "Working".to_string();
