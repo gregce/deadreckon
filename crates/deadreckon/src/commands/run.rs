@@ -386,6 +386,7 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             from_turn: None,
             event_sender: None,
             cancellation_token: None,
+            narrate: None,
             docs: RunLoopDocsConfig {
                 home: paths.home().to_path_buf(),
                 config_path: Some(paths.config_path()),

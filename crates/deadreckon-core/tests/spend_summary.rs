@@ -47,6 +47,7 @@ fn spend_summary_marks_tilde_when_any_turn_subscription() {
             estimated: false,
             wall_time_seconds: Some(2.0),
             wall_time_cap_seconds: None,
+            kind: "loop".to_string(),
         },
     )
     .expect("spend");
@@ -74,6 +75,7 @@ fn spend_summary_no_tilde_when_all_http_priced() {
             estimated: false,
             wall_time_seconds: Some(2.0),
             wall_time_cap_seconds: None,
+            kind: "loop".to_string(),
         },
     )
     .expect("spend");
@@ -103,6 +105,7 @@ fn spend_summary_tilde_persists_after_resume_via_jsonl_replay() {
             estimated: false,
             wall_time_seconds: Some(1.0),
             wall_time_cap_seconds: None,
+            kind: "loop".to_string(),
         },
     )
     .expect("first spend");
@@ -122,6 +125,7 @@ fn spend_summary_tilde_persists_after_resume_via_jsonl_replay() {
             estimated: false,
             wall_time_seconds: Some(2.0),
             wall_time_cap_seconds: None,
+            kind: "loop".to_string(),
         },
     )
     .expect("second spend");
@@ -152,6 +156,7 @@ fn spend_summary_total_unchanged_by_tilde_flag() {
             estimated: true,
             wall_time_seconds: Some(3.0),
             wall_time_cap_seconds: None,
+            kind: "loop".to_string(),
         },
     )
     .expect("spend");

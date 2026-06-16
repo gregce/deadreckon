@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 — Live Narrator (in progress)
+
+- P1: narration snapshot schema 2 — additive `live` beat field (beat_seq,
+  covers_turn, source, rolling_summary) that legacy schema-1 snapshots parse
+  as absent; `SpendRecord.kind` (defaulted "loop", narrator rows write
+  "narrator"); additive `RunLoopConfig.narrate: Option<NarratorConfig>` (None
+  preserves every existing constructor).
+
 ## 0.1.1
 
 - Subscription CLI runs default to a ten-hour wall cap (was one hour):

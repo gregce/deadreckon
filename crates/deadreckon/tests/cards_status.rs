@@ -147,6 +147,7 @@ fn status_report_marks_subscription_spend_not_metered() {
             estimated: false,
             wall_time_seconds: Some(1.0),
             wall_time_cap_seconds: None,
+            kind: "loop".to_string(),
         },
     )
     .expect("spend");
@@ -183,6 +184,7 @@ fn status_report_marks_mixed_route_spend_with_subscription_note() {
             estimated: false,
             wall_time_seconds: Some(1.0),
             wall_time_cap_seconds: None,
+            kind: "loop".to_string(),
         },
     )
     .expect("spend");
@@ -202,6 +204,7 @@ fn status_report_marks_mixed_route_spend_with_subscription_note() {
             estimated: false,
             wall_time_seconds: Some(2.0),
             wall_time_cap_seconds: None,
+            kind: "loop".to_string(),
         },
     )
     .expect("spend");
