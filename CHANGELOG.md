@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.2.0 — Live Narrator (in progress)
+## 0.2.0 — Live Narrator
+
+A `dr run` now narrates itself in plain English as it works — a
+continuity-carrying, subscription-first, model-driven sidecar with a
+deterministic floor — so an operator can glance at progress instead of reading
+tool calls, edits, and JSONL. Phase detail follows.
+
 
 - P1: narration snapshot schema 2 — additive `live` beat field (beat_seq,
   covers_turn, source, rolling_summary) that legacy schema-1 snapshots parse
@@ -48,10 +54,13 @@
   TTY and off under `--no-narrate`.
 - P9: headless narration — `dr run --narrate` streams append-only, turn-stamped
   beats (`[turn N] …`) to stderr, keeping stdout clean for piped consumers;
-  `--no-narrate` disables narration and `--narrator-model` pins the model.
-  Piped runs now drive plain progress (stdout-TTY auto-detect) so a run is never
-  silent between the start and exit cards. Raw cursor-control ANSI moved to the
-  `ui` module to honor the source coherence contract.
+  `--no-narrate` disables narration and `--narrator-model` pins the model
+  (validated against the catalog). Raw cursor-control ANSI moved to the `ui`
+  module to honor the source coherence contract. The silent-piped-run progress
+  decision (`effective_plain`) is unit-tested but deliberately not wired to the
+  run surface — this project keeps rich rendering when piped (opting out only
+  via `NO_COLOR`/`--plain`), so `--narrate` is the piped-progress path and the
+  auto-plain wiring is a V1 candidate.
 - P10: attach + post-hoc convergence — the attach Narrative view renders the
   live beats the run already wrote to `snapshots.jsonl` with no provider call;
   the post-hoc `RUN-NARRATIVE.md` seeds `current_narrative` from the full
