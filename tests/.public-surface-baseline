@@ -228,6 +228,11 @@ crate: deadreckon-providers
   error::ProviderError
   error::Result
   http::ProviderAdapter
+  narrator::NarratorBackend
+  narrator::NarratorCandidate
+  narrator::narrator_route_available
+  narrator::select_narrator_backend
+  narrator::select_narrator_route
   registry::ModelCatalogOverride
   registry::ModelEntry
   router::ModelContextWindowSource
@@ -274,6 +279,7 @@ crate: deadreckon-runtime
   seam::SeamRunCtx
   seam::SeamsConfig
   seam::write_seams_audit
+  turn_loop::NarratorConfig
   turn_loop::run_turn_loop
   turn_loop::RunLoopConfig
   turn_loop::RunLoopDocsConfig

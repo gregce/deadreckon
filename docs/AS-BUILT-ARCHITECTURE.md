@@ -1568,6 +1568,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 
 ### Built and reliable
 
+- Live narrator (§44): a `dr run` narrates itself in plain English as it works — a continuity-carrying, subscription-first model sidecar with a deterministic floor, a calm foreground block, headless `--narrate`, and attach/post-hoc convergence. This closes the prior thin gap where narration existed only at attach time and a piped run was silent.
 - Workspace, crates, build, lint, fmt, test discipline.
 - Workspace lint discipline (deny-tier clippy + rustc), tuned release profile, registry-shaped library `lib.rs`, library print refusal, and error retryable/fatal taxonomy as vocabulary for future watchdog work.
 - Binary module layout: the former 40.6k-line `crates/deadreckon/src/main.rs` has been split into private `commands/` and `tui/` modules behind `main_inner` dispatch. `cli.rs`, the `Command` enum, all verbs, all user-facing output, and the public library surface remain unchanged by that split.
@@ -3006,6 +3007,24 @@ binary versions in `release/known-good-providers.json` (schema_version 1).
 `docs/RELEASE.md` holds the one-time "Stable v0.1.0 operator checklist"
 (tap repo + token, npm trusted publishing, Windows Authenticode or a
 consciously narrowed lane, version bumps, preflight, Windows smoke, tag).
+
+## 44. Live Narrator (one rolling story, written live, rendered everywhere)
+
+44.1 **Sidecar architecture.** A `dr run` now spawns an in-process narrator task. `run.rs` resolves a `NarratorConfig` from the surface (TTY on by default; `--narrate` opts in headless; `--no-narrate` disables; `--narrator-model` pins the model), builds a `RunEventBus` whose sender feeds `RunLoopConfig.event_sender`, and spawns `NarratorEngine` (`crates/deadreckon/src/narrator.rs`) subscribed to the bus. The engine reacts to per-turn `DocsCheckpoint`, reads the rich `TurnRecord`, and appends beats to `<run_root>/narrative/snapshots.jsonl`. The task flushes a final beat and stops on run completion or cancellation.
+
+44.2 **Continuity.** Each beat feeds the model the prior narrative + only the windowed new turns + a carried rolling summary and asks it to amend/extend (`build_live_narrator_prompt` / `apply_live_narrator_response` in `narrative.rs`; voice in `skills/live-narrator/`). `NarratorWindow` carries only turns since the last beat; the rolling summary is bounded to 1200 chars, so per-beat input is a constant ceiling and total cost is O(turns), not O(turns²). Beats append to the schema-2 `snapshots.jsonl` (the `live` field carries `beat_seq`, `covers_turn`, `source`, `rolling_summary`); the prior beat is never overwritten.
+
+44.3 **Subscription-first backend.** `select_narrator_route` prefers a free, logged-in CLI (`cli:claude-code --model haiku` → `cli:codex --model gpt-5.1-codex-mini`) then a cheap API model (`anthropic claude-haiku-4-5` → `openai gpt-4o-mini`) then the deterministic floor, gating CLIs on binary presence + a non-logged-out auth probe. The narrator builds its own `ProviderRouter`; the run's router stays on the big model. The deterministic projection remains the floor, so narration always works with no provider.
+
+44.4 **Cadence.** `cadence_decision` is time-gated + coalesced — a beat fires on new work past the min gap or a turn burst, faster bursts coalesce, total beats are capped per run, and a long single turn escalates via the quiet timer. Between model beats a deterministic $0 ticker (`turn N · tool (elapsed)`) keeps a long turn from looking frozen.
+
+44.5 **Surfaces.** Foreground: a calm few-lines-max block redrawn in place (`ForegroundBlock`; cursor control via `ui::cursor_clear_lines`). Headless `--narrate`: append-only, turn-stamped beats to stderr; stdout stays clean. Piped runs drive plain progress (`effective_plain`) so they are never silent between the start and exit cards. Attach renders the live beats the run already wrote, with no provider call.
+
+44.6 **Spend isolation.** `NarratorLedger` tracks narrator spend against its own cap and degrades to the floor at the cap; `kind: "narrator"` `spend.jsonl` rows keep the run's spend math (which filters `kind: "loop"`) unaffected. Subscription backends record $0.
+
+44.7 **Post-hoc convergence.** `complete_run_docs` seeds `current_narrative` from `live_narrative_digest` — the full accumulated beat history — so `RUN-NARRATIVE.md` consolidates the live story rather than re-deriving from the raw trace.
+
+44.8 **Deferred.** Cadence/budget knobs use the rider defaults baked into `NarratorConfig`; reading them from `[defaults]` in `config.toml`, a persistent streaming CLI session, and a shared cross-surface daemon remain V1 candidates.
 
 ---
 

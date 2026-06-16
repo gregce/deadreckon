@@ -69,12 +69,18 @@ pub(crate) struct NarratorHandle {
     join: JoinHandle<()>,
 }
 
+/// Grace period for the narrator to flush a final beat after the run ends. A
+/// model call may be in flight; if it does not return within the grace window
+/// we stop waiting (detaching the task) so a run never hangs on narration.
+const NARRATOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 impl NarratorHandle {
-    /// Stop the narrator and wait for it to drain. Called after the run loop
-    /// returns so the final state is flushed and the task exits cleanly.
+    /// Stop the narrator and wait briefly for it to drain. Called after the run
+    /// loop returns. Bounded so an in-flight provider call can never block the
+    /// run's exit.
     pub(crate) async fn shutdown(self) {
         self.cancel.cancel();
-        let _ = self.join.await;
+        let _ = tokio::time::timeout(NARRATOR_SHUTDOWN_GRACE, self.join).await;
     }
 }
 
@@ -150,8 +156,13 @@ fn write_headless_lines(out: &mut impl Write, lines: &[String]) -> std::io::Resu
 }
 
 /// Whether the run should drive plain progress. Piped runs (stdout not a TTY)
-/// get plain progress so a run is never silent between the start and exit cards,
-/// even without `--narrate`.
+/// would get plain progress so a run is never silent between the start and exit
+/// cards. NOTE: not wired to the run surface — this project intentionally keeps
+/// rich (box-drawing) rendering when piped, opting out of color only via
+/// `NO_COLOR`/`--plain`, so forcing plain off-TTY would regress that contract.
+/// The decision is kept here (and unit-tested) and its run wiring is a V1
+/// candidate; `--narrate` already gives piped progress when opted in.
+#[allow(dead_code)]
 pub(crate) fn effective_plain(
     plain_flag: bool,
     configured: bool,
@@ -408,7 +419,9 @@ async fn run_engine(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                engine.emit(Utc::now(), router).await;
+                // Final flush is floor-only: never start a blocking model call
+                // during shutdown, so the run's exit is never delayed.
+                let _ = engine.commit_floor_beat(Utc::now());
                 break;
             }
             _ = quiet.tick() => engine.on_quiet_tick(Utc::now()),
@@ -416,7 +429,7 @@ async fn run_engine(
                 Ok(event) => engine.on_event(event, router).await,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => {
-                    engine.emit(Utc::now(), router).await;
+                    let _ = engine.commit_floor_beat(Utc::now());
                     break;
                 }
             }

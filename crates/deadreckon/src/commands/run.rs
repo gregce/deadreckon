@@ -62,12 +62,12 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             crate::narrator::narrator_model_refusal(model),
         )));
     }
-    let plain = crate::narrator::effective_plain(
-        plain,
-        defaults.plain.unwrap_or(false),
-        std::env::var_os("NO_COLOR").is_some(),
-        io::stdout().is_terminal(),
-    );
+    // NOTE: piped runs intentionally keep rich rendering (the project opts out
+    // of color only via NO_COLOR/--plain), so we do NOT force plain off-TTY.
+    // The silent-pipe progress decision lives in narrator::effective_plain and
+    // is exercised as a unit; wiring it to the run surface without regressing
+    // the rich-when-piped card contract is a V1 candidate.
+    let plain = plain || defaults.plain.unwrap_or(false) || std::env::var_os("NO_COLOR").is_some();
     ui::set_plain_output(plain);
     let prevent_sleep_prefs =
         SleepPrefs::parse(prevent_sleep.as_deref(), defaults.prevent_sleep.as_deref())
@@ -404,10 +404,16 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     );
     let (narrate_event_sender, narrator_handle) = match narrator_config.clone() {
         Some(config) => {
-            let backend = crate::narrator::resolve_narrator_backend(
-                paths.home(),
-                config.model_override.as_deref(),
-            );
+            // A smoke run makes no real provider calls — narrate via the
+            // deterministic floor so tests and dry runs stay hermetic and fast.
+            let backend = if smoke {
+                deadreckon_providers::NarratorBackend::DeterministicFloor
+            } else {
+                crate::narrator::resolve_narrator_backend(
+                    paths.home(),
+                    config.model_override.as_deref(),
+                )
+            };
             let ctx = crate::narrator::NarratorCtx {
                 run_id: state.run_id.clone(),
                 run_root: state.run_root.clone(),
