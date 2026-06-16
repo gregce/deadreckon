@@ -32,7 +32,15 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         no_hints,
         no_docs,
         doc_skill,
+        narrate,
+        no_narrate,
+        narrator_model,
     } = args;
+    if narrate && no_narrate {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "pass only one of --narrate / --no-narrate".to_string(),
+        )));
+    }
     let auto_confirm = yes || no_confirm || quiet;
     let effective_no_hints = no_hints || quiet;
     if smoke && provider.is_some() {
@@ -47,7 +55,12 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
-    let plain = plain || defaults.plain.unwrap_or(false) || std::env::var_os("NO_COLOR").is_some();
+    let plain = crate::narrator::effective_plain(
+        plain,
+        defaults.plain.unwrap_or(false),
+        std::env::var_os("NO_COLOR").is_some(),
+        io::stdout().is_terminal(),
+    );
     ui::set_plain_output(plain);
     let prevent_sleep_prefs =
         SleepPrefs::parse(prevent_sleep.as_deref(), defaults.prevent_sleep.as_deref())
@@ -376,8 +389,12 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     // Live narrator: on a TTY, narration is on by default; the bus sender feeds
     // the loop and the sidecar engine turns events into beats. Off-TTY without
     // --narrate, resolve returns None and the run is wired exactly as before.
-    let narrator_config =
-        crate::narrator::resolve_narrator_config(io::stdin().is_terminal(), false, false, None);
+    let narrator_config = crate::narrator::resolve_narrator_config(
+        io::stdin().is_terminal(),
+        narrate,
+        no_narrate,
+        narrator_model,
+    );
     let (narrate_event_sender, narrator_handle) = match narrator_config.clone() {
         Some(config) => {
             let backend = crate::narrator::resolve_narrator_backend(

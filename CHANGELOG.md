@@ -46,6 +46,12 @@
   stream); `ForegroundBlock` redraws in place (clearing the prior block) so the
   block updates rather than scrolls. Foreground narration is on by default on a
   TTY and off under `--no-narrate`.
+- P9: headless narration — `dr run --narrate` streams append-only, turn-stamped
+  beats (`[turn N] …`) to stderr, keeping stdout clean for piped consumers;
+  `--no-narrate` disables narration and `--narrator-model` pins the model.
+  Piped runs now drive plain progress (stdout-TTY auto-detect) so a run is never
+  silent between the start and exit cards. Raw cursor-control ANSI moved to the
+  `ui` module to honor the source coherence contract.
 
 ## 0.1.1
 

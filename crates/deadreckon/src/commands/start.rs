@@ -2649,6 +2649,9 @@ async fn dispatch_start_command(
                 no_hints: args.quiet,
                 no_docs: false,
                 doc_skill: None,
+                narrate: false,
+                no_narrate: false,
+                narrator_model: None,
             })
             .await;
             if result.is_ok()

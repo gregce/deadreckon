@@ -1047,6 +1047,29 @@ pub(crate) fn live_block_lines(snapshot: &NarrativeSnapshot, max_lines: usize) -
     lines
 }
 
+/// Append-only, turn-stamped beat lines for the headless `--narrate` surface:
+/// `[turn N] headline` plus the top current_work claims, bounded to `max_lines`.
+/// Plain text (no cursor controls) so it streams cleanly to stderr.
+#[allow(dead_code)] // wired into the narrator task's headless render in P9
+pub(crate) fn headless_beat_lines(snapshot: &NarrativeSnapshot, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let covers = snapshot
+        .live
+        .as_ref()
+        .map(|beat| beat.covers_turn)
+        .unwrap_or(0);
+    let mut lines = vec![format!("[turn {covers}] {}", snapshot.headline)];
+    for claim in &snapshot.current_work {
+        if lines.len() >= max_lines {
+            break;
+        }
+        lines.push(format!("  · {}", claim.text));
+    }
+    lines
+}
+
 pub(crate) fn narrative_plain_lines(
     projection: &NarrativeProjection,
     visual: NarrativeVisualMode,

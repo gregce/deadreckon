@@ -27,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 use crate::narrative::{
     LiveBeatMeta, NarrativeProviderRefresh, NarrativeSnapshot, NarratorWindow,
     append_narrative_snapshot, apply_live_narrator_response, build_live_floor_beat,
-    build_live_narrator_prompt, live_block_lines, read_turn_record, seed_live_snapshot,
-    turn_record_to_input,
+    build_live_narrator_prompt, headless_beat_lines, live_block_lines, read_turn_record,
+    seed_live_snapshot, turn_record_to_input,
 };
 
 const NARRATOR_MAX_TOKENS: u32 = 1024;
@@ -139,6 +139,28 @@ fn append_narrator_spend(run_root: &Path, record: &SpendRecord) {
     }
 }
 
+/// Write append-only beat lines to a sink (stderr in production). Plain,
+/// newline-terminated, no cursor controls — so stdout stays clean for piped
+/// consumers.
+fn write_headless_lines(out: &mut impl Write, lines: &[String]) -> std::io::Result<()> {
+    for line in lines {
+        writeln!(out, "{line}")?;
+    }
+    out.flush()
+}
+
+/// Whether the run should drive plain progress. Piped runs (stdout not a TTY)
+/// get plain progress so a run is never silent between the start and exit cards,
+/// even without `--narrate`.
+pub(crate) fn effective_plain(
+    plain_flag: bool,
+    configured: bool,
+    no_color: bool,
+    stdout_is_tty: bool,
+) -> bool {
+    plain_flag || configured || no_color || !stdout_is_tty
+}
+
 /// The narrator engine: holds the rolling story and turns run events into beats
 /// via the window + cadence + continuity machinery. Sync logic; the async task
 /// drives it and performs the provider call between prompt and commit.
@@ -202,12 +224,16 @@ impl NarratorEngine {
         self.draw(&[line]);
     }
 
-    fn render_block(&mut self) {
-        if !self.ctx.config.foreground {
-            return;
+    fn render_beat(&mut self) {
+        if self.ctx.config.foreground {
+            let lines = live_block_lines(&self.current, self.ctx.config.lines);
+            self.draw(&lines);
+        } else if self.ctx.config.headless_append {
+            // Append-only, turn-stamped beats to stderr; stdout stays clean.
+            let lines = headless_beat_lines(&self.current, self.ctx.config.lines + 1);
+            let mut err = std::io::stderr();
+            let _ = write_headless_lines(&mut err, &lines);
         }
-        let lines = live_block_lines(&self.current, self.ctx.config.lines);
-        self.draw(&lines);
     }
 
     fn draw(&mut self, lines: &[String]) {
@@ -283,7 +309,7 @@ impl NarratorEngine {
         self.current = beat;
         self.beats_emitted += 1;
         self.last_beat_at = Some(now);
-        self.render_block();
+        self.render_beat();
         Ok(())
     }
 
@@ -310,7 +336,7 @@ impl NarratorEngine {
         self.current = beat;
         self.beats_emitted += 1;
         self.last_beat_at = Some(now);
-        self.render_block();
+        self.render_beat();
         Ok(())
     }
 
@@ -519,10 +545,7 @@ impl ForegroundBlock {
     }
 
     pub(crate) fn render(&mut self, lines: &[String]) -> String {
-        let mut out = String::new();
-        for _ in 0..self.drawn_lines {
-            out.push_str("\x1b[1A\x1b[2K");
-        }
+        let mut out = crate::ui::cursor_clear_lines(self.drawn_lines);
         for line in lines {
             out.push_str(line);
             out.push('\n');
@@ -597,6 +620,46 @@ mod tests {
         let (_sender, handle) = build_narration(floor_ctx(temp.path().to_path_buf()));
         let stopped = tokio::time::timeout(Duration::from_secs(2), handle.shutdown()).await;
         assert!(stopped.is_ok(), "narrator task exits promptly on cancel");
+    }
+
+    #[test]
+    fn narrate_headless_writes_beats_to_stderr_not_stdout() {
+        // The engine writes these to stderr; the writer keeps stdout clean.
+        let mut buf = Vec::new();
+        write_headless_lines(
+            &mut buf,
+            &["[turn 5] Did X".to_string(), "  · work".to_string()],
+        )
+        .expect("write");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(text.contains("[turn 5] Did X"));
+        assert!(text.ends_with('\n'), "newline-terminated append output");
+    }
+
+    #[test]
+    fn narrate_headless_beats_are_append_only_and_turn_stamped() {
+        let mut buf = Vec::new();
+        write_headless_lines(&mut buf, &["[turn 1] a".to_string()]).expect("write 1");
+        write_headless_lines(&mut buf, &["[turn 2] b".to_string()]).expect("write 2");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(
+            text.contains("[turn 1]") && text.contains("[turn 2]"),
+            "both beats retained (append, not overwrite)"
+        );
+        assert!(
+            !text.as_bytes().contains(&0x1b),
+            "append-only: no in-place cursor escapes"
+        );
+    }
+
+    #[test]
+    fn piped_run_is_not_silent_between_start_and_exit() {
+        // Piped (stdout not a tty) => plain progress on, so never silent.
+        assert!(effective_plain(false, false, false, false));
+        // Interactive tty with no flags => not forced into plain.
+        assert!(!effective_plain(false, false, false, true));
+        // Explicit flags still force plain on a tty.
+        assert!(effective_plain(true, false, false, true));
     }
 
     #[tokio::test]
@@ -754,16 +817,16 @@ mod tests {
     fn foreground_block_updates_in_place_not_appends() {
         let mut block = ForegroundBlock::new();
         let first = block.render(&["headline".to_string(), "· work".to_string()]);
-        assert!(
-            !first.contains("\x1b[1A"),
-            "the first render draws without clearing anything"
+        assert_eq!(
+            first, "headline\n· work\n",
+            "the first render draws the lines with no clearing prefix"
         );
         assert_eq!(block.drawn_lines(), 2);
 
         let second = block.render(&["new headline".to_string()]);
-        assert_eq!(
-            second.matches("\x1b[1A").count(),
-            2,
+        let expected_clear = crate::ui::cursor_clear_lines(2);
+        assert!(
+            second.starts_with(&expected_clear),
             "the next render clears the two prior lines in place rather than appending"
         );
         assert_eq!(block.drawn_lines(), 1);
