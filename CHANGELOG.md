@@ -29,6 +29,12 @@
   eliding older content — so each beat's model input is a constant ceiling and
   total narration cost is O(turns), not O(turns²). `turn_record_to_input` maps a
   persisted `TurnRecord` into the per-turn narrator input.
+- P6: cadence — `cadence_decision` emits a model beat only when there is new
+  work and either the min gap elapsed or a turn burst accumulated, coalescing
+  faster bursts and capping total beats per run; a long single turn escalates
+  to a beat via the quiet timer. Between model beats a deterministic $0 ticker
+  (`turn N · tool (elapsed)`) keeps a long turn from looking frozen, with no
+  provider call.
 
 ## 0.1.1
 

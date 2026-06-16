@@ -97,6 +97,69 @@ pub(crate) fn spawn_narrator(
     })
 }
 
+/// What the cadence should do at a decision point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BeatDecision {
+    /// Emit a model beat now.
+    Emit,
+    /// Hold — fold this turn into the window and wait (coalescing).
+    Coalesce,
+    /// The per-run beat cap is reached; emit no more model beats.
+    CapReached,
+}
+
+/// Time-gated + coalesced cadence. A model beat is due when there is new work
+/// AND (enough time has passed OR a burst of turns has accumulated), or when a
+/// single long turn has been quiet past the threshold (escalation). Bursts
+/// under the gap coalesce; the per-run cap bounds total model calls.
+#[allow(dead_code)] // wired into the narrator task in P7
+pub(crate) fn cadence_decision(
+    config: &NarratorConfig,
+    beats_emitted: u32,
+    turns_since_last_beat: u32,
+    seconds_since_last_beat: Option<u64>,
+    turn_in_flight_seconds: Option<u64>,
+) -> BeatDecision {
+    if beats_emitted >= config.max_beats {
+        return BeatDecision::CapReached;
+    }
+    let due_by_gap = match seconds_since_last_beat {
+        None => true,
+        Some(elapsed) => elapsed >= config.min_gap_seconds,
+    };
+    let due_by_burst = turns_since_last_beat >= config.turn_burst;
+    let due_by_quiet =
+        turn_in_flight_seconds.is_some_and(|elapsed| elapsed >= config.quiet_seconds);
+    let has_new_work = turns_since_last_beat > 0;
+    if (has_new_work && (due_by_gap || due_by_burst)) || due_by_quiet {
+        BeatDecision::Emit
+    } else {
+        BeatDecision::Coalesce
+    }
+}
+
+/// The deterministic, $0 live-activity ticker shown between model beats so a
+/// long turn never looks frozen. Pure formatting over event fields — no
+/// provider call.
+#[allow(dead_code)] // wired into the narrator task in P8
+pub(crate) fn deterministic_ticker_line(turn: u32, tool: &str, elapsed_seconds: u64) -> String {
+    let tool = if tool.trim().is_empty() {
+        "working"
+    } else {
+        tool.trim()
+    };
+    format!("turn {turn} · {tool} ({})", format_elapsed(elapsed_seconds))
+}
+
+#[allow(dead_code)] // wired into the narrator task in P8
+fn format_elapsed(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -150,5 +213,60 @@ mod tests {
         cancel.cancel();
         let stopped = tokio::time::timeout(Duration::from_secs(1), join).await;
         assert!(stopped.is_ok(), "narrator task exits promptly on cancel");
+    }
+
+    #[test]
+    fn narrator_coalesces_fast_turns_into_one_beat() {
+        let config = NarratorConfig::default();
+        // Three turns in 5s — under the 30s gap and the 8-turn burst: hold.
+        assert_eq!(
+            cadence_decision(&config, 1, 3, Some(5), None),
+            BeatDecision::Coalesce
+        );
+    }
+
+    #[test]
+    fn narrator_forces_beat_after_turn_burst() {
+        let config = NarratorConfig::default();
+        // Eight turns since the last beat forces a beat even under the gap.
+        assert_eq!(
+            cadence_decision(&config, 1, config.turn_burst, Some(5), None),
+            BeatDecision::Emit
+        );
+    }
+
+    #[test]
+    fn narrator_quiet_timer_escalates_long_turn_to_model_beat() {
+        let config = NarratorConfig::default();
+        // No completed turns, but one turn has been in flight past the quiet
+        // threshold: escalate to a model beat so a long turn isn't silent.
+        assert_eq!(
+            cadence_decision(&config, 1, 0, Some(5), Some(config.quiet_seconds + 1)),
+            BeatDecision::Emit
+        );
+        // Without the quiet escalation, no new work means coalesce.
+        assert_eq!(
+            cadence_decision(&config, 1, 0, Some(5), Some(1)),
+            BeatDecision::Coalesce
+        );
+    }
+
+    #[test]
+    fn deterministic_ticker_updates_between_beats_with_no_model_call() {
+        // Pure formatting over event fields — no provider, no backend needed.
+        let line = deterministic_ticker_line(14, "cargo test", 72);
+        assert!(line.contains("turn 14"));
+        assert!(line.contains("cargo test"));
+        assert!(line.contains("1m12s"));
+        assert_eq!(deterministic_ticker_line(3, "", 5), "turn 3 · working (5s)");
+    }
+
+    #[test]
+    fn narrator_respects_per_run_beat_cap() {
+        let config = NarratorConfig::default();
+        assert_eq!(
+            cadence_decision(&config, config.max_beats, 8, Some(120), None),
+            BeatDecision::CapReached
+        );
     }
 }
