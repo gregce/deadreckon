@@ -277,6 +277,13 @@ pub(crate) fn ansi_wrap(code: &str, text: &str) -> String {
     format!("\x1b[{code}m{text}{ANSI_RESET}")
 }
 
+/// Control sequence to move the cursor up `n` lines, clearing each, for
+/// in-place block redraws (the live narrator's calm foreground block). Raw
+/// ANSI lives in this module by the coherence contract.
+pub(crate) fn cursor_clear_lines(n: usize) -> String {
+    "\x1b[1A\x1b[2K".repeat(n)
+}
+
 #[allow(dead_code)]
 pub(crate) fn ansi_reset() -> &'static str {
     ANSI_RESET

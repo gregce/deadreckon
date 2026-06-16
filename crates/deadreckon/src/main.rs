@@ -716,6 +716,9 @@ async fn main_inner() -> Result<()> {
             no_hints,
             no_docs,
             doc_skill,
+            narrate,
+            no_narrate,
+            narrator_model,
         } => {
             ui::set_plain_output(plain);
             let goal = resolve_required_goal_input(
@@ -755,6 +758,9 @@ async fn main_inner() -> Result<()> {
                 no_hints,
                 no_docs,
                 doc_skill,
+                narrate,
+                no_narrate,
+                narrator_model,
             })
             .await
         }
@@ -3314,6 +3320,9 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
         no_hints: true,
         no_docs: false,
         doc_skill: None,
+        narrate: false,
+        no_narrate: false,
+        narrator_model: None,
     })
     .await;
     let restore_result = std::env::set_current_dir(&original_dir);
