@@ -465,10 +465,13 @@ fn stable_validate_requires_changelog_section_and_rc_does_not() {
 
 #[test]
 fn stable_validate_requires_npm_wrapper_version_match() {
+    // Use a version that will never be the shipped one, so the npm-wrapper
+    // mismatch gate fires regardless of the workspace's current version (a real
+    // tag matching the bumped version would make validate succeed).
     let stable = release_trust([
         "validate",
         "--ref",
-        "refs/tags/v0.2.0",
+        "refs/tags/v9.9.9",
         "--repo",
         "gregce/deadreckon",
         "--skip-changelog",
@@ -480,7 +483,7 @@ fn stable_validate_requires_npm_wrapper_version_match() {
     let rc = release_trust([
         "validate",
         "--ref",
-        "refs/tags/v0.2.0-rc.1",
+        "refs/tags/v9.9.9-rc.1",
         "--repo",
         "gregce/deadreckon",
         "--skip-changelog",
