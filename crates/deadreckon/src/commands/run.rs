@@ -373,6 +373,13 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         run_prefix(&state.run_id)
     );
     let run_id_for_plain = state.run_id.clone();
+    // Live narrator (P3 wiring): on a TTY, narration is on by default; the bus
+    // sender feeds the loop and a sidecar task drains it. Off-TTY without
+    // --narrate, resolve returns None and the run is wired exactly as before.
+    let narrator_config =
+        crate::narrator::resolve_narrator_config(io::stdin().is_terminal(), false, false, None);
+    let (narrate_event_sender, narrator_handle) =
+        crate::narrator::build_narration(narrator_config.clone());
     let turn_loop = run_turn_loop(
         &mut state,
         &router,
@@ -384,9 +391,9 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             no_seams,
             max_turns: 12,
             from_turn: None,
-            event_sender: None,
+            event_sender: narrate_event_sender,
             cancellation_token: None,
-            narrate: None,
+            narrate: narrator_config,
             docs: RunLoopDocsConfig {
                 home: paths.home().to_path_buf(),
                 config_path: Some(paths.config_path()),
@@ -407,6 +414,9 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     } else {
         maybe_with_cli_wait_status(!plain && !quiet, &wait_label, turn_loop).await?
     };
+    if let Some(handle) = narrator_handle {
+        handle.shutdown().await;
+    }
     state.child_pids.clear();
     save_state(&state)?;
     lock.release()?;

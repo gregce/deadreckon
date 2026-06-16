@@ -13,6 +13,10 @@
   an availability predicate, plus a registry-backed predicate that gates CLIs
   on binary presence + login state and HTTP on a non-empty API-key env var.
   `--narrator-model` overrides the model without changing provider order.
+- P3: the run process now wires a `RunEventBus` into the turn loop and spawns an
+  in-process narrator sidecar that drains run events and stops cleanly when the
+  run finishes or is cancelled. On a TTY narration is on by default; off-TTY
+  without `--narrate` the run is wired exactly as before (no bus, no task).
 
 ## 0.1.1
 
