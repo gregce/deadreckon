@@ -569,11 +569,28 @@ fn validate_goal_text(command_label: &str, goal: &str) -> Result<()> {
 #[tokio::main]
 async fn main() {
     if let Err(err) = main_inner().await {
+        // A prompt the user aborted (Ctrl-C / Esc / EOF) is not a failure: exit
+        // calmly with the interrupt convention (130), no "error: I/O error"
+        // line and no path hint.
+        if is_prompt_cancelled(&err) {
+            eprintln!(
+                "{}",
+                ui::render(ui::Stream::Stderr, ui::Tone::Muted, "cancelled")
+            );
+            std::process::exit(130);
+        }
         let exit_code = err.exit_code();
         print_error(&err);
         print_error_hint(&err);
         std::process::exit(exit_code);
     }
+}
+
+/// True when the error is an aborted interactive prompt. The prompt engine
+/// surfaces Ctrl-C / Esc / EOF as an interrupted I/O error; without this it
+/// would be rendered as a generic I/O error with a "referenced path" hint.
+fn is_prompt_cancelled(err: &CliError) -> bool {
+    matches!(err, CliError::Io(source) if source.kind() == std::io::ErrorKind::Interrupted)
 }
 
 async fn main_inner() -> Result<()> {
