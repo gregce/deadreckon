@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.3.0 — Orchestrated Narration (in progress)
+## 0.3.0 — Orchestrated Narration — 2026-06-17
+
+Extends the Live Narrator (0.2.0, AS-BUILT §44) to every orchestrated and
+campaign child. Children are subprocesses, so they got zero live beats; now
+each narrates file-only to its own `snapshots.jsonl`, the plan attach surfaces
+each child's live headline, `dr orchestrate --narrate` prints a one-line-per-
+child stderr aggregate, and `dr attach <campaign> --view narrative` renders a
+campaign projection at plan parity. See AS-BUILT §45.
+
 
 - P1: shared `build_run_narration` helper (extracted from run.rs) + a
   `resolve_narrator_config_for_child` that narrates orchestrate/campaign
@@ -35,6 +43,10 @@
   agent table. It flows through the same `narrative_plain_lines` renderer as a
   plan, so the campaign narrative has full section parity. Adds a `Campaign`
   `NarrativeScope` variant (additive).
+- P11: docs — AS-BUILT §45 (Orchestrated Narration) added; §44.5/§44.6
+  corrected (`effective_plain` is unwired; the spend-math guarantee was only
+  made real in §45.7); §22 shipped list updated; V1-CANDIDATES gains an
+  Orchestrated Narration follow-ups section.
 - P9: parent aggregate stderr line (Option D1) — when `dr orchestrate --narrate`
   is active the parent tails each running child's `snapshots.jsonl` (reusing
   `JsonlTail`) and prints one capped line per active child to STDERR every ~2s,
