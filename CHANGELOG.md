@@ -15,6 +15,12 @@
   shared `resolve_narration` thread `--narrate/--no-narrate/--narrator-model`;
   shutdown is bounded and runs before lock release. The `dr run` TTY contract is
   unchanged.
+- P4/P5: `dr orchestrate` gains `--narrate/--no-narrate/--narrator-model`,
+  threaded through `fork_command` to each spawned child's argv (`run_plan_child`
+  appends `--narrate` + sets `DEADRECKON_NARRATE_CHILD=1` and
+  `DEADRECKON_AUTH_PROBE=0`), so coder/full-plan children narrate file-only to
+  their own `snapshots.jsonl`. Child argv building is extracted into a pure
+  `child_argv` so propagation is unit-tested without spawning.
 
 ## 0.2.0 — Live Narrator
 

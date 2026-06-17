@@ -796,8 +796,14 @@ async fn main_inner() -> Result<()> {
             no_hints,
             quiet,
             plain,
+            narrate,
+            no_narrate,
+            narrator_model,
         } => {
             ui::set_plain_output(plain);
+            if let Err(message) = crate::narrator::validate_narration_flags(narrate, no_narrate) {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(message)));
+            }
             let request = commands::orchestrate::orchestrate_request_from_cli(
                 command,
                 commands::orchestrate::BareOrchestrateArgs {
@@ -814,6 +820,9 @@ async fn main_inner() -> Result<()> {
                     no_hints,
                     quiet,
                     plain,
+                    narrate,
+                    no_narrate,
+                    narrator_model,
                 },
             )?;
             ui::set_plain_output(request.plan.plain);
@@ -955,6 +964,8 @@ async fn main_inner() -> Result<()> {
                 quiet,
                 plain,
                 completion_surface: true,
+                narrate: false,
+                narrator_model: None,
             })
             .await
         }

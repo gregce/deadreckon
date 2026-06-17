@@ -6,6 +6,8 @@ pub(crate) struct OrchestrateRunArgs {
     pub(crate) yes: bool,
     pub(crate) no_repair: bool,
     pub(crate) completion_surface: bool,
+    pub(crate) narrate: bool,
+    pub(crate) narrator_model: Option<String>,
 }
 
 pub(crate) struct BareOrchestrateArgs {
@@ -22,6 +24,9 @@ pub(crate) struct BareOrchestrateArgs {
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
     pub(crate) plain: bool,
+    pub(crate) narrate: bool,
+    pub(crate) no_narrate: bool,
+    pub(crate) narrator_model: Option<String>,
 }
 
 pub(crate) fn orchestrate_request_from_cli(
@@ -69,6 +74,8 @@ pub(crate) fn orchestrate_request_from_cli(
             yes: args.yes || bare.yes,
             no_repair: args.no_repair || bare.no_repair,
             completion_surface: true,
+            narrate: bare.narrate && !bare.no_narrate,
+            narrator_model: bare.narrator_model,
         }),
         Some(OrchestrateCommand::FullPlan(args)) => Ok(OrchestrateRunArgs {
             plan: PlanCommandArgs {
@@ -110,6 +117,8 @@ pub(crate) fn orchestrate_request_from_cli(
             yes: args.yes || bare.yes,
             no_repair: args.no_repair || bare.no_repair,
             completion_surface: true,
+            narrate: bare.narrate && !bare.no_narrate,
+            narrator_model: bare.narrator_model,
         }),
         None => interactive_orchestrate_request(bare),
     }
@@ -130,6 +139,9 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         no_hints,
         quiet,
         plain,
+        narrate,
+        no_narrate,
+        narrator_model,
     } = bare;
     let Some(goal) = resolve_optional_goal_input("orchestrate", goal, goal_file)? else {
         return Err(CliError::Core(deadreckon_core::user_error(
@@ -214,6 +226,8 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         yes,
         no_repair,
         completion_surface: true,
+        narrate: narrate && !no_narrate,
+        narrator_model,
     })
 }
 
@@ -491,6 +505,8 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
         quiet,
         plain,
         completion_surface: false,
+        narrate: args.narrate,
+        narrator_model: args.narrator_model.clone(),
     })
     .await?;
     let sub_result_launch_dir = std::env::var(deadreckon_core::campaign::ENV_SUB_RESULT).ok();

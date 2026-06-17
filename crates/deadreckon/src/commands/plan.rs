@@ -1606,6 +1606,8 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         quiet,
         plain,
         completion_surface,
+        narrate,
+        narrator_model,
     } = args;
     let paths = DeadreckonPaths::discover();
     let resolved_id = resolve_plan_id(&paths, &plan_id)?;
@@ -1707,6 +1709,7 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
             let plan_for_child = plan.clone();
             let sandbox_for_child = sandbox.clone();
             let signal_tx_for_child = signal_tx.clone();
+            let narrator_model_for_child = narrator_model.clone();
             handles.push((
                 task_index,
                 tokio::task::spawn_blocking(move || {
@@ -1721,6 +1724,8 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                         quiet,
                         plain,
                         forward_output: false,
+                        narrate,
+                        narrator_model: narrator_model_for_child,
                         signal_sender: Some(signal_tx_for_child),
                     })
                 }),
@@ -2551,7 +2556,92 @@ struct PlanChildLaunch<'a> {
     quiet: bool,
     plain: bool,
     forward_output: bool,
+    narrate: bool,
+    narrator_model: Option<String>,
     signal_sender: Option<std::sync::mpsc::Sender<PlanChildSignal>>,
+}
+
+/// Build the spawned child's argument vector (the `run`/`extend` invocation
+/// plus flags). Pure so the `--narrate` propagation is unit-testable without
+/// spawning a subprocess.
+#[allow(clippy::too_many_arguments)] // mirrors run_plan_child's resolved locals
+fn child_argv(
+    plan: &Plan,
+    task: &PlanTask,
+    prompt: &str,
+    source_dir: &Path,
+    plain: bool,
+    sandbox: &str,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    narrate: bool,
+    narrator_model: Option<&str>,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let review_parent = review_parent_run_id(plan, task);
+    if let Some(parent_run_id) = review_parent.as_deref() {
+        argv.extend([
+            "extend".to_string(),
+            parent_run_id.to_string(),
+            prompt.to_string(),
+            "--no-docs".to_string(),
+        ]);
+    } else {
+        argv.extend([
+            "run".to_string(),
+            prompt.to_string(),
+            "--from".to_string(),
+            source_dir.display().to_string(),
+            "--yes".to_string(),
+            "--no-confirm".to_string(),
+            "--no-hints".to_string(),
+            "--no-docs".to_string(),
+        ]);
+        if plain {
+            argv.push("--plain".to_string());
+        }
+        if let Some(acceptance_path) = plan.acceptance_path.as_deref() {
+            argv.push("--acceptance".to_string());
+            argv.push(acceptance_path.display().to_string());
+        }
+    }
+    if narrate {
+        argv.push("--narrate".to_string());
+        if let Some(model) = narrator_model {
+            argv.push("--narrator-model".to_string());
+            argv.push(model.to_string());
+        }
+    }
+    argv.push("--sandbox".to_string());
+    argv.push(sandbox.to_string());
+    if let Some(max_spend) = max_spend {
+        argv.push("--max-spend".to_string());
+        argv.push(format!("{max_spend:.6}"));
+    }
+    if let Some(max_wall_seconds) = max_wall_seconds {
+        argv.push("--max-wall-seconds".to_string());
+        argv.push(max_wall_seconds.to_string());
+    }
+    if task
+        .provider
+        .as_deref()
+        .is_some_and(|provider| provider == "smoke" || provider.starts_with("smoke:"))
+    {
+        if review_parent.is_some() {
+            argv.push("--provider".to_string());
+            argv.push("smoke".to_string());
+        } else {
+            argv.push("--smoke".to_string());
+        }
+    } else if let Some(provider) = task.provider.as_deref() {
+        argv.push("--provider".to_string());
+        argv.push(provider.to_string());
+    }
+    if let Some(model) = child_model_for_task(&plan.providers, task) {
+        argv.push("--model".to_string());
+        argv.push(model.to_string());
+    }
+    argv
 }
 
 fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
@@ -2566,6 +2656,8 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         quiet,
         plain,
         forward_output,
+        narrate,
+        narrator_model,
         signal_sender,
     } = launch;
     let task = &plan.tasks[task_index];
@@ -2585,55 +2677,25 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         .env("DEADRECKON_HOME", paths.home())
         .env("DEADRECKON_HINTS", "0")
         .env("DEADRECKON_SCOPE_ROOT", &launch_dir);
-    let review_parent_run_id = review_parent_run_id(plan, task);
-    if let Some(parent_run_id) = review_parent_run_id.as_deref() {
+    if narrate {
+        // The child narrates FILE-ONLY (parent owns its stdout/stderr); the env
+        // also skips the per-child auth probe — the parent resolved the model.
         command
-            .arg("extend")
-            .arg(parent_run_id)
-            .arg(prompt)
-            .arg("--no-docs");
-    } else {
-        command
-            .arg("run")
-            .arg(prompt)
-            .arg("--from")
-            .arg(source_dir)
-            .arg("--yes")
-            .arg("--no-confirm")
-            .arg("--no-hints")
-            .arg("--no-docs");
-        if plain {
-            command.arg("--plain");
-        }
-        if let Some(acceptance_path) = plan.acceptance_path.as_deref() {
-            command.arg("--acceptance").arg(acceptance_path);
-        }
+            .env(crate::narrator::NARRATE_CHILD_ENV, "1")
+            .env("DEADRECKON_AUTH_PROBE", "0");
     }
-    command.arg("--sandbox").arg(sandbox);
-    if let Some(max_spend) = max_spend {
-        command.arg("--max-spend").arg(format!("{max_spend:.6}"));
-    }
-    if let Some(max_wall_seconds) = max_wall_seconds {
-        command
-            .arg("--max-wall-seconds")
-            .arg(max_wall_seconds.to_string());
-    }
-    if task
-        .provider
-        .as_deref()
-        .is_some_and(|provider| provider == "smoke" || provider.starts_with("smoke:"))
-    {
-        if review_parent_run_id.is_some() {
-            command.arg("--provider").arg("smoke");
-        } else {
-            command.arg("--smoke");
-        }
-    } else if let Some(provider) = task.provider.as_deref() {
-        command.arg("--provider").arg(provider);
-    }
-    if let Some(model) = child_model_for_task(&plan.providers, task) {
-        command.arg("--model").arg(model);
-    }
+    command.args(child_argv(
+        plan,
+        task,
+        &prompt,
+        source_dir,
+        plain,
+        sandbox,
+        max_spend,
+        max_wall_seconds,
+        narrate,
+        narrator_model.as_deref(),
+    ));
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -2965,8 +3027,8 @@ mod tests {
 
 #[cfg(test)]
 mod model_routing_tests {
-    use super::child_model_for_task;
-    use deadreckon_core::plan::{PlanProviders, PlanTask, PlanTaskStatus};
+    use super::{child_argv, child_model_for_task};
+    use deadreckon_core::plan::{Plan, PlanProviders, PlanTask, PlanTaskStatus};
 
     fn task(index: u32) -> PlanTask {
         PlanTask {
@@ -3022,5 +3084,82 @@ mod model_routing_tests {
     fn provider_default_model_means_no_model_argv() {
         let providers = providers(Some("provider default"), &[]);
         assert_eq!(child_model_for_task(&providers, &task(0)), None);
+    }
+
+    fn narrate_plan() -> Plan {
+        let mut coder = task(0);
+        coder.subject = "coder".to_string();
+        let mut reviewer = task(1);
+        reviewer.subject = "reviewer".to_string();
+        Plan::new(
+            "goal",
+            deadreckon_core::plan::PlanMode::FullPlan,
+            vec![coder, reviewer],
+            providers(None, &[]),
+            None,
+            "test",
+        )
+        .expect("plan")
+    }
+
+    #[test]
+    fn orchestrate_full_plan_with_narrate_appends_narrate_flag_to_each_child_argv() {
+        let plan = narrate_plan();
+        let task0 = &plan.tasks[0];
+        let with = child_argv(
+            &plan,
+            task0,
+            "do the thing",
+            std::path::Path::new("/src"),
+            false,
+            "none",
+            None,
+            None,
+            true,
+            None,
+        );
+        assert!(with.iter().any(|a| a == "--narrate"), "{with:?}");
+        let without = child_argv(
+            &plan,
+            task0,
+            "do the thing",
+            std::path::Path::new("/src"),
+            false,
+            "none",
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            !without.iter().any(|a| a == "--narrate"),
+            "no --narrate without opt-in: {without:?}"
+        );
+    }
+
+    #[test]
+    fn plan_child_argv_pinned_test_updated_for_narrate_flag() {
+        let plan = narrate_plan();
+        let task0 = &plan.tasks[0];
+        let argv = child_argv(
+            &plan,
+            task0,
+            "do the thing",
+            std::path::Path::new("/src"),
+            false,
+            "none",
+            None,
+            None,
+            true,
+            Some("haiku"),
+        );
+        // run child: leads with run/--from/--no-docs, then --narrate + model.
+        assert_eq!(argv[0], "run");
+        assert!(argv.iter().any(|a| a == "--no-docs"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--narrator-model" && w[1] == "haiku"),
+            "{argv:?}"
+        );
     }
 }
