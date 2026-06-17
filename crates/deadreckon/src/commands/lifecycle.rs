@@ -1353,7 +1353,13 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         no_docs,
         doc_skill,
         post_actions,
+        narrate,
+        no_narrate,
+        narrator_model,
     } = args;
+    if let Err(message) = crate::narrator::validate_narration_flags(narrate, no_narrate) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(message)));
+    }
     let new_goal = new_goal.trim().to_string();
     if new_goal.is_empty() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
@@ -1470,6 +1476,9 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             provider_source: primary_setup.source.as_str().to_string(),
             post_actions,
             context_turns,
+            narrate,
+            no_narrate,
+            narrator_model: narrator_model.clone(),
         })
         .await;
     }
@@ -1570,6 +1579,32 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         "extended run {} running; attach in another terminal",
         run_prefix(&state.run_id)
     );
+    // Live narrator: a spawned reviewer child (NARRATE_CHILD_ENV) narrates
+    // file-only; an interactive `dr extend` uses the TTY default. Floor unless a
+    // model is pinned; smoke forces the floor.
+    let is_narrate_child = std::env::var_os(crate::narrator::NARRATE_CHILD_ENV).is_some();
+    let narrator_config = crate::narrator::resolve_narration(
+        is_narrate_child,
+        io::stdin().is_terminal(),
+        narrate,
+        no_narrate,
+        narrator_model,
+    );
+    let extend_force_floor = effective_provider.as_deref() == Some("smoke")
+        || (is_narrate_child
+            && crate::narrator::child_narrator_backend_is_floor(
+                narrator_config
+                    .as_ref()
+                    .and_then(|config| config.model_override.as_deref()),
+            ));
+    let (narrate_event_sender, narrator_handle) = crate::narrator::build_run_narration(
+        paths.home(),
+        Some(paths.config_path()),
+        &state.run_id,
+        &state.run_root,
+        extend_force_floor,
+        narrator_config.clone(),
+    );
     let outcome = with_cli_wait_status(
         &wait_label,
         run_turn_loop(
@@ -1583,9 +1618,9 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
                 no_seams: false,
                 max_turns: 12,
                 from_turn: None,
-                event_sender: None,
+                event_sender: narrate_event_sender,
                 cancellation_token: None,
-                narrate: None,
+                narrate: narrator_config,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
                     config_path: Some(paths.config_path()),
@@ -1601,6 +1636,9 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         ),
     )
     .await?;
+    if let Some(handle) = narrator_handle {
+        handle.shutdown().await;
+    }
     state.child_pids.clear();
     save_state(&state)?;
     lock.release()?;
@@ -1696,6 +1734,9 @@ struct ExtendWorktreeArgs {
     provider_source: String,
     post_actions: bool,
     context_turns: Option<u32>,
+    narrate: bool,
+    no_narrate: bool,
+    narrator_model: Option<String>,
 }
 
 async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
@@ -1720,6 +1761,9 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         provider_source,
         post_actions,
         context_turns,
+        narrate,
+        no_narrate,
+        narrator_model,
     } = args;
     let parent_branch = parent_record.branch_name.clone();
     let source_git_root = parent_record.source_git_root.clone().ok_or_else(|| {
@@ -1828,6 +1872,29 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         "extended run {} running; attach in another terminal",
         run_prefix(&state.run_id)
     );
+    let is_narrate_child = std::env::var_os(crate::narrator::NARRATE_CHILD_ENV).is_some();
+    let narrator_config = crate::narrator::resolve_narration(
+        is_narrate_child,
+        io::stdin().is_terminal(),
+        narrate,
+        no_narrate,
+        narrator_model,
+    );
+    let extend_force_floor = effective_provider.as_deref() == Some("smoke")
+        || (is_narrate_child
+            && crate::narrator::child_narrator_backend_is_floor(
+                narrator_config
+                    .as_ref()
+                    .and_then(|config| config.model_override.as_deref()),
+            ));
+    let (narrate_event_sender, narrator_handle) = crate::narrator::build_run_narration(
+        paths.home(),
+        Some(paths.config_path()),
+        &state.run_id,
+        &state.run_root,
+        extend_force_floor,
+        narrator_config.clone(),
+    );
     let outcome = with_cli_wait_status(
         &wait_label,
         run_turn_loop(
@@ -1841,9 +1908,9 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
                 no_seams: false,
                 max_turns: 12,
                 from_turn: None,
-                event_sender: None,
+                event_sender: narrate_event_sender,
                 cancellation_token: None,
-                narrate: None,
+                narrate: narrator_config,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
                     config_path: Some(paths.config_path()),
@@ -1859,6 +1926,9 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         ),
     )
     .await?;
+    if let Some(handle) = narrator_handle {
+        handle.shutdown().await;
+    }
     state.child_pids.clear();
     save_state(&state)?;
     lock.release()?;

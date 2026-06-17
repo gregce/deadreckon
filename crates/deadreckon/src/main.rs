@@ -1179,6 +1179,9 @@ async fn main_inner() -> Result<()> {
             sandbox,
             no_docs,
             doc_skill,
+            narrate,
+            no_narrate,
+            narrator_model,
         } => {
             commands::lifecycle::extend_command(ExtendCommandArgs {
                 parent_run_id,
@@ -1194,6 +1197,9 @@ async fn main_inner() -> Result<()> {
                 no_docs,
                 doc_skill,
                 post_actions: completion_hints_enabled(false),
+                narrate,
+                no_narrate,
+                narrator_model,
             })
             .await
         }
@@ -11555,6 +11561,9 @@ async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<
         no_docs: false,
         doc_skill: None,
         post_actions: false,
+        narrate: false,
+        no_narrate: false,
+        narrator_model: None,
     })
     .await
 }

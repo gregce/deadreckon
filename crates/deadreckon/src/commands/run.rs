@@ -399,16 +399,13 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     // Off-TTY with no --narrate, resolve returns None and the run is wired as
     // before. A smoke run forces the floor so tests stay hermetic.
     let is_narrate_child = std::env::var_os(crate::narrator::NARRATE_CHILD_ENV).is_some();
-    let narrator_config = if is_narrate_child {
-        crate::narrator::resolve_narrator_config_for_child(narrate, no_narrate, narrator_model)
-    } else {
-        crate::narrator::resolve_narrator_config(
-            io::stdin().is_terminal(),
-            narrate,
-            no_narrate,
-            narrator_model,
-        )
-    };
+    let narrator_config = crate::narrator::resolve_narration(
+        is_narrate_child,
+        io::stdin().is_terminal(),
+        narrate,
+        no_narrate,
+        narrator_model,
+    );
     let force_floor = smoke
         || (is_narrate_child
             && crate::narrator::child_narrator_backend_is_floor(
