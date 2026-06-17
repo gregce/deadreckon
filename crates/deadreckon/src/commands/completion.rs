@@ -28,7 +28,52 @@ fn write_completion_script(shell: Shell, output: &mut dyn Write) {
     let mut command = completion_command_tree();
     let bin_name = command.get_name().to_string();
     generate(shell, &mut command, bin_name, output);
+    if let Some(snippet) = at_goal_completion_snippet(shell) {
+        let _ = output.write_all(snippet.as_bytes());
+    }
 }
+
+/// Extra completion so the `@path/to/goal.md` goal form completes the path after
+/// the `@`. clap's generated scripts complete whole tokens and can't see the
+/// `@` prefix; these wrappers strip it, complete the path, and restore it.
+/// Bash and Zsh only — the shells where prefix-stripped completion is
+/// expressible. (`--goal-file` carries `ValueHint::FilePath` for every shell.)
+fn at_goal_completion_snippet(shell: Shell) -> Option<&'static str> {
+    match shell {
+        Shell::Bash => Some(BASH_AT_GOAL_COMPLETION),
+        Shell::Zsh => Some(ZSH_AT_GOAL_COMPLETION),
+        _ => None,
+    }
+}
+
+const BASH_AT_GOAL_COMPLETION: &str = r#"
+# deadreckon: complete the path after a leading @ in the goal argument.
+_deadreckon_at_goal() {
+    _deadreckon "$@"
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    if [[ "$cur" == @* ]]; then
+        local entry
+        COMPREPLY=()
+        while IFS= read -r entry; do
+            [[ -n "$entry" ]] && COMPREPLY+=("@$entry")
+        done < <(compgen -f -- "${cur#@}")
+    fi
+}
+complete -F _deadreckon_at_goal -o nosort -o bashdefault -o default deadreckon
+"#;
+
+const ZSH_AT_GOAL_COMPLETION: &str = r#"
+# deadreckon: complete the path after a leading @ in the goal argument.
+_deadreckon_at_goal() {
+    if [[ ${words[CURRENT]} == @* ]]; then
+        compset -P '@'
+        _files
+        return
+    fi
+    _deadreckon "$@"
+}
+compdef _deadreckon_at_goal deadreckon
+"#;
 
 fn completion_command_tree() -> ClapCommand {
     unhide_completion_commands(Cli::command())
@@ -183,6 +228,42 @@ fn default_completion_path(shell: Shell) -> PathBuf {
             .join("deadreckon-completions.ps1"),
         Shell::Zsh => home.join(".zsh").join("completions").join("_deadreckon"),
         _ => home.join(".deadreckon").join("completion"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn script(shell: Shell) -> String {
+        let mut out = Vec::new();
+        write_completion_script(shell, &mut out);
+        String::from_utf8(out).expect("utf8 completion script")
+    }
+
+    #[test]
+    fn at_goal_completion_is_emitted_for_bash_and_zsh_only() {
+        // Generating deadreckon's large clap tree is stack-heavy; run on a
+        // worker thread with a generous stack (test threads default to ~2 MiB).
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let bash = script(Shell::Bash);
+                assert!(bash.contains("_deadreckon_at_goal"), "bash @-goal wrapper");
+                assert!(bash.contains("compgen -f -- \"${cur#@}\""), "bash strips @");
+
+                let zsh = script(Shell::Zsh);
+                assert!(zsh.contains("_deadreckon_at_goal"), "zsh @-goal wrapper");
+                assert!(zsh.contains("compset -P '@'"), "zsh strips @ then _files");
+
+                // Other shells get the base clap script without the @ wrapper.
+                let fish = script(Shell::Fish);
+                assert!(!fish.contains("_deadreckon_at_goal"));
+                assert!(fish.contains("deadreckon"), "base completion still present");
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("completion assertions");
     }
 }
 
