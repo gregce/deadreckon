@@ -28,6 +28,12 @@
 - P6: `dr campaign` gains `--narrate/--no-narrate/--narrator-model`, appended to
   the `orchestrate full-plan` sub-orchestrator argv (`build_sub_orchestrator_command`),
   so the campaign → orchestrate → run/extend chain narrates end to end.
+- P9: parent aggregate stderr line (Option D1) — when `dr orchestrate --narrate`
+  is active the parent tails each running child's `snapshots.jsonl` (reusing
+  `JsonlTail`) and prints one capped line per active child to STDERR every ~2s,
+  preferring each child's latest Live beat. The aggregate never touches stdout
+  (the parent scrapes children's run-ids off its own stdout), enforced by a
+  test-threaded sink.
 - P8: plan-attach surfacing reliability — the per-child agent table caps at
   `PLAN_AGENT_TABLE_MAX` active children with a `+N more` overflow line, and
   `latest_child_narrative_snapshot` now reads via `read_latest_live_snapshot`,

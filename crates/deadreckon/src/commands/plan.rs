@@ -1590,6 +1590,41 @@ fn orchestrate_confirmation_refusal_error(plan: &Plan, no_hints: bool) -> CliErr
     }
 }
 
+/// Per-child snapshot tails the parent polls to render its live aggregate
+/// stderr line (Option D1). Keyed by task index.
+#[derive(Default)]
+struct ParentAggregateState {
+    tails: BTreeMap<usize, crate::plan_event_bus::JsonlTail<crate::narrative::NarrativeSnapshot>>,
+    headlines: BTreeMap<usize, String>,
+}
+
+/// Tail each running child's `snapshots.jsonl` and refresh its latest headline.
+fn refresh_parent_aggregate(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    state: &mut ParentAggregateState,
+    running_indices: &[usize],
+) {
+    for &task_index in running_indices {
+        let Some(run_id) = plan.tasks[task_index].child_run_id.clone() else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(slot) = state.tails.entry(task_index) {
+            let Ok(run_state) = load_run(paths, &run_id) else {
+                continue;
+            };
+            let path = crate::narrative::child_snapshots_path(&run_state.run_root);
+            slot.insert(crate::plan_event_bus::JsonlTail::new(path));
+        }
+        if let Some(tail) = state.tails.get_mut(&task_index)
+            && let Ok(rows) = tail.read_new()
+            && let Some(headline) = crate::narrative::latest_headline_from(&rows)
+        {
+            state.headlines.insert(task_index, headline);
+        }
+    }
+}
+
 pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     let ForkCommandArgs {
         plan_id,
@@ -1739,6 +1774,10 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         let mut last_plain_status = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(2))
             .unwrap_or_else(std::time::Instant::now);
+        let mut aggregate_state = ParentAggregateState::default();
+        let mut last_aggregate = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(2))
+            .unwrap_or_else(std::time::Instant::now);
         while !running.is_empty() {
             drain_plan_child_signals(
                 &paths,
@@ -1764,6 +1803,35 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
             }
             if running.is_empty() {
                 break;
+            }
+            if narrate && !quiet && last_aggregate.elapsed() >= std::time::Duration::from_secs(2) {
+                let running_indices: Vec<usize> =
+                    running.iter().map(|(task_index, _)| *task_index).collect();
+                refresh_parent_aggregate(&paths, &plan, &mut aggregate_state, &running_indices);
+                let children: Vec<crate::narrative::ChildHeadline> = running_indices
+                    .iter()
+                    .filter_map(|task_index| {
+                        aggregate_state.headlines.get(task_index).map(|headline| {
+                            crate::narrative::ChildHeadline {
+                                task_id: plan.tasks[*task_index].task_id.clone(),
+                                headline: headline.clone(),
+                            }
+                        })
+                    })
+                    .collect();
+                if !children.is_empty() {
+                    if !plain {
+                        clear_cli_wait_status();
+                    }
+                    let mut out = std::io::sink();
+                    let mut err = std::io::stderr();
+                    let mut sinks = crate::narrative::AggregateSinks {
+                        out: &mut out,
+                        err: &mut err,
+                    };
+                    let _ = crate::narrative::emit_parent_aggregate(&mut sinks, &children, 100);
+                }
+                last_aggregate = std::time::Instant::now();
             }
             if !quiet {
                 if plain {

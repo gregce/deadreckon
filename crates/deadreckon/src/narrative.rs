@@ -1101,7 +1101,10 @@ pub(crate) fn narrative_plain_lines(
     push_claim_section(&mut lines, "Current work", &snapshot.current_work);
     push_claim_section(&mut lines, "Architecture", &snapshot.architecture_notes);
     if !snapshot.agent_table.is_empty() {
-        lines.extend(agent_table_lines(&snapshot.agent_table, PLAN_AGENT_TABLE_MAX));
+        lines.extend(agent_table_lines(
+            &snapshot.agent_table,
+            PLAN_AGENT_TABLE_MAX,
+        ));
         lines.push(String::new());
     }
     if !snapshot.coordination_notes.is_empty() {
@@ -1166,6 +1169,61 @@ fn agent_table_lines(rows: &[NarrativeAgentRow], max: usize) -> Vec<String> {
         lines.push(format!("- +{} more", rows.len() - max));
     }
     lines
+}
+
+/// One active child's current narration headline, for the parent's live
+/// aggregate line (Option D1).
+pub(crate) struct ChildHeadline {
+    pub(crate) task_id: String,
+    pub(crate) headline: String,
+}
+
+/// Path to a run's narration snapshots file, given its run root.
+pub(crate) fn child_snapshots_path(run_root: &Path) -> PathBuf {
+    run_root.join(NARRATIVE_DIR).join(NARRATIVE_SNAPSHOTS_JSONL)
+}
+
+/// Pick the headline to show for a child from a batch of newly-tailed snapshot
+/// rows — preferring the latest Live beat, falling back to the last row.
+pub(crate) fn latest_headline_from(rows: &[NarrativeSnapshot]) -> Option<String> {
+    rows.iter()
+        .rev()
+        .find(|snapshot| snapshot.live.is_some())
+        .or_else(|| rows.last())
+        .map(|snapshot| snapshot.headline.clone())
+}
+
+/// Render one capped line per active child for the parent's aggregate view.
+pub(crate) fn parent_aggregate_lines(children: &[ChildHeadline], max_width: usize) -> Vec<String> {
+    children
+        .iter()
+        .map(|child| {
+            let raw = format!("· {} {}", child.task_id, child.headline);
+            raw.chars().take(max_width).collect::<String>()
+        })
+        .collect()
+}
+
+/// Output sinks for the parent aggregate. The aggregate is written ONLY to
+/// `err`; `out` is threaded so a test can prove stdout stays untouched (the
+/// parent scrapes children's run-ids off its own stdout).
+pub(crate) struct AggregateSinks<'a> {
+    // Threaded so a test can assert stdout stays empty; production passes a sink.
+    #[allow(dead_code)]
+    pub(crate) out: &'a mut dyn Write,
+    pub(crate) err: &'a mut dyn Write,
+}
+
+/// Write one capped line per active child to the aggregate's stderr sink.
+pub(crate) fn emit_parent_aggregate(
+    sinks: &mut AggregateSinks<'_>,
+    children: &[ChildHeadline],
+    max_width: usize,
+) -> std::io::Result<()> {
+    for line in parent_aggregate_lines(children, max_width) {
+        writeln!(sinks.err, "{line}")?;
+    }
+    Ok(())
 }
 
 /// Like [`read_latest_snapshot`] but prefers the latest LIVE beat over a later
@@ -3602,6 +3660,56 @@ mod tests {
             latest.headline, "Live: wired the bus",
             "the live beat is preferred over a later deterministic projection"
         );
+    }
+
+    #[test]
+    fn parent_aggregate_stderr_prints_one_capped_line_per_active_child() {
+        let children = vec![
+            ChildHeadline {
+                task_id: "task-0".to_string(),
+                headline: "x".repeat(200),
+            },
+            ChildHeadline {
+                task_id: "task-1".to_string(),
+                headline: "reviewing".to_string(),
+            },
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        {
+            let mut sinks = AggregateSinks {
+                out: &mut out,
+                err: &mut err,
+            };
+            emit_parent_aggregate(&mut sinks, &children, 60).expect("emit");
+        }
+        let text = String::from_utf8(err).expect("utf8");
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per active child");
+        for line in &lines {
+            assert!(line.chars().count() <= 60, "capped: {line:?}");
+        }
+        assert!(lines[0].contains("task-0"));
+        assert!(lines[1].contains("reviewing"));
+    }
+
+    #[test]
+    fn parent_aggregate_never_writes_to_stdout() {
+        let children = vec![ChildHeadline {
+            task_id: "task-0".to_string(),
+            headline: "wiring".to_string(),
+        }];
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        {
+            let mut sinks = AggregateSinks {
+                out: &mut out,
+                err: &mut err,
+            };
+            emit_parent_aggregate(&mut sinks, &children, 80).expect("emit");
+        }
+        assert!(out.is_empty(), "aggregate must never touch stdout");
+        assert!(!err.is_empty(), "aggregate goes to stderr");
     }
 
     #[test]
