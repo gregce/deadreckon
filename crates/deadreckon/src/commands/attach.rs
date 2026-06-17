@@ -30,7 +30,11 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     if let Some((campaign_dir, campaign)) = commands::campaign::resolve_campaign(&paths, &run_ref)?
     {
         let state = commands::campaign::CampaignAttachState::new(&paths, &campaign_dir, campaign);
-        if args.json {
+        if args.view.is_narrative() && args.json {
+            print_campaign_narrative_json(&paths, &state.campaign, args.visual)?;
+        } else if args.view.is_narrative() && (!io::stdout().is_terminal() || args.plain) {
+            print_campaign_narrative_plain(&paths, &state.campaign, args.visual)?;
+        } else if args.json {
             print!(
                 "{}",
                 commands::campaign::campaign_attach_json_text(Some(&paths), &state)?
@@ -266,6 +270,50 @@ fn plan_projection_for_plain(
         messages: &messages,
         plan_events: &plan_events,
         feed_events: &[],
+        selected: 0,
+    })
+}
+
+fn print_campaign_narrative_plain(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+    visual: NarrativeVisualMode,
+) -> Result<()> {
+    print!(
+        "{}",
+        campaign_narrative_plain_text(paths, campaign, visual)?
+    );
+    Ok(())
+}
+
+pub(crate) fn campaign_narrative_plain_text(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+    visual: NarrativeVisualMode,
+) -> Result<String> {
+    let projection = campaign_projection_for_plain(paths, campaign)?;
+    let mut output = narrative::narrative_plain_lines(&projection, visual).join("\n");
+    output.push('\n');
+    Ok(output)
+}
+
+fn print_campaign_narrative_json(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+    _visual: NarrativeVisualMode,
+) -> Result<()> {
+    let projection = campaign_projection_for_plain(paths, campaign)?;
+    println!("{}", serde_json::to_string_pretty(&projection)?);
+    Ok(())
+}
+
+fn campaign_projection_for_plain(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+) -> Result<narrative::NarrativeProjection> {
+    narrative::ensure_campaign_projection(&narrative::CampaignNarrativeInput {
+        paths,
+        campaign,
         selected: 0,
     })
 }

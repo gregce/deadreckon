@@ -28,6 +28,13 @@
 - P6: `dr campaign` gains `--narrate/--no-narrate/--narrator-model`, appended to
   the `orchestrate full-plan` sub-orchestrator argv (`build_sub_orchestrator_command`),
   so the campaign → orchestrate → run/extend chain narrates end to end.
+- P10: campaign Narrative view (Option D2) — `dr attach <campaign-id> --view
+  narrative` (and `--json`) now renders a campaign-scoped projection built by
+  `build_campaign_projection`, aggregating each sub-goal's freshest child
+  narration (its merged run's live beat, else its sub-plan's snapshot) into an
+  agent table. It flows through the same `narrative_plain_lines` renderer as a
+  plan, so the campaign narrative has full section parity. Adds a `Campaign`
+  `NarrativeScope` variant (additive).
 - P9: parent aggregate stderr line (Option D1) — when `dr orchestrate --narrate`
   is active the parent tails each running child's `snapshots.jsonl` (reusing
   `JsonlTail`) and prints one capped line per active child to STDERR every ~2s,

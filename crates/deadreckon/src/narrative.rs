@@ -110,11 +110,18 @@ pub(crate) struct PlanNarrativeInput<'a> {
     pub(crate) selected: usize,
 }
 
+pub(crate) struct CampaignNarrativeInput<'a> {
+    pub(crate) paths: &'a DeadreckonPaths,
+    pub(crate) campaign: &'a deadreckon_core::campaign::Campaign,
+    pub(crate) selected: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NarrativeScope {
     Run,
     Plan,
+    Campaign,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +468,20 @@ pub(crate) fn ensure_plan_projection(
     let plan_dir = input.paths.plan_dir(&input.plan.plan_id);
     let narrative_dir = plan_dir.join(NARRATIVE_DIR);
     let projection = build_plan_projection(input);
+    if let Some(current) = read_current_projection_if_covered(&projection, &narrative_dir) {
+        persist_projection(&current, &narrative_dir)?;
+        return Ok(current);
+    }
+    persist_projection(&projection, &narrative_dir)?;
+    Ok(projection)
+}
+
+pub(crate) fn ensure_campaign_projection(
+    input: &CampaignNarrativeInput<'_>,
+) -> crate::Result<NarrativeProjection> {
+    let campaign_dir = input.paths.plan_dir(&input.campaign.campaign_id);
+    let narrative_dir = campaign_dir.join(NARRATIVE_DIR);
+    let projection = build_campaign_projection(input);
     if let Some(current) = read_current_projection_if_covered(&projection, &narrative_dir) {
         persist_projection(&current, &narrative_dir)?;
         return Ok(current);
@@ -1024,6 +1045,327 @@ pub(crate) fn build_plan_projection(input: &PlanNarrativeInput<'_>) -> Narrative
         state: narrative_state,
         snapshot,
         graph,
+    }
+}
+
+fn sub_status_narrative_label(status: deadreckon_core::campaign::SubGoalStatus) -> &'static str {
+    use deadreckon_core::campaign::SubGoalStatus;
+    match status {
+        SubGoalStatus::Pending => "pending",
+        SubGoalStatus::Running => "running",
+        SubGoalStatus::Merged => "merged",
+        SubGoalStatus::Failed => "failed",
+        SubGoalStatus::Killed => "killed",
+    }
+}
+
+fn campaign_status_narrative_label(
+    status: deadreckon_core::campaign::CampaignStatus,
+) -> &'static str {
+    use deadreckon_core::campaign::CampaignStatus;
+    match status {
+        CampaignStatus::Pending => "pending",
+        CampaignStatus::Forked => "forked",
+        CampaignStatus::Merged => "merged",
+        CampaignStatus::Failed => "failed",
+        CampaignStatus::Killed => "killed",
+    }
+}
+
+/// Fold a sub-goal's freshest narration headline: prefer its merged run's live
+/// beat, else its sub-plan's aggregated plan snapshot (which itself folds the
+/// sub-plan's children).
+fn sub_narrative_headline(
+    paths: &DeadreckonPaths,
+    sub: &deadreckon_core::campaign::SubGoal,
+) -> Option<(String, String)> {
+    if let Some(run_id) = sub.result_run_id.as_deref()
+        && let Some((_path, snapshot)) = latest_child_narrative_snapshot(paths, run_id)
+    {
+        return Some((snapshot.snapshot_id, snapshot.headline));
+    }
+    if let Some(plan_id) = sub.sub_plan_id.as_deref() {
+        let dir = paths.plan_dir(plan_id).join(NARRATIVE_DIR);
+        if let Some(snapshot) = read_latest_live_snapshot(&dir) {
+            return Some((snapshot.snapshot_id, snapshot.headline));
+        }
+    }
+    None
+}
+
+/// Build a campaign-scoped narrative projection that aggregates each sub-goal's
+/// freshest child narration into an agent table — the campaign analogue of
+/// [`build_plan_projection`], rendered by the same [`narrative_plain_lines`].
+pub(crate) fn build_campaign_projection(input: &CampaignNarrativeInput<'_>) -> NarrativeProjection {
+    let campaign = input.campaign;
+    let campaign_prefix = short_id(&campaign.campaign_id);
+    let campaign_evidence = format!(
+        "file:{}",
+        input
+            .paths
+            .plan_dir(&campaign.campaign_id)
+            .join("campaign.json")
+            .display()
+    );
+    let completed = campaign
+        .sub_goals
+        .iter()
+        .filter(|sub| sub.status == deadreckon_core::campaign::SubGoalStatus::Merged)
+        .count();
+    let running = campaign
+        .sub_goals
+        .iter()
+        .filter(|sub| sub.status == deadreckon_core::campaign::SubGoalStatus::Running)
+        .count();
+    let failed = campaign
+        .sub_goals
+        .iter()
+        .filter(|sub| {
+            matches!(
+                sub.status,
+                deadreckon_core::campaign::SubGoalStatus::Failed
+                    | deadreckon_core::campaign::SubGoalStatus::Killed
+            )
+        })
+        .count();
+    let headline = format!(
+        "Campaign {} is {} with {completed} merged, {running} running, and {failed} blocked or failed.",
+        campaign_prefix,
+        campaign_status_narrative_label(campaign.status)
+    );
+    let mut current_work = vec![claim(
+        format!(
+            "The campaign is coordinating {} independent sub-goal(s).",
+            campaign.sub_goals.len()
+        ),
+        vec![campaign_evidence.clone()],
+        "high",
+    )];
+    let selected_summary = campaign
+        .sub_goals
+        .get(input.selected)
+        .map(|sub| {
+            format!(
+                "Selected sub {} is {} and {}.",
+                sub.sub_id,
+                sub_status_narrative_label(sub.status),
+                sub.result_run_id
+                    .as_deref()
+                    .map(|run_id| format!("maps to run {}", short_id(run_id)))
+                    .or_else(|| sub
+                        .sub_plan_id
+                        .as_deref()
+                        .map(|plan_id| format!("maps to plan {}", short_id(plan_id))))
+                    .unwrap_or_else(|| "has no plan yet".to_string())
+            )
+        })
+        .unwrap_or_else(|| "No selected sub-goal is available.".to_string());
+    current_work.push(claim(
+        selected_summary,
+        vec![campaign_evidence.clone()],
+        "high",
+    ));
+
+    let mut citations = vec![NarrativeCitation {
+        id: format!("campaign:{campaign_prefix}"),
+        kind: "campaign".to_string(),
+        path: Some(
+            input
+                .paths
+                .plan_dir(&campaign.campaign_id)
+                .join("campaign.json"),
+        ),
+        summary: format!("campaign {campaign_prefix} root goal"),
+    }];
+    let agent_table = campaign
+        .sub_goals
+        .iter()
+        .map(|sub| {
+            let base = one_line(&sub.goal, 80);
+            let (summary, evidence) = match sub_narrative_headline(input.paths, sub) {
+                Some((snapshot_id, child_headline)) => {
+                    let evidence_id = format!("sub-narrative:{}:{snapshot_id}", sub.sub_id);
+                    citations.push(NarrativeCitation {
+                        id: evidence_id.clone(),
+                        kind: "sub-narrative".to_string(),
+                        path: None,
+                        summary: one_line(&child_headline, 120),
+                    });
+                    (
+                        format!("{base}; {}", one_line(&child_headline, 120)),
+                        vec![format!("sub:{}", sub.sub_id), evidence_id],
+                    )
+                }
+                None => (base, vec![format!("sub:{}", sub.sub_id)]),
+            };
+            NarrativeAgentRow {
+                task_id: sub.sub_id.clone(),
+                role: "sub".to_string(),
+                provider: campaign
+                    .providers
+                    .default_child
+                    .clone()
+                    .or_else(|| campaign.providers.coder.clone()),
+                status: sub_status_narrative_label(sub.status).to_string(),
+                summary,
+                evidence,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let architecture_notes = vec![claim(
+        "The campaign view aggregates each sub-goal's freshest child narration; sub-goals run as independent orchestrate sub-plans."
+            .to_string(),
+        vec![campaign_evidence.clone()],
+        "high",
+    )];
+    let mut risks = Vec::new();
+    if failed > 0 {
+        risks.push(claim(
+            format!("{failed} sub-goal(s) are failed or killed."),
+            vec![campaign_evidence.clone()],
+            "high",
+        ));
+    }
+    risks.push(claim(
+        "Provider-backed narration has not run yet; deterministic fallback facts are shown."
+            .to_string(),
+        vec![campaign_evidence.clone()],
+        "high",
+    ));
+    let next_likely = vec![claim(
+        if campaign.merged_run_id.is_some() {
+            "Inspect the merged result run or apply it.".to_string()
+        } else {
+            "Use Enter on a sub-goal to inspect its sub-plan, or wait for running sub-goals to finish."
+                .to_string()
+        },
+        vec![campaign_evidence],
+        "low",
+    )];
+
+    let source_window = NarrativeSourceWindow::default();
+    let graph = build_campaign_graph(campaign, &source_window);
+    debug_assert!(validate_graph(&graph));
+    let graph_hash = graph_content_hash(&graph);
+    let snapshot_id = snapshot_id(&(
+        NarrativeScope::Campaign,
+        &campaign.campaign_id,
+        &headline,
+        &current_work,
+        &architecture_notes,
+        &risks,
+        &next_likely,
+        &graph_hash,
+    ));
+    let created_at = Utc::now();
+    let snapshot = NarrativeSnapshot {
+        version: 1,
+        snapshot_id: snapshot_id.clone(),
+        scope: NarrativeScope::Campaign,
+        target_id: campaign.campaign_id.clone(),
+        created_at,
+        status: NarrativeStatus::Deterministic,
+        source_window,
+        coverage: NarrativeSnapshotCoverage::default(),
+        headline,
+        current_work,
+        architecture_notes,
+        risks,
+        next_likely,
+        citations,
+        plan_status: Some(campaign_status_narrative_label(campaign.status).to_string()),
+        agent_table,
+        coordination_notes: Vec::new(),
+        live: None,
+    };
+    let latest_covered = NarrativeCoverage {
+        architecture_graph_hash: Some(graph_hash),
+        ..NarrativeCoverage::default()
+    };
+    let narrative_state = NarrativeState {
+        version: 1,
+        scope: NarrativeScope::Campaign,
+        target_id: campaign.campaign_id.clone(),
+        latest_snapshot_id: snapshot_id,
+        latest_status: NarrativeStatus::Deterministic,
+        latest_created_at: Some(created_at),
+        latest_covered,
+        cadence: NarrativeCadence::default(),
+        provider: NarrativeProviderState {
+            route: campaign
+                .providers
+                .planner
+                .clone()
+                .or_else(|| campaign.providers.default_child.clone()),
+            source: "deterministic".to_string(),
+            model: None,
+            calls: 0,
+            cost_usd: 0.0,
+            subscription_seconds: 0.0,
+        },
+        last_error: None,
+    };
+    NarrativeProjection {
+        state: narrative_state,
+        snapshot,
+        graph,
+    }
+}
+
+fn build_campaign_graph(
+    campaign: &deadreckon_core::campaign::Campaign,
+    source_window: &NarrativeSourceWindow,
+) -> ArchitectureGraph {
+    let campaign_prefix = short_id(&campaign.campaign_id);
+    let root_id = format!("campaign:{campaign_prefix}");
+    let mut nodes = vec![ArchitectureNode {
+        id: root_id.clone(),
+        label: format!("campaign {campaign_prefix}"),
+        kind: "campaign".to_string(),
+        status: campaign_status_narrative_label(campaign.status).to_string(),
+        weight: 1,
+        evidence: vec![root_id.clone()],
+        style_token: "campaign".to_string(),
+    }];
+    let mut edges = Vec::new();
+    for sub in &campaign.sub_goals {
+        let node_id = format!("sub:{}", sub.sub_id);
+        nodes.push(ArchitectureNode {
+            id: node_id.clone(),
+            label: sub.sub_id.clone(),
+            kind: "agent".to_string(),
+            status: sub_status_narrative_label(sub.status).to_string(),
+            weight: 1,
+            evidence: vec![node_id.clone()],
+            style_token: "agent".to_string(),
+        });
+        edges.push(ArchitectureEdge {
+            from: root_id.clone(),
+            to: node_id.clone(),
+            label: "sub-goal".to_string(),
+            kind: "spawn".to_string(),
+            evidence: vec![node_id],
+        });
+    }
+    let graph_hash = stable_hash(&(source_window, &nodes, &edges));
+    ArchitectureGraph {
+        version: 1,
+        graph_id: format!("arch-{}", &graph_hash[..12.min(graph_hash.len())]),
+        scope: NarrativeScope::Campaign,
+        target_id: campaign.campaign_id.clone(),
+        generated_at: Utc::now(),
+        source_window: source_window.clone(),
+        default_visual: NarrativeVisualMode::Agents,
+        nodes,
+        edges,
+        groups: Vec::new(),
+        layout: ArchitectureLayout {
+            kind: "swimlane".to_string(),
+            root_ids: vec![root_id],
+            warnings: Vec::new(),
+        },
+        legend: default_legend(),
     }
 }
 
@@ -3659,6 +4001,148 @@ mod tests {
         assert_eq!(
             latest.headline, "Live: wired the bus",
             "the live beat is preferred over a later deterministic projection"
+        );
+    }
+
+    fn campaign_with_live_child(
+        paths: &DeadreckonPaths,
+        repo: &Path,
+    ) -> (deadreckon_core::campaign::Campaign, String) {
+        let child_state = create_run(
+            paths,
+            RunOptions {
+                goal: "sub builds the parser".to_string(),
+                cwd: repo.to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("campaign-sub-run".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("child run");
+        let mut child_projection = build_run_projection(&RunNarrativeInput {
+            state: &child_state,
+            spend: &[],
+            traces: &[],
+            events: &[],
+            live_files: vec![],
+            file_count: 0,
+            total_bytes: 0,
+            acceptance_summary: "default gate".to_string(),
+            provider_activity: &[],
+            parent_plan: None,
+        });
+        child_projection.snapshot.snapshot_id = "sub-live-beat".to_string();
+        child_projection.state.latest_snapshot_id = "sub-live-beat".to_string();
+        child_projection.snapshot.headline = "Sub wired the tokenizer.".to_string();
+        child_projection.snapshot.live = Some(LiveBeat {
+            beat_seq: 4,
+            covers_turn: 9,
+            source: NarrativeSource::Live,
+            rolling_summary: None,
+        });
+        persist_run_projection(&child_state, &child_projection).expect("persist child live beat");
+
+        use deadreckon_core::campaign::{SubGoal, SubGoalStatus};
+        let subs = vec![
+            SubGoal {
+                sub_id: "sub-0".to_string(),
+                goal: "build the parser".to_string(),
+                task_key: "parser".to_string(),
+                sub_plan_id: None,
+                result_run_id: Some(child_state.run_id.clone()),
+                scope: None,
+                status: SubGoalStatus::Running,
+            },
+            SubGoal {
+                sub_id: "sub-1".to_string(),
+                goal: "review the parser".to_string(),
+                task_key: "review".to_string(),
+                sub_plan_id: None,
+                result_run_id: None,
+                scope: None,
+                status: SubGoalStatus::Pending,
+            },
+        ];
+        let campaign = deadreckon_core::campaign::Campaign::new(
+            "ship the parser",
+            subs,
+            PlanProviders {
+                planner: Some("cli:test".to_string()),
+                default_child: Some("cli:test".to_string()),
+                ..PlanProviders::default()
+            },
+            1,
+            None,
+            None,
+            "0.3.0",
+        )
+        .expect("campaign");
+        (campaign, child_state.run_id)
+    }
+
+    #[test]
+    fn campaign_narrative_projection_aggregates_child_live_beats() {
+        let temp = TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let (campaign, _run_id) = campaign_with_live_child(&paths, &repo);
+
+        let projection = build_campaign_projection(&CampaignNarrativeInput {
+            paths: &paths,
+            campaign: &campaign,
+            selected: 0,
+        });
+
+        assert_eq!(projection.snapshot.scope, NarrativeScope::Campaign);
+        let row = projection
+            .snapshot
+            .agent_table
+            .iter()
+            .find(|row| row.task_id == "sub-0")
+            .expect("sub-0 row");
+        assert!(
+            row.summary.contains("Sub wired the tokenizer"),
+            "campaign folds the sub's live beat: {row:#?}"
+        );
+    }
+
+    #[test]
+    fn campaign_attach_has_narrative_view_at_parity_with_plan() {
+        let temp = TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let (campaign, _run_id) = campaign_with_live_child(&paths, &repo);
+
+        let projection = build_campaign_projection(&CampaignNarrativeInput {
+            paths: &paths,
+            campaign: &campaign,
+            selected: 0,
+        });
+        let lines = narrative_plain_lines(&projection, NarrativeVisualMode::Agents);
+        let text = lines.join("\n");
+
+        // The campaign view renders through the SAME renderer as a plan, so it
+        // carries every structural section a plan narrative has.
+        for section in [
+            "Current work",
+            "Architecture",
+            "Agents",
+            "Risks",
+            "Next likely",
+            "Evidence",
+        ] {
+            assert!(text.contains(section), "missing section {section}: {text}");
+        }
+        assert!(text.contains("Campaign"), "campaign headline present");
+        assert!(
+            text.contains("sub-0") && text.contains("sub-1"),
+            "one row per sub-goal"
         );
     }
 
