@@ -956,6 +956,15 @@ pub(crate) enum Commands {
         quiet: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
+        #[arg(
+            long,
+            help = "Narrate each child in plain English through the sub-orchestrators"
+        )]
+        narrate: bool,
+        #[arg(long, help = "Disable child narration entirely")]
+        no_narrate: bool,
+        #[arg(long, help = "Pin the narrator model id for children")]
+        narrator_model: Option<String>,
     },
     #[command(
         next_help_heading = "Run Lifecycle",

@@ -845,8 +845,14 @@ async fn main_inner() -> Result<()> {
             no_hints,
             quiet,
             plain,
+            narrate,
+            no_narrate,
+            narrator_model,
         } => {
             ui::set_plain_output(plain);
+            if let Err(message) = crate::narrator::validate_narration_flags(narrate, no_narrate) {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(message)));
+            }
             if let Some(command) = command {
                 match command {
                     CampaignCommand::Repair(repair) => {
@@ -886,6 +892,9 @@ async fn main_inner() -> Result<()> {
                 no_hints,
                 quiet,
                 plain,
+                narrate,
+                no_narrate,
+                narrator_model,
             })
             .await
         }
