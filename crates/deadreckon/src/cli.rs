@@ -891,6 +891,15 @@ pub(crate) enum Commands {
         quiet: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
+        #[arg(
+            long,
+            help = "Narrate each child in plain English (per-child snapshots + parent aggregate)"
+        )]
+        narrate: bool,
+        #[arg(long, help = "Disable child narration entirely")]
+        no_narrate: bool,
+        #[arg(long, help = "Pin the narrator model id for children")]
+        narrator_model: Option<String>,
     },
     #[command(
         about = "Run one goal as N independent orchestrators, then compose their results (depth-capped at 2)",
@@ -2480,6 +2489,8 @@ pub(crate) struct ForkCommandArgs {
     pub(crate) quiet: bool,
     pub(crate) plain: bool,
     pub(crate) completion_surface: bool,
+    pub(crate) narrate: bool,
+    pub(crate) narrator_model: Option<String>,
 }
 
 pub(crate) struct MergeCommandArgs {

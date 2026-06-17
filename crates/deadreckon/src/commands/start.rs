@@ -2847,6 +2847,8 @@ async fn dispatch_start_command(
                     yes: auto_confirm,
                     no_repair: false,
                     completion_surface: false,
+                    narrate: false,
+                    narrator_model: None,
                 },
             )
             .await;
