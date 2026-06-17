@@ -275,3 +275,18 @@ fn doctor_hint_suppressed_when_error_already_carries_try_line() {
     ));
     assert!(error_hint(&without_try).contains("doctor"));
 }
+
+#[test]
+fn cancelled_prompt_is_detected_and_real_io_errors_are_not() {
+    // Ctrl-C / Esc / EOF at a prompt surfaces as an interrupted I/O error; it
+    // must be recognized as a cancellation (exit calmly), not rendered as an
+    // I/O error with a "referenced path" hint.
+    let cancelled: CliError =
+        std::io::Error::new(std::io::ErrorKind::Interrupted, "prompt cancelled").into();
+    assert!(is_prompt_cancelled(&cancelled));
+
+    // A genuine I/O error is not a cancellation and still gets the path hint.
+    let not_found: CliError = std::io::Error::new(std::io::ErrorKind::NotFound, "missing").into();
+    assert!(!is_prompt_cancelled(&not_found));
+    assert!(error_hint(&not_found).contains("referenced path"));
+}
