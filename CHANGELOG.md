@@ -21,6 +21,10 @@
   `DEADRECKON_AUTH_PROBE=0`), so coder/full-plan children narrate file-only to
   their own `snapshots.jsonl`. Child argv building is extracted into a pure
   `child_argv` so propagation is unit-tested without spawning.
+- P7: `spend_summary` now counts only `kind:"loop"` rows — a latent leak where
+  `kind:"narrator"` rows (written by any narrating run) inflated tokens/turns/
+  wall and could overwrite the run's `total_usd`. The total is taken from the
+  last loop row.
 
 ## 0.2.0 — Live Narrator
 

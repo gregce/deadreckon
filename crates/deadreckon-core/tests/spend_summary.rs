@@ -166,3 +166,48 @@ fn spend_summary_total_unchanged_by_tilde_flag() {
     assert_eq!(summary.input_tokens, 11);
     assert_eq!(summary.output_tokens, 7);
 }
+
+fn record(kind: &str, turn: u32, cost: f64, total: f64, input: u64) -> SpendRecord {
+    SpendRecord {
+        timestamp: Utc::now(),
+        turn,
+        provider: "p".to_string(),
+        model: "m".to_string(),
+        input_tokens: input,
+        output_tokens: 0,
+        cost_usd: cost,
+        total_cost_usd: total,
+        cap_usd: None,
+        subscription: false,
+        estimated: false,
+        wall_time_seconds: Some(1.0),
+        wall_time_cap_seconds: None,
+        kind: kind.to_string(),
+    }
+}
+
+#[test]
+fn spend_summary_excludes_kind_narrator_rows_from_total() {
+    let (_temp, state) = state();
+    append_spend(&state, &record("loop", 1, 0.02, 0.02, 100)).expect("loop row");
+    append_spend(&state, &record("narrator", 1, 0.50, 0.50, 9999)).expect("narrator row");
+    let summary = spend_summary(&state).expect("summary");
+    assert_eq!(summary.input_tokens, 100, "narrator tokens excluded");
+    assert_eq!(
+        summary.turns, 1,
+        "narrator row is not counted as a run turn"
+    );
+}
+
+#[test]
+fn spend_summary_total_usd_taken_from_last_loop_row() {
+    let (_temp, state) = state();
+    append_spend(&state, &record("loop", 1, 0.02, 0.02, 10)).expect("loop 1");
+    append_spend(&state, &record("loop", 2, 0.03, 0.05, 10)).expect("loop 2");
+    append_spend(&state, &record("narrator", 2, 0.50, 0.50, 0)).expect("trailing narrator");
+    let summary = spend_summary(&state).expect("summary");
+    assert_eq!(
+        summary.total_usd, 0.05,
+        "total comes from the last loop row, not the trailing narrator row"
+    );
+}
