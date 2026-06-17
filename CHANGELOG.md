@@ -25,6 +25,9 @@
   `kind:"narrator"` rows (written by any narrating run) inflated tokens/turns/
   wall and could overwrite the run's `total_usd`. The total is taken from the
   last loop row.
+- P6: `dr campaign` gains `--narrate/--no-narrate/--narrator-model`, appended to
+  the `orchestrate full-plan` sub-orchestrator argv (`build_sub_orchestrator_command`),
+  so the campaign → orchestrate → run/extend chain narrates end to end.
 
 ## 0.2.0 — Live Narrator
 

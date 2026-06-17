@@ -29,6 +29,8 @@ pub(crate) struct CampaignSubLaunch<'a> {
     pub(crate) child_provider: Option<&'a str>,
     pub(crate) planner_model: Option<&'a str>,
     pub(crate) child_model: Option<&'a str>,
+    pub(crate) narrate: bool,
+    pub(crate) narrator_model: Option<&'a str>,
     pub(crate) ancestor_task_keys: &'a [String],
     pub(crate) ancestor_scopes: &'a [String],
 }
@@ -87,6 +89,12 @@ pub(crate) fn build_sub_orchestrator_command(
     if let Some(child_model) = launch.child_model {
         command.arg("--model").arg(child_model);
     }
+    if launch.narrate {
+        command.arg("--narrate");
+        if let Some(narrator_model) = launch.narrator_model {
+            command.arg("--narrator-model").arg(narrator_model);
+        }
+    }
     Ok(command)
 }
 
@@ -135,6 +143,9 @@ pub(crate) struct CampaignArgs {
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
     pub(crate) plain: bool,
+    pub(crate) narrate: bool,
+    pub(crate) no_narrate: bool,
+    pub(crate) narrator_model: Option<String>,
 }
 
 pub(crate) struct CampaignRepairArgs {
@@ -1342,6 +1353,8 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     ancestor_scopes.push(scope.clone());
     let launch_paths = &paths;
     let mut sub_index = 0usize;
+    let campaign_narrate = args.narrate && !args.no_narrate;
+    let campaign_narrator_model = args.narrator_model.clone();
 
     run_campaign_fork(
         &campaign_dir,
@@ -1365,6 +1378,8 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
                 child_provider: child_provider.as_deref(),
                 planner_model: providers.planner_model.as_deref(),
                 child_model: providers.default_child_model.as_deref(),
+                narrate: campaign_narrate,
+                narrator_model: campaign_narrator_model.as_deref(),
                 ancestor_task_keys: &ancestor_task_keys,
                 ancestor_scopes: &ancestor_scopes,
             })?;
@@ -2264,6 +2279,8 @@ mod model_argv_tests {
             child_provider: Some("smoke"),
             planner_model: Some("planner-mx"),
             child_model: Some("child-mx"),
+            narrate: false,
+            narrator_model: None,
             ancestor_task_keys: &[],
             ancestor_scopes: &[],
         })
@@ -2279,5 +2296,42 @@ mod model_argv_tests {
         };
         assert_eq!(pair("--planner-model").as_deref(), Some("planner-mx"));
         assert_eq!(pair("--model").as_deref(), Some("child-mx"));
+    }
+
+    #[test]
+    fn campaign_narrate_propagates_through_sub_orchestrator_to_leaf_run_argv() {
+        let command = build_sub_orchestrator_command(&CampaignSubLaunch {
+            home: Path::new("/tmp/home"),
+            source_dir: Path::new("/tmp/src"),
+            launch_dir: Path::new("/tmp/launch"),
+            campaign_id: "cmp-1",
+            sub_goal: "sub goal",
+            sub_n: 2,
+            sandbox: "none",
+            max_spend: None,
+            plain: false,
+            planner_provider: Some("smoke"),
+            child_provider: Some("smoke"),
+            planner_model: None,
+            child_model: None,
+            narrate: true,
+            narrator_model: Some("haiku"),
+            ancestor_task_keys: &[],
+            ancestor_scopes: &[],
+        })
+        .expect("command");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            args.iter().any(|a| a == "--narrate"),
+            "campaign passes --narrate to the sub-orchestrator: {args:?}"
+        );
+        let model = args
+            .iter()
+            .position(|a| a == "--narrator-model")
+            .map(|at| args[at + 1].clone());
+        assert_eq!(model.as_deref(), Some("haiku"));
     }
 }
