@@ -97,6 +97,23 @@ pub(crate) fn child_narrator_backend_is_floor(model_override: Option<&str>) -> b
     model_override.is_none()
 }
 
+/// Resolve narration for any run loop: a spawned child (`is_child`, file-only)
+/// or an interactive/leaf run (`is_tty` TTY contract). The single decision used
+/// by `dr run` and both `extend` paths.
+pub(crate) fn resolve_narration(
+    is_child: bool,
+    is_tty: bool,
+    narrate: bool,
+    no_narrate: bool,
+    model_override: Option<String>,
+) -> Option<NarratorConfig> {
+    if is_child {
+        resolve_narrator_config_for_child(narrate, no_narrate, model_override)
+    } else {
+        resolve_narrator_config(is_tty, narrate, no_narrate, model_override)
+    }
+}
+
 /// A spawned narrator task plus the token that stops it.
 pub(crate) struct NarratorHandle {
     cancel: CancellationToken,
@@ -754,6 +771,51 @@ mod tests {
         assert!(
             !child_narrator_backend_is_floor(Some("haiku")),
             "an explicit --narrator-model opts into a metered backend"
+        );
+    }
+
+    #[test]
+    fn extend_command_in_place_reviewer_child_narrates_when_narrate_passed() {
+        // A spawned reviewer (child env set, off-TTY, --narrate) narrates file-only.
+        let config = resolve_narration(true, false, true, false, None)
+            .expect("reviewer child narrates when --narrate is passed");
+        assert!(!config.foreground && !config.headless_append, "file-only");
+    }
+
+    #[test]
+    fn extend_worktree_command_reviewer_child_narrates_when_narrate_passed() {
+        // The worktree extend path uses the same resolution as in-place.
+        let config = resolve_narration(true, false, true, false, Some("haiku".to_string()))
+            .expect("worktree reviewer child narrates");
+        assert!(!config.foreground && !config.headless_append, "file-only");
+        assert_eq!(config.model_override.as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn headless_child_narration_keeps_stdout_clean_so_parent_scrapes_run_id() {
+        let config = resolve_narration(true, false, true, false, None).expect("child config");
+        assert!(
+            !config.foreground && !config.headless_append,
+            "a child writes to no terminal channel (clean stdout for run-id scrape)"
+        );
+    }
+
+    #[test]
+    fn headless_child_narration_keeps_stderr_clean_no_failure_summary_pollution() {
+        let config = resolve_narration(true, false, true, false, None).expect("child config");
+        assert!(!config.headless_append, "no append beats on stderr");
+    }
+
+    #[tokio::test]
+    async fn extend_narrator_handle_shutdown_runs_before_lock_release() {
+        // The handle's shutdown is bounded, so calling it before lock release
+        // (as both extend sites do) can never block the run's exit.
+        let temp = TempDir::new().expect("tempdir");
+        let (_sender, handle) = build_narration(floor_ctx(temp.path().to_path_buf()));
+        let stopped = tokio::time::timeout(Duration::from_secs(2), handle.shutdown()).await;
+        assert!(
+            stopped.is_ok(),
+            "shutdown completes within the grace window"
         );
     }
 

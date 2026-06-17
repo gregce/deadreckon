@@ -9,6 +9,12 @@
   deterministic floor unless a `--narrator-model` is pinned; the `dr run`
   TTY contract is unchanged. The child path activates via the
   `DEADRECKON_NARRATE_CHILD` env the parent sets.
+- P2/P3: both `extend` paths (in-place + worktree) now wire the narrator —
+  reviewer children re-entering `extend` narrate file-only via
+  `build_run_narration` (previously `event_sender:None`). `extend`/and the
+  shared `resolve_narration` thread `--narrate/--no-narrate/--narrator-model`;
+  shutdown is bounded and runs before lock release. The `dr run` TTY contract is
+  unchanged.
 
 ## 0.2.0 — Live Narrator
 

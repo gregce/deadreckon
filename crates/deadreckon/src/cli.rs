@@ -1476,6 +1476,18 @@ pub(crate) enum Commands {
         no_docs: bool,
         #[arg(long, help = "Documentation skill name")]
         doc_skill: Option<String>,
+        #[arg(
+            long,
+            help = "Stream live plain-English narration to stderr on a piped run"
+        )]
+        narrate: bool,
+        #[arg(long, help = "Disable live narration entirely")]
+        no_narrate: bool,
+        #[arg(
+            long,
+            help = "Pin the narrator model id (keeps provider preference order)"
+        )]
+        narrator_model: Option<String>,
     },
     #[command(
         next_help_heading = "Completed Run Actions",
@@ -2539,4 +2551,7 @@ pub(crate) struct ExtendCommandArgs {
     pub(crate) no_docs: bool,
     pub(crate) doc_skill: Option<String>,
     pub(crate) post_actions: bool,
+    pub(crate) narrate: bool,
+    pub(crate) no_narrate: bool,
+    pub(crate) narrator_model: Option<String>,
 }
