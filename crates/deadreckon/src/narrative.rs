@@ -1101,16 +1101,7 @@ pub(crate) fn narrative_plain_lines(
     push_claim_section(&mut lines, "Current work", &snapshot.current_work);
     push_claim_section(&mut lines, "Architecture", &snapshot.architecture_notes);
     if !snapshot.agent_table.is_empty() {
-        lines.push("Agents".to_string());
-        for row in &snapshot.agent_table {
-            lines.push(format!(
-                "- {} [{}] {} {}",
-                row.task_id,
-                row.status,
-                row.provider.as_deref().unwrap_or("-"),
-                row.summary
-            ));
-        }
+        lines.extend(agent_table_lines(&snapshot.agent_table, PLAN_AGENT_TABLE_MAX));
         lines.push(String::new());
     }
     if !snapshot.coordination_notes.is_empty() {
@@ -1152,6 +1143,47 @@ pub(crate) fn graph_ascii_lines(
 pub(crate) fn validate_graph(graph: &ArchitectureGraph) -> bool {
     graph.nodes.iter().all(|node| !node.evidence.is_empty())
         && graph.edges.iter().all(|edge| !edge.evidence.is_empty())
+}
+
+/// Max per-child rows in the plan agent_table before collapsing to "+N more"
+/// (rider Q5 — one calm line per active child, bounded).
+const PLAN_AGENT_TABLE_MAX: usize = 8;
+
+/// Render the per-child agent table as one line per child, capped at `max`
+/// with a "+N more" overflow line.
+fn agent_table_lines(rows: &[NarrativeAgentRow], max: usize) -> Vec<String> {
+    let mut lines = vec!["Agents".to_string()];
+    for row in rows.iter().take(max) {
+        lines.push(format!(
+            "- {} [{}] {} {}",
+            row.task_id,
+            row.status,
+            row.provider.as_deref().unwrap_or("-"),
+            row.summary
+        ));
+    }
+    if rows.len() > max {
+        lines.push(format!("- +{} more", rows.len() - max));
+    }
+    lines
+}
+
+/// Like [`read_latest_snapshot`] but prefers the latest LIVE beat over a later
+/// attach-time Deterministic projection, so an on-demand attach refresh can
+/// never mask a child's live headline. Falls back to the last valid row.
+pub(crate) fn read_latest_live_snapshot(narrative_dir: &Path) -> Option<NarrativeSnapshot> {
+    let raw = fs::read_to_string(narrative_dir.join(NARRATIVE_SNAPSHOTS_JSONL)).ok()?;
+    let mut last_any = None;
+    let mut last_live = None;
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        if let Ok(snapshot) = serde_json::from_str::<NarrativeSnapshot>(line) {
+            if snapshot.live.is_some() {
+                last_live = Some(snapshot.clone());
+            }
+            last_any = Some(snapshot);
+        }
+    }
+    last_live.or(last_any)
 }
 
 pub(crate) fn read_latest_snapshot(narrative_dir: &Path) -> LatestNarrativeSnapshot {
@@ -2872,7 +2904,7 @@ fn latest_child_narrative_snapshot(
         .run_root
         .join(NARRATIVE_DIR)
         .join(NARRATIVE_SNAPSHOTS_JSONL);
-    let snapshot = read_latest_snapshot(&state.run_root.join(NARRATIVE_DIR)).snapshot?;
+    let snapshot = read_latest_live_snapshot(&state.run_root.join(NARRATIVE_DIR))?;
     Some((snapshots_path, snapshot))
 }
 
@@ -3502,6 +3534,73 @@ mod tests {
         assert!(
             max_estimate <= ROLLING_SUMMARY_CAP + 1000,
             "per-beat input stays O(1): {max_estimate}"
+        );
+    }
+
+    fn agent_row(task_id: &str, summary: &str) -> NarrativeAgentRow {
+        NarrativeAgentRow {
+            task_id: task_id.to_string(),
+            role: "child".to_string(),
+            provider: Some("cli:claude-code".to_string()),
+            status: "running".to_string(),
+            summary: summary.to_string(),
+            evidence: vec!["turn:1".to_string()],
+        }
+    }
+
+    #[test]
+    fn plan_projection_surfaces_child_live_headline_one_line_per_active_child() {
+        let rows = vec![
+            agent_row("task-0", "Wiring the bus"),
+            agent_row("task-1", "Reviewing the diff"),
+        ];
+        let lines = agent_table_lines(&rows, PLAN_AGENT_TABLE_MAX);
+        let child_lines: Vec<_> = lines.iter().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(child_lines.len(), 2, "one line per active child");
+        assert!(lines.iter().any(|l| l.contains("Wiring the bus")));
+        assert!(lines.iter().any(|l| l.contains("Reviewing the diff")));
+    }
+
+    #[test]
+    fn plan_agent_table_caps_at_narrate_lines_with_plus_n_more_overflow() {
+        let rows: Vec<_> = (0..10)
+            .map(|i| agent_row(&format!("task-{i}"), "work"))
+            .collect();
+        let lines = agent_table_lines(&rows, PLAN_AGENT_TABLE_MAX);
+        let child_lines = lines.iter().filter(|l| l.starts_with("- ")).count();
+        // 8 task rows + 1 overflow line.
+        assert_eq!(child_lines, PLAN_AGENT_TABLE_MAX + 1);
+        assert!(
+            lines.iter().any(|l| l.contains("+2 more")),
+            "overflow collapses the rest: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn attach_time_deterministic_projection_does_not_mask_prior_live_beat() {
+        let temp = TempDir::new().expect("tempdir");
+        let dir = temp.path().join("narrative");
+
+        let mut beat = live_previous_snapshot();
+        beat.headline = "Live: wired the bus".to_string();
+        beat.live = Some(LiveBeat {
+            beat_seq: 1,
+            covers_turn: 3,
+            source: NarrativeSource::Live,
+            rolling_summary: None,
+        });
+        append_narrative_snapshot(&dir, &beat).expect("write live beat");
+
+        // A later attach-time deterministic projection (live = None) is appended.
+        let mut deterministic = live_previous_snapshot();
+        deterministic.headline = "Deterministic fallback".to_string();
+        deterministic.snapshot_id = "det-1".to_string();
+        append_narrative_snapshot(&dir, &deterministic).expect("write deterministic");
+
+        let latest = read_latest_live_snapshot(&dir).expect("a snapshot");
+        assert_eq!(
+            latest.headline, "Live: wired the bus",
+            "the live beat is preferred over a later deterministic projection"
         );
     }
 

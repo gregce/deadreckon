@@ -28,6 +28,11 @@
 - P6: `dr campaign` gains `--narrate/--no-narrate/--narrator-model`, appended to
   the `orchestrate full-plan` sub-orchestrator argv (`build_sub_orchestrator_command`),
   so the campaign → orchestrate → run/extend chain narrates end to end.
+- P8: plan-attach surfacing reliability — the per-child agent table caps at
+  `PLAN_AGENT_TABLE_MAX` active children with a `+N more` overflow line, and
+  `latest_child_narrative_snapshot` now reads via `read_latest_live_snapshot`,
+  which prefers the latest Live beat over a later attach-time Deterministic
+  projection so an on-demand refresh can never mask a child's live headline.
 
 ## 0.2.0 — Live Narrator
 
