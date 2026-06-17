@@ -393,39 +393,37 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         run_prefix(&state.run_id)
     );
     let run_id_for_plain = state.run_id.clone();
-    // Live narrator: on a TTY, narration is on by default; the bus sender feeds
-    // the loop and the sidecar engine turns events into beats. Off-TTY without
-    // --narrate, resolve returns None and the run is wired exactly as before.
-    let narrator_config = crate::narrator::resolve_narrator_config(
-        io::stdin().is_terminal(),
-        narrate,
-        no_narrate,
-        narrator_model,
-    );
-    let (narrate_event_sender, narrator_handle) = match narrator_config.clone() {
-        Some(config) => {
-            // A smoke run makes no real provider calls — narrate via the
-            // deterministic floor so tests and dry runs stay hermetic and fast.
-            let backend = if smoke {
-                deadreckon_providers::NarratorBackend::DeterministicFloor
-            } else {
-                crate::narrator::resolve_narrator_backend(
-                    paths.home(),
-                    config.model_override.as_deref(),
-                )
-            };
-            let ctx = crate::narrator::NarratorCtx {
-                run_id: state.run_id.clone(),
-                run_root: state.run_root.clone(),
-                config_path: Some(paths.config_path()),
-                backend,
-                config,
-            };
-            let (sender, handle) = crate::narrator::build_narration(ctx);
-            (Some(sender), Some(handle))
-        }
-        None => (None, None),
+    // Live narrator. A spawned orchestrate/campaign child (NARRATE_CHILD_ENV set)
+    // narrates FILE-ONLY and defaults to the deterministic floor unless a model
+    // was pinned; an interactive `dr run` keeps the TTY-default foreground block.
+    // Off-TTY with no --narrate, resolve returns None and the run is wired as
+    // before. A smoke run forces the floor so tests stay hermetic.
+    let is_narrate_child = std::env::var_os(crate::narrator::NARRATE_CHILD_ENV).is_some();
+    let narrator_config = if is_narrate_child {
+        crate::narrator::resolve_narrator_config_for_child(narrate, no_narrate, narrator_model)
+    } else {
+        crate::narrator::resolve_narrator_config(
+            io::stdin().is_terminal(),
+            narrate,
+            no_narrate,
+            narrator_model,
+        )
     };
+    let force_floor = smoke
+        || (is_narrate_child
+            && crate::narrator::child_narrator_backend_is_floor(
+                narrator_config
+                    .as_ref()
+                    .and_then(|config| config.model_override.as_deref()),
+            ));
+    let (narrate_event_sender, narrator_handle) = crate::narrator::build_run_narration(
+        paths.home(),
+        Some(paths.config_path()),
+        &state.run_id,
+        &state.run_root,
+        force_floor,
+        narrator_config.clone(),
+    );
     let turn_loop = run_turn_loop(
         &mut state,
         &router,

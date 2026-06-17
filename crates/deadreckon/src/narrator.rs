@@ -63,6 +63,40 @@ pub(crate) fn resolve_narrator_config(
     })
 }
 
+/// Resolve narration for a spawned orchestrate/campaign CHILD. A child is
+/// headless and its stdout (run-id scrape) and stderr (failure capture) belong
+/// to the parent, so a child narrates FILE-ONLY: `foreground=false` AND
+/// `headless_append=false` — `render_beat` no-ops on both surfaces while beats
+/// still append to `snapshots.jsonl`. Returns `None` unless the parent opted in
+/// via `--narrate`.
+pub(crate) fn resolve_narrator_config_for_child(
+    narrate_flag: bool,
+    no_narrate: bool,
+    model_override: Option<String>,
+) -> Option<NarratorConfig> {
+    if no_narrate || !narrate_flag {
+        return None;
+    }
+    Some(NarratorConfig {
+        foreground: false,
+        headless_append: false,
+        model_override,
+        ..NarratorConfig::default()
+    })
+}
+
+/// Env var the parent sets on a narrating child so the child resolves narration
+/// FILE-ONLY (not the off-TTY `--narrate` stderr path a user gets from
+/// `dr run --narrate | …`).
+pub(crate) const NARRATE_CHILD_ENV: &str = "DEADRECKON_NARRATE_CHILD";
+
+/// A child defaults to the deterministic floor ($0, no auth probe) unless the
+/// parent pinned a model — this bounds the dollar blast radius and the
+/// `probe_cli_auth` storm across a wide fan-out.
+pub(crate) fn child_narrator_backend_is_floor(model_override: Option<&str>) -> bool {
+    model_override.is_none()
+}
+
 /// A spawned narrator task plus the token that stops it.
 pub(crate) struct NarratorHandle {
     cancel: CancellationToken,
@@ -129,6 +163,39 @@ fn build_narrator_router(ctx: &NarratorCtx) -> Option<ProviderRouter> {
         }),
         NarratorBackend::DeterministicFloor => None,
     }
+}
+
+/// Shared narrator wiring for any run loop (the `dr run` command and both
+/// `extend` paths). When `config` is `Some`, pick the backend (the deterministic
+/// floor when `force_floor`, else the subscription-first resolver), build the
+/// `NarratorCtx`, and spawn the engine; when `None`, the run is wired exactly as
+/// before. The single shutdown-ordering contract lives at the call site:
+/// `handle.shutdown().await` after the awaited loop, before lock release.
+pub(crate) fn build_run_narration(
+    home: &Path,
+    config_path: Option<PathBuf>,
+    run_id: &str,
+    run_root: &Path,
+    force_floor: bool,
+    config: Option<NarratorConfig>,
+) -> (Option<broadcast::Sender<RunEvent>>, Option<NarratorHandle>) {
+    let Some(config) = config else {
+        return (None, None);
+    };
+    let backend = if force_floor {
+        NarratorBackend::DeterministicFloor
+    } else {
+        resolve_narrator_backend(home, config.model_override.as_deref())
+    };
+    let ctx = NarratorCtx {
+        run_id: run_id.to_string(),
+        run_root: run_root.to_path_buf(),
+        config_path,
+        backend,
+        config,
+    };
+    let (sender, handle) = build_narration(ctx);
+    (Some(sender), Some(handle))
 }
 
 fn append_narrator_spend(run_root: &Path, record: &SpendRecord) {
@@ -639,6 +706,54 @@ mod tests {
         assert!(
             resolve_narrator_config(true, false, true, None).is_none(),
             "--no-narrate disables narration even on a tty"
+        );
+    }
+
+    #[test]
+    fn resolve_narrator_config_for_child_returns_some_file_only_off_tty() {
+        let child = resolve_narrator_config_for_child(true, false, None)
+            .expect("a narrating child gets a file-only config");
+        assert!(!child.foreground, "child has no foreground calm block");
+        assert!(
+            !child.headless_append,
+            "child never writes beats to stdout/stderr — file-only"
+        );
+        assert!(
+            resolve_narrator_config_for_child(false, false, None).is_none(),
+            "child stays silent unless the parent passes --narrate"
+        );
+        assert!(
+            resolve_narrator_config_for_child(true, true, None).is_none(),
+            "--no-narrate wins for a child too"
+        );
+    }
+
+    #[test]
+    fn resolve_narrator_config_unchanged_for_dr_run_tty_matrix() {
+        // The dr-run contract must be untouched by the new child path.
+        assert!(
+            resolve_narrator_config(true, false, false, None)
+                .expect("tty default")
+                .foreground
+        );
+        assert!(
+            resolve_narrator_config(false, true, false, None)
+                .expect("off-tty --narrate")
+                .headless_append
+        );
+        assert!(resolve_narrator_config(false, false, false, None).is_none());
+        assert!(resolve_narrator_config(true, false, true, None).is_none());
+    }
+
+    #[test]
+    fn child_narrator_defaults_to_deterministic_floor_when_no_narrator_model() {
+        assert!(
+            child_narrator_backend_is_floor(None),
+            "no pinned model -> floor ($0, no auth probe)"
+        );
+        assert!(
+            !child_narrator_backend_is_floor(Some("haiku")),
+            "an explicit --narrator-model opts into a metered backend"
         );
     }
 

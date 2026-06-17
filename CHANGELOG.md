@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 — Orchestrated Narration (in progress)
+
+- P1: shared `build_run_narration` helper (extracted from run.rs) + a
+  `resolve_narrator_config_for_child` that narrates orchestrate/campaign
+  children FILE-ONLY (foreground=false, headless_append=false) so beats hit
+  `snapshots.jsonl` but never a child's stdout/stderr. Children default to the
+  deterministic floor unless a `--narrator-model` is pinned; the `dr run`
+  TTY contract is unchanged. The child path activates via the
+  `DEADRECKON_NARRATE_CHILD` env the parent sets.
+
 ## 0.2.0 — Live Narrator
 
 A `dr run` now narrates itself in plain English as it works — a
