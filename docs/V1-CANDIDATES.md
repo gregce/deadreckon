@@ -105,3 +105,24 @@
   per-artifact sha256 fragments for tar.xz, at which point a fresh
   `curl | sh` transcript should show the inner installer verifying the
   artifact hash and the wrapper check becomes defense in depth.
+
+## Orchestrated Narration follow-ups (0.3.0, §45)
+
+- Wire `effective_plain` (auto-plain when stdout is not a TTY): the helper is
+  unit-tested but intentionally unwired — the project renders rich box-drawing
+  even when piped, and auto-plain-on-pipe broke the `cards_preview` fixture.
+  A V1 needs a coherent piped-output story (which surfaces go plain, which
+  stay rich) before flipping it on.
+- Parent aggregate for campaign at the orchestrate level: the §45.5 stderr
+  aggregate is wired into `dr orchestrate --narrate` only. A campaign relies on
+  each sub-orchestrator emitting its own aggregate to its own stderr; a true
+  campaign-level live aggregate (one calm line per sub-goal in the campaign
+  parent) would need the campaign parent to tail each sub-plan's children.
+- Provider-backed campaign narrative graph: `build_campaign_projection` ships a
+  deterministic root→sub graph and never calls a model. A V1 could fold a
+  provider beat over the aggregated sub headlines (mirroring the run/plan
+  narrator) and build a richer cross-sub architecture graph.
+- Live beats for the campaign view mid-run: the campaign projection folds each
+  sub's freshest snapshot but does not itself emit schema-2 `live` beats, so a
+  campaign has no rolling narrative of its own — only an aggregation of its
+  children's. A V1 could give the campaign its own beat stream.
