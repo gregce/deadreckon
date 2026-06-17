@@ -667,6 +667,7 @@ pub(crate) enum Commands {
         #[arg(
             long,
             value_name = "PATH",
+            value_hint = clap::ValueHint::FilePath,
             help = "Read the natural-language goal from a file; relative paths try cwd, then git root"
         )]
         goal_file: Option<PathBuf>,
@@ -734,6 +735,7 @@ pub(crate) enum Commands {
         #[arg(
             long,
             value_name = "PATH",
+            value_hint = clap::ValueHint::FilePath,
             help = "Read the natural-language goal from a file; relative paths try cwd, then git root"
         )]
         goal_file: Option<PathBuf>,
