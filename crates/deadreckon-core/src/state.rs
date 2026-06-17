@@ -319,6 +319,12 @@ pub fn spend_summary(state: &PipelineState) -> Result<SpendSummary> {
                 path: path.clone(),
                 source,
             })?;
+        // Only the run loop's own turns count toward run spend. The live
+        // narrator writes kind="narrator" rows to the same ledger; those must
+        // not inflate tokens/turns/wall or overwrite the running total.
+        if record.kind != "loop" {
+            continue;
+        }
         summary.total_usd = record.total_cost_usd;
         summary.input_tokens = summary.input_tokens.saturating_add(record.input_tokens);
         summary.output_tokens = summary.output_tokens.saturating_add(record.output_tokens);
