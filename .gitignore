@@ -17,3 +17,6 @@ developer-id*
 .specstory/statistics.json
 .specstory/.project.json
 .specstory/cli/config.toml
+
+# macOS Finder metadata
+.DS_Store
