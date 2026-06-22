@@ -1590,6 +1590,14 @@ fn orchestrate_confirmation_refusal_error(plan: &Plan, no_hints: bool) -> CliErr
     }
 }
 
+/// Whether the orchestrate parent should print its own per-child aggregate
+/// line. Suppressed when this orchestrate is itself a campaign sub-orchestrator
+/// (`is_campaign_sub`) — the campaign parent owns the live surface there and
+/// prints one consolidated line per sub-goal instead.
+fn orchestrate_aggregate_enabled(narrate: bool, quiet: bool, is_campaign_sub: bool) -> bool {
+    narrate && !quiet && !is_campaign_sub
+}
+
 /// Per-child snapshot tails the parent polls to render its live aggregate
 /// stderr line (Option D1). Keyed by task index.
 #[derive(Default)]
@@ -1775,6 +1783,8 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
             .checked_sub(std::time::Duration::from_secs(2))
             .unwrap_or_else(std::time::Instant::now);
         let mut aggregate_state = ParentAggregateState::default();
+        let is_campaign_sub = std::env::var_os(deadreckon_core::campaign::ENV_SUB_RESULT).is_some();
+        let aggregate_enabled = orchestrate_aggregate_enabled(narrate, quiet, is_campaign_sub);
         let mut last_aggregate = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(2))
             .unwrap_or_else(std::time::Instant::now);
@@ -1804,7 +1814,7 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
             if running.is_empty() {
                 break;
             }
-            if narrate && !quiet && last_aggregate.elapsed() >= std::time::Duration::from_secs(2) {
+            if aggregate_enabled && last_aggregate.elapsed() >= std::time::Duration::from_secs(2) {
                 let running_indices: Vec<usize> =
                     running.iter().map(|(task_index, _)| *task_index).collect();
                 refresh_parent_aggregate(&paths, &plan, &mut aggregate_state, &running_indices);
@@ -3090,6 +3100,18 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("try:"), "{rendered}");
+    }
+
+    #[test]
+    fn orchestrate_aggregate_suppressed_when_running_as_campaign_sub() {
+        // A normal narrating orchestrate prints its aggregate.
+        assert!(orchestrate_aggregate_enabled(true, false, false));
+        // The same orchestrate as a campaign sub-orchestrator stays silent so
+        // the campaign parent owns the live surface.
+        assert!(!orchestrate_aggregate_enabled(true, false, true));
+        // --no-narrate / --quiet still win regardless.
+        assert!(!orchestrate_aggregate_enabled(false, false, false));
+        assert!(!orchestrate_aggregate_enabled(true, true, false));
     }
 }
 

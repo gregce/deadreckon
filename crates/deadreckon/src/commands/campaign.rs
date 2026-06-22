@@ -105,6 +105,26 @@ pub(crate) fn discover_sub_result(
     deadreckon_core::campaign::read_sub_result(launch_dir).map_err(CliError::Core)
 }
 
+/// Filename of the early plan-id marker a sub-orchestrator publishes to its
+/// launch dir so the campaign parent can tail its grandchildren mid-run (before
+/// the result sidecar exists). Plain text: the sub-plan id.
+const SUB_PLAN_ID_FILE: &str = "plan-id";
+
+/// Publish a sub-orchestrator's plan id to its launch dir as soon as the plan
+/// exists, so the campaign parent's live aggregate can discover the grandchild
+/// run roots before the sub finishes.
+pub(crate) fn publish_sub_plan_id(launch_dir: &Path, plan_id: &str) {
+    let _ = fs::write(launch_dir.join(SUB_PLAN_ID_FILE), plan_id);
+}
+
+/// Read a sub-orchestrator's published plan id, if it has reached plan creation.
+pub(crate) fn read_sub_plan_id(launch_dir: &Path) -> Option<String> {
+    fs::read_to_string(launch_dir.join(SUB_PLAN_ID_FILE))
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|plan_id| !plan_id.is_empty())
+}
+
 /// Write a sub-orchestrator's result sidecar. Called at the end of
 /// `orchestrate full-plan` when launched by a campaign (DEADRECKON_CAMPAIGN_SUB_RESULT
 /// is set): records the plan id and its merged result run for the meta-coordinator.
@@ -1355,6 +1375,9 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     let mut sub_index = 0usize;
     let campaign_narrate = args.narrate && !args.no_narrate;
     let campaign_narrator_model = args.narrator_model.clone();
+    let campaign_quiet = args.quiet;
+    let n_subs = campaign_obj.sub_goals.len();
+    let campaign_prefix = run_prefix(&campaign_id);
 
     run_campaign_fork(
         &campaign_dir,
@@ -1363,7 +1386,9 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
             let share = per_sub
                 .as_ref()
                 .and_then(|shares| shares.get(sub_index).copied());
+            let position = sub_index + 1;
             sub_index += 1;
+            let aggregate_on = campaign_narrate && !campaign_quiet;
             let mut command = build_sub_orchestrator_command(&CampaignSubLaunch {
                 home: &home,
                 source_dir: &cwd,
@@ -1383,19 +1408,89 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
                 ancestor_task_keys: &ancestor_task_keys,
                 ancestor_scopes: &ancestor_scopes,
             })?;
-            let status = command.status()?;
+            if aggregate_on {
+                let goal_snippet = sub.goal.chars().take(60).collect::<String>();
+                eprintln!(
+                    "campaign {campaign_prefix} · {} ({position}/{n_subs}) started — {goal_snippet}",
+                    sub.sub_id
+                );
+            }
+            // Non-blocking spawn so the campaign parent can tick its own
+            // aggregate line (tailing this sub's grandchildren) while the
+            // sub-orchestrator runs. Sequential semantics are preserved — we
+            // still wait for this sub before the next.
+            let mut child = command.spawn()?;
+            let mut last_tick = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(2))
+                .unwrap_or_else(std::time::Instant::now);
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if aggregate_on && last_tick.elapsed() >= std::time::Duration::from_secs(2) {
+                    let headline = read_sub_plan_id(launch_dir)
+                        .and_then(|plan_id| {
+                            deadreckon_core::plan::load_plan(launch_paths, &plan_id).ok()
+                        })
+                        .map(|plan| {
+                            plan.tasks
+                                .iter()
+                                .filter_map(|task| task.child_run_id.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .and_then(|run_ids| {
+                            narrative::freshest_child_headline(launch_paths, &run_ids)
+                        });
+                    let line = narrative::campaign_aggregate_line(
+                        &campaign_prefix,
+                        &sub.sub_id,
+                        position,
+                        n_subs,
+                        "running",
+                        headline.as_deref(),
+                        100,
+                    );
+                    let mut out = std::io::sink();
+                    let mut err = std::io::stderr();
+                    let mut sinks = narrative::AggregateSinks {
+                        out: &mut out,
+                        err: &mut err,
+                    };
+                    let _ = narrative::emit_campaign_aggregate(&mut sinks, &line);
+                    last_tick = std::time::Instant::now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            };
             if !status.success() {
+                if aggregate_on {
+                    eprintln!(
+                        "campaign {campaign_prefix} · {} ({position}/{n_subs}) failed",
+                        sub.sub_id
+                    );
+                }
                 return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
                     "sub-orchestrator {} exited with {status}",
                     sub.sub_id
                 ))));
             }
-            discover_sub_result(launch_dir)?.ok_or_else(|| {
+            let result = discover_sub_result(launch_dir)?.ok_or_else(|| {
                 CliError::Core(DeadreckonError::InvalidInput(format!(
                     "sub-orchestrator {} produced no result",
                     sub.sub_id
                 )))
-            })
+            })?;
+            if aggregate_on {
+                let run = result
+                    .result_run_id
+                    .as_deref()
+                    .map(run_prefix)
+                    .unwrap_or_else(|| "-".to_string());
+                eprintln!(
+                    "campaign {campaign_prefix} · {} ({position}/{n_subs}) merged → run {run}",
+                    sub.sub_id
+                );
+            }
+            Ok(result)
         },
         |result| {
             result
@@ -2259,6 +2354,27 @@ where
 }
 
 #[cfg(test)]
+mod sub_plan_marker_tests {
+    use super::{publish_sub_plan_id, read_sub_plan_id};
+    use tempfile::TempDir;
+
+    #[test]
+    fn sub_plan_id_marker_roundtrips_for_mid_run_grandchild_discovery() {
+        let temp = TempDir::new().expect("temp");
+        assert!(
+            read_sub_plan_id(temp.path()).is_none(),
+            "no marker before the sub-orchestrator creates its plan"
+        );
+        publish_sub_plan_id(temp.path(), "plan-abc123");
+        assert_eq!(
+            read_sub_plan_id(temp.path()).as_deref(),
+            Some("plan-abc123"),
+            "campaign parent can discover the sub-plan id mid-run"
+        );
+    }
+}
+
+#[cfg(test)]
 mod model_argv_tests {
     use super::{CampaignSubLaunch, build_sub_orchestrator_command};
     use std::path::Path;
@@ -2333,5 +2449,35 @@ mod model_argv_tests {
             .position(|a| a == "--narrator-model")
             .map(|at| args[at + 1].clone());
         assert_eq!(model.as_deref(), Some("haiku"));
+
+        // Building the argv is not enough — the receiving `orchestrate full-plan`
+        // subcommand must actually ACCEPT these flags. (A real campaign run found
+        // the subcommand rejecting `--narrate` though the argv looked correct.)
+        // The full CLI command tree is large; parse it on a roomy stack because
+        // the default 2 MiB test-harness thread stack overflows building it
+        // (the real binary parses on the 8 MiB main thread).
+        let mut argv = vec![std::ffi::OsString::from("deadreckon")];
+        argv.extend(command.get_args().map(|arg| arg.to_owned()));
+        let narrate_parsed = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                use clap::Parser;
+                let cli = crate::cli::Cli::try_parse_from(&argv)
+                    .expect("sub-orchestrator argv must parse against the real CLI");
+                matches!(
+                    &cli.command,
+                    Some(crate::cli::Commands::Orchestrate {
+                        command: Some(crate::cli::OrchestrateCommand::FullPlan(parsed)),
+                        ..
+                    }) if parsed.narrate && parsed.narrator_model.as_deref() == Some("haiku")
+                )
+            })
+            .expect("spawn parse thread")
+            .join()
+            .expect("parse thread");
+        assert!(
+            narrate_parsed,
+            "orchestrate full-plan must parse --narrate/--narrator-model from the campaign argv"
+        );
     }
 }
