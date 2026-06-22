@@ -1013,8 +1013,13 @@ fn normalize_file_path(value: &str, working_dir: &Path) -> Option<PathBuf> {
 
 fn truncate_summary(value: &str) -> String {
     let mut out = value.trim().replace('\n', " ");
-    if out.len() > MAX_SUMMARY_CHARS {
-        out.truncate(MAX_SUMMARY_CHARS);
+    // Truncate by characters, not bytes. `String::truncate` panics when the byte
+    // index is not a char boundary (e.g. mid em-dash), which crashed the provider
+    // flight recorder on multibyte output. `char_indices().nth(N)` yields the byte
+    // offset of the Nth char only when more than N chars exist, and that offset is
+    // always a valid boundary.
+    if let Some((idx, _)) = out.char_indices().nth(MAX_SUMMARY_CHARS) {
+        out.truncate(idx);
         out.push_str("...");
     }
     out
@@ -1050,6 +1055,21 @@ mod tests {
     use deadreckon_core::paths::DeadreckonPaths;
     use deadreckon_core::state::{RunOptions, create_run};
     use tempfile::TempDir;
+
+    #[test]
+    fn truncate_summary_handles_multibyte_boundary() {
+        // 239 ASCII bytes then em dashes makes byte index 240 fall mid-character,
+        // which used to panic String::truncate (the is_char_boundary assertion).
+        let input = format!("{}{}", "a".repeat(239), "\u{2014}".repeat(10));
+        let out = truncate_summary(&input);
+        assert!(out.ends_with("..."));
+        assert!(out.chars().count() <= MAX_SUMMARY_CHARS + 3);
+    }
+
+    #[test]
+    fn truncate_summary_keeps_short_strings() {
+        assert_eq!(truncate_summary("  hello\nworld  "), "hello world");
+    }
 
     #[test]
     fn provider_flight_recorder_captures_log_rows_and_checkpoint() {
