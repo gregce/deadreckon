@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.1 — Narration actually narrates — 2026-06-22
+
+Found by the first real end-to-end campaign run (every prior check was a unit
+test): the live narrator wrote zero beats in real runs, and campaign
+sub-orchestrators crashed on `--narrate`. Three fixes, each with a regression
+test that reproduces the failure:
+
+- fix(narrator): the live narrator never wrote a beat in real runs. `emit()`
+  awaited a model call inline in the engine loop; for short runs that call was
+  still in flight at shutdown, the 5s grace timed out, and the runtime aborted
+  the task before any beat was committed. The engine's cancel token is now
+  threaded into the `ProviderRequest`, so shutdown interrupts the in-flight call
+  and `emit()` falls through to a floor beat. This affected all narration,
+  including `dr run --narrate` from 0.2.0.
+- fix(narrator): on shutdown, buffered `DocsCheckpoint`/`RunCompleted` events
+  are drained (window-fill only, no blocking model call) before the final floor
+  flush — `cancel` and a non-empty `recv()` race in the `select!`, and if cancel
+  won, a fast run produced zero beats.
+- fix(cli): `orchestrate full-plan` and `orchestrate review` now accept
+  `--narrate/--no-narrate/--narrator-model`. They were only on the bare
+  `orchestrate` command, so every campaign sub-orchestrator (`orchestrate
+  full-plan … --narrate`) exited with "unexpected argument '--narrate'". The
+  propagation test now parses the real sub-orchestrator argv through clap.
+- feat(campaign): campaign-parent live aggregate. With `dr campaign --narrate`
+  the parent publishes each sub-orchestrator's plan id early, tails that sub's
+  grandchild leaf runs, and prints one framed line per active sub-goal to
+  stderr (`campaign <id> · sub-i (i/N) <status> · <freshest descendant beat>`).
+  The sub-orchestrator's own per-task aggregate is suppressed under a campaign
+  so the campaign parent owns the live surface.
+
 ## 0.3.0 — Orchestrated Narration — 2026-06-17
 
 Extends the Live Narrator (0.2.0, AS-BUILT §44) to every orchestrated and

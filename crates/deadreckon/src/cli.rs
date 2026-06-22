@@ -1907,6 +1907,15 @@ pub(crate) struct OrchestrateReviewArgs {
     pub(crate) quiet: bool,
     #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
     pub(crate) plain: bool,
+    #[arg(
+        long,
+        help = "Narrate each child in plain English (per-child snapshots + parent aggregate)"
+    )]
+    pub(crate) narrate: bool,
+    #[arg(long, help = "Disable child narration entirely")]
+    pub(crate) no_narrate: bool,
+    #[arg(long, help = "Pin the narrator model id for children")]
+    pub(crate) narrator_model: Option<String>,
 }
 
 #[derive(Args)]
@@ -1976,6 +1985,15 @@ pub(crate) struct OrchestrateFullPlanArgs {
     pub(crate) quiet: bool,
     #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
     pub(crate) plain: bool,
+    #[arg(
+        long,
+        help = "Narrate each child in plain English (per-child snapshots + parent aggregate)"
+    )]
+    pub(crate) narrate: bool,
+    #[arg(long, help = "Disable child narration entirely")]
+    pub(crate) no_narrate: bool,
+    #[arg(long, help = "Pin the narrator model id for children")]
+    pub(crate) narrator_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

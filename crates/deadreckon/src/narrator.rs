@@ -168,7 +168,7 @@ pub(crate) fn build_narration(ctx: NarratorCtx) -> (broadcast::Sender<RunEvent>,
     let sender = bus.sender();
     let cancel = CancellationToken::new();
     let router = build_narrator_router(&ctx);
-    let engine = NarratorEngine::new(ctx);
+    let engine = NarratorEngine::new(ctx, cancel.clone());
     let join = tokio::spawn(run_engine(engine, receiver, cancel.clone(), router));
     (sender, NarratorHandle { cancel, join })
 }
@@ -296,10 +296,13 @@ struct NarratorEngine {
     last_beat_at: Option<DateTime<Utc>>,
     turn_started: Option<(u32, DateTime<Utc>)>,
     block: ForegroundBlock,
+    // Cancelled at shutdown. Threaded into the model request so an in-flight
+    // beat call is interrupted instead of blocking the final flush.
+    cancel: CancellationToken,
 }
 
 impl NarratorEngine {
-    fn new(ctx: NarratorCtx) -> Self {
+    fn new(ctx: NarratorCtx, cancel: CancellationToken) -> Self {
         let narrative_dir = ctx.run_root.join("narrative");
         let current = seed_live_snapshot(&ctx.run_id);
         let ledger = NarratorLedger::new(ctx.config.budget_usd);
@@ -313,6 +316,7 @@ impl NarratorEngine {
             last_beat_at: None,
             turn_started: None,
             block: ForegroundBlock::new(),
+            cancel,
         }
     }
 
@@ -383,7 +387,10 @@ impl NarratorEngine {
                 output_path: None,
                 sandbox_backend: None,
                 pid_file: None,
-                cancellation_token: None,
+                // Interruptible: a shutdown cancel aborts the in-flight beat call
+                // so emit() falls through to a floor beat instead of the task
+                // being killed mid-call with no beat written.
+                cancellation_token: Some(self.cancel.clone()),
             };
             if let Ok(response) = router.complete(&request).await
                 && self.commit_model_beat(&response, now).is_ok()
@@ -489,6 +496,17 @@ impl NarratorEngine {
             self.render_ticker(turn, "working", now);
         }
     }
+
+    /// Fold a turn into the window without emitting. Used to drain events still
+    /// buffered at shutdown so the final floor flush covers them — never starts
+    /// a model call, so the run's exit is not delayed.
+    fn observe_event(&mut self, event: &RunEvent) {
+        if let RunEventKind::DocsCheckpoint { turn, path, .. } = &event.event
+            && let Some(record) = read_turn_record(path, *turn)
+        {
+            self.window.observe(turn_record_to_input(&record));
+        }
+    }
 }
 
 async fn run_engine(
@@ -503,8 +521,15 @@ async fn run_engine(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                // Final flush is floor-only: never start a blocking model call
-                // during shutdown, so the run's exit is never delayed.
+                // Drain events still buffered at shutdown before the final flush.
+                // `cancel` and a non-empty `recv()` race in this `select!`; if
+                // cancel wins first, the run's own DocsCheckpoint/RunCompleted
+                // events are still in the channel, and skipping them leaves the
+                // window empty so `commit_floor_beat` writes nothing — a fast run
+                // would produce zero beats. Observe-only keeps shutdown floor-only.
+                while let Ok(event) = receiver.try_recv() {
+                    engine.observe_event(&event);
+                }
                 let _ = engine.commit_floor_beat(Utc::now());
                 break;
             }
@@ -907,10 +932,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_wiring_writes_a_beat_from_docscheckpoint_then_runcompleted() {
+        // End-to-end through the real bus + spawned engine: a DocsCheckpoint
+        // pointing at a real `_incremental.jsonl`, then RunCompleted, must leave
+        // a beat in snapshots.jsonl. (A real `dr run --narrate` wrote zero beats
+        // even though every unit piece passed — this exercises the live path.)
+        let temp = TempDir::new().expect("tempdir");
+        let run_root = temp.path().join("run");
+        let working_dir = temp.path().join("work");
+        let incremental = working_dir.join(".deadreckon").join("docs");
+        std::fs::create_dir_all(&incremental).expect("docs dir");
+        let record = serde_json::json!({
+            "turn": 1,
+            "title": "Edit calc.py",
+            "tool_kind": "cli_subagent",
+            "latency_ms": 1200,
+            "files": [{"path": "calc.py", "adds": 26, "dels": 0,
+                       "largest_hunk_excerpt": "+def add", "is_new": true, "is_binary": false}],
+            "outcome": "ok",
+            "response_full": "added add()",
+            "response_summary": "added add()",
+            "response_text": "added add()",
+            "trace_link": "",
+            "snapshot_link": "",
+            "commit_sha": null,
+            "decision_candidate": false
+        });
+        let incremental_file = incremental.join("_incremental.jsonl");
+        std::fs::write(&incremental_file, format!("{record}\n")).expect("write incremental");
+
+        let (sender, handle) = build_narration(floor_ctx(run_root.clone()));
+        let send = |kind| {
+            sender
+                .send(RunEvent {
+                    timestamp: Utc::now(),
+                    run_id: "run-x".to_string(),
+                    event: kind,
+                })
+                .map(|_| ())
+        };
+        send(RunEventKind::TurnStarted { turn: 1 }).expect("turn started");
+        send(RunEventKind::DocsCheckpoint {
+            turn: 1,
+            path: incremental_file.clone(),
+            status: "turn-end".to_string(),
+        })
+        .expect("docs checkpoint");
+        send(RunEventKind::RunCompleted {
+            status: "completed".to_string(),
+        })
+        .expect("run completed");
+        // No yield: shutdown races the buffered events. The engine must still
+        // drain them (fill the window) before its final flush, or a fast run
+        // writes zero beats — exactly what a real `dr run --narrate` did.
+        handle.shutdown().await;
+
+        let snapshots = run_root.join("narrative").join("snapshots.jsonl");
+        assert!(
+            snapshots.exists(),
+            "the live wiring must write at least one beat to snapshots.jsonl"
+        );
+    }
+
+    #[tokio::test]
     async fn narrator_engine_writes_floor_beat_from_window() {
         let temp = TempDir::new().expect("tempdir");
         let run_root = temp.path().to_path_buf();
-        let mut engine = NarratorEngine::new(floor_ctx(run_root.clone()));
+        let mut engine = NarratorEngine::new(floor_ctx(run_root.clone()), CancellationToken::new());
         engine.window.observe(LiveTurnInput {
             turn: 1,
             title: "first step".to_string(),

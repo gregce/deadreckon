@@ -74,8 +74,8 @@ pub(crate) fn orchestrate_request_from_cli(
             yes: args.yes || bare.yes,
             no_repair: args.no_repair || bare.no_repair,
             completion_surface: true,
-            narrate: bare.narrate && !bare.no_narrate,
-            narrator_model: bare.narrator_model,
+            narrate: (args.narrate || bare.narrate) && !(args.no_narrate || bare.no_narrate),
+            narrator_model: args.narrator_model.or(bare.narrator_model),
         }),
         Some(OrchestrateCommand::FullPlan(args)) => Ok(OrchestrateRunArgs {
             plan: PlanCommandArgs {
@@ -117,8 +117,8 @@ pub(crate) fn orchestrate_request_from_cli(
             yes: args.yes || bare.yes,
             no_repair: args.no_repair || bare.no_repair,
             completion_surface: true,
-            narrate: bare.narrate && !bare.no_narrate,
-            narrator_model: bare.narrator_model,
+            narrate: (args.narrate || bare.narrate) && !(args.no_narrate || bare.no_narrate),
+            narrator_model: args.narrator_model.or(bare.narrator_model),
         }),
         None => interactive_orchestrate_request(bare),
     }
@@ -468,6 +468,9 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     }
     let plan = commands::plan::create_orchestration_plan(args.plan).await?;
     let plan_id = plan.plan_id.clone();
+    if let Ok(launch_dir) = std::env::var(deadreckon_core::campaign::ENV_SUB_RESULT) {
+        commands::campaign::publish_sub_plan_id(std::path::Path::new(&launch_dir), &plan_id);
+    }
     if !quiet {
         commands::plan::print_orchestrate_preflight(
             &plan,

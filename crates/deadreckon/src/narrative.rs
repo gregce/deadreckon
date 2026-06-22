@@ -1568,6 +1568,53 @@ pub(crate) fn emit_parent_aggregate(
     Ok(())
 }
 
+/// The freshest live headline across a campaign sub-goal's grandchildren — the
+/// leaf run roots under its sub-plan. Picks the latest beat by `created_at`.
+pub(crate) fn freshest_child_headline(
+    paths: &DeadreckonPaths,
+    run_ids: &[String],
+) -> Option<String> {
+    run_ids
+        .iter()
+        .filter_map(|run_id| {
+            let state = load_run(paths, run_id).ok()?;
+            let snapshot = read_latest_live_snapshot(&state.run_root.join(NARRATIVE_DIR))?;
+            Some((snapshot.created_at, snapshot.headline))
+        })
+        .max_by_key(|(created_at, _)| *created_at)
+        .map(|(_, headline)| headline)
+}
+
+/// One campaign-level aggregate line for the active sub-goal: campaign-framed
+/// (`campaign <prefix> · <sub> (i/N) <status>`) plus its freshest descendant
+/// headline when one exists, capped to `max_width`.
+pub(crate) fn campaign_aggregate_line(
+    campaign_prefix: &str,
+    sub_id: &str,
+    position: usize,
+    total: usize,
+    status: &str,
+    headline: Option<&str>,
+    max_width: usize,
+) -> String {
+    let raw = match headline {
+        Some(headline) => format!(
+            "campaign {campaign_prefix} · {sub_id} ({position}/{total}) {status} · {headline}"
+        ),
+        None => format!("campaign {campaign_prefix} · {sub_id} ({position}/{total}) {status}"),
+    };
+    raw.chars().take(max_width).collect::<String>()
+}
+
+/// Write one campaign aggregate line to the aggregate's stderr sink (never
+/// stdout — the campaign scrapes sub results off its own stdout path).
+pub(crate) fn emit_campaign_aggregate(
+    sinks: &mut AggregateSinks<'_>,
+    line: &str,
+) -> std::io::Result<()> {
+    writeln!(sinks.err, "{line}")
+}
+
 /// Like [`read_latest_snapshot`] but prefers the latest LIVE beat over a later
 /// attach-time Deterministic projection, so an on-demand attach refresh can
 /// never mask a child's live headline. Falls back to the last valid row.
@@ -4144,6 +4191,100 @@ mod tests {
             text.contains("sub-0") && text.contains("sub-1"),
             "one row per sub-goal"
         );
+    }
+
+    #[test]
+    fn campaign_aggregate_line_frames_sub_position_and_headline() {
+        let line = campaign_aggregate_line(
+            "3f2a",
+            "sub-0",
+            1,
+            3,
+            "running",
+            Some("wiring the tokenizer into the parser"),
+            100,
+        );
+        assert!(line.starts_with("campaign 3f2a · sub-0 (1/3) running · "));
+        assert!(line.contains("wiring the tokenizer"));
+        assert!(line.chars().count() <= 100);
+    }
+
+    #[test]
+    fn campaign_aggregate_line_without_headline_shows_status_only() {
+        let line = campaign_aggregate_line("3f2a", "sub-1", 2, 3, "running", None, 100);
+        assert_eq!(line, "campaign 3f2a · sub-1 (2/3) running");
+    }
+
+    #[test]
+    fn campaign_aggregate_line_caps_long_headline() {
+        let line =
+            campaign_aggregate_line("3f2a", "sub-0", 1, 3, "running", Some(&"x".repeat(500)), 60);
+        assert_eq!(line.chars().count(), 60);
+    }
+
+    #[test]
+    fn freshest_child_headline_picks_most_recent_live_beat_across_grandchildren() {
+        let temp = TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+
+        let mut run_ids = Vec::new();
+        for (i, (headline, secs)) in [
+            ("older grandchild beat", 100i64),
+            ("freshest grandchild beat", 900i64),
+            ("middle grandchild beat", 500i64),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let state = create_run(
+                &paths,
+                RunOptions {
+                    goal: format!("grandchild {i}"),
+                    cwd: repo.clone(),
+                    sandbox: "none".to_string(),
+                    provider: Some("cli:test".to_string()),
+                    skill_name: "default-coding".to_string(),
+                    max_spend_usd: None,
+                    max_wall_seconds: None,
+                    run_id: Some(format!("grandchild-{i}")),
+                    codebase: None,
+                },
+            )
+            .expect("grandchild run");
+            let mut beat = live_previous_snapshot();
+            beat.headline = headline.to_string();
+            beat.created_at = DateTime::from_timestamp(*secs, 0).expect("ts");
+            beat.live = Some(LiveBeat {
+                beat_seq: 1,
+                covers_turn: 1,
+                source: NarrativeSource::Live,
+                rolling_summary: None,
+            });
+            append_narrative_snapshot(&state.run_root.join(NARRATIVE_DIR), &beat)
+                .expect("write beat");
+            run_ids.push(state.run_id);
+        }
+
+        let headline = freshest_child_headline(&paths, &run_ids).expect("a headline");
+        assert_eq!(headline, "freshest grandchild beat");
+    }
+
+    #[test]
+    fn campaign_sub_aggregate_never_writes_to_stdout() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        {
+            let mut sinks = AggregateSinks {
+                out: &mut out,
+                err: &mut err,
+            };
+            emit_campaign_aggregate(&mut sinks, "campaign 3f2a · sub-0 (1/3) running")
+                .expect("emit");
+        }
+        assert!(out.is_empty(), "campaign aggregate must never touch stdout");
+        assert!(String::from_utf8(err).unwrap().contains("sub-0"));
     }
 
     #[test]
