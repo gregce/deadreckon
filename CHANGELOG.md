@@ -29,6 +29,12 @@ test that reproduces the failure:
   stderr (`campaign <id> · sub-i (i/N) <status> · <freshest descendant beat>`).
   The sub-orchestrator's own per-task aggregate is suppressed under a campaign
   so the campaign parent owns the live surface.
+- fix(runtime): truncate flight summaries on char boundaries (thanks
+  @jakelevirne, #1). `truncate_summary` used `MAX_SUMMARY_CHARS` (a character
+  count) as a byte index, so provider output where byte 240 landed mid-character
+  (em dash, smart quote, emoji, box-drawing) tripped `String::truncate`'s
+  `is_char_boundary` assertion and crashed the flight-recorder task — which under
+  orchestration paused the whole plan. Now truncates via `char_indices().nth(N)`.
 
 ## 0.3.0 — Orchestrated Narration — 2026-06-17
 
