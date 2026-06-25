@@ -7,6 +7,11 @@
   `ContractSource` enums and the pure, total `detect_project_kind` (Rust +
   Unknown for now), `default_checks_for`, and `detection_caveat`. No call-site
   change yet; later phases fill the detection table and wire it into the gate.
+- P8: deleting a covered non-Rust test now refuses like a deleted Rust test —
+  `evaluate` scans the earliest snapshot for conventional test files when a
+  shell test-runner check is present (the deleted file is gone from the
+  post-run tree); suppression lint gains `--passWithNoTests` and a trailing
+  `exit 0`. `classify` was already language-uniform.
 - P7: tamper `check_coverage` now recognizes cross-language test-runner shell
   commands (npm/pnpm/yarn/bun test, pytest, go test, deno/mix/dotnet test,
   mvn/gradle/gradlew test, rspec/rake, phpunit/composer test, make/just/task
