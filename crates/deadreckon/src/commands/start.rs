@@ -2652,6 +2652,7 @@ async fn dispatch_start_command(
                 narrate: false,
                 no_narrate: false,
                 narrator_model: None,
+                infer_contract: false,
             })
             .await;
             if result.is_ok()

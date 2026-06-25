@@ -2,6 +2,14 @@
 
 ## Polyglot — Default done-contract detection (in progress)
 
+- P9: optional `deadreckon run --infer-contract` — for an Unknown project tree
+  with no operator `acceptance.yaml`, a cheap model PROPOSES a test command the
+  operator must approve before it arms the gate. The approved spec is written
+  with a `# proposed by deadreckon --infer-contract (approved …): <model>`
+  header. It is a no-op under `--yes`/`--quiet`/non-TTY (a model proposal can
+  never define "done" unattended); no provider / low confidence falls back to
+  the deterministic caveat. The deterministic floor stays the only unattended
+  marker-signer.
 - P1: new `deadreckon-core::acceptance_defaults` module — `ProjectKind` /
   `PackageManager` / `BuildTool` / `RubyRunner` / `PhpRunner` / `Runner` /
   `ContractSource` enums and the pure, total `detect_project_kind` (Rust +
