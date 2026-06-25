@@ -2,6 +2,14 @@
 
 ## Polyglot — Default done-contract detection (in progress)
 
+- P10: friendliness — `deadreckon run` previews the resolved done-contract and
+  its source (detected/operator/inferred), `--preview` prints a full
+  project-kind + contract report, an Unknown tree surfaces a "no test contract
+  detected" caveat (no silent green), and a detected-but-unrunnable tree
+  (package.json without a test script, or pyproject with no visible tests)
+  refuses with a `try: … --acceptance … (or --infer-contract)` footer instead
+  of running a hollow gate. (A standalone `detect` report command is deferred —
+  the `detect` verb is already the provider probe; see V1-CANDIDATES.)
 - P9: optional `deadreckon run --infer-contract` — for an Unknown project tree
   with no operator `acceptance.yaml`, a cheap model PROPOSES a test command the
   operator must approve before it arms the gate. The approved spec is written
