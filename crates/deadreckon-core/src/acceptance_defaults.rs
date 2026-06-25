@@ -96,11 +96,34 @@ pub fn detect_project_kind(working_dir: &Path) -> ProjectKind {
     if exists("go.mod") {
         return ProjectKind::Go;
     }
+    if python_project(working_dir) && python_has_visible_tests(working_dir) {
+        return ProjectKind::Python;
+    }
     if exists("mix.exs") {
         return ProjectKind::Elixir;
     }
     if has_dotnet_project(working_dir) {
         return ProjectKind::Dotnet;
+    }
+    // JVM: Maven wins over Gradle (lower row); Gradle prefers the wrapper.
+    if exists("pom.xml") {
+        return ProjectKind::Jvm(BuildTool::Maven);
+    }
+    if exists("build.gradle") || exists("build.gradle.kts") {
+        return ProjectKind::Jvm(if exists("gradlew") {
+            BuildTool::GradleWrapper
+        } else {
+            BuildTool::Gradle
+        });
+    }
+    if exists("Gemfile") || exists("Rakefile") || working_dir.join("spec").is_dir() {
+        return ProjectKind::Ruby(ruby_runner(working_dir));
+    }
+    if exists("composer.json") && composer_has_test_script(working_dir) {
+        return ProjectKind::Php(PhpRunner::Composer);
+    }
+    if exists("phpunit.xml") || exists("phpunit.xml.dist") {
+        return ProjectKind::Php(PhpRunner::Phpunit);
     }
 
     // Script-runners (rows 13–15) — a textual `test` entry-point scan. The
@@ -142,6 +165,64 @@ fn node_package_manager(working_dir: &Path) -> PackageManager {
     } else {
         PackageManager::Npm
     }
+}
+
+/// A Python project sentinel: `pyproject.toml`, `setup.py`, or `setup.cfg`.
+fn python_project(working_dir: &Path) -> bool {
+    let exists = |name: &str| working_dir.join(name).exists();
+    exists("pyproject.toml") || exists("setup.py") || exists("setup.cfg")
+}
+
+/// Whether the tree has visible tests: a `tests/` dir, or any top-level
+/// `test_*.py` / `*_test.py`. A bare project with no tests degrades to Unknown —
+/// a green "0 tests" is hollow.
+fn python_has_visible_tests(working_dir: &Path) -> bool {
+    if working_dir.join("tests").is_dir() {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(working_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .map(is_python_test_file)
+            .unwrap_or(false)
+    })
+}
+
+fn is_python_test_file(name: &str) -> bool {
+    name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"))
+}
+
+/// Ruby sub-runner: `spec/` + `rspec` in `Gemfile.lock` → Rspec; else Rake.
+/// (Substring scan of `Gemfile.lock`; no bundler crate.)
+fn ruby_runner(working_dir: &Path) -> RubyRunner {
+    let has_rspec = working_dir.join("spec").is_dir()
+        && std::fs::read_to_string(working_dir.join("Gemfile.lock"))
+            .map(|lock| lock.contains("rspec"))
+            .unwrap_or(false);
+    if has_rspec {
+        RubyRunner::Rspec
+    } else {
+        RubyRunner::Rake
+    }
+}
+
+/// Whether `composer.json` declares a non-empty `scripts.test`.
+fn composer_has_test_script(working_dir: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(working_dir.join("composer.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    value
+        .get("scripts")
+        .and_then(|scripts| scripts.get("test"))
+        .map(|test| !test.is_null())
+        .unwrap_or(false)
 }
 
 /// Any `*.csproj` / `*.fsproj` / `*.sln` in the directory marks a .NET project.
@@ -359,5 +440,110 @@ mod tests {
             detect_project_kind(tmp.path()),
             ProjectKind::ScriptRunner(Runner::Just)
         );
+    }
+
+    // ---- P3: resolved kinds (Python/JVM/Ruby/PHP) + precedence ----
+
+    fn mkdir(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir.join(name)).expect("mkdir fixture");
+    }
+
+    #[test]
+    fn detect_python_requires_visible_tests() {
+        let tmp = TempDir::new().expect("tempdir");
+        write(tmp.path(), "pyproject.toml", "[project]\nname = \"x\"\n");
+        write(
+            tmp.path(),
+            "test_app.py",
+            "def test_ok():\n    assert True\n",
+        );
+        assert_eq!(detect_project_kind(tmp.path()), ProjectKind::Python);
+    }
+
+    #[test]
+    fn bare_pyproject_no_tests_is_unknown() {
+        let tmp = TempDir::new().expect("tempdir");
+        write(tmp.path(), "pyproject.toml", "[project]\nname = \"x\"\n");
+        assert_eq!(detect_project_kind(tmp.path()), ProjectKind::Unknown);
+    }
+
+    #[test]
+    fn detect_maven_from_pom_xml() {
+        let tmp = TempDir::new().expect("tempdir");
+        write(tmp.path(), "pom.xml", "<project></project>\n");
+        assert_eq!(
+            detect_project_kind(tmp.path()),
+            ProjectKind::Jvm(BuildTool::Maven)
+        );
+    }
+
+    #[test]
+    fn gradle_uses_wrapper_when_gradlew_present() {
+        let tmp = TempDir::new().expect("tempdir");
+        write(tmp.path(), "build.gradle", "plugins { id 'java' }\n");
+        write(tmp.path(), "gradlew", "#!/bin/sh\n");
+        assert_eq!(
+            detect_project_kind(tmp.path()),
+            ProjectKind::Jvm(BuildTool::GradleWrapper)
+        );
+    }
+
+    #[test]
+    fn ruby_prefers_rspec_when_spec_dir_and_rspec_in_lockfile() {
+        let tmp = TempDir::new().expect("tempdir");
+        write(tmp.path(), "Gemfile", "source 'https://rubygems.org'\n");
+        write(
+            tmp.path(),
+            "Gemfile.lock",
+            "GEM\n  specs:\n    rspec (3.12.0)\n",
+        );
+        mkdir(tmp.path(), "spec");
+        assert_eq!(
+            detect_project_kind(tmp.path()),
+            ProjectKind::Ruby(RubyRunner::Rspec)
+        );
+    }
+
+    #[test]
+    fn ruby_falls_back_to_rake_test_task() {
+        let tmp = TempDir::new().expect("tempdir");
+        write(tmp.path(), "Gemfile", "source 'https://rubygems.org'\n");
+        write(tmp.path(), "Rakefile", "task :test do\nend\n");
+        assert_eq!(
+            detect_project_kind(tmp.path()),
+            ProjectKind::Ruby(RubyRunner::Rake)
+        );
+    }
+
+    #[test]
+    fn php_prefers_composer_test_script() {
+        let tmp = TempDir::new().expect("tempdir");
+        write(
+            tmp.path(),
+            "composer.json",
+            r#"{"scripts":{"test":"phpunit"}}"#,
+        );
+        assert_eq!(
+            detect_project_kind(tmp.path()),
+            ProjectKind::Php(PhpRunner::Composer)
+        );
+    }
+
+    #[test]
+    fn php_uses_phpunit_when_no_composer_script() {
+        let tmp = TempDir::new().expect("tempdir");
+        write(tmp.path(), "phpunit.xml", "<phpunit></phpunit>\n");
+        assert_eq!(
+            detect_project_kind(tmp.path()),
+            ProjectKind::Php(PhpRunner::Phpunit)
+        );
+    }
+
+    #[test]
+    fn native_kind_wins_over_makefile_test_target() {
+        let tmp = TempDir::new().expect("tempdir");
+        write(tmp.path(), "go.mod", "module example.com/x\n");
+        write(tmp.path(), "Makefile", "test:\n\t./run-tests\n");
+        assert_eq!(detect_project_kind(tmp.path()), ProjectKind::Go);
     }
 }
