@@ -127,6 +127,22 @@ pub fn evaluate(
             });
         }
     }
+    // Cross-language analogue: a shell test-runner check covers the conventional
+    // test files in the earliest snapshot, so deleting a JS/Py/Go/etc. test
+    // (gone from the post-run working dir) still refuses like a deleted Rust test.
+    if checks.iter().any(|check| {
+        matches!(check, AcceptanceCheck::Shell { command, .. } if shell_program_is_test_runner(command))
+    }) && let Some(snapshot) = earliest_snapshot_dir(run_root)?
+    {
+        for path in conventional_test_files(&snapshot)? {
+            coverage.push(CheckCoverage {
+                path,
+                by_check: "shell".to_string(),
+                classification: CoverageClassification::Test,
+                directory: false,
+            });
+        }
+    }
     coverage.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -297,6 +313,8 @@ pub fn lint_suppressions(check_kind: &str, command: &str) -> Vec<SuppressionFind
         ("|| :", r"(?i)\|\|\s*:(\s|$|[;&|])"),
         ("--no-verify", r"(?i)(^|\s)--no-verify(\s|$)"),
         ("--exit-zero", r"(?i)(^|\s)--exit-zero(\s|$)"),
+        ("--passWithNoTests", r"(?i)(^|\s)--passwithnotests(\s|$)"),
+        ("trailing exit 0", r"(?i)(^|[;&|]|\s)exit\s+0\s*$"),
     ]
     .into_iter()
     .filter_map(|(pattern, regex)| {
@@ -1082,6 +1100,79 @@ mod tests {
 
         assert_eq!(tamper.verdict, AcceptanceTamperVerdict::Clean);
         assert!(tamper.covered_files_touched.is_empty());
+    }
+
+    // ---- P8: deletion + suppression refuse cross-language ----
+
+    #[test]
+    fn deleting_covered_jest_test_refuses() {
+        let (_temp, state) = fixture_run("jest delete");
+        std::fs::create_dir_all(state.working_dir.join("src")).expect("src");
+        std::fs::write(
+            state.working_dir.join("src/auth.test.js"),
+            "test('x',()=>{})\n",
+        )
+        .expect("test");
+        snapshot_working(&state, 0).expect("snapshot");
+        std::fs::remove_file(state.working_dir.join("src/auth.test.js")).expect("delete");
+        record_files(&state, vec![state.working_dir.join("src/auth.test.js")]);
+        let checks = vec![AcceptanceCheck::Shell {
+            command: "npm test".to_string(),
+            cwd: None,
+            must_pass: true,
+        }];
+
+        let tamper = super::evaluate(&state.run_id, &state.run_root, &state.working_dir, &checks)
+            .expect("tamper");
+        assert_eq!(tamper.verdict, AcceptanceTamperVerdict::Refuse);
+        assert!(
+            tamper
+                .refusal_reasons
+                .iter()
+                .any(|r| r.contains("auth.test.js"))
+        );
+    }
+
+    #[test]
+    fn deleting_covered_pytest_test_refuses() {
+        let (_temp, state) = fixture_run("pytest delete");
+        std::fs::create_dir_all(state.working_dir.join("tests")).expect("tests");
+        std::fs::write(
+            state.working_dir.join("tests/test_auth.py"),
+            "def test_x():\n    pass\n",
+        )
+        .expect("test");
+        snapshot_working(&state, 0).expect("snapshot");
+        std::fs::remove_file(state.working_dir.join("tests/test_auth.py")).expect("delete");
+        record_files(&state, vec![state.working_dir.join("tests/test_auth.py")]);
+        let checks = vec![AcceptanceCheck::Shell {
+            command: "python -m pytest -q".to_string(),
+            cwd: None,
+            must_pass: true,
+        }];
+
+        let tamper = super::evaluate(&state.run_id, &state.run_root, &state.working_dir, &checks)
+            .expect("tamper");
+        assert_eq!(tamper.verdict, AcceptanceTamperVerdict::Refuse);
+    }
+
+    #[test]
+    fn pass_with_no_tests_flag_refuses() {
+        let findings = super::lint_suppressions("shell", "jest --passWithNoTests");
+        assert!(
+            !findings.is_empty(),
+            "--passWithNoTests is a suppression evasion"
+        );
+        let (verdict, _, reasons) = super::classify(false, &findings, &[]);
+        assert_eq!(verdict, AcceptanceTamperVerdict::Refuse);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("passWithNoTests") || r.contains("suppression"))
+        );
+
+        // A trailing `exit 0` that masks a real test failure also refuses.
+        assert!(!super::lint_suppressions("shell", "pytest -q ; exit 0").is_empty());
     }
 
     #[test]
