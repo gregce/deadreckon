@@ -406,53 +406,21 @@ fn emit_acceptance_progress(
     )
 }
 
+/// The default checks the no-spec (dr-gate) path evaluates — the same detection
+/// and compilation as `compiled_acceptance_checks`, so the standalone binary and
+/// the in-process compile agree byte-for-byte instead of diverging into a
+/// Rust-only special case.
+fn default_acceptance_checks(working_dir: &Path) -> Vec<AcceptanceCheck> {
+    let kind = crate::acceptance_defaults::detect_project_kind(working_dir);
+    crate::acceptance_defaults::default_checks_for(&kind, working_dir)
+}
+
 fn evaluate_default_acceptance(working_dir: &Path) -> Result<Vec<AcceptanceCheckResult>> {
-    if working_dir.join("Cargo.toml").exists() {
-        let started = Instant::now();
-        let output = Command::new("cargo")
-            .arg("test")
-            .current_dir(working_dir)
-            .output()
-            .map_err(|source| DeadreckonError::Io {
-                path: working_dir.join("Cargo.toml"),
-                source,
-            })?;
-        return Ok(vec![AcceptanceCheckResult {
-            kind: "cargo_test".to_string(),
-            passed: output.status.success(),
-            must_pass: true,
-            detail: format!("cargo test exited with {}", output.status),
-            command: Some("cargo test".to_string()),
-            cwd: Some(working_dir.to_path_buf()),
-            duration_ms: Some(duration_ms(started)),
-            stdout: clipped_stdout(&output),
-            stderr: clipped_stderr(&output),
-        }]);
+    let mut results = Vec::new();
+    for check in default_acceptance_checks(working_dir) {
+        results.push(evaluate_check(working_dir, check)?);
     }
-    if !working_dir.is_dir() {
-        return Ok(vec![AcceptanceCheckResult {
-            kind: "working_dir".to_string(),
-            passed: false,
-            must_pass: true,
-            detail: format!("working directory missing: {}", working_dir.display()),
-            command: None,
-            cwd: Some(working_dir.to_path_buf()),
-            duration_ms: None,
-            stdout: None,
-            stderr: None,
-        }]);
-    }
-    Ok(vec![AcceptanceCheckResult {
-        kind: "working_dir".to_string(),
-        passed: true,
-        must_pass: true,
-        detail: "working directory exists".to_string(),
-        command: None,
-        cwd: Some(working_dir.to_path_buf()),
-        duration_ms: None,
-        stdout: None,
-        stderr: None,
-    }])
+    Ok(results)
 }
 
 fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<AcceptanceCheckResult> {
@@ -912,6 +880,58 @@ mod tests {
             reparsed.as_slice(),
             [super::AcceptanceCheck::Shell { command, .. }] if command == "go test ./..."
         ));
+    }
+
+    // ---- P6: dr-gate default eval routes through default_checks_for ----
+
+    #[test]
+    fn dr_gate_default_eval_matches_compiled_checks_for_python() {
+        let temp = TempDir::new().expect("tempdir");
+        let working = temp.path().join("work");
+        std::fs::create_dir_all(&working).expect("work");
+        std::fs::write(working.join("pyproject.toml"), "[project]\nname = \"x\"\n")
+            .expect("pyproject");
+        std::fs::write(
+            working.join("test_app.py"),
+            "def test_ok():\n    assert True\n",
+        )
+        .expect("test file");
+
+        let dr_gate = super::default_acceptance_checks(&working);
+        let in_process = crate::acceptance_defaults::default_checks_for(
+            &crate::acceptance_defaults::ProjectKind::Python,
+            &working,
+        );
+        assert_eq!(dr_gate, in_process);
+        assert!(matches!(
+            dr_gate.as_slice(),
+            [super::AcceptanceCheck::Shell { command, .. }] if command == "python -m pytest -q"
+        ));
+    }
+
+    #[test]
+    fn dr_gate_default_eval_node_runs_test_not_fileexists() {
+        let temp = TempDir::new().expect("tempdir");
+        let working = temp.path().join("work");
+        std::fs::create_dir_all(&working).expect("work");
+        std::fs::write(
+            working.join("package.json"),
+            r#"{"scripts":{"test":"jest"}}"#,
+        )
+        .expect("package.json");
+
+        let checks = super::default_acceptance_checks(&working);
+        // The dr-gate default path attempts the real test command, never the
+        // hollow FileExists "working directory exists".
+        assert!(matches!(
+            checks.as_slice(),
+            [super::AcceptanceCheck::Shell { command, .. }] if command == "npm test"
+        ));
+        assert!(
+            !checks
+                .iter()
+                .any(|c| matches!(c, super::AcceptanceCheck::FileExists { .. }))
+        );
     }
 
     #[test]
