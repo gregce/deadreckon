@@ -1,6 +1,16 @@
 # Changelog
 
-## Polyglot — Default done-contract detection (in progress)
+## Polyglot — Default done-contract detection — 2026-06-25
+
+Makes the acceptance gate non-hollow for non-Rust projects. A run with no
+operator `acceptance.yaml` in a Node/Deno/Python/Go/Elixir/.NET/JVM/Ruby/PHP or
+script-runner (Make/just/Task) tree now detects the project, compiles a real
+test contract, writes the generated spec for audit, and keeps tamper coverage
+honest for shell test commands (deleting a JS/Py/Go test refuses like a deleted
+Rust test). Optional `deadreckon run --infer-contract` proposes a contract for
+an unknown tree that the operator must approve before it arms the gate — the
+deterministic floor stays the only unattended marker-signer. No `AcceptanceCheck`
+schema change. See AS-BUILT §13.1 / §35.9.
 
 - P10: friendliness — `deadreckon run` previews the resolved done-contract and
   its source (detected/operator/inferred), `--preview` prints a full

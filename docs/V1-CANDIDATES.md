@@ -126,3 +126,24 @@
   sub's freshest snapshot but does not itself emit schema-2 `live` beats, so a
   campaign has no rolling narrative of its own — only an aggregation of its
   children's. A V1 could give the campaign its own beat stream.
+
+## Polyglot done-contract follow-ups (Polyglot, §13.1/§35.9)
+
+- Standalone `detect` report command: the project-kind + contract report is
+  surfaced via `deadreckon run --preview`, not a dedicated verb — the `detect`
+  verb is already the provider-probe command. A renamed report verb (e.g.
+  `deadreckon contract`) could expose it standalone.
+- Inferred-contract `test_globs` → tamper: an approved inferred contract's
+  explicit `test_globs` are not yet threaded into tamper coverage (coverage
+  comes from the proposed command being a recognized test runner). Threading
+  the globs needs either a side file or an `AcceptanceCheck` field; deferred to
+  avoid a schema change.
+- Monorepo / multi-package detection: detection resolves one contract for the
+  working-dir root; per-workspace/per-package contracts in a monorepo are out
+  of scope.
+- Multi-command pipelines (lint && test && build) as a single inferred default.
+- Languages beyond the shipped native set (Scala/Clojure/Swift/C/C++/Haskell/
+  Dart) — reachable today via the script-runner row or approved inference; the
+  native table is extensible.
+- Auto-installing missing toolchains/deps so a detected command can actually run.
+- Blanket pytest `-k 'not …'` skip detection in the suppression lint.
