@@ -323,6 +323,15 @@ pub fn default_checks_for(kind: &ProjectKind, working_dir: &Path) -> Vec<Accepta
     }]
 }
 
+/// The canonical default test command for a kind (for preview/`detect`), or
+/// `None` for `Unknown` (no runnable command). `Rust` reports `cargo test`.
+pub fn default_command_for(kind: &ProjectKind, working_dir: &Path) -> Option<String> {
+    if let ProjectKind::Rust = kind {
+        return Some("cargo test".to_string());
+    }
+    test_command_for(kind, working_dir)
+}
+
 /// The canonical test command for a kind, or `None` for `Unknown`/`Rust`.
 fn test_command_for(kind: &ProjectKind, working_dir: &Path) -> Option<String> {
     let command = match kind {

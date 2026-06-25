@@ -248,12 +248,42 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         plain,
         run_id: &run_id,
     });
+    // Detected-but-unrunnable trees (a JS/Python project we can't resolve a test
+    // command for) refuse with a `try:` footer rather than silently running a
+    // hollow gate — unless the operator gave --acceptance or opted into
+    // --infer-contract.
+    if !preview
+        && acceptance.is_none()
+        && !infer_contract
+        && let Some((reason, try_hint)) = commands::detect::unrunnable_refusal(&cwd, "run")
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &reason, &try_hint,
+        )));
+    }
+    let contract_source = if acceptance.is_some() {
+        deadreckon_core::acceptance_defaults::ContractSource::Operator
+    } else {
+        deadreckon_core::acceptance_defaults::ContractSource::Detected
+    };
     if preview {
         eprintln!("{preview_text}");
+        if !brief {
+            eprintln!("{}", commands::detect::detect_report(&cwd));
+        }
         return Ok(());
     }
     if !quiet {
         eprintln!("{preview_text}");
+        if !brief {
+            eprintln!(
+                "{}",
+                commands::detect::contract_preview_line(&cwd, contract_source)
+            );
+            if let Some(caveat) = commands::detect::contract_caveat(&cwd) {
+                eprintln!("caveat: {caveat}");
+            }
+        }
     }
     if !auto_confirm {
         if !io::stdin().is_terminal() {
