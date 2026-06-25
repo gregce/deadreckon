@@ -7,6 +7,11 @@
   `ContractSource` enums and the pure, total `detect_project_kind` (Rust +
   Unknown for now), `default_checks_for`, and `detection_caveat`. No call-site
   change yet; later phases fill the detection table and wire it into the gate.
+- P2: `detect_project_kind` resolves the single-canonical-command kinds — Node
+  (`scripts.test` present; package manager from `bun.lockb`/`pnpm-lock.yaml`/
+  `yarn.lock`/npm), Deno, Go, Elixir, .NET (`*.csproj`/`*.fsproj`/`*.sln`) — and
+  the deterministic `test`-target scan for Make/just/Task script-runners. A
+  `package.json` without a test script degrades to Unknown+caveat.
 
 ## 0.3.1 — Narration actually narrates — 2026-06-22
 
