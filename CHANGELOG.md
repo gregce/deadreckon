@@ -7,6 +7,11 @@
   `ContractSource` enums and the pure, total `detect_project_kind` (Rust +
   Unknown for now), `default_checks_for`, and `detection_caveat`. No call-site
   change yet; later phases fill the detection table and wire it into the gate.
+- P3: `detect_project_kind` resolves the ambiguous kinds — Python (sentinel AND
+  visible tests; a bare `pyproject.toml` degrades to Unknown), JVM (Maven over
+  Gradle, Gradle preferring `./gradlew`), Ruby (rspec when `spec/`+rspec in
+  `Gemfile.lock`, else rake), PHP (composer script vs phpunit) — and the
+  precedence rules (native rows beat script-runners; lower row wins).
 - P2: `detect_project_kind` resolves the single-canonical-command kinds — Node
   (`scripts.test` present; package manager from `bun.lockb`/`pnpm-lock.yaml`/
   `yarn.lock`/npm), Deno, Go, Elixir, .NET (`*.csproj`/`*.fsproj`/`*.sln`) — and
