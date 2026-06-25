@@ -7,6 +7,8 @@
   `ContractSource` enums and the pure, total `detect_project_kind` (Rust +
   Unknown for now), `default_checks_for`, and `detection_caveat`. No call-site
   change yet; later phases fill the detection table and wire it into the gate.
+- P4: `default_checks_for` compiles each non-Rust kind to a real `Shell` test
+  check (cwd set to the working dir); `Unknown` keeps `FileExists`.
 - P3: `detect_project_kind` resolves the ambiguous kinds — Python (sentinel AND
   visible tests; a bare `pyproject.toml` degrades to Unknown), JVM (Maven over
   Gradle, Gradle preferring `./gradlew`), Ruby (rspec when `spec/`+rspec in

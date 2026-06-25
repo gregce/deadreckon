@@ -299,18 +299,84 @@ fn has_task(body: &str, task: &str) -> bool {
 }
 
 /// Compile a kind into the real default [`AcceptanceCheck`] set. Rust keeps the
-/// existing `CargoTest`; everything else (until P4) falls back to the historical
-/// `FileExists {working_dir}` placeholder.
-pub fn default_checks_for(kind: &ProjectKind, _working_dir: &Path) -> Vec<AcceptanceCheck> {
-    match kind {
-        ProjectKind::Rust => vec![AcceptanceCheck::CargoTest {
+/// existing `CargoTest`; every other native kind compiles to a single
+/// `Shell { command, cwd: Some(working_dir), must_pass: true }` running that
+/// ecosystem's canonical test command — which reuses the existing evaluation,
+/// signing, and tamper path. `Unknown` keeps the historical `FileExists`.
+pub fn default_checks_for(kind: &ProjectKind, working_dir: &Path) -> Vec<AcceptanceCheck> {
+    if let ProjectKind::Rust = kind {
+        return vec![AcceptanceCheck::CargoTest {
             args: Vec::new(),
             must_pass: true,
-        }],
-        _ => vec![AcceptanceCheck::FileExists {
+        }];
+    }
+    let Some(command) = test_command_for(kind, working_dir) else {
+        return vec![AcceptanceCheck::FileExists {
             path: "{working_dir}".to_string(),
             must_pass: true,
-        }],
+        }];
+    };
+    vec![AcceptanceCheck::Shell {
+        command,
+        cwd: Some(working_dir.display().to_string()),
+        must_pass: true,
+    }]
+}
+
+/// The canonical test command for a kind, or `None` for `Unknown`/`Rust`.
+fn test_command_for(kind: &ProjectKind, working_dir: &Path) -> Option<String> {
+    let command = match kind {
+        ProjectKind::Rust | ProjectKind::Unknown => return None,
+        ProjectKind::Node(pm) => format!("{} test", package_manager_program(*pm)),
+        ProjectKind::Deno => "deno test -A".to_string(),
+        ProjectKind::Go => "go test ./...".to_string(),
+        ProjectKind::Python => "python -m pytest -q".to_string(),
+        ProjectKind::Elixir => "mix test".to_string(),
+        ProjectKind::Dotnet => "dotnet test".to_string(),
+        ProjectKind::Jvm(BuildTool::Maven) => "mvn -q test".to_string(),
+        ProjectKind::Jvm(BuildTool::Gradle) => "gradle test".to_string(),
+        ProjectKind::Jvm(BuildTool::GradleWrapper) => "./gradlew test".to_string(),
+        ProjectKind::Ruby(runner) => ruby_command(*runner, working_dir),
+        ProjectKind::Php(PhpRunner::Composer) => "composer test".to_string(),
+        ProjectKind::Php(PhpRunner::Phpunit) => {
+            if working_dir.join("vendor/bin/phpunit").exists() {
+                "vendor/bin/phpunit".to_string()
+            } else {
+                "phpunit".to_string()
+            }
+        }
+        ProjectKind::ScriptRunner(Runner::Make) => "make test".to_string(),
+        ProjectKind::ScriptRunner(Runner::Just) => "just test".to_string(),
+        ProjectKind::ScriptRunner(Runner::Task) => "task test".to_string(),
+    };
+    Some(command)
+}
+
+fn package_manager_program(pm: PackageManager) -> &'static str {
+    match pm {
+        PackageManager::Npm => "npm",
+        PackageManager::Pnpm => "pnpm",
+        PackageManager::Yarn => "yarn",
+        PackageManager::Bun => "bun",
+    }
+}
+
+/// Ruby command: rspec when resolved; otherwise `bundle exec rake test` when the
+/// Rakefile declares a `test` task, else `bundle exec rake`.
+fn ruby_command(runner: RubyRunner, working_dir: &Path) -> String {
+    match runner {
+        RubyRunner::Rspec => "bundle exec rspec".to_string(),
+        RubyRunner::Minitest => "bundle exec rake test".to_string(),
+        RubyRunner::Rake => {
+            let has_test_task = std::fs::read_to_string(working_dir.join("Rakefile"))
+                .map(|body| body.contains(":test") || body.contains("\"test\""))
+                .unwrap_or(false);
+            if has_test_task {
+                "bundle exec rake test".to_string()
+            } else {
+                "bundle exec rake".to_string()
+            }
+        }
     }
 }
 
@@ -545,5 +611,80 @@ mod tests {
         write(tmp.path(), "go.mod", "module example.com/x\n");
         write(tmp.path(), "Makefile", "test:\n\t./run-tests\n");
         assert_eq!(detect_project_kind(tmp.path()), ProjectKind::Go);
+    }
+
+    // ---- P4: default_checks_for compiles real Shell checks ----
+
+    fn shell_of(checks: &[AcceptanceCheck]) -> (String, Option<String>, bool) {
+        match checks.first().expect("one check") {
+            AcceptanceCheck::Shell {
+                command,
+                cwd,
+                must_pass,
+            } => (command.clone(), cwd.clone(), *must_pass),
+            other => panic!("expected Shell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_pnpm_compiles_pnpm_test_shell_check() {
+        let tmp = TempDir::new().expect("tempdir");
+        let checks = default_checks_for(&ProjectKind::Node(PackageManager::Pnpm), tmp.path());
+        let (command, _, must_pass) = shell_of(&checks);
+        assert_eq!(command, "pnpm test");
+        assert!(must_pass);
+    }
+
+    #[test]
+    fn python_compiles_pytest_shell_check() {
+        let tmp = TempDir::new().expect("tempdir");
+        let checks = default_checks_for(&ProjectKind::Python, tmp.path());
+        assert_eq!(shell_of(&checks).0, "python -m pytest -q");
+    }
+
+    #[test]
+    fn go_compiles_go_test_shell_check() {
+        let tmp = TempDir::new().expect("tempdir");
+        let checks = default_checks_for(&ProjectKind::Go, tmp.path());
+        assert_eq!(shell_of(&checks).0, "go test ./...");
+    }
+
+    #[test]
+    fn elixir_compiles_mix_test_shell_check() {
+        let tmp = TempDir::new().expect("tempdir");
+        let checks = default_checks_for(&ProjectKind::Elixir, tmp.path());
+        assert_eq!(shell_of(&checks).0, "mix test");
+    }
+
+    #[test]
+    fn dotnet_compiles_dotnet_test_shell_check() {
+        let tmp = TempDir::new().expect("tempdir");
+        let checks = default_checks_for(&ProjectKind::Dotnet, tmp.path());
+        assert_eq!(shell_of(&checks).0, "dotnet test");
+    }
+
+    #[test]
+    fn gradle_wrapper_compiles_gradlew_test_shell_check() {
+        let tmp = TempDir::new().expect("tempdir");
+        let checks = default_checks_for(&ProjectKind::Jvm(BuildTool::GradleWrapper), tmp.path());
+        assert_eq!(shell_of(&checks).0, "./gradlew test");
+    }
+
+    #[test]
+    fn script_runner_compiles_make_test_shell_check() {
+        let tmp = TempDir::new().expect("tempdir");
+        let checks = default_checks_for(&ProjectKind::ScriptRunner(Runner::Make), tmp.path());
+        assert_eq!(shell_of(&checks).0, "make test");
+    }
+
+    #[test]
+    fn compiled_check_sets_cwd_to_working_dir() {
+        let tmp = TempDir::new().expect("tempdir");
+        let checks = default_checks_for(&ProjectKind::Go, tmp.path());
+        let (_, cwd, _) = shell_of(&checks);
+        assert_eq!(
+            cwd.as_deref(),
+            Some(tmp.path().display().to_string().as_str())
+        );
     }
 }
