@@ -7,6 +7,12 @@
   `ContractSource` enums and the pure, total `detect_project_kind` (Rust +
   Unknown for now), `default_checks_for`, and `detection_caveat`. No call-site
   change yet; later phases fill the detection table and wire it into the gate.
+- P7: tamper `check_coverage` now recognizes cross-language test-runner shell
+  commands (npm/pnpm/yarn/bun test, pytest, go test, deno/mix/dotnet test,
+  mvn/gradle/gradlew test, rspec/rake, phpunit/composer test, make/just/task
+  test, jest/vitest) and maps the ecosystem's conventional test files
+  (`tests/`/`test/`/`spec/`, `*_test.go`, `*.test.*`, `*.spec.*`, `*Test.cs`,
+  `test_*.py`, …) to `Test` coverage.
 - P6: the dr-gate no-spec path (`evaluate_default_acceptance`) routes through
   `default_checks_for` too, so the standalone binary and the in-process compile
   agree byte-for-byte; the Rust-only special case is gone (Node now attempts

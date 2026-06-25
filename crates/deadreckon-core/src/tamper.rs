@@ -256,6 +256,19 @@ pub fn check_coverage(
                         directory: false,
                     });
                 }
+                // A command whose program is a known cross-language test runner
+                // covers the ecosystem's conventional test files as Test — so
+                // deleting a JS/Py/Go/etc. test refuses like a deleted Rust test.
+                if shell_program_is_test_runner(command) {
+                    for path in conventional_test_files(working_dir)? {
+                        coverage.push(CheckCoverage {
+                            path,
+                            by_check: "shell".to_string(),
+                            classification: CoverageClassification::Test,
+                            directory: false,
+                        });
+                    }
+                }
             }
         }
     }
@@ -491,6 +504,87 @@ fn rust_test_files(working_dir: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+/// Whether a shell command's program is a known cross-language test runner.
+/// Deterministic, LLM-free — conventions are stable and this is security-critical.
+pub fn shell_program_is_test_runner(command: &str) -> bool {
+    let raw: Vec<&str> = command.split_whitespace().collect();
+    // Strip a leading `bundle exec` wrapper.
+    let tokens: &[&str] = if raw.len() >= 2 && raw[0] == "bundle" && raw[1] == "exec" {
+        &raw[2..]
+    } else {
+        &raw[..]
+    };
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let program = program_basename(first);
+    let sub = tokens.get(1).copied().unwrap_or("");
+    match program {
+        // Runners that are tests by name, whatever the args.
+        "pytest" | "rspec" | "phpunit" | "jest" | "vitest" => true,
+        // Tools whose `test` subcommand is the test runner.
+        "go" | "npm" | "pnpm" | "yarn" | "bun" | "deno" | "mix" | "dotnet" | "gradle"
+        | "gradlew" | "make" | "just" | "task" | "composer" => sub == "test",
+        // rake (bare) or `rake test`.
+        "rake" => tokens.len() == 1 || tokens.contains(&"test"),
+        // maven: `mvn … test`.
+        "mvn" => tokens.contains(&"test"),
+        // `python -m pytest`.
+        "python" | "python3" => tokens.windows(2).any(|w| w == ["-m", "pytest"]),
+        _ => false,
+    }
+}
+
+/// The program basename of a command token, stripping a `./` or directory prefix
+/// (`./gradlew` → `gradlew`, `vendor/bin/phpunit` → `phpunit`).
+fn program_basename(token: &str) -> &str {
+    token.rsplit('/').next().unwrap_or(token)
+}
+
+/// Files matching cross-language test conventions: anything under a `tests/`,
+/// `test/`, or `spec/` directory, plus conventional test filenames per ecosystem.
+fn conventional_test_files(working_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for path in inventory_files(working_dir)? {
+        let Some(relative) = working_relative_path(working_dir, &path) else {
+            continue;
+        };
+        if ignored_relative(&relative) {
+            continue;
+        }
+        if is_conventional_test_file(&relative) {
+            files.push(relative);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Whether a relative path matches a cross-language test convention.
+fn is_conventional_test_file(relative: &Path) -> bool {
+    if relative.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("tests" | "test" | "spec")
+        )
+    }) {
+        return true;
+    }
+    let Some(name) = relative.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.ends_with("_test.go")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+        || name.ends_with("Test.java")
+        || name.ends_with("Test.kt")
+        || name.ends_with("_test.exs")
+        || name.ends_with("Test.cs")
+        || name.ends_with("Tests.cs")
+        || name.ends_with("_test.py")
+        || (name.starts_with("test_") && name.ends_with(".py"))
 }
 
 fn is_rust_test_file(working_dir: &Path, relative: &Path) -> bool {
@@ -784,6 +878,107 @@ mod tests {
             by_path.get(&PathBuf::from("script.sh")),
             Some(&CoverageClassification::Unknown)
         );
+    }
+
+    // ---- P7: shell test-runner commands classify conventional tests as Test ----
+
+    fn covers_as_test(working_dir: &std::path::Path, command: &str, test_rel: &str) -> bool {
+        let checks = vec![AcceptanceCheck::Shell {
+            command: command.to_string(),
+            cwd: None,
+            must_pass: true,
+        }];
+        let coverage = super::check_coverage(&checks, working_dir).expect("coverage");
+        coverage.iter().any(|item| {
+            item.path == PathBuf::from(test_rel)
+                && item.classification == CoverageClassification::Test
+        })
+    }
+
+    #[test]
+    fn npm_test_shell_check_classifies_as_test_coverage() {
+        let (_temp, state) = fixture_run("npm");
+        std::fs::create_dir_all(state.working_dir.join("src")).expect("src");
+        std::fs::write(
+            state.working_dir.join("src/auth.test.js"),
+            "test('x',()=>{})\n",
+        )
+        .expect("test");
+        assert!(covers_as_test(
+            &state.working_dir,
+            "npm test",
+            "src/auth.test.js"
+        ));
+    }
+
+    #[test]
+    fn pytest_shell_check_maps_tests_dir_coverage() {
+        let (_temp, state) = fixture_run("pytest");
+        std::fs::create_dir_all(state.working_dir.join("tests")).expect("tests");
+        std::fs::write(
+            state.working_dir.join("tests/test_auth.py"),
+            "def test_x():\n    pass\n",
+        )
+        .expect("test");
+        assert!(covers_as_test(
+            &state.working_dir,
+            "python -m pytest -q",
+            "tests/test_auth.py"
+        ));
+    }
+
+    #[test]
+    fn go_test_shell_check_maps_go_test_files() {
+        let (_temp, state) = fixture_run("go");
+        std::fs::write(state.working_dir.join("auth_test.go"), "package x\n").expect("test");
+        assert!(covers_as_test(
+            &state.working_dir,
+            "go test ./...",
+            "auth_test.go"
+        ));
+    }
+
+    #[test]
+    fn mix_test_shell_check_classifies_as_test_coverage() {
+        let (_temp, state) = fixture_run("mix");
+        std::fs::create_dir_all(state.working_dir.join("test")).expect("test dir");
+        std::fs::write(
+            state.working_dir.join("test/auth_test.exs"),
+            "defmodule X do\nend\n",
+        )
+        .expect("test");
+        assert!(covers_as_test(
+            &state.working_dir,
+            "mix test",
+            "test/auth_test.exs"
+        ));
+    }
+
+    #[test]
+    fn dotnet_test_shell_check_maps_test_files() {
+        let (_temp, state) = fixture_run("dotnet");
+        std::fs::write(
+            state.working_dir.join("AuthTests.cs"),
+            "class AuthTests {}\n",
+        )
+        .expect("test");
+        assert!(covers_as_test(
+            &state.working_dir,
+            "dotnet test",
+            "AuthTests.cs"
+        ));
+    }
+
+    #[test]
+    fn make_test_shell_check_classifies_as_test_coverage() {
+        let (_temp, state) = fixture_run("make");
+        std::fs::create_dir_all(state.working_dir.join("tests")).expect("tests");
+        std::fs::write(state.working_dir.join("tests/smoke.sh"), "echo ok\n").expect("test");
+        assert!(covers_as_test(
+            &state.working_dir,
+            "make test",
+            "tests/smoke.sh"
+        ));
     }
 
     #[test]
