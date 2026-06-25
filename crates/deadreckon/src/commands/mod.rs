@@ -7,6 +7,7 @@ pub(crate) mod completion;
 pub(crate) mod doc;
 pub(crate) mod doctor;
 pub(crate) mod import;
+pub(crate) mod infer_contract;
 pub(crate) mod init;
 pub(crate) mod inspection;
 pub(crate) mod learning;

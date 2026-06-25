@@ -736,6 +736,7 @@ async fn main_inner() -> Result<()> {
             narrate,
             no_narrate,
             narrator_model,
+            infer_contract,
         } => {
             ui::set_plain_output(plain);
             let goal = resolve_required_goal_input(
@@ -778,6 +779,7 @@ async fn main_inner() -> Result<()> {
                 narrate,
                 no_narrate,
                 narrator_model,
+                infer_contract,
             })
             .await
         }
@@ -3366,6 +3368,7 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
         narrate: false,
         no_narrate: false,
         narrator_model: None,
+        infer_contract: false,
     })
     .await;
     let restore_result = std::env::set_current_dir(&original_dir);

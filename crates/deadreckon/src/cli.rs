@@ -834,6 +834,11 @@ pub(crate) enum Commands {
             help = "Pin the narrator model id (keeps provider preference order)"
         )]
         narrator_model: Option<String>,
+        #[arg(
+            long,
+            help = "For an unknown project tree with no acceptance.yaml, propose a test contract for you to approve before it arms the gate (interactive only)"
+        )]
+        infer_contract: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -2451,6 +2456,7 @@ pub(crate) struct RunCommandArgs {
     pub(crate) narrate: bool,
     pub(crate) no_narrate: bool,
     pub(crate) narrator_model: Option<String>,
+    pub(crate) infer_contract: bool,
 }
 
 pub(crate) struct StartCommandArgs {

@@ -35,6 +35,7 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         narrate,
         no_narrate,
         narrator_model,
+        infer_contract,
     } = args;
     if let Err(message) = crate::narrator::validate_narration_flags(narrate, no_narrate) {
         return Err(CliError::Core(DeadreckonError::InvalidInput(message)));
@@ -296,6 +297,15 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
         deadreckon_core::write_codebase_record(&state.working_dir, &codebase)?;
     }
     commands::acceptance::copy_acceptance_into_run(&state, &acceptance_source)?;
+    maybe_infer_contract(
+        &paths,
+        &state,
+        infer_contract,
+        auto_confirm,
+        quiet,
+        provider.as_deref(),
+    )
+    .await?;
     let mut lock = acquire_lock(
         &paths,
         &state.task_key,
@@ -647,6 +657,92 @@ fn cancelled_run_surface() -> VerdictSurface {
         [("Recommended", "deadreckon run \"<goal>\"")],
         [("Secondary", "deadreckon start \"<goal>\"")],
     )
+}
+
+/// `--infer-contract` preflight: for an unknown project tree with no operator
+/// `acceptance.yaml`, a cheap model proposes a test command the operator must
+/// approve before it arms the gate. A no-op unless opted in, Unknown, and on an
+/// interactive surface — a model proposal never defines "done" unattended.
+async fn maybe_infer_contract(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    infer_flag: bool,
+    yes: bool,
+    quiet: bool,
+    provider_arg: Option<&str>,
+) -> Result<()> {
+    use crate::commands::infer_contract::{
+        InferenceOutcome, arm_inferred_contract, infer_contract_eligible, propose_contract,
+        resolve_inferred_contract,
+    };
+    if !infer_flag {
+        return Ok(());
+    }
+    let spec_path = deadreckon_core::gate::acceptance_spec_path_for_run_root(&state.run_root);
+    if spec_path.exists() {
+        return Ok(());
+    }
+    let kind = deadreckon_core::acceptance_defaults::detect_project_kind(&state.working_dir);
+    let kind_unknown = matches!(
+        kind,
+        deadreckon_core::acceptance_defaults::ProjectKind::Unknown
+    );
+    let is_tty = io::stdin().is_terminal();
+    let eligible = infer_contract_eligible(infer_flag, kind_unknown, yes, quiet, false, is_tty);
+    if !eligible {
+        return Ok(());
+    }
+    let defaults = config_defaults(paths)?;
+    let Some(provider) = commands::start::goal_shape_provider_route(paths, &defaults, provider_arg)
+    else {
+        return Ok(());
+    };
+    let config_path = paths.config_path();
+    let proposal = propose_contract(&config_path, &provider, &state.working_dir).await;
+    let outcome = resolve_inferred_contract(
+        eligible,
+        || proposal,
+        |proposal| {
+            eprintln!("\nInferred done-contract (no acceptance.yaml, unknown project tree):");
+            eprintln!("  command:    {}", proposal.command);
+            if !proposal.test_globs.is_empty() {
+                eprintln!("  test files: {}", proposal.test_globs.join(", "));
+            }
+            eprintln!(
+                "  rationale:  {} (confidence {:.0}%)",
+                proposal.rationale,
+                proposal.confidence * 100.0
+            );
+            crate::prompt::confirm("Approve this contract to gate the run?", false).unwrap_or(false)
+        },
+    );
+    match outcome {
+        InferenceOutcome::Approved(proposal) => {
+            arm_inferred_contract(
+                &spec_path,
+                &state.working_dir,
+                &proposal,
+                &provider,
+                chrono::Utc::now(),
+            )
+            .map_err(|source| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "failed to write inferred contract: {source}"
+                )))
+            })?;
+            if !quiet {
+                eprintln!(
+                    "Inferred contract armed; the gate will run: {}",
+                    proposal.command
+                );
+            }
+        }
+        InferenceOutcome::NoProvider if !quiet => {
+            eprintln!("No usable inference; continuing with a no-test-contract caveat.");
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
