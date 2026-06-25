@@ -1,5 +1,13 @@
 # Changelog
 
+## Polyglot — Default done-contract detection (in progress)
+
+- P1: new `deadreckon-core::acceptance_defaults` module — `ProjectKind` /
+  `PackageManager` / `BuildTool` / `RubyRunner` / `PhpRunner` / `Runner` /
+  `ContractSource` enums and the pure, total `detect_project_kind` (Rust +
+  Unknown for now), `default_checks_for`, and `detection_caveat`. No call-site
+  change yet; later phases fill the detection table and wire it into the gate.
+
 ## 0.3.1 — Narration actually narrates — 2026-06-22
 
 Found by the first real end-to-end campaign run (every prior check was a unit
