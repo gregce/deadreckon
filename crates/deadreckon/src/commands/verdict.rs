@@ -33,9 +33,17 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     }
     let state = resolve_verdict_run(&paths, args.run_id.as_deref())?;
     let report = build_verdict_report(&state);
+    // The sidecar is an additive audit artifact; a read-only filesystem must not
+    // turn a verdict into a hard failure, so a write error is swallowed.
+    let cached = cache_verdict_report(&state, &report).ok();
     let surface = render_verdict_surface(&report, &state);
     if args.json {
-        let envelope = verdict_json(&report, &state, &surface.primary_action.command);
+        let envelope = verdict_json(
+            &report,
+            &state,
+            &surface.primary_action.command,
+            cached.as_deref(),
+        );
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
         println!("{}", surface.render_plain(args.quiet));
@@ -156,6 +164,7 @@ pub(crate) fn verdict_json(
     report: &VerdictReport,
     state: &deadreckon_core::PipelineState,
     primary_command: &str,
+    cached: Option<&std::path::Path>,
 ) -> serde_json::Value {
     serde_json::json!({
         "kind": "verdict",
@@ -171,6 +180,7 @@ pub(crate) fn verdict_json(
         "paths": {
             "run_root": state.run_root,
             "marker": deadreckon_core::gate::marker_path_for_run_root(&state.run_root),
+            "cache": cached,
         },
     })
 }
@@ -273,7 +283,10 @@ pub(crate) fn render_verdict_surface(
         Some(&report.run_id),
         explanation,
         [("Recommended", command)],
-        Vec::<(String, String)>::new(),
+        [
+            ("Inspect", format!("deadreckon show {short}")),
+            ("Compare", "deadreckon verdict --all".to_string()),
+        ],
     )
 }
 
@@ -302,6 +315,31 @@ pub(crate) fn build_verdict_report(state: &deadreckon_core::PipelineState) -> Ve
             VerdictSource::Native
         },
     }
+}
+
+/// Cache the verdict report as a sidecar at `<run_root>/proofs/verdict-<ts>.json`.
+///
+/// This is the ONLY write `verdict` performs, and it is an additive audit
+/// artifact — never the PipelineState, never the marker, never a progress row.
+/// The cache is never read back as authority: each invocation re-verifies live,
+/// so a stale sidecar can never mask a regression. Returns the written path.
+pub(crate) fn cache_verdict_report(
+    state: &deadreckon_core::PipelineState,
+    report: &VerdictReport,
+) -> std::io::Result<std::path::PathBuf> {
+    let proofs = state.run_root.join("proofs");
+    std::fs::create_dir_all(&proofs)?;
+    let stamp = report
+        .taken_at
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let path = proofs.join(format!("verdict-{stamp}.json"));
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(report)?),
+    )?;
+    Ok(path)
 }
 
 /// Added/modified/deleted counts since the run's earliest snapshot, via the same
@@ -768,7 +806,7 @@ mod tests {
     #[test]
     fn verdict_json_envelope_shape_is_stable() {
         let report = report_for(VerdictState::Verified);
-        let envelope = verdict_json(&report, &dummy_state(), "deadreckon finish render");
+        let envelope = verdict_json(&report, &dummy_state(), "deadreckon finish render", None);
         for key in [
             "kind",
             "id",
@@ -788,7 +826,7 @@ mod tests {
     #[test]
     fn verdict_json_includes_per_check_results() {
         let report = report_for(VerdictState::Verified);
-        let envelope = verdict_json(&report, &dummy_state(), "deadreckon finish render");
+        let envelope = verdict_json(&report, &dummy_state(), "deadreckon finish render", None);
         let checks = envelope["checks"].as_array().expect("checks array");
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0]["command"], "go test ./...");
@@ -842,5 +880,65 @@ mod tests {
 
         let summaries = verdict_all_summaries(&paths, 2).expect("summaries");
         assert_eq!(summaries.len(), 2);
+    }
+
+    // ---- V-P10: cache + output policy ----
+
+    #[test]
+    fn verdict_caches_report_sidecar() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "cache-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "cache-run-0001").expect("load");
+
+        let report = build_verdict_report(&state);
+        let path = cache_verdict_report(&state, &report).expect("cache");
+
+        assert!(path.exists(), "sidecar must be written: {path:?}");
+        assert_eq!(
+            path.parent().and_then(|p| p.file_name()),
+            Some("proofs".as_ref())
+        );
+        let body = std::fs::read_to_string(&path).expect("read sidecar");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("sidecar json");
+        assert_eq!(value["run_id"], "cache-run-0001");
+        assert!(value.get("state").is_some());
+    }
+
+    #[test]
+    fn verdict_never_mutates_run_status() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "nomut-run-0001", &repo);
+        let before = deadreckon_core::load_run(&paths, "nomut-run-0001").expect("load");
+        let status_before = before.status;
+
+        let report = build_verdict_report(&before);
+        cache_verdict_report(&before, &report).expect("cache");
+
+        let after = deadreckon_core::load_run(&paths, "nomut-run-0001").expect("reload");
+        assert_eq!(
+            status_before, after.status,
+            "verdict must never advance or mutate run status"
+        );
+    }
+
+    #[test]
+    fn verdict_quiet_suppresses_secondary_actions() {
+        let surface = render_verdict_surface(&report_for(VerdictState::Verified), &dummy_state());
+        let loud = surface.render_plain(false);
+        let quiet = surface.render_plain(true);
+        assert!(
+            loud.contains("deadreckon show"),
+            "non-quiet render should carry the secondary inspect hint:\n{loud}"
+        );
+        assert!(
+            !quiet.contains("deadreckon show"),
+            "--quiet must suppress secondary actions:\n{quiet}"
+        );
     }
 }
