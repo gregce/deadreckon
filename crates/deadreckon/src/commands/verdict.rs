@@ -93,9 +93,25 @@ pub(crate) fn build_verdict_report(state: &deadreckon_core::PipelineState) -> Ve
         had_signed_marker,
         marker_valid,
         checks: rerun.checks,
-        changed_files: ChangedFiles::default(),
+        changed_files: changed_file_counts(state),
         source: VerdictSource::Native,
     }
+}
+
+/// Added/modified/deleted counts since the run's earliest snapshot, via the same
+/// `tamper::touched_files` diff the gate uses. Empty when there is no snapshot.
+fn changed_file_counts(state: &deadreckon_core::PipelineState) -> ChangedFiles {
+    let touched = deadreckon_core::tamper::touched_files(&state.run_root, &state.working_dir)
+        .unwrap_or_default();
+    let mut counts = ChangedFiles::default();
+    for change in touched.values() {
+        match change {
+            deadreckon_core::tamper::TouchedChange::Created => counts.added += 1,
+            deadreckon_core::tamper::TouchedChange::Modified => counts.modified += 1,
+            deadreckon_core::tamper::TouchedChange::Deleted => counts.deleted += 1,
+        }
+    }
+    counts
 }
 
 /// The result of re-running a run's acceptance checks NOW. Read-only: it runs
@@ -406,5 +422,55 @@ mod tests {
         let report = build_verdict_report(&state);
         assert!(!report.had_signed_marker);
         assert_eq!(report.state, VerdictState::Unverified);
+    }
+
+    // ---- V-P5: changed-file summary ----
+
+    use chrono::Utc;
+    use deadreckon_core::artifacts::{ProvenanceRecord, append_provenance, snapshot_working};
+
+    #[test]
+    fn verdict_reports_changed_file_counts() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "changed-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "changed-run-0001").expect("load");
+
+        snapshot_working(&state, 0).expect("snapshot");
+        std::fs::write(state.working_dir.join("new.txt"), "hello\n").expect("create");
+        append_provenance(
+            &state,
+            &ProvenanceRecord {
+                timestamp: Utc::now(),
+                prompt_id: "p".to_string(),
+                model: "fixture".to_string(),
+                tool_call_id: "t".to_string(),
+                session_id: "s".to_string(),
+                files: vec![state.working_dir.join("new.txt")],
+            },
+        )
+        .expect("provenance");
+
+        let report = build_verdict_report(&state);
+        assert!(
+            report.changed_files.added >= 1,
+            "{:?}",
+            report.changed_files
+        );
+    }
+
+    #[test]
+    fn verdict_changed_files_empty_when_no_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "nosnap-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "nosnap-run-0001").expect("load");
+
+        let report = build_verdict_report(&state);
+        assert_eq!(report.changed_files, ChangedFiles::default());
     }
 }
