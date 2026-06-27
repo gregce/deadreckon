@@ -20,6 +20,9 @@
 - V-P7: `verdict --json` emits the inspection envelope (kind:verdict, id,
   status, checks, changed_files, source, had_signed_marker/marker_valid,
   next_actions, paths) — stable shape, per-check results included, non-TTY safe.
+- V-P9: imported runs (those with `import.json` in their run root) flow through
+  `verdict` as `Unverified` with `source:"imported"` and fresh check results;
+  `deadreckon import` completion now cross-links `deadreckon verdict <id>`.
 - V-P8: `verdict --all [--limit N]` re-verifies the most recent runs into a
   compact one-screen table (run, verdict, checks pass/total, spend, goal);
   `--all --json` emits a stable array of per-run summaries.

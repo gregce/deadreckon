@@ -244,6 +244,12 @@ verb.
 | `import` | One-command rollback | pass | Imported runs can be abandoned or replaced explicitly. |
 | `import` | One verdict + ONE primary action | pass | Import list, ambiguous/stale/unknown-source, selection, and completion surfaces carry one primary action plus additive JSON. |
 | `import` | Lifecycle hint | pass | Help points at show. |
+| `verdict` | Auto-detect, don't ask | pass | Defaults to the latest run; no prompt when the run is implied or named. |
+| `verdict` | Preview before mutate | n-a | Read-only report; it never mutates run state. |
+| `verdict` | Refuse with try: | pass | Unknown or ambiguous run ids refuse with a `deadreckon list` retry. |
+| `verdict` | One-command rollback | n-a | Read-only; there is nothing to roll back. |
+| `verdict` | One verdict + ONE primary action | pass | Renders through VerdictSurface with one state and one primary next action. |
+| `verdict` | Lifecycle hint | pass | Points at finish or resume depending on the verdict. |
 | `learn` | Auto-detect, don't ask | pass | Index/report/propose use existing run evidence by default. |
 | `learn` | Preview before mutate | pass | Import/export/propose candidate paths preview before durable writes. |
 | `learn` | Refuse with try: | pass | Weak evidence and bundle errors include recovery. |

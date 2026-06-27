@@ -1851,6 +1851,7 @@ fn import_completed_surface(
     mode: ImportMode,
 ) -> VerdictSurface {
     let primary = format!("deadreckon show {run_id}");
+    let verify = format!("deadreckon verdict {run_id}");
     let mut evidence = vec![
         ("run", run_id.to_string()),
         ("source", resolved.source.clone()),
@@ -1892,7 +1893,10 @@ fn import_completed_surface(
             evidence,
         ),
         vec![("Recommended", primary.as_str())],
-        vec![("Secondary", manifest.reimport_command.as_str())],
+        vec![
+            ("Verify", verify.as_str()),
+            ("Secondary", manifest.reimport_command.as_str()),
+        ],
     )
 }
 
@@ -2621,4 +2625,66 @@ fn stable_hash(value: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadreckon_providers::registry::{IngestCwdMatch, IngestStorage};
+
+    fn sample_resolved() -> ResolvedImportSource {
+        ResolvedImportSource {
+            alias: "claude".to_string(),
+            source: "cli:claude".to_string(),
+            schema: "claude-jsonl".to_string(),
+            storage: IngestStorage::Jsonl,
+            roots: vec![PathBuf::from("/tmp/roots")],
+            cwd_match: IngestCwdMatch::None,
+            cwd_match_path: None,
+            file_glob: None,
+            id_prefix: None,
+            kind: ImportSourceKind::Provider,
+        }
+    }
+
+    fn sample_manifest() -> ImportManifest {
+        ImportManifest {
+            version: 1,
+            source: "cli:claude".to_string(),
+            source_alias: "claude".to_string(),
+            schema: "claude-jsonl".to_string(),
+            storage: "jsonl".to_string(),
+            cwd: PathBuf::from("/tmp/cwd"),
+            mode: "session".to_string(),
+            session_id: None,
+            session_paths: Vec::new(),
+            content_hash: "deadbeef".to_string(),
+            imported_at: "2026-06-27T00:00:00Z".parse().expect("ts"),
+            source_started_at: None,
+            source_updated_at: None,
+            rows_seen: 3,
+            events_imported: 3,
+            provenance_records: 1,
+            raw_rows_stored: false,
+            reimport_command: "deadreckon import claude --replace".to_string(),
+        }
+    }
+
+    #[test]
+    fn import_completion_hint_points_at_verdict() {
+        let resolved = sample_resolved();
+        let manifest = sample_manifest();
+        let surface = import_completed_surface(
+            &resolved,
+            "imported-run-0001",
+            &manifest,
+            Path::new("/tmp/run/import.json"),
+            ImportMode::Session,
+        );
+        let rendered = surface.render_plain(false);
+        assert!(
+            rendered.contains("deadreckon verdict imported-run-0001"),
+            "import completion hint must cross-link to verdict:\n{rendered}"
+        );
+    }
 }

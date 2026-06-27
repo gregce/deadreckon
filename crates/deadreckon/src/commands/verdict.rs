@@ -296,7 +296,11 @@ pub(crate) fn build_verdict_report(state: &deadreckon_core::PipelineState) -> Ve
         marker_valid,
         checks: rerun.checks,
         changed_files: changed_file_counts(state),
-        source: VerdictSource::Native,
+        source: if state.run_root.join("import.json").exists() {
+            VerdictSource::Imported
+        } else {
+            VerdictSource::Native
+        },
     }
 }
 
@@ -364,9 +368,8 @@ pub(crate) enum VerdictState {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum VerdictSource {
     Native,
-    // Constructed in P9 (imported-run integration); reserved here so the report
-    // schema is stable from P1.
-    #[allow(dead_code)]
+    /// A run produced by `deadreckon import` (no native marker) — its `import.json`
+    /// is present. Such a run is always `Unverified` and labeled not-natively-gated.
     Imported,
 }
 
@@ -614,6 +617,23 @@ mod tests {
         let report = build_verdict_report(&state);
         assert!(!report.had_signed_marker);
         assert_eq!(report.state, VerdictState::Unverified);
+    }
+
+    #[test]
+    fn imported_run_verdict_is_unverified_imported_source() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "imported-src-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "imported-src-0001").expect("load");
+        // A run produced by `deadreckon import` is marked by import.json in its run_root.
+        std::fs::write(state.run_root.join("import.json"), "{}\n").expect("import.json");
+
+        let report = build_verdict_report(&state);
+        assert_eq!(report.source, VerdictSource::Imported);
+        assert_eq!(report.state, VerdictState::Unverified);
+        assert!(!report.had_signed_marker);
     }
 
     // ---- V-P5: changed-file summary ----
