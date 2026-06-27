@@ -2,6 +2,9 @@
 
 ## Verdict — did-it-actually-work report (in progress)
 
+- V-P2: `verdict <id|latest>` resolves a run by id/prefix or the most recent run
+  across scopes; an unknown id or ambiguous prefix refuses with a `try:
+  deadreckon list` footer, no runs at all with `try: deadreckon start`.
 - V-P1: new read-only `deadreckon verdict` verb (registered in the CLI) plus the
   `commands::verdict` module — `VerdictState` (Verified/Regressed/Unverified),
   `VerdictReport`/`VerdictSource`/`ChangedFiles` schema, and the pure
