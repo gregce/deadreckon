@@ -215,6 +215,10 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
         marks: [P, P, P, P, P, P],
     },
     VerbFriendliness {
+        verb: "verdict",
+        marks: [P, N, P, N, P, P],
+    },
+    VerbFriendliness {
         verb: "learn",
         marks: [P, P, P, P, P, P],
     },
