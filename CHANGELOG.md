@@ -13,6 +13,10 @@
 - V-P5: the report carries added/modified/deleted counts since the run's
   earliest snapshot, computed via the same `tamper::touched_files` diff the gate
   uses (empty when there is no snapshot).
+- V-P6: a single-run `verdict` renders through `VerdictSurface` — one label
+  (Verified→pass, Regressed→fail, Unverified→noop), an Explanation/Evidence
+  panel (per-check pass/fail, changed-file summary, provenance line), and the
+  one mapped next action (finish for Verified/Unverified-pass, resume otherwise).
 - V-P1: new read-only `deadreckon verdict` verb (registered in the CLI) plus the
   `commands::verdict` module — `VerdictState` (Verified/Regressed/Unverified),
   `VerdictReport`/`VerdictSource`/`ChangedFiles` schema, and the pure
