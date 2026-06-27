@@ -31,7 +31,12 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     let state = resolve_verdict_run(&paths, args.run_id.as_deref())?;
     let report = build_verdict_report(&state);
     let surface = render_verdict_surface(&report, &state);
-    println!("{}", surface.render_plain(args.quiet));
+    if args.json {
+        let envelope = verdict_json(&report, &state, &surface.primary_action.command);
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    } else {
+        println!("{}", surface.render_plain(args.quiet));
+    }
     Ok(())
 }
 
@@ -68,6 +73,31 @@ fn resolve_latest_run(paths: &DeadreckonPaths) -> Result<deadreckon_core::Pipeli
             "deadreckon start \"<goal>\"",
         ))),
     }
+}
+
+/// The machine envelope for `verdict --json`, matching the inspection shape
+/// (`kind`/`id`/`status`/`next_actions`/`paths` + the verdict payload).
+pub(crate) fn verdict_json(
+    report: &VerdictReport,
+    state: &deadreckon_core::PipelineState,
+    primary_command: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "verdict",
+        "id": report.run_id,
+        "status": report.state,
+        "checks": report.checks,
+        "changed_files": report.changed_files,
+        "source": report.source,
+        "had_signed_marker": report.had_signed_marker,
+        "marker_valid": report.marker_valid,
+        "next_actions": [primary_command],
+        "try_lines": Vec::<String>::new(),
+        "paths": {
+            "run_root": state.run_root,
+            "marker": deadreckon_core::gate::marker_path_for_run_root(&state.run_root),
+        },
+    })
 }
 
 /// Render the verdict as a `VerdictSurface` — one label, an Explanation/Evidence
@@ -636,5 +666,37 @@ mod tests {
     fn regressed_render_recommends_resume() {
         let surface = render_verdict_surface(&report_for(VerdictState::Regressed), &dummy_state());
         assert!(surface.primary_action.command.contains("deadreckon resume"));
+    }
+
+    // ---- V-P7: --json parity ----
+
+    #[test]
+    fn verdict_json_envelope_shape_is_stable() {
+        let report = report_for(VerdictState::Verified);
+        let envelope = verdict_json(&report, &dummy_state(), "deadreckon finish render");
+        for key in [
+            "kind",
+            "id",
+            "status",
+            "checks",
+            "changed_files",
+            "source",
+            "next_actions",
+            "paths",
+        ] {
+            assert!(envelope.get(key).is_some(), "missing {key}: {envelope}");
+        }
+        assert_eq!(envelope["kind"], "verdict");
+        assert_eq!(envelope["status"], "verified");
+    }
+
+    #[test]
+    fn verdict_json_includes_per_check_results() {
+        let report = report_for(VerdictState::Verified);
+        let envelope = verdict_json(&report, &dummy_state(), "deadreckon finish render");
+        let checks = envelope["checks"].as_array().expect("checks array");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["command"], "go test ./...");
+        assert_eq!(checks[0]["passed"], true);
     }
 }
