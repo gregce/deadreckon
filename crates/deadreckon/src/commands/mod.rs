@@ -20,3 +20,4 @@ pub(crate) mod providers;
 pub(crate) mod run;
 pub(crate) mod seams;
 pub(crate) mod start;
+pub(crate) mod verdict;

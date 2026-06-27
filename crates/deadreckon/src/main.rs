@@ -1320,6 +1320,25 @@ async fn main_inner() -> Result<()> {
                 },
             )
         }
+        Commands::Verdict {
+            run_id,
+            all,
+            limit,
+            json,
+            plain,
+            quiet,
+        } => {
+            ui::set_plain_output(plain);
+            commands::verdict::verdict_command(commands::verdict::VerdictArgs {
+                run_id,
+                all,
+                limit,
+                json,
+                plain,
+                quiet,
+            })
+            .await
+        }
         Commands::Show {
             run_id,
             turn,
