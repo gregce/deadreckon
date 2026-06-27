@@ -30,13 +30,8 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = resolve_verdict_run(&paths, args.run_id.as_deref())?;
     let report = build_verdict_report(&state);
-    let passed = report.checks.iter().filter(|c| c.passed).count();
-    let detail = if report.checks.is_empty() && !state.working_dir.is_dir() {
-        "working dir unavailable".to_string()
-    } else {
-        format!("{passed}/{} checks", report.checks.len())
-    };
-    println!("{} {} ({detail})", report.state.label(), report.run_id);
+    let surface = render_verdict_surface(&report, &state);
+    println!("{}", surface.render_plain(args.quiet));
     Ok(())
 }
 
@@ -73,6 +68,108 @@ fn resolve_latest_run(paths: &DeadreckonPaths) -> Result<deadreckon_core::Pipeli
             "deadreckon start \"<goal>\"",
         ))),
     }
+}
+
+/// Render the verdict as a `VerdictSurface` — one label, an Explanation/Evidence
+/// panel (per-check pass/fail, changed-file summary, provenance line), and the
+/// single mapped next action. Verified→pass kind, Regressed→fail, Unverified→noop.
+pub(crate) fn render_verdict_surface(
+    report: &VerdictReport,
+    state: &deadreckon_core::PipelineState,
+) -> VerdictSurface {
+    let passed = report.checks.iter().filter(|check| check.passed).count();
+    let total = report.checks.len();
+    let all_pass = report
+        .checks
+        .iter()
+        .all(|check| !check.must_pass || check.passed);
+    let working_dir_gone = report.checks.is_empty() && !state.working_dir.is_dir();
+
+    let kind = match report.state {
+        VerdictState::Verified => VerdictKind::Verified,
+        VerdictState::Regressed => VerdictKind::Failed,
+        VerdictState::Unverified => VerdictKind::Noop,
+    };
+    let what_happened = match report.state {
+        VerdictState::Verified => "Re-running this run's acceptance checks still passes.",
+        VerdictState::Regressed => {
+            "This run's acceptance checks no longer pass — the work silently broke."
+        }
+        VerdictState::Unverified => {
+            "This run has no signed deadreckon marker; its checks were re-run fresh."
+        }
+    };
+    let why_this_verdict = match report.state {
+        VerdictState::Verified => "Valid signed marker, and every must-pass check passes now.",
+        VerdictState::Regressed if report.had_signed_marker && !report.marker_valid => {
+            "The signed marker no longer validates (forged or tampered)."
+        }
+        VerdictState::Regressed => "A must-pass check fails when re-run now.",
+        VerdictState::Unverified if working_dir_gone => {
+            "Working dir unavailable; nothing could be re-verified."
+        }
+        VerdictState::Unverified if all_pass => {
+            "Checks pass now — verified now, not gated at build time."
+        }
+        VerdictState::Unverified => "Checks fail when re-run now.",
+    };
+
+    let provenance = if report.had_signed_marker {
+        format!(
+            "deadreckon-gated ({})",
+            if report.marker_valid {
+                "valid"
+            } else {
+                "invalid"
+            }
+        )
+    } else {
+        "not natively gated (verified now)".to_string()
+    };
+    let mut evidence = vec![
+        (
+            "checks".to_string(),
+            if working_dir_gone {
+                "working dir unavailable".to_string()
+            } else {
+                format!("{passed}/{total} passed")
+            },
+        ),
+        (
+            "changed files".to_string(),
+            format!(
+                "+{} ~{} -{}",
+                report.changed_files.added,
+                report.changed_files.modified,
+                report.changed_files.deleted
+            ),
+        ),
+        ("provenance".to_string(), provenance),
+    ];
+    for check in report.checks.iter().take(6) {
+        let mark = if check.passed { "pass" } else { "FAIL" };
+        let label = check.command.clone().unwrap_or_else(|| check.kind.clone());
+        evidence.push((format!("check · {mark}"), label));
+    }
+
+    let short = run_prefix(&report.run_id);
+    let command = match report.state {
+        VerdictState::Verified => format!("deadreckon finish {short}"),
+        VerdictState::Regressed => format!("deadreckon resume {short}"),
+        VerdictState::Unverified if all_pass && !working_dir_gone => {
+            format!("deadreckon finish {short}")
+        }
+        VerdictState::Unverified => format!("deadreckon resume {short}"),
+    };
+    let explanation = ExplanationPanel::new(what_happened, why_this_verdict, evidence);
+    VerdictSurface::must_new(
+        kind,
+        "run",
+        Some(&report.run_id),
+        explanation,
+        [("Recommended", command)],
+        Vec::<(String, String)>::new(),
+    )
 }
 
 /// Build the full verdict for a run: re-run its checks, read (never overwrite)
@@ -155,16 +252,6 @@ pub(crate) enum VerdictState {
     /// No signed marker (imported / paused / failed run): verdict ran the
     /// declared checks fresh — verified now, not at build time.
     Unverified,
-}
-
-impl VerdictState {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            VerdictState::Verified => "VERIFIED",
-            VerdictState::Regressed => "REGRESSED",
-            VerdictState::Unverified => "UNVERIFIED",
-        }
-    }
 }
 
 /// Whether the run was gated natively by deadreckon or imported from another tool.
@@ -472,5 +559,82 @@ mod tests {
 
         let report = build_verdict_report(&state);
         assert_eq!(report.changed_files, ChangedFiles::default());
+    }
+
+    // ---- V-P6: single-run render via VerdictSurface ----
+
+    fn report_for(state: VerdictState) -> VerdictReport {
+        VerdictReport {
+            schema: 1,
+            run_id: "render-run-0001".to_string(),
+            taken_at: "2026-06-27T00:00:00Z".to_string(),
+            state,
+            had_signed_marker: matches!(state, VerdictState::Verified | VerdictState::Regressed),
+            marker_valid: matches!(state, VerdictState::Verified),
+            checks: vec![AcceptanceCheckResult {
+                kind: "shell".to_string(),
+                passed: matches!(state, VerdictState::Verified | VerdictState::Unverified),
+                must_pass: true,
+                detail: "ran".to_string(),
+                command: Some("go test ./...".to_string()),
+                cwd: None,
+                duration_ms: None,
+                stdout: None,
+                stderr: None,
+            }],
+            changed_files: ChangedFiles {
+                added: 1,
+                modified: 2,
+                deleted: 0,
+            },
+            source: VerdictSource::Native,
+        }
+    }
+
+    fn dummy_state() -> deadreckon_core::PipelineState {
+        // A working dir that exists so the render does not treat it as gone.
+        let temp = Box::leak(Box::new(TempDir::new().expect("tempdir")));
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        create_run(
+            &paths,
+            RunOptions {
+                goal: "g".to_string(),
+                cwd: repo,
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("render-state-0001".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run")
+    }
+
+    #[test]
+    fn verdict_render_uses_one_primary_action() {
+        let surface = render_verdict_surface(&report_for(VerdictState::Verified), &dummy_state());
+        assert!(!surface.primary_action.command.is_empty());
+        // VerdictSurface enforces exactly one primary action by construction.
+        let rendered = surface.render_plain(false);
+        assert!(
+            rendered.contains("VERIFIED") || rendered.contains("verified"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn verified_render_recommends_finish() {
+        let surface = render_verdict_surface(&report_for(VerdictState::Verified), &dummy_state());
+        assert!(surface.primary_action.command.contains("deadreckon finish"));
+    }
+
+    #[test]
+    fn regressed_render_recommends_resume() {
+        let surface = render_verdict_surface(&report_for(VerdictState::Regressed), &dummy_state());
+        assert!(surface.primary_action.command.contains("deadreckon resume"));
     }
 }
