@@ -28,8 +28,7 @@ pub(crate) struct VerdictArgs {
 pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     let _ = (args.all, args.limit, args.json, args.plain, args.quiet);
     let paths = DeadreckonPaths::discover();
-    let id = args.run_id.as_deref().unwrap_or("latest");
-    let state = load_cli_run(&paths, id)?;
+    let state = resolve_verdict_run(&paths, args.run_id.as_deref())?;
     let report = VerdictReport {
         schema: 1,
         run_id: state.run_id,
@@ -43,6 +42,41 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     };
     println!("{} {}", report.state.label(), report.run_id);
     Ok(())
+}
+
+/// Resolve the run to verify: an explicit id/prefix, or the most recent run
+/// across all scopes when no id is given. Not-found and ambiguous-prefix become
+/// `try:`-footer refusals so a typo reads as guidance, not a stack trace.
+pub(crate) fn resolve_verdict_run(
+    paths: &DeadreckonPaths,
+    id_arg: Option<&str>,
+) -> Result<deadreckon_core::PipelineState> {
+    match id_arg {
+        None | Some("latest") | Some("last") => resolve_latest_run(paths),
+        Some(id) => deadreckon_core::load_run(paths, id).map_err(|err| {
+            let message = err.to_string();
+            let refusal = if message.contains("ambiguous") {
+                message
+            } else {
+                format!("unknown run {id}")
+            };
+            CliError::Core(deadreckon_core::user_error(&refusal, "deadreckon list"))
+        }),
+    }
+}
+
+/// The most recently updated run across every scope (so `verdict` works from any
+/// directory), or a refusal when there are no runs at all.
+fn resolve_latest_run(paths: &DeadreckonPaths) -> Result<deadreckon_core::PipelineState> {
+    let mut runs = deadreckon_core::list_runs(paths, None)?;
+    runs.sort_by_key(|entry| entry.updated_at);
+    match runs.last() {
+        Some(entry) => Ok(deadreckon_core::load_run(paths, &entry.run_id)?),
+        None => Err(CliError::Core(deadreckon_core::user_error(
+            "no runs to verify",
+            "deadreckon start \"<goal>\"",
+        ))),
+    }
 }
 
 /// The three honest post-run states.
@@ -153,5 +187,68 @@ mod tests {
             compute_verdict(false, false, false),
             VerdictState::Unverified
         );
+    }
+
+    // ---- V-P2: run resolution ----
+
+    use deadreckon_core::paths::DeadreckonPaths;
+    use deadreckon_core::state::{RunOptions, create_run};
+    use tempfile::TempDir;
+
+    fn fixture_run(paths: &DeadreckonPaths, run_id: &str, repo: &std::path::Path) {
+        create_run(
+            paths,
+            RunOptions {
+                goal: format!("goal {run_id}"),
+                cwd: repo.to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some(run_id.to_string()),
+                codebase: None,
+            },
+        )
+        .expect("create_run");
+    }
+
+    #[test]
+    fn verdict_resolves_latest_when_no_id() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "only-run-0001", &repo);
+
+        let state = resolve_verdict_run(&paths, None).expect("latest");
+        assert_eq!(state.run_id, "only-run-0001");
+    }
+
+    #[test]
+    fn verdict_unknown_id_refuses_with_try_list() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "real-run-0001", &repo);
+
+        let err = resolve_verdict_run(&paths, Some("nope")).expect_err("refuse");
+        assert!(err.to_string().contains("deadreckon list"), "{err}");
+    }
+
+    #[test]
+    fn verdict_ambiguous_prefix_refuses() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "ambig-run-0001", &repo);
+        fixture_run(&paths, "ambig-run-0002", &repo);
+
+        let err = resolve_verdict_run(&paths, Some("ambig")).expect_err("refuse");
+        let message = err.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(message.contains("deadreckon list"), "{message}");
     }
 }
