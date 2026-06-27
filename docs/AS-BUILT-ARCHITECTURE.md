@@ -1171,6 +1171,22 @@ Script-runner detection is a textual, deterministic scan for a `test` entry-poin
 
 **Friendliness.** The run preflight previews the resolved contract and its source (detected/operator/inferred); `--preview` prints a full kind+contract report; an `Unknown` tree carries a "no test contract detected" caveat into the verdict (no silent green); and a detected-but-unrunnable tree refuses with a `try: … --acceptance … (or --infer-contract)` footer.
 
+### 13.8 `deadreckon verdict` — read-only "did it actually work?"
+
+`verdict` is a read-only verb (`crates/deadreckon/src/commands/verdict.rs`) that answers one question about **any** run — native or imported — without touching its state. It composes the pieces above rather than adding a new engine: it re-runs the run's acceptance checks **now** through the gate's write-free `evaluate_acceptance_checks` (no spec, no progress, no state writes), reads (never overwrites) the original signed marker via `validate_acceptance_marker`, and counts changed files since the earliest snapshot through the same `tamper::touched_files` diff the gate uses.
+
+**Three honest states**, decided by the pure `compute_verdict(had_marker, marker_valid, rerun_all_must_pass)`:
+
+| State | Meaning |
+|---|---|
+| `VERIFIED` | A valid signed marker AND every must-pass check still passes when re-run now. |
+| `REGRESSED` | A marker existed but no longer validates (forged/tampered), or a must-pass check now fails — the load-bearing new signal: work that silently broke. Never silently `VERIFIED`. |
+| `UNVERIFIED` | No signed marker (imported, paused, or failed run). The declared checks are re-run fresh and reported, but the verdict never claims native gating. |
+
+Run resolution defaults to the most-recently-updated run across every scope (so it works from any directory); an explicit id/prefix that is unknown or ambiguous refuses with a `try: deadreckon list` footer. Imported runs are detected by `import.json` in the run root and reported with `source:"imported"`. `verdict --all [--limit N]` re-verifies the recent runs into a one-screen comparison table; `--json` (single or `--all`) emits a stable machine envelope (`kind:"verdict"`, `status`, `checks`, `changed_files`, `source`, `next_actions`, `paths`).
+
+**Read-only by construction.** The single write `verdict` performs is an additive audit sidecar at `<run_root>/proofs/verdict-<ts>.json`; it is never read back as authority (each invocation re-verifies live, so a stale sidecar can never mask a regression), and a read-only filesystem degrades to a swallowed write rather than a failed verdict. `verdict` never mutates `PipelineState`, advances a phase, signs a marker, or promotes.
+
 ---
 
 ## 14. Telemetry: Spend, Traces, Provenance, Events
@@ -1599,6 +1615,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 
 - Live narrator (§44): a `dr run` narrates itself in plain English as it works — a continuity-carrying, subscription-first model sidecar with a deterministic floor, a calm foreground block, headless `--narrate`, and attach/post-hoc convergence. This closes the prior thin gap where narration existed only at attach time and a piped run was silent.
 - Orchestrated narration (§45): orchestrate/campaign children (subprocesses) now narrate file-only to their own `snapshots.jsonl` on the $0 floor (or a pinned `--narrator-model`); the plan attach surfaces each child's live headline (live-preferring read, density-capped), `dr orchestrate --narrate` prints a one-line-per-child stderr aggregate, and `dr attach <campaign> --view narrative` renders a campaign projection at plan parity. Closes the prior thin gap where only a top-level `dr run` narrated.
+- Verdict — did-it-actually-work (§13.8/§37.11): `deadreckon verdict` is a read-only verb that re-verifies any run NOW (native or imported) into three honest states — `VERIFIED` / `REGRESSED` / `UNVERIFIED` — by re-running its acceptance checks through the gate's write-free path, reading (never overwriting) the signed marker, and diffing changed files since snapshot. A forged/tampered marker or a now-failing must-pass check reads `REGRESSED`, never a false `VERIFIED`; imported runs (Claude Code/Codex/aider) report `UNVERIFIED` with `source:"imported"`. `--all` compares recent runs, `--json` is at parity, and the only write is an additive `proofs/verdict-<ts>.json` audit sidecar never read back as authority. No `PipelineState`/`AcceptanceMarker` schema change; no run-state mutation or promotion. This closes the prior thin gap where there was no honest, after-the-fact "did it still work?" check for imported or long-finished runs.
 - Polyglot done-contract (§13.1/§35.9): a run with no operator `acceptance.yaml` in a non-Rust tree no longer gets a hollow `FileExists` gate. A deterministic detector compiles a real default test command for Node/Deno/Python/Go/Elixir/.NET/JVM/Ruby/PHP and Make/just/Task script-runners, writes the generated spec for audit, and tamper covers non-Rust tests (deleting a JS/Py/Go test refuses like a deleted Rust test). Optional `--infer-contract` proposes a contract for an unknown tree that the operator must approve before it arms the gate. This closes the prior thin gap where "VERIFIED" on a non-Rust project could mean nothing was checked. No `AcceptanceCheck` schema variant added; inference never arms the gate without approval.
 - Workspace, crates, build, lint, fmt, test discipline.
 - Workspace lint discipline (deny-tier clippy + rustc), tuned release profile, registry-shaped library `lib.rs`, library print refusal, and error retryable/fatal taxonomy as vocabulary for future watchdog work.
@@ -1632,7 +1649,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Self-documenting run artifacts in stoa shape: `RUN-NARRATIVE.md`, `RUN-AS-BUILT.md`, `RUN-DECISIONS.md`, optional `AS-BUILT-DELTA.md`, per-turn `_incremental.jsonl`, explicit `docs_checkpoint` run events, and `polish.json` schema v2.
 - `deadreckon doc`, `list` DOCS status, doc-aware `apply` commit bodies, extend-parent narrative updates, diff coverage retry, the legacy repo/user/project `run-narrator` skill mechanism, and default split polish skills (`narrator-overview`, `narrator-phases`, `narrator-as-built`, `narrator-decisions`).
 - Acceptance gate with signed marker; anti-self-attestation and tamper-evident hollow-pass detection are enforced without adding `PipelineState`, `Plan`, marker, or check-result fields.
-- `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `rewind`, `show`, `import`, `cleanup`/`prune`, `completion`, `learn`, and `improve` verbs.
+- `init`, `config get/set`, `run`, `doctor`, `status`/`next`, `list`, `attach`, `kill`, `resume`, `undo`, `rewind`, `show`, `import`, `verdict`, `cleanup`/`prune`, `completion`, `learn`, and `improve` verbs.
 - Shell tab-completion via `completion install` / `completion {bash,zsh,fish,elvish,powershell}` driven from the live clap command tree; `init` opt-out installs completions and (for zsh) appends a managed `.zshrc` block.
 - `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, campaign sub-plan cards, and completion action footer. Run, plan, chain, and campaign attach now share an explicit responsiveness contract: render paths are provider-free and write-free, JSONL streams are tailed or cached, provider narrative refreshes run in cancellable/coalesced background jobs, stale narrative snapshots survive redraw, and long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
 - Descriptor-driven provider activity ingest for Codex, Claude Code, Gemini JSON/JSONL, OpenCode file-mode logs, GitHub Copilot CLI session-state JSONL, and Pi session JSONL, normalized into `agent` / `thinking` / `tool` / `result` / `todo` / `tokens` rows without rewriting provider-owned logs.
@@ -2570,6 +2587,22 @@ is one bounded classifier call, not an LLM control loop. Notifications are opt-i
 and run only at lifecycle transitions, not through a daemon. Palettes,
 localization, a card template engine, richer guided onboarding, a long-lived
 notifier, and deeper multi-piece classification are V1 candidates.
+
+### 37.11 Verdict trust surface
+
+`deadreckon verdict` (§13.8) is the read-only complement to the gate: where the
+gate decides whether a run may *become* a verified run at build time, `verdict`
+asks whether it *still is* one — for any run, including imports from Claude Code,
+Codex, or aider that never had a deadreckon marker. It is registered in the
+friendliness contract (`FRIENDLINESS-AUDIT.md`) as a read-only inspect verb:
+auto-detects the latest run (no prompt), refuses unknown/ambiguous ids with a
+`try: deadreckon list` footer, renders through `VerdictSurface` with one state and
+one primary next action (`finish` when verified-now, `resume` when regressed),
+and carries `Inspect`/`Compare` secondary actions that `--quiet` suppresses.
+`preview-before-mutate` and `one-command-rollback` are `n-a` because it never
+mutates. The honest third state matters: a run whose marker was forged or whose
+checks silently broke reads `REGRESSED`, never a false `VERIFIED`, so "did it
+actually work?" can be answered against durable artifacts long after the run.
 
 ---
 

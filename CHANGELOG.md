@@ -1,10 +1,24 @@
 # Changelog
 
-## Verdict — did-it-actually-work report (in progress)
+## Verdict (stable) — did-it-actually-work report — 2026-06-27
+
+Adds `deadreckon verdict`, a read-only verb that answers "did it actually work?"
+for ANY run — native or imported from Claude Code/Codex/aider — by re-running its
+acceptance checks now, reading (never overwriting) the signed marker, and
+reporting one of three honest states: `VERIFIED`, `REGRESSED`, or `UNVERIFIED`. A
+forged/tampered marker or a now-failing must-pass check reads `REGRESSED`, never a
+false `VERIFIED`. `--all` compares recent runs, `--json` is at parity, and the
+only write is an additive `proofs/verdict-<ts>.json` audit sidecar never read back
+as authority. No `PipelineState`/`AcceptanceMarker` schema change; no run-state
+mutation or promotion. See AS-BUILT §13.8 and §37.11.
 
 - V-P2: `verdict <id|latest>` resolves a run by id/prefix or the most recent run
   across scopes; an unknown id or ambiguous prefix refuses with a `try:
   deadreckon list` footer, no runs at all with `try: deadreckon start`.
+- V-P3: `verdict` re-runs the run's acceptance checks NOW through the gate's
+  write-free `evaluate_acceptance_checks` (no spec, no progress, no state writes);
+  a missing/cleaned working dir yields no checks and reads as "working dir
+  unavailable" rather than a false pass.
 - V-P4: `build_verdict_report` reads (never overwrites) the signed marker via
   validate_acceptance_marker and combines had_marker/marker_valid with the
   re-run through compute_verdict: a valid marker whose checks still pass is
@@ -20,6 +34,11 @@
 - V-P7: `verdict --json` emits the inspection envelope (kind:verdict, id,
   status, checks, changed_files, source, had_signed_marker/marker_valid,
   next_actions, paths) — stable shape, per-check results included, non-TTY safe.
+- V-P10: `verdict` caches each report to `<run_root>/proofs/verdict-<ts>.json` (an
+  additive audit sidecar, never read back as authority — a stale cache can never
+  mask a live regression), honors `--quiet`/`--plain`/`--json`, carries inspect
+  and compare secondary actions that `--quiet` suppresses, and is registered in
+  the friendliness contract as a read-only verb that never prompts or mutates.
 - V-P9: imported runs (those with `import.json` in their run root) flow through
   `verdict` as `Unverified` with `source:"imported"` and fresh check results;
   `deadreckon import` completion now cross-links `deadreckon verdict <id>`.
