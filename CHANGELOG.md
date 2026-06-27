@@ -5,6 +5,11 @@
 - V-P2: `verdict <id|latest>` resolves a run by id/prefix or the most recent run
   across scopes; an unknown id or ambiguous prefix refuses with a `try:
   deadreckon list` footer, no runs at all with `try: deadreckon start`.
+- V-P4: `build_verdict_report` reads (never overwrites) the signed marker via
+  validate_acceptance_marker and combines had_marker/marker_valid with the
+  re-run through compute_verdict: a valid marker whose checks still pass is
+  VERIFIED, a marker that no longer validates (forged signature) or whose checks
+  now fail is REGRESSED, no marker is UNVERIFIED.
 - V-P1: new read-only `deadreckon verdict` verb (registered in the CLI) plus the
   `commands::verdict` module — `VerdictState` (Verified/Regressed/Unverified),
   `VerdictReport`/`VerdictSource`/`ChangedFiles` schema, and the pure

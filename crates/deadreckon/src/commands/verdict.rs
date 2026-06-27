@@ -29,23 +29,12 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     let _ = (args.all, args.limit, args.json, args.plain, args.quiet);
     let paths = DeadreckonPaths::discover();
     let state = resolve_verdict_run(&paths, args.run_id.as_deref())?;
-    let rerun = rerun_acceptance(&state);
-    let report = VerdictReport {
-        schema: 1,
-        run_id: state.run_id,
-        taken_at: chrono::Utc::now().to_rfc3339(),
-        state: compute_verdict(false, false, rerun.all_must_pass),
-        had_signed_marker: false,
-        marker_valid: false,
-        checks: rerun.checks,
-        changed_files: ChangedFiles::default(),
-        source: VerdictSource::Native,
-    };
+    let report = build_verdict_report(&state);
     let passed = report.checks.iter().filter(|c| c.passed).count();
-    let detail = if rerun.working_dir_available {
-        format!("{passed}/{} checks", report.checks.len())
-    } else {
+    let detail = if report.checks.is_empty() && !state.working_dir.is_dir() {
         "working dir unavailable".to_string()
+    } else {
+        format!("{passed}/{} checks", report.checks.len())
     };
     println!("{} {} ({detail})", report.state.label(), report.run_id);
     Ok(())
@@ -86,24 +75,45 @@ fn resolve_latest_run(paths: &DeadreckonPaths) -> Result<deadreckon_core::Pipeli
     }
 }
 
+/// Build the full verdict for a run: re-run its checks, read (never overwrite)
+/// the signed marker, and combine through `compute_verdict`. Read-only.
+pub(crate) fn build_verdict_report(state: &deadreckon_core::PipelineState) -> VerdictReport {
+    let rerun = rerun_acceptance(state);
+    let marker_path = deadreckon_core::gate::marker_path_for_run_root(&state.run_root);
+    let had_signed_marker = marker_path.exists();
+    // A marker that no longer validates (signature mismatch, tampered tamper
+    // bytes, wrong run_id) is treated as not-valid → Regressed, never Verified.
+    let marker_valid =
+        had_signed_marker && deadreckon_core::gate::validate_acceptance_marker(state).is_ok();
+    VerdictReport {
+        schema: 1,
+        run_id: state.run_id.clone(),
+        taken_at: chrono::Utc::now().to_rfc3339(),
+        state: compute_verdict(had_signed_marker, marker_valid, rerun.all_must_pass),
+        had_signed_marker,
+        marker_valid,
+        checks: rerun.checks,
+        changed_files: ChangedFiles::default(),
+        source: VerdictSource::Native,
+    }
+}
+
 /// The result of re-running a run's acceptance checks NOW. Read-only: it runs
 /// the same checks the gate uses but writes no spec, no progress, and no state.
 pub(crate) struct RerunResult {
     pub(crate) checks: Vec<AcceptanceCheckResult>,
     pub(crate) all_must_pass: bool,
-    pub(crate) working_dir_available: bool,
 }
 
 /// Re-run the run's acceptance checks against its recorded working dir via the
 /// same `evaluate_acceptance_checks` path dr-gate uses (no early-exit, full
 /// per-check results). A missing working dir (exported/cleaned) yields no checks
-/// and `working_dir_available: false` rather than an error.
+/// (a caller treats empty + missing dir as "working dir unavailable").
 pub(crate) fn rerun_acceptance(state: &deadreckon_core::PipelineState) -> RerunResult {
     if !state.working_dir.is_dir() {
         return RerunResult {
             checks: Vec::new(),
             all_must_pass: false,
-            working_dir_available: false,
         };
     }
     let checks =
@@ -113,7 +123,6 @@ pub(crate) fn rerun_acceptance(state: &deadreckon_core::PipelineState) -> RerunR
     RerunResult {
         checks,
         all_must_pass,
-        working_dir_available: true,
     }
 }
 
@@ -303,7 +312,7 @@ mod tests {
         let status_before = state.status;
 
         let rerun = rerun_acceptance(&state);
-        assert!(rerun.working_dir_available);
+
         assert!(
             !rerun.checks.is_empty(),
             "re-running yields per-check results"
@@ -325,12 +334,77 @@ mod tests {
         std::fs::remove_dir_all(&state.working_dir).expect("remove working dir");
 
         let rerun = rerun_acceptance(&state);
-        assert!(!rerun.working_dir_available);
+
         assert!(rerun.checks.is_empty());
         // No marker + nothing re-verifiable → Unverified.
         assert_eq!(
             compute_verdict(false, false, rerun.all_must_pass),
             VerdictState::Unverified
         );
+    }
+
+    // ---- V-P4: marker read + verdict computation ----
+
+    fn sign_marker(state: &deadreckon_core::PipelineState) {
+        // Real signed marker over genuine (passing) results — the gate path.
+        deadreckon_core::gate::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect("write signed marker");
+    }
+
+    #[test]
+    fn valid_marker_passing_rerun_is_verified() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "verified-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "verified-run-0001").expect("load");
+        sign_marker(&state);
+
+        let report = build_verdict_report(&state);
+        assert!(report.had_signed_marker && report.marker_valid);
+        assert_eq!(report.state, VerdictState::Verified);
+    }
+
+    #[test]
+    fn tampered_marker_is_regressed_not_verified() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "tampered-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "tampered-run-0001").expect("load");
+        sign_marker(&state);
+
+        // Forge the signature: the marker file still exists but no longer validates.
+        let marker_path = deadreckon_core::gate::marker_path_for_run_root(&state.run_root);
+        let mut marker: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker_path).expect("read marker"))
+                .expect("parse");
+        marker["signature"] = serde_json::Value::String("forged".to_string());
+        std::fs::write(&marker_path, marker.to_string()).expect("write tampered");
+
+        let report = build_verdict_report(&state);
+        assert!(report.had_signed_marker && !report.marker_valid);
+        assert_eq!(report.state, VerdictState::Regressed);
+    }
+
+    #[test]
+    fn imported_run_without_marker_is_unverified() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "imported-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "imported-run-0001").expect("load");
+        // No marker written (as if imported from another tool).
+
+        let report = build_verdict_report(&state);
+        assert!(!report.had_signed_marker);
+        assert_eq!(report.state, VerdictState::Unverified);
     }
 }
