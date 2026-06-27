@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 — Honest verification — 2026-06-27
+
+Makes "did it actually work?" answerable honestly, end to end. Two milestones
+ship together:
+
+- **Polyglot done-contract detection** — the acceptance gate is no longer hollow
+  on non-Rust projects. A run with no operator `acceptance.yaml` now gets a real,
+  detected test command for Node/Deno/Python/Go/Elixir/.NET/JVM/Ruby/PHP and
+  Make/just/Task script-runners (with an optional approval-gated `--infer-contract`
+  for unknown trees), so a `VERIFIED` on a non-Rust tree means something was
+  actually checked.
+- **`deadreckon verdict`** — a read-only "did it actually work?" report for ANY
+  run, native or imported from Claude Code/Codex/aider. It re-runs the run's
+  acceptance checks now and reports one of three honest states — `VERIFIED`,
+  `REGRESSED`, `UNVERIFIED` — so a forged/tampered marker or a silently-broken
+  build reads `REGRESSED` instead of a false `VERIFIED`. `--all` compares recent
+  runs; `--json` is at parity.
+
+No `PipelineState`/`AcceptanceMarker` schema changes. See the milestone sections
+below for the per-phase detail.
+
 ## Verdict (stable) — did-it-actually-work report — 2026-06-27
 
 Adds `deadreckon verdict`, a read-only verb that answers "did it actually work?"
