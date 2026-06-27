@@ -29,18 +29,25 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     let _ = (args.all, args.limit, args.json, args.plain, args.quiet);
     let paths = DeadreckonPaths::discover();
     let state = resolve_verdict_run(&paths, args.run_id.as_deref())?;
+    let rerun = rerun_acceptance(&state);
     let report = VerdictReport {
         schema: 1,
         run_id: state.run_id,
         taken_at: chrono::Utc::now().to_rfc3339(),
-        state: compute_verdict(false, false, false),
+        state: compute_verdict(false, false, rerun.all_must_pass),
         had_signed_marker: false,
         marker_valid: false,
-        checks: Vec::new(),
+        checks: rerun.checks,
         changed_files: ChangedFiles::default(),
         source: VerdictSource::Native,
     };
-    println!("{} {}", report.state.label(), report.run_id);
+    let passed = report.checks.iter().filter(|c| c.passed).count();
+    let detail = if rerun.working_dir_available {
+        format!("{passed}/{} checks", report.checks.len())
+    } else {
+        "working dir unavailable".to_string()
+    };
+    println!("{} {} ({detail})", report.state.label(), report.run_id);
     Ok(())
 }
 
@@ -76,6 +83,37 @@ fn resolve_latest_run(paths: &DeadreckonPaths) -> Result<deadreckon_core::Pipeli
             "no runs to verify",
             "deadreckon start \"<goal>\"",
         ))),
+    }
+}
+
+/// The result of re-running a run's acceptance checks NOW. Read-only: it runs
+/// the same checks the gate uses but writes no spec, no progress, and no state.
+pub(crate) struct RerunResult {
+    pub(crate) checks: Vec<AcceptanceCheckResult>,
+    pub(crate) all_must_pass: bool,
+    pub(crate) working_dir_available: bool,
+}
+
+/// Re-run the run's acceptance checks against its recorded working dir via the
+/// same `evaluate_acceptance_checks` path dr-gate uses (no early-exit, full
+/// per-check results). A missing working dir (exported/cleaned) yields no checks
+/// and `working_dir_available: false` rather than an error.
+pub(crate) fn rerun_acceptance(state: &deadreckon_core::PipelineState) -> RerunResult {
+    if !state.working_dir.is_dir() {
+        return RerunResult {
+            checks: Vec::new(),
+            all_must_pass: false,
+            working_dir_available: false,
+        };
+    }
+    let checks =
+        deadreckon_core::gate::evaluate_acceptance_checks(&state.run_root, &state.working_dir)
+            .unwrap_or_default();
+    let all_must_pass = checks.iter().all(|check| !check.must_pass || check.passed);
+    RerunResult {
+        checks,
+        all_must_pass,
+        working_dir_available: true,
     }
 }
 
@@ -250,5 +288,49 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("ambiguous"), "{message}");
         assert!(message.contains("deadreckon list"), "{message}");
+    }
+
+    // ---- V-P3: live re-evaluation ----
+
+    #[test]
+    fn verdict_reruns_compiled_checks_without_mutating_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "rerun-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "rerun-run-0001").expect("load");
+        let status_before = state.status;
+
+        let rerun = rerun_acceptance(&state);
+        assert!(rerun.working_dir_available);
+        assert!(
+            !rerun.checks.is_empty(),
+            "re-running yields per-check results"
+        );
+
+        // The run state on disk is unchanged — verdict is read-only.
+        let reloaded = deadreckon_core::load_run(&paths, "rerun-run-0001").expect("reload");
+        assert_eq!(reloaded.status, status_before);
+    }
+
+    #[test]
+    fn verdict_missing_working_dir_yields_unverified_detail() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "gone-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "gone-run-0001").expect("load");
+        std::fs::remove_dir_all(&state.working_dir).expect("remove working dir");
+
+        let rerun = rerun_acceptance(&state);
+        assert!(!rerun.working_dir_available);
+        assert!(rerun.checks.is_empty());
+        // No marker + nothing re-verifiable → Unverified.
+        assert_eq!(
+            compute_verdict(false, false, rerun.all_must_pass),
+            VerdictState::Unverified
+        );
     }
 }
