@@ -1,5 +1,15 @@
 # Changelog
 
+## Verdict — did-it-actually-work report (in progress)
+
+- V-P1: new read-only `deadreckon verdict` verb (registered in the CLI) plus the
+  `commands::verdict` module — `VerdictState` (Verified/Regressed/Unverified),
+  `VerdictReport`/`VerdictSource`/`ChangedFiles` schema, and the pure
+  `compute_verdict(had_marker, marker_valid, rerun_all_must_pass)` decision (a
+  marker that no longer validates or whose checks now fail is Regressed, never
+  silently Verified). Run resolution, live re-evaluation, rendering, `--json`,
+  `--all`, and the sidecar cache land in later phases.
+
 ## Polyglot — Default done-contract detection — 2026-06-25
 
 Makes the acceptance gate non-hollow for non-Rust projects. A run with no

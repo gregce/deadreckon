@@ -1675,6 +1675,24 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Inspect And Import",
+        about = "Re-verify a run NOW: VERIFIED / REGRESSED / UNVERIFIED with evidence and one next action (read-only)"
+    )]
+    Verdict {
+        #[arg(help = "Run id, unique prefix, or latest (default: latest)")]
+        run_id: Option<String>,
+        #[arg(long, help = "Compare several recent runs side by side")]
+        all: bool,
+        #[arg(long, help = "With --all: how many recent runs (default 10)")]
+        limit: Option<usize>,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+        #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
+        plain: bool,
+        #[arg(long, help = "Suppress secondary actions and chatter")]
+        quiet: bool,
+    },
+    #[command(
+        next_help_heading = "Inspect And Import",
         hide = true,
         visible_alias = "inspect",
         about = "Show full state, provenance, and trace details for a run, plan, or plan child",
