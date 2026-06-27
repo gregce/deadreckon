@@ -10,6 +10,9 @@
   re-run through compute_verdict: a valid marker whose checks still pass is
   VERIFIED, a marker that no longer validates (forged signature) or whose checks
   now fail is REGRESSED, no marker is UNVERIFIED.
+- V-P5: the report carries added/modified/deleted counts since the run's
+  earliest snapshot, computed via the same `tamper::touched_files` diff the gate
+  uses (empty when there is no snapshot).
 - V-P1: new read-only `deadreckon verdict` verb (registered in the CLI) plus the
   `commands::verdict` module — `VerdictState` (Verified/Regressed/Unverified),
   `VerdictReport`/`VerdictSource`/`ChangedFiles` schema, and the pure
