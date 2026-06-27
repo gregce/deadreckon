@@ -20,6 +20,9 @@
 - V-P7: `verdict --json` emits the inspection envelope (kind:verdict, id,
   status, checks, changed_files, source, had_signed_marker/marker_valid,
   next_actions, paths) — stable shape, per-check results included, non-TTY safe.
+- V-P8: `verdict --all [--limit N]` re-verifies the most recent runs into a
+  compact one-screen table (run, verdict, checks pass/total, spend, goal);
+  `--all --json` emits a stable array of per-run summaries.
 - V-P1: new read-only `deadreckon verdict` verb (registered in the CLI) plus the
   `commands::verdict` module — `VerdictState` (Verified/Regressed/Unverified),
   `VerdictReport`/`VerdictSource`/`ChangedFiles` schema, and the pure

@@ -26,8 +26,11 @@ pub(crate) struct VerdictArgs {
 /// `VerdictSurface` rendering, `--json`, `--all`, and the sidecar cache land in
 /// P2–P10. For now it prints a placeholder so the command is reachable.
 pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
-    let _ = (args.all, args.limit, args.json, args.plain, args.quiet);
+    let _ = args.plain; // applied via ui::set_plain_output at the dispatch site
     let paths = DeadreckonPaths::discover();
+    if args.all {
+        return verdict_all_command(&paths, args.limit.unwrap_or(10), args.json);
+    }
     let state = resolve_verdict_run(&paths, args.run_id.as_deref())?;
     let report = build_verdict_report(&state);
     let surface = render_verdict_surface(&report, &state);
@@ -73,6 +76,78 @@ fn resolve_latest_run(paths: &DeadreckonPaths) -> Result<deadreckon_core::Pipeli
             "deadreckon start \"<goal>\"",
         ))),
     }
+}
+
+/// A one-row verdict summary for the `--all` comparison.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct VerdictSummary {
+    pub(crate) run_id: String,
+    pub(crate) goal: String,
+    pub(crate) state: VerdictState,
+    pub(crate) checks_passed: usize,
+    pub(crate) checks_total: usize,
+    pub(crate) spend_usd: f64,
+}
+
+/// Re-verify the most recent `limit` runs (across scopes) into compact summaries
+/// so "several at once" collapses to one screen. Newest first.
+pub(crate) fn verdict_all_summaries(
+    paths: &DeadreckonPaths,
+    limit: usize,
+) -> Result<Vec<VerdictSummary>> {
+    let mut runs = deadreckon_core::list_runs(paths, None)?;
+    runs.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
+    runs.truncate(limit);
+    let mut summaries = Vec::new();
+    for entry in runs {
+        let state = deadreckon_core::load_run(paths, &entry.run_id)?;
+        let report = build_verdict_report(&state);
+        let checks_passed = report.checks.iter().filter(|check| check.passed).count();
+        summaries.push(VerdictSummary {
+            run_id: entry.run_id,
+            goal: entry.goal,
+            state: report.state,
+            checks_passed,
+            checks_total: report.checks.len(),
+            spend_usd: state.total_spend_usd,
+        });
+    }
+    Ok(summaries)
+}
+
+fn verdict_all_command(paths: &DeadreckonPaths, limit: usize, json: bool) -> Result<()> {
+    let summaries = verdict_all_summaries(paths, limit)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summaries)?);
+        return Ok(());
+    }
+    if summaries.is_empty() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "no runs to verify",
+            "deadreckon start \"<goal>\"",
+        )));
+    }
+    println!(
+        "{:<10} {:<11} {:>7} {:>9}  goal",
+        "run", "verdict", "checks", "spend"
+    );
+    for summary in &summaries {
+        let state = match summary.state {
+            VerdictState::Verified => "VERIFIED",
+            VerdictState::Regressed => "REGRESSED",
+            VerdictState::Unverified => "UNVERIFIED",
+        };
+        println!(
+            "{:<10} {:<11} {:>3}/{:<3} {:>8.2}  {}",
+            run_prefix(&summary.run_id),
+            state,
+            summary.checks_passed,
+            summary.checks_total,
+            summary.spend_usd,
+            summary.goal.chars().take(48).collect::<String>(),
+        );
+    }
+    Ok(())
 }
 
 /// The machine envelope for `verdict --json`, matching the inspection shape
@@ -698,5 +773,54 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0]["command"], "go test ./...");
         assert_eq!(checks[0]["passed"], true);
+    }
+
+    // ---- V-P8: --all comparison ----
+
+    #[test]
+    fn verdict_all_lists_recent_runs_with_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "all-run-0001", &repo);
+        fixture_run(&paths, "all-run-0002", &repo);
+
+        let summaries = verdict_all_summaries(&paths, 10).expect("summaries");
+        assert_eq!(summaries.len(), 2);
+        // No markers → every run is Unverified.
+        assert!(
+            summaries
+                .iter()
+                .all(|s| s.state == VerdictState::Unverified)
+        );
+    }
+
+    #[test]
+    fn verdict_all_json_is_array() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "alljson-run-0001", &repo);
+
+        let summaries = verdict_all_summaries(&paths, 10).expect("summaries");
+        let value = serde_json::to_value(&summaries).expect("json");
+        assert!(value.is_array());
+        assert_eq!(value.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn verdict_all_respects_limit() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "lim-run-0001", &repo);
+        fixture_run(&paths, "lim-run-0002", &repo);
+        fixture_run(&paths, "lim-run-0003", &repo);
+
+        let summaries = verdict_all_summaries(&paths, 2).expect("summaries");
+        assert_eq!(summaries.len(), 2);
     }
 }
