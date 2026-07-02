@@ -8,6 +8,12 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P6: the launch accept matrix — campaign above the confirm line ALWAYS
+  confirms interactively or refuses in non-TTY (no flag overrides the
+  guardrail; an unbounded ceiling counts as above the line); `--yes`
+  auto-accepts only when confidence clears the floor and the ceiling is
+  under the auto-spend line; a non-TTY launch without `--yes` refuses with
+  `try:` instead of hanging.
 - C-P5: the provider planner supersedes the text-only goal-shape classifier —
   one bounded call whose prompt embeds the SignalBundle (contract, workspace,
   history, budget, text analysis), whose typed draft (pieces + confidence +
