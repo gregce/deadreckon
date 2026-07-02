@@ -1,12 +1,25 @@
 # Changelog
 
-## Course (unreleased) — the harness plots the course
+## Course (stable) — the harness plots the course — 2026-07-02
 
-`deadreckon start` becomes the only launch decision a user needs: a
-deterministic signal bundle plus one clamped provider call resolves a durable
-`launch-plan.json`, a course card previews WHAT/WHO/COST/DONE/WHY/ESCAPE, and
-the shape can be corrected mid-voyage. Phases land bottom-up; this section
-graduates to a stable milestone at C-P14.
+`deadreckon start` becomes the only launch decision a user needs. A
+deterministic SignalBundle (goal structure, the DETECTED done contract,
+workspace shape, task history, budget fit) plus one clamped provider call
+resolves a typed, durable `launch-plan.json` that lands in every dispatched
+root; a golden-pinned course card previews WHAT/WHO/COST/DONE/WHY/ESCAPE;
+the only question `start` may ask is "How will you know it worked?" (and
+only when contract detection is Unknown); campaign is never auto-chosen and
+never auto-accepted above the confirm line; plans replay (`--plan`),
+launches gain JSON parity (`--json --yes`), one-piece decompositions
+collapse to runs, workers can propose reshapes that stay inert until
+`deadreckon reshape` accepts them, and `[defaults] start_attach` makes
+start-then-watch one motion. Closes the campaign/chain auto-detect
+friendliness cells. See AS-BUILT §46.
+
+- C-P14: friendliness closure (campaign/chain auto-detect cells flip to
+  pass with the planner-seeded `--n` and ladder continuation), AS-BUILT §46
+  (Course: Launch Planning and Reshaping) + §22 shipped entry, and Course
+  follow-ups logged in V1-CANDIDATES.
 
 - C-P13: start-then-watch — `[defaults] start_attach = true` drops an
   interactive launch straight into attach after the lifecycle footer; JSON,
