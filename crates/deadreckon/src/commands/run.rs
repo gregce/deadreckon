@@ -1,6 +1,23 @@
 use super::super::*;
 
+/// Direct `deadreckon run`: a trivial operator plan records the decision so
+/// every run root carries `launch-plan.json`, however the launch began.
 pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
+    let plan = commands::course::trivial_operator_plan(
+        &args.goal,
+        commands::course::CourseShape::Single,
+        "run",
+    );
+    run_command_with_launch_plan(args, plan).await
+}
+
+/// Launch a run carrying an accepted launch plan (C-P9): the plan is saved
+/// into the run root right after the run is created, so attach, verdict, and
+/// replay can read the decision from the artifact alone.
+pub(crate) async fn run_command_with_launch_plan(
+    args: RunCommandArgs,
+    launch_plan: commands::course::LaunchPlan,
+) -> Result<()> {
     let RunCommandArgs {
         goal,
         fresh,
@@ -318,6 +335,7 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             codebase: Some(codebase.clone()),
         },
     )?;
+    commands::course::save_launch_plan_best_effort(&state.run_root, &launch_plan);
     if let Some(source_path) = codebase
         .source_path
         .as_ref()

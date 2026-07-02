@@ -6945,6 +6945,112 @@ fn write_fake_path_binary(root: &std::path::Path, name: &str, body: &str) {
     fs::set_permissions(&binary, perms).expect("fake binary chmod");
 }
 
+// ---- C-P9: dispatch reads the plan ----
+
+fn read_launch_plan(root: &std::path::Path) -> serde_json::Value {
+    let raw = fs::read_to_string(root.join("launch-plan.json"))
+        .unwrap_or_else(|err| panic!("launch-plan.json missing in {}: {err}", root.display()));
+    serde_json::from_str(&raw).expect("launch plan parses")
+}
+
+fn newest_run_root(paths: &DeadreckonPaths) -> std::path::PathBuf {
+    let mut runs = deadreckon_core::list_runs(paths, None).expect("list runs");
+    runs.sort_by_key(|entry| entry.updated_at);
+    let last = runs.last().expect("at least one run");
+    last.state_path.parent().expect("run root").to_path_buf()
+}
+
+#[test]
+fn accepted_plan_lands_in_run_root() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["start", "plan lands in run root", "--yes", "--plain"])
+        .output()
+        .expect("start run");
+
+    assert_success(&output);
+    let plan = read_launch_plan(&newest_run_root(&paths));
+    assert_eq!(plan["schema"], 1, "{plan}");
+    assert_eq!(plan["shape"], "single", "{plan}");
+    assert_eq!(plan["goal"], "plan lands in run root", "{plan}");
+    assert_eq!(plan["accepted_by"], "yes-flag-guardrail", "{plan}");
+    assert!(plan["resolution"]["rationale"].as_str().is_some(), "{plan}");
+}
+
+#[test]
+fn plan_shape_dispatches_orchestrate_with_planned_n() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "planned shape goal",
+            "--mode",
+            "full-plan",
+            "--children",
+            "3",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("start full-plan");
+
+    assert_success(&output);
+    let dispatched = newest_plan(&paths);
+    let plan = read_launch_plan(&paths.plan_dir(&dispatched.plan_id));
+    assert_eq!(plan["shape"], "plan", "{plan}");
+    assert_eq!(plan["n"], 3, "{plan}");
+    assert_eq!(
+        dispatched.tasks.len(),
+        3,
+        "dispatch honored the planned n: {plan}"
+    );
+}
+
+#[test]
+fn direct_run_writes_trivial_operator_plan() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "run",
+            "direct verb plan record",
+            "--smoke",
+            "--sandbox",
+            "none",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("direct run");
+
+    assert_success(&output);
+    let plan = read_launch_plan(&newest_run_root(&paths));
+    assert_eq!(plan["shape"], "single", "{plan}");
+    assert_eq!(plan["accepted_by"], "operator", "{plan}");
+    assert_eq!(plan["resolution"]["source"], "operator", "{plan}");
+    assert!(
+        plan["resolution"]["rationale"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("direct run verb"),
+        "{plan}"
+    );
+}
+
 fn write_start_ready_setup(paths: &DeadreckonPaths, root: &std::path::Path) {
     fs::create_dir_all(paths.home()).expect("home");
     fs::write(paths.config_path(), "default_provider = \"smoke\"\n").expect("config");

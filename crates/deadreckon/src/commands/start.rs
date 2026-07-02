@@ -2506,12 +2506,23 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         return Err(CliError::Surface { code: 1, surface });
     }
     materialize_start_done_criteria(&mut decision).await?;
-    dispatch_start_command(args, &decision).await
+    // C-P9: the decision becomes the durable artifact before anything runs.
+    let accepted_by = if decision.confirmed_by_start_picker {
+        "operator"
+    } else if args.yes {
+        "yes-flag-guardrail"
+    } else {
+        "operator"
+    };
+    let ceiling = config_defaults(&paths).ok().and_then(|d| d.max_spend);
+    let launch_plan = commands::course::launch_plan_from_decision(&decision, ceiling, accepted_by);
+    dispatch_start_command(args, &decision, launch_plan).await
 }
 
 async fn dispatch_start_command(
     args: StartCommandArgs,
     decision: &StartLaunchDecision,
+    launch_plan: commands::course::LaunchPlan,
 ) -> Result<()> {
     match decision.selected_mode {
         StartSelectedMode::Run => {
@@ -2520,43 +2531,46 @@ async fn dispatch_start_command(
             let goal = args.goal.clone();
             let quiet = args.quiet;
             let auto_confirm = args.yes || args.quiet || decision.confirmed_by_start_picker;
-            let result = commands::run::run_command(RunCommandArgs {
-                goal: args.goal,
-                fresh: args.fresh || decision.source_fresh,
-                worktree: args.worktree || decision.source_worktree,
-                from: args.from.or_else(|| decision.source_from.clone()),
-                in_place: false,
-                base: None,
-                branch: None,
-                allow_dirty: args.allow_dirty || decision.source_allow_dirty,
-                init_git: decision.source_init_git,
-                yes: auto_confirm,
-                preview: false,
-                brief: false,
-                no_seams: args.no_seams,
-                plain: args.plain,
-                prevent_sleep: None,
-                quiet: args.quiet,
-                max_spend: None,
-                max_wall_seconds: None,
-                sandbox: None,
-                provider: decision.provider_route.clone(),
-                model: decision.model.clone().or_else(|| args.model.clone()),
-                doc_provider: None,
-                acceptance: None,
-                skill: "deadreckon".to_string(),
-                smoke: false,
-                i_know_its_a_lot: false,
-                no_confirm: auto_confirm
-                    || matches!(decision.done_action, StartDoneAction::DefaultGate),
-                no_hints: args.quiet,
-                no_docs: false,
-                doc_skill: None,
-                narrate: false,
-                no_narrate: false,
-                narrator_model: None,
-                infer_contract: false,
-            })
+            let result = commands::run::run_command_with_launch_plan(
+                RunCommandArgs {
+                    goal: args.goal,
+                    fresh: args.fresh || decision.source_fresh,
+                    worktree: args.worktree || decision.source_worktree,
+                    from: args.from.or_else(|| decision.source_from.clone()),
+                    in_place: false,
+                    base: None,
+                    branch: None,
+                    allow_dirty: args.allow_dirty || decision.source_allow_dirty,
+                    init_git: decision.source_init_git,
+                    yes: auto_confirm,
+                    preview: false,
+                    brief: false,
+                    no_seams: args.no_seams,
+                    plain: args.plain,
+                    prevent_sleep: None,
+                    quiet: args.quiet,
+                    max_spend: None,
+                    max_wall_seconds: None,
+                    sandbox: None,
+                    provider: decision.provider_route.clone(),
+                    model: decision.model.clone().or_else(|| args.model.clone()),
+                    doc_provider: None,
+                    acceptance: None,
+                    skill: "deadreckon".to_string(),
+                    smoke: false,
+                    i_know_its_a_lot: false,
+                    no_confirm: auto_confirm
+                        || matches!(decision.done_action, StartDoneAction::DefaultGate),
+                    no_hints: args.quiet,
+                    no_docs: false,
+                    doc_skill: None,
+                    narrate: false,
+                    no_narrate: false,
+                    narrator_model: None,
+                    infer_contract: false,
+                },
+                launch_plan,
+            )
             .await;
             if result.is_ok()
                 && !quiet
@@ -2603,10 +2617,14 @@ async fn dispatch_start_command(
             })
             .await;
             if result.is_ok()
-                && !quiet
                 && let Some(run) = newest_start_run(&paths, &before, &goal)?
             {
-                print_start_lifecycle_footer("run", &run.run_id);
+                if let Some(root) = run.state_path.parent() {
+                    commands::course::save_launch_plan_best_effort(root, &launch_plan);
+                }
+                if !quiet {
+                    print_start_lifecycle_footer("run", &run.run_id);
+                }
             }
             result
         }
@@ -2655,10 +2673,15 @@ async fn dispatch_start_command(
             })
             .await;
             if result.is_ok()
-                && !quiet
                 && let Some(plan) = newest_start_plan(&paths, &before, &goal)?
             {
-                print_start_lifecycle_footer("campaign", &plan.plan_id);
+                commands::course::save_launch_plan_best_effort(
+                    &paths.plan_dir(&plan.plan_id),
+                    &launch_plan,
+                );
+                if !quiet {
+                    print_start_lifecycle_footer("campaign", &plan.plan_id);
+                }
             }
             result
         }
@@ -2760,10 +2783,15 @@ async fn dispatch_start_command(
             )
             .await;
             if result.is_ok()
-                && !quiet
                 && let Some(plan) = newest_start_plan(&paths, &before, &goal)?
             {
-                print_start_lifecycle_footer("plan", &plan.plan_id);
+                commands::course::save_launch_plan_best_effort(
+                    &paths.plan_dir(&plan.plan_id),
+                    &launch_plan,
+                );
+                if !quiet {
+                    print_start_lifecycle_footer("plan", &plan.plan_id);
+                }
             }
             result
         }
