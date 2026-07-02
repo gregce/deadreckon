@@ -7051,6 +7051,145 @@ fn direct_run_writes_trivial_operator_plan() {
     );
 }
 
+// ---- C-P10: replay + launch JSON parity ----
+
+#[test]
+fn start_plan_replays_identical_shape_and_pieces() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "replayable goal",
+            "--mode",
+            "full-plan",
+            "--children",
+            "3",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("first launch");
+    assert_success(&output);
+    let first = newest_plan(&paths);
+    let saved = temp.path().join("saved-launch-plan.json");
+    fs::copy(
+        paths.plan_dir(&first.plan_id).join("launch-plan.json"),
+        &saved,
+    )
+    .expect("copy plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "--plan",
+            saved.to_str().expect("utf8"),
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("replay");
+    assert_success(&output);
+
+    let replayed = newest_plan(&paths);
+    assert_ne!(replayed.plan_id, first.plan_id, "a new plan launched");
+    assert_eq!(replayed.tasks.len(), 3, "same n");
+    let record = read_launch_plan(&paths.plan_dir(&replayed.plan_id));
+    assert_eq!(record["shape"], "plan", "{record}");
+    assert_eq!(record["n"], 3, "{record}");
+    assert_eq!(record["goal"], "replayable goal", "{record}");
+    assert_eq!(record["resolution"]["source"], "replay", "{record}");
+    assert_eq!(record["accepted_by"], "replay", "{record}");
+}
+
+#[test]
+fn replay_with_smaller_budget_refuses_naming_numbers() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let saved = temp.path().join("expensive-plan.json");
+    fs::write(
+        &saved,
+        serde_json::json!({
+            "schema": 1,
+            "created_at": "2026-07-01T00:00:00Z",
+            "goal": "expensive goal",
+            "shape": "single",
+            "pieces": [],
+            "budget": { "ceiling_usd": 12.0 },
+            "resolution": {
+                "source": "operator",
+                "confidence": 1.0,
+                "rationale": "test plan"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "--plan",
+            saved.to_str().expect("utf8"),
+            "--max-spend",
+            "5",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("replay refusal");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("$12.00"), "{err}");
+    assert!(err.contains("$5.00"), "{err}");
+    assert!(err.contains("try:"), "{err}");
+}
+
+#[test]
+fn start_json_emits_launch_envelope_no_card() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["start", "json launch goal", "--yes", "--json"])
+        .output()
+        .expect("json launch");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    let start = out.find('{').expect("json start");
+    let envelope: serde_json::Value = serde_json::from_str(out[start..].trim())
+        .unwrap_or_else(|err| panic!("stdout tail must be one JSON envelope: {err}\n{out}"));
+    assert_eq!(envelope["kind"], "launch", "{envelope}");
+    assert_eq!(envelope["plan"]["shape"], "single", "{envelope}");
+    assert!(
+        envelope["dispatched"]["ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty()),
+        "{envelope}"
+    );
+    assert!(
+        envelope["next_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty()),
+        "{envelope}"
+    );
+    assert!(!out.contains("+---"), "no card borders in json mode: {out}");
+}
+
 fn write_start_ready_setup(paths: &DeadreckonPaths, root: &std::path::Path) {
     fs::create_dir_all(paths.home()).expect("home");
     fs::write(paths.config_path(), "default_provider = \"smoke\"\n").expect("config");

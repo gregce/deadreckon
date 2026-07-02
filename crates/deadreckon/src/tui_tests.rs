@@ -2025,6 +2025,8 @@ fn start_args_for_test(goal: &str) -> StartCommandArgs {
     StartCommandArgs {
         goal: goal.to_string(),
         mode: CliStartMode::Auto,
+        plan: None,
+        max_spend: None,
         provider: None,
         model: None,
         children: None,

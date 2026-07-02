@@ -2362,7 +2362,82 @@ fn start_goal_required_error() -> CliError {
     ))
 }
 
+/// Replay a saved launch plan (C-P10): validate, re-clamp against the
+/// current budget flag, stamp the resolution as a replay, and dispatch the
+/// identical shape. The plan file is the decision — no classification, no
+/// planning, at most the standard launch confirmation.
+async fn start_replay_command(args: StartCommandArgs, plan_path: &Path) -> Result<()> {
+    let mut plan = commands::course::load_launch_plan(plan_path)?;
+    if plan.shape == commands::course::CourseShape::ChainExtend {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "a chain-extend plan cannot be replayed (it needs its parent run)",
+            "deadreckon start \"<goal>\"",
+        )));
+    }
+    if let (Some(cap), Some(ceiling)) = (args.max_spend, plan.budget.ceiling_usd)
+        && ceiling > cap
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("launch plan budget ${ceiling:.2} exceeds --max-spend ${cap:.2}"),
+            &format!(
+                "deadreckon start --plan {} --max-spend {ceiling:.0}",
+                plan_path.display()
+            ),
+        )));
+    }
+    if args.max_spend.is_some() {
+        plan.budget.ceiling_usd = args.max_spend;
+    }
+    plan.resolution.source = commands::course::ResolutionSource::Replay;
+    plan.accepted_by = Some("replay".to_string());
+
+    let mut decision = start_launch_decision(StartLaunchInput {
+        goal: &plan.goal.clone(),
+        requested_mode: match plan.shape {
+            commands::course::CourseShape::Single | commands::course::CourseShape::ChainExtend => {
+                crate::cli::CliStartMode::Run
+            }
+            commands::course::CourseShape::Plan => crate::cli::CliStartMode::FullPlan,
+            commands::course::CourseShape::Campaign => crate::cli::CliStartMode::Auto,
+        },
+        stdin_is_tty: io::stdin().is_terminal(),
+    });
+    if plan.shape == commands::course::CourseShape::Campaign {
+        decision.selected_mode = StartSelectedMode::Campaign;
+        decision.selection_source = StartSelectionSource::ExplicitFlag;
+    }
+    decision.reason = format!("replayed launch plan from {}", plan_path.display());
+    decision.child_count = plan.n;
+    decision.provider_route = plan.providers.coder.clone();
+    decision.planner_provider_route = plan.providers.planner.clone();
+    decision.coder_provider_route = plan.providers.coder.clone();
+    decision.reviewer_provider_route = plan.providers.reviewer.clone();
+    decision.confirmed_by_start_picker = args.yes;
+    let mut replay_args = args;
+    replay_args.goal = plan.goal.clone();
+    // Replays never prompt for setup; the plan is the decision. The accept
+    // matrix still applies at dispatch (campaign guardrails included).
+    resolve_start_setup(&mut decision, &replay_args, None, false)?;
+    decision.child_count = plan.n;
+    if let Some(recovery) = decision.recovery.as_ref() {
+        let mut try_lines = recovery.try_lines.clone();
+        try_lines.truncate(1);
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &recovery.message,
+            try_lines
+                .first()
+                .map(String::as_str)
+                .unwrap_or("deadreckon try"),
+        )));
+    }
+    materialize_start_done_criteria(&mut decision).await?;
+    dispatch_start_command(replay_args, &decision, plan).await
+}
+
 pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
+    if let Some(plan_path) = args.plan.clone() {
+        return start_replay_command(args, &plan_path).await;
+    }
     let stdin_is_tty = io::stdin().is_terminal();
     let paths = DeadreckonPaths::discover();
     let cwd = std::env::current_dir()?;
@@ -2409,7 +2484,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     } else if decision.recovery.is_none() {
         resolve_start_setup(&mut decision, &args, None, stdin_is_tty)?;
     }
-    if args.json {
+    if args.json && !args.yes {
         let surface = start_preview_surface(&decision, &args, &paths)?;
         let mut next_actions = vec![surface.primary_action.command.clone()];
         next_actions.extend(start_preview_secondary_actions(&decision));
@@ -2514,8 +2589,47 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     } else {
         "operator"
     };
-    let ceiling = config_defaults(&paths).ok().and_then(|d| d.max_spend);
+    let ceiling = args
+        .max_spend
+        .or_else(|| config_defaults(&paths).ok().and_then(|d| d.max_spend));
     let launch_plan = commands::course::launch_plan_from_decision(&decision, ceiling, accepted_by);
+    if args.json && args.yes {
+        // C-P10: launch JSON parity — dispatch quietly, then emit one
+        // machine envelope carrying the plan and what actually launched.
+        let before_runs = start_run_ids(&paths)?;
+        let before_plans = start_plan_ids(&paths)?;
+        let goal = decision.goal.clone();
+        let mode_label = decision.selected_mode.label().to_string();
+        let mut quiet_args = args;
+        quiet_args.quiet = true;
+        dispatch_start_command(quiet_args, &decision, launch_plan.clone()).await?;
+        let mut dispatched_ids: Vec<String> = Vec::new();
+        if let Some(run) = newest_start_run(&paths, &before_runs, &goal)? {
+            dispatched_ids.push(run.run_id);
+        }
+        if let Some(plan_entry) = newest_start_plan(&paths, &before_plans, &goal)? {
+            dispatched_ids.push(plan_entry.plan_id);
+        }
+        let next_actions: Vec<String> = dispatched_ids
+            .first()
+            .map(|id| {
+                vec![
+                    format!("deadreckon attach {id}"),
+                    format!("deadreckon status {id}"),
+                ]
+            })
+            .unwrap_or_default();
+        let envelope = json!({
+            "kind": "launch",
+            "goal": goal,
+            "mode": mode_label,
+            "plan": &launch_plan,
+            "dispatched": { "mode": mode_label, "ids": dispatched_ids },
+            "next_actions": next_actions,
+        });
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+        return Ok(());
+    }
     dispatch_start_command(args, &decision, launch_plan).await
 }
 
@@ -2549,7 +2663,7 @@ async fn dispatch_start_command(
                     plain: args.plain,
                     prevent_sleep: None,
                     quiet: args.quiet,
-                    max_spend: None,
+                    max_spend: args.max_spend,
                     max_wall_seconds: None,
                     sandbox: None,
                     provider: decision.provider_route.clone(),
@@ -2603,7 +2717,7 @@ async fn dispatch_start_command(
                 dest: None,
                 max_context_turns: None,
                 no_context: false,
-                max_spend: None,
+                max_spend: args.max_spend,
                 max_wall_seconds: None,
                 provider: decision.provider_route.clone(),
                 model: decision.model.clone().or_else(|| args.model.clone()),
@@ -2659,7 +2773,7 @@ async fn dispatch_start_command(
                 provider: child_provider,
                 planner_model: None,
                 model: args.model.clone(),
-                max_spend: None,
+                max_spend: args.max_spend,
                 max_wall_seconds: None,
                 sandbox: None,
                 preview: false,
@@ -2735,7 +2849,7 @@ async fn dispatch_start_command(
                             )
                         }),
                         mode,
-                        max_spend: None,
+                        max_spend: args.max_spend,
                         max_wall_seconds: None,
                         sandbox: None,
                         planner_provider: if mode == CliPlanMode::FullPlan {
