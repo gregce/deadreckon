@@ -698,6 +698,19 @@ pub(crate) enum Commands {
         reviewer_provider: Option<String>,
         #[arg(long, help = "Show the resolved launch preview without starting work")]
         preview: bool,
+        #[arg(
+            long = "plan",
+            value_name = "FILE",
+            value_hint = clap::ValueHint::FilePath,
+            help = "Replay a saved launch-plan.json instead of planning"
+        )]
+        plan: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "USD",
+            help = "Budget ceiling for this launch (also gates auto-accept)"
+        )]
+        max_spend: Option<f64>,
         #[arg(long, help = "Confirm the launch preview without prompting")]
         yes: bool,
         #[arg(long, help = "Force built-in governance seams for this launch")]
@@ -2480,6 +2493,8 @@ pub(crate) struct RunCommandArgs {
 pub(crate) struct StartCommandArgs {
     pub(crate) goal: String,
     pub(crate) mode: CliStartMode,
+    pub(crate) plan: Option<PathBuf>,
+    pub(crate) max_spend: Option<f64>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) children: Option<u8>,

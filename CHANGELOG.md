@@ -8,6 +8,13 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P10: replay + launch JSON parity — `start --plan <file>` validates,
+  re-clamps against `--max-spend` (a plan whose budget exceeds the cap
+  refuses naming both numbers), stamps the resolution as `replay`, and
+  dispatches the identical shape; `start --json --yes` launches quietly and
+  emits one machine envelope (kind:launch, the plan, dispatched ids, next
+  actions) — state-changing launches finally have JSON parity; `start` gains
+  `--max-spend`, threaded into every dispatch arm.
 - C-P9: dispatch reads the plan — start builds `launch-plan.json` from the
   resolved decision before anything runs and the accepted plan lands in the
   dispatched root (run root at creation, plan/campaign dir on launch, extend

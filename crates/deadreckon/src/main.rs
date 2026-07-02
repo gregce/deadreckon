@@ -654,6 +654,8 @@ async fn main_inner() -> Result<()> {
             goal,
             goal_file,
             mode,
+            plan,
+            max_spend,
             provider,
             model,
             children,
@@ -676,11 +678,17 @@ async fn main_inner() -> Result<()> {
             let resolved_goal = resolve_optional_goal_input("start", goal, goal_file)?;
             let allows_prompts =
                 std::io::stdin().is_terminal() && !yes && !json && !plain && !quiet;
-            let goal =
-                commands::start::resolve_start_goal(resolved_goal.as_deref(), allows_prompts)?;
+            // A --plan replay carries its goal in the plan file.
+            let goal = if plan.is_some() {
+                resolved_goal.unwrap_or_default()
+            } else {
+                commands::start::resolve_start_goal(resolved_goal.as_deref(), allows_prompts)?
+            };
             commands::start::start_command(StartCommandArgs {
                 goal,
                 mode,
+                plan,
+                max_spend,
                 provider,
                 model,
                 children,
