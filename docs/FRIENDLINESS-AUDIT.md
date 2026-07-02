@@ -76,7 +76,7 @@ verb.
 | `orchestrate` | One-command rollback | pass | Plan state can be killed/cleaned and merged results are applied explicitly. |
 | `orchestrate` | One verdict + ONE primary action | pass | Orchestrate/plan lifecycle output uses `plan_verdict_surface`, with preview/setup rows demoted to non-primary guidance. |
 | `orchestrate` | Lifecycle hint | pass | Output names attach/merge/finish. |
-| `campaign` | Auto-detect, don't ask | fail | `--n` is still required instead of recommendation-seeded. |
+| `campaign` | Auto-detect, don't ask | pass | Course closed this: the launch planner seeds `--n` (grounded classify with a deterministic ladder floor) when the flag is absent. |
 | `campaign` | Preview before mutate | pass | Campaign preview shows sub-goals before launch. |
 | `campaign` | Refuse with try: | pass | Depth/count/cross-sub refusals include recovery lines. |
 | `campaign` | One-command rollback | pass | Campaigns can be killed and result application is explicit. |
@@ -100,7 +100,7 @@ verb.
 | `merge` | One-command rollback | pass | Promotion results are library entries until explicitly applied/exported. |
 | `merge` | One verdict + ONE primary action | pass | Merge completion, conflict, repair, and invalid-option paths render one primary action. |
 | `merge` | Lifecycle hint | pass | Output points at finish/apply/export. |
-| `chain` | Auto-detect, don't ask | fail | Chain breadth/step planning still asks more than the effortless path should. |
+| `chain` | Auto-detect, don't ask | pass | Course closed this: the effortless path auto-detects continuation (verified same-task history resolves to a follow-up run with zero questions); explicit `chain` step lists are operator-authored input, not an ask. |
 | `chain` | Preview before mutate | pass | Plan/run/apply modes preview or confirm state changes. |
 | `chain` | Refuse with try: | pass | Chain refusals include scoped recovery commands. |
 | `chain` | One-command rollback | pass | Undo/redo/reapply are one-command recovery paths. |

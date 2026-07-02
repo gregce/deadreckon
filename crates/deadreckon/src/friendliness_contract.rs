@@ -104,7 +104,7 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
     },
     VerbFriendliness {
         verb: "campaign",
-        marks: [F, P, P, P, P, P],
+        marks: [P, P, P, P, P, P],
     },
     VerbFriendliness {
         verb: "plan",
@@ -120,7 +120,7 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
     },
     VerbFriendliness {
         verb: "chain",
-        marks: [F, P, P, P, P, P],
+        marks: [P, P, P, P, P, P],
     },
     VerbFriendliness {
         verb: "doctor",

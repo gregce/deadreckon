@@ -50,6 +50,7 @@ This document captures the system as built today — what's wired, what's load-b
 37. [Effortless: the friendliness contract](#37-effortless-the-friendliness-contract)
 38. [Binary Module Layout (post-decompose)](#38-binary-module-layout-post-decompose)
 39. [Composable Seams (swap a worker, keep the gate)](#39-composable-seams-swap-a-worker-keep-the-gate)
+46. [Course: Launch Planning and Reshaping](#46-course-launch-planning-and-reshaping)
 
 ---
 
@@ -1699,6 +1700,7 @@ The previously named thin areas now have code paths and depth tests:
 9. **Multi-run coordination.** Scope-qualified locks, stale reclaim, same-scope refusal tests, and sequential chain coordination are in place; parallel/DAG scheduling remains out of scope.
 10. **Promotion / library workflow.** Promotion is atomic and `library list|search|show` makes artifacts discoverable by scope, goal, date, and promoted-doc content.
 11. **Composable seams and API compaction.** Policy, catalog, hook, and event-sink workers are swappable through `[seams]` with fixed fail policies, while direct-API history is bounded by deterministic context-window compaction. The gate remains non-swappable and is protected by adversarial seam sandbox tests.
+12. **Course launch planning (§46).** `start` resolves the execution shape from a deterministic SignalBundle plus one clamped planner call, records the decision as `launch-plan.json` in every dispatched root, previews it on a golden-pinned course card, asks at most one question (the done contract, only when undetected), replays plans (`--plan`), emits a launch JSON envelope (`--json --yes`), collapses one-piece plans to runs, and accepts worker reshape proposals only through the explicit `reshape` verb. This closes the campaign/chain auto-detect friendliness cells and the launch JSON-parity gap; it does NOT add auto-reshape, per-piece task seeding, or campaign-level reshaping (V1).
 
 ### Not yet built (V1+ candidates per `docs/goals/2026-05-11-1400-deadreckon-usability-rider.md` and the V1 list in the robust rider)
 
@@ -3115,6 +3117,152 @@ The Live Narrator (§44) worked for a `dr run` only. Orchestrate/campaign childr
 45.7 **Spend-math fix.** `spend_summary` (`state.rs`) now counts only `kind: "loop"` rows and takes `total_usd` from the last loop row. Before this, every interactive run that narrated inflated its own tokens/turns/wall and could overwrite `total_usd` with a `kind: "narrator"` row — the latent leak referenced in §44.6.
 
 45.8 **Deferred.** Wiring `effective_plain` (auto-plain-on-pipe), a parent aggregate for campaign at the orchestrate level (campaign currently relies on each sub-orchestrator's own aggregate), and a provider-backed campaign narrative graph remain V1 candidates.
+
+---
+
+## 46. Course: Launch Planning and Reshaping
+
+### 46.1 Mental model
+
+Course makes launch shape the planner's job, not the operator's — the same
+inversion a database query planner performs. The goal is the query; the
+detected done contract is the schema plus assertions; `start` is the planner;
+the course card is EXPLAIN; the existing run/plan/campaign/chain machinery is
+the executor; collapse and reshape are adaptive re-planning. Course invents no
+execution engine: it decides and records *which existing engine runs, with
+what pieces, under what money*. Everything lives in
+`crates/deadreckon/src/commands/course.rs` plus a bounded turn-loop seam.
+
+### 46.2 The SignalBundle
+
+`collect_signal_bundle` computes five deterministic signals before any
+provider call, and the bundle embeds verbatim into the launch plan as the
+audit of what the decision saw:
+
+- `analyze_goal_structure` — enumerated items, conjunction clauses, leading
+  imperative verbs → a `strong` decomposability verdict.
+- `contract_signal` — the Polyglot detector (§13.1) as a launch signal, so
+  `start` and the gate agree on what "done" will mean before any spend.
+- `scan_workspace` — Cargo/pnpm/npm-workspaces/go.work members (a parallelism
+  map) plus a capped tree-size bucket.
+- `history_signal` — prior runs by task key; verified history is the
+  continuation signal.
+- `budget_signal` — plan/campaign feasibility floors; a shape the money
+  cannot fund is never proposed.
+
+All five are pure, total, and provider-free; degraded inputs yield defaults,
+never errors.
+
+### 46.3 The deterministic ladder
+
+`ladder_decision` resolves a shape from ordered rules; the first match
+decides and every decision records which rule fired: (1) verified same-task
+history → chain-extend continuation; (2) budget below the plan floor →
+single; (2.5) explicit parallel-workstream keywords → plan (the proven
+pre-Course heuristic, owned here so `start_goal_recommends_full_plan` cannot
+drift); (3) strong decomposition + ≥2 workspace members → plan with n clamped
+to members and 6; (4) strong decomposition alone → plan clamped to 4;
+(default) single. **Campaign is structurally unreachable from the ladder** —
+deterministic campaign selection is a spend hazard; campaign requires the
+provider planner or the operator. A grid depth test sweeps goals × members ×
+ceilings to keep it unreachable.
+
+### 46.4 The provider planner
+
+`classify_goal_shape_for_start` superseded the old text-only classifier: one
+bounded call (5s timeout, 512 tokens, read-only prompt) whose prompt embeds
+the SignalBundle, and whose typed draft (`shape`, `n`, `pieces` with per-piece
+goals and done hints, `confidence`, `rationale`) is clamped by
+`resolve_provider_course_plan`: confidence below the floor downgrades a
+disagreeing shape to the ladder; budget-infeasible shapes downgrade; n and
+pieces clamp into 2..=6; a one-piece plan collapses to single (46.10). Every
+clamp is recorded in `clamps_applied`. Any parse miss falls back silently to
+the ladder — a planner can never fail or stall a launch.
+
+### 46.5 `launch-plan.json`
+
+The durable decision artifact (schema 1), written into every dispatched root:
+goal, shape (`single`/`plan`/`campaign`/`chain-extend`), pieces, n, per-role
+providers, budget ceiling/split, contract summary with provenance
+(`detected`/`operator`/`inferred`/`asked`/`none`), the embedded SignalBundle,
+resolution (source `provider`/`ladder`/`operator`/`replay`, confidence,
+rationale, clamp trail), escape hatches, `accepted_by`, and `parent` (set on
+reshape lineage). Serde is additive-tolerant; an unknown schema refuses with
+a `try:` footer. Direct verbs (`deadreckon run`) record a trivial operator
+plan so every root carries the decision record however the launch began.
+Saves are best-effort — a read-only filesystem cannot fail a launch.
+
+### 46.6 The accept matrix
+
+`accept_policy` weighs TTY × yes × confidence × ceiling × shape. Campaign
+above the confirm line (default $25, unbounded counts as above) ALWAYS
+confirms interactively or refuses in non-TTY — no flag overrides the
+guardrail. `--yes` auto-accepts only when confidence clears the floor
+(default 0.7) and the ceiling is under the auto-spend line (default $20).
+Non-TTY without `--yes` refuses with `try:` instead of hanging. The asymmetry
+is deliberate: wrong-single costs a retry; wrong-campaign costs real money.
+
+### 46.7 The course card
+
+`course_card` renders goal/shape/pieces/who/cost/done/why/escape through the
+shared Card primitives — done contract and escape hatches never omitted — and
+the 80-column plain layout is golden-pinned (whitespace is spec).
+`prompt_course_card` drives sail/edit/force-single/abort through the
+`StartPrompter` seam; forcing single collapses the plan and records the
+operator override in the clamp trail.
+
+### 46.8 The one-question flow
+
+With no operator `acceptance.yaml`, a Polyglot-detected contract answers
+"done" with zero questions (source `detected`, DefaultGate action — the gate
+compiles the same detected default at run time). An unknown tree asks exactly
+one question — "How will you know it worked?" — whose one-line answer
+compiles through the existing def-done flow (source `asked`); Enter accepts
+the default gate. `--yes` skips the question and proceeds with the caveat on
+the label; non-TTY without `--yes` keeps the def-done refusal, aligned with
+46.6. The old four-choice done menu is gone.
+
+### 46.9 Dispatch, replay, JSON parity
+
+`dispatch_start_command` consumes the built plan and lands it in the
+dispatched root (run root at creation via `run_command_with_launch_plan`,
+plan/campaign dir on launch, extend target on success). `start --plan <file>`
+replays a saved plan: schema-validated, re-clamped against `--max-spend` (a
+plan whose budget exceeds the cap refuses naming both numbers), stamped
+`replay`, identical shape/n dispatched; chain-extend plans refuse (they need
+their parent). `start --json --yes` launches quietly and emits one machine
+envelope `{kind:"launch", plan, dispatched ids, next_actions}`; `--json`
+without `--yes` keeps the read-only preview. `start` gains `--max-spend`,
+threaded into every dispatch arm.
+
+### 46.10 Course correction: collapse and reshape
+
+De-escalation: a decomposition of exactly one piece collapses to a single run
+(recorded in the clamp trail) instead of inflating to n=2 or refusing.
+Escalation: the turn loop's additive `reshape` action lets a worker propose
+2–6 independent pieces; the loop records an INERT `reshape-proposal.json`
+(launch-plan schema, `parent` set, no acceptance), a `reshape.proposed`
+trace, and keeps working — non-terminal, never self-executing. `deadreckon
+reshape <id>` previews the proposal on the course card and, only on explicit
+acceptance (card sail or `--yes`; non-TTY refuses with `try:`), dispatches a
+full-plan orchestration with the parent run recorded in the dispatched
+plan's `launch-plan.json`.
+
+### 46.11 Start-then-watch and configuration
+
+`[defaults] start_attach = true` drops an interactive launch straight into
+attach after the lifecycle footer; JSON, quiet, preview, and non-TTY sessions
+never auto-attach, and a failed attach cannot turn a successful launch into
+an error. Guardrail knobs (`shape_confidence_floor`, auto-spend ceiling,
+campaign confirm line) ship as compiled defaults in `course.rs`; config keys
+for them are a follow-up (V1-CANDIDATES).
+
+### 46.12 What stayed out
+
+Auto-reshape without operator accept, campaign-level reshaping, piece-goal
+seeding into dispatched plan tasks, learned shape priors, cross-machine
+plans, chain-extend replay, and multi-contract monorepo planning are logged
+in V1-CANDIDATES, not silently expanded.
 
 ---
 

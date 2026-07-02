@@ -127,6 +127,27 @@
   campaign has no rolling narrative of its own — only an aggregation of its
   children's. A V1 could give the campaign its own beat stream.
 
+## Course follow-ups (Course, §46)
+
+- Piece-goal seeding into dispatched plan tasks: an accepted reshape (and a
+  planner draft's pieces) currently informs `--n` and the audit record; the
+  plan's own planner re-decomposes. Threading explicit piece goals into
+  `PlanTask`s needs a planner-bypass path with its own fixtures.
+- Auto-reshape policy: accepting a proposal without an operator (under
+  budget headroom and a config gate) is deliberately out — the accept is the
+  human checkpoint. Revisit only with a blast-radius story.
+- Campaign-level reshaping and planner-chosen per-sub breadth beyond the
+  existing clamp.
+- Chain-extend replay: a `--plan` replay of a continuation needs its parent
+  run; refused today.
+- Config keys for the guardrail knobs (`shape_confidence_floor`,
+  `shape_auto_spend_ceiling`, `campaign_confirm_line`) — compiled defaults
+  ship first; keys land when real use proves the defaults wrong.
+- Card `e`dit as a full in-frame editor (today it exits to flags); budget
+  split editing on the card.
+- Learned shape priors from run history (self-improvement loop integration)
+  and cross-machine launch plans.
+
 ## Polyglot done-contract follow-ups (Polyglot, §13.1/§35.9)
 
 - Standalone `detect` report command: the project-kind + contract report is
