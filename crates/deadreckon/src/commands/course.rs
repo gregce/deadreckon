@@ -859,6 +859,17 @@ pub(crate) fn resolve_provider_course_plan(
     if downgraded {
         clamps.push("shape downgraded to fit the budget ceiling".to_string());
     }
+    // C-P11: de-escalation — a decomposition of exactly one piece is not a
+    // plan; it collapses to a single run instead of inflating to n=2 (the
+    // old refusal path becomes graceful fallback, recorded in the trail).
+    let shape = if shape == CourseShape::Plan
+        && (draft.n == Some(1) || (draft.n.is_none() && draft.pieces.len() == 1))
+    {
+        clamps.push("plan collapsed to single: decomposition yielded one piece".to_string());
+        CourseShape::Single
+    } else {
+        shape
+    };
     let n = match shape {
         CourseShape::Single | CourseShape::ChainExtend => None,
         CourseShape::Plan | CourseShape::Campaign => {
@@ -1781,6 +1792,63 @@ mod tests {
             policy(CourseShape::Single, 0.9, Some(5.0), true, false),
             AcceptDecision::InteractiveCard
         );
+    }
+
+    // ---- C-P11: de-escalation plan collapse ----
+
+    #[test]
+    fn single_task_decomposition_collapses_to_run() {
+        let signals = bundle_with(
+            analyze_goal_structure("do the thing"),
+            0,
+            HistorySignal::default(),
+            None,
+        );
+        let ladder = ladder_decision(&signals);
+        // n=1 explicitly, and pieces-of-one with n unset, both collapse.
+        for draft in [
+            r#"{"shape":"plan","n":1,"confidence":0.9,"rationale":"one piece really"}"#,
+            r#"{"shape":"plan","confidence":0.9,"rationale":"one piece really",
+                "pieces":[{"goal":"the only piece"}]}"#,
+        ] {
+            let (shape, n, _pieces, resolution) = resolve_provider_course_plan(
+                draft,
+                &signals,
+                &ladder,
+                SHAPE_CONFIDENCE_FLOOR_DEFAULT,
+            )
+            .expect("resolved");
+            assert_eq!(shape, CourseShape::Single, "{resolution:?}");
+            assert_eq!(n, None, "{resolution:?}");
+        }
+    }
+
+    #[test]
+    fn collapse_recorded_as_event_and_rationale() {
+        let signals = bundle_with(
+            analyze_goal_structure("do the thing"),
+            0,
+            HistorySignal::default(),
+            None,
+        );
+        let ladder = ladder_decision(&signals);
+        let (_shape, _n, _pieces, resolution) = resolve_provider_course_plan(
+            r#"{"shape":"plan","n":1,"confidence":0.9,"rationale":"one piece really"}"#,
+            &signals,
+            &ladder,
+            SHAPE_CONFIDENCE_FLOOR_DEFAULT,
+        )
+        .expect("resolved");
+        // The clamp trail is the durable record — it rides launch-plan.json
+        // into the dispatched root, so the collapse is auditable forever.
+        assert!(
+            resolution
+                .clamps_applied
+                .iter()
+                .any(|clamp| clamp.contains("collapsed to single")),
+            "{resolution:?}"
+        );
+        assert_eq!(resolution.rationale, "one piece really");
     }
 
     // ---- C-P5: the provider planner ----

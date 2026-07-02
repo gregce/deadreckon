@@ -8,6 +8,10 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P11: de-escalation — a decomposition of exactly one piece collapses to a
+  single run instead of inflating to n=2 or refusing; the collapse is
+  recorded in the plan's clamp trail, which rides `launch-plan.json` into
+  the dispatched root as the durable audit record.
 - C-P10: replay + launch JSON parity — `start --plan <file>` validates,
   re-clamps against `--max-spend` (a plan whose budget exceeds the cap
   refuses naming both numbers), stamps the resolution as `replay`, and
