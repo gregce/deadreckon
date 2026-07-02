@@ -2633,11 +2633,49 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     dispatch_start_command(args, &decision, launch_plan).await
 }
 
+#[derive(Clone, Copy)]
+struct StartAttachFlags {
+    json: bool,
+    quiet: bool,
+    preview: bool,
+}
+
+/// C-P13: start-then-watch. After a successful interactive launch, drop
+/// into attach when `[defaults] start_attach = true`. Best-effort — a
+/// failed attach must not turn a successful launch into an error.
+async fn maybe_start_attach(id: &str, flags: &StartAttachFlags) {
+    let paths = DeadreckonPaths::discover();
+    let enabled = config_defaults(&paths)
+        .ok()
+        .and_then(|defaults| defaults.start_attach)
+        .unwrap_or(false);
+    let tty = io::stdout().is_terminal() && io::stdin().is_terminal();
+    if !commands::course::should_auto_attach(enabled, tty, flags.json, flags.quiet, flags.preview) {
+        return;
+    }
+    let _ = commands::attach::attach_command(commands::attach::AttachCommandArgs {
+        run_id: id.to_string(),
+        no_hints: false,
+        plain: false,
+        json: false,
+        view: crate::narrative::AttachViewMode::Activity,
+        visual: crate::narrative::NarrativeVisualMode::Architecture,
+        narrative_provider: None,
+        narrative_max_spend: None,
+    })
+    .await;
+}
+
 async fn dispatch_start_command(
     args: StartCommandArgs,
     decision: &StartLaunchDecision,
     launch_plan: commands::course::LaunchPlan,
 ) -> Result<()> {
+    let args_snapshot = StartAttachFlags {
+        json: args.json,
+        quiet: args.quiet,
+        preview: args.preview,
+    };
     match decision.selected_mode {
         StartSelectedMode::Run => {
             let paths = DeadreckonPaths::discover();
@@ -2691,6 +2729,7 @@ async fn dispatch_start_command(
                 && let Some(run) = newest_start_run(&paths, &before, &goal)?
             {
                 print_start_lifecycle_footer("run", &run.run_id);
+                maybe_start_attach(&run.run_id, &args_snapshot).await;
             }
             result
         }
@@ -2738,6 +2777,7 @@ async fn dispatch_start_command(
                 }
                 if !quiet {
                     print_start_lifecycle_footer("run", &run.run_id);
+                    maybe_start_attach(&run.run_id, &args_snapshot).await;
                 }
             }
             result
@@ -2795,6 +2835,7 @@ async fn dispatch_start_command(
                 );
                 if !quiet {
                     print_start_lifecycle_footer("campaign", &plan.plan_id);
+                    maybe_start_attach(&plan.plan_id, &args_snapshot).await;
                 }
             }
             result
@@ -2905,6 +2946,7 @@ async fn dispatch_start_command(
                 );
                 if !quiet {
                     print_start_lifecycle_footer("plan", &plan.plan_id);
+                    maybe_start_attach(&plan.plan_id, &args_snapshot).await;
                 }
             }
             result

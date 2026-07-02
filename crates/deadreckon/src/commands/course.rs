@@ -1375,6 +1375,20 @@ pub(crate) struct ReshapeArgs {
     pub(crate) quiet: bool,
 }
 
+/// Start-then-watch (C-P13): whether a successful launch should drop
+/// straight into attach. Opt-in via `[defaults] start_attach = true`, and
+/// only for an interactive human — machine modes and quiet sessions never
+/// auto-attach, and preview launches have nothing to watch.
+pub(crate) fn should_auto_attach(
+    config_enabled: bool,
+    tty: bool,
+    json: bool,
+    quiet: bool,
+    preview: bool,
+) -> bool {
+    config_enabled && tty && !json && !quiet && !preview
+}
+
 /// Where the plan lives inside a dispatched root (run root, plan dir,
 /// campaign dir, chain dir).
 pub(crate) fn launch_plan_path(root: &Path) -> PathBuf {
@@ -1926,6 +1940,26 @@ mod tests {
             policy(CourseShape::Single, 0.9, Some(5.0), true, false),
             AcceptDecision::InteractiveCard
         );
+    }
+
+    // ---- C-P13: start-then-watch ----
+
+    #[test]
+    fn start_attach_config_drops_into_attach_on_tty() {
+        assert!(should_auto_attach(true, true, false, false, false));
+        // Off by default: the config knob is the only way in.
+        assert!(!should_auto_attach(false, true, false, false, false));
+        // Nothing to watch after a preview.
+        assert!(!should_auto_attach(true, true, false, false, true));
+        // No terminal, no TUI.
+        assert!(!should_auto_attach(true, false, false, false, false));
+    }
+
+    #[test]
+    fn json_and_quiet_never_auto_attach() {
+        assert!(!should_auto_attach(true, true, true, false, false));
+        assert!(!should_auto_attach(true, true, false, true, false));
+        assert!(!should_auto_attach(true, false, true, true, false));
     }
 
     // ---- C-P11: de-escalation plan collapse ----

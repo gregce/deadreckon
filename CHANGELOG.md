@@ -8,6 +8,10 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P13: start-then-watch — `[defaults] start_attach = true` drops an
+  interactive launch straight into attach after the lifecycle footer; JSON,
+  quiet, preview, and non-TTY sessions never auto-attach, and a failed
+  attach can never turn a successful launch into an error.
 - C-P12: reshape proposals — a worker can emit a `reshape` action proposing
   2-6 independent pieces; the loop records an INERT `reshape-proposal.json`
   (launch-plan schema, parent set, no acceptance) plus a `reshape.proposed`

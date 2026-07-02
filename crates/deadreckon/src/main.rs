@@ -3701,6 +3701,7 @@ fn gate_line_from_results(
 #[derive(Debug, Default)]
 struct ConfigDefaults {
     provider: Option<String>,
+    start_attach: Option<bool>,
     model: Option<String>,
     sandbox: Option<String>,
     max_spend: Option<f64>,
@@ -3717,6 +3718,7 @@ struct ConfigDefaults {
 fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
     let root = load_config_value(paths)?;
     Ok(ConfigDefaults {
+        start_attach: get_toml_path(&root, "defaults.start_attach").and_then(toml::Value::as_bool),
         provider: get_toml_path(&root, "defaults.provider")
             .or_else(|| get_toml_path(&root, "default_provider"))
             .and_then(toml::Value::as_str)
