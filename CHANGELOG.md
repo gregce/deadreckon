@@ -8,6 +8,14 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P8: the one-question flow — a Polyglot-detected contract answers "done"
+  with zero questions (new `detected` source, interactive or not); an unknown
+  tree asks exactly one question, "How will you know it worked?" (one line
+  compiled through the existing def-done flow as the `asked` source; Enter
+  accepts the default gate); `--yes` skips the question and proceeds with the
+  caveat on the label; non-TTY without `--yes` keeps the def-done refusal,
+  aligned with the accept matrix. The old four-choice done menu (and its
+  generate-from-goal variant) is gone — the ask subsumes it.
 - C-P7: the course card — one calm launch surface rendering
   goal/shape/pieces/who/cost/done/why/escape through the shared Card
   primitives, golden-pinned (whitespace is spec), with the sail/edit/

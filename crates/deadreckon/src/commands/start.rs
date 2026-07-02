@@ -125,6 +125,10 @@ pub(crate) enum StartDoneCriteriaSource {
     Project,
     Generated,
     Manual,
+    /// Polyglot detection found a real test contract — zero questions asked.
+    Detected,
+    /// The operator answered the one launch question in English.
+    Asked,
     DefaultGate,
     Missing,
 }
@@ -135,6 +139,8 @@ impl StartDoneCriteriaSource {
             Self::Project => "project",
             Self::Generated => "generated",
             Self::Manual => "manual",
+            Self::Detected => "detected",
+            Self::Asked => "asked",
             Self::DefaultGate => "default",
             Self::Missing => "missing",
         }
@@ -167,7 +173,6 @@ impl StartSourceMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartDoneAction {
     Existing,
-    GenerateFromGoal,
     ManualText {
         text: String,
         overwrite_existing: bool,
@@ -1329,73 +1334,31 @@ pub(crate) fn resolve_start_orchestration_options(
     Ok(())
 }
 
+/// The one question `start` may ask (C-P8), and only when no contract was
+/// found or detected: "How will you know it worked?". A one-line answer is
+/// compiled through the existing def-done flow; pressing Enter accepts the
+/// default gate with its caveat. No menus, no second question.
 pub(crate) fn prompt_start_done_criteria(
     decision: &mut StartLaunchDecision,
     prompter: &mut dyn StartPrompter,
 ) -> Result<()> {
-    let choice = prompter.select_one(prompt::SelectPrompt {
-        title: format!("Choose {NOUN_DONE_CONTRACT}"),
-        help: Some(format!("No project {NOUN_DONE_CONTRACT} was found.")),
-        choices: vec![
-            start_prompt_choice(
-                "default",
-                "Use the default gate for this launch",
-                "working directory exists, or cargo test for Rust projects",
-            ),
-            start_prompt_choice(
-                "generate",
-                "Create from the goal before launch",
-                "uses the existing def-done compiler after final confirmation",
-            ),
-            start_prompt_choice(
-                "manual",
-                "Write criteria in English",
-                "compiled through the existing def-done flow after confirmation",
-            ),
-            prompt::SelectChoice::new("cancel", "Cancel and show def-done command"),
-        ],
-        default_index: 0,
-    })?;
-    match choice.id.as_str() {
-        "default" => {
-            decision.done_criteria_source = StartDoneCriteriaSource::DefaultGate;
-            decision.done_action = StartDoneAction::DefaultGate;
-            decision.done_criteria_label = "default dr-gate behavior".to_string();
-        }
-        "generate" => {
-            decision.done_criteria_source = StartDoneCriteriaSource::Generated;
-            decision.done_action = StartDoneAction::GenerateFromGoal;
-            decision.done_criteria_label = "create from goal before launch".to_string();
-        }
-        "manual" => {
-            let text = prompter.input("definition of done: ", None)?;
-            if text.trim().is_empty() {
-                set_start_recovery(
-                    decision,
-                    format!("empty {NOUN_DONE_CONTRACT} was not saved"),
-                    vec![format!(
-                        "deadreckon def-done \"what should count as done\" && deadreckon start \"{}\"",
-                        shell_display_quote(&decision.goal)
-                    )],
-                );
-                return Ok(());
-            }
-            decision.done_criteria_source = StartDoneCriteriaSource::Manual;
-            decision.done_action = StartDoneAction::ManualText {
-                text: text.trim().to_string(),
-                overwrite_existing: false,
-            };
-            decision.done_criteria_label = "write manual criteria before launch".to_string();
-        }
-        _ => set_start_recovery(
-            decision,
-            format!("{NOUN_DONE_CONTRACT} is missing for this repo"),
-            vec![format!(
-                "deadreckon def-done \"what should count as done\" && deadreckon start \"{}\"",
-                shell_display_quote(&decision.goal)
-            )],
-        ),
+    let text = prompter.input(
+        "How will you know it worked? (one line; Enter = default gate) ",
+        None,
+    )?;
+    let text = text.trim();
+    if text.is_empty() {
+        decision.done_criteria_source = StartDoneCriteriaSource::DefaultGate;
+        decision.done_action = StartDoneAction::DefaultGate;
+        decision.done_criteria_label = "default dr-gate behavior".to_string();
+        return Ok(());
     }
+    decision.done_criteria_source = StartDoneCriteriaSource::Asked;
+    decision.done_action = StartDoneAction::ManualText {
+        text: text.to_string(),
+        overwrite_existing: false,
+    };
+    decision.done_criteria_label = format!("asked at launch: {text}");
     Ok(())
 }
 
@@ -1722,7 +1685,7 @@ fn resolve_start_setup(
             return Ok(());
         }
         let cwd = std::env::current_dir()?;
-        resolve_start_done_criteria(decision, &cwd, Some(&mut *prompter))?;
+        resolve_start_done_criteria(decision, &cwd, Some(&mut *prompter), args.yes)?;
         if decision.recovery.is_none()
             && !matches!(
                 decision.selected_mode,
@@ -1753,7 +1716,7 @@ fn resolve_start_setup(
             return Ok(());
         }
         let cwd = std::env::current_dir()?;
-        resolve_start_done_criteria(decision, &cwd, None)?;
+        resolve_start_done_criteria(decision, &cwd, None, args.yes)?;
         if decision.recovery.is_none()
             && !matches!(
                 decision.selected_mode,
@@ -1857,10 +1820,11 @@ fn detected_start_provider_label(provider: &str) -> String {
     format!("{provider} (detected) - run deadreckon config provider {provider} to make permanent")
 }
 
-fn resolve_start_done_criteria(
+pub(crate) fn resolve_start_done_criteria(
     decision: &mut StartLaunchDecision,
     cwd: &Path,
     prompter: Option<&mut dyn StartPrompter>,
+    yes: bool,
 ) -> Result<()> {
     let source = commands::acceptance::resolve_acceptance_source(cwd, None)?;
     if source.is_some() {
@@ -1875,8 +1839,33 @@ fn resolve_start_done_criteria(
         return Ok(());
     }
 
+    // C-P8: the one-question flow. A detected contract means everything
+    // about "done" is already known — zero questions, interactive or not.
+    let contract = commands::course::contract_signal(cwd);
+    if contract.detected {
+        decision.done_criteria_source = StartDoneCriteriaSource::Detected;
+        decision.done_action = StartDoneAction::DefaultGate;
+        decision.done_criteria_label = format!(
+            "{} [detected]",
+            contract.command.as_deref().unwrap_or("detected contract")
+        );
+        return Ok(());
+    }
+
     if let Some(prompter) = prompter {
         prompt_start_done_criteria(decision, prompter)?;
+        return Ok(());
+    }
+
+    if yes {
+        // Explicit consent to proceed: skip the question, carry the caveat
+        // (Polyglot doctrine — the gate will surface it, never silent green).
+        let caveat = contract
+            .caveat
+            .unwrap_or_else(|| "no test contract detected".to_string());
+        decision.done_criteria_source = StartDoneCriteriaSource::DefaultGate;
+        decision.done_action = StartDoneAction::DefaultGate;
+        decision.done_criteria_label = format!("default gate - caveat: {caveat}");
         return Ok(());
     }
 
@@ -2151,13 +2140,6 @@ pub(crate) fn start_done_materialization_request(
     decision: &StartLaunchDecision,
 ) -> Option<(String, bool)> {
     match decision.done_action.clone() {
-        StartDoneAction::GenerateFromGoal => Some((
-            format!(
-                "For this start, define practical acceptance checks for: {}",
-                decision.goal
-            ),
-            false,
-        )),
         StartDoneAction::ManualText {
             text,
             overwrite_existing,

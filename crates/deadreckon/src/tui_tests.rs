@@ -2622,12 +2622,14 @@ fn start_full_plan_picker_collects_child_count_and_role_providers() {
 
 #[test]
 fn start_fake_prompter_done_default_uses_default_gate() {
+    // C-P8: Enter (empty answer) at the one question accepts the default gate.
     let mut decision = start_launch_decision(StartLaunchInput {
         goal: "build the app",
         requested_mode: CliStartMode::Auto,
         stdin_is_tty: true,
     });
-    let mut prompter = ScriptedStartPrompter::new(&["default"]);
+    let mut prompter = ScriptedStartPrompter::new(&[]);
+    prompter.inputs.push_back(String::new());
 
     prompt_start_done_criteria(&mut decision, &mut prompter).expect("done prompt");
 
@@ -2641,12 +2643,13 @@ fn start_fake_prompter_done_default_uses_default_gate() {
 
 #[test]
 fn start_fake_prompter_manual_done_creates_without_overwrite() {
+    // C-P8: a one-line answer compiles through the existing def-done flow.
     let mut decision = start_launch_decision(StartLaunchInput {
         goal: "build the app",
         requested_mode: CliStartMode::Auto,
         stdin_is_tty: true,
     });
-    let mut prompter = ScriptedStartPrompter::new(&["manual"]);
+    let mut prompter = ScriptedStartPrompter::new(&[]);
     prompter
         .inputs
         .push_back("tests pass and screenshots are clean".to_string());
@@ -2654,9 +2657,126 @@ fn start_fake_prompter_manual_done_creates_without_overwrite() {
     prompt_start_done_criteria(&mut decision, &mut prompter).expect("done prompt");
 
     assert_eq!(
+        decision.done_criteria_source,
+        StartDoneCriteriaSource::Asked
+    );
+    assert_eq!(
         start_done_materialization_request(&decision),
         Some(("tests pass and screenshots are clean".to_string(), false))
     );
+}
+
+#[test]
+fn detected_contract_asks_zero_questions() {
+    // C-P8: Polyglot detection answers "done" — no prompt fires at all.
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("go.mod"), "module example.com/m\n").expect("write");
+    let mut decision = start_launch_decision(StartLaunchInput {
+        goal: "build the app",
+        requested_mode: CliStartMode::Auto,
+        stdin_is_tty: true,
+    });
+    let mut prompter = ScriptedStartPrompter::new(&[]);
+
+    super::commands::start::resolve_start_done_criteria(
+        &mut decision,
+        temp.path(),
+        Some(&mut prompter),
+        false,
+    )
+    .expect("resolve");
+
+    assert!(
+        prompter.prompt_titles.is_empty(),
+        "{:?}",
+        prompter.prompt_titles
+    );
+    assert_eq!(
+        decision.done_criteria_source,
+        StartDoneCriteriaSource::Detected
+    );
+    assert_eq!(decision.done_action, StartDoneAction::DefaultGate);
+    assert!(
+        decision.done_criteria_label.contains("go test ./..."),
+        "{}",
+        decision.done_criteria_label
+    );
+    assert!(decision.done_criteria_label.contains("[detected]"));
+}
+
+#[test]
+fn yes_flag_skips_question_and_carries_caveat() {
+    // C-P8: --yes never asks; an unknown tree proceeds with the caveat on
+    // the label (the gate surfaces it later — never a silent green).
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut decision = start_launch_decision(StartLaunchInput {
+        goal: "build the app",
+        requested_mode: CliStartMode::Auto,
+        stdin_is_tty: false,
+    });
+
+    super::commands::start::resolve_start_done_criteria(&mut decision, temp.path(), None, true)
+        .expect("resolve");
+
+    assert!(decision.recovery.is_none(), "yes proceeds, never refuses");
+    assert_eq!(
+        decision.done_criteria_source,
+        StartDoneCriteriaSource::DefaultGate
+    );
+    assert!(
+        decision.done_criteria_label.contains("caveat"),
+        "{}",
+        decision.done_criteria_label
+    );
+
+    // Without --yes the non-TTY refusal is unchanged (aligned with the
+    // accept matrix: a script must opt in explicitly).
+    let mut refused = start_launch_decision(StartLaunchInput {
+        goal: "build the app",
+        requested_mode: CliStartMode::Auto,
+        stdin_is_tty: false,
+    });
+    super::commands::start::resolve_start_done_criteria(&mut refused, temp.path(), None, false)
+        .expect("resolve");
+    assert!(
+        refused.recovery.is_some(),
+        "non-TTY without yes still refuses"
+    );
+}
+
+#[test]
+fn unknown_contract_asks_exactly_one_question() {
+    // C-P8: the one question is an input(), never a menu — a scripted
+    // prompter with a single queued input satisfies the whole flow.
+    let mut decision = start_launch_decision(StartLaunchInput {
+        goal: "build the app",
+        requested_mode: CliStartMode::Auto,
+        stdin_is_tty: true,
+    });
+    let mut prompter = ScriptedStartPrompter::new(&[]);
+    prompter
+        .inputs
+        .push_back("the smoke test passes".to_string());
+
+    prompt_start_done_criteria(&mut decision, &mut prompter).expect("done prompt");
+
+    assert_eq!(
+        prompter.prompt_titles.len(),
+        1,
+        "exactly one question: {:?}",
+        prompter.prompt_titles
+    );
+    assert!(
+        prompter.prompt_titles[0].contains("How will you know it worked?"),
+        "{:?}",
+        prompter.prompt_titles
+    );
+    assert!(prompter.inputs.is_empty(), "exactly one input consumed");
+    assert_eq!(
+        decision.done_criteria_source,
+        StartDoneCriteriaSource::Asked
+    );
+    assert!(decision.done_criteria_label.contains("asked at launch"));
 }
 
 #[test]
