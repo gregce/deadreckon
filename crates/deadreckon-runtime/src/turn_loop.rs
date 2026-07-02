@@ -132,9 +132,24 @@ enum Action {
         path: PathBuf,
         content: String,
     },
+    /// C-P12: the worker proposes decomposing the goal into independent
+    /// pieces. Recording it is non-terminal and the proposal is INERT — it
+    /// executes only when an operator accepts it via `deadreckon reshape`.
+    Reshape {
+        tool_call_id: String,
+        #[serde(default)]
+        pieces: Vec<ReshapePieceDraft>,
+    },
     Done {
         summary: Option<String>,
     },
+}
+
+#[derive(Debug, Deserialize)]
+struct ReshapePieceDraft {
+    goal: String,
+    #[serde(default)]
+    done_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -907,6 +922,35 @@ pub async fn run_turn_loop(
                 .await?;
                 history.push(format!("tool {tool_call_id} result: wrote file"));
             }
+            Action::Reshape {
+                tool_call_id,
+                pieces,
+            } => {
+                let recorded = record_reshape_proposal(state, turn, &pieces)?;
+                emit_event(
+                    state,
+                    config.event_sender.as_ref(),
+                    RunEventKind::ToolCallResult {
+                        turn,
+                        tool_call_id: tool_call_id.clone(),
+                        status: "recorded".to_string(),
+                        preview: event_preview(format!(
+                            "reshape proposal: {} piece(s), inert until accepted",
+                            pieces.len()
+                        )),
+                    },
+                )?;
+                history.push(format!(
+                    "tool {tool_call_id} recorded a reshape proposal at {} ({} pieces). It is inert until an operator runs `deadreckon reshape {}`. Keep working the goal in this run.",
+                    recorded.display(),
+                    pieces.len(),
+                    state.run_id
+                ));
+                state.turn = turn;
+                save_history(state, &history)?;
+                save_state(state)?;
+                continue;
+            }
             Action::Done { summary } => {
                 state.turn = turn;
                 history.push(format!("done: {}", summary.clone().unwrap_or_default()));
@@ -1075,7 +1119,7 @@ fn build_prompt(state: &PipelineState, history: &[String]) -> String {
     let spec_text = spec_prompt_text(state);
     let skill_text = run_skill_text(state);
     format!(
-        "You are deadreckon running unattended coding work.\nWorking directory: {}\nSPEC:\n{}\n\nSkill and implementation-notes contract:\n{}\n\nHistory:\n{}\n\nReturn exactly one JSON object with action bash, write_file, or done.",
+        "You are deadreckon running unattended coding work.\nWorking directory: {}\nSPEC:\n{}\n\nSkill and implementation-notes contract:\n{}\n\nHistory:\n{}\n\nReturn exactly one JSON object with action bash, write_file, reshape (propose splitting the goal into 2-6 independent pieces: {{\"action\":\"reshape\",\"tool_call_id\":\"...\",\"pieces\":[{{\"goal\":\"...\",\"done_hint\":\"...\"}}]}} - recorded for the operator, never executed by you), or done.",
         state.working_dir.display(),
         spec_text,
         skill_text,
@@ -1414,6 +1458,68 @@ fn append_provenance_for_files(
             files,
         },
     )
+}
+
+/// C-P12: write the inert reshape proposal into the run root in the
+/// launch-plan schema (parent set, accepted_by ABSENT — inert by
+/// construction) and trace the event. The proposal never executes here.
+fn record_reshape_proposal(
+    state: &PipelineState,
+    turn: u32,
+    pieces: &[ReshapePieceDraft],
+) -> Result<PathBuf> {
+    let path = state.run_root.join("reshape-proposal.json");
+    let n = pieces.len().clamp(2, 6) as u8;
+    let piece_values: Vec<serde_json::Value> = pieces
+        .iter()
+        .enumerate()
+        .map(|(idx, piece)| {
+            json!({
+                "id": format!("p{}", idx + 1),
+                "goal": piece.goal,
+                "done_hint": piece.done_hint,
+            })
+        })
+        .collect();
+    let proposal = json!({
+        "schema": 1,
+        "created_at": Utc::now().to_rfc3339(),
+        "goal": state.goal,
+        "shape": "plan",
+        "n": n,
+        "pieces": piece_values,
+        "resolution": {
+            "source": "provider",
+            "confidence": 0.6,
+            "rationale": format!("worker proposed decomposition at turn {turn}"),
+        },
+        "parent": state.run_id,
+    });
+    let bytes = serde_json::to_vec_pretty(&proposal).map_err(|source| {
+        deadreckon_core::DeadreckonError::Json {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    std::fs::write(&path, bytes).map_err(|source| deadreckon_core::DeadreckonError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    append_trace(
+        state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn,
+            event: "reshape.proposed".to_string(),
+            latency_ms: None,
+            detail: json!({
+                "pieces": pieces.len(),
+                "path": path.display().to_string(),
+            }),
+        },
+    )?;
+    Ok(path)
 }
 
 fn append_tool_refusal(
@@ -2824,7 +2930,7 @@ fallback_context_window = 80
         assert!(
             prompt
                 .trim_end()
-                .ends_with("Return exactly one JSON object with action bash, write_file, or done.")
+                .ends_with("Return exactly one JSON object with action bash, write_file, reshape (propose splitting the goal into 2-6 independent pieces: {\"action\":\"reshape\",\"tool_call_id\":\"...\",\"pieces\":[{\"goal\":\"...\",\"done_hint\":\"...\"}]} - recorded for the operator, never executed by you), or done.")
         );
     }
 

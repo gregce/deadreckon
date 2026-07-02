@@ -2557,6 +2557,90 @@ fn always_failing_script() -> Vec<FixtureResponse> {
     .expect("script")
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reshape_action_writes_inert_proposal_and_event() {
+    let _gate = env!("CARGO_BIN_EXE_dr-gate");
+    let temp = repo_tempdir();
+    let server = MockServer::start(reshape_script()).await;
+    write_config(temp.path(), &server.base_url());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .arg("run")
+        .arg("--fresh")
+        .arg("--yes")
+        .arg("reshape proposing task")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--no-docs")
+        .env("DEADRECKON_HOME", temp.path().join("home"))
+        .output()
+        .expect("run deadreckon");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run = list_runs(&paths, None)
+        .expect("runs")
+        .into_iter()
+        .next()
+        .expect("run");
+    let state = load_run(&paths, &run.run_id).expect("state");
+    // The run completed normally — recording a proposal is non-terminal.
+    assert_eq!(state.status, RunStatus::Completed);
+    let proposal_path = state.run_root.join("reshape-proposal.json");
+    let raw = std::fs::read_to_string(&proposal_path).expect("proposal exists");
+    let proposal: serde_json::Value = serde_json::from_str(&raw).expect("proposal parses");
+    assert_eq!(proposal["schema"], 1, "{proposal}");
+    assert_eq!(proposal["shape"], "plan", "{proposal}");
+    assert_eq!(proposal["parent"], state.run_id.as_str(), "{proposal}");
+    assert!(
+        proposal.get("accepted_by").is_none_or(|v| v.is_null()),
+        "inert: no acceptance recorded: {proposal}"
+    );
+    let traces = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("traces");
+    assert!(traces.contains("reshape.proposed"), "{traces}");
+    // Inert means inert: no plan was dispatched by the run itself.
+    let plans_dir = paths.plans_dir();
+    let plan_count = std::fs::read_dir(&plans_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(plan_count, 0, "no plan may exist without an accept");
+}
+
+fn reshape_script() -> Vec<FixtureResponse> {
+    serde_json::from_value(json!([
+        {
+            "content": "{\"action\":\"reshape\",\"tool_call_id\":\"tool-reshape-1\",\"pieces\":[{\"goal\":\"piece a\",\"done_hint\":\"a tests\"},{\"goal\":\"piece b\"}]}",
+            "prompt_tokens": 100,
+            "completion_tokens": 40
+        },
+        {
+            "content": "{\"action\":\"bash\",\"tool_call_id\":\"tool-bash-1\",\"command\":\"printf ok > done.txt\"}",
+            "prompt_tokens": 100,
+            "completion_tokens": 30
+        },
+        {
+            "content": implementation_notes_write_action("notes-1", "Recorded the change and the reshape proposal."),
+            "prompt_tokens": 100,
+            "completion_tokens": 30
+        },
+        {
+            "content": "{\"action\":\"done\",\"summary\":\"finished with a proposal on file\"}",
+            "prompt_tokens": 100,
+            "completion_tokens": 20
+        }
+    ]))
+    .expect("script")
+}
+
 fn three_turn_script() -> Vec<FixtureResponse> {
     serde_json::from_value(json!([
         {

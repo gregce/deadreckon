@@ -1241,6 +1241,140 @@ pub(crate) fn save_launch_plan_best_effort(root: &Path, plan: &LaunchPlan) {
     let _ = save_launch_plan(&launch_plan_path(root), plan);
 }
 
+/// `deadreckon reshape <id>` (C-P12): preview a run's inert reshape
+/// proposal on the course card and, on acceptance, dispatch it as a
+/// full-plan orchestration with the parent run recorded in the plan.
+/// The proposal NEVER executes without this explicit accept.
+pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let state = super::verdict::resolve_verdict_run(&paths, Some(&args.run_id))?;
+    if matches!(state.status, deadreckon_core::RunStatus::Executing) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("run {} is still running", state.run_id),
+            &format!("deadreckon attach {}", state.run_id),
+        )));
+    }
+    let proposal_path = state.run_root.join("reshape-proposal.json");
+    if !proposal_path.exists() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("run {} has no reshape proposal", state.run_id),
+            &format!("deadreckon status {}", state.run_id),
+        )));
+    }
+    let mut plan = load_launch_plan(&proposal_path)?;
+    plan.parent.get_or_insert_with(|| state.run_id.clone());
+
+    if !args.quiet && !args.json {
+        print!("{}", render_course_card(&plan, args.plain));
+    }
+    if args.json && !args.yes {
+        // Read-only preview envelope; accepting from JSON requires --yes.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "reshape-preview",
+                "run_id": state.run_id,
+                "plan": &plan,
+                "next_actions": [format!("deadreckon reshape {} --yes", state.run_id)],
+            }))?
+        );
+        return Ok(());
+    }
+    if !args.yes {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "a reshape proposal needs explicit acceptance",
+                &format!("deadreckon reshape {} --yes", state.run_id),
+            )));
+        }
+        let mut prompter = super::start::TerminalStartPrompter;
+        match prompt_course_card(&mut plan, &mut prompter)? {
+            CardOutcome::Sail => {}
+            CardOutcome::ForceSingle | CardOutcome::Edit | CardOutcome::Abort => {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "reshape not accepted",
+                    &format!("deadreckon reshape {} --yes", state.run_id),
+                )));
+            }
+        }
+    }
+    plan.accepted_by = Some("operator".to_string());
+    let n = plan
+        .n
+        .unwrap_or_else(|| u8::try_from(plan.pieces.len()).unwrap_or(2))
+        .clamp(2, PLAN_MAX_PIECES);
+
+    let before: std::collections::BTreeSet<String> =
+        super::inspection::list_plan_entries(&paths, None)?
+            .into_iter()
+            .map(|entry| entry.plan_id)
+            .collect();
+    let goal = plan.goal.clone();
+    super::orchestrate::orchestrate_command(super::orchestrate::OrchestrateRunArgs {
+        plan: crate::cli::PlanCommandArgs {
+            goal: goal.clone(),
+            n,
+            mode: crate::cli::CliPlanMode::FullPlan,
+            max_spend: plan.budget.ceiling_usd,
+            max_wall_seconds: None,
+            sandbox: None,
+            planner_provider: plan.providers.planner.clone(),
+            provider: plan.providers.coder.clone(),
+            child_provider: Vec::new(),
+            coder_provider: None,
+            reviewer_provider: None,
+            planner_model: None,
+            model: None,
+            child_model: Vec::new(),
+            coder_model: None,
+            reviewer_model: None,
+            init_git: false,
+            acceptance: None,
+            skip_acceptance_prompt: true,
+            no_hints: args.quiet,
+            quiet: args.quiet,
+            json: false,
+            plain: args.plain,
+        },
+        preview: false,
+        yes: true,
+        no_repair: false,
+        completion_surface: !args.quiet,
+        narrate: false,
+        narrator_model: None,
+    })
+    .await?;
+    let dispatched = super::inspection::list_plan_entries(&paths, None)?
+        .into_iter()
+        .filter(|entry| entry.goal == goal && !before.contains(&entry.plan_id))
+        .map(|entry| entry.plan_id)
+        .next_back();
+    if let Some(plan_id) = dispatched.as_ref() {
+        save_launch_plan_best_effort(&paths.plan_dir(plan_id), &plan);
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "reshape",
+                "run_id": state.run_id,
+                "dispatched": { "plan_id": dispatched },
+                "plan": &plan,
+            }))?
+        );
+    }
+    Ok(())
+}
+
+/// Parsed `deadreckon reshape` arguments.
+pub(crate) struct ReshapeArgs {
+    pub(crate) run_id: String,
+    pub(crate) yes: bool,
+    pub(crate) json: bool,
+    pub(crate) plain: bool,
+    pub(crate) quiet: bool,
+}
+
 /// Where the plan lives inside a dispatched root (run root, plan dir,
 /// campaign dir, chain dir).
 pub(crate) fn launch_plan_path(root: &Path) -> PathBuf {
