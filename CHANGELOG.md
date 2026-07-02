@@ -1,5 +1,18 @@
 # Changelog
 
+## Course (unreleased) — the harness plots the course
+
+`deadreckon start` becomes the only launch decision a user needs: a
+deterministic signal bundle plus one clamped provider call resolves a durable
+`launch-plan.json`, a course card previews WHAT/WHO/COST/DONE/WHY/ESCAPE, and
+the shape can be corrected mid-voyage. Phases land bottom-up; this section
+graduates to a stable milestone at C-P14.
+
+- C-P1: `commands::course` module — the `LaunchPlan` schema-1 artifact
+  (shape/pieces/providers/budget/contract/signals/resolution/escape, additive-
+  tolerant serde), `launch-plan.json` load/save with schema check, and
+  refusals with `try:` footers for missing/invalid/unsupported plan files.
+
 ## 0.4.0 — Honest verification — 2026-06-27
 
 Makes "did it actually work?" answerable honestly, end to end. Two milestones
