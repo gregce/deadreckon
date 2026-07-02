@@ -8,6 +8,10 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P2: the first half of the SignalBundle — `analyze_goal_structure`
+  (enumerations, conjunction clauses, imperative verbs → a `strong`
+  decomposability verdict) and `scan_workspace` (Cargo/pnpm/npm/go.work
+  member detection + a capped tree-size bucket). Pure, total, provider-free.
 - C-P1: `commands::course` module — the `LaunchPlan` schema-1 artifact
   (shape/pieces/providers/budget/contract/signals/resolution/escape, additive-
   tolerant serde), `launch-plan.json` load/save with schema check, and
