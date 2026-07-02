@@ -1140,6 +1140,96 @@ pub(crate) fn prompt_course_card(
     })
 }
 
+/// Build the durable plan from a resolved start decision (C-P9). Everything
+/// dispatch is about to do must be readable from this artifact alone.
+pub(crate) fn launch_plan_from_decision(
+    decision: &super::start::StartLaunchDecision,
+    ceiling_usd: Option<f64>,
+    accepted_by: &str,
+) -> LaunchPlan {
+    use super::start::StartSelectedMode;
+    let shape = match decision.selected_mode {
+        StartSelectedMode::Run => CourseShape::Single,
+        StartSelectedMode::Extend => CourseShape::ChainExtend,
+        StartSelectedMode::Review | StartSelectedMode::FullPlan => CourseShape::Plan,
+        StartSelectedMode::Campaign => CourseShape::Campaign,
+    };
+    let resolution = match decision.goal_shape.as_ref() {
+        Some(recommendation) => CourseResolution {
+            source: match recommendation.source {
+                super::start::GoalShapeSource::Provider => ResolutionSource::Provider,
+                super::start::GoalShapeSource::Fallback => ResolutionSource::Ladder,
+            },
+            confidence: match recommendation.source {
+                super::start::GoalShapeSource::Provider => 0.8,
+                super::start::GoalShapeSource::Fallback => 0.75,
+            },
+            rationale: recommendation.rationale.clone(),
+            clamps_applied: Vec::new(),
+        },
+        None => CourseResolution {
+            source: ResolutionSource::Operator,
+            confidence: 1.0,
+            rationale: decision.reason.clone(),
+            clamps_applied: Vec::new(),
+        },
+    };
+    let mut plan = LaunchPlan::new(&decision.goal, shape, resolution);
+    plan.n = decision.child_count;
+    plan.providers = CourseProviders {
+        planner: decision.planner_provider_route.clone(),
+        coder: decision
+            .coder_provider_route
+            .clone()
+            .or_else(|| decision.provider_route.clone()),
+        reviewer: decision.reviewer_provider_route.clone(),
+    };
+    plan.budget = CourseBudget {
+        ceiling_usd,
+        split: Vec::new(),
+        wall_seconds: None,
+    };
+    plan.contract = CourseContract {
+        source: match decision.done_criteria_source {
+            super::start::StartDoneCriteriaSource::Detected => ContractOrigin::Detected,
+            super::start::StartDoneCriteriaSource::Asked => ContractOrigin::Asked,
+            super::start::StartDoneCriteriaSource::Project
+            | super::start::StartDoneCriteriaSource::Generated
+            | super::start::StartDoneCriteriaSource::Manual => ContractOrigin::Operator,
+            super::start::StartDoneCriteriaSource::DefaultGate
+            | super::start::StartDoneCriteriaSource::Missing => ContractOrigin::None,
+        },
+        kind: None,
+        summary: Some(decision.done_criteria_label.clone()),
+        caveat: None,
+    };
+    plan.accepted_by = Some(accepted_by.to_string());
+    plan
+}
+
+/// A trivial operator plan for a direct verb launch (`deadreckon run` etc.)
+/// so every dispatched root carries the decision record, however it began.
+pub(crate) fn trivial_operator_plan(goal: &str, shape: CourseShape, verb: &str) -> LaunchPlan {
+    let mut plan = LaunchPlan::new(
+        goal,
+        shape,
+        CourseResolution {
+            source: ResolutionSource::Operator,
+            confidence: 1.0,
+            rationale: format!("direct {verb} verb — operator chose the shape"),
+            clamps_applied: Vec::new(),
+        },
+    );
+    plan.accepted_by = Some("operator".to_string());
+    plan
+}
+
+/// Persist the plan into a dispatched root, best-effort: a read-only or
+/// exotic filesystem must not fail a launch that already succeeded.
+pub(crate) fn save_launch_plan_best_effort(root: &Path, plan: &LaunchPlan) {
+    let _ = save_launch_plan(&launch_plan_path(root), plan);
+}
+
 /// Where the plan lives inside a dispatched root (run root, plan dir,
 /// campaign dir, chain dir).
 pub(crate) fn launch_plan_path(root: &Path) -> PathBuf {

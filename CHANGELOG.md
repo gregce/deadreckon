@@ -8,6 +8,13 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P9: dispatch reads the plan — start builds `launch-plan.json` from the
+  resolved decision before anything runs and the accepted plan lands in the
+  dispatched root (run root at creation, plan/campaign dir on launch, extend
+  target on success); direct `deadreckon run` records a trivial operator
+  plan so every root carries the decision record however the launch began;
+  `accepted_by` distinguishes operator confirmation from `--yes` guardrail
+  acceptance.
 - C-P8: the one-question flow — a Polyglot-detected contract answers "done"
   with zero questions (new `detected` source, interactive or not); an unknown
   tree asks exactly one question, "How will you know it worked?" (one line
