@@ -8,6 +8,11 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P7: the course card — one calm launch surface rendering
+  goal/shape/pieces/who/cost/done/why/escape through the shared Card
+  primitives, golden-pinned (whitespace is spec), with the sail/edit/
+  force-single/abort interaction driven through the existing prompter seam;
+  forcing single records the operator override in the plan's clamp trail.
 - C-P6: the launch accept matrix — campaign above the confirm line ALWAYS
   confirms interactively or refuses in non-TTY (no flag overrides the
   guardrail; an unbounded ceiling counts as above the line); `--yes`
