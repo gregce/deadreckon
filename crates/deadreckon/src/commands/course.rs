@@ -906,6 +906,73 @@ pub(crate) fn resolve_provider_course_plan(
     ))
 }
 
+/// `--yes` may auto-accept only under this ceiling (config-overridable via
+/// `[defaults] shape_auto_spend_ceiling`).
+pub(crate) const SHAPE_AUTO_SPEND_CEILING_DEFAULT: f64 = 20.0;
+/// Campaign ALWAYS confirms interactively above this line (config-overridable
+/// via `[defaults] campaign_confirm_line`). Guardrail beats every flag.
+pub(crate) const CAMPAIGN_CONFIRM_LINE_DEFAULT: f64 = 25.0;
+
+/// What happens at the launch gate: show the card, sail silently, or refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceptDecision {
+    InteractiveCard,
+    AutoAccept,
+    RefuseWithTry,
+}
+
+/// Everything the accept gate weighs. The asymmetry is deliberate: a wrong
+/// single costs a retry; a wrong campaign costs real money.
+#[derive(Clone, Copy)]
+pub(crate) struct AcceptPolicyInput<'a> {
+    pub(crate) resolution: &'a CourseResolution,
+    pub(crate) shape: CourseShape,
+    pub(crate) ceiling_usd: Option<f64>,
+    pub(crate) tty: bool,
+    pub(crate) yes: bool,
+    pub(crate) confidence_floor: f64,
+    pub(crate) auto_spend_ceiling: f64,
+    pub(crate) campaign_confirm_line: f64,
+}
+
+/// The launch accept matrix (TTY × yes × confidence × ceiling × shape):
+/// - campaign above the confirm line ALWAYS confirms (TTY) or refuses
+///   (non-TTY) — no flag overrides the guardrail;
+/// - `--yes` auto-accepts only when confidence clears the floor AND the
+///   ceiling (when set) is under the auto-spend line;
+/// - otherwise a TTY shows the card and a non-TTY refuses with a `try:`
+///   (a script must opt in explicitly; launches never hang on stdin).
+pub(crate) fn accept_policy(input: AcceptPolicyInput<'_>) -> AcceptDecision {
+    let campaign_above_line = input.shape == CourseShape::Campaign
+        && input
+            .ceiling_usd
+            .is_none_or(|c| c > input.campaign_confirm_line);
+    if campaign_above_line {
+        return if input.tty {
+            AcceptDecision::InteractiveCard
+        } else {
+            AcceptDecision::RefuseWithTry
+        };
+    }
+    if input.yes {
+        let under_ceiling = input
+            .ceiling_usd
+            .is_none_or(|c| c <= input.auto_spend_ceiling);
+        return if input.resolution.confidence >= input.confidence_floor && under_ceiling {
+            AcceptDecision::AutoAccept
+        } else if input.tty {
+            AcceptDecision::InteractiveCard
+        } else {
+            AcceptDecision::RefuseWithTry
+        };
+    }
+    if input.tty {
+        AcceptDecision::InteractiveCard
+    } else {
+        AcceptDecision::RefuseWithTry
+    }
+}
+
 /// Where the plan lives inside a dispatched root (run root, plan dir,
 /// campaign dir, chain dir).
 pub(crate) fn launch_plan_path(root: &Path) -> PathBuf {
@@ -1266,6 +1333,97 @@ mod tests {
         assert_eq!(single_pkg.shape, CourseShape::Plan, "{single_pkg:?}");
         assert!(single_pkg.n.unwrap() <= 4, "{single_pkg:?}");
         assert_eq!(single_pkg.rule, "decomposition");
+    }
+
+    // ---- C-P6: guardrails + accept policy ----
+
+    fn policy(
+        shape: CourseShape,
+        confidence: f64,
+        ceiling: Option<f64>,
+        tty: bool,
+        yes: bool,
+    ) -> AcceptDecision {
+        let resolution = CourseResolution {
+            source: ResolutionSource::Provider,
+            confidence,
+            rationale: "test".to_string(),
+            clamps_applied: Vec::new(),
+        };
+        accept_policy(AcceptPolicyInput {
+            resolution: &resolution,
+            shape,
+            ceiling_usd: ceiling,
+            tty,
+            yes,
+            confidence_floor: SHAPE_CONFIDENCE_FLOOR_DEFAULT,
+            auto_spend_ceiling: SHAPE_AUTO_SPEND_CEILING_DEFAULT,
+            campaign_confirm_line: CAMPAIGN_CONFIRM_LINE_DEFAULT,
+        })
+    }
+
+    #[test]
+    fn yes_flag_autoaccepts_only_above_confidence_and_under_ceiling() {
+        // Confident + under the auto-spend ceiling → silent sail.
+        assert_eq!(
+            policy(CourseShape::Plan, 0.9, Some(10.0), true, true),
+            AcceptDecision::AutoAccept
+        );
+        // Confident but over the auto-spend ceiling → card, not silence.
+        assert_eq!(
+            policy(CourseShape::Plan, 0.9, Some(100.0), true, true),
+            AcceptDecision::InteractiveCard
+        );
+        // Under the ceiling but unsure → card, not silence.
+        assert_eq!(
+            policy(CourseShape::Plan, 0.4, Some(10.0), true, true),
+            AcceptDecision::InteractiveCard
+        );
+        // No explicit ceiling: confidence alone decides for non-campaign.
+        assert_eq!(
+            policy(CourseShape::Single, 0.9, None, true, true),
+            AcceptDecision::AutoAccept
+        );
+    }
+
+    #[test]
+    fn campaign_above_line_always_confirms_or_refuses() {
+        // Above the line: --yes and confidence are irrelevant.
+        assert_eq!(
+            policy(CourseShape::Campaign, 0.99, Some(100.0), true, true),
+            AcceptDecision::InteractiveCard
+        );
+        assert_eq!(
+            policy(CourseShape::Campaign, 0.99, Some(100.0), false, true),
+            AcceptDecision::RefuseWithTry
+        );
+        // No ceiling means unbounded — that is above the line by definition.
+        assert_eq!(
+            policy(CourseShape::Campaign, 0.99, None, true, true),
+            AcceptDecision::InteractiveCard
+        );
+        // Under the line campaign behaves like any other shape.
+        assert_eq!(
+            policy(CourseShape::Campaign, 0.9, Some(10.0), true, true),
+            AcceptDecision::AutoAccept
+        );
+    }
+
+    #[test]
+    fn non_tty_without_yes_refuses_with_try() {
+        assert_eq!(
+            policy(CourseShape::Single, 0.9, Some(5.0), false, false),
+            AcceptDecision::RefuseWithTry
+        );
+        assert_eq!(
+            policy(CourseShape::Plan, 0.9, None, false, false),
+            AcceptDecision::RefuseWithTry
+        );
+        // A TTY without --yes always gets the card.
+        assert_eq!(
+            policy(CourseShape::Single, 0.9, Some(5.0), true, false),
+            AcceptDecision::InteractiveCard
+        );
     }
 
     // ---- C-P5: the provider planner ----
