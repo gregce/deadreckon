@@ -202,6 +202,12 @@ verb.
 | `kill` | One-command rollback | pass | Killed runs can be resumed when state permits. |
 | `kill` | One verdict + ONE primary action | pass | Run/plan/chain/campaign kill paths render one killed verdict and one inspection/recovery command. |
 | `kill` | Lifecycle hint | pass | Output points at resume/cleanup/status. |
+| `reshape` | Auto-detect, don't ask | pass | `latest` resolves; the proposal file is found without prompts. |
+| `reshape` | Preview before mutate | pass | The course card previews the proposal before any dispatch. |
+| `reshape` | Refuse with try: | pass | Missing proposal, still-running run, and non-TTY acceptance refuse with recovery lines. |
+| `reshape` | One-command rollback | pass | The dispatched plan is killable and its children undoable like any orchestration. |
+| `reshape` | One verdict + ONE primary action | pass | Acceptance delegates to the orchestrate completion surface (one recommended command). |
+| `reshape` | Lifecycle hint | pass | Refusals and the worker's history hint name `deadreckon reshape <id>`. |
 | `resume` | Auto-detect, don't ask | pass | `latest` and partial traces resolve automatically. |
 | `resume` | Preview before mutate | pass | Resume shows provider/source context before entering the loop. |
 | `resume` | Refuse with try: | pass | Completed/missing run paths include extend/start guidance. |

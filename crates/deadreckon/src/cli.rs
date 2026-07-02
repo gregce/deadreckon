@@ -1629,6 +1629,22 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Run Lifecycle",
+        about = "Preview and accept a run's reshape proposal as a plan"
+    )]
+    Reshape {
+        #[arg(help = "Run id or prefix carrying a reshape proposal, or `latest`")]
+        run_id: String,
+        #[arg(long, help = "Accept and dispatch without prompting")]
+        yes: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+        #[arg(long, help = "Plain output without ANSI affordances")]
+        plain: bool,
+        #[arg(long, help = "Suppress success chatter and post-action hints")]
+        quiet: bool,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
         visible_alias = "continue",
         about = "Resume an incomplete run",
         after_help = RESUME_HELP

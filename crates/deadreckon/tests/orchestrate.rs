@@ -7051,6 +7051,166 @@ fn direct_run_writes_trivial_operator_plan() {
     );
 }
 
+// ---- C-P12: reshape proposals ----
+
+fn smoke_run_with_proposal(paths: &DeadreckonPaths, repo: &std::path::Path) -> String {
+    let output = deadreckon(paths)
+        .current_dir(repo)
+        .args([
+            "run",
+            "parent run for reshape",
+            "--smoke",
+            "--sandbox",
+            "none",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("smoke parent run");
+    assert_success(&output);
+    let root = newest_run_root(paths);
+    let run_id = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("run id")
+        .to_string();
+    fs::write(
+        root.join("reshape-proposal.json"),
+        serde_json::json!({
+            "schema": 1,
+            "created_at": "2026-07-02T00:00:00Z",
+            "goal": "parent run for reshape",
+            "shape": "plan",
+            "n": 2,
+            "pieces": [
+                { "id": "p1", "goal": "piece a" },
+                { "id": "p2", "goal": "piece b" }
+            ],
+            "resolution": {
+                "source": "provider",
+                "confidence": 0.6,
+                "rationale": "worker proposed decomposition at turn 2"
+            },
+            "parent": run_id
+        })
+        .to_string(),
+    )
+    .expect("write proposal");
+    run_id
+}
+
+fn plan_dir_count(paths: &DeadreckonPaths) -> usize {
+    fs::read_dir(paths.plans_dir())
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn reshape_verb_previews_proposal_card() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    let run_id = smoke_run_with_proposal(&paths, &repo);
+
+    // Non-TTY without --yes: the card previews, then acceptance refuses.
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["reshape", &run_id, "--plain"])
+        .output()
+        .expect("reshape preview");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let out = stdout(&output);
+    assert!(out.contains("course - plot, preview, sail"), "{out}");
+    assert!(out.contains("piece a"), "{out}");
+    let err = stderr(&output);
+    assert!(err.contains("explicit acceptance"), "{err}");
+    assert!(
+        err.contains(&format!("deadreckon reshape {run_id} --yes")),
+        "{err}"
+    );
+}
+
+#[test]
+fn proposal_never_executes_without_accept() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    let run_id = smoke_run_with_proposal(&paths, &repo);
+
+    let before = plan_dir_count(&paths);
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["reshape", &run_id, "--plain"])
+        .output()
+        .expect("reshape refusal");
+    assert!(!output.status.success());
+    assert_eq!(
+        plan_dir_count(&paths),
+        before,
+        "a refused proposal must dispatch nothing"
+    );
+
+    // A run without a proposal refuses with the status hint.
+    let bare = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "run",
+            "run without proposal",
+            "--smoke",
+            "--sandbox",
+            "none",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("bare run");
+    assert_success(&bare);
+    let bare_root = newest_run_root(&paths);
+    let bare_id = bare_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("id")
+        .to_string();
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["reshape", &bare_id, "--plain", "--yes"])
+        .output()
+        .expect("no proposal");
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("has no reshape proposal"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn accepted_reshape_dispatches_plan_with_parent_lineage() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    let run_id = smoke_run_with_proposal(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["reshape", &run_id, "--yes", "--plain", "--quiet"])
+        .output()
+        .expect("reshape accept");
+    assert_success(&output);
+
+    let dispatched = newest_plan(&paths);
+    assert_eq!(dispatched.root_goal, "parent run for reshape");
+    assert_eq!(dispatched.tasks.len(), 2, "planned n honored");
+    let record = read_launch_plan(&paths.plan_dir(&dispatched.plan_id));
+    assert_eq!(record["parent"], run_id.as_str(), "{record}");
+    assert_eq!(record["accepted_by"], "operator", "{record}");
+    assert_eq!(record["shape"], "plan", "{record}");
+}
+
 // ---- C-P10: replay + launch JSON parity ----
 
 #[test]

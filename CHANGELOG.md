@@ -8,6 +8,14 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P12: reshape proposals — a worker can emit a `reshape` action proposing
+  2-6 independent pieces; the loop records an INERT `reshape-proposal.json`
+  (launch-plan schema, parent set, no acceptance) plus a `reshape.proposed`
+  trace and keeps working — non-terminal, never self-executing. The new
+  `deadreckon reshape <id>` verb previews the proposal on the course card
+  and, only on explicit acceptance (card sail or `--yes`; non-TTY refuses
+  with `try:`), dispatches a full-plan orchestration with the parent run
+  recorded in the dispatched plan's launch-plan.json.
 - C-P11: de-escalation — a decomposition of exactly one piece collapses to a
   single run instead of inflating to n=2 or refusing; the collapse is
   recorded in the plan's clamp trail, which rides `launch-plan.json` into

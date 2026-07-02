@@ -187,7 +187,7 @@ pub(crate) trait StartPrompter {
     fn input(&mut self, message: &str, default: Option<&str>) -> Result<String>;
 }
 
-struct TerminalStartPrompter;
+pub(crate) struct TerminalStartPrompter;
 
 impl StartPrompter for TerminalStartPrompter {
     fn select_one(&mut self, prompt: prompt::SelectPrompt) -> Result<prompt::SelectChoice> {

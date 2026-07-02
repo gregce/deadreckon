@@ -1294,6 +1294,23 @@ async fn main_inner() -> Result<()> {
             ui::set_plain_output(plain);
             kill_command(run_id, force, plain)
         }
+        Commands::Reshape {
+            run_id,
+            yes,
+            json,
+            plain,
+            quiet,
+        } => {
+            ui::set_plain_output(plain || json);
+            commands::course::reshape_command(commands::course::ReshapeArgs {
+                run_id,
+                yes,
+                json,
+                plain,
+                quiet,
+            })
+            .await
+        }
         Commands::Resume {
             run_id,
             from_turn,
