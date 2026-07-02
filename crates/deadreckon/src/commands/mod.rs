@@ -4,6 +4,7 @@ pub(crate) mod attach_runtime;
 pub(crate) mod campaign;
 pub(crate) mod chain;
 pub(crate) mod completion;
+pub(crate) mod course;
 pub(crate) mod detect;
 pub(crate) mod doc;
 pub(crate) mod doctor;
