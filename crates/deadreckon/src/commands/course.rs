@@ -973,6 +973,173 @@ pub(crate) fn accept_policy(input: AcceptPolicyInput<'_>) -> AcceptDecision {
     }
 }
 
+/// What the operator chose at the course card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardOutcome {
+    Sail,
+    Edit,
+    ForceSingle,
+    Abort,
+}
+
+/// Build the course card: WHAT / SHAPE / pieces / WHO / COST / DONE / WHY /
+/// ESCAPE, always all present. Layout is spec — pinned by a golden test, so
+/// whitespace changes are contract changes.
+pub(crate) fn course_card(plan: &LaunchPlan) -> Card {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    rows.push(("goal".to_string(), plan.goal.clone()));
+    let shape_row = match (plan.shape, plan.n) {
+        (CourseShape::Plan, Some(n)) => format!(
+            "plan - {n} pieces in parallel - confidence {:.2}",
+            plan.resolution.confidence
+        ),
+        (CourseShape::Campaign, Some(n)) => format!(
+            "campaign - {n} sub-goals - confidence {:.2}",
+            plan.resolution.confidence
+        ),
+        (CourseShape::ChainExtend, _) => format!(
+            "follow-up run (continues verified history) - confidence {:.2}",
+            plan.resolution.confidence
+        ),
+        _ => format!(
+            "single {NOUN_VERIFIED_RUN} - confidence {:.2}",
+            plan.resolution.confidence
+        ),
+    };
+    rows.push(("shape".to_string(), shape_row));
+    if plan.pieces.len() > 1 {
+        for (idx, piece) in plan.pieces.iter().enumerate() {
+            rows.push((format!("piece {}", idx + 1), piece.goal.clone()));
+        }
+    }
+    let who = [
+        plan.providers
+            .planner
+            .as_deref()
+            .map(|p| format!("planner {p}")),
+        plan.providers
+            .coder
+            .as_deref()
+            .map(|p| format!("coder {p}")),
+        plan.providers
+            .reviewer
+            .as_deref()
+            .map(|p| format!("reviewer {p}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" - ");
+    rows.push((
+        "who".to_string(),
+        if who.is_empty() {
+            "resolved at launch".to_string()
+        } else {
+            who
+        },
+    ));
+    let cost = match plan.budget.ceiling_usd {
+        Some(ceiling) if !plan.budget.split.is_empty() => format!(
+            "ceiling ${ceiling:.2} - split {}",
+            plan.budget
+                .split
+                .iter()
+                .map(|part| format!("{part:.0}"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        ),
+        Some(ceiling) => format!("ceiling ${ceiling:.2}"),
+        None => "no explicit ceiling (defaults apply)".to_string(),
+    };
+    rows.push(("cost".to_string(), cost));
+    let done = match (&plan.contract.summary, &plan.contract.caveat) {
+        (Some(summary), None) => format!("{summary} [{}]", plan.contract.source.label()),
+        (Some(summary), Some(caveat)) => format!("{summary} - caveat: {caveat}"),
+        (None, Some(caveat)) => format!("none - {caveat}"),
+        (None, None) => format!("[{}]", plan.contract.source.label()),
+    };
+    rows.push(("done".to_string(), done));
+    rows.push(("why".to_string(), plan.resolution.rationale.clone()));
+    rows.push((
+        "escape".to_string(),
+        format!("{} - {}", plan.escape.kill, plan.escape.undo),
+    ));
+    Card {
+        title: TitleLine {
+            glyph: TitleGlyph::Preview,
+            label: "course - plot, preview, sail".to_string(),
+        },
+        subtitle: None,
+        sections: vec![Section::KeyValue { rows }],
+        primary_action: Some(HintLine {
+            label: "sail".to_string(),
+            command: "Enter (or --yes)".to_string(),
+        }),
+        hints: vec![
+            HintLine {
+                label: "edit".to_string(),
+                command: "e".to_string(),
+            },
+            HintLine {
+                label: "single".to_string(),
+                command: "s".to_string(),
+            },
+            HintLine {
+                label: "abort".to_string(),
+                command: "q".to_string(),
+            },
+        ],
+    }
+}
+
+/// Render the card for a stream (plain strips borders per CardOptions).
+pub(crate) fn render_course_card(plan: &LaunchPlan, plain: bool) -> String {
+    render_card(
+        &course_card(plan),
+        &CardOptions {
+            color: !plain,
+            plain,
+            terminal_columns: Some(80),
+            no_color_env: plain,
+        },
+    )
+}
+
+/// Drive the card interaction through the existing prompter seam so tests
+/// script it: sail / edit / force-single / abort. Forcing single records the
+/// operator as the resolution source (their override is part of the audit).
+pub(crate) fn prompt_course_card(
+    plan: &mut LaunchPlan,
+    prompter: &mut dyn super::start::StartPrompter,
+) -> Result<CardOutcome> {
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Sail this course?".to_string(),
+        help: Some("Enter sails - e edits - s forces a single run - q aborts".to_string()),
+        choices: vec![
+            prompt::SelectChoice::new("sail", "Sail (launch as planned)"),
+            prompt::SelectChoice::new("edit", "Edit shape, count, or budget"),
+            prompt::SelectChoice::new("single", "Force a single run"),
+            prompt::SelectChoice::new("abort", "Abort"),
+        ],
+        default_index: 0,
+    })?;
+    Ok(match choice.id.as_str() {
+        "edit" => CardOutcome::Edit,
+        "single" => {
+            plan.shape = CourseShape::Single;
+            plan.n = None;
+            plan.pieces.truncate(1);
+            plan.resolution.source = ResolutionSource::Operator;
+            plan.resolution
+                .clamps_applied
+                .push("operator forced single at the card".to_string());
+            CardOutcome::ForceSingle
+        }
+        "abort" => CardOutcome::Abort,
+        _ => CardOutcome::Sail,
+    })
+}
+
 /// Where the plan lives inside a dispatched root (run root, plan dir,
 /// campaign dir, chain dir).
 pub(crate) fn launch_plan_path(root: &Path) -> PathBuf {
@@ -1333,6 +1500,106 @@ mod tests {
         assert_eq!(single_pkg.shape, CourseShape::Plan, "{single_pkg:?}");
         assert!(single_pkg.n.unwrap() <= 4, "{single_pkg:?}");
         assert_eq!(single_pkg.rule, "decomposition");
+    }
+
+    // ---- C-P7: the course card ----
+
+    struct ScriptedCardPrompter {
+        choice: &'static str,
+    }
+
+    impl super::super::start::StartPrompter for ScriptedCardPrompter {
+        fn select_one(&mut self, _prompt: prompt::SelectPrompt) -> Result<prompt::SelectChoice> {
+            Ok(prompt::SelectChoice::new(self.choice, self.choice))
+        }
+        fn confirm(&mut self, _question: &str, default_yes: bool) -> Result<bool> {
+            Ok(default_yes)
+        }
+        fn input(&mut self, _message: &str, _default: Option<&str>) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn course_card_golden_snapshot_pins_layout() {
+        // The card layout is spec: whitespace changes are contract changes.
+        let expected = "\
++------------------------------------------------------------------------------+
+| > course - plot, preview, sail                                               |
+|   goal          add rate limiting to the API                                 |
+|   shape         plan - 3 pieces in parallel - confidence 0.82                |
+|   piece 1       token-bucket limiter core                                    |
+|   piece 2       config surface in limits.toml                                |
+|   who           planner cli:claude-code - coder cli:claude-code - reviewe... |
+|   cost          ceiling $12.00 - split 5 / 3 / 4                             |
+|   done          pnpm test [detected]                                         |
+|   why           three independently testable pieces                          |
+|   escape        deadreckon kill latest - deadreckon undo latest              |
+|                                                                              |
+|   sail          Enter (or --yes)                                             |
+|   edit          e                                                            |
+|   single        s                                                            |
+|   abort         q                                                            |
++------------------------------------------------------------------------------+
+";
+        let rendered = render_course_card(&sample_plan(), true);
+        assert_eq!(rendered, expected, "--- actual ---\n{rendered}");
+    }
+
+    #[test]
+    fn card_always_names_done_contract_and_escape() {
+        // Whatever the plan carries, done and escape rows always render.
+        let full = render_course_card(&sample_plan(), true);
+        assert!(full.contains("done"), "{full}");
+        assert!(full.contains("pnpm test [detected]"), "{full}");
+        assert!(full.contains("deadreckon kill latest"), "{full}");
+
+        let bare = LaunchPlan::new(
+            "x",
+            CourseShape::Single,
+            CourseResolution {
+                source: ResolutionSource::Ladder,
+                confidence: 0.75,
+                rationale: "r".to_string(),
+                clamps_applied: Vec::new(),
+            },
+        );
+        let rendered = render_course_card(&bare, true);
+        assert!(rendered.contains("[none]"), "{rendered}");
+        assert!(rendered.contains("deadreckon undo latest"), "{rendered}");
+        assert!(rendered.contains("escape"), "{rendered}");
+    }
+
+    #[test]
+    fn s_key_forces_single_and_records_operator_source() {
+        let mut plan = sample_plan();
+        assert_eq!(plan.shape, CourseShape::Plan);
+        let outcome = prompt_course_card(&mut plan, &mut ScriptedCardPrompter { choice: "single" })
+            .expect("outcome");
+        assert_eq!(outcome, CardOutcome::ForceSingle);
+        assert_eq!(plan.shape, CourseShape::Single);
+        assert_eq!(plan.n, None);
+        assert!(plan.pieces.len() <= 1, "{:?}", plan.pieces);
+        assert_eq!(plan.resolution.source, ResolutionSource::Operator);
+        assert!(
+            plan.resolution
+                .clamps_applied
+                .iter()
+                .any(|clamp| clamp.contains("operator forced single")),
+            "{:?}",
+            plan.resolution
+        );
+
+        let mut sail_plan = sample_plan();
+        let outcome =
+            prompt_course_card(&mut sail_plan, &mut ScriptedCardPrompter { choice: "sail" })
+                .expect("outcome");
+        assert_eq!(outcome, CardOutcome::Sail);
+        assert_eq!(
+            sail_plan.shape,
+            CourseShape::Plan,
+            "sail leaves the plan untouched"
+        );
     }
 
     // ---- C-P6: guardrails + accept policy ----
