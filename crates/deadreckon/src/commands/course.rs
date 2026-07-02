@@ -237,6 +237,240 @@ impl LaunchPlan {
     }
 }
 
+/// How decomposable the goal text reads: enumerations, conjunction clauses,
+/// and imperative verbs. Pure text analysis — no provider, no filesystem.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DecompositionHints {
+    pub(crate) enumerated_items: usize,
+    pub(crate) conjunction_clauses: usize,
+    pub(crate) imperative_verbs: usize,
+    pub(crate) goal_words: usize,
+    pub(crate) strong: bool,
+}
+
+const IMPERATIVE_VERBS: &[&str] = &[
+    "add",
+    "build",
+    "create",
+    "document",
+    "fix",
+    "implement",
+    "migrate",
+    "refactor",
+    "remove",
+    "rename",
+    "rewrite",
+    "ship",
+    "test",
+    "update",
+    "upgrade",
+    "wire",
+    "write",
+];
+
+const CLAUSE_STOPWORDS: &[&str] = &["a", "an", "and", "as", "for", "the", "then", "to", "with"];
+
+/// Analyze the goal text for decomposability. `strong` means the goal names
+/// separable pieces explicitly (a numbered/bulleted list) or reads as two or
+/// more imperative clauses — the textual half of the plan-shape signal.
+pub(crate) fn analyze_goal_structure(goal: &str) -> DecompositionHints {
+    let lower = goal.to_ascii_lowercase();
+    let goal_words = lower.split_whitespace().count();
+    let enumerated_items = count_enumerated_items(&lower);
+    let clauses = split_conjunction_clauses(&lower);
+    let conjunction_clauses = clauses.len();
+    let imperative_verbs = clauses
+        .iter()
+        .filter(|clause| {
+            clause
+                .split_whitespace()
+                .next()
+                .is_some_and(|first| IMPERATIVE_VERBS.contains(&first))
+        })
+        .count();
+    let strong = enumerated_items >= 2 || (conjunction_clauses >= 2 && imperative_verbs >= 2);
+    DecompositionHints {
+        enumerated_items,
+        conjunction_clauses,
+        imperative_verbs,
+        goal_words,
+        strong,
+    }
+}
+
+/// Count explicit list markers: `1.` / `2)` numbered tokens or leading `-`
+/// bullets. The max of the two counts, not the sum — a goal that uses both
+/// styles is still one list.
+fn count_enumerated_items(lower: &str) -> usize {
+    let mut numbered = 0usize;
+    for token in lower.split_whitespace() {
+        let trimmed = token.trim_end_matches(['.', ')', ':']);
+        if !trimmed.is_empty()
+            && trimmed.len() <= 2
+            && trimmed.chars().all(|c| c.is_ascii_digit())
+            && token.len() > trimmed.len()
+        {
+            numbered += 1;
+        }
+    }
+    let bullets = lower
+        .split(['\n', ';'])
+        .filter(|line| line.trim_start().starts_with("- "))
+        .count();
+    numbered.max(bullets)
+}
+
+/// Split on clause separators and keep clauses that carry a real word.
+fn split_conjunction_clauses(lower: &str) -> Vec<String> {
+    let normalized = lower
+        .replace(", and ", "|")
+        .replace(" and ", "|")
+        .replace(" then ", "|")
+        .replace([';', ','], "|");
+    normalized
+        .split('|')
+        .map(str::trim)
+        .filter(|clause| {
+            clause
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .filter(|word| word.len() >= 3)
+                .any(|word| !CLAUSE_STOPWORDS.contains(&word))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Tree-size bucket, counted with hard caps so the scan is always cheap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TreeBucket {
+    #[default]
+    Small,
+    Medium,
+    Large,
+}
+
+/// The workspace shape: member count/names (a parallelism map) and size.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspaceSignal {
+    pub(crate) members: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) member_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default)]
+    pub(crate) tree_bucket: TreeBucket,
+}
+
+/// Scan the working dir for workspace structure. Pure over the filesystem,
+/// total: unreadable/absent manifests degrade to a single-package signal.
+pub(crate) fn scan_workspace(dir: &Path) -> WorkspaceSignal {
+    let (kind, member_names) = workspace_members(dir);
+    WorkspaceSignal {
+        members: member_names.len(),
+        member_names: member_names.into_iter().take(8).collect(),
+        kind,
+        tree_bucket: tree_bucket(dir),
+    }
+}
+
+fn workspace_members(dir: &Path) -> (Option<String>, Vec<String>) {
+    if let Ok(raw) = fs::read_to_string(dir.join("Cargo.toml"))
+        && let Ok(value) = toml::from_str::<toml::Value>(&raw)
+        && let Some(members) = value
+            .get("workspace")
+            .and_then(|ws| ws.get("members"))
+            .and_then(toml::Value::as_array)
+    {
+        let names: Vec<String> = members
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_string)
+            .collect();
+        if !names.is_empty() {
+            return (Some("cargo".to_string()), names);
+        }
+    }
+    if let Ok(raw) = fs::read_to_string(dir.join("pnpm-workspace.yaml")) {
+        let names: Vec<String> = raw
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- "))
+            .map(|entry| entry.trim_matches(['"', '\'']).to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        if !names.is_empty() {
+            return (Some("pnpm".to_string()), names);
+        }
+    }
+    if let Ok(raw) = fs::read_to_string(dir.join("package.json"))
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(entries) = value.get("workspaces").and_then(|w| w.as_array())
+    {
+        let names: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.as_str())
+            .map(str::to_string)
+            .collect();
+        if !names.is_empty() {
+            return (Some("npm".to_string()), names);
+        }
+    }
+    if let Ok(raw) = fs::read_to_string(dir.join("go.work")) {
+        let names: Vec<String> = raw
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("use "))
+            .map(|entry| entry.trim_matches(['(', ')']).trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        if !names.is_empty() {
+            return (Some("go-work".to_string()), names);
+        }
+    }
+    (None, Vec::new())
+}
+
+/// Bounded recursive file count: stops past the medium threshold or depth 6,
+/// and skips dot-dirs, `target`, and `node_modules` so the scan stays cheap.
+fn tree_bucket(dir: &Path) -> TreeBucket {
+    const SMALL: usize = 200;
+    const MEDIUM: usize = 2000;
+    let mut count = 0usize;
+    let mut stack = vec![(dir.to_path_buf(), 0u8)];
+    while let Some((path, depth)) = stack.pop() {
+        if depth > 6 || count > MEDIUM {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push((entry.path(), depth + 1));
+            } else {
+                count += 1;
+                if count > MEDIUM {
+                    break;
+                }
+            }
+        }
+    }
+    if count <= SMALL {
+        TreeBucket::Small
+    } else if count <= MEDIUM {
+        TreeBucket::Medium
+    } else {
+        TreeBucket::Large
+    }
+}
+
 /// Where the plan lives inside a dispatched root (run root, plan dir,
 /// campaign dir, chain dir).
 pub(crate) fn launch_plan_path(root: &Path) -> PathBuf {
@@ -400,5 +634,50 @@ mod tests {
         save_launch_plan(&path, &plan).expect("save creates parents");
         let back = load_launch_plan(&path).expect("load");
         assert_eq!(plan, back);
+    }
+
+    // ---- C-P2: decomposability + workspace signals ----
+
+    #[test]
+    fn enumerated_goal_yields_strong_decomposability() {
+        let numbered = analyze_goal_structure(
+            "1. add a token-bucket limiter 2. add the config surface 3. wire it into main",
+        );
+        assert!(numbered.enumerated_items >= 2, "{numbered:?}");
+        assert!(numbered.strong, "{numbered:?}");
+
+        let clauses = analyze_goal_structure(
+            "add rate limiting to the api and write the config docs then wire the ci gate",
+        );
+        assert!(clauses.conjunction_clauses >= 2, "{clauses:?}");
+        assert!(clauses.imperative_verbs >= 2, "{clauses:?}");
+        assert!(clauses.strong, "{clauses:?}");
+    }
+
+    #[test]
+    fn single_sentence_goal_is_weak() {
+        let hints = analyze_goal_structure("fix the typo in the readme header");
+        assert!(!hints.strong, "{hints:?}");
+        assert_eq!(hints.enumerated_items, 0, "{hints:?}");
+    }
+
+    #[test]
+    fn cargo_workspace_members_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\", \"crates/c\"]\n",
+        )
+        .expect("write");
+        let signal = scan_workspace(dir.path());
+        assert_eq!(signal.members, 3, "{signal:?}");
+        assert_eq!(signal.kind.as_deref(), Some("cargo"), "{signal:?}");
+        assert_eq!(signal.member_names[0], "crates/a");
+        assert_eq!(signal.tree_bucket, TreeBucket::Small);
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        let none = scan_workspace(empty.path());
+        assert_eq!(none.members, 0, "{none:?}");
+        assert!(none.kind.is_none(), "{none:?}");
     }
 }
