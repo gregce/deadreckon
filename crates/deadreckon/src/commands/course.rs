@@ -570,6 +570,9 @@ pub(crate) fn budget_signal(ceiling_usd: Option<f64>) -> BudgetSignal {
 /// the launch plan for audit. Total: every field degrades, none error.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SignalBundle {
+    /// The goal verbatim — part of the audit record and the keyword rules.
+    #[serde(default)]
+    pub(crate) goal: String,
     pub(crate) decomposability: DecompositionHints,
     pub(crate) contract: ContractSignal,
     pub(crate) workspace: WorkspaceSignal,
@@ -584,12 +587,37 @@ pub(crate) fn collect_signal_bundle(
     ceiling_usd: Option<f64>,
 ) -> SignalBundle {
     SignalBundle {
+        goal: goal.to_string(),
         decomposability: analyze_goal_structure(goal),
         contract: contract_signal(cwd),
         workspace: scan_workspace(cwd),
         history: history_signal(paths, cwd, goal),
         budget: budget_signal(ceiling_usd),
     }
+}
+
+/// The proven parallel-workstream keyword heuristic (carried over from the
+/// pre-Course classifier): an operator who names parallel work gets a plan.
+pub(crate) fn goal_names_parallel_workstreams(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    const WORDS: &[&str] = &[
+        "parallel",
+        "parallelize",
+        "workstream",
+        "workstreams",
+        "separable",
+    ];
+    const PHRASES: &[&str] = &[
+        "multiple independent",
+        "many modules",
+        "several modules",
+        "frontend, docs",
+        "api, frontend",
+    ];
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|word| WORDS.contains(&word))
+        || PHRASES.iter().any(|phrase| lower.contains(phrase))
 }
 
 /// The ladder's decision: shape + n + which rule fired. Campaign is never a
@@ -636,6 +664,17 @@ pub(crate) fn ladder_decision(signals: &SignalBundle) -> LadderDecision {
         };
     }
     let d = &signals.decomposability;
+    // Rule 2.5 — the operator named parallel workstreams explicitly; honor
+    // the ask (the proven keyword heuristic the old classifier carried).
+    if goal_names_parallel_workstreams(&signals.goal) {
+        let n = pieces_hint(d).clamp(2, 4);
+        return LadderDecision {
+            shape: CourseShape::Plan,
+            n: Some(n),
+            rationale: "goal names parallel or separable workstreams".to_string(),
+            rule: "parallel-keywords",
+        };
+    }
     // Rule 3 — strong decomposition + a workspace parallelism map.
     if d.strong && signals.workspace.members >= 2 {
         let members = u8::try_from(signals.workspace.members).unwrap_or(PLAN_MAX_PIECES);
@@ -666,7 +705,7 @@ pub(crate) fn ladder_decision(signals: &SignalBundle) -> LadderDecision {
     LadderDecision {
         shape: CourseShape::Single,
         n: None,
-        rationale: "goal reads focused enough for one verified run".to_string(),
+        rationale: format!("goal reads focused enough for one {NOUN_VERIFIED_RUN}"),
         rule: "default-single",
     }
 }
@@ -690,6 +729,181 @@ pub(crate) fn ladder_resolution(decision: &LadderDecision) -> CourseResolution {
         rationale: format!("[{}] {}", decision.rule, decision.rationale),
         clamps_applied: Vec::new(),
     }
+}
+
+/// The provider planner's raw draft (classify→plan upgrade of the old
+/// goal-shape classifier): typed pieces, confidence, rationale.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProviderCoursePlanDraft {
+    shape: String,
+    #[serde(default)]
+    n: Option<u8>,
+    #[serde(default)]
+    pieces: Vec<ProviderCoursePieceDraft>,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProviderCoursePieceDraft {
+    goal: String,
+    #[serde(default)]
+    done_hint: Option<String>,
+}
+
+/// Below this confidence a provider shape that disagrees with the ladder is
+/// downgraded to the ladder result (overridable via config in C-P6).
+pub(crate) const SHAPE_CONFIDENCE_FLOOR_DEFAULT: f64 = 0.7;
+
+/// The grounded planner prompt: the provider sees exactly what the ladder
+/// saw, so its answer refines measured signals instead of guessing.
+pub(crate) fn course_planner_prompt(goal: &str, signals: &SignalBundle) -> String {
+    let contract = signals
+        .contract
+        .command
+        .as_deref()
+        .unwrap_or("none detected");
+    let workspace = if signals.workspace.members >= 2 {
+        format!(
+            "{} members ({})",
+            signals.workspace.members,
+            signals.workspace.member_names.join(", ")
+        )
+    } else {
+        "single package".to_string()
+    };
+    let history = if signals.history.prior_runs > 0 {
+        format!(
+            "{} prior run(s), last status {}",
+            signals.history.prior_runs,
+            signals.history.last_status.as_deref().unwrap_or("unknown")
+        )
+    } else {
+        "no prior runs".to_string()
+    };
+    let budget = signals
+        .budget
+        .ceiling_usd
+        .map(|c| format!("${c:.2} ceiling"))
+        .unwrap_or_else(|| "no explicit ceiling".to_string());
+    format!(
+        "You are a read-only launch planner for deadreckon. Do not write files, install packages, or mutate state.\n\n\
+         Return JSON only: {{\"shape\":\"single|plan|campaign\",\"n\":3,\"pieces\":[{{\"goal\":\"...\",\"done_hint\":\"...\"}}],\"confidence\":0.8,\"rationale\":\"one short line\"}}.\n\n\
+         Rubric:\n\
+         - single: one cohesive change a single supervised run handles.\n\
+         - plan: one project with 2-6 parallelizable pieces; name each piece's goal and a done hint.\n\
+         - campaign: several independent projects, each warranting its own coordination; use sparingly.\n\
+         Signals (already measured — ground your answer in them):\n\
+         - detected done contract: {contract}\n\
+         - workspace: {workspace}\n\
+         - history: {history}\n\
+         - budget: {budget}\n\
+         - text analysis: {enumerated} enumerated items, {clauses} clauses, {imperatives} imperative verbs\n\n\
+         Goal: {goal}",
+        enumerated = signals.decomposability.enumerated_items,
+        clauses = signals.decomposability.conjunction_clauses,
+        imperatives = signals.decomposability.imperative_verbs,
+    )
+}
+
+/// The planner's resolved output: shape, clamped n, typed pieces, and a
+/// resolution carrying every clamp applied on the way.
+pub(crate) type ResolvedCoursePlan = (CourseShape, Option<u8>, Vec<CoursePiece>, CourseResolution);
+
+/// Parse + clamp a provider draft against the ladder floor. `None` on any
+/// parse miss — the caller falls back to the ladder; the planner can never
+/// fail a launch.
+pub(crate) fn resolve_provider_course_plan(
+    content: &str,
+    signals: &SignalBundle,
+    ladder: &LadderDecision,
+    confidence_floor: f64,
+) -> Option<ResolvedCoursePlan> {
+    let draft = serde_json::from_str::<ProviderCoursePlanDraft>(content)
+        .ok()
+        .or_else(|| {
+            commands::plan::json_slice(content, '{', '}')
+                .and_then(|slice| serde_json::from_str::<ProviderCoursePlanDraft>(slice).ok())
+        })?;
+    let mut clamps: Vec<String> = Vec::new();
+    let shape = match draft.shape.trim().to_ascii_lowercase().as_str() {
+        "single" | "run" => CourseShape::Single,
+        "plan" | "orchestrate" | "orchestration" | "full-plan" | "full_plan" => CourseShape::Plan,
+        "campaign" => CourseShape::Campaign,
+        _ => return None,
+    };
+    let confidence = draft.confidence.unwrap_or(0.5).clamp(0.0, 1.0);
+    let rationale = draft.rationale.unwrap_or_default().trim().to_string();
+    if rationale.is_empty() {
+        return None;
+    }
+    // Confidence-floor downgrade: an unsure planner defers to the ladder.
+    if confidence < confidence_floor && shape != ladder.shape {
+        clamps.push(format!(
+            "confidence {confidence:.2} below floor {confidence_floor:.2}: shape {} downgraded to ladder {}",
+            shape.label(),
+            ladder.shape.label()
+        ));
+        let mut resolution = ladder_resolution(ladder);
+        resolution.clamps_applied = clamps;
+        return Some((ladder.shape, ladder.n, Vec::new(), resolution));
+    }
+    // Budget clamp: an infeasible shape downgrades, recorded.
+    let (shape, downgraded) = match shape {
+        CourseShape::Campaign if !signals.budget.campaign_feasible => (CourseShape::Plan, true),
+        CourseShape::Plan if !signals.budget.plan_feasible => (CourseShape::Single, true),
+        other => (other, false),
+    };
+    if downgraded {
+        clamps.push("shape downgraded to fit the budget ceiling".to_string());
+    }
+    let n = match shape {
+        CourseShape::Single | CourseShape::ChainExtend => None,
+        CourseShape::Plan | CourseShape::Campaign => {
+            let raw = draft.n.unwrap_or(3);
+            let clamped = raw.clamp(2, PLAN_MAX_PIECES);
+            if clamped != raw {
+                clamps.push(format!("n clamped {raw}->{clamped}"));
+            }
+            Some(clamped)
+        }
+    };
+    let mut pieces: Vec<CoursePiece> = draft
+        .pieces
+        .into_iter()
+        .enumerate()
+        .map(|(idx, piece)| CoursePiece {
+            id: format!("p{}", idx + 1),
+            goal: piece.goal,
+            done_hint: piece.done_hint,
+            role: None,
+            provider: None,
+            model: None,
+            budget_usd: None,
+        })
+        .collect();
+    if let Some(n) = n
+        && pieces.len() > usize::from(n)
+    {
+        clamps.push(format!("pieces truncated {}->{}", pieces.len(), n));
+        pieces.truncate(usize::from(n));
+    }
+    if matches!(shape, CourseShape::Single) && pieces.len() > 1 {
+        pieces.truncate(1);
+    }
+    Some((
+        shape,
+        n,
+        pieces,
+        CourseResolution {
+            source: ResolutionSource::Provider,
+            confidence,
+            rationale,
+            clamps_applied: clamps,
+        },
+    ))
 }
 
 /// Where the plan lives inside a dispatched root (run root, plan dir,
@@ -988,6 +1202,7 @@ mod tests {
         ceiling: Option<f64>,
     ) -> SignalBundle {
         SignalBundle {
+            goal: String::new(),
             decomposability,
             contract: ContractSignal::default(),
             workspace: WorkspaceSignal {
@@ -1051,6 +1266,151 @@ mod tests {
         assert_eq!(single_pkg.shape, CourseShape::Plan, "{single_pkg:?}");
         assert!(single_pkg.n.unwrap() <= 4, "{single_pkg:?}");
         assert_eq!(single_pkg.rule, "decomposition");
+    }
+
+    // ---- C-P5: the provider planner ----
+
+    #[test]
+    fn planner_prompt_includes_contract_and_workspace_signals() {
+        let mut signals = bundle_with(
+            analyze_goal_structure("add limiter and write docs then wire ci"),
+            3,
+            HistorySignal::default(),
+            Some(12.0),
+        );
+        signals.contract = ContractSignal {
+            kind: Some("go".to_string()),
+            command: Some("go test ./...".to_string()),
+            caveat: None,
+            detected: true,
+        };
+        signals.workspace.member_names = vec![
+            "crates/a".to_string(),
+            "crates/b".to_string(),
+            "crates/c".to_string(),
+        ];
+        let prompt = course_planner_prompt("add limiter and write docs then wire ci", &signals);
+        assert!(prompt.contains("go test ./..."), "{prompt}");
+        assert!(prompt.contains("3 members"), "{prompt}");
+        assert!(prompt.contains("crates/a"), "{prompt}");
+        assert!(prompt.contains("$12.00 ceiling"), "{prompt}");
+        assert!(prompt.contains("Goal: add limiter"), "{prompt}");
+    }
+
+    #[test]
+    fn low_confidence_draft_downgrades_to_ladder_shape() {
+        let signals = bundle_with(
+            analyze_goal_structure("fix the readme typo"),
+            0,
+            HistorySignal::default(),
+            None,
+        );
+        let ladder = ladder_decision(&signals);
+        assert_eq!(ladder.shape, CourseShape::Single);
+        let (shape, n, pieces, resolution) = resolve_provider_course_plan(
+            r#"{"shape":"campaign","n":4,"confidence":0.3,"rationale":"maybe several things"}"#,
+            &signals,
+            &ladder,
+            SHAPE_CONFIDENCE_FLOOR_DEFAULT,
+        )
+        .expect("resolved");
+        assert_eq!(shape, CourseShape::Single, "{resolution:?}");
+        assert_eq!(n, None);
+        assert!(pieces.is_empty());
+        assert_eq!(resolution.source, ResolutionSource::Ladder);
+        assert!(
+            resolution
+                .clamps_applied
+                .iter()
+                .any(|clamp| clamp.contains("downgraded to ladder")),
+            "{resolution:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_n_clamped_and_recorded_in_clamps_applied() {
+        let signals = bundle_with(
+            analyze_goal_structure("1. a 2. b 3. c"),
+            0,
+            HistorySignal::default(),
+            None,
+        );
+        let ladder = ladder_decision(&signals);
+        let draft = r#"{"shape":"plan","n":9,"confidence":0.9,"rationale":"nine pieces",
+            "pieces":[{"goal":"a"},{"goal":"b"},{"goal":"c"},{"goal":"d"},{"goal":"e"},
+                      {"goal":"f"},{"goal":"g"},{"goal":"h"},{"goal":"i"}]}"#;
+        let (shape, n, pieces, resolution) =
+            resolve_provider_course_plan(draft, &signals, &ladder, SHAPE_CONFIDENCE_FLOOR_DEFAULT)
+                .expect("resolved");
+        assert_eq!(shape, CourseShape::Plan);
+        assert_eq!(n, Some(PLAN_MAX_PIECES));
+        assert_eq!(pieces.len(), usize::from(PLAN_MAX_PIECES));
+        assert!(
+            resolution
+                .clamps_applied
+                .iter()
+                .any(|clamp| clamp.contains("n clamped 9->6")),
+            "{resolution:?}"
+        );
+        assert!(
+            resolution
+                .clamps_applied
+                .iter()
+                .any(|clamp| clamp.contains("pieces truncated 9->6")),
+            "{resolution:?}"
+        );
+    }
+
+    #[test]
+    fn planner_failure_falls_back_to_ladder_source() {
+        let signals = bundle_with(
+            analyze_goal_structure("fix the readme typo"),
+            0,
+            HistorySignal::default(),
+            None,
+        );
+        let ladder = ladder_decision(&signals);
+        // Garbage, empty rationale, and unknown shapes all yield None — the
+        // caller then uses the ladder, so a planner can never fail a launch.
+        for content in [
+            "no json here at all",
+            r#"{"shape":"plan","n":3,"confidence":0.9,"rationale":""}"#,
+            r#"{"shape":"surprise","n":3,"confidence":0.9,"rationale":"x"}"#,
+        ] {
+            assert!(
+                resolve_provider_course_plan(
+                    content,
+                    &signals,
+                    &ladder,
+                    SHAPE_CONFIDENCE_FLOOR_DEFAULT
+                )
+                .is_none(),
+                "{content}"
+            );
+        }
+        // Budget clamp: an infeasible campaign downgrades with a record.
+        let tight = bundle_with(
+            analyze_goal_structure("1. a 2. b"),
+            0,
+            HistorySignal::default(),
+            Some(3.0),
+        );
+        let tight_ladder = ladder_decision(&tight);
+        let (shape, _n, _pieces, resolution) = resolve_provider_course_plan(
+            r#"{"shape":"campaign","n":3,"confidence":0.95,"rationale":"three projects"}"#,
+            &tight,
+            &tight_ladder,
+            SHAPE_CONFIDENCE_FLOOR_DEFAULT,
+        )
+        .expect("resolved");
+        assert_eq!(shape, CourseShape::Plan, "{resolution:?}");
+        assert!(
+            resolution
+                .clamps_applied
+                .iter()
+                .any(|clamp| clamp.contains("fit the budget")),
+            "{resolution:?}"
+        );
     }
 
     #[test]

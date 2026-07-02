@@ -8,6 +8,15 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P5: the provider planner supersedes the text-only goal-shape classifier —
+  one bounded call whose prompt embeds the SignalBundle (contract, workspace,
+  history, budget, text analysis), whose typed draft (pieces + confidence +
+  rationale) is clamped against the ladder (confidence-floor downgrade,
+  budget-fit downgrade, n and piece truncation, every clamp recorded), and
+  whose failure silently falls back to the ladder — a planner can never fail
+  a launch. Deterministic campaign classification is gone by doctrine; the
+  proven parallel-workstreams keyword heuristic survives as ladder rule 2.5,
+  owned by course so the auto-mode heuristic and the floor cannot drift.
 - C-P4: the deterministic ladder — seven ordered rules resolve a shape with
   zero provider calls (continuation on verified history, budget-floor forcing
   single, decomposition+workspace or decomposition-alone yielding a clamped

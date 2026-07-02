@@ -711,8 +711,8 @@ fn start_preview_uses_provider_goal_shape_suggestion() {
         &provider_root,
         "cli:shape",
         r#"case "$1" in
-  *"goal-shape classifier"*)
-    printf '{"shape":"campaign","n":4,"rationale":"four independent apps"}'
+  *"launch planner"*)
+    printf '{"shape":"campaign","n":4,"confidence":0.9,"rationale":"four independent apps"}'
     ;;
   *)
     printf 'unexpected provider prompt\n' >&2
@@ -6891,7 +6891,7 @@ HTML
 }}
 {script_body}
 case "$1" in
-  *"read-only planning agent"*|*"read-only merge repair planner"*|*"read-only goal-shape classifier"*) ;;
+  *"read-only planning agent"*|*"read-only merge repair planner"*|*"read-only launch planner"*) ;;
   *) write_deadreckon_notes ;;
 esac
 "#

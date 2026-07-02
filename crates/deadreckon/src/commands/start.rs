@@ -363,15 +363,6 @@ fn start_auto_mode_decision(
     )
 }
 
-#[derive(Debug, Deserialize)]
-struct ProviderGoalShapeDraft {
-    shape: String,
-    #[serde(default)]
-    n: Option<u8>,
-    #[serde(default)]
-    rationale: Option<String>,
-}
-
 fn start_goal_shape_should_classify(
     args: &StartCommandArgs,
     eligibility: StartPromptEligibility,
@@ -416,6 +407,12 @@ pub(crate) fn goal_shape_provider_route(
     .and_then(|selection| selection.provider)
 }
 
+/// Classify the goal's launch shape. Superseded internals (C-P5): the old
+/// text-only classifier is gone — a SignalBundle grounds one bounded planner
+/// call whose draft is clamped against the deterministic ladder, and the
+/// ladder itself is the provider-free floor. The `GoalShapeRecommendation`
+/// output shape is unchanged so preview records and campaign seeding keep
+/// working until dispatch consumes the plan file directly (C-P9).
 pub(crate) async fn classify_goal_shape_for_start(
     paths: &DeadreckonPaths,
     cwd: &Path,
@@ -423,27 +420,41 @@ pub(crate) async fn classify_goal_shape_for_start(
     provider: Option<&str>,
     plain: bool,
 ) -> GoalShapeRecommendation {
+    let defaults_ceiling = config_defaults(paths).ok().and_then(|d| d.max_spend);
+    let signals = commands::course::collect_signal_bundle(paths, cwd, goal, defaults_ceiling);
+    let ladder = commands::course::ladder_decision(&signals);
     if let Some(provider) = provider
         && provider != "smoke"
         && !provider.starts_with("smoke:")
-        && let Some(recommendation) =
-            provider_goal_shape_recommendation(paths, cwd, goal, provider, plain).await
+        && let Some(resolved) =
+            provider_course_plan(paths, cwd, goal, provider, plain, &signals, &ladder).await
     {
-        return recommendation;
+        let (shape, n, _pieces, resolution) = resolved;
+        return GoalShapeRecommendation {
+            schema_version: 1,
+            goal: goal.to_string(),
+            shape: course_shape_to_goal_shape(shape),
+            n,
+            rationale: resolution.rationale,
+            source: GoalShapeSource::Provider,
+            provider: Some(provider.to_string()),
+        };
     }
-    fallback_goal_shape_recommendation(goal)
+    ladder_goal_shape_recommendation(goal, &ladder)
 }
 
-async fn provider_goal_shape_recommendation(
+async fn provider_course_plan(
     paths: &DeadreckonPaths,
     cwd: &Path,
     goal: &str,
     provider: &str,
     plain: bool,
-) -> Option<GoalShapeRecommendation> {
+    signals: &commands::course::SignalBundle,
+    ladder: &commands::course::LadderDecision,
+) -> Option<commands::course::ResolvedCoursePlan> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), Some(provider)).ok()?;
     let request = ProviderRequest {
-        prompt: goal_shape_prompt(goal),
+        prompt: commands::course::course_planner_prompt(goal, signals),
         max_output_tokens: 512,
         cwd: Some(cwd.to_path_buf()),
         output_path: None,
@@ -453,125 +464,50 @@ async fn provider_goal_shape_recommendation(
     };
     let response = tokio::time::timeout(
         Duration::from_secs(5),
-        maybe_with_cli_wait_status(!plain, "classifying goal shape", router.complete(&request)),
+        maybe_with_cli_wait_status(!plain, "plotting the course", router.complete(&request)),
     )
     .await
     .ok()?
     .ok()?;
-    parse_provider_goal_shape(goal, &response.provider, &response.content)
-}
-
-fn goal_shape_prompt(goal: &str) -> String {
-    format!(
-        "You are a read-only goal-shape classifier for deadreckon. Do not write files, create temporary files, install packages, commit, delete, move, or mutate state.\n\nReturn JSON only: {{\"shape\":\"single|orchestrate|campaign\",\"n\":2,\"rationale\":\"one short line\"}}.\n\nRubric:\n- single: one cohesive change a single supervised run handles.\n- orchestrate: one project with parallelizable subtasks.\n- campaign: several independent projects, each warranting its own coordination.\n\nIf shape is orchestrate or campaign, include n from 2 through 6. Keep rationale short. Goal: {goal}"
+    commands::course::resolve_provider_course_plan(
+        &response.content,
+        signals,
+        ladder,
+        commands::course::SHAPE_CONFIDENCE_FLOOR_DEFAULT,
     )
 }
 
-pub(crate) fn parse_provider_goal_shape(
-    goal: &str,
-    provider: &str,
-    content: &str,
-) -> Option<GoalShapeRecommendation> {
-    let parsed = serde_json::from_str::<ProviderGoalShapeDraft>(content)
-        .ok()
-        .or_else(|| {
-            commands::plan::json_slice(content, '{', '}')
-                .and_then(|slice| serde_json::from_str::<ProviderGoalShapeDraft>(slice).ok())
-        })?;
-    let shape = parse_goal_shape(&parsed.shape)?;
-    let rationale = parsed.rationale.unwrap_or_default().trim().to_string();
-    if rationale.is_empty() {
-        return None;
-    }
-    let n = goal_shape_count(shape, parsed.n);
-    Some(GoalShapeRecommendation {
-        schema_version: 1,
-        goal: goal.to_string(),
-        shape,
-        n,
-        rationale,
-        source: GoalShapeSource::Provider,
-        provider: Some(provider.to_string()),
-    })
-}
-
-fn parse_goal_shape(value: &str) -> Option<GoalShape> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "single" | "run" => Some(GoalShape::Single),
-        "orchestrate" | "orchestration" | "full-plan" | "full_plan" => Some(GoalShape::Orchestrate),
-        "campaign" => Some(GoalShape::Campaign),
-        _ => None,
-    }
-}
-
-fn goal_shape_count(shape: GoalShape, n: Option<u8>) -> Option<u8> {
+fn course_shape_to_goal_shape(shape: commands::course::CourseShape) -> GoalShape {
     match shape {
-        GoalShape::Single => None,
-        GoalShape::Orchestrate | GoalShape::Campaign => Some(n.unwrap_or(3).clamp(2, 6)),
+        // Chain-extend rides the single-run recommendation until dispatch
+        // consumes the plan file directly (C-P9); the rationale carries the
+        // continuation story.
+        commands::course::CourseShape::Single | commands::course::CourseShape::ChainExtend => {
+            GoalShape::Single
+        }
+        commands::course::CourseShape::Plan => GoalShape::Orchestrate,
+        commands::course::CourseShape::Campaign => GoalShape::Campaign,
     }
 }
 
-pub(crate) fn fallback_goal_shape_recommendation(goal: &str) -> GoalShapeRecommendation {
-    let lower = goal.to_ascii_lowercase();
-    let (shape, n, rationale) = if start_goal_recommends_full_plan(&lower) {
-        (
-            GoalShape::Orchestrate,
-            Some(commands::orchestrate::recommend_child_count_for_goal(
-                goal,
-                CliPlanMode::FullPlan,
-            )),
-            "goal names parallel or separable workstreams".to_string(),
-        )
-    } else {
-        let clauses = deterministic_campaign_clause_count(goal);
-        if clauses >= 2 {
-            (
-                GoalShape::Campaign,
-                Some((clauses as u8).clamp(2, 6)),
-                format!("goal reads as {clauses} independent clauses"),
-            )
-        } else {
-            (
-                GoalShape::Single,
-                None,
-                format!("goal looks focused enough for one {NOUN_VERIFIED_RUN}"),
-            )
-        }
-    };
+/// Convert a ladder decision into the recommendation shape the preview and
+/// campaign seeding consume — the provider-free classification floor.
+/// Campaign is never a deterministic outcome (Course doctrine: deterministic
+/// campaign selection is a spend hazard).
+pub(crate) fn ladder_goal_shape_recommendation(
+    goal: &str,
+    ladder: &commands::course::LadderDecision,
+) -> GoalShapeRecommendation {
+    let resolution = commands::course::ladder_resolution(ladder);
     GoalShapeRecommendation {
         schema_version: 1,
         goal: goal.to_string(),
-        shape,
-        n,
-        rationale,
+        shape: course_shape_to_goal_shape(ladder.shape),
+        n: ladder.n,
+        rationale: resolution.rationale,
         source: GoalShapeSource::Fallback,
         provider: None,
     }
-}
-
-fn deterministic_campaign_clause_count(goal: &str) -> usize {
-    let lower = goal.to_ascii_lowercase();
-    let normalized = lower
-        .replace(", and ", "|")
-        .replace(" and ", "|")
-        .replace(" then ", "|")
-        .replace([';', ','], "|");
-    normalized
-        .split('|')
-        .map(str::trim)
-        .filter(|clause| goal_shape_clause_is_nounish(clause))
-        .count()
-}
-
-fn goal_shape_clause_is_nounish(clause: &str) -> bool {
-    const STOP: &[&str] = &[
-        "a", "an", "and", "as", "build", "create", "do", "fix", "for", "make", "the", "then", "to",
-        "with",
-    ];
-    clause
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|word| word.len() >= 3)
-        .any(|word| !STOP.contains(&word))
 }
 
 fn goal_shape_to_start_mode(shape: GoalShape) -> StartSelectedMode {
@@ -654,24 +590,9 @@ fn start_goal_recommends_review(lower_goal: &str) -> bool {
 }
 
 fn start_goal_recommends_full_plan(lower_goal: &str) -> bool {
-    let words = [
-        "parallel",
-        "parallelize",
-        "workstream",
-        "workstreams",
-        "separable",
-    ];
-    let phrases = [
-        "multiple independent",
-        "many modules",
-        "several modules",
-        "frontend, docs",
-        "api, frontend",
-    ];
-    words
-        .iter()
-        .any(|word| start_goal_contains_word(lower_goal, word))
-        || phrases.iter().any(|phrase| lower_goal.contains(phrase))
+    // One keyword list, owned by the course ladder (rule 2.5), so the
+    // auto-mode heuristic and the deterministic floor can never drift.
+    commands::course::goal_names_parallel_workstreams(lower_goal)
 }
 
 fn start_goal_contains_word(lower_goal: &str, needle: &str) -> bool {
