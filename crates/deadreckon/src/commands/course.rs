@@ -592,6 +592,106 @@ pub(crate) fn collect_signal_bundle(
     }
 }
 
+/// The ladder's decision: shape + n + which rule fired. Campaign is never a
+/// ladder outcome — it requires the provider planner or the operator.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LadderDecision {
+    pub(crate) shape: CourseShape,
+    pub(crate) n: Option<u8>,
+    pub(crate) rationale: String,
+    pub(crate) rule: &'static str,
+}
+
+pub(crate) const PLAN_MAX_PIECES: u8 = 6;
+
+/// Rules in order; first match decides. Deterministic, total, provider-free —
+/// this is the floor the planner can only refine, and the exact behavior of
+/// the no-provider path.
+pub(crate) fn ladder_decision(signals: &SignalBundle) -> LadderDecision {
+    // Rule 1 — verified history on this task key: continue, don't restart.
+    if signals.history.last_verified_same_task {
+        return LadderDecision {
+            shape: CourseShape::ChainExtend,
+            n: None,
+            rationale: format!(
+                "prior verified run{} on this task — continuing beats restarting",
+                signals
+                    .history
+                    .last_run_id
+                    .as_deref()
+                    .map(|id| format!(" {id}"))
+                    .unwrap_or_default()
+            ),
+            rule: "continuation",
+        };
+    }
+    // Rule 2 — money decides: never propose a shape that cannot fit.
+    if !signals.budget.plan_feasible {
+        return LadderDecision {
+            shape: CourseShape::Single,
+            n: None,
+            rationale: "budget ceiling below the plan floor — single run fits the money"
+                .to_string(),
+            rule: "budget",
+        };
+    }
+    let d = &signals.decomposability;
+    // Rule 3 — strong decomposition + a workspace parallelism map.
+    if d.strong && signals.workspace.members >= 2 {
+        let members = u8::try_from(signals.workspace.members).unwrap_or(PLAN_MAX_PIECES);
+        let n = pieces_hint(d).min(members).clamp(2, PLAN_MAX_PIECES);
+        return LadderDecision {
+            shape: CourseShape::Plan,
+            n: Some(n),
+            rationale: format!(
+                "{} separable pieces across {} workspace members",
+                pieces_hint(d),
+                signals.workspace.members
+            ),
+            rule: "decomposition+workspace",
+        };
+    }
+    // Rule 4 — strong decomposition in a single-package tree.
+    if d.strong {
+        let n = pieces_hint(d).clamp(2, 4);
+        return LadderDecision {
+            shape: CourseShape::Plan,
+            n: Some(n),
+            rationale: format!("{} separable pieces named in the goal", pieces_hint(d)),
+            rule: "decomposition",
+        };
+    }
+    // Rules 5/7 — focused goal (or nothing else fired): one supervised run.
+    // Rule 6 (campaign) intentionally does not exist here.
+    LadderDecision {
+        shape: CourseShape::Single,
+        n: None,
+        rationale: "goal reads focused enough for one verified run".to_string(),
+        rule: "default-single",
+    }
+}
+
+fn pieces_hint(d: &DecompositionHints) -> u8 {
+    let hint = d.enumerated_items.max(d.conjunction_clauses);
+    u8::try_from(hint).unwrap_or(PLAN_MAX_PIECES)
+}
+
+/// Wrap a ladder decision as a plan resolution. Rule-certain about what it
+/// saw, conservative about what it means: single/continuation clear the
+/// default auto-accept floor, plan sits below it so `--yes` still shows the
+/// card unless the operator raised confidence deliberately.
+pub(crate) fn ladder_resolution(decision: &LadderDecision) -> CourseResolution {
+    CourseResolution {
+        source: ResolutionSource::Ladder,
+        confidence: match decision.shape {
+            CourseShape::Single | CourseShape::ChainExtend => 0.75,
+            _ => 0.6,
+        },
+        rationale: format!("[{}] {}", decision.rule, decision.rationale),
+        clamps_applied: Vec::new(),
+    }
+}
+
 /// Where the plan lives inside a dispatched root (run root, plan dir,
 /// campaign dir, chain dir).
 pub(crate) fn launch_plan_path(root: &Path) -> PathBuf {
@@ -877,5 +977,108 @@ mod tests {
         let open = budget_signal(None);
         assert!(open.plan_feasible, "{open:?}");
         assert!(open.campaign_feasible, "{open:?}");
+    }
+
+    // ---- C-P4: the deterministic ladder ----
+
+    fn bundle_with(
+        decomposability: DecompositionHints,
+        members: usize,
+        history: HistorySignal,
+        ceiling: Option<f64>,
+    ) -> SignalBundle {
+        SignalBundle {
+            decomposability,
+            contract: ContractSignal::default(),
+            workspace: WorkspaceSignal {
+                members,
+                member_names: Vec::new(),
+                kind: None,
+                tree_bucket: TreeBucket::Small,
+            },
+            history,
+            budget: budget_signal(ceiling),
+        }
+    }
+
+    #[test]
+    fn ladder_prefers_continuation_on_verified_history() {
+        let decision = ladder_decision(&bundle_with(
+            analyze_goal_structure("1. build a 2. build b 3. build c"),
+            4,
+            HistorySignal {
+                prior_runs: 2,
+                last_verified_same_task: true,
+                last_run_id: Some("run-42".to_string()),
+                last_status: Some("completed".to_string()),
+            },
+            None,
+        ));
+        assert_eq!(decision.shape, CourseShape::ChainExtend, "{decision:?}");
+        assert_eq!(decision.rule, "continuation");
+        assert!(decision.rationale.contains("run-42"), "{decision:?}");
+    }
+
+    #[test]
+    fn small_budget_forces_single() {
+        let decision = ladder_decision(&bundle_with(
+            analyze_goal_structure("1. build a 2. build b 3. build c"),
+            4,
+            HistorySignal::default(),
+            Some(1.0),
+        ));
+        assert_eq!(decision.shape, CourseShape::Single, "{decision:?}");
+        assert_eq!(decision.rule, "budget");
+    }
+
+    #[test]
+    fn enumerated_goal_plus_workspace_yields_plan_n_clamped() {
+        let hints = analyze_goal_structure(
+            "1. api 2. config 3. docs 4. tests 5. ci 6. release 7. site 8. bench",
+        );
+        let decision = ladder_decision(&bundle_with(hints, 3, HistorySignal::default(), None));
+        assert_eq!(decision.shape, CourseShape::Plan, "{decision:?}");
+        // Clamped by workspace members (3), not the raw enumeration (8).
+        assert_eq!(decision.n, Some(3), "{decision:?}");
+        assert_eq!(decision.rule, "decomposition+workspace");
+
+        let single_pkg = ladder_decision(&bundle_with(
+            analyze_goal_structure("add limiter and write docs then wire ci"),
+            0,
+            HistorySignal::default(),
+            None,
+        ));
+        assert_eq!(single_pkg.shape, CourseShape::Plan, "{single_pkg:?}");
+        assert!(single_pkg.n.unwrap() <= 4, "{single_pkg:?}");
+        assert_eq!(single_pkg.rule, "decomposition");
+    }
+
+    #[test]
+    fn ladder_never_selects_campaign() {
+        // Sweep a grid of synthetic bundles — many clauses, many members,
+        // open budgets — and assert campaign is structurally unreachable.
+        let goals = [
+            "fix the readme typo",
+            "add limiter and write docs then wire ci",
+            "1. api 2. config 3. docs 4. tests 5. ci 6. release",
+            "rebuild billing, notifications, admin, search, and export",
+        ];
+        for goal in goals {
+            for members in [0usize, 2, 6, 12] {
+                for ceiling in [None, Some(1.0), Some(50.0), Some(500.0)] {
+                    let decision = ladder_decision(&bundle_with(
+                        analyze_goal_structure(goal),
+                        members,
+                        HistorySignal::default(),
+                        ceiling,
+                    ));
+                    assert_ne!(
+                        decision.shape,
+                        CourseShape::Campaign,
+                        "campaign must never be ladder-chosen: {goal} {members} {ceiling:?}"
+                    );
+                }
+            }
+        }
     }
 }
