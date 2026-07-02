@@ -2261,6 +2261,24 @@ fn deterministic_recommendation(goal: &str) -> GoalShapeRecommendation {
 }
 
 #[test]
+fn planner_timeout_gives_cli_routes_room_to_answer() {
+    // A cold `claude -p` takes ~10-15s; the 5s HTTP ceiling guaranteed a
+    // silent ladder fallback for every CLI-routed launch.
+    assert_eq!(
+        super::commands::start::course_planner_timeout("cli:claude-code").as_secs(),
+        30
+    );
+    assert_eq!(
+        super::commands::start::course_planner_timeout("cli:codex").as_secs(),
+        30
+    );
+    assert_eq!(
+        super::commands::start::course_planner_timeout("anthropic").as_secs(),
+        5
+    );
+}
+
+#[test]
 fn goal_shape_falls_back_to_deterministic_when_provider_unavailable() {
     // C-P5 doctrine change: campaign is never a deterministic outcome — the
     // ladder biases single (wrong-single costs a retry; wrong-campaign costs

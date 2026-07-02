@@ -16,6 +16,11 @@ collapse to runs, workers can propose reshapes that stay inert until
 start-then-watch one motion. Closes the campaign/chain auto-detect
 friendliness cells. See AS-BUILT §46.
 
+- Fix: the launch planner's timeout is now route-aware — 30s for `cli:*`
+  providers (a cold `claude -p` needs ~10-15s; the old 5s HTTP-tuned ceiling
+  guaranteed a silent ladder fallback on every CLI-routed launch), 5s for
+  HTTP routes. Found by a real launch whose planner returned an excellent
+  3-piece plan 8 seconds after the harness had stopped listening.
 - C-P14: friendliness closure (campaign/chain auto-detect cells flip to
   pass with the planner-seeded `--n` and ladder continuation), AS-BUILT §46
   (Course: Launch Planning and Reshaping) + §22 shipped entry, and Course
