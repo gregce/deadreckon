@@ -468,7 +468,7 @@ async fn provider_course_plan(
         cancellation_token: None,
     };
     let response = tokio::time::timeout(
-        Duration::from_secs(5),
+        course_planner_timeout(provider),
         maybe_with_cli_wait_status(!plain, "plotting the course", router.complete(&request)),
     )
     .await
@@ -480,6 +480,17 @@ async fn provider_course_plan(
         ladder,
         commands::course::SHAPE_CONFIDENCE_FLOOR_DEFAULT,
     )
+}
+
+/// CLI subagent providers cold-start in ~10-15s; the 5s ceiling that suits
+/// HTTP routes guarantees a silent ladder fallback for them. The planner is
+/// one bounded read-only call either way — give CLIs room to answer.
+pub(crate) fn course_planner_timeout(provider: &str) -> Duration {
+    if provider.starts_with("cli:") {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(5)
+    }
 }
 
 fn course_shape_to_goal_shape(shape: commands::course::CourseShape) -> GoalShape {
