@@ -471,6 +471,127 @@ fn tree_bucket(dir: &Path) -> TreeBucket {
     }
 }
 
+/// The detected done contract as a launch signal (summary only; the gate
+/// compiles the real spec at run time via the same detector).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContractSignal {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) caveat: Option<String>,
+    pub(crate) detected: bool,
+}
+
+/// Reuses the Polyglot detector so `start` and the gate agree on what "done"
+/// will mean before any money is spent.
+pub(crate) fn contract_signal(working_dir: &Path) -> ContractSignal {
+    let kind = deadreckon_core::acceptance_defaults::detect_project_kind(working_dir);
+    let command = deadreckon_core::acceptance_defaults::default_command_for(&kind, working_dir);
+    let caveat = deadreckon_core::acceptance_defaults::detection_caveat(&kind);
+    let detected = command.is_some() && caveat.is_none();
+    ContractSignal {
+        kind: Some(deadreckon_core::acceptance_defaults::kind_label(&kind)),
+        command,
+        caveat,
+        detected,
+    }
+}
+
+/// Prior work on this task key: the continuation signal.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HistorySignal {
+    pub(crate) prior_runs: usize,
+    pub(crate) last_verified_same_task: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_status: Option<String>,
+}
+
+/// Prior runs whose goal derives the same task key in this workspace scope.
+/// Total: unreadable scope/state degrades to the empty signal.
+pub(crate) fn history_signal(paths: &DeadreckonPaths, cwd: &Path, goal: &str) -> HistorySignal {
+    let Ok(scope) = workspace_scope(cwd) else {
+        return HistorySignal::default();
+    };
+    let key = task_key(goal);
+    let Ok(mut runs) = deadreckon_core::list_runs(paths, Some(&scope)) else {
+        return HistorySignal::default();
+    };
+    runs.retain(|entry| task_key(&entry.goal) == key);
+    runs.sort_by_key(|entry| entry.updated_at);
+    let last = runs.last();
+    HistorySignal {
+        prior_runs: runs.len(),
+        last_verified_same_task: last
+            .map(|entry| matches!(entry.status, deadreckon_core::RunStatus::Completed))
+            .unwrap_or(false),
+        last_run_id: last.map(|entry| entry.run_id.clone()),
+        last_status: last.map(|entry| format!("{:?}", entry.status).to_ascii_lowercase()),
+    }
+}
+
+/// Whether the requested/default money envelope fits each shape. A shape the
+/// budget cannot fund is never proposed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BudgetSignal {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ceiling_usd: Option<f64>,
+    pub(crate) plan_feasible: bool,
+    pub(crate) campaign_feasible: bool,
+}
+
+/// The smallest sensible per-piece spend; a plan of n needs n of these.
+pub(crate) const MIN_PIECE_BUDGET_USD: f64 = 1.0;
+pub(crate) const MIN_PLAN_PIECES: u8 = 2;
+/// A campaign multiplies plan cost by its sub count.
+pub(crate) const MIN_CAMPAIGN_SUBS: u8 = 2;
+
+pub(crate) fn plan_feasible_floor(n: u8) -> f64 {
+    f64::from(n.max(MIN_PLAN_PIECES)) * MIN_PIECE_BUDGET_USD
+}
+
+pub(crate) fn campaign_feasible_floor(n: u8) -> f64 {
+    f64::from(n.max(MIN_CAMPAIGN_SUBS)) * plan_feasible_floor(MIN_PLAN_PIECES)
+}
+
+pub(crate) fn budget_signal(ceiling_usd: Option<f64>) -> BudgetSignal {
+    BudgetSignal {
+        ceiling_usd,
+        plan_feasible: ceiling_usd.is_none_or(|c| c >= plan_feasible_floor(MIN_PLAN_PIECES)),
+        campaign_feasible: ceiling_usd
+            .is_none_or(|c| c >= campaign_feasible_floor(MIN_CAMPAIGN_SUBS)),
+    }
+}
+
+/// Everything the shape decision saw, computed free and embedded verbatim in
+/// the launch plan for audit. Total: every field degrades, none error.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SignalBundle {
+    pub(crate) decomposability: DecompositionHints,
+    pub(crate) contract: ContractSignal,
+    pub(crate) workspace: WorkspaceSignal,
+    pub(crate) history: HistorySignal,
+    pub(crate) budget: BudgetSignal,
+}
+
+pub(crate) fn collect_signal_bundle(
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+    goal: &str,
+    ceiling_usd: Option<f64>,
+) -> SignalBundle {
+    SignalBundle {
+        decomposability: analyze_goal_structure(goal),
+        contract: contract_signal(cwd),
+        workspace: scan_workspace(cwd),
+        history: history_signal(paths, cwd, goal),
+        budget: budget_signal(ceiling_usd),
+    }
+}
+
 /// Where the plan lives inside a dispatched root (run root, plan dir,
 /// campaign dir, chain dir).
 pub(crate) fn launch_plan_path(root: &Path) -> PathBuf {
@@ -679,5 +800,82 @@ mod tests {
         let none = scan_workspace(empty.path());
         assert_eq!(none.members, 0, "{none:?}");
         assert!(none.kind.is_none(), "{none:?}");
+    }
+
+    // ---- C-P3: contract + history + budget signals ----
+
+    #[test]
+    fn contract_signal_reuses_polyglot_detection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("go.mod"), "module example.com/m\n").expect("write");
+        let signal = contract_signal(dir.path());
+        assert_eq!(
+            signal.command.as_deref(),
+            Some("go test ./..."),
+            "{signal:?}"
+        );
+        assert!(signal.detected, "{signal:?}");
+        assert!(signal.caveat.is_none(), "{signal:?}");
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        let unknown = contract_signal(empty.path());
+        assert!(!unknown.detected, "{unknown:?}");
+        assert!(unknown.caveat.is_some(), "{unknown:?}");
+    }
+
+    #[test]
+    fn prior_verified_run_sets_continuation_signal() {
+        use deadreckon_core::paths::DeadreckonPaths;
+        use deadreckon_core::state::{RunOptions, create_run, save_state};
+        use deadreckon_core::{PhaseId, PhaseStatus};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let goal = "add rate limiting to the api";
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: goal.to_string(),
+                cwd: repo.clone(),
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("course-hist-0001".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("create_run");
+        state
+            .set_phase_status(PhaseId(60), PhaseStatus::Completed)
+            .expect("complete");
+        save_state(&state).expect("save");
+
+        let signal = history_signal(&paths, &repo, goal);
+        assert_eq!(signal.prior_runs, 1, "{signal:?}");
+        assert!(signal.last_verified_same_task, "{signal:?}");
+        assert_eq!(signal.last_run_id.as_deref(), Some("course-hist-0001"));
+
+        let other = history_signal(&paths, &repo, "a completely different goal");
+        assert_eq!(other.prior_runs, 0, "{other:?}");
+        assert!(!other.last_verified_same_task, "{other:?}");
+    }
+
+    #[test]
+    fn budget_below_plan_floor_marks_plan_infeasible() {
+        let tiny = budget_signal(Some(1.0));
+        assert!(!tiny.plan_feasible, "{tiny:?}");
+        assert!(!tiny.campaign_feasible, "{tiny:?}");
+
+        let plan_only = budget_signal(Some(3.0));
+        assert!(plan_only.plan_feasible, "{plan_only:?}");
+        assert!(!plan_only.campaign_feasible, "{plan_only:?}");
+
+        let open = budget_signal(None);
+        assert!(open.plan_feasible, "{open:?}");
+        assert!(open.campaign_feasible, "{open:?}");
     }
 }

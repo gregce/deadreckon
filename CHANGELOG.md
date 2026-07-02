@@ -8,6 +8,11 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P3: the SignalBundle completes — `contract_signal` (the Polyglot detector
+  as a launch signal, so `start` and the gate agree on "done" pre-spend),
+  `history_signal` (prior runs by task key; verified history = continuation),
+  `budget_signal` + feasibility floors (a shape the money cannot fund is
+  never proposed), and `collect_signal_bundle` tying all five together.
 - C-P2: the first half of the SignalBundle — `analyze_goal_structure`
   (enumerations, conjunction clauses, imperative verbs → a `strong`
   decomposability verdict) and `scan_workspace` (Cargo/pnpm/npm/go.work
