@@ -8,6 +8,11 @@ deterministic signal bundle plus one clamped provider call resolves a durable
 the shape can be corrected mid-voyage. Phases land bottom-up; this section
 graduates to a stable milestone at C-P14.
 
+- C-P4: the deterministic ladder — seven ordered rules resolve a shape with
+  zero provider calls (continuation on verified history, budget-floor forcing
+  single, decomposition+workspace or decomposition-alone yielding a clamped
+  plan, default single). Campaign is structurally unreachable from the ladder
+  (swept by a grid depth test); every decision records which rule fired.
 - C-P3: the SignalBundle completes — `contract_signal` (the Polyglot detector
   as a launch signal, so `start` and the gate agree on "done" pre-spend),
   `history_signal` (prior runs by task key; verified history = continuation),
