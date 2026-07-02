@@ -31,8 +31,8 @@ use super::commands::start::{
     GoalShape, GoalShapeRecommendation, GoalShapeSource, StartDoneAction, StartDoneCriteriaSource,
     StartLaunchInput, StartPromptEligibility, StartPrompter, StartProviderSource,
     StartSelectedMode, StartSelectionSource, StartSourceMode, add_start_history_actions,
-    apply_goal_shape_recommendation, fallback_goal_shape_recommendation, maybe_prompt_start_mode,
-    parse_provider_goal_shape, prompt_start_done_criteria, prompt_start_existing_done_criteria,
+    apply_goal_shape_recommendation, ladder_goal_shape_recommendation, maybe_prompt_start_mode,
+    prompt_start_done_criteria, prompt_start_existing_done_criteria,
     resolve_start_orchestration_options, start_done_materialization_request, start_launch_decision,
     start_launch_preview_facts, start_provider_role_summary,
 };
@@ -2212,41 +2212,72 @@ fn start_auto_recommends_full_plan_for_parallel_goal() {
 
 #[test]
 fn goal_shape_classifier_validates_and_clamps_provider_output() {
-    let recommendation = parse_provider_goal_shape(
-        "rebuild billing, notifications, and admin",
-        "cli:planner",
-        r#"{"shape":"campaign","n":9,"rationale":"three independent services"}"#,
+    // C-P5: the planner draft is parsed and clamped by the course resolver;
+    // a confident campaign draft survives with n clamped into 2..=6.
+    let signals = super::commands::course::SignalBundle {
+        budget: super::commands::course::budget_signal(None),
+        ..Default::default()
+    };
+    let ladder = super::commands::course::ladder_decision(&signals);
+    let (shape, n, _pieces, resolution) = super::commands::course::resolve_provider_course_plan(
+        r#"{"shape":"campaign","n":9,"confidence":0.9,"rationale":"three independent services"}"#,
+        &signals,
+        &ladder,
+        super::commands::course::SHAPE_CONFIDENCE_FLOOR_DEFAULT,
     )
-    .expect("recommendation");
+    .expect("resolved");
 
-    assert_eq!(recommendation.shape, GoalShape::Campaign);
-    assert_eq!(recommendation.n, Some(6));
-    assert_eq!(recommendation.source, GoalShapeSource::Provider);
-    assert_eq!(recommendation.provider.as_deref(), Some("cli:planner"));
+    assert_eq!(shape, super::commands::course::CourseShape::Campaign);
+    assert_eq!(n, Some(6));
     assert!(
-        parse_provider_goal_shape(
-            "bad",
-            "cli:planner",
+        resolution
+            .clamps_applied
+            .iter()
+            .any(|clamp| clamp.contains("9->6")),
+        "{resolution:?}"
+    );
+    assert!(
+        super::commands::course::resolve_provider_course_plan(
             r#"{"shape":"surprise","n":3,"rationale":"bad"}"#,
+            &signals,
+            &ladder,
+            super::commands::course::SHAPE_CONFIDENCE_FLOOR_DEFAULT,
         )
         .is_none()
     );
 }
 
+fn deterministic_recommendation(goal: &str) -> GoalShapeRecommendation {
+    // The provider-free floor: a fresh SignalBundle through the ladder, then
+    // the same conversion `classify_goal_shape_for_start` uses on fallback.
+    let signals = super::commands::course::SignalBundle {
+        decomposability: super::commands::course::analyze_goal_structure(goal),
+        budget: super::commands::course::budget_signal(None),
+        ..Default::default()
+    };
+    ladder_goal_shape_recommendation(goal, &super::commands::course::ladder_decision(&signals))
+}
+
 #[test]
 fn goal_shape_falls_back_to_deterministic_when_provider_unavailable() {
-    let recommendation =
-        fallback_goal_shape_recommendation("rebuild billing, notifications, and admin");
+    // C-P5 doctrine change: campaign is never a deterministic outcome — the
+    // ladder biases single (wrong-single costs a retry; wrong-campaign costs
+    // real money). The provider planner is the only path that may propose
+    // campaign, and it is clamped and confirmed downstream.
+    let recommendation = deterministic_recommendation("rebuild billing, notifications, and admin");
 
-    assert_eq!(recommendation.shape, GoalShape::Campaign);
-    assert_eq!(recommendation.n, Some(3));
+    assert_eq!(recommendation.shape, GoalShape::Single);
     assert_eq!(recommendation.source, GoalShapeSource::Fallback);
-    assert!(recommendation.rationale.contains("independent clauses"));
+    assert!(
+        recommendation.rationale.starts_with('['),
+        "rationale names the ladder rule: {}",
+        recommendation.rationale
+    );
 }
 
 #[test]
 fn single_change_goal_classifies_as_single() {
-    let recommendation = fallback_goal_shape_recommendation("fix the login button spacing");
+    let recommendation = deterministic_recommendation("fix the login button spacing");
 
     assert_eq!(recommendation.shape, GoalShape::Single);
     assert_eq!(recommendation.n, None);
