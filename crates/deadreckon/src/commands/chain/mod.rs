@@ -312,11 +312,14 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
             why_failed,
             json,
         ),
-        "attach" => chain_attach_command(
-            &paths,
-            args.get(1).map(String::as_str).unwrap_or("latest"),
-            plain,
-        ),
+        "attach" => {
+            chain_attach_command(
+                &paths,
+                args.get(1).map(String::as_str).unwrap_or("latest"),
+                plain,
+            )
+            .await
+        }
         "pause" => chain_pause_command(
             &paths,
             args.get(1).map(String::as_str).unwrap_or("latest"),
@@ -672,7 +675,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
     )
     .await?;
     if auto_attach {
-        chain_attach_command(&paths, &chain_id, false)?;
+        chain_attach_command(&paths, &chain_id, false).await?;
     }
     Ok(chain_id)
 }
@@ -2127,12 +2130,16 @@ fn print_chain_header(paths: &DeadreckonPaths, chain: &Chain) {
     print_kv_block(&items);
 }
 
-pub(crate) fn chain_attach_command(paths: &DeadreckonPaths, id: &str, plain: bool) -> Result<()> {
+pub(crate) async fn chain_attach_command(
+    paths: &DeadreckonPaths,
+    id: &str,
+    plain: bool,
+) -> Result<()> {
     let id = resolve_chain_id(paths, id, false)?;
     let chain = load_chain(paths, &id)?;
     if io::stdout().is_terminal() && !plain {
         print_attach_banner("chain", &id);
-        return chain_attach_tui(paths, &id);
+        return chain_attach_tui(paths, &id).await;
     }
     print_chain_attach_snapshot(&chain);
     Ok(())
@@ -2184,7 +2191,7 @@ pub(crate) fn chain_attach_summary_line(chain: &Chain) -> String {
     )
 }
 
-fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
+async fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -2193,6 +2200,8 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
     let mut tui_state = ChainAttachTuiState::default();
     let mut event_tail = AttachJsonlTail::<ChainEvent>::new(paths.chain_events(chain_id));
     let mut show_help = false;
+    let mut input_events = AttachInputEvents::new(AttachTickBudget::default());
+    let mut pending_input_at: Option<Instant> = None;
 
     let result = loop {
         let budget = AttachTickBudget::default();
@@ -2223,16 +2232,20 @@ fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
             }
         })?;
         tick.record_since(AttachLoopStage::Draw, stage_started);
+        if let Some(started_at) = pending_input_at.take() {
+            tick.record(AttachLoopStage::InputToFrame, started_at.elapsed());
+        }
 
         let stage_started = Instant::now();
-        let input_ready = event::poll(Duration::from_millis(200))?;
+        let input_event = input_events.next_event().await?;
         tick.record_since(AttachLoopStage::InputPoll, stage_started);
         drop(tick.slow_sync_stages());
         drop(tick.slow_stage_labels());
         let _ = tick.frame_exceeded();
-        if input_ready {
-            let event = event::read()?;
+        let _ = tick.input_to_frame_exceeded();
+        if let Some(event) = input_event {
             if let Event::Key(key) = event {
+                pending_input_at = Some(Instant::now());
                 match handle_help_key(show_help, key) {
                     HelpKeyAction::Open => {
                         show_help = true;

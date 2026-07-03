@@ -1,5 +1,7 @@
 use super::super::*;
 use super::campaign::CampaignAttachState;
+use crossterm::event::EventStream;
+use futures_util::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TUI_SUSPEND_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -9,6 +11,9 @@ pub(crate) struct AttachTickBudget {
     pub(crate) target_frame_ms: u64,
     pub(crate) max_sync_io_ms: u64,
     pub(crate) slow_warning_ms: u64,
+    pub(crate) max_input_to_frame_ms: u64,
+    pub(crate) idle_initial_ms: u64,
+    pub(crate) idle_max_ms: u64,
 }
 
 impl Default for AttachTickBudget {
@@ -17,6 +22,9 @@ impl Default for AttachTickBudget {
             target_frame_ms: 500,
             max_sync_io_ms: 80,
             slow_warning_ms: 180,
+            max_input_to_frame_ms: 32,
+            idle_initial_ms: 16,
+            idle_max_ms: 250,
         }
     }
 }
@@ -39,6 +47,7 @@ pub(crate) enum AttachLoopStage {
     ProviderNarrativeRefresh,
     Draw,
     InputPoll,
+    InputToFrame,
 }
 
 impl AttachLoopStage {
@@ -52,6 +61,7 @@ impl AttachLoopStage {
             Self::ProviderNarrativeRefresh => "narrative provider refresh",
             Self::Draw => "draw",
             Self::InputPoll => "input poll",
+            Self::InputToFrame => "input to frame",
         }
     }
 }
@@ -119,6 +129,13 @@ impl AttachTickTiming {
         self.total_elapsed() > Duration::from_millis(self.budget.target_frame_ms)
     }
 
+    pub(crate) fn input_to_frame_exceeded(&self) -> bool {
+        let max_input = Duration::from_millis(self.budget.max_input_to_frame_ms);
+        self.stages
+            .iter()
+            .any(|stage| stage.stage == AttachLoopStage::InputToFrame && stage.elapsed > max_input)
+    }
+
     pub(crate) fn slow_sync_stages(&self) -> Vec<&AttachStageTiming> {
         let max_sync = Duration::from_millis(self.budget.max_sync_io_ms);
         self.stages
@@ -140,6 +157,105 @@ impl AttachTickTiming {
             .into_iter()
             .map(|stage| stage.stage.label())
             .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AttachIdleBackoff {
+    initial: Duration,
+    max: Duration,
+    current: Duration,
+}
+
+impl AttachIdleBackoff {
+    pub(crate) fn new(initial: Duration, max: Duration) -> Self {
+        let initial = initial.min(max);
+        Self {
+            initial,
+            max,
+            current: initial,
+        }
+    }
+
+    pub(crate) fn from_budget(budget: AttachTickBudget) -> Self {
+        Self::new(
+            Duration::from_millis(budget.idle_initial_ms),
+            Duration::from_millis(budget.idle_max_ms),
+        )
+    }
+
+    pub(crate) fn current_delay(&self) -> Duration {
+        self.current
+    }
+
+    pub(crate) fn record_idle(&mut self) {
+        self.current = (self.current * 2).min(self.max);
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.current = self.initial;
+    }
+}
+
+pub(crate) struct AttachInputEvents {
+    stream: EventStream,
+    idle: AttachIdleBackoff,
+}
+
+impl AttachInputEvents {
+    pub(crate) fn new(budget: AttachTickBudget) -> Self {
+        Self {
+            stream: EventStream::new(),
+            idle: AttachIdleBackoff::from_budget(budget),
+        }
+    }
+
+    pub(crate) async fn next_event(&mut self) -> Result<Option<Event>> {
+        tokio::select! {
+            event = self.stream.next() => {
+                self.idle.reset();
+                match event {
+                    Some(Ok(event)) => Ok(Some(event)),
+                    Some(Err(error)) => Err(error.into()),
+                    None => Ok(None),
+                }
+            }
+            _ = tokio::time::sleep(self.idle.current_delay()) => {
+                self.idle.record_idle();
+                Ok(None)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachWakeReason {
+    Input,
+    Ledger,
+    FallbackTick,
+}
+
+#[cfg(test)]
+pub(crate) async fn wait_for_attach_wake_for_test(
+    input_rx: &mut tokio::sync::mpsc::Receiver<()>,
+    ledger_rx: &mut tokio::sync::mpsc::Receiver<()>,
+    idle: &mut AttachIdleBackoff,
+    fallback_tick: Duration,
+) -> AttachWakeReason {
+    tokio::select! {
+        Some(_) = input_rx.recv() => {
+            idle.reset();
+            AttachWakeReason::Input
+        }
+        Some(_) = ledger_rx.recv() => {
+            idle.reset();
+            AttachWakeReason::Ledger
+        }
+        _ = tokio::time::sleep(idle.current_delay().min(fallback_tick)) => {
+            idle.record_idle();
+            AttachWakeReason::FallbackTick
+        }
     }
 }
 
