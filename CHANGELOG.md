@@ -65,6 +65,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   --why` plain parity, with deterministic causes from state, gate progress,
   tamper proofs, and provider traces; every rendered cause carries an artifact
   path and bounded excerpt.
+- H-P12 (`a3c7b3e`): run attach gains a Helm timeline band from provider
+  checkpoints, spend rows, gate/tamper proof files, and reshape traces; `t`
+  focuses the band, Left/Right scrubs turns, and the detail pane shows the
+  selected turn story with checkpoint IDs and diff counts.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
