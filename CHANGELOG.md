@@ -45,6 +45,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   leaves, Enter zooms in-frame with a breadcrumb, Esc backs out before detach,
   and campaign leaf runs expose status, activity, gate, and spend without any
   drill-in.
+- H-P7 (`9366f44`): attach loops use crossterm `EventStream` with adaptive idle
+  backoff instead of fixed 200/250ms polling, record input-to-frame latency
+  against a dedicated budget, and keep run, plan, chain, and campaign input
+  responsive without blocking redraw cadence.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
