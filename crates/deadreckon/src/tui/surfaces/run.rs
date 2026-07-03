@@ -1,4 +1,5 @@
 use crate::tui::attach_state::{AttachPanel, AttachTuiState, attach_panel_layout};
+use crate::tui::effects::EffectTrigger;
 use crate::tui::panes::activity::{
     attach_activity_lines_for_tui, panel_border_style, panel_title, render_live_files,
     render_processes, visible_items,
@@ -20,6 +21,7 @@ use crate::{AttachLive, RunEvent, SpendRecord, TraceRecord};
 use chrono::Utc;
 use deadreckon_core::RunStatus;
 use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, List, Paragraph};
 
 pub(crate) fn render_attach(
@@ -136,6 +138,8 @@ pub(crate) fn render_attach(
     );
     let spine = spine_for_run_with_events(state, events, Utc::now());
     render_spine_band(frame, layout.spine, &spine);
+    let acceptance_area = if metered_provider { top[3] } else { top[2] };
+    render_active_effects(frame, acceptance_area, layout.activity, tui_state);
     let tick = (Utc::now().timestamp_millis() / 180).max(0) as usize;
     let status_line = deadreckoning_status_line(
         state,
@@ -150,4 +154,26 @@ pub(crate) fn render_attach(
         ]),
         layout.footer,
     );
+}
+
+fn render_active_effects(
+    frame: &mut ratatui::Frame<'_>,
+    acceptance_area: ratatui::layout::Rect,
+    card_area: ratatui::layout::Rect,
+    tui_state: &AttachTuiState,
+) {
+    for effect_frame in &tui_state.active_effect_frames {
+        let _effect = effect_frame.tachyon_effect();
+        let (area, color) = match effect_frame.trigger {
+            EffectTrigger::GatePass => (acceptance_area, Color::Cyan),
+            EffectTrigger::VerdictCompletion => (card_area, Color::Yellow),
+            EffectTrigger::NodeStateChange => (card_area, Color::Magenta),
+        };
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color)),
+            area,
+        );
+    }
 }

@@ -5,6 +5,10 @@ use crate::commands::chain::{
     apply_mode_label, apply_strategy_label, branch_policy_label, chain_apply_strategy,
     chain_attach_summary_line, chain_step_dot, chain_step_status_label, on_fail_label, short_sha,
 };
+use crate::tui::effects::{
+    EffectFrame, EffectFrameDecision, EffectRegistry, EffectTrigger, MotionPolicy, UiEffectEvent,
+    registered_effect_triggers,
+};
 use crate::tui::panes::activity::{list_scroll_offset, scroll_indicator};
 use crate::tui::panes::footer::footer;
 use crate::tui::spine::{render_spine_band, spine_for_chain_with_events};
@@ -27,6 +31,10 @@ pub(crate) struct ChainAttachTuiState {
     pub(crate) events_scroll: u16,
     pub(crate) narrative_open: bool,
     pub(crate) narrative_scroll: usize,
+    pub(crate) motion_policy: MotionPolicy,
+    active_effect_frames: Vec<EffectFrame>,
+    last_effect_status: Option<ChainStatus>,
+    last_step_status_signature: Option<String>,
     pub(crate) event_status_hint: Option<String>,
     pub(crate) modal: Option<AttachModal>,
 }
@@ -180,6 +188,7 @@ pub(crate) struct AttachCommandSpec {
 pub(crate) enum CommandModeVerb {
     Attach,
     Kill,
+    Motion,
     Quit,
     Reshape,
     Resume,
@@ -192,6 +201,7 @@ impl CommandModeVerb {
         match self {
             Self::Attach => "attach",
             Self::Kill => "kill",
+            Self::Motion => "motion",
             Self::Quit => "q",
             Self::Reshape => "reshape",
             Self::Resume => "resume",
@@ -225,6 +235,12 @@ pub(crate) fn attach_command_table() -> &'static [AttachCommandSpec] {
             cli_command: Some("deadreckon chain kill"),
             kind: CommandModeVerb::Kill,
             confirm: true,
+        },
+        AttachCommandSpec {
+            verb: "motion",
+            cli_command: None,
+            kind: CommandModeVerb::Motion,
+            confirm: false,
         },
         AttachCommandSpec {
             verb: "q",
@@ -261,6 +277,14 @@ pub(crate) fn attach_command_table() -> &'static [AttachCommandSpec] {
 }
 
 impl ChainAttachTuiState {
+    pub(crate) fn new(narrative_open: bool, motion_policy: MotionPolicy) -> Self {
+        Self {
+            narrative_open,
+            motion_policy,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn clamp(&mut self, chain: &Chain) {
         if chain.steps.is_empty() {
             self.selected_step = 0;
@@ -301,7 +325,7 @@ impl ChainAttachTuiState {
         self.modal = Some(AttachModal::line_input(
             "command",
             "Enter run    Esc cancel",
-            ":kill, :resume, :verdict, :why, :reshape, :attach, :q",
+            ":kill, :resume, :verdict, :why, :reshape, :attach, :motion, :q",
             LineInputPurpose::Command,
         ));
     }
@@ -354,6 +378,28 @@ impl ChainAttachTuiState {
                     self.open_kill_confirm();
                     ChainModalAction::None
                 }
+                CommandModeVerb::Motion => {
+                    let Some(target) = invocation.target.as_deref() else {
+                        self.open_notice(
+                            "motion",
+                            format!("motion {}", self.motion_policy.as_str()),
+                        );
+                        return ChainModalAction::None;
+                    };
+                    match MotionPolicy::parse(target) {
+                        Some(policy) => {
+                            self.motion_policy = policy;
+                            self.open_notice(
+                                "motion",
+                                format!("motion {} for this attach session", policy.as_str()),
+                            );
+                        }
+                        None => {
+                            self.open_notice("motion", "try: :motion full|reduced|off");
+                        }
+                    }
+                    ChainModalAction::None
+                }
                 CommandModeVerb::Quit => ChainModalAction::QuitRequested,
                 _ => {
                     let Some(spec) = attach_command_table()
@@ -390,6 +436,71 @@ impl ChainAttachTuiState {
             .clamp(0, chain.steps.len().saturating_sub(1) as isize);
         self.selected_step = next as usize;
     }
+
+    pub(crate) fn effect_registry(&self) -> EffectRegistry {
+        EffectRegistry::new(self.motion_policy)
+    }
+
+    pub(crate) fn refresh_effects_for_chain(&mut self, chain: &Chain, input_pending: bool) {
+        debug_assert_eq!(registered_effect_triggers().len(), 3);
+        debug_assert!(
+            self.effect_registry()
+                .frames_for_event(UiEffectEvent::Unregistered("chain-refresh"))
+                .is_empty()
+        );
+
+        let mut next_frames = Vec::new();
+        let step_signature = chain_step_status_signature(chain);
+        if self
+            .last_step_status_signature
+            .as_deref()
+            .is_some_and(|previous| previous != step_signature)
+        {
+            next_frames
+                .extend(self.frames_for_trigger(EffectTrigger::NodeStateChange, input_pending));
+        }
+        self.last_step_status_signature = Some(step_signature);
+
+        if self.last_effect_status.is_some_and(|previous| {
+            previous != chain.status && chain_status_is_verdict(chain.status)
+        }) {
+            next_frames
+                .extend(self.frames_for_trigger(EffectTrigger::VerdictCompletion, input_pending));
+        }
+        self.last_effect_status = Some(chain.status);
+        self.active_effect_frames = next_frames;
+    }
+
+    pub(crate) fn clear_active_effect_frames(&mut self) {
+        self.active_effect_frames.clear();
+    }
+
+    fn frames_for_trigger(&self, trigger: EffectTrigger, input_pending: bool) -> Vec<EffectFrame> {
+        let registry = self.effect_registry();
+        let event = UiEffectEvent::Registered(trigger);
+        if registry.next_frame_decision(event, input_pending)
+            == EffectFrameDecision::PreemptedForInput
+        {
+            Vec::new()
+        } else {
+            registry.frames_for_event(event)
+        }
+    }
+}
+
+fn chain_step_status_signature(chain: &Chain) -> String {
+    chain
+        .steps
+        .iter()
+        .map(|step| format!("{}:{:?};", step.index, step.status))
+        .collect::<String>()
+}
+
+fn chain_status_is_verdict(status: ChainStatus) -> bool {
+    matches!(
+        status,
+        ChainStatus::Completed | ChainStatus::Failed | ChainStatus::Killed | ChainStatus::Undone
+    )
 }
 
 fn parse_command_mode(
@@ -639,8 +750,37 @@ pub(crate) fn render_chain_attach(
         Paragraph::new(chain_attach_footer_text_for_state(chain, tui_state)),
         rows[3],
     );
+    render_active_effects(frame, rows[0], body[0], body[1], tui_state);
     if let Some(modal) = &tui_state.modal {
         render_chain_modal(frame, modal);
+    }
+}
+
+fn render_active_effects(
+    frame: &mut ratatui::Frame<'_>,
+    gate_area: Rect,
+    node_area: Rect,
+    verdict_area: Rect,
+    tui_state: &ChainAttachTuiState,
+) {
+    for effect_frame in &tui_state.active_effect_frames {
+        let area = match effect_frame.trigger {
+            EffectTrigger::GatePass => gate_area,
+            EffectTrigger::VerdictCompletion => verdict_area,
+            EffectTrigger::NodeStateChange => node_area,
+        };
+        let _effect = effect_frame.tachyon_effect();
+        let color = match effect_frame.trigger {
+            EffectTrigger::GatePass => Color::Cyan,
+            EffectTrigger::VerdictCompletion => Color::Yellow,
+            EffectTrigger::NodeStateChange => Color::Magenta,
+        };
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color)),
+            area,
+        );
     }
 }
 

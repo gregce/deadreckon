@@ -42,12 +42,14 @@ use super::commands::start::{StartLaunchDecision, prompt_start_model};
 use super::tui::{
     AttachActionNotice, AttachHelpMode, AttachPanel, AttachPanelCounts, AttachPanelRows,
     AttachParentPlan, AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState, ChainModalAction,
-    CommandModeVerb, NARRATIVE_SPLIT_WIDTH, TimelineMark, attach_command_table,
+    CommandModeVerb, EffectFrameDecision, EffectRegistry, EffectTrigger, MotionPolicy,
+    NARRATIVE_SPLIT_WIDTH, TimelineMark, UiEffectEvent, attach_command_table,
     build_run_narrative_projection, chain_activity_lines, chain_attach_footer_text,
     chain_attach_header_text, chain_event_read_hint, chain_timeline_lines, footer,
     help_overlay_lines, markdown_to_tui_lines, max_panel_scroll, panel_title, plan_narrative_title,
-    render_chain_attach, render_help_overlay, render_timeline_band, render_why_panel,
-    scroll_indicator, selection_glyph, timeline_for_run, why_for_run, why_plain_lines,
+    registered_effect_triggers, render_chain_attach, render_help_overlay, render_timeline_band,
+    render_why_panel, scroll_indicator, selection_glyph, timeline_for_run, why_for_run,
+    why_plain_lines,
 };
 use super::{
     ATTACH_JSONL_TAIL_ROW_LIMIT, ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive,
@@ -6661,13 +6663,150 @@ fn command_table_contains_only_existing_verbs() {
 
     assert_eq!(
         verbs,
-        vec!["attach", "kill", "q", "reshape", "resume", "verdict", "why"]
+        vec![
+            "attach", "kill", "motion", "q", "reshape", "resume", "verdict", "why"
+        ]
     );
     assert!(
         table
             .iter()
-            .all(|spec| spec.cli_command.is_some() || spec.verb == "q")
+            .all(|spec| spec.cli_command.is_some() || matches!(spec.verb, "motion" | "q"))
     );
+}
+
+#[test]
+fn effects_fire_only_on_registered_triggers() {
+    assert_eq!(
+        registered_effect_triggers(),
+        [
+            EffectTrigger::GatePass,
+            EffectTrigger::VerdictCompletion,
+            EffectTrigger::NodeStateChange
+        ]
+    );
+
+    let full = EffectRegistry::new(MotionPolicy::Full);
+    let fired = registered_effect_triggers()
+        .iter()
+        .filter(|trigger| {
+            !full
+                .frames_for_event(UiEffectEvent::Registered(**trigger))
+                .is_empty()
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(fired, registered_effect_triggers());
+    assert!(
+        full.frames_for_event(UiEffectEvent::Unregistered("focus-change"))
+            .is_empty()
+    );
+
+    let reduced = EffectRegistry::new(MotionPolicy::Reduced);
+    assert!(
+        reduced
+            .frames_for_event(UiEffectEvent::Registered(EffectTrigger::GatePass))
+            .is_empty()
+    );
+    assert_eq!(
+        reduced
+            .frames_for_event(UiEffectEvent::Registered(EffectTrigger::VerdictCompletion))
+            .len(),
+        1
+    );
+    assert!(
+        reduced
+            .frames_for_event(UiEffectEvent::Registered(EffectTrigger::NodeStateChange))
+            .is_empty()
+    );
+
+    let defaults = ConfigDefaults {
+        ui_motion: Some("full".to_string()),
+        ..ConfigDefaults::default()
+    };
+    assert_eq!(defaults.motion_policy(false, true), MotionPolicy::Full);
+    assert_eq!(
+        ConfigDefaults::default().motion_policy(false, false),
+        MotionPolicy::Reduced
+    );
+    assert_eq!(
+        ConfigDefaults::default().motion_policy(true, true),
+        MotionPolicy::Reduced
+    );
+
+    let (_temp, state) = doc_preview_state();
+    let mut run_tui_state = AttachTuiState {
+        motion_policy: MotionPolicy::Full,
+        ..AttachTuiState::default()
+    };
+    let configured_live = AttachLive {
+        acceptance: AcceptanceLive {
+            status: AcceptanceUiStatus::Configured,
+            ..AcceptanceLive::default()
+        },
+        ..AttachLive::default()
+    };
+    run_tui_state.refresh_effects_for_run(&state, &configured_live, false);
+    assert!(run_tui_state.active_effect_frames.is_empty());
+    let passed_live = AttachLive {
+        acceptance: AcceptanceLive {
+            status: AcceptanceUiStatus::Passed,
+            total: 1,
+            completed: 1,
+            passed: 1,
+            ..AcceptanceLive::default()
+        },
+        ..AttachLive::default()
+    };
+    run_tui_state.refresh_effects_for_run(&state, &passed_live, false);
+    assert!(
+        run_tui_state
+            .active_effect_frames
+            .iter()
+            .any(|frame| frame.trigger == EffectTrigger::GatePass)
+    );
+}
+
+#[test]
+fn motion_off_renders_zero_effect_frames() {
+    let off = EffectRegistry::new(MotionPolicy::Off);
+    for trigger in registered_effect_triggers() {
+        assert!(
+            off.frames_for_event(UiEffectEvent::Registered(trigger))
+                .is_empty()
+        );
+    }
+
+    let mut tui_state = ChainAttachTuiState::default();
+    let chain = chain_fixture();
+    let _ = tui_state.handle_key_with_modal(
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+        &chain,
+    );
+    submit_modal_text(&mut tui_state, &chain, "motion off");
+
+    assert_eq!(tui_state.motion_policy, MotionPolicy::Off);
+    assert!(
+        tui_state
+            .effect_registry()
+            .frames_for_event(UiEffectEvent::Registered(EffectTrigger::VerdictCompletion))
+            .is_empty()
+    );
+}
+
+#[test]
+fn effect_never_delays_input_processing() {
+    let full = EffectRegistry::new(MotionPolicy::Full);
+
+    for trigger in registered_effect_triggers() {
+        let frames = full.frames_for_event(UiEffectEvent::Registered(trigger));
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].duration < Duration::from_millis(800));
+        assert!(frames[0].input_preemptible);
+        assert_eq!(
+            full.next_frame_decision(UiEffectEvent::Registered(trigger), true),
+            EffectFrameDecision::PreemptedForInput
+        );
+    }
 }
 
 #[test]

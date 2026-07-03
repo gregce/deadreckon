@@ -5,9 +5,10 @@ use crate::tui::panes::voyage::VoyageZoomState;
 use crate::tui::surfaces::chain::{chain_narrative_json_text, chain_narrative_plain_text};
 use crate::tui::tree::NodeId;
 use crate::tui::{
-    AttachActionNotice, AttachHelpMode, AttachParentPlan, AttachTuiState, RunNarrativeRenderInput,
-    attach_panel_counts, build_run_narrative_projection, render_help_overlay,
-    run_narrative_projection, toggle_attach_view, why_for_run, why_plain_lines,
+    AttachActionNotice, AttachHelpMode, AttachParentPlan, AttachTuiState, MotionPolicy,
+    RunNarrativeRenderInput, attach_panel_counts, build_run_narrative_projection,
+    render_help_overlay, run_narrative_projection, toggle_attach_view, why_for_run,
+    why_plain_lines,
 };
 
 #[derive(Debug)]
@@ -787,11 +788,15 @@ async fn attach_tui_with_parent(
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    let motion_policy = config_defaults(paths)
+        .map(|defaults| defaults.motion_policy(true, false))
+        .unwrap_or_else(|_| MotionPolicy::default_for_environment(true, false));
     let mut tui_state = AttachTuiState {
         show_completion_actions,
         parent_plan,
         view: initial_view,
         visual: initial_visual,
+        motion_policy,
         ..AttachTuiState::default()
     };
     let mut quiet_tracker = NarrativeQuietRefreshTracker::new(Utc::now());
@@ -862,6 +867,7 @@ async fn attach_tui_with_parent(
         let panel_layout = attach_panel_layout(terminal_area);
         let panel_counts = attach_panel_counts(&state, spend, traces, &events, &live, &tui_state);
         tui_state.clamp(panel_counts, panel_layout.rows);
+        tui_state.refresh_effects_for_run(&state, &live, pending_input_at.is_some());
         let auto_refresh = event_refresh.or_else(|| {
             if tui_state.view.is_narrative() {
                 quiet_tracker.maybe_trigger(
@@ -900,6 +906,7 @@ async fn attach_tui_with_parent(
                 render_help_overlay(frame, AttachHelpMode::Run);
             }
         })?;
+        tui_state.clear_active_effect_frames();
         tick.record_since(AttachLoopStage::Draw, stage_started);
         if let Some(started_at) = pending_input_at.take() {
             tick.record(AttachLoopStage::InputToFrame, started_at.elapsed());

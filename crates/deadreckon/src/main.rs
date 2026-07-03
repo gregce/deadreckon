@@ -3710,6 +3710,7 @@ struct ConfigDefaults {
     cli_max_wall_seconds: Option<f64>,
     prevent_sleep: Option<String>,
     plain: Option<bool>,
+    ui_motion: Option<String>,
     doc_provider: Option<String>,
     doc_skill: Option<String>,
     doc_subskills: Option<Vec<String>>,
@@ -3749,6 +3750,9 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
             .and_then(toml::Value::as_str)
             .map(ToString::to_string),
         plain: get_toml_path(&root, "defaults.plain").and_then(toml::Value::as_bool),
+        ui_motion: get_toml_path(&root, "ui.motion")
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string),
         doc_provider: get_toml_path(&root, "defaults.doc_provider")
             .and_then(toml::Value::as_str)
             .map(ToString::to_string),
@@ -3775,6 +3779,12 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
                     .map(|value| value as f64)
             }),
     })
+}
+
+impl ConfigDefaults {
+    fn motion_policy(&self, stdout_is_tty: bool, replay_mode: bool) -> tui::MotionPolicy {
+        tui::MotionPolicy::from_config_value(self.ui_motion.as_deref(), stdout_is_tty, replay_mode)
+    }
 }
 
 fn effective_doc_subskills(defaults: &ConfigDefaults) -> Vec<String> {
