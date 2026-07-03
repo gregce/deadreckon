@@ -5,11 +5,13 @@ use crate::tui::panes::header::provider_is_metered;
 use crate::tui::panes::narrative::{
     NARRATIVE_SPLIT_WIDTH, PLAN_NARRATIVE_AREA_HEIGHT, narrative_list_item, visible_narrative_items,
 };
+use crate::tui::spine::{render_spine_band, spine_for_plan_with_events};
 use crate::{
     SpendRecord, TraceRecord, acceptance_status_value, commands, event_line, format_count,
     load_run, narrative, one_line, plan_mode_label, plan_status_label, read_jsonl, read_last_jsonl,
     run_prefix, run_spend_label, task_status_label, ui,
 };
+use chrono::Utc;
 use deadreckon_core::{
     DeadreckonPaths, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMode, PlanTask,
     PlanTaskStatus,
@@ -47,6 +49,7 @@ pub(crate) fn render_plan_attach(
             Constraint::Length(7),
             Constraint::Min(10),
             Constraint::Length(PLAN_NARRATIVE_AREA_HEIGHT),
+            Constraint::Length(4),
             Constraint::Length(2),
         ])
         .split(area);
@@ -183,6 +186,8 @@ pub(crate) fn render_plan_attach(
             vertical[2],
         );
     }
+    let spine = spine_for_plan_with_events(paths, plan, state.plan_events, Utc::now());
+    render_spine_band(frame, vertical[3], &spine);
     let footer = plan_attach_footer(
         paths,
         plan,
@@ -191,7 +196,7 @@ pub(crate) fn render_plan_attach(
         state.view,
         state.visual,
     );
-    frame.render_widget(Paragraph::new(footer), vertical[3]);
+    frame.render_widget(Paragraph::new(footer), vertical[4]);
 }
 
 pub(crate) fn plan_narrative_title(

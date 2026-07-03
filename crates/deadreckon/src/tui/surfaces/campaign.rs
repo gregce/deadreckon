@@ -3,8 +3,10 @@ use crate::commands::campaign::{
 };
 use crate::tui::panes::activity::{scroll_indicator, selection_glyph};
 use crate::tui::panes::footer::footer;
+use crate::tui::spine::{render_spine_band, spine_for_campaign_with_events};
 use crate::tui::surfaces::plan::plan_event_line;
 use crate::{one_line, run_prefix, ui};
+use chrono::Utc;
 use deadreckon_core::campaign::SubGoalStatus;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
@@ -19,6 +21,7 @@ pub(crate) fn render_campaign_attach(frame: &mut ratatui::Frame<'_>, state: &Cam
             Constraint::Length(6),
             Constraint::Min(8),
             Constraint::Length(7),
+            Constraint::Length(4),
             Constraint::Length(2),
         ])
         .split(area);
@@ -81,9 +84,21 @@ pub(crate) fn render_campaign_attach(frame: &mut ratatui::Frame<'_>, state: &Cam
         ),
         vertical[2],
     );
+    let campaign_events = state
+        .feed
+        .iter()
+        .filter_map(|event| match event {
+            CampaignFeedEvent::Campaign { event } => Some(event.clone()),
+            CampaignFeedEvent::SubPlan { .. }
+            | CampaignFeedEvent::Snapshot { .. }
+            | CampaignFeedEvent::Warning { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let spine = spine_for_campaign_with_events(&state.campaign, &campaign_events, Utc::now());
+    render_spine_band(frame, vertical[3], &spine);
     frame.render_widget(
         Paragraph::new(campaign_attach_footer_text(false)),
-        vertical[3],
+        vertical[4],
     );
 }
 
@@ -98,6 +113,20 @@ pub(crate) fn render_campaign_attach_text(state: &CampaignAttachState, plain: bo
     }
     lines.push("campaign feed".to_string());
     lines.extend(campaign_feed_text_lines(state, 12));
+    lines.push("status spine".to_string());
+    let campaign_events = state
+        .feed
+        .iter()
+        .filter_map(|event| match event {
+            CampaignFeedEvent::Campaign { event } => Some(event.clone()),
+            CampaignFeedEvent::SubPlan { .. }
+            | CampaignFeedEvent::Snapshot { .. }
+            | CampaignFeedEvent::Warning { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    lines.extend(crate::tui::spine::spine_plain_lines(
+        &spine_for_campaign_with_events(&state.campaign, &campaign_events, Utc::now()),
+    ));
     lines.push(campaign_attach_footer_text(plain));
     let mut text = lines.join("\n");
     text.push('\n');

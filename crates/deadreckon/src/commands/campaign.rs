@@ -2102,6 +2102,12 @@ pub(crate) fn campaign_attach_summary(
             ui_status(rollup_verdict_text(rollup.rollup_verdict))
         );
     }
+    let _ = writeln!(out, "{}", ui_heading("Status spine"));
+    for line in crate::tui::spine::spine_plain_lines(
+        &crate::tui::spine::spine_for_campaign_with_events(campaign, &[], Utc::now()),
+    ) {
+        let _ = writeln!(out, "{line}");
+    }
     for sub in &campaign.sub_goals {
         let result = sub
             .result_run_id

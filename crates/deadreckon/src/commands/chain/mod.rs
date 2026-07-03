@@ -2141,6 +2141,14 @@ pub(crate) fn chain_attach_command(paths: &DeadreckonPaths, id: &str, plain: boo
 fn print_chain_attach_snapshot(chain: &Chain) {
     let paths = DeadreckonPaths::discover();
     print_chain_header(&paths, chain);
+    println!("{}", ui_heading("Status spine"));
+    for line in crate::tui::spine::spine_plain_lines(&crate::tui::spine::spine_for_chain(
+        &paths,
+        chain,
+        Utc::now(),
+    )) {
+        println!("{line}");
+    }
     for step in &chain.steps {
         println!(
             "{} step {} {} {}",

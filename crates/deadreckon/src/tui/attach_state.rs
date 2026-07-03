@@ -323,6 +323,7 @@ pub(crate) struct AttachPanelLayout {
     pub(crate) activity: ratatui::layout::Rect,
     pub(crate) files: ratatui::layout::Rect,
     pub(crate) processes: ratatui::layout::Rect,
+    pub(crate) spine: ratatui::layout::Rect,
     pub(crate) footer: ratatui::layout::Rect,
     pub(crate) rows: AttachPanelRows,
 }
@@ -348,6 +349,7 @@ pub(crate) fn attach_panel_layout(area: ratatui::layout::Rect) -> AttachPanelLay
             Constraint::Length(5),
             Constraint::Min(10),
             Constraint::Length(4),
+            Constraint::Length(4),
             Constraint::Length(2),
         ])
         .split(area);
@@ -360,7 +362,8 @@ pub(crate) fn attach_panel_layout(area: ratatui::layout::Rect) -> AttachPanelLay
         activity: center[0],
         files: center[1],
         processes: vertical[2],
-        footer: vertical[3],
+        spine: vertical[3],
+        footer: vertical[4],
         rows: AttachPanelRows {
             activity: panel_inner_rows(center[0]),
             files: panel_inner_rows(center[1]),

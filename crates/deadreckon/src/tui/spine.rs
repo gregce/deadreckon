@@ -9,8 +9,11 @@ use deadreckon_core::{
     Chain, ChainEvent, ChainStatus, ChainStepStatus, DeadreckonPaths, PipelineState, Plan,
     PlanEvent, PlanStatus, PlanTaskStatus, RUN_EVENTS_JSONL, RunEvent, RunEventKind, RunStatus,
 };
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::{commands, read_jsonl};
+use crate::{commands, one_line, read_jsonl};
 
 pub(crate) const SPINE_STALE_AFTER_SECONDS: u64 = 30;
 
@@ -271,8 +274,16 @@ impl PrimaryAction {
 
 pub(crate) fn spine_for_run(state: &PipelineState, now: DateTime<Utc>) -> SpineSnapshot {
     let events = read_jsonl::<RunEvent>(&state.run_root.join(RUN_EVENTS_JSONL)).unwrap_or_default();
-    let alive = run_aliveness(state, &events, now);
-    let mut wrong = run_attention(state, &events, &alive);
+    spine_for_run_with_events(state, &events, now)
+}
+
+pub(crate) fn spine_for_run_with_events(
+    state: &PipelineState,
+    events: &[RunEvent],
+    now: DateTime<Utc>,
+) -> SpineSnapshot {
+    let alive = run_aliveness(state, events, now);
+    let mut wrong = run_attention(state, events, &alive);
     let reshape_path = state.run_root.join("reshape-proposal.json");
     let has_reshape_proposal = valid_launch_plan(&reshape_path);
 
@@ -303,8 +314,17 @@ pub(crate) fn spine_for_plan(
     now: DateTime<Utc>,
 ) -> SpineSnapshot {
     let events = deadreckon_core::read_plan_events(paths, &plan.plan_id).unwrap_or_default();
+    spine_for_plan_with_events(paths, plan, &events, now)
+}
+
+pub(crate) fn spine_for_plan_with_events(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    events: &[PlanEvent],
+    now: DateTime<Utc>,
+) -> SpineSnapshot {
     SpineSnapshot {
-        alive: plan_aliveness(plan, &events, now),
+        alive: plan_aliveness(plan, events, now),
         doing: plan_doing(plan),
         on_track: plan_on_track(paths, plan),
         wrong: plan_attention(plan),
@@ -318,11 +338,19 @@ pub(crate) fn spine_for_chain(
     now: DateTime<Utc>,
 ) -> SpineSnapshot {
     let events = read_jsonl::<ChainEvent>(&paths.chain_events(&chain.chain_id)).unwrap_or_default();
+    spine_for_chain_with_events(chain, &events, now)
+}
+
+pub(crate) fn spine_for_chain_with_events(
+    chain: &Chain,
+    events: &[ChainEvent],
+    now: DateTime<Utc>,
+) -> SpineSnapshot {
     SpineSnapshot {
-        alive: chain_aliveness(chain, &events, now),
+        alive: chain_aliveness(chain, events, now),
         doing: chain_doing(chain),
         on_track: chain_on_track(chain),
-        wrong: chain_attention(chain, &events, now),
+        wrong: chain_attention(chain, events, now),
         next: chain_primary_action(chain),
     }
 }
@@ -336,8 +364,16 @@ pub(crate) fn spine_for_campaign(
     let events =
         read_jsonl::<CampaignEvent>(&deadreckon_core::campaign::campaign_events_path(&plan_dir))
             .unwrap_or_default();
+    spine_for_campaign_with_events(campaign, &events, now)
+}
+
+pub(crate) fn spine_for_campaign_with_events(
+    campaign: &Campaign,
+    events: &[CampaignEvent],
+    now: DateTime<Utc>,
+) -> SpineSnapshot {
     SpineSnapshot {
-        alive: campaign_aliveness(campaign, &events, now),
+        alive: campaign_aliveness(campaign, events, now),
         doing: campaign_doing(campaign),
         on_track: campaign_on_track(campaign),
         wrong: campaign_attention(campaign),
@@ -357,6 +393,91 @@ pub(crate) fn spine_contract_markdown_rows() -> Vec<String> {
             )
         })
         .collect()
+}
+
+pub(crate) fn spine_plain_lines(snapshot: &SpineSnapshot) -> Vec<String> {
+    vec![
+        format!("alive: {}", aliveness_text(&snapshot.alive)),
+        format!("doing: {}", snapshot.doing),
+        format!("on track: {}", on_track_text(&snapshot.on_track)),
+        format!("wrong: {}", attention_text(&snapshot.wrong)),
+        format!("next: {}", snapshot.next.command),
+    ]
+}
+
+pub(crate) fn render_spine_band(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    snapshot: &SpineSnapshot,
+) {
+    let lines = spine_band_lines(snapshot, area.width.saturating_sub(4) as usize);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title("status spine").borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn spine_band_lines(snapshot: &SpineSnapshot, width: usize) -> Vec<Line<'static>> {
+    let first = format!(
+        "alive: {} | doing: {} | on track: {}",
+        aliveness_text(&snapshot.alive),
+        snapshot.doing,
+        on_track_text(&snapshot.on_track)
+    );
+    let second = format!(
+        "wrong: {} | next: {}",
+        attention_text(&snapshot.wrong),
+        snapshot.next.command
+    );
+    vec![
+        Line::from(vec![Span::styled(
+            one_line(&first, width),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(one_line(&second, width)),
+    ]
+}
+
+fn aliveness_text(alive: &Aliveness) -> String {
+    match alive {
+        Aliveness::Live {
+            last_event_age_seconds,
+        } => format!("live {last_event_age_seconds}s"),
+        Aliveness::Stale { age_seconds } => format!("stale {age_seconds}s"),
+        Aliveness::Dead { reason } => format!("dead - {reason}"),
+        Aliveness::Done => "done".to_string(),
+    }
+}
+
+fn on_track_text(on_track: &OnTrack) -> String {
+    let gate = match (on_track.gate_passed, on_track.gate_total) {
+        (Some(passed), Some(total)) => format!("gate {passed}/{total}"),
+        _ => "gate -".to_string(),
+    };
+    let spend = match on_track.spend_ceiling_usd {
+        Some(ceiling) => format!("${:.2}/${:.2}", on_track.spend_used_usd, ceiling),
+        None if on_track.spend_used_usd > 0.0 => {
+            format!("${:.2}/unbounded", on_track.spend_used_usd)
+        }
+        None => "spend unbounded".to_string(),
+    };
+    let turns = on_track
+        .turns_used
+        .map(|turns| format!("turn {turns}"))
+        .unwrap_or_else(|| "turn -".to_string());
+    format!("{gate} - {spend} - {turns}")
+}
+
+fn attention_text(wrong: &[Attention]) -> String {
+    match wrong {
+        [] => "none".to_string(),
+        [first] => format!("1 attention - {}", first.summary),
+        [first, rest @ ..] => format!("{} attention - {}", rest.len() + 1, first.summary),
+    }
 }
 
 fn run_aliveness(state: &PipelineState, events: &[RunEvent], now: DateTime<Utc>) -> Aliveness {
