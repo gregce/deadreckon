@@ -35,6 +35,7 @@ pub(crate) struct ChainAttachTuiState {
     active_effect_frames: Vec<EffectFrame>,
     last_effect_status: Option<ChainStatus>,
     last_step_status_signature: Option<String>,
+    pub(crate) discoverability_hint_visible: bool,
     pub(crate) event_status_hint: Option<String>,
     pub(crate) modal: Option<AttachModal>,
 }
@@ -281,6 +282,7 @@ impl ChainAttachTuiState {
         Self {
             narrative_open,
             motion_policy,
+            discoverability_hint_visible: true,
             ..Self::default()
         }
     }
@@ -332,6 +334,10 @@ impl ChainAttachTuiState {
 
     pub(crate) fn open_notice(&mut self, title: impl Into<String>, body: impl Into<String>) {
         self.modal = Some(AttachModal::notice(title, body));
+    }
+
+    pub(crate) fn dismiss_discoverability_hint(&mut self) {
+        self.discoverability_hint_visible = false;
     }
 
     pub(crate) fn handle_key_with_modal(
@@ -1061,16 +1067,25 @@ fn chain_attach_footer_text_for_state(chain: &Chain, tui_state: &ChainAttachTuiS
             surface.primary_action.command
         )
     } else if tui_state.narrative_open {
-        footer(&[
-            ("[n]", "Activity"),
+        let mut items = Vec::new();
+        items.push(("[n]", "Activity"));
+        if tui_state.discoverability_hint_visible {
+            items.push(("Tab panes · w why · : commands", ""));
+        }
+        items.extend([
             ("[Enter]", "drill"),
             ("[Ctrl-D/q/Esc]", "detach"),
             ("j/k PgUp/PgDn", "scroll"),
-            ("?", "help"),
-        ])
+        ]);
+        items.push(("?", "help"));
+        footer(&items)
     } else {
-        footer(&[
-            ("[n]", "Narrative"),
+        let mut items = Vec::new();
+        items.extend([("[n]", "Narrative"), (":", "commands")]);
+        if tui_state.discoverability_hint_visible {
+            items.push(("Tab panes · w why · : commands", ""));
+        }
+        items.extend([
             ("[Enter]", "drill"),
             ("[r]", "redo"),
             ("[e]", "extend"),
@@ -1079,8 +1094,9 @@ fn chain_attach_footer_text_for_state(chain: &Chain, tui_state: &ChainAttachTuiS
             ("[Ctrl-D/q/Esc]", "detach"),
             ("j/k", "move"),
             ("PgUp/PgDn", "activity"),
-            ("?", "help"),
-        ])
+        ]);
+        items.push(("?", "help"));
+        footer(&items)
     }
 }
 

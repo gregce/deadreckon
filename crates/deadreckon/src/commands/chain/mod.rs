@@ -2248,6 +2248,7 @@ async fn chain_attach_tui(
                 render_help_overlay(frame, AttachHelpMode::Chain);
             }
         })?;
+        tui_state.dismiss_discoverability_hint();
         tui_state.clear_active_effect_frames();
         tick.record_since(AttachLoopStage::Draw, stage_started);
         if let Some(started_at) = pending_input_at.take() {
