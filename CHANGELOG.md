@@ -49,6 +49,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   backoff instead of fixed 200/250ms polling, record input-to-frame latency
   against a dedicated budget, and keep run, plan, chain, and campaign input
   responsive without blocking redraw cadence.
+- H-P8 (`e219abe`): a headless JSONL event-storm replay now proves frame
+  coalescing, input-to-frame latency stays inside budget, and attach JSONL
+  tails retain a bounded row window; the macOS release-size guard is
+  rebaselined to the verified EventStream-enabled binary.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
