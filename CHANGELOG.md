@@ -30,6 +30,9 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   contract table, run/plan/chain/campaign builders over durable files, and
   depth tests for event-age aliveness, single primary action, launch-plan budget
   ceilings, and inert reshape proposals.
+- H-P3 (`9238a65`): attach renders the shared status spine band across run,
+  plan, chain, and campaign surfaces; plain and off-TTY attach summaries print
+  the same five spine answers, including paused-run attention and next action.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
