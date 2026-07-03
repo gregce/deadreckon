@@ -3,8 +3,10 @@ use crate::commands::campaign::{
 };
 use crate::tui::panes::activity::{scroll_indicator, selection_glyph};
 use crate::tui::panes::footer::footer;
+use crate::tui::panes::voyage::{VoyagePaneState, render_voyage_pane};
 use crate::tui::spine::{render_spine_band, spine_for_campaign_with_events};
 use crate::tui::surfaces::plan::plan_event_line;
+use crate::tui::tree::{NodeId, tree_for_campaign};
 use crate::{one_line, run_prefix, ui};
 use chrono::Utc;
 use deadreckon_core::campaign::SubGoalStatus;
@@ -39,7 +41,23 @@ pub(crate) fn render_campaign_attach(frame: &mut ratatui::Frame<'_>, state: &Cam
         vertical[0],
     );
 
-    let panes = campaign_sub_pane_layout(vertical[1], state.campaign.sub_goals.len());
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(42), Constraint::Min(48)])
+        .split(vertical[1]);
+    let tree = tree_for_campaign(&state.paths, &state.campaign);
+    let mut voyage_state = VoyagePaneState::default();
+    if let Some(sub) = state.campaign.sub_goals.get(state.selected) {
+        voyage_state.select_node(
+            &tree,
+            &NodeId::sub_goal(&state.campaign.campaign_id, &sub.sub_id),
+        );
+    } else {
+        voyage_state.sync(&tree);
+    }
+    render_voyage_pane(frame, body[0], &tree, &mut voyage_state);
+
+    let panes = campaign_sub_pane_layout(body[1], state.campaign.sub_goals.len());
     for (index, sub) in state.campaign.sub_goals.iter().enumerate() {
         let Some(rect) = panes.get(index).copied() else {
             continue;

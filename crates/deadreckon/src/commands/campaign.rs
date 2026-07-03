@@ -1943,6 +1943,7 @@ fn campaign_snapshot_key(campaign: &deadreckon_core::campaign::Campaign) -> Stri
 
 #[derive(Debug, Clone)]
 pub(crate) struct CampaignAttachState {
+    pub(crate) paths: DeadreckonPaths,
     pub(crate) campaign_dir: PathBuf,
     pub(crate) campaign: deadreckon_core::campaign::Campaign,
     pub(crate) rollup: Option<deadreckon_core::campaign::CampaignRollup>,
@@ -1962,6 +1963,7 @@ impl CampaignAttachState {
         let rollup = deadreckon_core::campaign::read_campaign_rollup(&campaign_dir).ok();
         let (aggregate_spend_usd, sub_spend_usd) = campaign_spend(paths, &campaign);
         Self {
+            paths: paths.clone(),
             campaign_dir,
             campaign,
             rollup,
