@@ -4,7 +4,7 @@ use crate::commands::acceptance::ensure_acceptance_before_start;
 use crate::commands::attach::{attach_should_quit, resume_tui, suspend_tui};
 use crate::tui::navigation::{HelpKeyAction, handle_help_key};
 use crate::tui::{
-    AttachHelpMode, ChainAttachTuiState, ChainModalAction, chain_event_read_hint,
+    AttachHelpMode, ChainAttachTuiState, ChainModalAction, CommandModeVerb, chain_event_read_hint,
     render_chain_attach, render_help_overlay,
 };
 
@@ -2261,8 +2261,10 @@ async fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()>
             match event {
                 Event::Key(key)
                     if tui_state.modal.is_some()
-                        || (matches!(key.code, KeyCode::Char('e') | KeyCode::Char('k'))
-                            && key.modifiers.is_empty()) =>
+                        || (matches!(
+                            key.code,
+                            KeyCode::Char(':') | KeyCode::Char('e') | KeyCode::Char('k')
+                        ) && key.modifiers.is_empty()) =>
                 {
                     match tui_state.handle_key_with_modal(key, &chain) {
                         ChainModalAction::KillConfirmed => {
@@ -2281,6 +2283,15 @@ async fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()>
                                     .open_notice("extend failed", one_line(&err.to_string(), 96));
                             }
                         }
+                        ChainModalAction::CommandConfirmed { verb, target } => {
+                            if let Err(err) =
+                                dispatch_chain_command_mode(paths, chain_id, verb, target).await
+                            {
+                                tui_state
+                                    .open_notice("command failed", one_line(&err.to_string(), 96));
+                            }
+                        }
+                        ChainModalAction::QuitRequested => break Ok(()),
                         ChainModalAction::None => {}
                     }
                 }
@@ -2345,6 +2356,59 @@ async fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()>
     )?;
     terminal.show_cursor()?;
     result
+}
+
+async fn dispatch_chain_command_mode(
+    paths: &DeadreckonPaths,
+    chain_id: &str,
+    verb: CommandModeVerb,
+    target: Option<String>,
+) -> Result<()> {
+    let target = target.unwrap_or_else(|| chain_id.to_string());
+    match verb {
+        CommandModeVerb::Attach => Box::pin(chain_attach_command(paths, &target, false)).await,
+        CommandModeVerb::Kill => chain_kill_command_quiet(paths, &target, false),
+        CommandModeVerb::Quit => Ok(()),
+        CommandModeVerb::Reshape => {
+            super::course::reshape_command(super::course::ReshapeArgs {
+                run_id: target,
+                yes: true,
+                json: false,
+                plain: false,
+                quiet: true,
+            })
+            .await
+        }
+        CommandModeVerb::Resume => {
+            chain_run_command(
+                paths,
+                &target,
+                ChainRunOptions {
+                    detach: true,
+                    quiet: true,
+                    plain: false,
+                    from_step: None,
+                    max_spend_add: None,
+                    reset_breaker: false,
+                    apply_mode: None,
+                    skip_acceptance_prompt: true,
+                },
+            )
+            .await
+        }
+        CommandModeVerb::Verdict => {
+            super::verdict::verdict_command(super::verdict::VerdictArgs {
+                run_id: Some(target),
+                all: false,
+                limit: None,
+                json: false,
+                plain: false,
+                quiet: true,
+            })
+            .await
+        }
+        CommandModeVerb::Why => chain_show_command(paths, &target, true, false),
+    }
 }
 
 fn chain_pause_command(paths: &DeadreckonPaths, id: &str, reason: Option<String>) -> Result<()> {
