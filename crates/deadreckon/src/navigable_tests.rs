@@ -580,6 +580,8 @@ fn render_plan_attach_text_with_campaign_for_test(
                     plan_events: &[],
                     feed_events: &[],
                     selected: 0,
+                    selected_node: None,
+                    zoomed_node: None,
                     show_hints: true,
                     view: AttachViewMode::Activity,
                     visual: NarrativeVisualMode::Architecture,

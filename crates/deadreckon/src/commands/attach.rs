@@ -1,6 +1,8 @@
 use super::super::*;
 use super::attach_runtime::*;
 use crate::tui::navigation::{HelpKeyAction, handle_help_key};
+use crate::tui::panes::voyage::VoyageZoomState;
+use crate::tui::tree::NodeId;
 use crate::tui::{
     AttachActionNotice, AttachHelpMode, AttachParentPlan, AttachTuiState, RunNarrativeRenderInput,
     attach_panel_counts, build_run_narrative_projection, render_help_overlay,
@@ -508,6 +510,7 @@ async fn attach_plan_tui(
     let mut narrative_refresh_job: Option<AttachPlanNarrativeRefreshJob> = None;
     let mut narrative_projection_cache = AttachNarrativeProjectionCache::default();
     let mut show_help = false;
+    let mut zoom = VoyageZoomState::default();
 
     let result = loop {
         let mut tick = AttachTickTiming::new(AttachSurface::Plan, AttachTickBudget::default());
@@ -596,6 +599,10 @@ async fn attach_plan_tui(
             None
         };
         let stage_started = Instant::now();
+        let selected_node = plan
+            .tasks
+            .get(selected)
+            .map(|task| NodeId::task(&plan.plan_id, &task.task_id));
         terminal.draw(|frame| {
             render_plan_attach(
                 frame,
@@ -606,6 +613,8 @@ async fn attach_plan_tui(
                     plan_events: &plan_events,
                     feed_events: &feed_events,
                     selected,
+                    selected_node: selected_node.as_ref(),
+                    zoomed_node: zoom.zoomed(),
                     show_hints,
                     view,
                     visual,
@@ -642,6 +651,13 @@ async fn attach_plan_tui(
                 }
             }
             match event {
+                Event::Key(key)
+                    if key.code == KeyCode::Esc
+                        && key.modifiers.is_empty()
+                        && zoom.zoomed().is_some() =>
+                {
+                    let _ = zoom.escape();
+                }
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
                     view = toggle_attach_view(view);
@@ -676,43 +692,17 @@ async fn attach_plan_tui(
                     // background refresh job invalidates the narrative cache on completion.
                 }
                 Event::Key(key) if key.code == KeyCode::Enter => {
-                    if let Some(run_id) = plan
+                    let zoom_target = plan
                         .tasks
                         .get(selected)
-                        .and_then(|task| task.child_run_id.as_deref())
-                    {
-                        if load_run(paths, run_id).is_err() {
-                            narrative_notice = Some(unloadable_child_notice(run_id));
-                            continue;
-                        }
-                        let parent_plan = plan.tasks.get(selected).map(|task| AttachParentPlan {
-                            plan_id: plan.plan_id.clone(),
-                            task_id: task.task_id.clone(),
-                            campaign_parent: parent_campaign.clone(),
-                        });
-                        if cancel_plan_narrative_refresh_job(&mut narrative_refresh_job) {
-                            narrative_notice = Some(
-                                "plan refresh cancelled while opening child attach".to_string(),
-                            );
-                        }
-                        suspend_tui(&mut terminal)?;
-                        let child_result = attach_tui_with_parent(
-                            paths,
-                            run_id,
-                            show_hints,
-                            parent_plan,
-                            view,
-                            visual,
-                            narrative_config.clone(),
-                        )
-                        .await;
-                        if let Err(err) = &child_result {
-                            print_error(err);
-                            let _ =
-                                wait_for_return("press Enter/q/Esc to return to plan attach...");
-                        }
-                        resume_tui(&mut terminal)?;
-                    }
+                        .map(|task| {
+                            task.child_run_id
+                                .as_deref()
+                                .map(NodeId::run)
+                                .unwrap_or_else(|| NodeId::task(&plan.plan_id, &task.task_id))
+                        })
+                        .unwrap_or_else(|| NodeId::plan(&plan.plan_id));
+                    let _ = zoom.enter(zoom_target);
                 }
                 Event::Key(key) if view.is_narrative() => {
                     let total = narrative_projection.as_ref().map_or(0, |projection| {
@@ -1206,15 +1196,6 @@ fn wait_for_return(message: &str) -> Result<()> {
     outcome
 }
 
-/// Notice shown when Enter opens a child whose run state cannot be loaded,
-/// instead of a silent no-op.
-fn unloadable_child_notice(run_id: &str) -> String {
-    format!(
-        "unavailable: child run {} could not be loaded",
-        run_prefix(run_id)
-    )
-}
-
 const PLAN_LIST_PAGE: usize = 10;
 
 /// Drives the plan attach task selection through the shared navigation core
@@ -1307,7 +1288,7 @@ impl crate::tui::navigation::NavigableSurface for NarrativeScrollNav<'_> {
 mod nav_tests {
     use super::{
         CompletionKeyOutcome, NarrativeScrollNav, PLAN_LIST_PAGE, PLAN_NARRATIVE_PAGE, PlanNav,
-        resolve_completion_key, return_key_dismisses, unloadable_child_notice,
+        resolve_completion_key, return_key_dismisses,
     };
     use crate::CompletionAction;
     use crate::tui::navigation::dispatch_navigation;
@@ -1504,15 +1485,5 @@ mod nav_tests {
                 "{code:?} should not dismiss the return prompt"
             );
         }
-    }
-
-    #[test]
-    fn enter_on_unloadable_child_shows_notice() {
-        let notice = unloadable_child_notice("aaaaaaaabbbbbbbb");
-        assert!(notice.contains("unavailable"), "{notice}");
-        assert!(
-            notice.contains("aaaaaaaa"),
-            "shows the run prefix: {notice}"
-        );
     }
 }

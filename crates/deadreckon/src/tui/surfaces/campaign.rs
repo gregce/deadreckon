@@ -2,14 +2,16 @@ use crate::commands::campaign::{
     CampaignAttachState, CampaignFeedEvent, campaign_status_text, rollup_verdict_text,
 };
 use crate::tui::panes::activity::{scroll_indicator, selection_glyph};
+use crate::tui::panes::detail::run_detail_lines;
 use crate::tui::panes::footer::footer;
-use crate::tui::panes::voyage::{VoyagePaneState, render_voyage_pane};
+use crate::tui::panes::voyage::{VoyagePaneState, node_breadcrumb, render_voyage_pane};
 use crate::tui::spine::{render_spine_band, spine_for_campaign_with_events};
-use crate::tui::surfaces::plan::plan_event_line;
+use crate::tui::surfaces::plan::{plan_event_line, plan_task_detail_lines};
 use crate::tui::tree::{NodeId, tree_for_campaign};
-use crate::{one_line, run_prefix, ui};
+use crate::{load_plan, load_run, one_line, plan_status_label, run_prefix, ui};
 use chrono::Utc;
 use deadreckon_core::campaign::SubGoalStatus;
+use deadreckon_core::{DeadreckonPaths, Plan};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -47,7 +49,10 @@ pub(crate) fn render_campaign_attach(frame: &mut ratatui::Frame<'_>, state: &Cam
         .split(vertical[1]);
     let tree = tree_for_campaign(&state.paths, &state.campaign);
     let mut voyage_state = VoyagePaneState::default();
-    if let Some(sub) = state.campaign.sub_goals.get(state.selected) {
+    let effective_node = state.zoomed_node.as_ref().or(state.selected_node.as_ref());
+    if let Some(node) = effective_node {
+        voyage_state.select_node(&tree, node);
+    } else if let Some(sub) = state.campaign.sub_goals.get(state.selected) {
         voyage_state.select_node(
             &tree,
             &NodeId::sub_goal(&state.campaign.campaign_id, &sub.sub_id),
@@ -57,37 +62,21 @@ pub(crate) fn render_campaign_attach(frame: &mut ratatui::Frame<'_>, state: &Cam
     }
     render_voyage_pane(frame, body[0], &tree, &mut voyage_state);
 
-    let panes = campaign_sub_pane_layout(body[1], state.campaign.sub_goals.len());
-    for (index, sub) in state.campaign.sub_goals.iter().enumerate() {
-        let Some(rect) = panes.get(index).copied() else {
-            continue;
-        };
-        let selected = index == state.selected;
-        let title = format!(
-            "{} {} {}",
-            selection_glyph(selected),
-            sub.sub_id,
-            campaign_sub_status_text(sub.status)
-        );
-        let lines = campaign_sub_lines(state, index, rect.width.saturating_sub(4) as usize)
-            .into_iter()
-            .map(Line::from)
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .title(title)
-                        .borders(Borders::ALL)
-                        .border_style(if selected {
-                            Style::default().fg(ui::TUI_PALETTE.border_focused)
-                        } else {
-                            Style::default().fg(ui::TUI_PALETTE.border_idle)
-                        }),
-                )
-                .wrap(Wrap { trim: true }),
-            rect,
-        );
+    let rendered_detail = if let Some(node) = effective_node {
+        tree.find(node).is_some()
+            && render_campaign_node_detail(
+                frame,
+                body[1],
+                state,
+                &tree,
+                node,
+                state.zoomed_node.is_some(),
+            )
+    } else {
+        false
+    };
+    if !rendered_detail {
+        render_campaign_sub_cards(frame, body[1], state);
     }
 
     let feed = campaign_feed_lines(state, vertical[2].height.saturating_sub(2) as usize)
@@ -251,6 +240,132 @@ fn campaign_sub_lines(state: &CampaignAttachState, index: usize, width: usize) -
         ),
         one_line(&format!("  {}", sub.goal), width),
     ]
+}
+
+fn render_campaign_sub_cards(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    state: &CampaignAttachState,
+) {
+    let panes = campaign_sub_pane_layout(area, state.campaign.sub_goals.len());
+    for (index, sub) in state.campaign.sub_goals.iter().enumerate() {
+        let Some(rect) = panes.get(index).copied() else {
+            continue;
+        };
+        let selected = index == state.selected;
+        let title = format!(
+            "{} {} {}",
+            selection_glyph(selected),
+            sub.sub_id,
+            campaign_sub_status_text(sub.status)
+        );
+        let lines = campaign_sub_lines(state, index, rect.width.saturating_sub(4) as usize)
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_style(if selected {
+                            Style::default().fg(ui::TUI_PALETTE.border_focused)
+                        } else {
+                            Style::default().fg(ui::TUI_PALETTE.border_idle)
+                        }),
+                )
+                .wrap(Wrap { trim: true }),
+            rect,
+        );
+    }
+}
+
+fn render_campaign_node_detail(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    state: &CampaignAttachState,
+    tree: &crate::tui::tree::TreeModel,
+    node: &NodeId,
+    zoomed: bool,
+) -> bool {
+    let width = area.width.saturating_sub(4) as usize;
+    let mut lines = match node {
+        NodeId::Run(run_id) => load_run(&state.paths, run_id)
+            .map(|run| run_detail_lines(&run, width))
+            .unwrap_or_else(|_| vec![format!("run {} unavailable", run_prefix(run_id))]),
+        NodeId::Task { plan_id, task_id } => {
+            let Ok(plan) = load_plan(&state.paths, plan_id) else {
+                return false;
+            };
+            let Some(task) = plan.tasks.iter().find(|task| task.task_id == *task_id) else {
+                return false;
+            };
+            plan_task_detail_lines(&state.paths, &plan, task, width)
+        }
+        NodeId::Plan(plan_id) => {
+            let Ok(plan) = load_plan(&state.paths, plan_id) else {
+                return false;
+            };
+            plan_detail_lines(&state.paths, &plan, width)
+        }
+        NodeId::SubGoal {
+            campaign_id,
+            sub_id,
+        } if campaign_id == &state.campaign.campaign_id => {
+            let Some(index) = state
+                .campaign
+                .sub_goals
+                .iter()
+                .position(|sub| sub.sub_id == *sub_id)
+            else {
+                return false;
+            };
+            campaign_sub_lines(state, index, width)
+        }
+        NodeId::Campaign(campaign_id) if campaign_id == &state.campaign.campaign_id => {
+            campaign_attach_header_text_lines(state)
+        }
+        _ => return false,
+    };
+    if zoomed && let Some(breadcrumb) = node_breadcrumb(tree, node) {
+        lines.insert(0, format!("breadcrumb {breadcrumb}"));
+    }
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+            .block(
+                Block::default()
+                    .title(campaign_detail_title(node, zoomed))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ui::TUI_PALETTE.border_focused)),
+            )
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+    true
+}
+
+fn plan_detail_lines(_paths: &DeadreckonPaths, plan: &Plan, width: usize) -> Vec<String> {
+    vec![
+        format!(
+            "plan {}  status {}",
+            run_prefix(&plan.plan_id),
+            plan_status_label(plan.status)
+        ),
+        one_line(&plan.root_goal, width),
+    ]
+}
+
+fn campaign_detail_title(node: &NodeId, zoomed: bool) -> String {
+    let prefix = if zoomed { "zoom" } else { "detail" };
+    match node {
+        NodeId::Run(run_id) => format!("{prefix}: run {}", run_prefix(run_id)),
+        NodeId::Task { task_id, .. } => format!("{prefix}: task {task_id}"),
+        NodeId::Plan(plan_id) => format!("{prefix}: plan {}", run_prefix(plan_id)),
+        NodeId::SubGoal { sub_id, .. } => format!("{prefix}: sub {sub_id}"),
+        NodeId::Campaign(campaign_id) => format!("{prefix}: campaign {}", run_prefix(campaign_id)),
+        NodeId::Chain(_) | NodeId::ChainStep { .. } => format!("{prefix}: voyage"),
+    }
 }
 
 fn campaign_feed_lines(state: &CampaignAttachState, max: usize) -> Vec<Line<'static>> {

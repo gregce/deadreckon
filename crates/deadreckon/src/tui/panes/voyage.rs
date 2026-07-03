@@ -14,6 +14,45 @@ pub(crate) struct VoyagePaneState {
     tree: TreeState<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct VoyageZoomState {
+    zoomed: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VoyageZoomAction {
+    Zoomed,
+    BackedOut,
+    Quit,
+}
+
+impl VoyageZoomState {
+    pub(crate) fn enter(&mut self, selected: NodeId) -> VoyageZoomAction {
+        self.zoomed = Some(selected);
+        VoyageZoomAction::Zoomed
+    }
+
+    pub(crate) fn escape(&mut self) -> VoyageZoomAction {
+        if self.zoomed.take().is_some() {
+            VoyageZoomAction::BackedOut
+        } else {
+            VoyageZoomAction::Quit
+        }
+    }
+
+    pub(crate) fn zoomed(&self) -> Option<&NodeId> {
+        self.zoomed.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn breadcrumb(&self, model: &TreeModel) -> String {
+        self.zoomed
+            .as_ref()
+            .and_then(|id| node_breadcrumb(model, id))
+            .unwrap_or_else(|| "voyage".to_string())
+    }
+}
+
 impl VoyagePaneState {
     #[cfg(test)]
     pub(crate) fn selected_path(&self) -> &[String] {
@@ -90,6 +129,10 @@ pub(crate) fn render_voyage_pane(
 pub(crate) fn collapsed_voyage_header(model: &TreeModel, width: usize) -> String {
     let row = node_row(&model.root, width.saturating_sub("voyage ".len()), 0);
     format!("voyage {row}")
+}
+
+pub(crate) fn node_breadcrumb(model: &TreeModel, id: &NodeId) -> Option<String> {
+    breadcrumb_to_node(&model.root, id, &mut Vec::new()).map(|parts| parts.join(" > "))
 }
 
 fn tree_items(model: &TreeModel, width: usize) -> io::Result<Vec<TreeItem<'static, String>>> {
@@ -217,6 +260,27 @@ fn path_to_node(node: &TreeNode, id: &NodeId, path: &mut Vec<String>) -> Option<
         }
     }
     path.pop();
+    None
+}
+
+fn breadcrumb_to_node(
+    node: &TreeNode,
+    id: &NodeId,
+    parts: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    parts.push(format!("{} {}", kind_label(node.kind), node_ref(&node.id)));
+    if &node.id == id {
+        let found = parts.clone();
+        parts.pop();
+        return Some(found);
+    }
+    for child in &node.children {
+        if let Some(found) = breadcrumb_to_node(child, id, parts) {
+            parts.pop();
+            return Some(found);
+        }
+    }
+    parts.pop();
     None
 }
 

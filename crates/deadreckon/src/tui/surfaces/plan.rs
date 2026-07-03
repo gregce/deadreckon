@@ -1,11 +1,12 @@
 use crate::plan_event_bus::PlanFeedEvent;
 use crate::tui::attach_state::AttachCampaignParent;
 use crate::tui::panes::activity::{scroll_indicator, selection_glyph};
+use crate::tui::panes::detail::run_detail_lines;
 use crate::tui::panes::header::provider_is_metered;
 use crate::tui::panes::narrative::{
     NARRATIVE_SPLIT_WIDTH, PLAN_NARRATIVE_AREA_HEIGHT, narrative_list_item, visible_narrative_items,
 };
-use crate::tui::panes::voyage::{VoyagePaneState, render_voyage_pane};
+use crate::tui::panes::voyage::{VoyagePaneState, node_breadcrumb, render_voyage_pane};
 use crate::tui::spine::{render_spine_band, spine_for_plan_with_events};
 use crate::tui::tree::{NodeId, tree_for_plan};
 use crate::{
@@ -29,6 +30,8 @@ pub(crate) struct PlanAttachRenderState<'a> {
     pub(crate) plan_events: &'a [PlanEvent],
     pub(crate) feed_events: &'a [PlanFeedEvent],
     pub(crate) selected: usize,
+    pub(crate) selected_node: Option<&'a NodeId>,
+    pub(crate) zoomed_node: Option<&'a NodeId>,
     pub(crate) show_hints: bool,
     pub(crate) view: narrative::AttachViewMode,
     pub(crate) visual: narrative::NarrativeVisualMode,
@@ -120,63 +123,31 @@ pub(crate) fn render_plan_attach(
         .split(task_area);
     let tree = tree_for_plan(paths, plan);
     let mut voyage_state = VoyagePaneState::default();
-    if let Some(task) = plan.tasks.get(state.selected) {
+    let effective_node = state.zoomed_node.or(state.selected_node);
+    if let Some(node) = effective_node {
+        voyage_state.select_node(&tree, node);
+    } else if let Some(task) = plan.tasks.get(state.selected) {
         voyage_state.select_node(&tree, &NodeId::task(&plan.plan_id, &task.task_id));
     } else {
         voyage_state.sync(&tree);
     }
     render_voyage_pane(frame, body[0], &tree, &mut voyage_state);
-    let panes = plan_task_pane_layout(body[1], plan.tasks.len());
-    for (index, task) in plan.tasks.iter().enumerate() {
-        let Some(rect) = panes.get(index).copied() else {
-            continue;
-        };
-        let is_selected = index == state.selected;
-        let title = format!(
-            "{} {} {}",
-            selection_glyph(is_selected),
-            task.task_id,
-            task_status_label(task.status)
-        );
-        let lines =
-            plan_task_detail_lines(paths, plan, task, rect.width.saturating_sub(4) as usize)
-                .into_iter()
-                .enumerate()
-                .map(|(line_index, line)| {
-                    if line_index == 0 {
-                        Line::from(vec![
-                            Span::styled(
-                                line.split_once("  ")
-                                    .map(|(role, _)| role.to_string())
-                                    .unwrap_or_else(|| line.clone()),
-                                Style::default().fg(Color::Magenta),
-                            ),
-                            Span::raw(
-                                line.split_once("  ")
-                                    .map(|(_, rest)| format!("  {rest}"))
-                                    .unwrap_or_default(),
-                            ),
-                        ])
-                    } else {
-                        Line::from(line)
-                    }
-                })
-                .collect::<Vec<_>>();
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .title(title)
-                        .borders(Borders::ALL)
-                        .border_style(if is_selected {
-                            Style::default().fg(ui::TUI_PALETTE.border_focused)
-                        } else {
-                            Style::default().fg(ui::TUI_PALETTE.border_idle)
-                        }),
-                )
-                .wrap(Wrap { trim: true }),
-            rect,
-        );
+    let rendered_detail = if let Some(node) = effective_node {
+        tree.find(node).is_some()
+            && render_plan_node_detail(
+                frame,
+                body[1],
+                paths,
+                plan,
+                &tree,
+                node,
+                state.zoomed_node.is_some(),
+            )
+    } else {
+        false
+    };
+    if !rendered_detail {
+        render_plan_task_cards(frame, body[1], paths, plan, state);
     }
 
     if state.view.is_narrative() {
@@ -311,11 +282,11 @@ pub(crate) fn plan_attach_footer(
     let mut has_primary_footer_action = false;
     let mut footer = if view.is_narrative() {
         format!(
-            "n narrative/activity  v visual={}  r refresh  |  arrows/Tab child  Enter child run  q detach",
+            "n narrative/activity  v visual={}  r refresh  |  arrows/Tab child  Enter zoom  q detach",
             visual.label()
         )
     } else {
-        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter child run  |  n narrative  b/Backspace back from child"
+        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter zoom  |  Esc backs out of zoom  |  n narrative"
             .to_string()
     };
     if let Some(task) = plan.tasks.get(selected) {
@@ -323,7 +294,7 @@ pub(crate) fn plan_attach_footer(
             None => {
                 has_primary_footer_action = true;
                 let wait_hint = format!(
-                    "Enter waits for child run  |  next deadreckon fork {}",
+                    "Enter zoom task  |  Esc backs out of zoom  |  next deadreckon fork {}",
                     run_prefix(&plan.plan_id)
                 );
                 if view.is_narrative() {
@@ -335,7 +306,7 @@ pub(crate) fn plan_attach_footer(
             }
             Some(run_id) if load_run(paths, run_id).is_err() => {
                 has_primary_footer_action = true;
-                let unavailable_hint = "child detail unavailable  |  next deadreckon list --all";
+                let unavailable_hint = "child detail unavailable  |  Enter zoom task  |  Esc backs out of zoom  |  next deadreckon list --all";
                 if view.is_narrative() {
                     footer = format!("{footer}  |  {unavailable_hint}");
                 } else {
@@ -428,6 +399,129 @@ fn plan_task_pane_layout(
         }
     }
     rects
+}
+
+fn render_plan_task_cards(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    state: &PlanAttachRenderState<'_>,
+) {
+    let panes = plan_task_pane_layout(area, plan.tasks.len());
+    for (index, task) in plan.tasks.iter().enumerate() {
+        let Some(rect) = panes.get(index).copied() else {
+            continue;
+        };
+        let is_selected = index == state.selected;
+        let title = format!(
+            "{} {} {}",
+            selection_glyph(is_selected),
+            task.task_id,
+            task_status_label(task.status)
+        );
+        let lines =
+            plan_task_detail_lines(paths, plan, task, rect.width.saturating_sub(4) as usize)
+                .into_iter()
+                .enumerate()
+                .map(|(line_index, line)| {
+                    if line_index == 0 {
+                        Line::from(vec![
+                            Span::styled(
+                                line.split_once("  ")
+                                    .map(|(role, _)| role.to_string())
+                                    .unwrap_or_else(|| line.clone()),
+                                Style::default().fg(Color::Magenta),
+                            ),
+                            Span::raw(
+                                line.split_once("  ")
+                                    .map(|(_, rest)| format!("  {rest}"))
+                                    .unwrap_or_default(),
+                            ),
+                        ])
+                    } else {
+                        Line::from(line)
+                    }
+                })
+                .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_style(if is_selected {
+                            Style::default().fg(ui::TUI_PALETTE.border_focused)
+                        } else {
+                            Style::default().fg(ui::TUI_PALETTE.border_idle)
+                        }),
+                )
+                .wrap(Wrap { trim: true }),
+            rect,
+        );
+    }
+}
+
+fn render_plan_node_detail(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    tree: &crate::tui::tree::TreeModel,
+    node: &NodeId,
+    zoomed: bool,
+) -> bool {
+    let width = area.width.saturating_sub(4) as usize;
+    let mut lines = match node {
+        NodeId::Run(run_id) => load_run(paths, run_id)
+            .map(|state| run_detail_lines(&state, width))
+            .unwrap_or_else(|_| vec![format!("run {} unavailable", run_prefix(run_id))]),
+        NodeId::Task { plan_id, task_id } if plan_id == &plan.plan_id => {
+            let Some(task) = plan.tasks.iter().find(|task| task.task_id == *task_id) else {
+                return false;
+            };
+            plan_task_detail_lines(paths, plan, task, width)
+        }
+        NodeId::Plan(plan_id) if plan_id == &plan.plan_id => vec![
+            format!(
+                "plan {}  status {}",
+                run_prefix(&plan.plan_id),
+                plan_status_label(plan.status)
+            ),
+            one_line(&plan.root_goal, width),
+            plan_provider_summary(plan),
+        ],
+        _ => return false,
+    };
+    if zoomed && let Some(breadcrumb) = node_breadcrumb(tree, node) {
+        lines.insert(0, format!("breadcrumb {breadcrumb}"));
+    }
+    let title = plan_detail_title(node, zoomed);
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ui::TUI_PALETTE.border_focused)),
+            )
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+    true
+}
+
+fn plan_detail_title(node: &NodeId, zoomed: bool) -> String {
+    let prefix = if zoomed { "zoom" } else { "detail" };
+    match node {
+        NodeId::Run(run_id) => format!("{prefix}: run {}", run_prefix(run_id)),
+        NodeId::Task { task_id, .. } => format!("{prefix}: task {task_id}"),
+        NodeId::Plan(plan_id) => format!("{prefix}: plan {}", run_prefix(plan_id)),
+        NodeId::Chain(_)
+        | NodeId::ChainStep { .. }
+        | NodeId::Campaign(_)
+        | NodeId::SubGoal { .. } => format!("{prefix}: voyage"),
+    }
 }
 
 fn plan_activity_lines(
