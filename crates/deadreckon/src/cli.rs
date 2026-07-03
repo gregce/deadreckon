@@ -1604,6 +1604,8 @@ pub(crate) enum Commands {
         narrative_max_spend: Option<f64>,
         #[arg(long, help = "Structured JSON output for the selected attach view")]
         json: bool,
+        #[arg(long, help = "Print the cited why panel text instead of live attach")]
+        why: bool,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]

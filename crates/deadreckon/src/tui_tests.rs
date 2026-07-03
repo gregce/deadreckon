@@ -46,7 +46,7 @@ use super::tui::{
     chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
     chain_event_read_hint, chain_timeline_lines, footer, help_overlay_lines, markdown_to_tui_lines,
     max_panel_scroll, panel_title, plan_narrative_title, render_chain_attach, render_help_overlay,
-    scroll_indicator, selection_glyph,
+    render_why_panel, scroll_indicator, selection_glyph, why_for_run, why_plain_lines,
 };
 use super::{
     ATTACH_JSONL_TAIL_ROW_LIMIT, ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive,
@@ -1456,6 +1456,57 @@ fn doc_preview_state() -> (tempfile::TempDir, deadreckon_core::PipelineState) {
     )
     .expect("state");
     (temp, state)
+}
+
+fn write_failed_acceptance_progress(
+    state: &deadreckon_core::PipelineState,
+    kind: &str,
+    detail: &str,
+) {
+    let path = deadreckon_core::gate::acceptance_progress_path_for_run_root(&state.run_root);
+    std::fs::create_dir_all(path.parent().expect("proofs")).expect("proofs");
+    let entry = deadreckon_core::gate::AcceptanceProgressEntry {
+        checked_at: Utc::now(),
+        status: "failed".to_string(),
+        index: 1,
+        total: 1,
+        result: Some(deadreckon_core::AcceptanceCheckResult {
+            kind: kind.to_string(),
+            passed: false,
+            must_pass: true,
+            detail: detail.to_string(),
+            command: Some("cargo test".to_string()),
+            cwd: Some(state.working_dir.clone()),
+            duration_ms: Some(12),
+            stdout: None,
+            stderr: Some("test failed".to_string()),
+        }),
+    };
+    std::fs::write(
+        path,
+        format!("{}\n", serde_json::to_string(&entry).expect("json")),
+    )
+    .expect("progress");
+}
+
+fn write_tamper_caveat(state: &deadreckon_core::PipelineState) {
+    let tamper = deadreckon_core::tamper::AcceptanceTamper {
+        schema_version: 1,
+        run_id: state.run_id.clone(),
+        evaluated_at: Utc::now(),
+        verdict: deadreckon_core::tamper::AcceptanceTamperVerdict::Caveat,
+        spec_modified: false,
+        lint_findings: Vec::new(),
+        covered_files_touched: vec![deadreckon_core::tamper::CoveredFileTouch {
+            path: "tests/auth_test.rs".to_string(),
+            change: deadreckon_core::tamper::TouchedChange::Modified,
+            by_check: "cargo_test".to_string(),
+            classification: deadreckon_core::tamper::CoverageClassification::Test,
+        }],
+        caveats: vec!["agent modified test file tests/auth_test.rs this run".to_string()],
+        refusal_reasons: Vec::new(),
+    };
+    deadreckon_core::tamper::write_acceptance_tamper(&state.run_root, &tamper).expect("tamper");
 }
 
 fn full_plan_fixture(task_count: usize) -> (tempfile::TempDir, DeadreckonPaths, Plan) {
@@ -4738,6 +4789,125 @@ fn paused_run_spine_names_pause_reason_and_next() {
         text.contains(&format!("deadreckon attach {}", state.run_id)),
         "{text}"
     );
+}
+
+#[test]
+fn gate_failed_run_why_cites_failing_check_and_proof_path() {
+    let (_temp, mut state) = doc_preview_state();
+    state.status = RunStatus::Failed;
+    state.failure_reason = Some("acceptance failed".to_string());
+    deadreckon_core::save_state(&state).expect("save failed state");
+    write_failed_acceptance_progress(&state, "cargo_test", "auth::tests::expired_token");
+
+    let report = why_for_run(&state).expect("why report");
+    let rendered = render_surface_module_text(120, 14, |frame| {
+        render_why_panel(frame, frame.area(), &report, 0);
+    });
+
+    assert!(report.verdict_line.contains("acceptance"), "{report:#?}");
+    assert!(
+        report.causes.iter().any(|cause| {
+            cause.summary.contains("cargo_test")
+                && cause.excerpt.contains("expired_token")
+                && cause.evidence_path.display().to_string().contains("proofs")
+        }),
+        "{report:#?}"
+    );
+    assert!(rendered.contains("why"), "{rendered}");
+    assert!(rendered.contains("cargo_test"), "{rendered}");
+    assert!(rendered.contains("expired_token"), "{rendered}");
+    assert!(rendered.contains("acceptance-progress.jsonl"), "{rendered}");
+}
+
+#[test]
+fn paused_at_cap_why_names_cap_and_next_action() {
+    let (_temp, mut state) = doc_preview_state();
+    state.status = RunStatus::Executing;
+    state.pause_reason = Some("spend cap reached".to_string());
+    deadreckon_core::save_state(&state).expect("save paused state");
+
+    let report = why_for_run(&state).expect("why report");
+    let lines = why_plain_lines(&report).join("\n");
+    let mut tui_state = AttachTuiState::default();
+    tui_state.handle_key(
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+        AttachPanelCounts {
+            activity: 10,
+            files: 0,
+            processes: 0,
+        },
+        AttachPanelRows {
+            activity: 5,
+            files: 0,
+            processes: 0,
+        },
+    );
+    let rendered =
+        render_attach_text_with_size(&state, &[], &AttachLive::default(), tui_state, 140, 24);
+
+    assert!(lines.contains("spend cap reached"), "{lines}");
+    assert!(
+        lines.contains(&format!("deadreckon attach {}", state.run_id)),
+        "{lines}"
+    );
+    assert!(rendered.contains("why"), "{rendered}");
+    assert!(rendered.contains("spend cap reached"), "{rendered}");
+}
+
+#[test]
+fn tamper_caveat_surfaces_in_why_causes() {
+    let (_temp, state) = doc_preview_state();
+    write_tamper_caveat(&state);
+
+    let report = why_for_run(&state).expect("why report");
+    let lines = why_plain_lines(&report).join("\n");
+
+    assert!(
+        report.causes.iter().any(|cause| {
+            cause.summary.contains("tamper caveat")
+                && cause.excerpt.contains("tests/auth_test.rs")
+                && cause
+                    .evidence_path
+                    .display()
+                    .to_string()
+                    .contains("acceptance-tamper.json")
+        }),
+        "{report:#?}"
+    );
+    assert!(lines.contains("tests/auth_test.rs"), "{lines}");
+    assert!(lines.contains("acceptance-tamper.json"), "{lines}");
+}
+
+#[test]
+fn why_never_renders_uncited_cause() {
+    let (_temp, mut state) = doc_preview_state();
+    state.status = RunStatus::Failed;
+    state.failure_reason = Some("provider exited 1".to_string());
+    deadreckon_core::save_state(&state).expect("save failed state");
+    append_trace(
+        &state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn: 3,
+            event: "provider.error".to_string(),
+            latency_ms: Some(100),
+            detail: serde_json::json!({"stderr": "model provider exited 1"}),
+        },
+    )
+    .expect("trace");
+
+    let report = why_for_run(&state).expect("why report");
+    let lines = why_plain_lines(&report).join("\n");
+
+    assert!(!report.causes.is_empty(), "{report:#?}");
+    for cause in &report.causes {
+        assert!(cause.evidence_path.is_absolute(), "{cause:#?}");
+        assert!(
+            lines.contains(&cause.evidence_path.display().to_string()),
+            "missing citation for {cause:#?}\n{lines}"
+        );
+    }
 }
 
 #[test]

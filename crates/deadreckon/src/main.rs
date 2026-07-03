@@ -1265,6 +1265,7 @@ async fn main_inner() -> Result<()> {
             no_narrative_provider,
             narrative_max_spend,
             json,
+            why,
             no_hints,
             plain,
         } => {
@@ -1279,6 +1280,7 @@ async fn main_inner() -> Result<()> {
                 no_hints,
                 plain,
                 json,
+                why,
                 view,
                 visual,
                 narrative_provider,

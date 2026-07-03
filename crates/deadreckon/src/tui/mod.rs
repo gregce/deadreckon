@@ -5,6 +5,7 @@ mod render;
 pub(crate) mod spine;
 pub(crate) mod surfaces;
 pub(crate) mod tree;
+pub(crate) mod why;
 
 pub(crate) use attach_state::{
     AttachActionNotice, AttachCampaignParent, AttachPanel, AttachParentPlan, AttachTuiState,
@@ -30,6 +31,10 @@ pub(crate) use surfaces::plan::{
     plan_provider_summary, plan_repair_label, plan_task_detail_lines, render_plan_attach,
 };
 pub(crate) use surfaces::run::render_attach;
+pub(crate) use why::{why_for_run, why_plain_lines};
+
+#[cfg(test)]
+pub(crate) use why::render_why_panel;
 
 #[cfg(test)]
 pub(crate) use render::help_overlay_lines;

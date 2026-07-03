@@ -693,6 +693,11 @@ pub(crate) fn footer_for_state(
             ]
         };
         push(&mut items, actions);
+    } else if tui_state.why_open {
+        push(
+            &mut items,
+            &[("[w]", "Activity"), ("Tab", "focus"), ("j/k", "scroll")],
+        );
     } else if tui_state.view.is_narrative() {
         push(&mut items, &[("[n]", "Activity")]);
         items.push((
@@ -708,6 +713,7 @@ pub(crate) fn footer_for_state(
             &mut items,
             &[
                 ("[n]", "Narrative"),
+                ("[w]", "Why"),
                 ("Tab", "focus"),
                 ("j/k Up/Down PgUp/PgDn", "scroll"),
             ],
