@@ -73,6 +73,11 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   `attach --view narrative` plain/json parity; the chain step pane now
   participates as the Helm voyage view while preserving step status, activity,
   spine, and in-frame command flows.
+- H-P14 (`fbc50b5`): Helm motion policy lands with `[ui] motion`,
+  `:motion full|reduced|off`, and a bounded tachyonfx-backed registry for the
+  three supported triggers: gate pass shimmer, verdict/completion flash, and
+  node state glyph pulse. Reduced motion keeps only completion effects for
+  non-TTY/replay defaults; off renders zero effect frames.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
