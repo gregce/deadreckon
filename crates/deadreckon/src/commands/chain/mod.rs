@@ -2135,11 +2135,20 @@ pub(crate) async fn chain_attach_command(
     id: &str,
     plain: bool,
 ) -> Result<()> {
+    chain_attach_command_with_view(paths, id, plain, false).await
+}
+
+pub(crate) async fn chain_attach_command_with_view(
+    paths: &DeadreckonPaths,
+    id: &str,
+    plain: bool,
+    narrative_open: bool,
+) -> Result<()> {
     let id = resolve_chain_id(paths, id, false)?;
     let chain = load_chain(paths, &id)?;
     if io::stdout().is_terminal() && !plain {
         print_attach_banner("chain", &id);
-        return chain_attach_tui(paths, &id).await;
+        return chain_attach_tui(paths, &id, narrative_open).await;
     }
     print_chain_attach_snapshot(&chain);
     Ok(())
@@ -2191,13 +2200,20 @@ pub(crate) fn chain_attach_summary_line(chain: &Chain) -> String {
     )
 }
 
-async fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()> {
+async fn chain_attach_tui(
+    paths: &DeadreckonPaths,
+    chain_id: &str,
+    narrative_open: bool,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut tui_state = ChainAttachTuiState::default();
+    let mut tui_state = ChainAttachTuiState {
+        narrative_open,
+        ..ChainAttachTuiState::default()
+    };
     let mut event_tail = AttachJsonlTail::<ChainEvent>::new(paths.chain_events(chain_id));
     let mut show_help = false;
     let mut input_events = AttachInputEvents::new(AttachTickBudget::default());

@@ -2,6 +2,7 @@ use super::super::*;
 use super::attach_runtime::*;
 use crate::tui::navigation::{HelpKeyAction, handle_help_key};
 use crate::tui::panes::voyage::VoyageZoomState;
+use crate::tui::surfaces::chain::{chain_narrative_json_text, chain_narrative_plain_text};
 use crate::tui::tree::NodeId;
 use crate::tui::{
     AttachActionNotice, AttachHelpMode, AttachParentPlan, AttachTuiState, RunNarrativeRenderInput,
@@ -112,14 +113,27 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
                     }
                     return Ok(());
                 }
-                if commands::chain::resolve_chain_id(&paths, &run_ref, false).is_ok() {
+                if let Ok(chain_id) = commands::chain::resolve_chain_id(&paths, &run_ref, false) {
                     if args.why {
-                        return commands::chain::chain_show_command(&paths, &run_ref, true, false);
+                        return commands::chain::chain_show_command(&paths, &chain_id, true, false);
                     }
-                    if args.view.is_narrative() || args.json {
-                        return print_chain_narrative_refusal(&run_ref, args.json);
+                    if args.view.is_narrative() {
+                        let chain = load_chain(&paths, &chain_id)?;
+                        let events = read_jsonl::<ChainEvent>(&paths.chain_events(&chain_id))
+                            .unwrap_or_default();
+                        if args.json {
+                            print!("{}", chain_narrative_json_text(&chain, &events)?);
+                        } else if io::stdout().is_terminal() && !args.plain {
+                            return commands::chain::chain_attach_command_with_view(
+                                &paths, &chain_id, args.plain, true,
+                            )
+                            .await;
+                        } else {
+                            print!("{}", chain_narrative_plain_text(&chain, &events));
+                        }
+                        return Ok(());
                     }
-                    return commands::chain::chain_attach_command(&paths, &run_ref, args.plain)
+                    return commands::chain::chain_attach_command(&paths, &chain_id, args.plain)
                         .await;
                 }
                 return Err(run_error);
@@ -343,55 +357,6 @@ fn campaign_projection_for_plain(
         campaign,
         selected: 0,
     })
-}
-
-fn print_chain_narrative_refusal(run_ref: &str, json_output: bool) -> Result<()> {
-    print!("{}", chain_narrative_refusal_text(run_ref, json_output)?);
-    Ok(())
-}
-
-pub(crate) fn chain_narrative_refusal_text(run_ref: &str, json_output: bool) -> Result<String> {
-    let surface = chain_narrative_refusal_surface(run_ref);
-    if json_output {
-        return Ok(format!(
-            "{}\n",
-            serde_json::to_string_pretty(&surface.add_to_json(json!({
-                "status": "unsupported",
-                "kind": "chain",
-                "id": run_ref,
-                "message": "Narrative attach is currently supported for runs, plans, and plan child refs.",
-                "try": [
-                    "deadreckon chain status",
-                    "deadreckon attach <run-id> --view narrative",
-                    "deadreckon attach <plan-id> --view narrative"
-                ]
-            })))?
-        ));
-    }
-    Ok(surface.render_plain(false))
-}
-
-fn chain_narrative_refusal_surface(run_ref: &str) -> VerdictSurface {
-    let primary = format!("deadreckon chain status {run_ref}");
-    VerdictSurface::must_new(
-        VerdictKind::Blocked,
-        "chain narrative",
-        Some(run_ref),
-        ExplanationPanel::new(
-            "Chain narrative attach is not supported yet.",
-            "Narrative attach currently supports runs, plans, and plan child refs; chain status is the supported chain inspection path.",
-            vec![
-                ("chain", run_ref),
-                ("view", "narrative"),
-                ("supported narrative targets", "run, plan, plan child"),
-            ],
-        ),
-        vec![("Recommended", primary.as_str())],
-        vec![
-            ("Secondary", "deadreckon attach <run-id> --view narrative"),
-            ("Secondary", "deadreckon attach <plan-id> --view narrative"),
-        ],
-    )
 }
 
 async fn attach_campaign_tui(
