@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.0 — The harness plots the course — 2026-07-03
+
+Makes `deadreckon start` the only launch decision a user needs. One milestone
+ships:
+
+- **Course launch planning** — the operator no longer picks the execution shape
+  (run / orchestrate / campaign) and hopes `start` softens it. A deterministic
+  SignalBundle (goal structure, the DETECTED done contract, workspace shape,
+  task history, budget fit) plus one clamped provider call resolves a typed,
+  durable `launch-plan.json` that lands in every dispatched root; a golden-pinned
+  course card previews WHAT/WHO/COST/DONE/WHY/ESCAPE; the only question `start`
+  may ask is "How will you know it worked?" (and only when the contract is
+  undetected). Campaign is never auto-chosen and never auto-accepted above the
+  confirm line; plans replay (`--plan`), state-changing launches gain JSON parity
+  (`--json --yes`), one-piece decompositions collapse to runs, and workers can
+  propose reshapes that stay inert until `deadreckon reshape` accepts them.
+
+No `PipelineState` schema changes — the plan is a file, not fields. See the
+milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §46.
+
 ## Course (stable) — the harness plots the course — 2026-07-02
 
 `deadreckon start` becomes the only launch decision a user needs. A
