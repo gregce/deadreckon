@@ -21,7 +21,9 @@ pub(crate) use panes::narrative::{
 };
 pub(crate) use render::{AttachHelpMode, render_help_overlay};
 pub(crate) use surfaces::campaign::render_campaign_attach;
-pub(crate) use surfaces::chain::{ChainAttachTuiState, chain_event_read_hint, render_chain_attach};
+pub(crate) use surfaces::chain::{
+    ChainAttachTuiState, ChainModalAction, chain_event_read_hint, render_chain_attach,
+};
 pub(crate) use surfaces::plan::{
     PlanAttachRenderState, plan_event_line, plan_event_summary, plan_final_gate_line,
     plan_provider_summary, plan_repair_label, plan_task_detail_lines, render_plan_attach,

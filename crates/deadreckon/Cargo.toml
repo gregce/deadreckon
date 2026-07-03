@@ -44,6 +44,7 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tui-tree-widget.workspace = true
+tui-textarea.workspace = true
 unicode-width.workspace = true
 uuid.workspace = true
 

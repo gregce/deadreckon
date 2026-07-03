@@ -85,14 +85,15 @@
 
 ## Attach TUI Uniformity (deferred)
 
-- Live in-frame prompts: the confirm-before-destructive flow and the "press
-  Enter to return" prompts run by suspending the alternate screen and reading a
-  raw key, not as an in-frame modal. A V1 could render a true in-frame
-  confirm/return overlay (a ratatui modal) without suspending the TUI.
-- A TUI text-input widget: there is no in-frame editable input today (anything
-  needing text suspends to a line prompt). A V1 could add `tui-input` /
-  `tui-textarea` once a real in-frame input/search/filter use case is designed
-  (Tier 3 in the rider until then).
+- Live in-frame prompts beyond Helm: Helm P9 moves chain attach's kill confirm
+  and extend input into in-frame modals. Remaining "press Enter to return"
+  overlays around nested command output and completion actions still suspend the
+  alternate screen; a V1 pass can finish those return overlays once their output
+  capture story is explicit.
+- Broader TUI text input: Helm P9 adds the ratatui-0.29-compatible
+  `tui-textarea` path for single-line chain input and command-mode plumbing.
+  V1 can expand input widgets to search, filtering, or multi-line editing once
+  those workflows are designed.
 
 ## Release integrity (embedded checksum verification)
 
