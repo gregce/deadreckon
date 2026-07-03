@@ -57,6 +57,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   input inside the ratatui frame, with modal key swallowing, Esc cancel,
   quiet command dispatch, and the ratatui-0.29-compatible `tui-textarea`
   widget ready for command-mode input.
+- H-P10 (`9dca498`): chain attach now opens command mode with `:`, dispatches
+  fixed existing verbs through in-frame input and confirm flows, surfaces
+  unknown commands with nearest `try:` guidance, and routes `:reshape` through
+  the Course reshape command path.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
