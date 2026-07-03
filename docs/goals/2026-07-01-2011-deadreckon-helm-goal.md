@@ -6,7 +6,7 @@ GOAL: Make attach the best mission-control TUI in the agent-supervision category
 - `crates/deadreckon/src/commands/attach.rs` — tick loop, `AttachTickTiming`, 250ms poll.
 - `crates/deadreckon/src/tui/{render.rs,attach_state.rs,navigation.rs}` — `render_attach`, `NavigableSurface`, the monolith to decompose.
 - `crates/deadreckon/src/narrative.rs` + `crates/deadreckon-core/src/events.rs` — projections, `PlanEventBus`, JSONL tails.
-- `docs/AS-BUILT-ARCHITECTURE.md` §18/§25/§27/§32/§36; `docs/V1-CANDIDATES.md` (flattened tree, in-frame input deferrals). Prior riders hold.
+- `docs/AS-BUILT-ARCHITECTURE.md` §18/§25/§27/§32/§36 and §46 (Course — `launch-plan.json`, `reshape-proposal.json`, the `reshape.proposed` trace, `start_attach`: artifacts helm now reads); `docs/V1-CANDIDATES.md` (flattened tree, in-frame input deferrals). Prior riders hold; Course (stable) landed since this was drafted — attach is now the auto-entered post-launch surface and reshape proposals are a state to surface.
 
 **Posture.** Stable track (0.4.0). Stay on ratatui 0.29 + crossterm 0.29 — no framework migration (iocraft/r3bl/rooibos rejected; ratzilla web mirror is V1). The non-blocking render contract is sacred: no provider calls inline, complete-JSONL-row tailing only, q/Esc always instant. New widget crates (tree, textarea, effects) are Tier 2 — logged in DEPENDENCIES.md, pinned to ratatui 0.29. Decomposition is behavior-preserving, guarded by characterization goldens. No `PipelineState` schema changes; read models only. No `git push`. Edits inside `/Users/gdc/deadreckon`. Decisions → V1-CANDIDATES.
 

@@ -3,7 +3,14 @@
 This rider holds the prescriptive constraints for the goal at
 `/Users/gdc/deadreckon/docs/goals/2026-07-01-2011-deadreckon-helm-goal.md`.
 It supersedes nothing in prior riders (attach-tui-uniformity, live-narrator,
-orchestrate-campaign-narration, verdict); their invariants still apply. This
+orchestrate-campaign-narration, verdict, **course**); their invariants still
+apply. Course (stable, AS-BUILT §46) landed after this rider was drafted and
+introduces durable artifacts helm reads — `launch-plan.json` (the decision
+record in every dispatched root: shape, pieces, budget ceiling, contract,
+confidence), an inert `reshape-proposal.json` + `reshape.proposed` trace (a
+worker-proposed decomposition — **non-terminal, the run keeps working**, not a
+pause), and `[defaults] start_attach` making attach the auto-entered
+post-launch surface. Helm surfaces these; it invents none of them. This
 rider adds: the **status spine** contract, the flattened **event tree**, an
 **event-driven async loop**, **render decomposition**, **command mode**,
 **in-frame input**, the **why panel**, the **turn timeline**, a
@@ -23,7 +30,7 @@ rendered is ever a guess.
 - **Maturity stays stable** (0.4.0 shipped; lands under a `Helm` CHANGELOG section).
 - **ratatui 0.29 + crossterm 0.29 stay.** No framework migration. Evaluated and rejected: iocraft (React-like, young, full rewrite), r3bl_tui (async-first but a rewrite), rooibos (maturity risk). ratzilla (`attach --web`, same render code → browser) is explicitly V1. New crates are WIDGETS, not frameworks, pinned to ratatui-0.29-compatible releases.
 - **The non-blocking render contract is sacred and inherited verbatim** (AS-BUILT §18): render never calls a provider inline; feeds tail complete JSONL rows only; expensive work goes to caches or background `tokio::spawn` polled between frames; provider failure degrades to the stale deterministic snapshot; q/Esc detach is instant even mid-provider-call. Every new pane (tree, why, timeline) is bound by it.
-- **Read models only.** Helm adds NO durable schema. The tree, spine, why report, and timeline are projections computed from existing files (state.json, events/spend/traces JSONL, plan-events, campaign-events, snapshots, proofs). A `spine.json`-style cache may be written per attach session under the run's `narrative/` dir but is never read as authority.
+- **Read models only.** Helm adds NO durable schema. The tree, spine, why report, and timeline are projections computed from existing files (state.json, events/spend/traces JSONL, plan-events, campaign-events, snapshots, proofs, and the Course artifacts `launch-plan.json` + `reshape-proposal.json`). A `spine.json`-style cache may be written per attach session under the run's `narrative/` dir but is never read as authority. `launch-plan.json` is authoritative for the budget ceiling and per-piece goal labels where present (an enhancement — the inferred values remain the fallback when a root predates Course); helm never writes it.
 - **Behavior-preserving decomposition.** P1 splits render.rs with zero behavior change; the characterization goldens and public-surface baseline must not move. New behavior lands only in later phases.
 - **Command mode maps to existing verbs only.** `:` commands shell to the same code paths as the CLI verbs (kill/resume/verdict/why). No new state-changing operations are invented inside the TUI.
 - **Motion policy before any effect.** No tachyonfx call ships before the `[ui] motion` config and its plumbing exist (P14 gate). Effects are event-triggered, bounded (< 800ms), and never block input.
@@ -39,9 +46,9 @@ rendered is ever a guess.
 struct SpineSnapshot {
     alive: Aliveness,        // Live{last_event_age}, Stale{age}, Dead{reason}, Done
     doing: String,           // "turn 6 · bash (12s)" | "piece 2/3 merging" | "step 3/5 applying"
-    on_track: OnTrack,       // gate {passed}/{total}, spend used/ceiling, turns used/max
-    wrong: Vec<Attention>,   // gate failure, tamper caveat, provider error, stall (> threshold quiet), paused-at-cap
-    next: PrimaryAction,     // exactly one recommended command (VerdictSurface doctrine, live)
+    on_track: OnTrack,       // gate {passed}/{total}, spend used/ceiling (ceiling from launch-plan.json when present), turns used/max
+    wrong: Vec<Attention>,   // gate failure, tamper caveat, provider error, stall (> threshold quiet), paused-at-cap, reshape-proposed (inert, non-terminal)
+    next: PrimaryAction,     // exactly one recommended command (VerdictSurface doctrine, live); a pending reshape-proposal.json → `deadreckon reshape <id>`
 }
 fn spine_for_run(...) -> SpineSnapshot      // and _plan/_chain/_campaign
 ```
@@ -85,7 +92,9 @@ struct WhyReport {
 Deterministic classifier over: `failure_reason`/`pause_reason` in state,
 last `acceptance.failed` trace + failing check detail, tamper verdict file,
 last provider error trace, cancel marker, spend/wall cap events. Every cause
-carries the real artifact path + a bounded excerpt. (This is the live seed of
+carries the real artifact path + a bounded excerpt. A pending reshape proposal
+is **not** a why-cause (it is not a failure or pause) — it lives in the spine's
+attention/next and as a timeline mark, never in the why panel. (This is the live seed of
 options-file C1 `verdict --why`; a later slice may lift it into the verb —
 Helm lands it as the attach panel.)
 
@@ -94,6 +103,7 @@ Helm lands it as the attach panel.)
 ```
 struct TimelineEntry { turn: u32, at: DateTime, story: String, files: (u32,u32,u32), spend_delta: f64, marks: Vec<Mark> }
 // Mark: GatePass, GateFail, TamperCaveat, Reshape, Checkpoint
+// Reshape mark source = the `reshape.proposed` trace (turn-stamped) written by Course C-P12.
 ```
 
 Computed from turn-doc checkpoints + narrative snapshots + spend ledger +
@@ -145,7 +155,9 @@ Contextual keys extend the existing shared navigation core
 
 Command mode (`:`) — in-frame single-line input (ratatui-textarea), prefix-
 matched against a fixed verb table, confirm-before-destructive preserved:
-`:kill [id]`, `:resume [id]`, `:verdict [id]`, `:why [id]`, `:attach <id>`
+`:kill [id]`, `:resume [id]`, `:verdict [id]`, `:why [id]`, `:reshape [id]`
+(preview/accept a pending reshape proposal — Course's `deadreckon reshape`
+verb; confirm-before-dispatch, non-TTY refuses with `try:`), `:attach <id>`
 (retarget), `:motion full|reduced|off`, `:q`. Unknown command → inline
 refusal with the nearest match as `try:`.
 
@@ -163,12 +175,14 @@ Depth tests:
 - `each_surface_module_renders_via_shared_navigation`
 
 ### P2 — SpineSnapshot model + contract table
-- `spine.rs`: the struct, four `spine_for_*` builders (pure over durable files), the 5×4 contract table, doc==code test scaffold.
+- `spine.rs`: the struct, four `spine_for_*` builders (pure over durable files), the 5×4 contract table, doc==code test scaffold. A pending `reshape-proposal.json` in a run root is an `Attention` item whose `PrimaryAction` is `deadreckon reshape <id>` — read straight from the inert artifact (never self-executed); the run stays live, so aliveness/doing are unaffected.
 
 Depth tests:
 - `spine_contract_table_has_no_placeholder_cells`
 - `run_spine_reports_aliveness_from_event_age`
 - `spine_next_action_is_exactly_one_command`
+- `pending_reshape_proposal_surfaces_as_attention_and_reshape_next`
+- `reshape_proposal_does_not_mark_run_paused_or_dead`
 
 ### P3 — Spine band wired into all four surfaces
 - Bottom band renders the snapshot uniformly; attention items render as count + first item; `--plain`/off-TTY attach summaries print the same five answers as lines.
@@ -225,12 +239,13 @@ Depth tests:
 - `modal_swallows_keys_and_esc_cancels`
 
 ### P10 — Command mode
-- `:` opens the input modal wired to the fixed verb table; commands dispatch to the same code paths as CLI verbs; destructive commands reuse the in-frame confirm; unknown → nearest-match `try:` inline.
+- `:` opens the input modal wired to the fixed verb table; commands dispatch to the same code paths as CLI verbs (including Course's `deadreckon reshape` via `:reshape [id]`); destructive/dispatching commands reuse the in-frame confirm; unknown → nearest-match `try:` inline.
 
 Depth tests:
 - `colon_kill_routes_through_existing_kill_path_with_confirm`
 - `unknown_command_refuses_inline_with_nearest_match`
 - `command_table_contains_only_existing_verbs`
+- `colon_reshape_routes_through_existing_reshape_path_with_confirm`
 
 ### P11 — Why panel
 - `why.rs` deterministic classifier + `w` pane rendering `WhyReport` with cited artifact paths and bounded excerpts; works for any tree node; `--plain` attach gains `--why` text parity.
@@ -248,6 +263,7 @@ Depth tests:
 - `timeline_entries_match_turn_checkpoints`
 - `scrubbing_selects_turn_story_and_diff_counts`
 - `gate_events_render_as_timeline_marks`
+- `reshape_proposed_trace_renders_as_timeline_mark`
 
 ### P13 — Chain parity
 - Chain attach gains the narrative view (closing the AS-BUILT §18.2 unsupported gap) and full spine/tree/timeline participation (steps as nodes).
@@ -272,7 +288,7 @@ Depth tests:
 - `footer_hints_follow_focused_pane`
 
 ### P16 — Architecture doc + CHANGELOG (doc only; no depth test)
-- Insert `## 47. Helm: mission-control attach` into AS-BUILT (spine contract table, tree model, loop design + latency budgets, command mode, why/timeline, motion policy) and update §18/§25/§27/§32/§36 cross-references; update §22 shipped list (flattened campaign tree and in-frame input move from thin → shipped; attach daemon/ratzilla stay deferred, stated).
+- Insert `## 47. Helm: mission-control attach` into AS-BUILT (spine contract table, tree model, loop design + latency budgets, command mode, why/timeline, motion policy) and update §18/§25/§27/§32/§36 and §46 (Course — helm surfaces its `launch-plan.json`/`reshape-proposal.json`/`reshape.proposed` artifacts and adds `:reshape`) cross-references; update §22 shipped list (flattened campaign tree and in-frame input move from thin → shipped; attach daemon/ratzilla stay deferred, stated).
 - DEPENDENCIES.md: log tui-tree-widget, ratatui-textarea (or tui-textarea), tachyonfx with pins + one-line justifications.
 - Append CHANGELOG:
   ```
