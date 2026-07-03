@@ -78,6 +78,9 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   three supported triggers: gate pass shimmer, verdict/completion flash, and
   node state glyph pulse. Reduced motion keeps only completion effects for
   non-TTY/replay defaults; off renders zero effect frames.
+- H-P15 (`6ce444e`): Helm discoverability is polished with sectioned `?`
+  overlays, a command-mode verb reference, focused-pane footer hints, and a
+  first-session footer cue for panes, why, and commands.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
