@@ -4,6 +4,7 @@ pub(crate) mod panes;
 mod render;
 pub(crate) mod spine;
 pub(crate) mod surfaces;
+pub(crate) mod tree;
 
 pub(crate) use attach_state::{
     AttachActionNotice, AttachCampaignParent, AttachPanel, AttachParentPlan, AttachTuiState,

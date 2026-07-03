@@ -1363,6 +1363,63 @@ fn full_plan_fixture(task_count: usize) -> (tempfile::TempDir, DeadreckonPaths, 
     (temp, paths, plan)
 }
 
+fn campaign_tree_fixture() -> (
+    tempfile::TempDir,
+    DeadreckonPaths,
+    std::path::PathBuf,
+    deadreckon_core::campaign::Campaign,
+    String,
+) {
+    let (temp, paths, mut plan) = full_plan_fixture(2);
+    let mut child = create_run(
+        &paths,
+        RunOptions {
+            goal: "campaign leaf run".to_string(),
+            cwd: temp.path().to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke:child".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(2.0),
+            max_wall_seconds: None,
+            run_id: Some("leafrun000000000000000000000000001".to_string()),
+            codebase: None,
+        },
+    )
+    .expect("child run");
+    child.status = RunStatus::Completed;
+    child.total_spend_usd = 1.25;
+    deadreckon_core::save_state(&child).expect("save child run");
+    plan.tasks[0].child_run_id = Some(child.run_id.clone());
+    plan.tasks[0].status = PlanTaskStatus::Completed;
+    plan.tasks[1].status = PlanTaskStatus::Running;
+    plan.status = PlanStatus::Forked;
+    save_plan(&paths, &plan).expect("save plan");
+
+    let mut sub_goals = deadreckon_core::campaign::build_sub_goals(
+        vec!["alpha service".to_string(), "beta service".to_string()],
+        2,
+    )
+    .expect("campaign sub-goals");
+    sub_goals[0].sub_plan_id = Some(plan.plan_id.clone());
+    sub_goals[0].status = deadreckon_core::campaign::SubGoalStatus::Running;
+    let mut campaign = deadreckon_core::campaign::Campaign::new(
+        "ship mission control",
+        sub_goals,
+        PlanProviders::default(),
+        0,
+        Some(12.0),
+        None,
+        "0.1.0",
+    )
+    .expect("campaign");
+    campaign.campaign_id = "camphelm000000000000000000000004".to_string();
+    campaign.status = deadreckon_core::campaign::CampaignStatus::Forked;
+    let campaign_dir = paths.plan_dir(&campaign.campaign_id);
+    deadreckon_core::campaign::write_campaign(&campaign_dir, &campaign).expect("save campaign");
+
+    (temp, paths, campaign_dir, campaign, child.run_id)
+}
+
 fn review_plan_fixture() -> (tempfile::TempDir, DeadreckonPaths, Plan) {
     let temp = test_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -4532,6 +4589,154 @@ fn paused_run_spine_names_pause_reason_and_next() {
     assert!(
         text.contains(&format!("deadreckon attach {}", state.run_id)),
         "{text}"
+    );
+}
+
+#[test]
+fn campaign_tree_builds_four_levels_from_fixtures() {
+    let (_temp, paths, campaign_dir, campaign, child_run_id) = campaign_tree_fixture();
+
+    let tree = super::tui::tree::build_tree(super::tui::tree::AttachTarget::campaign(
+        &paths,
+        campaign_dir,
+        &campaign.campaign_id,
+    ))
+    .expect("campaign tree");
+
+    assert_eq!(tree.root.kind, super::tui::tree::NodeKind::Campaign);
+    assert_eq!(tree.max_depth(), 4, "{tree:#?}");
+
+    let sub = tree
+        .root
+        .children
+        .iter()
+        .find(|node| node.id == super::tui::tree::NodeId::sub_goal(&campaign.campaign_id, "sub-0"))
+        .expect("sub node");
+    assert_eq!(sub.kind, super::tui::tree::NodeKind::SubGoal);
+    assert_eq!(sub.children[0].kind, super::tui::tree::NodeKind::Task);
+    assert_eq!(
+        sub.children[0].children[0].kind,
+        super::tui::tree::NodeKind::Run
+    );
+
+    let run = tree
+        .find(&super::tui::tree::NodeId::run(&child_run_id))
+        .expect("run node");
+    assert_eq!(run.status, super::tui::tree::NodeStatus::Verified);
+    assert_eq!(run.spend, Some(1.25));
+}
+
+#[test]
+fn fold_events_updates_node_status_without_rebuild() {
+    let (temp, paths, mut plan) = full_plan_fixture(2);
+    save_plan(&paths, &plan).expect("save plan");
+    let mut tree =
+        super::tui::tree::build_tree(super::tui::tree::AttachTarget::plan(&paths, &plan.plan_id))
+            .expect("plan tree");
+
+    let task_id = super::tui::tree::NodeId::task(&plan.plan_id, "task-0");
+    let original_label = tree.find(&task_id).expect("task").label.clone();
+    let original_child_count = tree.root.children.len();
+
+    super::tui::tree::fold_events(
+        &mut tree,
+        &[super::tui::tree::TreeEvent::Plan(PlanFeedEvent::Plan {
+            event: PlanEvent {
+                timestamp: Utc::now(),
+                plan_id: plan.plan_id.clone(),
+                event: PlanEventKind::TaskStarted {
+                    task_id: "task-0".to_string(),
+                    task_index: 0,
+                },
+            },
+        })],
+    );
+
+    let task = tree.find(&task_id).expect("task");
+    assert_eq!(task.status, super::tui::tree::NodeStatus::Running);
+    assert_eq!(task.label, original_label);
+    assert_eq!(tree.root.children.len(), original_child_count);
+
+    let mut child = create_run(
+        &paths,
+        RunOptions {
+            goal: "fold child".to_string(),
+            cwd: temp.path().to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke:child".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: None,
+            max_wall_seconds: None,
+            run_id: Some("foldrun00000000000000000000000001".to_string()),
+            codebase: None,
+        },
+    )
+    .expect("run");
+    child.status = RunStatus::Executing;
+    deadreckon_core::save_state(&child).expect("save run");
+    plan.tasks[0].child_run_id = Some(child.run_id.clone());
+
+    super::tui::tree::fold_events(
+        &mut tree,
+        &[super::tui::tree::TreeEvent::Plan(PlanFeedEvent::Plan {
+            event: PlanEvent {
+                timestamp: Utc::now(),
+                plan_id: plan.plan_id.clone(),
+                event: PlanEventKind::TaskRunDiscovered {
+                    task_id: "task-0".to_string(),
+                    task_index: 0,
+                    run_id: Some(child.run_id.clone()),
+                    pid: Some(42),
+                },
+            },
+        })],
+    );
+
+    let run_id = super::tui::tree::NodeId::run(&child.run_id);
+    assert_eq!(
+        tree.find(&run_id).map(|node| node.status),
+        Some(super::tui::tree::NodeStatus::Running)
+    );
+
+    super::tui::tree::fold_events(
+        &mut tree,
+        &[super::tui::tree::TreeEvent::Plan(PlanFeedEvent::ChildRun {
+            task_id: "task-0".to_string(),
+            run_id: child.run_id.clone(),
+            event: RunEvent {
+                timestamp: Utc::now(),
+                run_id: child.run_id.clone(),
+                event: RunEventKind::RunCompleted {
+                    status: "completed".to_string(),
+                },
+            },
+        })],
+    );
+
+    assert_eq!(
+        tree.find(&task_id).map(|node| node.status),
+        Some(super::tui::tree::NodeStatus::Verified)
+    );
+    assert_eq!(
+        tree.find(&run_id).map(|node| node.status),
+        Some(super::tui::tree::NodeStatus::Verified)
+    );
+}
+
+#[test]
+fn tree_depth_bounded_by_campaign_max_depth() {
+    let (_temp, paths, campaign_dir, campaign, _child_run_id) = campaign_tree_fixture();
+
+    let tree = super::tui::tree::build_tree(super::tui::tree::AttachTarget::campaign(
+        &paths,
+        campaign_dir,
+        &campaign.campaign_id,
+    ))
+    .expect("campaign tree");
+
+    assert!(
+        tree.max_depth() <= deadreckon_core::campaign::CAMPAIGN_MAX_DEPTH as usize + 2,
+        "tree depth exceeded campaign nesting cap: {tree:#?}"
     );
 }
 
