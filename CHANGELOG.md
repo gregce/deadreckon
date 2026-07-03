@@ -20,6 +20,13 @@ ships:
 No `PipelineState` schema changes — the plan is a file, not fields. See the
 milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §46.
 
+## Helm (stable) — mission-control attach — 2026-07-03
+
+- H-P1 (`b2a6a48`): render decomposition moves attach surface entry points into
+  `tui/surfaces/{run,plan,chain,campaign}.rs` and routes shared chrome through
+  `tui/panes/{header,activity,narrative,docs,footer}.rs`; characterization
+  goldens and the public surface remain unchanged.
+
 ## Course (stable) — the harness plots the course — 2026-07-02
 
 `deadreckon start` becomes the only launch decision a user needs. A
