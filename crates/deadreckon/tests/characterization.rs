@@ -139,7 +139,7 @@ fn chain_status_table_matches_golden() {
 }
 
 #[test]
-fn attach_off_tty_frame_matches_golden() {
+fn characterization_goldens_unchanged_after_split() {
     let temp = fixed_length_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));

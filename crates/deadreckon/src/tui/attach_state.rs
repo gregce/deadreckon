@@ -1,5 +1,6 @@
 use super::super::*;
-use super::render::{render_markdown_doc_lines, run_narrative_lines};
+use super::panes::docs::render_markdown_doc_lines;
+use super::panes::narrative::run_narrative_lines;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttachPanel {
