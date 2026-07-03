@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fs;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -8,12 +9,12 @@ use super::commands::attach::{
 };
 use super::commands::attach_runtime::{
     AttachIdleBackoff, AttachLoopStage, AttachNarrativeRefreshState, AttachPlanNarrativeRefreshJob,
-    AttachRunNarrativeRefreshJob, AttachSurface, AttachTickBudget, AttachTickTiming,
-    AttachWakeReason, AttachWorkMode, PlanNarrativeRefreshInput, attach_loop_stage_work,
-    cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job,
+    AttachRunNarrativeRefreshJob, AttachStormReplayConfig, AttachSurface, AttachTickBudget,
+    AttachTickTiming, AttachWakeReason, AttachWorkMode, PlanNarrativeRefreshInput,
+    attach_loop_stage_work, cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job,
     plan_narrative_refresh_request, poll_plan_narrative_refresh_job,
-    poll_run_narrative_refresh_job, start_or_coalesce_plan_narrative_refresh_job,
-    wait_for_attach_wake_for_test,
+    poll_run_narrative_refresh_job, replay_attach_event_storm_for_test,
+    start_or_coalesce_plan_narrative_refresh_job, wait_for_attach_wake_for_test,
 };
 use super::commands::campaign::{
     CampaignAttachState, campaign_drop_subgoal_before_launch, campaign_edit_subgoal_before_launch,
@@ -48,27 +49,27 @@ use super::tui::{
     selection_glyph,
 };
 use super::{
-    ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive, AcceptanceUiStatus, AttachJsonlTail,
-    AttachLive, AttachNarrativeProjectionCache, AttachProviderActivityCache,
-    AttachProviderLogScanCache, AttachViewMode, COMMAND_HELP_CATALOG, CommandAudience,
-    CommandDiscovery, CommandHelpEntry, CompletionAction, ConfigDefaults, HELP_ALL_GROUPS,
-    LiveFile, NOUN_DONE_CONTRACT, NOUN_VERIFIED_RUN, NarrativeAcceptanceRefreshTracker,
-    NarrativeQuietRefreshTracker, NarrativeRefreshKind, NarrativeVisualMode, PLAN_AS_BUILT,
-    PLAN_CHILDREN, PLAN_DECISIONS, PLAN_DOC_PROVIDER_ERROR, PlanAttachRenderState,
-    PlanDocRefreshOptions, PlanFeedEvent, PlanProviderAsBuilt, PlanProviderChild,
-    PlanProviderDecisions, PlanProviderDocs, PlanProviderItem, PlanProviderNarrative,
-    PlanWrapperDocContext, ProviderActivity, ProviderJsonlLogSpec, Result, RunNarrativeRenderInput,
-    TopHelpGroup, acceptance_activity_lines, attach_banner, attach_header_text,
-    attach_live_inventory, claude_project_name_for_workdir, cli_wait_status_line,
-    collect_jsonl_provider_activity, collect_jsonl_provider_activity_scan, collect_plan_doc_input,
-    command_discovery, completion_action_from_input, completion_hints_enabled,
-    deadreckoning_course_ascii, deadreckoning_status_text, kill_banner, launch_preview_rows,
-    live_file_lines, materialize_plan_docs_to_working, meter_color, narrative_provider_selection,
-    plan_attach_footer, plan_doc_path, plan_merge_repair_summary_items,
-    plan_narrative_refresh_trigger, provider_ingest_base_roots, provider_jsonl_activity_lines,
-    provider_jsonl_log_spec_from_registry, provider_jsonl_session_matches_run,
-    read_plan_events_lossy, refresh_plan_docs, render_attach, render_plan_attach,
-    resolve_plan_doc_target, run_narrative_refresh_trigger, threshold_color,
+    ATTACH_JSONL_TAIL_ROW_LIMIT, ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive,
+    AcceptanceUiStatus, AttachJsonlTail, AttachLive, AttachNarrativeProjectionCache,
+    AttachProviderActivityCache, AttachProviderLogScanCache, AttachViewMode, COMMAND_HELP_CATALOG,
+    CommandAudience, CommandDiscovery, CommandHelpEntry, CompletionAction, ConfigDefaults,
+    HELP_ALL_GROUPS, LiveFile, NOUN_DONE_CONTRACT, NOUN_VERIFIED_RUN,
+    NarrativeAcceptanceRefreshTracker, NarrativeQuietRefreshTracker, NarrativeRefreshKind,
+    NarrativeVisualMode, PLAN_AS_BUILT, PLAN_CHILDREN, PLAN_DECISIONS, PLAN_DOC_PROVIDER_ERROR,
+    PlanAttachRenderState, PlanDocRefreshOptions, PlanFeedEvent, PlanProviderAsBuilt,
+    PlanProviderChild, PlanProviderDecisions, PlanProviderDocs, PlanProviderItem,
+    PlanProviderNarrative, PlanWrapperDocContext, ProviderActivity, ProviderJsonlLogSpec, Result,
+    RunNarrativeRenderInput, TopHelpGroup, acceptance_activity_lines, attach_banner,
+    attach_header_text, attach_live_inventory, claude_project_name_for_workdir,
+    cli_wait_status_line, collect_jsonl_provider_activity, collect_jsonl_provider_activity_scan,
+    collect_plan_doc_input, command_discovery, completion_action_from_input,
+    completion_hints_enabled, deadreckoning_course_ascii, deadreckoning_status_text, kill_banner,
+    launch_preview_rows, live_file_lines, materialize_plan_docs_to_working, meter_color,
+    narrative_provider_selection, plan_attach_footer, plan_doc_path,
+    plan_merge_repair_summary_items, plan_narrative_refresh_trigger, provider_ingest_base_roots,
+    provider_jsonl_activity_lines, provider_jsonl_log_spec_from_registry,
+    provider_jsonl_session_matches_run, read_plan_events_lossy, refresh_plan_docs, render_attach,
+    render_plan_attach, resolve_plan_doc_target, run_narrative_refresh_trigger, threshold_color,
     validate_plan_provider_docs, wrap_kv_value, write_plan_docs_deterministic,
     write_plan_docs_from_provider,
 };
@@ -214,6 +215,79 @@ fn input_to_frame_stage_recorded_and_budgeted() {
     timing.record(AttachLoopStage::InputToFrame, Duration::from_millis(13));
 
     assert!(timing.input_to_frame_exceeded());
+}
+
+#[test]
+fn event_storm_coalesces_frames_within_budget() {
+    let budget = AttachTickBudget {
+        target_frame_ms: 16,
+        max_sync_io_ms: 5,
+        slow_warning_ms: 8,
+        max_input_to_frame_ms: 16,
+        idle_initial_ms: 1,
+        idle_max_ms: 16,
+    };
+    let storm = helm_event_storm_fixture_jsonl(512);
+
+    let replay = replay_attach_event_storm_for_test(
+        &storm,
+        AttachStormReplayConfig {
+            surface: AttachSurface::Run,
+            budget,
+            frame_interval: Duration::from_millis(16),
+            tail_row_limit: ATTACH_JSONL_TAIL_ROW_LIMIT,
+        },
+    )
+    .expect("storm replay");
+
+    assert_eq!(replay.events_seen, 512);
+    assert!(replay.frames_drawn < replay.events_seen / 4);
+    assert!(replay.frames_drawn <= 34, "{replay:?}");
+    assert!(replay.max_tail_rows <= ATTACH_JSONL_TAIL_ROW_LIMIT);
+    assert!(replay.retained_tail_rows <= ATTACH_JSONL_TAIL_ROW_LIMIT);
+    assert!(!replay.input_to_frame_exceeded, "{replay:?}");
+    assert!(
+        replay.max_input_to_frame <= Duration::from_millis(budget.max_input_to_frame_ms),
+        "{replay:?}"
+    );
+}
+
+#[test]
+fn storm_does_not_grow_tail_buffers_unbounded() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("storm.jsonl");
+    let mut file = fs::File::create(&path).expect("storm file");
+    let total_rows = ATTACH_JSONL_TAIL_ROW_LIMIT * 3;
+    for seq in 0..total_rows {
+        writeln!(file, "{}", serde_json::json!({ "seq": seq })).expect("storm row");
+    }
+
+    let mut tail = AttachJsonlTail::<serde_json::Value>::new(path);
+    tail.refresh().expect("tail refresh");
+
+    assert_eq!(tail.rows().len(), ATTACH_JSONL_TAIL_ROW_LIMIT);
+    assert_eq!(
+        tail.rows()
+            .first()
+            .and_then(|row| row.get("seq"))
+            .and_then(serde_json::Value::as_u64),
+        Some((total_rows - ATTACH_JSONL_TAIL_ROW_LIMIT) as u64)
+    );
+}
+
+fn helm_event_storm_fixture_jsonl(events: usize) -> String {
+    let mut storm = String::new();
+    for seq in 0..events {
+        let kind = if seq % 7 == 0 { "input" } else { "ledger" };
+        let row = serde_json::json!({
+            "at_ms": seq,
+            "kind": kind,
+            "seq": seq,
+        });
+        storm.push_str(&row.to_string());
+        storm.push('\n');
+    }
+    storm
 }
 
 #[test]

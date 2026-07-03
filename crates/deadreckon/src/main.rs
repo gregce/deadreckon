@@ -11677,6 +11677,7 @@ struct AttachLiveInventory {
 }
 
 const ATTACH_LIVE_FILE_DISPLAY_LIMIT: usize = 240;
+const ATTACH_JSONL_TAIL_ROW_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AttachJsonlSignature {
@@ -11784,6 +11785,7 @@ where
             }
         }
         self.last_appended_rows = self.rows.len().saturating_sub(before_len);
+        self.trim_rows();
         self.partial_bytes = bytes.len().saturating_sub(complete_len);
         self.offset = self.offset.saturating_add(complete_len as u64);
         self.signature = Some(AttachJsonlSignature {
@@ -11791,6 +11793,13 @@ where
             modified,
         });
         Ok(&self.rows)
+    }
+
+    fn trim_rows(&mut self) {
+        let overflow = self.rows.len().saturating_sub(ATTACH_JSONL_TAIL_ROW_LIMIT);
+        if overflow > 0 {
+            self.rows.drain(0..overflow);
+        }
     }
 }
 
