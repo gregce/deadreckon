@@ -15,7 +15,7 @@ use super::commands::attach_runtime::{
     poll_run_narrative_refresh_job, start_or_coalesce_plan_narrative_refresh_job,
 };
 use super::commands::campaign::{
-    campaign_drop_subgoal_before_launch, campaign_edit_subgoal_before_launch,
+    CampaignAttachState, campaign_drop_subgoal_before_launch, campaign_edit_subgoal_before_launch,
     campaign_replace_sub_goals_before_launch,
 };
 use super::commands::chain::{
@@ -1878,6 +1878,26 @@ fn render_plan_attach_text_with_state(
     terminal
         .draw(|frame| render_plan_attach(frame, paths, plan, &state))
         .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    let mut text = String::new();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            text.push_str(buffer.cell((x, y)).expect("cell").symbol());
+        }
+        text.push('\n');
+    }
+    text
+}
+
+fn render_surface_module_text(
+    width: u16,
+    height: u16,
+    draw: impl FnOnce(&mut ratatui::Frame<'_>),
+) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(draw).expect("draw");
     let buffer = terminal.backend().buffer();
     let area = buffer.area;
     let mut text = String::new();
@@ -4296,6 +4316,98 @@ fn footer_shape_identical_across_surfaces() {
             "{name} footer offers Esc/q: {text}"
         );
     }
+}
+
+#[test]
+fn each_surface_module_renders_via_shared_navigation() {
+    let (_run_temp, run_state) = doc_preview_state();
+    let run_text = render_surface_module_text(140, 24, |frame| {
+        super::tui::surfaces::run::render_attach(
+            frame,
+            &run_state,
+            &[],
+            &[],
+            &[],
+            &AttachLive::default(),
+            &AttachTuiState::default(),
+        );
+    });
+    assert!(run_text.contains("deadreckon"), "{run_text}");
+
+    let (_plan_temp, paths, plan) = full_plan_fixture(2);
+    let plan_render_state = PlanAttachRenderState {
+        messages: &[],
+        plan_events: &[],
+        feed_events: &[],
+        selected: 0,
+        show_hints: true,
+        view: AttachViewMode::Activity,
+        visual: NarrativeVisualMode::Architecture,
+        campaign_parent: None,
+        narrative_notice: None,
+        narrative_projection: None,
+        narrative_scroll: 0,
+    };
+    let plan_text = render_surface_module_text(140, 24, |frame| {
+        super::tui::surfaces::plan::render_plan_attach(frame, &paths, &plan, &plan_render_state);
+    });
+    assert!(plan_text.contains("deadreckon plan"), "{plan_text}");
+
+    let chain = chain_fixture();
+    let chain_text = render_surface_module_text(100, 24, |frame| {
+        super::tui::surfaces::chain::render_chain_attach(
+            frame,
+            &chain,
+            &[],
+            &ChainAttachTuiState::default(),
+        );
+    });
+    assert!(chain_text.contains("deadreckon chain"), "{chain_text}");
+
+    let campaign_temp = test_tempdir();
+    let campaign_paths = DeadreckonPaths::from_home(campaign_temp.path().join("home"));
+    let mut sub_goals = deadreckon_core::campaign::build_sub_goals(
+        vec!["alpha service".to_string(), "beta service".to_string()],
+        2,
+    )
+    .expect("campaign sub-goals");
+    sub_goals[0].status = deadreckon_core::campaign::SubGoalStatus::Running;
+    let mut campaign = deadreckon_core::campaign::Campaign::new(
+        "ship mission control",
+        sub_goals,
+        PlanProviders::default(),
+        0,
+        Some(12.0),
+        None,
+        "0.1.0",
+    )
+    .expect("campaign");
+    campaign.campaign_id = "camphelm000000000000000000000001".to_string();
+    campaign.status = deadreckon_core::campaign::CampaignStatus::Forked;
+    let campaign_state = CampaignAttachState::new(
+        &campaign_paths,
+        campaign_paths.plan_dir(&campaign.campaign_id),
+        campaign,
+    );
+    let campaign_text = render_surface_module_text(120, 24, |frame| {
+        super::tui::surfaces::campaign::render_campaign_attach(frame, &campaign_state);
+    });
+    assert!(
+        campaign_text.contains("deadreckon campaign"),
+        "{campaign_text}"
+    );
+
+    let mut run_nav = AttachTuiState::default();
+    run_nav.handle_key(
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        counts(),
+        rows(),
+    );
+    assert_eq!(run_nav.activity_scroll, 1);
+
+    let mut chain_nav = ChainAttachTuiState::default();
+    chain_nav.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &chain);
+    assert_eq!(chain_nav.selected_step, 1);
 }
 
 #[test]

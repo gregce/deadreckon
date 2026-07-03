@@ -1,6 +1,8 @@
 mod attach_state;
 pub(crate) mod navigation;
+pub(crate) mod panes;
 mod render;
+pub(crate) mod surfaces;
 
 pub(crate) use attach_state::{
     AttachActionNotice, AttachCampaignParent, AttachPanel, AttachParentPlan, AttachTuiState,
@@ -9,24 +11,43 @@ pub(crate) use attach_state::{
 
 #[cfg(test)]
 pub(crate) use attach_state::{AttachPanelCounts, AttachPanelRows, max_panel_scroll};
-pub(crate) use render::{
-    AttachHelpMode, ChainAttachTuiState, PLAN_NARRATIVE_AREA_HEIGHT, PlanAttachRenderState,
-    RunNarrativeRenderInput, attach_activity_lines_for_tui, build_run_narrative_projection,
-    chain_event_read_hint, ensure_run_narrative_projection, live_file_lines, plan_event_line,
-    plan_event_summary, plan_final_gate_line, plan_provider_summary, plan_repair_label,
-    plan_task_detail_lines, process_lines, provider_is_metered, render_attach,
-    render_campaign_attach, render_chain_attach, render_help_overlay, render_plan_attach,
-    run_narrative_projection, run_narrative_projection_signature,
+pub(crate) use panes::activity::{attach_activity_lines_for_tui, live_file_lines, process_lines};
+pub(crate) use panes::header::provider_is_metered;
+pub(crate) use panes::narrative::{
+    PLAN_NARRATIVE_AREA_HEIGHT, RunNarrativeRenderInput, build_run_narrative_projection,
+    ensure_run_narrative_projection, run_narrative_projection, run_narrative_projection_signature,
 };
+pub(crate) use render::{AttachHelpMode, render_help_overlay};
+pub(crate) use surfaces::campaign::render_campaign_attach;
+pub(crate) use surfaces::chain::{ChainAttachTuiState, chain_event_read_hint, render_chain_attach};
+pub(crate) use surfaces::plan::{
+    PlanAttachRenderState, plan_event_line, plan_event_summary, plan_final_gate_line,
+    plan_provider_summary, plan_repair_label, plan_task_detail_lines, render_plan_attach,
+};
+pub(crate) use surfaces::run::render_attach;
 
 #[cfg(test)]
 pub(crate) use render::help_overlay_lines;
 
 #[cfg(test)]
-pub(crate) use render::{
-    CAMPAIGN_EMPTY_HINT, NARRATIVE_SPLIT_WIDTH, acceptance_activity_lines, attach_header_text,
-    chain_activity_lines, chain_attach_footer_text, chain_attach_header_text, chain_timeline_lines,
-    deadreckoning_status_text, footer, markdown_to_tui_lines, meter_color, panel_title,
-    plan_attach_footer, plan_narrative_title, render_campaign_attach_text, scroll_indicator,
-    selection_glyph, threshold_color,
+pub(crate) use panes::activity::{
+    acceptance_activity_lines, panel_title, scroll_indicator, selection_glyph,
 };
+#[cfg(test)]
+pub(crate) use panes::docs::markdown_to_tui_lines;
+#[cfg(test)]
+pub(crate) use panes::footer::footer;
+#[cfg(test)]
+pub(crate) use panes::header::{
+    attach_header_text, deadreckoning_status_text, meter_color, threshold_color,
+};
+#[cfg(test)]
+pub(crate) use panes::narrative::NARRATIVE_SPLIT_WIDTH;
+#[cfg(test)]
+pub(crate) use surfaces::campaign::{CAMPAIGN_EMPTY_HINT, render_campaign_attach_text};
+#[cfg(test)]
+pub(crate) use surfaces::chain::{
+    chain_activity_lines, chain_attach_footer_text, chain_attach_header_text, chain_timeline_lines,
+};
+#[cfg(test)]
+pub(crate) use surfaces::plan::{plan_attach_footer, plan_narrative_title};
