@@ -2,6 +2,7 @@ mod attach_state;
 pub(crate) mod navigation;
 pub(crate) mod panes;
 mod render;
+pub(crate) mod spine;
 pub(crate) mod surfaces;
 
 pub(crate) use attach_state::{
