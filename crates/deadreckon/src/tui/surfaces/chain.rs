@@ -16,6 +16,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use serde_json::json;
 use tui_textarea::{Input, Key, TextArea};
 
 use crate::{CliError, one_line, run_prefix};
@@ -24,6 +25,8 @@ use crate::{CliError, one_line, run_prefix};
 pub(crate) struct ChainAttachTuiState {
     pub(crate) selected_step: usize,
     pub(crate) events_scroll: u16,
+    pub(crate) narrative_open: bool,
+    pub(crate) narrative_scroll: usize,
     pub(crate) event_status_hint: Option<String>,
     pub(crate) modal: Option<AttachModal>,
 }
@@ -268,6 +271,12 @@ impl ChainAttachTuiState {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent, chain: &Chain) {
+        if key.code == KeyCode::Char('n') && key.modifiers.is_empty() {
+            self.narrative_open = !self.narrative_open;
+            self.narrative_scroll = 0;
+            self.clamp(chain);
+            return;
+        }
         {
             let mut nav = ChainNav { state: self, chain };
             crate::tui::navigation::dispatch_navigation(&mut nav, key);
@@ -466,24 +475,48 @@ impl crate::tui::navigation::NavigableSurface for ChainNav<'_> {
     }
 
     fn scroll_lines(&mut self, delta: isize) {
-        self.state.scroll(delta, self.chain);
+        if self.state.narrative_open {
+            self.state.narrative_scroll = if delta < 0 {
+                self.state
+                    .narrative_scroll
+                    .saturating_sub(delta.unsigned_abs())
+            } else {
+                self.state.narrative_scroll.saturating_add(delta as usize)
+            };
+        } else {
+            self.state.scroll(delta, self.chain);
+        }
     }
 
     fn scroll_page(&mut self, direction: isize) {
-        self.state.events_scroll = if direction < 0 {
-            self.state.events_scroll.saturating_sub(8)
+        if self.state.narrative_open {
+            self.state.narrative_scroll = if direction < 0 {
+                self.state.narrative_scroll.saturating_sub(8)
+            } else {
+                self.state.narrative_scroll.saturating_add(8)
+            };
+        } else if direction < 0 {
+            self.state.events_scroll = self.state.events_scroll.saturating_sub(8)
         } else {
-            self.state.events_scroll.saturating_add(8)
+            self.state.events_scroll = self.state.events_scroll.saturating_add(8)
         };
     }
 
     fn scroll_to_start(&mut self) {
-        self.state.selected_step = 0;
-        self.state.events_scroll = 0;
+        if self.state.narrative_open {
+            self.state.narrative_scroll = 0;
+        } else {
+            self.state.selected_step = 0;
+            self.state.events_scroll = 0;
+        }
     }
 
     fn scroll_to_end(&mut self) {
-        self.state.selected_step = self.chain.steps.len().saturating_sub(1);
+        if self.state.narrative_open {
+            self.state.narrative_scroll = usize::MAX / 2;
+        } else {
+            self.state.selected_step = self.chain.steps.len().saturating_sub(1);
+        }
     }
 }
 
@@ -564,23 +597,48 @@ pub(crate) fn render_chain_attach(
         .collect::<Vec<_>>();
     frame.render_widget(
         List::new(timeline).block(Block::default().borders(Borders::ALL).title(format!(
-            "steps{}",
+            "voyage{}",
             scroll_indicator(steps_offset, steps_rows, steps_total)
         ))),
         body[0],
     );
-    let event_lines = chain_activity_lines(events, tui_state)
-        .into_iter()
-        .map(ListItem::new)
-        .collect::<Vec<_>>();
-    let activity_title = chain_activity_title(tui_state);
-    frame.render_widget(
-        List::new(event_lines).block(Block::default().borders(Borders::ALL).title(activity_title)),
-        body[1],
-    );
+    if tui_state.narrative_open {
+        let lines = chain_narrative_lines(chain, events);
+        let rows = body[1].height.saturating_sub(2) as usize;
+        let scroll = tui_state
+            .narrative_scroll
+            .min(lines.len().saturating_sub(rows.max(1)));
+        let visible = lines
+            .into_iter()
+            .skip(scroll)
+            .take(rows.max(1))
+            .map(ListItem::new)
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(visible).block(Block::default().borders(Borders::ALL).title(format!(
+                "chain narrative{}",
+                scroll_indicator(scroll, rows, chain_narrative_lines(chain, events).len())
+            ))),
+            body[1],
+        );
+    } else {
+        let event_lines = chain_activity_lines(events, tui_state)
+            .into_iter()
+            .map(ListItem::new)
+            .collect::<Vec<_>>();
+        let activity_title = chain_activity_title(tui_state);
+        frame.render_widget(
+            List::new(event_lines)
+                .block(Block::default().borders(Borders::ALL).title(activity_title)),
+            body[1],
+        );
+    }
     let spine = spine_for_chain_with_events(chain, events, Utc::now());
     render_spine_band(frame, rows[2], &spine);
-    frame.render_widget(Paragraph::new(chain_attach_footer_text(chain)), rows[3]);
+    frame.render_widget(
+        Paragraph::new(chain_attach_footer_text_for_state(chain, tui_state)),
+        rows[3],
+    );
     if let Some(modal) = &tui_state.modal {
         render_chain_modal(frame, modal);
     }
@@ -737,7 +795,110 @@ pub(crate) fn chain_activity_lines(
         .collect()
 }
 
+pub(crate) fn chain_narrative_text_lines(chain: &Chain, events: &[ChainEvent]) -> Vec<String> {
+    let mut lines = vec![
+        "chain narrative".to_string(),
+        format!("root goal {}", chain.root_goal),
+        format!("summary {}", chain_attach_summary_line(chain)),
+    ];
+    if let Some(step) = chain.steps.first() {
+        lines.push(format!(
+            "current step {} {} {}",
+            step.index + 1,
+            chain_step_status_label(step.status),
+            one_line(&step.goal, 96)
+        ));
+    }
+    lines.push(String::new());
+    lines.push("steps".to_string());
+    for step in &chain.steps {
+        let run = step
+            .run_id
+            .as_deref()
+            .map(|run_id| format!(" run {}", run_prefix(run_id)))
+            .unwrap_or_default();
+        let reason = step
+            .fail_reason
+            .as_deref()
+            .map(|reason| format!(" reason {}", one_line(reason, 72)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "step {} {} {}{}{}",
+            step.index + 1,
+            chain_step_status_label(step.status),
+            one_line(&step.goal, 96),
+            run,
+            reason
+        ));
+    }
+    lines.push(String::new());
+    lines.push("recent activity".to_string());
+    if events.is_empty() {
+        lines.push("no chain events recorded yet".to_string());
+    } else {
+        lines.extend(
+            chain_activity_lines(events, &ChainAttachTuiState::default())
+                .into_iter()
+                .take(8)
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<Vec<_>>()
+                        .join("")
+                }),
+        );
+    }
+    lines
+}
+
+pub(crate) fn chain_narrative_lines(chain: &Chain, events: &[ChainEvent]) -> Vec<Line<'static>> {
+    chain_narrative_text_lines(chain, events)
+        .into_iter()
+        .map(Line::from)
+        .collect()
+}
+
+pub(crate) fn chain_narrative_plain_text(chain: &Chain, events: &[ChainEvent]) -> String {
+    let mut output = chain_narrative_text_lines(chain, events).join("\n");
+    output.push('\n');
+    output
+}
+
+pub(crate) fn chain_narrative_json_text(
+    chain: &Chain,
+    events: &[ChainEvent],
+) -> crate::Result<String> {
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&json!({
+            "status": "supported",
+            "kind": "chain",
+            "id": chain.chain_id,
+            "lines": chain_narrative_text_lines(chain, events),
+            "snapshot": {
+                "chain_id": chain.chain_id,
+                "root_goal": chain.root_goal,
+                "status": crate::commands::chain::chain_status_label(chain),
+                "steps": chain.steps.iter().map(|step| {
+                    json!({
+                        "index": step.index + 1,
+                        "goal": step.goal,
+                        "status": chain_step_status_label(step.status),
+                        "run_id": step.run_id,
+                    })
+                }).collect::<Vec<_>>()
+            }
+        }))?
+    ))
+}
+
+#[cfg(test)]
 pub(crate) fn chain_attach_footer_text(chain: &Chain) -> String {
+    chain_attach_footer_text_for_state(chain, &ChainAttachTuiState::default())
+}
+
+fn chain_attach_footer_text_for_state(chain: &Chain, tui_state: &ChainAttachTuiState) -> String {
     if chain.status == ChainStatus::Paused {
         let surface = chain_paused_attach_footer_surface(chain);
         let reason = chain.paused_reason.as_deref().unwrap_or("paused");
@@ -759,8 +920,17 @@ pub(crate) fn chain_attach_footer_text(chain: &Chain) -> String {
             surface.label(),
             surface.primary_action.command
         )
+    } else if tui_state.narrative_open {
+        footer(&[
+            ("[n]", "Activity"),
+            ("[Enter]", "drill"),
+            ("[Ctrl-D/q/Esc]", "detach"),
+            ("j/k PgUp/PgDn", "scroll"),
+            ("?", "help"),
+        ])
     } else {
         footer(&[
+            ("[n]", "Narrative"),
             ("[Enter]", "drill"),
             ("[r]", "redo"),
             ("[e]", "extend"),

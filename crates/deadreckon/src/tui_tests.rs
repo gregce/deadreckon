@@ -4,8 +4,8 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::commands::attach::{
-    attach_should_quit, attach_should_return_to_plan, chain_narrative_refusal_text,
-    run_narrative_json_text, run_narrative_plain_text,
+    attach_should_quit, attach_should_return_to_plan, run_narrative_json_text,
+    run_narrative_plain_text,
 };
 use super::commands::attach_runtime::{
     AttachIdleBackoff, AttachLoopStage, AttachNarrativeRefreshState, AttachPlanNarrativeRefreshJob,
@@ -4046,47 +4046,31 @@ fn non_tty_narrative_attach_does_not_call_provider_without_explicit_refresh() {
 
 #[test]
 fn chain_narrative_attach_has_clear_supported_behavior() {
-    let plain = chain_narrative_refusal_text("chain-1234", false).expect("plain");
-    assert!(
-        plain.starts_with("blocked chain narrative chain-1234"),
-        "{plain}"
-    );
-    assert!(plain.contains("Explanation\n"), "{plain}");
-    assert!(plain.contains("Evidence\n"), "{plain}");
-    assert!(
-        plain.contains("Chain narrative attach is not supported yet."),
-        "{plain}"
-    );
-    assert_eq!(plain.matches("\nRecommended\n").count(), 1, "{plain}");
-    assert!(
-        plain.contains("Recommended\ndeadreckon chain status chain-1234"),
-        "{plain}"
-    );
-    assert!(
-        plain.contains("deadreckon attach <run-id> --view narrative"),
-        "{plain}"
-    );
-    assert!(!plain.contains("try:"), "{plain}");
+    let chain = chain_fixture();
+    let events = vec![chain_event_record(&chain.chain_id, 1)];
 
-    let json_text = chain_narrative_refusal_text("chain-1234", true).expect("json");
+    let plain = super::tui::surfaces::chain::chain_narrative_plain_text(&chain, &events);
+    assert!(plain.starts_with("chain narrative"), "{plain}");
+    assert!(plain.contains("root goal build app"), "{plain}");
+    assert!(plain.contains("step 1 applied"), "{plain}");
+    assert!(plain.contains("step 2 running"), "{plain}");
+    assert!(plain.contains("step started step 2"), "{plain}");
+    assert!(!plain.contains("not supported"), "{plain}");
+
+    let json_text =
+        super::tui::surfaces::chain::chain_narrative_json_text(&chain, &events).expect("json");
     let value: serde_json::Value = serde_json::from_str(&json_text).expect("json value");
-    assert_eq!(value["status"], "unsupported");
+    assert_eq!(value["status"], "supported");
     assert_eq!(value["kind"], "chain");
-    assert_eq!(
-        value["primary_action"],
-        "deadreckon chain status chain-1234"
-    );
-    assert_eq!(value["verdict"]["kind"], "blocked");
-    assert_eq!(
-        value["verdict"]["recommended_command"],
-        "deadreckon chain status chain-1234"
-    );
+    assert_eq!(value["id"], chain.chain_id);
+    assert_eq!(value["snapshot"]["steps"][0]["status"], "applied");
+    assert_eq!(value["snapshot"]["steps"][1]["status"], "running");
     assert!(
-        value["try"]
+        value["lines"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|entry| entry == "deadreckon attach <plan-id> --view narrative"),
+            .any(|entry| entry == "step 2 running second step"),
         "{value:#}"
     );
 }
@@ -4445,6 +4429,56 @@ fn render_chain_attach_unit_snapshot() {
     assert!(text.contains("applied"), "{text}");
     assert!(text.contains("running"), "{text}");
     assert!(text.contains("step started step 2"), "{text}");
+}
+
+#[test]
+fn chain_attach_renders_narrative_view() {
+    let chain = chain_fixture();
+    let events = vec![chain_event_record(&chain.chain_id, 1)];
+    let mut tui_state = ChainAttachTuiState::default();
+
+    tui_state.handle_key(
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        &chain,
+    );
+    let text = render_chain_attach_text(&chain, &events, &tui_state);
+
+    assert!(tui_state.narrative_open);
+    assert!(text.contains("chain narrative"), "{text}");
+    assert!(text.contains("root goal"), "{text}");
+    assert!(text.contains("build app"), "{text}");
+    assert!(text.contains("step  1"), "{text}");
+    assert!(text.contains("applied"), "{text}");
+    assert!(text.contains("step started step 2"), "{text}");
+}
+
+#[test]
+fn chain_steps_appear_as_tree_nodes_with_status() {
+    let temp = test_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let chain = chain_fixture();
+
+    let model = super::tui::tree::tree_for_chain(&paths, &chain);
+    assert_eq!(model.root.children.len(), 2, "{model:#?}");
+    assert_eq!(
+        model.root.children[0].kind,
+        super::tui::tree::NodeKind::ChainStep
+    );
+    assert_eq!(
+        model.root.children[0].status,
+        super::tui::tree::NodeStatus::Verified
+    );
+    assert_eq!(
+        model.root.children[1].status,
+        super::tui::tree::NodeStatus::Running
+    );
+
+    let text = render_chain_attach_text(&chain, &[], &ChainAttachTuiState::default());
+    assert!(text.contains("voyage"), "{text}");
+    assert!(text.contains("step  1"), "{text}");
+    assert!(text.contains("applied"), "{text}");
+    assert!(text.contains("step  2"), "{text}");
+    assert!(text.contains("running"), "{text}");
 }
 
 #[test]
