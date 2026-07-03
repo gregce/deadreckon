@@ -1,4 +1,5 @@
 mod attach_state;
+pub(crate) mod effects;
 pub(crate) mod navigation;
 pub(crate) mod panes;
 mod render;
@@ -11,6 +12,11 @@ pub(crate) mod why;
 pub(crate) use attach_state::{
     AttachActionNotice, AttachCampaignParent, AttachPanel, AttachParentPlan, AttachTuiState,
     attach_panel_counts, attach_panel_layout, toggle_attach_view,
+};
+pub(crate) use effects::MotionPolicy;
+#[cfg(test)]
+pub(crate) use effects::{
+    EffectFrameDecision, EffectRegistry, EffectTrigger, UiEffectEvent, registered_effect_triggers,
 };
 
 #[cfg(test)]

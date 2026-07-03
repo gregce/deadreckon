@@ -1,4 +1,7 @@
 use super::super::*;
+use super::effects::{
+    EffectFrame, EffectFrameDecision, EffectRegistry, EffectTrigger, MotionPolicy, UiEffectEvent,
+};
 use super::panes::docs::render_markdown_doc_lines;
 use super::panes::narrative::run_narrative_lines;
 use super::timeline::{timeline_detail_lines, timeline_for_run_lossy};
@@ -58,6 +61,10 @@ pub(crate) struct AttachTuiState {
     pub(crate) view: AttachViewMode,
     pub(crate) visual: NarrativeVisualMode,
     pub(crate) show_completion_actions: bool,
+    pub(crate) motion_policy: MotionPolicy,
+    pub(crate) active_effect_frames: Vec<EffectFrame>,
+    pub(crate) last_acceptance_effect_status: Option<AcceptanceUiStatus>,
+    pub(crate) last_run_effect_status: Option<RunStatus>,
     pub(crate) post_action_notice: Option<AttachActionNotice>,
     pub(crate) narrative_notice: Option<String>,
     pub(crate) narrative_projection: Option<narrative::NarrativeProjection>,
@@ -82,6 +89,10 @@ impl Default for AttachTuiState {
             view: AttachViewMode::Activity,
             visual: NarrativeVisualMode::Architecture,
             show_completion_actions: true,
+            motion_policy: MotionPolicy::default(),
+            active_effect_frames: Vec::new(),
+            last_acceptance_effect_status: None,
+            last_run_effect_status: None,
             post_action_notice: None,
             narrative_notice: None,
             narrative_projection: None,
@@ -221,6 +232,53 @@ impl AttachTuiState {
         self.narrative_projection = None;
     }
 
+    pub(crate) fn effect_registry(&self) -> EffectRegistry {
+        EffectRegistry::new(self.motion_policy)
+    }
+
+    pub(crate) fn refresh_effects_for_run(
+        &mut self,
+        state: &deadreckon_core::PipelineState,
+        live: &AttachLive,
+        input_pending: bool,
+    ) {
+        let mut next_frames = Vec::new();
+        if self
+            .last_acceptance_effect_status
+            .is_some_and(|previous| previous != live.acceptance.status)
+            && live.acceptance.status == AcceptanceUiStatus::Passed
+        {
+            next_frames.extend(self.frames_for_trigger(EffectTrigger::GatePass, input_pending));
+        }
+        self.last_acceptance_effect_status = Some(live.acceptance.status);
+
+        if self
+            .last_run_effect_status
+            .is_some_and(|previous| previous != state.status && run_status_is_verdict(state.status))
+        {
+            next_frames
+                .extend(self.frames_for_trigger(EffectTrigger::VerdictCompletion, input_pending));
+        }
+        self.last_run_effect_status = Some(state.status);
+        self.active_effect_frames = next_frames;
+    }
+
+    pub(crate) fn clear_active_effect_frames(&mut self) {
+        self.active_effect_frames.clear();
+    }
+
+    fn frames_for_trigger(&self, trigger: EffectTrigger, input_pending: bool) -> Vec<EffectFrame> {
+        let registry = self.effect_registry();
+        let event = UiEffectEvent::Registered(trigger);
+        if registry.next_frame_decision(event, input_pending)
+            == EffectFrameDecision::PreemptedForInput
+        {
+            Vec::new()
+        } else {
+            registry.frames_for_event(event)
+        }
+    }
+
     pub(crate) fn scroll_focused(
         &mut self,
         delta: isize,
@@ -279,6 +337,13 @@ impl AttachTuiState {
             AttachPanel::Processes => self.processes_scroll = offset,
         }
     }
+}
+
+fn run_status_is_verdict(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Killed
+    )
 }
 
 /// Drives the run panel's multi-panel scroll model through the shared

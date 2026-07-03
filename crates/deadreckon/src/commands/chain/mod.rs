@@ -4,8 +4,8 @@ use crate::commands::acceptance::ensure_acceptance_before_start;
 use crate::commands::attach::{attach_should_quit, resume_tui, suspend_tui};
 use crate::tui::navigation::{HelpKeyAction, handle_help_key};
 use crate::tui::{
-    AttachHelpMode, ChainAttachTuiState, ChainModalAction, CommandModeVerb, chain_event_read_hint,
-    render_chain_attach, render_help_overlay,
+    AttachHelpMode, ChainAttachTuiState, ChainModalAction, CommandModeVerb, MotionPolicy,
+    chain_event_read_hint, render_chain_attach, render_help_overlay,
 };
 
 fn print_chain_help(topic: Option<&str>) {
@@ -2210,10 +2210,10 @@ async fn chain_attach_tui(
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut tui_state = ChainAttachTuiState {
-        narrative_open,
-        ..ChainAttachTuiState::default()
-    };
+    let motion_policy = config_defaults(paths)
+        .map(|defaults| defaults.motion_policy(true, false))
+        .unwrap_or_else(|_| MotionPolicy::default_for_environment(true, false));
+    let mut tui_state = ChainAttachTuiState::new(narrative_open, motion_policy);
     let mut event_tail = AttachJsonlTail::<ChainEvent>::new(paths.chain_events(chain_id));
     let mut show_help = false;
     let mut input_events = AttachInputEvents::new(AttachTickBudget::default());
@@ -2240,6 +2240,7 @@ async fn chain_attach_tui(
         );
         let events = event_tail.rows();
         tui_state.clamp(&chain);
+        tui_state.refresh_effects_for_chain(&chain, pending_input_at.is_some());
         let stage_started = Instant::now();
         terminal.draw(|frame| {
             render_chain_attach(frame, &chain, events, &tui_state);
@@ -2247,6 +2248,7 @@ async fn chain_attach_tui(
                 render_help_overlay(frame, AttachHelpMode::Chain);
             }
         })?;
+        tui_state.clear_active_effect_frames();
         tick.record_since(AttachLoopStage::Draw, stage_started);
         if let Some(started_at) = pending_input_at.take() {
             tick.record(AttachLoopStage::InputToFrame, started_at.elapsed());
@@ -2384,6 +2386,7 @@ async fn dispatch_chain_command_mode(
     match verb {
         CommandModeVerb::Attach => Box::pin(chain_attach_command(paths, &target, false)).await,
         CommandModeVerb::Kill => chain_kill_command_quiet(paths, &target, false),
+        CommandModeVerb::Motion => Ok(()),
         CommandModeVerb::Quit => Ok(()),
         CommandModeVerb::Reshape => {
             super::course::reshape_command(super::course::ReshapeArgs {
