@@ -53,6 +53,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   coalescing, input-to-frame latency stays inside budget, and attach JSONL
   tails retain a bounded row window; the macOS release-size guard is
   rebaselined to the verified EventStream-enabled binary.
+- H-P9 (`916d7ed`): chain attach now keeps destructive confirms and step-goal
+  input inside the ratatui frame, with modal key swallowing, Esc cancel,
+  quiet command dispatch, and the ratatui-0.29-compatible `tui-textarea`
+  widget ready for command-mode input.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
