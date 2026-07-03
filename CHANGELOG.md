@@ -69,6 +69,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   checkpoints, spend rows, gate/tamper proof files, and reshape traces; `t`
   focuses the band, Left/Right scrubs turns, and the detail pane shows the
   selected turn story with checkpoint IDs and diff counts.
+- H-P13 (`db1e9e6`): chain attach gains a supported narrative view and
+  `attach --view narrative` plain/json parity; the chain step pane now
+  participates as the Helm voyage view while preserving step status, activity,
+  spine, and in-frame command flows.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
