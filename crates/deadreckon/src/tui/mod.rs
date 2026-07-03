@@ -22,7 +22,8 @@ pub(crate) use panes::narrative::{
 pub(crate) use render::{AttachHelpMode, render_help_overlay};
 pub(crate) use surfaces::campaign::render_campaign_attach;
 pub(crate) use surfaces::chain::{
-    ChainAttachTuiState, ChainModalAction, chain_event_read_hint, render_chain_attach,
+    ChainAttachTuiState, ChainModalAction, CommandModeVerb, chain_event_read_hint,
+    render_chain_attach,
 };
 pub(crate) use surfaces::plan::{
     PlanAttachRenderState, plan_event_line, plan_event_summary, plan_final_gate_line,
@@ -51,7 +52,8 @@ pub(crate) use panes::narrative::NARRATIVE_SPLIT_WIDTH;
 pub(crate) use surfaces::campaign::{CAMPAIGN_EMPTY_HINT, render_campaign_attach_text};
 #[cfg(test)]
 pub(crate) use surfaces::chain::{
-    chain_activity_lines, chain_attach_footer_text, chain_attach_header_text, chain_timeline_lines,
+    attach_command_table, chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
+    chain_timeline_lines,
 };
 #[cfg(test)]
 pub(crate) use surfaces::plan::{plan_attach_footer, plan_narrative_title};

@@ -44,10 +44,24 @@ impl AttachModal {
         }
     }
 
+    fn confirm_command(invocation: CommandModeInvocation) -> Self {
+        let target = invocation
+            .target
+            .as_deref()
+            .map(|target| format!(" {target}"))
+            .unwrap_or_default();
+        Self {
+            title: format!("{}{}?", invocation.verb.as_str(), target),
+            body: "y confirm    n/Esc cancel".to_string(),
+            kind: AttachModalKind::Confirm(ConfirmAction::Command(invocation)),
+        }
+    }
+
     fn line_input(
         title: impl Into<String>,
         body: impl Into<String>,
         placeholder: impl Into<String>,
+        purpose: LineInputPurpose,
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text(placeholder);
@@ -57,6 +71,7 @@ impl AttachModal {
             title: title.into(),
             body: body.into(),
             kind: AttachModalKind::LineInput {
+                purpose,
                 textarea: Box::new(textarea),
             },
         }
@@ -76,15 +91,25 @@ impl AttachModal {
                 KeyCode::Char('y') if key.modifiers.is_empty() => {
                     ModalKeyOutcome::Action(match action {
                         ConfirmAction::Kill => ChainModalAction::KillConfirmed,
+                        ConfirmAction::Command(invocation) => ChainModalAction::CommandConfirmed {
+                            verb: invocation.verb,
+                            target: invocation.target.clone(),
+                        },
                     })
                 }
                 KeyCode::Esc | KeyCode::Char('n') => ModalKeyOutcome::Close,
                 _ => ModalKeyOutcome::Keep,
             },
-            AttachModalKind::LineInput { textarea } => match key.code {
-                KeyCode::Enter => ModalKeyOutcome::Action(ChainModalAction::ExtendSubmitted(
-                    textarea.lines().first().cloned().unwrap_or_default(),
-                )),
+            AttachModalKind::LineInput { purpose, textarea } => match key.code {
+                KeyCode::Enter => {
+                    let value = textarea.lines().first().cloned().unwrap_or_default();
+                    match purpose {
+                        LineInputPurpose::Extend => {
+                            ModalKeyOutcome::Action(ChainModalAction::ExtendSubmitted(value))
+                        }
+                        LineInputPurpose::Command => ModalKeyOutcome::Command(value),
+                    }
+                }
                 KeyCode::Esc => ModalKeyOutcome::Close,
                 _ => {
                     let _ = textarea.input(textarea_input(key));
@@ -102,13 +127,23 @@ impl AttachModal {
 #[derive(Debug, Clone)]
 enum AttachModalKind {
     Confirm(ConfirmAction),
-    LineInput { textarea: Box<TextArea<'static>> },
+    LineInput {
+        purpose: LineInputPurpose,
+        textarea: Box<TextArea<'static>>,
+    },
     Notice,
 }
 
 #[derive(Debug, Clone, Copy)]
+enum LineInputPurpose {
+    Extend,
+    Command,
+}
+
+#[derive(Debug, Clone)]
 enum ConfirmAction {
     Kill,
+    Command(CommandModeInvocation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,12 +151,110 @@ pub(crate) enum ChainModalAction {
     None,
     KillConfirmed,
     ExtendSubmitted(String),
+    CommandConfirmed {
+        verb: CommandModeVerb,
+        target: Option<String>,
+    },
+    QuitRequested,
 }
 
 enum ModalKeyOutcome {
     Keep,
     Close,
     Action(ChainModalAction),
+    Command(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AttachCommandSpec {
+    pub(crate) verb: &'static str,
+    pub(crate) cli_command: Option<&'static str>,
+    kind: CommandModeVerb,
+    confirm: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandModeVerb {
+    Attach,
+    Kill,
+    Quit,
+    Reshape,
+    Resume,
+    Verdict,
+    Why,
+}
+
+impl CommandModeVerb {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Attach => "attach",
+            Self::Kill => "kill",
+            Self::Quit => "q",
+            Self::Reshape => "reshape",
+            Self::Resume => "resume",
+            Self::Verdict => "verdict",
+            Self::Why => "why",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommandModeInvocation {
+    verb: CommandModeVerb,
+    target: Option<String>,
+}
+
+#[derive(Debug)]
+struct CommandModeParseError {
+    nearest: &'static str,
+}
+
+pub(crate) fn attach_command_table() -> &'static [AttachCommandSpec] {
+    const TABLE: &[AttachCommandSpec] = &[
+        AttachCommandSpec {
+            verb: "attach",
+            cli_command: Some("deadreckon attach"),
+            kind: CommandModeVerb::Attach,
+            confirm: true,
+        },
+        AttachCommandSpec {
+            verb: "kill",
+            cli_command: Some("deadreckon chain kill"),
+            kind: CommandModeVerb::Kill,
+            confirm: true,
+        },
+        AttachCommandSpec {
+            verb: "q",
+            cli_command: None,
+            kind: CommandModeVerb::Quit,
+            confirm: false,
+        },
+        AttachCommandSpec {
+            verb: "reshape",
+            cli_command: Some("deadreckon reshape"),
+            kind: CommandModeVerb::Reshape,
+            confirm: true,
+        },
+        AttachCommandSpec {
+            verb: "resume",
+            cli_command: Some("deadreckon chain resume"),
+            kind: CommandModeVerb::Resume,
+            confirm: true,
+        },
+        AttachCommandSpec {
+            verb: "verdict",
+            cli_command: Some("deadreckon verdict"),
+            kind: CommandModeVerb::Verdict,
+            confirm: true,
+        },
+        AttachCommandSpec {
+            verb: "why",
+            cli_command: Some("deadreckon show --why-failed"),
+            kind: CommandModeVerb::Why,
+            confirm: true,
+        },
+    ];
+    TABLE
 }
 
 impl ChainAttachTuiState {
@@ -151,6 +284,16 @@ impl ChainAttachTuiState {
             "new chain step",
             "Enter submit    Esc cancel",
             "step goal",
+            LineInputPurpose::Extend,
+        ));
+    }
+
+    pub(crate) fn open_command_input(&mut self) {
+        self.modal = Some(AttachModal::line_input(
+            "command",
+            "Enter run    Esc cancel",
+            ":kill, :resume, :verdict, :why, :reshape, :attach, :q",
+            LineInputPurpose::Command,
         ));
     }
 
@@ -171,10 +314,15 @@ impl ChainAttachTuiState {
                 }
                 ModalKeyOutcome::Close => ChainModalAction::None,
                 ModalKeyOutcome::Action(action) => action,
+                ModalKeyOutcome::Command(input) => self.handle_command_submission(&input),
             };
         }
         if key.modifiers == KeyModifiers::NONE {
             match key.code {
+                KeyCode::Char(':') => {
+                    self.open_command_input();
+                    return ChainModalAction::None;
+                }
                 KeyCode::Char('k') => {
                     self.open_kill_confirm();
                     return ChainModalAction::None;
@@ -190,6 +338,41 @@ impl ChainAttachTuiState {
         ChainModalAction::None
     }
 
+    fn handle_command_submission(&mut self, input: &str) -> ChainModalAction {
+        match parse_command_mode(input) {
+            Ok(invocation) => match invocation.verb {
+                CommandModeVerb::Kill => {
+                    self.open_kill_confirm();
+                    ChainModalAction::None
+                }
+                CommandModeVerb::Quit => ChainModalAction::QuitRequested,
+                _ => {
+                    let Some(spec) = attach_command_table()
+                        .iter()
+                        .find(|spec| spec.kind == invocation.verb)
+                    else {
+                        self.open_notice("unknown command", "try: :kill");
+                        return ChainModalAction::None;
+                    };
+                    debug_assert!(spec.cli_command.is_some() || spec.kind == CommandModeVerb::Quit);
+                    if spec.confirm {
+                        self.modal = Some(AttachModal::confirm_command(invocation));
+                        ChainModalAction::None
+                    } else {
+                        ChainModalAction::CommandConfirmed {
+                            verb: invocation.verb,
+                            target: invocation.target,
+                        }
+                    }
+                }
+            },
+            Err(err) => {
+                self.open_notice("unknown command", format!("try: :{}", err.nearest));
+                ChainModalAction::None
+            }
+        }
+    }
+
     pub(crate) fn scroll(&mut self, delta: isize, chain: &Chain) {
         if chain.steps.is_empty() {
             return;
@@ -198,6 +381,70 @@ impl ChainAttachTuiState {
             .clamp(0, chain.steps.len().saturating_sub(1) as isize);
         self.selected_step = next as usize;
     }
+}
+
+fn parse_command_mode(
+    input: &str,
+) -> std::result::Result<CommandModeInvocation, CommandModeParseError> {
+    let normalized = input.trim().trim_start_matches(':').trim();
+    let Some(raw_verb) = normalized.split_whitespace().next() else {
+        return Err(CommandModeParseError { nearest: "kill" });
+    };
+    let spec = command_spec_for(raw_verb).ok_or_else(|| CommandModeParseError {
+        nearest: nearest_command(raw_verb),
+    })?;
+    let target = normalized[raw_verb.len()..].trim();
+    let target = if target.is_empty() {
+        None
+    } else {
+        Some(target)
+    };
+    Ok(CommandModeInvocation {
+        verb: spec.kind,
+        target: target.map(ToString::to_string),
+    })
+}
+
+fn command_spec_for(raw_verb: &str) -> Option<&'static AttachCommandSpec> {
+    if let Some(exact) = attach_command_table()
+        .iter()
+        .find(|spec| spec.verb == raw_verb)
+    {
+        return Some(exact);
+    }
+    let mut matches = attach_command_table()
+        .iter()
+        .filter(|spec| spec.verb.starts_with(raw_verb));
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn nearest_command(raw_verb: &str) -> &'static str {
+    attach_command_table()
+        .iter()
+        .min_by_key(|spec| edit_distance(raw_verb, spec.verb))
+        .map(|spec| spec.verb)
+        .unwrap_or("kill")
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let insert = current[right_index] + 1;
+            let delete = previous[right_index + 1] + 1;
+            let replace = previous[right_index] + usize::from(left_char != *right_char);
+            current.push(insert.min(delete).min(replace));
+        }
+        previous = current;
+    }
+    previous[right_chars.len()]
 }
 
 /// Drives the chain attach step graph + events panel through the shared
@@ -352,7 +599,7 @@ fn render_chain_modal(frame: &mut ratatui::Frame<'_>, modal: &AttachModal) {
             let text = format!("{}\n{}", modal.title, modal.body);
             frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
         }
-        AttachModalKind::LineInput { textarea } => {
+        AttachModalKind::LineInput { textarea, .. } => {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Length(1)])

@@ -42,11 +42,11 @@ use super::commands::start::{StartLaunchDecision, prompt_start_model};
 use super::tui::{
     AttachActionNotice, AttachHelpMode, AttachPanel, AttachPanelCounts, AttachPanelRows,
     AttachParentPlan, AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState, ChainModalAction,
-    NARRATIVE_SPLIT_WIDTH, build_run_narrative_projection, chain_activity_lines,
-    chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
-    chain_timeline_lines, footer, help_overlay_lines, markdown_to_tui_lines, max_panel_scroll,
-    panel_title, plan_narrative_title, render_chain_attach, render_help_overlay, scroll_indicator,
-    selection_glyph,
+    CommandModeVerb, NARRATIVE_SPLIT_WIDTH, attach_command_table, build_run_narrative_projection,
+    chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
+    chain_event_read_hint, chain_timeline_lines, footer, help_overlay_lines, markdown_to_tui_lines,
+    max_panel_scroll, panel_title, plan_narrative_title, render_chain_attach, render_help_overlay,
+    scroll_indicator, selection_glyph,
 };
 use super::{
     ATTACH_JSONL_TAIL_ROW_LIMIT, ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive,
@@ -6188,6 +6188,93 @@ fn extend_input_renders_in_frame_and_submits_single_line() {
 }
 
 #[test]
+fn colon_kill_routes_through_existing_kill_path_with_confirm() {
+    let chain = chain_fixture();
+    let mut tui_state = ChainAttachTuiState::default();
+
+    let action = tui_state.handle_key_with_modal(
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+        &chain,
+    );
+    assert_eq!(action, ChainModalAction::None);
+    assert!(tui_state.modal.is_some());
+
+    submit_modal_text(&mut tui_state, &chain, "kill");
+    let text = render_chain_attach_text(&chain, &[], &tui_state);
+
+    assert!(text.contains("kill chain?"), "{text}");
+    assert!(text.contains("y confirm"), "{text}");
+
+    let action = tui_state.handle_key_with_modal(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        &chain,
+    );
+
+    assert_eq!(action, ChainModalAction::KillConfirmed);
+}
+
+#[test]
+fn unknown_command_refuses_inline_with_nearest_match() {
+    let chain = chain_fixture();
+    let mut tui_state = ChainAttachTuiState::default();
+
+    let _ = tui_state.handle_key_with_modal(
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+        &chain,
+    );
+    submit_modal_text(&mut tui_state, &chain, "kilz");
+    let text = render_chain_attach_text(&chain, &[], &tui_state);
+
+    assert!(text.contains("unknown command"), "{text}");
+    assert!(text.contains("try: :kill"), "{text}");
+}
+
+#[test]
+fn command_table_contains_only_existing_verbs() {
+    let table = attach_command_table();
+    let verbs = table.iter().map(|spec| spec.verb).collect::<Vec<_>>();
+
+    assert_eq!(
+        verbs,
+        vec!["attach", "kill", "q", "reshape", "resume", "verdict", "why"]
+    );
+    assert!(
+        table
+            .iter()
+            .all(|spec| spec.cli_command.is_some() || spec.verb == "q")
+    );
+}
+
+#[test]
+fn colon_reshape_routes_through_existing_reshape_path_with_confirm() {
+    let chain = chain_fixture();
+    let mut tui_state = ChainAttachTuiState::default();
+
+    let _ = tui_state.handle_key_with_modal(
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+        &chain,
+    );
+    submit_modal_text(&mut tui_state, &chain, "reshape run-abc123");
+    let text = render_chain_attach_text(&chain, &[], &tui_state);
+
+    assert!(text.contains("reshape run-abc123?"), "{text}");
+    assert!(text.contains("y confirm"), "{text}");
+
+    let action = tui_state.handle_key_with_modal(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        &chain,
+    );
+
+    assert_eq!(
+        action,
+        ChainModalAction::CommandConfirmed {
+            verb: CommandModeVerb::Reshape,
+            target: Some("run-abc123".to_string()),
+        }
+    );
+}
+
+#[test]
 fn chain_attach_plain_emits_periodic_snapshot_no_ansi() {
     let snapshot = chain_attach_header_text(&chain_fixture());
     let ansi_start = format!("{}[", char::from(27));
@@ -6514,6 +6601,17 @@ fn terminal_text(terminal: &Terminal<TestBackend>) -> String {
         text.push('\n');
     }
     text
+}
+
+fn submit_modal_text(state: &mut ChainAttachTuiState, chain: &Chain, text: &str) {
+    for ch in text.chars() {
+        let action = state
+            .handle_key_with_modal(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), chain);
+        assert_eq!(action, ChainModalAction::None);
+    }
+    let action =
+        state.handle_key_with_modal(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), chain);
+    assert_eq!(action, ChainModalAction::None);
 }
 
 fn model_picker_decision() -> StartLaunchDecision {
