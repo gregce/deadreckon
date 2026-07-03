@@ -37,6 +37,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   plan, chain, and campaign roots, builds campaign/sub-goal/task/run trees from
   durable state files, and folds existing run/plan/chain/campaign feed events
   without rebuilding the tree.
+- H-P5 (`473c3b0`): attach renders the Helm voyage pane with status glyphs,
+  gate counts, spend, display-width-safe labels, and selection state; plan and
+  campaign surfaces gain the left tree column while single-run attach collapses
+  the one-node tree into the header band.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
