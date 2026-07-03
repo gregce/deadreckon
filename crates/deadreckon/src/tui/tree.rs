@@ -244,21 +244,15 @@ pub(crate) fn build_tree(target: AttachTarget) -> Result<TreeModel> {
     match target {
         AttachTarget::Run { state_path } => {
             let state = load_state(&state_path)?;
-            Ok(TreeModel {
-                root: run_node(&state),
-            })
+            Ok(tree_for_run(&state))
         }
         AttachTarget::Plan { paths, plan_id } => {
             let plan = load_plan(&paths, &plan_id)?;
-            Ok(TreeModel {
-                root: plan_node(&paths, &plan),
-            })
+            Ok(tree_for_plan(&paths, &plan))
         }
         AttachTarget::Chain { paths, chain_id } => {
             let chain = load_chain(&paths, &chain_id)?;
-            Ok(TreeModel {
-                root: chain_node(&paths, &chain),
-            })
+            Ok(tree_for_chain(&paths, &chain))
         }
         AttachTarget::Campaign {
             paths,
@@ -272,10 +266,32 @@ pub(crate) fn build_tree(target: AttachTarget) -> Result<TreeModel> {
                     campaign.campaign_id
                 ))));
             }
-            Ok(TreeModel {
-                root: campaign_node(&paths, &campaign),
-            })
+            Ok(tree_for_campaign(&paths, &campaign))
         }
+    }
+}
+
+pub(crate) fn tree_for_run(state: &PipelineState) -> TreeModel {
+    TreeModel {
+        root: run_node(state),
+    }
+}
+
+pub(crate) fn tree_for_plan(paths: &DeadreckonPaths, plan: &Plan) -> TreeModel {
+    TreeModel {
+        root: plan_node(paths, plan),
+    }
+}
+
+pub(crate) fn tree_for_chain(paths: &DeadreckonPaths, chain: &Chain) -> TreeModel {
+    TreeModel {
+        root: chain_node(paths, chain),
+    }
+}
+
+pub(crate) fn tree_for_campaign(paths: &DeadreckonPaths, campaign: &Campaign) -> TreeModel {
+    TreeModel {
+        root: campaign_node(paths, campaign),
     }
 }
 

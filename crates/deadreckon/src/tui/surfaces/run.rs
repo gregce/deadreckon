@@ -10,8 +10,10 @@ use crate::tui::panes::header::{
     render_acceptance, render_context, render_spend,
 };
 use crate::tui::panes::narrative::{RunNarrativeRenderInput, render_run_narrative};
+use crate::tui::panes::voyage::collapsed_voyage_header;
 use crate::tui::render::turn_timer;
 use crate::tui::spine::{render_spine_band, spine_for_run_with_events};
+use crate::tui::tree::tree_for_run;
 use crate::{AttachLive, RunEvent, SpendRecord, TraceRecord};
 use chrono::Utc;
 use deadreckon_core::RunStatus;
@@ -49,12 +51,17 @@ pub(crate) fn render_attach(
         .direction(Direction::Horizontal)
         .constraints(top_constraints)
         .split(layout.header);
+    let voyage = tree_for_run(state);
+    let header_title = format!(
+        "deadreckon  {}",
+        collapsed_voyage_header(&voyage, top[0].width.saturating_sub(4) as usize)
+    );
     let header = Paragraph::new(attach_header_text_for_state(
         state,
         top[0].width,
         tui_state.parent_plan.as_ref(),
     ))
-    .block(Block::default().borders(Borders::ALL).title("deadreckon"));
+    .block(Block::default().borders(Borders::ALL).title(header_title));
     frame.render_widget(header, top[0]);
     if metered_provider {
         render_spend(frame, top[1], state);

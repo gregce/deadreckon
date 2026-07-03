@@ -5,7 +5,9 @@ use crate::tui::panes::header::provider_is_metered;
 use crate::tui::panes::narrative::{
     NARRATIVE_SPLIT_WIDTH, PLAN_NARRATIVE_AREA_HEIGHT, narrative_list_item, visible_narrative_items,
 };
+use crate::tui::panes::voyage::{VoyagePaneState, render_voyage_pane};
 use crate::tui::spine::{render_spine_band, spine_for_plan_with_events};
+use crate::tui::tree::{NodeId, tree_for_plan};
 use crate::{
     SpendRecord, TraceRecord, acceptance_status_value, commands, event_line, format_count,
     load_run, narrative, one_line, plan_mode_label, plan_status_label, read_jsonl, read_last_jsonl,
@@ -112,7 +114,19 @@ pub(crate) fn render_plan_attach(
     );
 
     let task_area = vertical[1];
-    let panes = plan_task_pane_layout(task_area, plan.tasks.len());
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(42), Constraint::Min(48)])
+        .split(task_area);
+    let tree = tree_for_plan(paths, plan);
+    let mut voyage_state = VoyagePaneState::default();
+    if let Some(task) = plan.tasks.get(state.selected) {
+        voyage_state.select_node(&tree, &NodeId::task(&plan.plan_id, &task.task_id));
+    } else {
+        voyage_state.sync(&tree);
+    }
+    render_voyage_pane(frame, body[0], &tree, &mut voyage_state);
+    let panes = plan_task_pane_layout(body[1], plan.tasks.len());
     for (index, task) in plan.tasks.iter().enumerate() {
         let Some(rect) = panes.get(index).copied() else {
             continue;

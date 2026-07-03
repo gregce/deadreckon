@@ -4741,6 +4741,119 @@ fn tree_depth_bounded_by_campaign_max_depth() {
 }
 
 #[test]
+fn tree_pane_renders_status_glyph_gate_and_spend_per_node() {
+    use super::tui::tree::{NodeId, NodeKind, NodeStatus, TreeModel, TreeNode};
+
+    let tree = TreeModel {
+        root: TreeNode {
+            id: NodeId::campaign("campaign-voyage"),
+            kind: NodeKind::Campaign,
+            label: "ship 漢字 mission control without clipping wide glyphs".to_string(),
+            status: NodeStatus::Running,
+            gate: Some((9, 14)),
+            spend: Some(7.2),
+            children: vec![
+                TreeNode {
+                    id: NodeId::sub_goal("campaign-voyage", "sub-verified"),
+                    kind: NodeKind::SubGoal,
+                    label: "verified service".to_string(),
+                    status: NodeStatus::Verified,
+                    gate: Some((14, 14)),
+                    spend: Some(3.5),
+                    children: Vec::new(),
+                },
+                TreeNode {
+                    id: NodeId::sub_goal("campaign-voyage", "sub-paused"),
+                    kind: NodeKind::SubGoal,
+                    label: "paused service".to_string(),
+                    status: NodeStatus::Paused,
+                    gate: None,
+                    spend: Some(1.25),
+                    children: Vec::new(),
+                },
+                TreeNode {
+                    id: NodeId::sub_goal("campaign-voyage", "sub-failed"),
+                    kind: NodeKind::SubGoal,
+                    label: "failed service".to_string(),
+                    status: NodeStatus::Failed,
+                    gate: None,
+                    spend: None,
+                    children: Vec::new(),
+                },
+            ],
+        },
+    };
+    let mut pane_state = super::tui::panes::voyage::VoyagePaneState::default();
+
+    let text = render_surface_module_text(84, 12, |frame| {
+        super::tui::panes::voyage::render_voyage_pane(frame, frame.area(), &tree, &mut pane_state);
+    });
+
+    assert!(text.contains("voyage"), "{text}");
+    assert!(text.contains("●"), "{text}");
+    assert!(text.contains("✓"), "{text}");
+    assert!(text.contains("⏸"), "{text}");
+    assert!(text.contains("✗"), "{text}");
+    assert!(text.contains("9/14"), "{text}");
+    assert!(text.contains("$7.20"), "{text}");
+    assert!(text.contains("漢"), "{text}");
+    assert!(text.contains("字"), "{text}");
+}
+
+#[test]
+fn single_run_attach_collapses_tree_to_header() {
+    let (_temp, state) = doc_preview_state();
+
+    let text = render_attach_text_with_size(
+        &state,
+        &[],
+        &AttachLive::default(),
+        AttachTuiState::default(),
+        160,
+        34,
+    );
+
+    assert!(text.contains("voyage ○ run"), "{text}");
+    assert!(text.contains(&state.run_id[..8]), "{text}");
+    assert!(text.contains("tool calls / provider activity"), "{text}");
+}
+
+#[test]
+fn tree_selection_survives_event_fold() {
+    let (_temp, paths, plan) = full_plan_fixture(2);
+    save_plan(&paths, &plan).expect("save plan");
+    let mut tree =
+        super::tui::tree::build_tree(super::tui::tree::AttachTarget::plan(&paths, &plan.plan_id))
+            .expect("plan tree");
+    let selected = super::tui::tree::NodeId::task(&plan.plan_id, "task-1");
+    let mut pane_state = super::tui::panes::voyage::VoyagePaneState::default();
+
+    assert!(pane_state.select_node(&tree, &selected));
+    let before = pane_state.selected_path().to_vec();
+
+    super::tui::tree::fold_events(
+        &mut tree,
+        &[super::tui::tree::TreeEvent::Plan(PlanFeedEvent::Plan {
+            event: PlanEvent {
+                timestamp: Utc::now(),
+                plan_id: plan.plan_id.clone(),
+                event: PlanEventKind::TaskStarted {
+                    task_id: "task-0".to_string(),
+                    task_index: 0,
+                },
+            },
+        })],
+    );
+    pane_state.sync(&tree);
+
+    assert_eq!(pane_state.selected_path(), before.as_slice());
+    assert_eq!(
+        tree.find(&selected).map(|node| node.label.as_str()),
+        Some("Task 1")
+    );
+}
+
+#[test]
 fn parent_plan_footer_replace_hack_removed() {
     // A child run attached from a plan gets its back affordance + breadcrumb
     // structurally (via footer items), not by string-replacing the detach text.
