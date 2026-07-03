@@ -13,8 +13,8 @@ use super::commands::attach_runtime::{
     AttachTickTiming, AttachWakeReason, AttachWorkMode, PlanNarrativeRefreshInput,
     attach_loop_stage_work, cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job,
     plan_narrative_refresh_request, poll_plan_narrative_refresh_job,
-    poll_run_narrative_refresh_job, replay_attach_event_storm_for_test,
-    start_or_coalesce_plan_narrative_refresh_job, wait_for_attach_wake_for_test,
+    poll_run_narrative_refresh_job, replay_attach_event_storm_for_test, reset_tui_suspend_depth,
+    start_or_coalesce_plan_narrative_refresh_job, tui_suspend_depth, wait_for_attach_wake_for_test,
 };
 use super::commands::campaign::{
     CampaignAttachState, campaign_drop_subgoal_before_launch, campaign_edit_subgoal_before_launch,
@@ -41,7 +41,7 @@ use super::commands::start::{
 use super::commands::start::{StartLaunchDecision, prompt_start_model};
 use super::tui::{
     AttachActionNotice, AttachHelpMode, AttachPanel, AttachPanelCounts, AttachPanelRows,
-    AttachParentPlan, AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState,
+    AttachParentPlan, AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState, ChainModalAction,
     NARRATIVE_SPLIT_WIDTH, build_run_narrative_projection, chain_activity_lines,
     chain_attach_footer_text, chain_attach_header_text, chain_event_read_hint,
     chain_timeline_lines, footer, help_overlay_lines, markdown_to_tui_lines, max_panel_scroll,
@@ -6090,6 +6090,104 @@ fn chain_attach_k_kills_chain_with_confirm() {
 }
 
 #[test]
+fn kill_confirm_renders_in_frame_without_screen_suspend() {
+    let chain = chain_fixture();
+    let mut tui_state = ChainAttachTuiState::default();
+    reset_tui_suspend_depth();
+
+    let action = tui_state.handle_key_with_modal(
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        &chain,
+    );
+
+    assert_eq!(action, ChainModalAction::None);
+    assert_eq!(tui_suspend_depth(), 0);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_chain_attach(frame, &chain, &[], &tui_state))
+        .expect("draw chain attach");
+    let text = terminal_text(&terminal);
+
+    assert!(text.contains("kill chain?"), "{text}");
+    assert!(text.contains("y confirm"), "{text}");
+    assert!(text.contains("Esc cancel"), "{text}");
+}
+
+#[test]
+fn modal_swallows_keys_and_esc_cancels() {
+    let chain = chain_fixture();
+    let mut tui_state = ChainAttachTuiState::default();
+    tui_state.open_kill_confirm();
+
+    let action = tui_state.handle_key_with_modal(
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        &chain,
+    );
+
+    assert_eq!(action, ChainModalAction::None);
+    assert_eq!(tui_state.selected_step, 0);
+    assert!(tui_state.modal.is_some());
+
+    let action =
+        tui_state.handle_key_with_modal(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &chain);
+
+    assert_eq!(action, ChainModalAction::None);
+    assert!(tui_state.modal.is_none());
+
+    tui_state.open_kill_confirm();
+    let action = tui_state.handle_key_with_modal(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        &chain,
+    );
+
+    assert_eq!(action, ChainModalAction::KillConfirmed);
+    assert!(tui_state.modal.is_none());
+}
+
+#[test]
+fn extend_input_renders_in_frame_and_submits_single_line() {
+    let chain = chain_fixture();
+    let mut tui_state = ChainAttachTuiState::default();
+    reset_tui_suspend_depth();
+
+    let action = tui_state.handle_key_with_modal(
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        &chain,
+    );
+
+    assert_eq!(action, ChainModalAction::None);
+    assert_eq!(tui_suspend_depth(), 0);
+    assert!(tui_state.modal.is_some());
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_chain_attach(frame, &chain, &[], &tui_state))
+        .expect("draw chain attach");
+    let text = terminal_text(&terminal);
+
+    assert!(text.contains("new chain step"), "{text}");
+    assert!(text.contains("Enter submit"), "{text}");
+    assert!(text.contains("Esc cancel"), "{text}");
+
+    for ch in "ship helm".chars() {
+        let action = tui_state
+            .handle_key_with_modal(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &chain);
+        assert_eq!(action, ChainModalAction::None);
+    }
+    let action =
+        tui_state.handle_key_with_modal(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &chain);
+
+    assert_eq!(
+        action,
+        ChainModalAction::ExtendSubmitted("ship helm".to_string())
+    );
+    assert!(tui_state.modal.is_none());
+}
+
+#[test]
 fn chain_attach_plain_emits_periodic_snapshot_no_ansi() {
     let snapshot = chain_attach_header_text(&chain_fixture());
     let ansi_start = format!("{}[", char::from(27));
@@ -6403,6 +6501,19 @@ fn help_overlay_survives_narrow_terminals() {
     terminal
         .draw(|frame| render_help_overlay(frame, AttachHelpMode::Chain))
         .expect("draw");
+}
+
+fn terminal_text(terminal: &Terminal<TestBackend>) -> String {
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    let mut text = String::new();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            text.push_str(buffer.cell((x, y)).expect("cell").symbol());
+        }
+        text.push('\n');
+    }
+    text
 }
 
 fn model_picker_decision() -> StartLaunchDecision {

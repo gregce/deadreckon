@@ -9,13 +9,14 @@ use crate::tui::panes::activity::{list_scroll_offset, scroll_indicator};
 use crate::tui::panes::footer::footer;
 use crate::tui::spine::{render_spine_band, spine_for_chain_with_events};
 use chrono::Utc;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use deadreckon::verdict_surface::{ExplanationPanel, VerdictKind, VerdictSurface};
 use deadreckon_core::{Chain, ChainEvent, ChainEventKind, ChainStatus};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use tui_textarea::{Input, Key, TextArea};
 
 use crate::{CliError, one_line, run_prefix};
 
@@ -24,6 +25,103 @@ pub(crate) struct ChainAttachTuiState {
     pub(crate) selected_step: usize,
     pub(crate) events_scroll: u16,
     pub(crate) event_status_hint: Option<String>,
+    pub(crate) modal: Option<AttachModal>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AttachModal {
+    title: String,
+    body: String,
+    kind: AttachModalKind,
+}
+
+impl AttachModal {
+    fn confirm_kill() -> Self {
+        Self {
+            title: "kill chain?".to_string(),
+            body: "y confirm    n/Esc cancel".to_string(),
+            kind: AttachModalKind::Confirm(ConfirmAction::Kill),
+        }
+    }
+
+    fn line_input(
+        title: impl Into<String>,
+        body: impl Into<String>,
+        placeholder: impl Into<String>,
+    ) -> Self {
+        let mut textarea = TextArea::default();
+        textarea.set_placeholder_text(placeholder);
+        textarea.set_cursor_line_style(Style::default());
+        textarea.set_cursor_style(Style::default().fg(Color::Cyan));
+        Self {
+            title: title.into(),
+            body: body.into(),
+            kind: AttachModalKind::LineInput {
+                textarea: Box::new(textarea),
+            },
+        }
+    }
+
+    fn notice(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            kind: AttachModalKind::Notice,
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> ModalKeyOutcome {
+        match &mut self.kind {
+            AttachModalKind::Confirm(action) => match key.code {
+                KeyCode::Char('y') if key.modifiers.is_empty() => {
+                    ModalKeyOutcome::Action(match action {
+                        ConfirmAction::Kill => ChainModalAction::KillConfirmed,
+                    })
+                }
+                KeyCode::Esc | KeyCode::Char('n') => ModalKeyOutcome::Close,
+                _ => ModalKeyOutcome::Keep,
+            },
+            AttachModalKind::LineInput { textarea } => match key.code {
+                KeyCode::Enter => ModalKeyOutcome::Action(ChainModalAction::ExtendSubmitted(
+                    textarea.lines().first().cloned().unwrap_or_default(),
+                )),
+                KeyCode::Esc => ModalKeyOutcome::Close,
+                _ => {
+                    let _ = textarea.input(textarea_input(key));
+                    ModalKeyOutcome::Keep
+                }
+            },
+            AttachModalKind::Notice => match key.code {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => ModalKeyOutcome::Close,
+                _ => ModalKeyOutcome::Keep,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum AttachModalKind {
+    Confirm(ConfirmAction),
+    LineInput { textarea: Box<TextArea<'static>> },
+    Notice,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConfirmAction {
+    Kill,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChainModalAction {
+    None,
+    KillConfirmed,
+    ExtendSubmitted(String),
+}
+
+enum ModalKeyOutcome {
+    Keep,
+    Close,
+    Action(ChainModalAction),
 }
 
 impl ChainAttachTuiState {
@@ -42,6 +140,54 @@ impl ChainAttachTuiState {
             crate::tui::navigation::dispatch_navigation(&mut nav, key);
         }
         self.clamp(chain);
+    }
+
+    pub(crate) fn open_kill_confirm(&mut self) {
+        self.modal = Some(AttachModal::confirm_kill());
+    }
+
+    pub(crate) fn open_extend_input(&mut self) {
+        self.modal = Some(AttachModal::line_input(
+            "new chain step",
+            "Enter submit    Esc cancel",
+            "step goal",
+        ));
+    }
+
+    pub(crate) fn open_notice(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        self.modal = Some(AttachModal::notice(title, body));
+    }
+
+    pub(crate) fn handle_key_with_modal(
+        &mut self,
+        key: KeyEvent,
+        chain: &Chain,
+    ) -> ChainModalAction {
+        if let Some(mut modal) = self.modal.take() {
+            return match modal.handle_key(key) {
+                ModalKeyOutcome::Keep => {
+                    self.modal = Some(modal);
+                    ChainModalAction::None
+                }
+                ModalKeyOutcome::Close => ChainModalAction::None,
+                ModalKeyOutcome::Action(action) => action,
+            };
+        }
+        if key.modifiers == KeyModifiers::NONE {
+            match key.code {
+                KeyCode::Char('k') => {
+                    self.open_kill_confirm();
+                    return ChainModalAction::None;
+                }
+                KeyCode::Char('e') => {
+                    self.open_extend_input();
+                    return ChainModalAction::None;
+                }
+                _ => {}
+            }
+        }
+        self.handle_key(key, chain);
+        ChainModalAction::None
     }
 
     pub(crate) fn scroll(&mut self, delta: isize, chain: &Chain) {
@@ -188,6 +334,74 @@ pub(crate) fn render_chain_attach(
     let spine = spine_for_chain_with_events(chain, events, Utc::now());
     render_spine_band(frame, rows[2], &spine);
     frame.render_widget(Paragraph::new(chain_attach_footer_text(chain)), rows[3]);
+    if let Some(modal) = &tui_state.modal {
+        render_chain_modal(frame, modal);
+    }
+}
+
+fn render_chain_modal(frame: &mut ratatui::Frame<'_>, modal: &AttachModal) {
+    let area = centered_rect(frame.area(), 52, modal_height(modal));
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(modal.title.as_str())
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    match &modal.kind {
+        AttachModalKind::Confirm(_) | AttachModalKind::Notice => {
+            let text = format!("{}\n{}", modal.title, modal.body);
+            frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
+        }
+        AttachModalKind::LineInput { textarea } => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(modal.body.as_str()).alignment(Alignment::Center),
+                rows[0],
+            );
+            frame.render_widget(textarea.as_ref(), rows[1]);
+        }
+    }
+}
+
+fn modal_height(modal: &AttachModal) -> u16 {
+    match &modal.kind {
+        AttachModalKind::LineInput { .. } => 4,
+        AttachModalKind::Confirm(_) | AttachModalKind::Notice => 5,
+    }
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn textarea_input(key: KeyEvent) -> Input {
+    let input_key = match key.code {
+        KeyCode::Char(value) => Key::Char(value),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::Tab => Key::Tab,
+        _ => Key::Null,
+    };
+    Input {
+        key: input_key,
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+    }
 }
 
 pub(crate) fn chain_attach_header_text(chain: &Chain) -> String {

@@ -4,8 +4,8 @@ use crate::commands::acceptance::ensure_acceptance_before_start;
 use crate::commands::attach::{attach_should_quit, resume_tui, suspend_tui};
 use crate::tui::navigation::{HelpKeyAction, handle_help_key};
 use crate::tui::{
-    AttachHelpMode, ChainAttachTuiState, chain_event_read_hint, render_chain_attach,
-    render_help_overlay,
+    AttachHelpMode, ChainAttachTuiState, ChainModalAction, chain_event_read_hint,
+    render_chain_attach, render_help_overlay,
 };
 
 fn print_chain_help(topic: Option<&str>) {
@@ -2259,6 +2259,31 @@ async fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()>
                 }
             }
             match event {
+                Event::Key(key)
+                    if tui_state.modal.is_some()
+                        || (matches!(key.code, KeyCode::Char('e') | KeyCode::Char('k'))
+                            && key.modifiers.is_empty()) =>
+                {
+                    match tui_state.handle_key_with_modal(key, &chain) {
+                        ChainModalAction::KillConfirmed => {
+                            if let Err(err) = chain_kill_command_quiet(paths, chain_id, false) {
+                                tui_state
+                                    .open_notice("kill failed", one_line(&err.to_string(), 96));
+                            }
+                        }
+                        ChainModalAction::ExtendSubmitted(goal) => {
+                            let goal = goal.trim().to_string();
+                            if !goal.is_empty()
+                                && let Err(err) =
+                                    chain_extend_command_quiet(paths, chain_id, goal, None, None)
+                            {
+                                tui_state
+                                    .open_notice("extend failed", one_line(&err.to_string(), 96));
+                            }
+                        }
+                        ChainModalAction::None => {}
+                    }
+                }
                 Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key) => match key.code {
                     KeyCode::Enter => {
@@ -2290,34 +2315,12 @@ async fn chain_attach_tui(paths: &DeadreckonPaths, chain_id: &str) -> Result<()>
                         let _ = prompt::open("press Enter to return to chain attach...", None);
                         resume_tui(&mut terminal)?;
                     }
-                    KeyCode::Char('e') => {
-                        suspend_tui(&mut terminal)?;
-                        let goal = prompt::open("new chain step goal: ", None)?;
-                        if !goal.trim().is_empty() {
-                            let action = chain_extend_command(paths, chain_id, goal, None, None);
-                            if let Err(err) = &action {
-                                print_error(err);
-                            }
-                        }
-                        let _ = prompt::open("press Enter to return to chain attach...", None);
-                        resume_tui(&mut terminal)?;
-                    }
                     KeyCode::Char('p') => {
                         suspend_tui(&mut terminal)?;
                         let action =
                             chain_pause_command(paths, chain_id, Some("user_paused".to_string()));
                         if let Err(err) = &action {
                             print_error(err);
-                        }
-                        let _ = prompt::open("press Enter to return to chain attach...", None);
-                        resume_tui(&mut terminal)?;
-                    }
-                    KeyCode::Char('k') => {
-                        suspend_tui(&mut terminal)?;
-                        if prompt::confirm("kill chain?", false)?
-                            && let Err(err) = chain_kill_command(paths, chain_id, false)
-                        {
-                            print_error(&err);
                         }
                         let _ = prompt::open("press Enter to return to chain attach...", None);
                         resume_tui(&mut terminal)?;
@@ -2386,6 +2389,19 @@ fn chain_pause_command(paths: &DeadreckonPaths, id: &str, reason: Option<String>
 }
 
 pub(crate) fn chain_kill_command(paths: &DeadreckonPaths, id: &str, force: bool) -> Result<()> {
+    chain_kill_command_inner(paths, id, force, true)
+}
+
+fn chain_kill_command_quiet(paths: &DeadreckonPaths, id: &str, force: bool) -> Result<()> {
+    chain_kill_command_inner(paths, id, force, false)
+}
+
+fn chain_kill_command_inner(
+    paths: &DeadreckonPaths,
+    id: &str,
+    force: bool,
+    print_verdict: bool,
+) -> Result<()> {
     let id = resolve_chain_id(paths, id, false)?;
     let mut chain = load_chain(paths, &id)?;
     let conductor = read_conductor_state(paths, &id)?;
@@ -2452,10 +2468,12 @@ pub(crate) fn chain_kill_command(paths: &DeadreckonPaths, id: &str, force: bool)
         json!({ "force": force }),
     )?;
     let _ = fs::remove_file(paths.conductor_json(&chain.chain_id));
-    print!(
-        "{}",
-        chain_verdict_surface(paths, &chain).render_plain(!completion_hints_enabled(false))
-    );
+    if print_verdict {
+        print!(
+            "{}",
+            chain_verdict_surface(paths, &chain).render_plain(!completion_hints_enabled(false))
+        );
+    }
     Ok(())
 }
 
@@ -2566,6 +2584,27 @@ fn chain_extend_command(
     insert_at: Option<u32>,
     max_spend_add: Option<f64>,
 ) -> Result<()> {
+    chain_extend_command_inner(paths, id, step_goal, insert_at, max_spend_add, true)
+}
+
+fn chain_extend_command_quiet(
+    paths: &DeadreckonPaths,
+    id: &str,
+    step_goal: String,
+    insert_at: Option<u32>,
+    max_spend_add: Option<f64>,
+) -> Result<()> {
+    chain_extend_command_inner(paths, id, step_goal, insert_at, max_spend_add, false)
+}
+
+fn chain_extend_command_inner(
+    paths: &DeadreckonPaths,
+    id: &str,
+    step_goal: String,
+    insert_at: Option<u32>,
+    max_spend_add: Option<f64>,
+    print_verdict: bool,
+) -> Result<()> {
     let id = resolve_chain_id(paths, id, false)?;
     let mut chain = load_chain(paths, &id)?;
     if chain.status == ChainStatus::Completed && insert_at.is_none() {
@@ -2612,20 +2651,22 @@ fn chain_extend_command(
         json!({ "insert_at": insert }),
     )?;
     let id = chain_prefix(&chain.chain_id);
-    print!(
-        "{}",
-        chain_transition_surface(
-            paths,
-            &chain,
-            VerdictKind::Preview,
-            "DeadReckon queued a new chain step.",
-            "The chain has stored work that has not run yet, so resume is the safest next command.",
-            vec![("inserted step".to_string(), (insert + 1).to_string())],
-            format!("deadreckon chain resume {id}"),
-            vec![format!("deadreckon chain show {id}")],
-        )
-        .render_plain(!completion_hints_enabled(false))
-    );
+    if print_verdict {
+        print!(
+            "{}",
+            chain_transition_surface(
+                paths,
+                &chain,
+                VerdictKind::Preview,
+                "DeadReckon queued a new chain step.",
+                "The chain has stored work that has not run yet, so resume is the safest next command.",
+                vec![("inserted step".to_string(), (insert + 1).to_string())],
+                format!("deadreckon chain resume {id}"),
+                vec![format!("deadreckon chain show {id}")],
+            )
+            .render_plain(!completion_hints_enabled(false))
+        );
+    }
     Ok(())
 }
 
