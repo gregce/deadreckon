@@ -7,12 +7,13 @@ use super::commands::attach::{
     run_narrative_json_text, run_narrative_plain_text,
 };
 use super::commands::attach_runtime::{
-    AttachLoopStage, AttachNarrativeRefreshState, AttachPlanNarrativeRefreshJob,
+    AttachIdleBackoff, AttachLoopStage, AttachNarrativeRefreshState, AttachPlanNarrativeRefreshJob,
     AttachRunNarrativeRefreshJob, AttachSurface, AttachTickBudget, AttachTickTiming,
-    AttachWorkMode, PlanNarrativeRefreshInput, attach_loop_stage_work,
+    AttachWakeReason, AttachWorkMode, PlanNarrativeRefreshInput, attach_loop_stage_work,
     cancel_plan_narrative_refresh_job, cancel_run_narrative_refresh_job,
     plan_narrative_refresh_request, poll_plan_narrative_refresh_job,
     poll_run_narrative_refresh_job, start_or_coalesce_plan_narrative_refresh_job,
+    wait_for_attach_wake_for_test,
 };
 use super::commands::campaign::{
     CampaignAttachState, campaign_drop_subgoal_before_launch, campaign_edit_subgoal_before_launch,
@@ -138,6 +139,9 @@ fn attach_tick_budget_records_slow_sync_stage_without_panicking() {
         target_frame_ms: 100,
         max_sync_io_ms: 5,
         slow_warning_ms: 8,
+        max_input_to_frame_ms: 12,
+        idle_initial_ms: 10,
+        idle_max_ms: 250,
     };
     let mut timing = AttachTickTiming::new(AttachSurface::Run, budget);
 
@@ -149,6 +153,67 @@ fn attach_tick_budget_records_slow_sync_stage_without_panicking() {
     assert_eq!(slow_sync[0].stage.label(), "live collect");
     assert_eq!(timing.slow_warning_stages().len(), 1);
     assert!(!timing.frame_exceeded());
+}
+
+#[tokio::test]
+async fn input_event_triggers_frame_without_waiting_full_tick() {
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(1);
+    let (_ledger_tx, mut ledger_rx) = tokio::sync::mpsc::channel(1);
+    let mut idle = AttachIdleBackoff::new(Duration::from_millis(250), Duration::from_millis(250));
+
+    input_tx.send(()).await.expect("send input");
+    let started = Instant::now();
+    let reason = wait_for_attach_wake_for_test(
+        &mut input_rx,
+        &mut ledger_rx,
+        &mut idle,
+        Duration::from_millis(250),
+    )
+    .await;
+
+    assert_eq!(reason, AttachWakeReason::Input);
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "input waited for the old full tick: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn idle_attach_backs_off_polling() {
+    let mut idle = AttachIdleBackoff::new(Duration::from_millis(10), Duration::from_millis(40));
+
+    assert_eq!(idle.current_delay(), Duration::from_millis(10));
+    idle.record_idle();
+    assert_eq!(idle.current_delay(), Duration::from_millis(20));
+    idle.record_idle();
+    assert_eq!(idle.current_delay(), Duration::from_millis(40));
+    idle.record_idle();
+    assert_eq!(idle.current_delay(), Duration::from_millis(40));
+    idle.reset();
+    assert_eq!(idle.current_delay(), Duration::from_millis(10));
+}
+
+#[test]
+fn input_to_frame_stage_recorded_and_budgeted() {
+    let budget = AttachTickBudget {
+        target_frame_ms: 100,
+        max_sync_io_ms: 5,
+        slow_warning_ms: 8,
+        max_input_to_frame_ms: 12,
+        idle_initial_ms: 10,
+        idle_max_ms: 250,
+    };
+    let mut timing = AttachTickTiming::new(AttachSurface::Run, budget);
+
+    timing.record(AttachLoopStage::InputToFrame, Duration::from_millis(9));
+
+    assert_eq!(AttachLoopStage::InputToFrame.label(), "input to frame");
+    assert!(!timing.input_to_frame_exceeded());
+
+    timing.record(AttachLoopStage::InputToFrame, Duration::from_millis(13));
+
+    assert!(timing.input_to_frame_exceeded());
 }
 
 #[test]

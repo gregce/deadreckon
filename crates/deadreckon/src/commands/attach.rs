@@ -106,7 +106,8 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
                     if args.view.is_narrative() || args.json {
                         return print_chain_narrative_refusal(&run_ref, args.json);
                     }
-                    return commands::chain::chain_attach_command(&paths, &run_ref, args.plain);
+                    return commands::chain::chain_attach_command(&paths, &run_ref, args.plain)
+                        .await;
                 }
                 return Err(run_error);
             }
@@ -387,6 +388,8 @@ async fn attach_campaign_tui(
         state.campaign_dir.clone(),
         state.campaign.campaign_id.clone(),
     );
+    let mut input_events = AttachInputEvents::new(AttachTickBudget::default());
+    let mut pending_input_at: Option<Instant> = None;
 
     let mut show_help = false;
     let result = loop {
@@ -414,15 +417,20 @@ async fn attach_campaign_tui(
             }
         })?;
         tick.record_since(AttachLoopStage::Draw, stage_started);
+        if let Some(started_at) = pending_input_at.take() {
+            tick.record(AttachLoopStage::InputToFrame, started_at.elapsed());
+        }
 
         let stage_started = Instant::now();
-        let input_ready = event::poll(Duration::from_millis(250))?;
+        let input_event = input_events.next_event().await?;
         tick.record_since(AttachLoopStage::InputPoll, stage_started);
         drop(tick.slow_sync_stages());
         drop(tick.slow_stage_labels());
         let _ = tick.frame_exceeded();
+        let _ = tick.input_to_frame_exceeded();
 
-        if input_ready && let Event::Key(key) = event::read()? {
+        if let Some(Event::Key(key)) = input_event {
+            pending_input_at = Some(Instant::now());
             match handle_help_key(show_help, key) {
                 HelpKeyAction::Open => {
                     show_help = true;
@@ -511,6 +519,8 @@ async fn attach_plan_tui(
     let mut narrative_projection_cache = AttachNarrativeProjectionCache::default();
     let mut show_help = false;
     let mut zoom = VoyageZoomState::default();
+    let mut input_events = AttachInputEvents::new(AttachTickBudget::default());
+    let mut pending_input_at: Option<Instant> = None;
 
     let result = loop {
         let mut tick = AttachTickTiming::new(AttachSurface::Plan, AttachTickBudget::default());
@@ -629,15 +639,20 @@ async fn attach_plan_tui(
             }
         })?;
         tick.record_since(AttachLoopStage::Draw, stage_started);
+        if let Some(started_at) = pending_input_at.take() {
+            tick.record(AttachLoopStage::InputToFrame, started_at.elapsed());
+        }
+
         let stage_started = Instant::now();
-        let input_ready = event::poll(Duration::from_millis(250))?;
+        let input_event = input_events.next_event().await?;
         tick.record_since(AttachLoopStage::InputPoll, stage_started);
         drop(tick.slow_sync_stages());
         drop(tick.slow_stage_labels());
         let _ = tick.frame_exceeded();
-        if input_ready {
-            let event = event::read()?;
+        let _ = tick.input_to_frame_exceeded();
+        if let Some(event) = input_event {
             if let Event::Key(key) = event {
+                pending_input_at = Some(Instant::now());
                 match handle_help_key(show_help, key) {
                     HelpKeyAction::Open => {
                         show_help = true;
@@ -776,6 +791,8 @@ async fn attach_tui_with_parent(
     let mut event_feed =
         tui_events::TuiEventFeed::file_tail(initial_state.run_root.join(RUN_EVENTS_JSONL));
     let mut events = event_feed.refresh(std::time::Duration::ZERO).await?;
+    let mut input_events = AttachInputEvents::new(AttachTickBudget::default());
+    let mut pending_input_at: Option<Instant> = None;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -895,16 +912,20 @@ async fn attach_tui_with_parent(
             }
         })?;
         tick.record_since(AttachLoopStage::Draw, stage_started);
+        if let Some(started_at) = pending_input_at.take() {
+            tick.record(AttachLoopStage::InputToFrame, started_at.elapsed());
+        }
 
         let stage_started = Instant::now();
-        let input_ready = event::poll(Duration::from_millis(200))?;
+        let input_event = input_events.next_event().await?;
         tick.record_since(AttachLoopStage::InputPoll, stage_started);
         drop(tick.slow_sync_stages());
         drop(tick.slow_stage_labels());
         let _ = tick.frame_exceeded();
-        if input_ready {
-            let event = event::read()?;
+        let _ = tick.input_to_frame_exceeded();
+        if let Some(event) = input_event {
             if let Event::Key(key) = event {
+                pending_input_at = Some(Instant::now());
                 match handle_help_key(show_help, key) {
                     HelpKeyAction::Open => {
                         show_help = true;
@@ -966,7 +987,8 @@ async fn attach_tui_with_parent(
                     if let Some(marker) = read_chain_step_marker(&state.working_dir)? {
                         suspend_tui(&mut terminal)?;
                         let action =
-                            commands::chain::chain_attach_command(paths, &marker.chain_id, false);
+                            commands::chain::chain_attach_command(paths, &marker.chain_id, false)
+                                .await;
                         if let Err(err) = &action {
                             print_error(err);
                         }
