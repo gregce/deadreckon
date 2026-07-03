@@ -39,6 +39,7 @@ use super::commands::start::{
     start_launch_preview_facts, start_provider_role_summary,
 };
 use super::commands::start::{StartLaunchDecision, prompt_start_model};
+use super::tui::panes::footer::footer_for_state;
 use super::tui::{
     AttachActionNotice, AttachHelpMode, AttachPanel, AttachPanelCounts, AttachPanelRows,
     AttachParentPlan, AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState, ChainModalAction,
@@ -7121,6 +7122,88 @@ fn help_overlay_lists_complete_bindings_per_mode() {
             .any(|(key, action)| *key == "k" && action.contains("kill")),
         "chain overlay must document k kill"
     );
+}
+
+#[test]
+fn help_overlay_lists_command_mode_verbs() {
+    let lines = help_overlay_lines(AttachHelpMode::Chain);
+    let text = lines
+        .iter()
+        .map(|(key, action)| format!("{key} {action}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(text.contains("Command mode"), "{text}");
+    for spec in attach_command_table() {
+        assert!(text.contains(&format!(":{}", spec.verb)), "{text}");
+    }
+    assert!(text.contains(":motion full|reduced|off"), "{text}");
+}
+
+#[test]
+fn footer_hints_follow_focused_pane() {
+    let (_temp, state) = doc_preview_state();
+
+    let default_footer = footer_for_state(&state, &AttachTuiState::default());
+    assert!(
+        default_footer.contains("Tab panes · w why · : commands"),
+        "{default_footer}"
+    );
+    let mut dismissed_state = AttachTuiState::default();
+    dismissed_state.dismiss_discoverability_hint();
+    let dismissed_footer = footer_for_state(&state, &dismissed_state);
+    assert!(
+        !dismissed_footer.contains("Tab panes · w why · : commands"),
+        "{dismissed_footer}"
+    );
+
+    let mut why_state = AttachTuiState::default();
+    why_state.open_why();
+    let why_footer = footer_for_state(&state, &why_state);
+    assert!(why_footer.contains("[w] Activity"), "{why_footer}");
+    assert!(!why_footer.contains("[w] Why"), "{why_footer}");
+
+    let mut timeline_state = AttachTuiState::default();
+    timeline_state.toggle_timeline();
+    let timeline_footer = footer_for_state(&state, &timeline_state);
+    assert!(
+        timeline_footer.contains("[t] Activity"),
+        "{timeline_footer}"
+    );
+    assert!(
+        timeline_footer.contains("Left/Right scrub"),
+        "{timeline_footer}"
+    );
+
+    let narrative_footer = footer_for_state(
+        &state,
+        &AttachTuiState {
+            view: AttachViewMode::Narrative,
+            ..AttachTuiState::default()
+        },
+    );
+    assert!(
+        narrative_footer.contains("[n] Activity"),
+        "{narrative_footer}"
+    );
+    assert!(
+        narrative_footer.contains("[v] Visual="),
+        "{narrative_footer}"
+    );
+
+    let chain = chain_fixture();
+    let chain_tui_state = ChainAttachTuiState::new(false, MotionPolicy::Full);
+    let backend = TestBackend::new(160, 34);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_chain_attach(frame, &chain, &[], &chain_tui_state))
+        .expect("draw");
+    let chain_text = terminal_text(&terminal);
+    assert!(
+        chain_text.contains("Tab panes · w why · : commands"),
+        "{chain_text}"
+    );
+    assert!(chain_text.contains(": commands"), "{chain_text}");
 }
 
 #[test]

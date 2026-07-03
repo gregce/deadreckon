@@ -590,7 +590,6 @@ pub(crate) fn footer_for_state(
     let push = |items: &mut Vec<(String, String)>, pairs: &[(&str, &str)]| {
         items.extend(pairs.iter().map(|(k, l)| (k.to_string(), l.to_string())));
     };
-
     // Detach (or, for a child run attached from a plan, back-to-plan + the parent
     // breadcrumb) comes first so the exit affordance and parent context stay
     // visible even when a narrow terminal truncates the footer tail.
@@ -743,6 +742,9 @@ pub(crate) fn footer_for_state(
 
     // Detach vs back-to-plan is structural (no string-replace hack): a child run
     // attached from a plan shows the parent label and a back affordance instead.
+    if tui_state.discoverability_hint_visible {
+        items.push(("Tab panes · w why · : commands".to_string(), String::new()));
+    }
     items.push(("?".to_string(), "help".to_string()));
     footer(&items)
 }
@@ -775,55 +777,86 @@ impl AttachHelpMode {
 pub(crate) fn help_overlay_lines(mode: AttachHelpMode) -> Vec<(&'static str, &'static str)> {
     match mode {
         AttachHelpMode::Run => vec![
+            ("Everywhere", "detach, focus panes, open help"),
             ("q / Esc / Ctrl-D", "detach (run keeps going)"),
             ("b / Backspace", "back to plan (when drilled in)"),
+            ("Detail pane", "switch evidence-backed views"),
             ("n", "toggle narrative / activity panels"),
+            ("w", "open why evidence panel"),
+            ("t", "focus / unfocus timeline"),
             ("v", "cycle visual map mode (narrative view)"),
             ("r", "refresh narrative"),
+            ("Pane focus", "move and scroll without leaving attach"),
             ("Tab / Shift-Tab", "switch focused panel"),
             ("j k / Up Down", "scroll focused panel"),
             ("PgUp / PgDn", "page"),
             ("Home End / g G", "jump to start / end"),
+            ("Context", "actions for chain steps and completed runs"),
             ("c", "open chain context (chain-step runs)"),
             ("a", "apply completed run (y confirms)"),
             ("x", "abandon completed run (y confirms)"),
             ("m / e", "materialize / extend completed run"),
             ("s / d", "show details / toggle docs"),
+            ("Command mode", command_mode_help_text(mode)),
             ("?", "toggle this help"),
         ],
         AttachHelpMode::Plan => vec![
+            ("Everywhere", "detach, focus children, open help"),
             ("q / Esc / Ctrl-D", "detach (plan keeps going)"),
             ("b / Backspace", "back to campaign (when drilled in)"),
+            ("Voyage pane", "select a child without drilling in"),
             ("Enter", "open the selected child run"),
+            ("Detail pane", "switch task cards and narrative"),
             ("n", "toggle narrative / task cards"),
             ("v", "cycle visual map mode (narrative view)"),
             ("r", "refresh narrative"),
+            ("Pane focus", "move and scroll without leaving attach"),
             ("j k / Up Down", "select task / scroll narrative"),
             ("PgUp / PgDn", "page"),
             ("Home End / g G", "jump to start / end"),
+            ("Command mode", command_mode_help_text(mode)),
             ("?", "toggle this help"),
         ],
         AttachHelpMode::Campaign => vec![
+            ("Everywhere", "detach, move selection, open help"),
             ("q / Ctrl-D", "detach (campaign keeps going)"),
             ("b / Esc / Backspace", "back"),
+            ("Voyage pane", "inspect sub-plans before zooming"),
             ("Enter", "drill into the selected sub-plan"),
             ("r", "refresh"),
+            ("Pane focus", "move and page through the campaign"),
             ("j k / Up Down / Tab", "select sub-plan"),
             ("PgUp / PgDn", "page"),
             ("Home End / g G", "jump to start / end"),
+            ("Command mode", command_mode_help_text(mode)),
             ("?", "toggle this help"),
         ],
         AttachHelpMode::Chain => vec![
+            ("Everywhere", "detach, select steps, open help"),
             ("q / Esc / Ctrl-D", "detach (chain keeps going)"),
+            ("Voyage pane", "act on the selected chain step"),
             ("Enter", "show the selected step's run"),
             ("r", "redo the selected step"),
             ("e", "extend the chain with a new step"),
             ("p", "pause the chain"),
             ("k", "kill the chain (asks to confirm)"),
+            ("Pane focus", "move through steps and activity"),
             ("Up / Down", "select step"),
             ("PgUp / PgDn", "scroll activity"),
+            ("Command mode", command_mode_help_text(mode)),
             ("?", "toggle this help"),
         ],
+    }
+}
+
+fn command_mode_help_text(mode: AttachHelpMode) -> &'static str {
+    match mode {
+        AttachHelpMode::Chain => {
+            ":attach <id> · :kill [id] · :motion full|reduced|off · :q · :reshape [id] · :resume [id] · :verdict [id] · :why [id]"
+        }
+        AttachHelpMode::Run | AttachHelpMode::Plan | AttachHelpMode::Campaign => {
+            "chain attach: :attach <id> · :kill [id] · :motion full|reduced|off · :q · :reshape [id] · :resume [id] · :verdict [id] · :why [id]"
+        }
     }
 }
 

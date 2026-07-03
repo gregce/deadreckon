@@ -906,6 +906,7 @@ async fn attach_tui_with_parent(
                 render_help_overlay(frame, AttachHelpMode::Run);
             }
         })?;
+        tui_state.dismiss_discoverability_hint();
         tui_state.clear_active_effect_frames();
         tick.record_since(AttachLoopStage::Draw, stage_started);
         if let Some(started_at) = pending_input_at.take() {

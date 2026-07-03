@@ -65,6 +65,7 @@ pub(crate) struct AttachTuiState {
     pub(crate) active_effect_frames: Vec<EffectFrame>,
     pub(crate) last_acceptance_effect_status: Option<AcceptanceUiStatus>,
     pub(crate) last_run_effect_status: Option<RunStatus>,
+    pub(crate) discoverability_hint_visible: bool,
     pub(crate) post_action_notice: Option<AttachActionNotice>,
     pub(crate) narrative_notice: Option<String>,
     pub(crate) narrative_projection: Option<narrative::NarrativeProjection>,
@@ -93,6 +94,7 @@ impl Default for AttachTuiState {
             active_effect_frames: Vec::new(),
             last_acceptance_effect_status: None,
             last_run_effect_status: None,
+            discoverability_hint_visible: true,
             post_action_notice: None,
             narrative_notice: None,
             narrative_projection: None,
@@ -265,6 +267,10 @@ impl AttachTuiState {
 
     pub(crate) fn clear_active_effect_frames(&mut self) {
         self.active_effect_frames.clear();
+    }
+
+    pub(crate) fn dismiss_discoverability_hint(&mut self) {
+        self.discoverability_hint_visible = false;
     }
 
     fn frames_for_trigger(&self, trigger: EffectTrigger, input_pending: bool) -> Vec<EffectFrame> {
