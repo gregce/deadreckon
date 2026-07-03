@@ -33,6 +33,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
 - H-P3 (`9238a65`): attach renders the shared status spine band across run,
   plan, chain, and campaign surfaces; plain and off-TTY attach summaries print
   the same five spine answers, including paused-run attention and next action.
+- H-P4 (`8c39e10`): `tui::tree` adds the pure TreeModel read model for run,
+  plan, chain, and campaign roots, builds campaign/sub-goal/task/run trees from
+  durable state files, and folds existing run/plan/chain/campaign feed events
+  without rebuilding the tree.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
