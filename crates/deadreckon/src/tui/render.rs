@@ -630,6 +630,16 @@ pub(crate) fn footer_for_state(
                 ("deadreckon", "status/list"),
             ],
         );
+    } else if tui_state.timeline_focused {
+        push(
+            &mut items,
+            &[
+                ("[t]", "Activity"),
+                ("Left/Right", "scrub"),
+                ("Tab", "focus"),
+                ("j/k", "scroll"),
+            ],
+        );
     } else if tui_state.show_completion_actions && state.status == RunStatus::Completed {
         let actions: &[(&str, &str)] = if is_worktree_run(state) {
             if tui_state.docs_open {
@@ -655,6 +665,7 @@ pub(crate) fn footer_for_state(
                 &[
                     ("[n]", "Narrative"),
                     ("[d]", "Docs"),
+                    ("[t]", "Timeline"),
                     ("[a]", "Apply"),
                     ("[x]", "Abandon"),
                     ("[s]", "Show"),
@@ -685,6 +696,7 @@ pub(crate) fn footer_for_state(
             &[
                 ("[n]", "Narrative"),
                 ("[d]", "Docs"),
+                ("[t]", "Timeline"),
                 ("[m]", "Materialize"),
                 ("[e]", "Extend"),
                 ("[s]", "Show"),
@@ -714,6 +726,7 @@ pub(crate) fn footer_for_state(
             &[
                 ("[n]", "Narrative"),
                 ("[w]", "Why"),
+                ("[t]", "Timeline"),
                 ("Tab", "focus"),
                 ("j/k Up/Down PgUp/PgDn", "scroll"),
             ],

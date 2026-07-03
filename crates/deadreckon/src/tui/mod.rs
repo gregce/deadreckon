@@ -4,6 +4,7 @@ pub(crate) mod panes;
 mod render;
 pub(crate) mod spine;
 pub(crate) mod surfaces;
+pub(crate) mod timeline;
 pub(crate) mod tree;
 pub(crate) mod why;
 
@@ -35,6 +36,9 @@ pub(crate) use why::{why_for_run, why_plain_lines};
 
 #[cfg(test)]
 pub(crate) use why::render_why_panel;
+
+#[cfg(test)]
+pub(crate) use timeline::{TimelineMark, render_timeline_band, timeline_for_run};
 
 #[cfg(test)]
 pub(crate) use render::help_overlay_lines;

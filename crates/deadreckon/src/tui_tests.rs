@@ -42,11 +42,12 @@ use super::commands::start::{StartLaunchDecision, prompt_start_model};
 use super::tui::{
     AttachActionNotice, AttachHelpMode, AttachPanel, AttachPanelCounts, AttachPanelRows,
     AttachParentPlan, AttachTuiState, CAMPAIGN_EMPTY_HINT, ChainAttachTuiState, ChainModalAction,
-    CommandModeVerb, NARRATIVE_SPLIT_WIDTH, attach_command_table, build_run_narrative_projection,
-    chain_activity_lines, chain_attach_footer_text, chain_attach_header_text,
-    chain_event_read_hint, chain_timeline_lines, footer, help_overlay_lines, markdown_to_tui_lines,
-    max_panel_scroll, panel_title, plan_narrative_title, render_chain_attach, render_help_overlay,
-    render_why_panel, scroll_indicator, selection_glyph, why_for_run, why_plain_lines,
+    CommandModeVerb, NARRATIVE_SPLIT_WIDTH, TimelineMark, attach_command_table,
+    build_run_narrative_projection, chain_activity_lines, chain_attach_footer_text,
+    chain_attach_header_text, chain_event_read_hint, chain_timeline_lines, footer,
+    help_overlay_lines, markdown_to_tui_lines, max_panel_scroll, panel_title, plan_narrative_title,
+    render_chain_attach, render_help_overlay, render_timeline_band, render_why_panel,
+    scroll_indicator, selection_glyph, timeline_for_run, why_for_run, why_plain_lines,
 };
 use super::{
     ATTACH_JSONL_TAIL_ROW_LIMIT, ATTACH_LIVE_FILE_DISPLAY_LIMIT, AcceptanceLive,
@@ -1507,6 +1508,56 @@ fn write_tamper_caveat(state: &deadreckon_core::PipelineState) {
         refusal_reasons: Vec::new(),
     };
     deadreckon_core::tamper::write_acceptance_tamper(&state.run_root, &tamper).expect("tamper");
+}
+
+fn write_timeline_checkpoint(
+    state: &deadreckon_core::PipelineState,
+    checkpoint_id: &str,
+    turn: u32,
+    files: Vec<deadreckon_core::flight::CheckpointFileChange>,
+) {
+    let manifest = deadreckon_core::flight::CheckpointManifest {
+        version: 1,
+        checkpoint_id: checkpoint_id.to_string(),
+        run_id: state.run_id.clone(),
+        flight_session_id: format!("flight-turn-{turn}-attempt-1"),
+        deadreckon_turn: turn,
+        attempt: 1,
+        provider_event_seq: Some(u64::from(turn)),
+        created_at: Utc::now(),
+        trigger: deadreckon_core::flight::CheckpointTrigger::ProviderTool,
+        base: deadreckon_core::flight::CheckpointBase {
+            kind: deadreckon_core::flight::CheckpointBaseKind::TurnSnapshot,
+            id: format!("turn-{}", turn.saturating_sub(1)),
+        },
+        full_anchor: false,
+        files,
+        working_tree_hash: format!("hash-{checkpoint_id}"),
+    };
+    let dir = deadreckon_core::flight::checkpoint_dir(state, checkpoint_id);
+    std::fs::create_dir_all(&dir).expect("checkpoint dir");
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("checkpoint manifest");
+}
+
+fn timeline_file_change(
+    path: &str,
+    change: deadreckon_core::flight::CheckpointChangeKind,
+) -> deadreckon_core::flight::CheckpointFileChange {
+    let after_bytes = match change {
+        deadreckon_core::flight::CheckpointChangeKind::Deleted => None,
+        _ => Some(std::path::PathBuf::from("files").join(path)),
+    };
+    deadreckon_core::flight::CheckpointFileChange {
+        path: std::path::PathBuf::from(path),
+        change,
+        before_hash: Some(format!("before-{path}")),
+        after_hash: Some(format!("after-{path}")),
+        after_bytes,
+    }
 }
 
 fn full_plan_fixture(task_count: usize) -> (tempfile::TempDir, DeadreckonPaths, Plan) {
@@ -4789,6 +4840,176 @@ fn paused_run_spine_names_pause_reason_and_next() {
         text.contains(&format!("deadreckon attach {}", state.run_id)),
         "{text}"
     );
+}
+
+#[test]
+fn timeline_entries_match_turn_checkpoints() {
+    use deadreckon_core::flight::CheckpointChangeKind::{Created, Deleted, Modified};
+
+    let (_temp, state) = doc_preview_state();
+    write_timeline_checkpoint(
+        &state,
+        "cp-000001",
+        1,
+        vec![
+            timeline_file_change("created.txt", Created),
+            timeline_file_change("modified.txt", Modified),
+        ],
+    );
+    write_timeline_checkpoint(
+        &state,
+        "cp-000002",
+        2,
+        vec![
+            timeline_file_change("again.txt", Modified),
+            timeline_file_change("removed.txt", Deleted),
+        ],
+    );
+    let mut first_spend = spend_record(1);
+    first_spend.cost_usd = 0.12;
+    let mut second_spend = spend_record(2);
+    second_spend.cost_usd = 0.34;
+
+    let timeline =
+        timeline_for_run(&state, &[first_spend, second_spend], &[], &[]).expect("timeline");
+
+    assert_eq!(timeline.entries.len(), 2, "{timeline:#?}");
+    assert_eq!(timeline.entries[0].turn, 1);
+    assert_eq!(timeline.entries[0].checkpoint_ids, vec!["cp-000001"]);
+    assert_eq!(timeline.entries[0].diff.created, 1);
+    assert_eq!(timeline.entries[0].diff.modified, 1);
+    assert_eq!(timeline.entries[0].diff.deleted, 0);
+    assert!((timeline.entries[0].spend_delta_usd - 0.12).abs() < f64::EPSILON);
+    assert!(timeline.entries[0].story.contains("turn 1"));
+    assert!(timeline.entries[0].story.contains("cp-000001"));
+    assert!(
+        timeline.entries[0]
+            .marks
+            .contains(&TimelineMark::Checkpoint)
+    );
+    assert_eq!(timeline.entries[1].turn, 2);
+    assert_eq!(timeline.entries[1].diff.deleted, 1);
+    assert!((timeline.entries[1].spend_delta_usd - 0.34).abs() < f64::EPSILON);
+}
+
+#[test]
+fn scrubbing_selects_turn_story_and_diff_counts() {
+    use deadreckon_core::flight::CheckpointChangeKind::{Created, Modified};
+
+    let (_temp, state) = doc_preview_state();
+    write_timeline_checkpoint(
+        &state,
+        "cp-000001",
+        1,
+        vec![timeline_file_change("first.txt", Created)],
+    );
+    write_timeline_checkpoint(
+        &state,
+        "cp-000002",
+        2,
+        vec![
+            timeline_file_change("new-panel.rs", Created),
+            timeline_file_change("existing-panel.rs", Modified),
+        ],
+    );
+    let mut tui_state = AttachTuiState::default();
+
+    tui_state.handle_key(
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        AttachPanelCounts {
+            activity: 10,
+            files: 0,
+            processes: 0,
+        },
+        AttachPanelRows {
+            activity: 5,
+            files: 0,
+            processes: 0,
+        },
+    );
+    tui_state.handle_key(
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        AttachPanelCounts {
+            activity: 10,
+            files: 0,
+            processes: 0,
+        },
+        AttachPanelRows {
+            activity: 5,
+            files: 0,
+            processes: 0,
+        },
+    );
+
+    assert!(tui_state.timeline_focused);
+    assert_eq!(tui_state.timeline_selected, 1);
+    let rendered =
+        render_attach_text_with_size(&state, &[], &AttachLive::default(), tui_state, 160, 34);
+
+    assert!(rendered.contains("timeline detail"), "{rendered}");
+    assert!(rendered.contains("turn 2"), "{rendered}");
+    assert!(rendered.contains("cp-000002"), "{rendered}");
+    assert!(rendered.contains("+1"), "{rendered}");
+    assert!(rendered.contains("~1"), "{rendered}");
+    assert!(rendered.contains("-0"), "{rendered}");
+}
+
+#[test]
+fn gate_events_render_as_timeline_marks() {
+    use deadreckon_core::flight::CheckpointChangeKind::Modified;
+
+    let (_temp, state) = doc_preview_state();
+    write_timeline_checkpoint(
+        &state,
+        "cp-000001",
+        1,
+        vec![timeline_file_change("lib.rs", Modified)],
+    );
+    write_failed_acceptance_progress(&state, "cargo_test", "timeline::gate");
+
+    let timeline = timeline_for_run(&state, &[], &[], &[]).expect("timeline");
+    let latest = timeline.entries.last().expect("timeline entry");
+    assert!(latest.marks.contains(&TimelineMark::GateFailed));
+
+    let rendered = render_surface_module_text(120, 5, |frame| {
+        render_timeline_band(frame, frame.area(), &timeline, 0, true);
+    });
+
+    assert!(rendered.contains("timeline"), "{rendered}");
+    assert!(rendered.contains("gate failed"), "{rendered}");
+}
+
+#[test]
+fn reshape_proposed_trace_renders_as_timeline_mark() {
+    use deadreckon_core::flight::CheckpointChangeKind::Modified;
+
+    let (_temp, state) = doc_preview_state();
+    write_timeline_checkpoint(
+        &state,
+        "cp-000003",
+        3,
+        vec![timeline_file_change("course.md", Modified)],
+    );
+    let reshape_trace = TraceRecord {
+        timestamp: Utc::now(),
+        run_id: state.run_id.clone(),
+        turn: 3,
+        event: "reshape.proposed".to_string(),
+        latency_ms: None,
+        detail: serde_json::json!({"proposal": "split into two turns"}),
+    };
+
+    let timeline = timeline_for_run(&state, &[], &[reshape_trace], &[]).expect("timeline");
+    assert!(
+        timeline.entries[0].marks.contains(&TimelineMark::Reshape),
+        "{timeline:#?}"
+    );
+
+    let rendered = render_surface_module_text(120, 5, |frame| {
+        render_timeline_band(frame, frame.area(), &timeline, 0, true);
+    });
+
+    assert!(rendered.contains("reshape"), "{rendered}");
 }
 
 #[test]
