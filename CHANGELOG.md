@@ -41,6 +41,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   gate counts, spend, display-width-safe labels, and selection state; plan and
   campaign surfaces gain the left tree column while single-run attach collapses
   the one-node tree into the header band.
+- H-P6 (`7464091`): Helm selection drives the detail pane for task and run
+  leaves, Enter zooms in-frame with a breadcrumb, Esc backs out before detach,
+  and campaign leaf runs expose status, activity, gate, and spend without any
+  drill-in.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
