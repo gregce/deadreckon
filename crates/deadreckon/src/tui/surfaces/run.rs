@@ -11,6 +11,7 @@ use crate::tui::panes::header::{
 };
 use crate::tui::panes::narrative::{RunNarrativeRenderInput, render_run_narrative};
 use crate::tui::render::turn_timer;
+use crate::tui::spine::{render_spine_band, spine_for_run_with_events};
 use crate::{AttachLive, RunEvent, SpendRecord, TraceRecord};
 use chrono::Utc;
 use deadreckon_core::RunStatus;
@@ -105,6 +106,8 @@ pub(crate) fn render_attach(
     }
     render_live_files(frame, layout.files, live, tui_state);
     render_processes(frame, layout.processes, live, tui_state);
+    let spine = spine_for_run_with_events(state, events, Utc::now());
+    render_spine_band(frame, layout.spine, &spine);
     let tick = (Utc::now().timestamp_millis() / 180).max(0) as usize;
     let status_line = deadreckoning_status_line(
         state,

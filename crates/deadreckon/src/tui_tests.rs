@@ -4411,6 +4411,131 @@ fn each_surface_module_renders_via_shared_navigation() {
 }
 
 #[test]
+fn all_four_surfaces_render_spine_band() {
+    let (_run_temp, run_state) = doc_preview_state();
+    let run_text = render_surface_module_text(140, 34, |frame| {
+        super::tui::surfaces::run::render_attach(
+            frame,
+            &run_state,
+            &[],
+            &[],
+            &[],
+            &AttachLive::default(),
+            &AttachTuiState::default(),
+        );
+    });
+
+    let (_plan_temp, paths, plan) = full_plan_fixture(2);
+    let plan_render_state = PlanAttachRenderState {
+        messages: &[],
+        plan_events: &[],
+        feed_events: &[],
+        selected: 0,
+        show_hints: true,
+        view: AttachViewMode::Activity,
+        visual: NarrativeVisualMode::Architecture,
+        campaign_parent: None,
+        narrative_notice: None,
+        narrative_projection: None,
+        narrative_scroll: 0,
+    };
+    let plan_text = render_surface_module_text(140, 34, |frame| {
+        super::tui::surfaces::plan::render_plan_attach(frame, &paths, &plan, &plan_render_state);
+    });
+
+    let chain = chain_fixture();
+    let chain_text = render_surface_module_text(120, 34, |frame| {
+        super::tui::surfaces::chain::render_chain_attach(
+            frame,
+            &chain,
+            &[],
+            &ChainAttachTuiState::default(),
+        );
+    });
+
+    let campaign_temp = test_tempdir();
+    let campaign_paths = DeadreckonPaths::from_home(campaign_temp.path().join("home"));
+    let sub_goals = deadreckon_core::campaign::build_sub_goals(
+        vec!["alpha service".to_string(), "beta service".to_string()],
+        2,
+    )
+    .expect("campaign sub-goals");
+    let campaign = deadreckon_core::campaign::Campaign::new(
+        "ship mission control",
+        sub_goals,
+        PlanProviders::default(),
+        0,
+        Some(12.0),
+        None,
+        "0.1.0",
+    )
+    .expect("campaign");
+    let campaign_state = CampaignAttachState::new(
+        &campaign_paths,
+        campaign_paths.plan_dir(&campaign.campaign_id),
+        campaign,
+    );
+    let campaign_text = render_surface_module_text(140, 34, |frame| {
+        super::tui::surfaces::campaign::render_campaign_attach(frame, &campaign_state);
+    });
+
+    for (surface, text) in [
+        ("run", run_text),
+        ("plan", plan_text),
+        ("chain", chain_text),
+        ("campaign", campaign_text),
+    ] {
+        assert!(
+            text.contains("status spine"),
+            "{surface} missing spine: {text}"
+        );
+        for label in ["alive", "doing", "on track", "wrong", "next"] {
+            assert!(text.contains(label), "{surface} missing {label}: {text}");
+        }
+    }
+}
+
+#[test]
+fn plain_attach_prints_five_spine_lines() {
+    let (_temp, state) = doc_preview_state();
+    let snapshot = super::tui::spine::spine_for_run(&state, Utc::now());
+    let lines = super::tui::spine::spine_plain_lines(&snapshot);
+
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert_eq!(lines[0].split_once(':').map(|(key, _)| key), Some("alive"));
+    assert_eq!(lines[1].split_once(':').map(|(key, _)| key), Some("doing"));
+    assert_eq!(
+        lines[2].split_once(':').map(|(key, _)| key),
+        Some("on track")
+    );
+    assert_eq!(lines[3].split_once(':').map(|(key, _)| key), Some("wrong"));
+    assert_eq!(lines[4].split_once(':').map(|(key, _)| key), Some("next"));
+}
+
+#[test]
+fn paused_run_spine_names_pause_reason_and_next() {
+    let (_temp, mut state) = doc_preview_state();
+    state.pause_reason = Some("spend cap reached".to_string());
+    state.status = RunStatus::Executing;
+
+    let text = render_attach_text_with_size(
+        &state,
+        &[],
+        &AttachLive::default(),
+        AttachTuiState::default(),
+        160,
+        34,
+    );
+
+    assert!(text.contains("status spine"), "{text}");
+    assert!(text.contains("spend cap reached"), "{text}");
+    assert!(
+        text.contains(&format!("deadreckon attach {}", state.run_id)),
+        "{text}"
+    );
+}
+
+#[test]
 fn parent_plan_footer_replace_hack_removed() {
     // A child run attached from a plan gets its back affordance + breadcrumb
     // structurally (via footer items), not by string-replacing the detach text.

@@ -7,6 +7,8 @@ use crate::commands::chain::{
 };
 use crate::tui::panes::activity::{list_scroll_offset, scroll_indicator};
 use crate::tui::panes::footer::footer;
+use crate::tui::spine::{render_spine_band, spine_for_chain_with_events};
+use chrono::Utc;
 use crossterm::event::KeyEvent;
 use deadreckon::verdict_surface::{ExplanationPanel, VerdictKind, VerdictSurface};
 use deadreckon_core::{Chain, ChainEvent, ChainEventKind, ChainStatus};
@@ -140,6 +142,7 @@ pub(crate) fn render_chain_attach(
         .constraints([
             Constraint::Length(5),
             Constraint::Min(8),
+            Constraint::Length(4),
             Constraint::Length(1),
         ])
         .split(area);
@@ -182,7 +185,9 @@ pub(crate) fn render_chain_attach(
         List::new(event_lines).block(Block::default().borders(Borders::ALL).title(activity_title)),
         body[1],
     );
-    frame.render_widget(Paragraph::new(chain_attach_footer_text(chain)), rows[2]);
+    let spine = spine_for_chain_with_events(chain, events, Utc::now());
+    render_spine_band(frame, rows[2], &spine);
+    frame.render_widget(Paragraph::new(chain_attach_footer_text(chain)), rows[3]);
 }
 
 pub(crate) fn chain_attach_header_text(chain: &Chain) -> String {

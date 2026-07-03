@@ -7762,6 +7762,9 @@ fn print_plan_summary(paths: &DeadreckonPaths, plan: &Plan, show_hints: bool) {
         ("capabilities", capabilities.as_str()),
     ];
     print_kv_block(&items);
+    print_spine_plain_lines(crate::tui::spine::spine_plain_lines(
+        &crate::tui::spine::spine_for_plan(paths, plan, Utc::now()),
+    ));
     commands::plan::print_orchestration_role_table(plan, true, None);
     commands::plan::print_orchestration_dependency_summary(plan);
     println!("docs {}", plan_docs_status_line(paths, plan));
@@ -11039,8 +11042,18 @@ fn print_run_summary(state: &deadreckon_core::PipelineState) {
         .map(|(label, value)| (label.as_str(), value.as_str()))
         .collect::<Vec<_>>();
     print_kv_block(&item_refs);
+    print_spine_plain_lines(crate::tui::spine::spine_plain_lines(
+        &crate::tui::spine::spine_for_run(state, Utc::now()),
+    ));
     print_run_locations(state);
     print_chain_context_for_working(&state.working_dir);
+}
+
+fn print_spine_plain_lines(lines: Vec<String>) {
+    println!("{}", ui_heading("Status spine"));
+    for line in lines {
+        println!("{line}");
+    }
 }
 
 fn print_chain_context_for_working(working_dir: &Path) {
