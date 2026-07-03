@@ -61,6 +61,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   fixed existing verbs through in-frame input and confirm flows, surfaces
   unknown commands with nearest `try:` guidance, and routes `:reshape` through
   the Course reshape command path.
+- H-P11 (`cddec12`): run attach gains the cited `w` why panel and `attach
+  --why` plain parity, with deterministic causes from state, gate progress,
+  tamper proofs, and provider traces; every rendered cause carries an artifact
+  path and bounded excerpt.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
