@@ -1951,6 +1951,8 @@ pub(crate) struct CampaignAttachState {
     pub(crate) sub_spend_usd: BTreeMap<String, f64>,
     pub(crate) feed: VecDeque<CampaignFeedEvent>,
     pub(crate) selected: usize,
+    pub(crate) selected_node: Option<crate::tui::tree::NodeId>,
+    pub(crate) zoomed_node: Option<crate::tui::tree::NodeId>,
 }
 
 impl CampaignAttachState {
@@ -1971,6 +1973,8 @@ impl CampaignAttachState {
             sub_spend_usd,
             feed: VecDeque::new(),
             selected: 0,
+            selected_node: None,
+            zoomed_node: None,
         }
     }
 

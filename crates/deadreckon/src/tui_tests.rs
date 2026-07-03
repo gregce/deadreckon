@@ -1881,6 +1881,8 @@ fn render_plan_attach_text_with_view(
             plan_events,
             feed_events: &[],
             selected,
+            selected_node: None,
+            zoomed_node: None,
             show_hints: true,
             view,
             visual,
@@ -1911,6 +1913,8 @@ fn render_plan_attach_text_with_feed(
             plan_events,
             feed_events,
             selected,
+            selected_node: None,
+            zoomed_node: None,
             show_hints: true,
             view: AttachViewMode::Activity,
             visual: NarrativeVisualMode::Architecture,
@@ -3886,12 +3890,13 @@ fn attach_plan_shows_capability_preview() {
 }
 
 #[test]
-fn attach_plan_enter_drills_then_esc_returns() {
+fn attach_plan_enter_zooms_then_esc_returns() {
     let (_temp, paths, plan) = full_plan_fixture(2);
 
     let text = render_plan_attach_text(&paths, &plan, &[], &[], 0);
 
-    assert!(text.contains("Enter waits for child run"), "{text}");
+    assert!(text.contains("Enter zoom task"), "{text}");
+    assert!(text.contains("Esc backs out of zoom"), "{text}");
     assert!(text.contains("q/Esc/Ctrl-D detach"), "{text}");
 }
 
@@ -3910,7 +3915,7 @@ fn plan_attach_footer_snapshot_captures_back_navigation_grammar() {
 
     assert!(footer.starts_with("q/Esc/Ctrl-D detach"), "{footer}");
     assert!(footer.contains("arrows/Tab focus child"), "{footer}");
-    assert!(footer.contains("Enter waits for child run"), "{footer}");
+    assert!(footer.contains("Enter zoom task"), "{footer}");
     assert_eq!(footer.matches("recommended:").count(), 0, "{footer}");
     assert_eq!(footer.matches("next ").count(), 1, "{footer}");
     assert!(footer.contains("next deadreckon fork"), "{footer}");
@@ -3918,7 +3923,7 @@ fn plan_attach_footer_snapshot_captures_back_navigation_grammar() {
 }
 
 #[test]
-fn attach_plan_enter_opens_selected_child_run_detail() {
+fn attach_plan_enter_zooms_selected_child_run_detail() {
     let (temp, paths, mut plan) = full_plan_fixture(2);
     let state = create_run(
         &paths,
@@ -3946,7 +3951,7 @@ fn attach_plan_enter_opens_selected_child_run_detail() {
         NarrativeVisualMode::Architecture,
     );
 
-    assert!(footer.contains("Enter child run"), "{footer}");
+    assert!(footer.contains("Enter zoom"), "{footer}");
     assert!(!footer.contains("try: deadreckon fork"), "{footer}");
     assert!(!footer.contains("recommended:"), "{footer}");
 }
@@ -3973,7 +3978,7 @@ fn attach_plan_enter_without_run_id_shows_one_next_action_footer() {
 
     let text = render_plan_attach_text(&paths, &plan, &[], &[], 0);
 
-    assert!(text.contains("Enter waits for child run"), "{text}");
+    assert!(text.contains("Enter zoom task"), "{text}");
     assert!(
         text.contains(&format!("next deadreckon fork {}", &plan.plan_id[..8])),
         "{text}"
@@ -4397,6 +4402,8 @@ fn each_surface_module_renders_via_shared_navigation() {
         plan_events: &[],
         feed_events: &[],
         selected: 0,
+        selected_node: None,
+        zoomed_node: None,
         show_hints: true,
         view: AttachViewMode::Activity,
         visual: NarrativeVisualMode::Architecture,
@@ -4488,6 +4495,8 @@ fn all_four_surfaces_render_spine_band() {
         plan_events: &[],
         feed_events: &[],
         selected: 0,
+        selected_node: None,
+        zoomed_node: None,
         show_hints: true,
         view: AttachViewMode::Activity,
         visual: NarrativeVisualMode::Architecture,
@@ -4851,6 +4860,116 @@ fn tree_selection_survives_event_fold() {
         tree.find(&selected).map(|node| node.label.as_str()),
         Some("Task 1")
     );
+}
+
+#[test]
+fn selecting_child_node_renders_its_activity_in_detail() {
+    let (temp, paths, mut plan) = full_plan_fixture(2);
+    let mut child = create_run(
+        &paths,
+        RunOptions {
+            goal: "selected child activity".to_string(),
+            cwd: temp.path().to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke:child".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(3.0),
+            max_wall_seconds: None,
+            run_id: Some("selectedchild000000000000000000001".to_string()),
+            codebase: None,
+        },
+    )
+    .expect("child run");
+    child.status = RunStatus::Executing;
+    child.total_spend_usd = 0.42;
+    deadreckon_core::save_state(&child).expect("save child");
+    deadreckon_core::emit_event(
+        &child,
+        None,
+        RunEventKind::ToolCallStarted {
+            turn: 2,
+            tool_call_id: "tool-helm".to_string(),
+            tool_name: "shell".to_string(),
+            args: serde_json::json!({"cmd": "make test"}),
+        },
+    )
+    .expect("event");
+    plan.tasks[0].child_run_id = Some(child.run_id.clone());
+    plan.tasks[0].status = PlanTaskStatus::Running;
+    save_plan(&paths, &plan).expect("save plan");
+
+    let selected = super::tui::tree::NodeId::run(&child.run_id);
+    let text = render_plan_attach_text_with_state(
+        &paths,
+        &plan,
+        &[],
+        &[],
+        &[],
+        PlanAttachRenderState {
+            messages: &[],
+            plan_events: &[],
+            feed_events: &[],
+            selected: 0,
+            selected_node: Some(&selected),
+            zoomed_node: None,
+            show_hints: true,
+            view: AttachViewMode::Activity,
+            visual: NarrativeVisualMode::Architecture,
+            campaign_parent: None,
+            narrative_notice: None,
+            narrative_projection: None,
+            narrative_scroll: 0,
+        },
+    );
+
+    assert!(text.contains("detail: run"), "{text}");
+    assert!(text.contains("selected child activity"), "{text}");
+    assert!(text.contains("turn 2 shell tool-helm started"), "{text}");
+}
+
+#[test]
+fn enter_zooms_and_breadcrumb_backs_out() {
+    let (_temp, paths, plan) = full_plan_fixture(2);
+    save_plan(&paths, &plan).expect("save plan");
+    let tree = super::tui::tree::tree_for_plan(&paths, &plan);
+    let selected = super::tui::tree::NodeId::task(&plan.plan_id, "task-0");
+    let mut zoom = super::tui::panes::voyage::VoyageZoomState::default();
+
+    assert_eq!(
+        zoom.enter(selected.clone()),
+        super::tui::panes::voyage::VoyageZoomAction::Zoomed
+    );
+    assert_eq!(zoom.zoomed(), Some(&selected));
+
+    let breadcrumb = zoom.breadcrumb(&tree);
+    assert!(breadcrumb.contains("plan"), "{breadcrumb}");
+    assert!(breadcrumb.contains("task-0"), "{breadcrumb}");
+
+    assert_eq!(
+        zoom.escape(),
+        super::tui::panes::voyage::VoyageZoomAction::BackedOut
+    );
+    assert_eq!(zoom.zoomed(), None);
+    assert_eq!(
+        zoom.escape(),
+        super::tui::panes::voyage::VoyageZoomAction::Quit
+    );
+}
+
+#[test]
+fn campaign_leaf_state_visible_without_any_zoom() {
+    let (_temp, paths, campaign_dir, campaign, child_run_id) = campaign_tree_fixture();
+    let mut state = CampaignAttachState::new(&paths, campaign_dir, campaign);
+    state.selected_node = Some(super::tui::tree::NodeId::run(&child_run_id));
+
+    let text = render_surface_module_text(150, 34, |frame| {
+        super::tui::surfaces::campaign::render_campaign_attach(frame, &state);
+    });
+
+    assert!(text.contains("detail: run"), "{text}");
+    assert!(text.contains("campaign leaf run"), "{text}");
+    assert!(text.contains("completed"), "{text}");
+    assert!(text.contains("$1.25"), "{text}");
 }
 
 #[test]
