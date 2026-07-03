@@ -26,6 +26,10 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   `tui/surfaces/{run,plan,chain,campaign}.rs` and routes shared chrome through
   `tui/panes/{header,activity,narrative,docs,footer}.rs`; characterization
   goldens and the public surface remain unchanged.
+- H-P2 (`912d311`): `tui::spine` adds the `SpineSnapshot` read model, 5x4
+  contract table, run/plan/chain/campaign builders over durable files, and
+  depth tests for event-age aliveness, single primary action, launch-plan budget
+  ceilings, and inert reshape proposals.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
