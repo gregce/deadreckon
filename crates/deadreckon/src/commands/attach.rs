@@ -6,7 +6,7 @@ use crate::tui::tree::NodeId;
 use crate::tui::{
     AttachActionNotice, AttachHelpMode, AttachParentPlan, AttachTuiState, RunNarrativeRenderInput,
     attach_panel_counts, build_run_narrative_projection, render_help_overlay,
-    run_narrative_projection, toggle_attach_view,
+    run_narrative_projection, toggle_attach_view, why_for_run, why_plain_lines,
 };
 
 #[derive(Debug)]
@@ -15,6 +15,7 @@ pub(crate) struct AttachCommandArgs {
     pub(crate) no_hints: bool,
     pub(crate) plain: bool,
     pub(crate) json: bool,
+    pub(crate) why: bool,
     pub(crate) view: AttachViewMode,
     pub(crate) visual: NarrativeVisualMode,
     pub(crate) narrative_provider: Option<String>,
@@ -32,7 +33,16 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     if let Some((campaign_dir, campaign)) = commands::campaign::resolve_campaign(&paths, &run_ref)?
     {
         let state = commands::campaign::CampaignAttachState::new(&paths, &campaign_dir, campaign);
-        if args.view.is_narrative() && args.json {
+        if args.why {
+            print!(
+                "{}",
+                commands::campaign::campaign_why_failed_report(
+                    &paths,
+                    &state.campaign,
+                    state.rollup.as_ref()
+                )
+            );
+        } else if args.view.is_narrative() && args.json {
             print_campaign_narrative_json(&paths, &state.campaign, args.visual)?;
         } else if args.view.is_narrative() && (!io::stdout().is_terminal() || args.plain) {
             print_campaign_narrative_plain(&paths, &state.campaign, args.visual)?;
@@ -103,6 +113,9 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
                     return Ok(());
                 }
                 if commands::chain::resolve_chain_id(&paths, &run_ref, false).is_ok() {
+                    if args.why {
+                        return commands::chain::chain_show_command(&paths, &run_ref, true, false);
+                    }
                     if args.view.is_narrative() || args.json {
                         return print_chain_narrative_refusal(&run_ref, args.json);
                     }
@@ -115,6 +128,10 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     };
     let run_id = state.run_id.clone();
     let show_hints = completion_hints_enabled(args.no_hints);
+    if args.why {
+        print!("{}", run_why_plain_text(&state)?);
+        return Ok(());
+    }
     if args.view.is_narrative() && args.json {
         print_run_narrative_json(&state, parent_plan.as_ref(), args.visual)?;
         return Ok(());
@@ -169,6 +186,13 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
         print_run_summary(&state);
     }
     Ok(())
+}
+
+pub(crate) fn run_why_plain_text(state: &deadreckon_core::PipelineState) -> Result<String> {
+    let report = why_for_run(state)?;
+    let mut output = why_plain_lines(&report).join("\n");
+    output.push('\n');
+    Ok(output)
 }
 
 fn print_run_narrative_plain(
@@ -948,6 +972,9 @@ async fn attach_tui_with_parent(
                 Event::Key(key) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
                     tui_state.toggle_view();
                 }
+                Event::Key(key) if key.code == KeyCode::Char('w') && key.modifiers.is_empty() => {
+                    tui_state.open_why();
+                }
                 Event::Key(key) if key.code == KeyCode::Char('v') && key.modifiers.is_empty() => {
                     tui_state.cycle_visual();
                 }
@@ -1001,6 +1028,8 @@ async fn attach_tui_with_parent(
                 {
                     if key.code == KeyCode::Char('d') && key.modifiers.is_empty() {
                         tui_state.toggle_docs();
+                    } else if key.code == KeyCode::Char('w') && key.modifiers.is_empty() {
+                        tui_state.open_why();
                     } else {
                         match resolve_completion_key(key, tui_state.pending_confirm) {
                             CompletionKeyOutcome::Confirm(action) => {

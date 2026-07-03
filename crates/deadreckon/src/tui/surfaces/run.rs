@@ -14,6 +14,7 @@ use crate::tui::panes::voyage::collapsed_voyage_header;
 use crate::tui::render::turn_timer;
 use crate::tui::spine::{render_spine_band, spine_for_run_with_events};
 use crate::tui::tree::tree_for_run;
+use crate::tui::why::{render_why_panel, why_for_run_lossy};
 use crate::{AttachLive, RunEvent, SpendRecord, TraceRecord};
 use chrono::Utc;
 use deadreckon_core::RunStatus;
@@ -72,7 +73,10 @@ pub(crate) fn render_attach(
         render_acceptance(frame, top[2], live);
     }
 
-    if tui_state.docs_open && state.status == RunStatus::Completed {
+    if tui_state.why_open {
+        let report = why_for_run_lossy(state);
+        render_why_panel(frame, layout.activity, &report, tui_state.why_scroll);
+    } else if tui_state.docs_open && state.status == RunStatus::Completed {
         render_run_docs(frame, layout.activity, state, tui_state);
     } else if tui_state.view.is_narrative() {
         render_run_narrative(

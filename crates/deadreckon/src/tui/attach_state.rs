@@ -1,6 +1,7 @@
 use super::super::*;
 use super::panes::docs::render_markdown_doc_lines;
 use super::panes::narrative::run_narrative_lines;
+use super::why::{why_for_run_lossy, why_panel_lines};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttachPanel {
@@ -46,6 +47,8 @@ pub(crate) struct AttachTuiState {
     pub(crate) activity_scroll: usize,
     pub(crate) docs_scroll: usize,
     pub(crate) docs_open: bool,
+    pub(crate) why_scroll: usize,
+    pub(crate) why_open: bool,
     pub(crate) narrative_scroll: usize,
     pub(crate) files_scroll: usize,
     pub(crate) processes_scroll: usize,
@@ -66,6 +69,8 @@ impl Default for AttachTuiState {
             activity_scroll: 0,
             docs_scroll: 0,
             docs_open: false,
+            why_scroll: 0,
+            why_open: false,
             narrative_scroll: 0,
             files_scroll: 0,
             processes_scroll: 0,
@@ -88,6 +93,11 @@ impl AttachTuiState {
         counts: AttachPanelCounts,
         rows: AttachPanelRows,
     ) {
+        if key.code == KeyCode::Char('w') && key.modifiers.is_empty() {
+            self.open_why();
+            self.clamp(counts, rows);
+            return;
+        }
         {
             let mut nav = RunNav {
                 state: self,
@@ -101,6 +111,7 @@ impl AttachTuiState {
 
     pub(crate) fn toggle_docs(&mut self) {
         self.docs_open = !self.docs_open;
+        self.why_open = false;
         if self.docs_open {
             self.view = AttachViewMode::Activity;
         }
@@ -110,6 +121,7 @@ impl AttachTuiState {
 
     pub(crate) fn toggle_view(&mut self) {
         self.docs_open = false;
+        self.why_open = false;
         self.view = toggle_attach_view(self.view);
         self.focused_panel = AttachPanel::Activity;
         self.post_action_notice = None;
@@ -122,6 +134,7 @@ impl AttachTuiState {
     pub(crate) fn cycle_visual(&mut self) {
         self.visual = self.visual.next();
         self.docs_open = false;
+        self.why_open = false;
         if self.view == AttachViewMode::Activity {
             self.view = AttachViewMode::Narrative;
         }
@@ -130,6 +143,7 @@ impl AttachTuiState {
 
     pub(crate) fn record_narrative_refresh(&mut self, notice: String) {
         self.docs_open = false;
+        self.why_open = false;
         if self.view == AttachViewMode::Activity {
             self.view = AttachViewMode::Narrative;
         }
@@ -139,16 +153,29 @@ impl AttachTuiState {
 
     pub(crate) fn record_post_action(&mut self, notice: AttachActionNotice) {
         self.docs_open = false;
+        self.why_open = false;
         self.view = AttachViewMode::Activity;
         self.focused_panel = AttachPanel::Activity;
         self.activity_scroll = 0;
         self.docs_scroll = 0;
+        self.why_scroll = 0;
         self.narrative_scroll = 0;
         self.files_scroll = 0;
         self.processes_scroll = 0;
         self.post_action_notice = Some(notice);
         self.narrative_notice = None;
         self.narrative_projection = None;
+    }
+
+    pub(crate) fn open_why(&mut self) {
+        self.docs_open = false;
+        self.view = AttachViewMode::Activity;
+        self.focused_panel = AttachPanel::Activity;
+        self.post_action_notice = None;
+        self.narrative_notice = None;
+        self.narrative_projection = None;
+        self.why_open = true;
+        self.why_scroll = 0;
     }
 
     pub(crate) fn scroll_focused(
@@ -174,6 +201,9 @@ impl AttachTuiState {
         self.docs_scroll =
             self.docs_scroll
                 .min(max_panel_scroll(AttachPanel::Activity, counts, rows));
+        self.why_scroll =
+            self.why_scroll
+                .min(max_panel_scroll(AttachPanel::Activity, counts, rows));
         self.narrative_scroll =
             self.narrative_scroll
                 .min(max_panel_scroll(AttachPanel::Activity, counts, rows));
@@ -187,6 +217,7 @@ impl AttachTuiState {
 
     fn focused_scroll(&self) -> usize {
         match self.focused_panel {
+            AttachPanel::Activity if self.why_open => self.why_scroll,
             AttachPanel::Activity if self.docs_open => self.docs_scroll,
             AttachPanel::Activity if self.view.is_narrative() => self.narrative_scroll,
             AttachPanel::Activity => self.activity_scroll,
@@ -197,6 +228,7 @@ impl AttachTuiState {
 
     fn set_focused_scroll(&mut self, offset: usize) {
         match self.focused_panel {
+            AttachPanel::Activity if self.why_open => self.why_scroll = offset,
             AttachPanel::Activity if self.docs_open => self.docs_scroll = offset,
             AttachPanel::Activity if self.view.is_narrative() => self.narrative_scroll = offset,
             AttachPanel::Activity => self.activity_scroll = offset,
@@ -381,7 +413,9 @@ pub(crate) fn attach_panel_counts(
     tui_state: &AttachTuiState,
 ) -> AttachPanelCounts {
     AttachPanelCounts {
-        activity: if tui_state.docs_open && state.status == RunStatus::Completed {
+        activity: if tui_state.why_open {
+            why_panel_lines(&why_for_run_lossy(state)).len()
+        } else if tui_state.docs_open && state.status == RunStatus::Completed {
             render_markdown_doc_lines(state).len()
         } else if tui_state.view.is_narrative() {
             run_narrative_lines(state, spend, traces, events, live, tui_state).len()

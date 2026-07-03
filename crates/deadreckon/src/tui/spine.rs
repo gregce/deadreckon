@@ -265,7 +265,7 @@ pub(crate) struct PrimaryAction {
 }
 
 impl PrimaryAction {
-    fn new(command: impl Into<String>) -> Self {
+    pub(crate) fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into().trim().to_string(),
         }

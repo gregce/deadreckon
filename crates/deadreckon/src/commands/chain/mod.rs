@@ -1727,7 +1727,7 @@ fn chain_empty_surface(command: &str, scoped: bool) -> VerdictSurface {
     )
 }
 
-fn chain_show_command(
+pub(crate) fn chain_show_command(
     paths: &DeadreckonPaths,
     id: &str,
     why_failed: bool,

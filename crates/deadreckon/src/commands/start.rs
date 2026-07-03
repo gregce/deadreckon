@@ -2669,6 +2669,7 @@ async fn maybe_start_attach(id: &str, flags: &StartAttachFlags) {
         no_hints: false,
         plain: false,
         json: false,
+        why: false,
         view: crate::narrative::AttachViewMode::Activity,
         visual: crate::narrative::NarrativeVisualMode::Architecture,
         narrative_provider: None,
