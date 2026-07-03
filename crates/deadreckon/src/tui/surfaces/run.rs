@@ -13,6 +13,7 @@ use crate::tui::panes::narrative::{RunNarrativeRenderInput, render_run_narrative
 use crate::tui::panes::voyage::collapsed_voyage_header;
 use crate::tui::render::turn_timer;
 use crate::tui::spine::{render_spine_band, spine_for_run_with_events};
+use crate::tui::timeline::{render_timeline_band, render_timeline_detail, timeline_for_run_lossy};
 use crate::tui::tree::tree_for_run;
 use crate::tui::why::{render_why_panel, why_for_run_lossy};
 use crate::{AttachLive, RunEvent, SpendRecord, TraceRecord};
@@ -76,6 +77,14 @@ pub(crate) fn render_attach(
     if tui_state.why_open {
         let report = why_for_run_lossy(state);
         render_why_panel(frame, layout.activity, &report, tui_state.why_scroll);
+    } else if tui_state.timeline_focused {
+        let timeline = timeline_for_run_lossy(state, spend, traces, events);
+        render_timeline_detail(
+            frame,
+            layout.activity,
+            &timeline,
+            tui_state.timeline_selected,
+        );
     } else if tui_state.docs_open && state.status == RunStatus::Completed {
         render_run_docs(frame, layout.activity, state, tui_state);
     } else if tui_state.view.is_narrative() {
@@ -117,6 +126,14 @@ pub(crate) fn render_attach(
     }
     render_live_files(frame, layout.files, live, tui_state);
     render_processes(frame, layout.processes, live, tui_state);
+    let timeline = timeline_for_run_lossy(state, spend, traces, events);
+    render_timeline_band(
+        frame,
+        layout.timeline,
+        &timeline,
+        tui_state.timeline_selected,
+        tui_state.timeline_focused,
+    );
     let spine = spine_for_run_with_events(state, events, Utc::now());
     render_spine_band(frame, layout.spine, &spine);
     let tick = (Utc::now().timestamp_millis() / 180).max(0) as usize;

@@ -1,6 +1,7 @@
 use super::super::*;
 use super::panes::docs::render_markdown_doc_lines;
 use super::panes::narrative::run_narrative_lines;
+use super::timeline::{timeline_detail_lines, timeline_for_run_lossy};
 use super::why::{why_for_run_lossy, why_panel_lines};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +50,8 @@ pub(crate) struct AttachTuiState {
     pub(crate) docs_open: bool,
     pub(crate) why_scroll: usize,
     pub(crate) why_open: bool,
+    pub(crate) timeline_focused: bool,
+    pub(crate) timeline_selected: usize,
     pub(crate) narrative_scroll: usize,
     pub(crate) files_scroll: usize,
     pub(crate) processes_scroll: usize,
@@ -71,6 +74,8 @@ impl Default for AttachTuiState {
             docs_open: false,
             why_scroll: 0,
             why_open: false,
+            timeline_focused: false,
+            timeline_selected: 0,
             narrative_scroll: 0,
             files_scroll: 0,
             processes_scroll: 0,
@@ -98,6 +103,26 @@ impl AttachTuiState {
             self.clamp(counts, rows);
             return;
         }
+        if key.code == KeyCode::Char('t') && key.modifiers.is_empty() {
+            self.toggle_timeline();
+            self.clamp(counts, rows);
+            return;
+        }
+        if self.timeline_focused && key.modifiers.is_empty() {
+            match key.code {
+                KeyCode::Left => {
+                    self.timeline_selected = self.timeline_selected.saturating_sub(1);
+                    self.clamp(counts, rows);
+                    return;
+                }
+                KeyCode::Right => {
+                    self.timeline_selected = self.timeline_selected.saturating_add(1);
+                    self.clamp(counts, rows);
+                    return;
+                }
+                _ => {}
+            }
+        }
         {
             let mut nav = RunNav {
                 state: self,
@@ -112,6 +137,7 @@ impl AttachTuiState {
     pub(crate) fn toggle_docs(&mut self) {
         self.docs_open = !self.docs_open;
         self.why_open = false;
+        self.timeline_focused = false;
         if self.docs_open {
             self.view = AttachViewMode::Activity;
         }
@@ -122,6 +148,7 @@ impl AttachTuiState {
     pub(crate) fn toggle_view(&mut self) {
         self.docs_open = false;
         self.why_open = false;
+        self.timeline_focused = false;
         self.view = toggle_attach_view(self.view);
         self.focused_panel = AttachPanel::Activity;
         self.post_action_notice = None;
@@ -135,6 +162,7 @@ impl AttachTuiState {
         self.visual = self.visual.next();
         self.docs_open = false;
         self.why_open = false;
+        self.timeline_focused = false;
         if self.view == AttachViewMode::Activity {
             self.view = AttachViewMode::Narrative;
         }
@@ -144,6 +172,7 @@ impl AttachTuiState {
     pub(crate) fn record_narrative_refresh(&mut self, notice: String) {
         self.docs_open = false;
         self.why_open = false;
+        self.timeline_focused = false;
         if self.view == AttachViewMode::Activity {
             self.view = AttachViewMode::Narrative;
         }
@@ -154,11 +183,13 @@ impl AttachTuiState {
     pub(crate) fn record_post_action(&mut self, notice: AttachActionNotice) {
         self.docs_open = false;
         self.why_open = false;
+        self.timeline_focused = false;
         self.view = AttachViewMode::Activity;
         self.focused_panel = AttachPanel::Activity;
         self.activity_scroll = 0;
         self.docs_scroll = 0;
         self.why_scroll = 0;
+        self.timeline_selected = 0;
         self.narrative_scroll = 0;
         self.files_scroll = 0;
         self.processes_scroll = 0;
@@ -169,6 +200,7 @@ impl AttachTuiState {
 
     pub(crate) fn open_why(&mut self) {
         self.docs_open = false;
+        self.timeline_focused = false;
         self.view = AttachViewMode::Activity;
         self.focused_panel = AttachPanel::Activity;
         self.post_action_notice = None;
@@ -176,6 +208,17 @@ impl AttachTuiState {
         self.narrative_projection = None;
         self.why_open = true;
         self.why_scroll = 0;
+    }
+
+    pub(crate) fn toggle_timeline(&mut self) {
+        self.timeline_focused = !self.timeline_focused;
+        self.docs_open = false;
+        self.why_open = false;
+        self.view = AttachViewMode::Activity;
+        self.focused_panel = AttachPanel::Activity;
+        self.post_action_notice = None;
+        self.narrative_notice = None;
+        self.narrative_projection = None;
     }
 
     pub(crate) fn scroll_focused(
@@ -355,6 +398,7 @@ pub(crate) struct AttachPanelLayout {
     pub(crate) activity: ratatui::layout::Rect,
     pub(crate) files: ratatui::layout::Rect,
     pub(crate) processes: ratatui::layout::Rect,
+    pub(crate) timeline: ratatui::layout::Rect,
     pub(crate) spine: ratatui::layout::Rect,
     pub(crate) footer: ratatui::layout::Rect,
     pub(crate) rows: AttachPanelRows,
@@ -379,8 +423,9 @@ pub(crate) fn attach_panel_layout(area: ratatui::layout::Rect) -> AttachPanelLay
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),
-            Constraint::Min(10),
+            Constraint::Min(6),
             Constraint::Length(4),
+            Constraint::Length(3),
             Constraint::Length(4),
             Constraint::Length(2),
         ])
@@ -394,8 +439,9 @@ pub(crate) fn attach_panel_layout(area: ratatui::layout::Rect) -> AttachPanelLay
         activity: center[0],
         files: center[1],
         processes: vertical[2],
-        spine: vertical[3],
-        footer: vertical[4],
+        timeline: vertical[3],
+        spine: vertical[4],
+        footer: vertical[5],
         rows: AttachPanelRows {
             activity: panel_inner_rows(center[0]),
             files: panel_inner_rows(center[1]),
@@ -415,6 +461,9 @@ pub(crate) fn attach_panel_counts(
     AttachPanelCounts {
         activity: if tui_state.why_open {
             why_panel_lines(&why_for_run_lossy(state)).len()
+        } else if tui_state.timeline_focused {
+            let timeline = timeline_for_run_lossy(state, spend, traces, events);
+            timeline_detail_lines(&timeline, tui_state.timeline_selected).len()
         } else if tui_state.docs_open && state.status == RunStatus::Completed {
             render_markdown_doc_lines(state).len()
         } else if tui_state.view.is_narrative() {
