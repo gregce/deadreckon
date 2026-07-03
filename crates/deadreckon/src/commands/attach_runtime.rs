@@ -2,6 +2,8 @@ use super::super::*;
 use super::campaign::CampaignAttachState;
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TUI_SUSPEND_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -255,6 +257,121 @@ pub(crate) async fn wait_for_attach_wake_for_test(
         _ = tokio::time::sleep(idle.current_delay().min(fallback_tick)) => {
             idle.record_idle();
             AttachWakeReason::FallbackTick
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AttachStormReplayConfig {
+    pub(crate) surface: AttachSurface,
+    pub(crate) budget: AttachTickBudget,
+    pub(crate) frame_interval: Duration,
+    pub(crate) tail_row_limit: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttachStormReplayResult {
+    pub(crate) events_seen: usize,
+    pub(crate) frames_drawn: usize,
+    pub(crate) max_input_to_frame: Duration,
+    pub(crate) input_to_frame_exceeded: bool,
+    pub(crate) max_tail_rows: usize,
+    pub(crate) retained_tail_rows: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, serde::Deserialize)]
+struct AttachStormReplayEvent {
+    at_ms: u64,
+    kind: String,
+}
+
+#[cfg(test)]
+pub(crate) fn replay_attach_event_storm_for_test(
+    jsonl: &str,
+    config: AttachStormReplayConfig,
+) -> Result<AttachStormReplayResult> {
+    let frame_ms = u64::try_from(config.frame_interval.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let mut events_seen = 0_usize;
+    let mut frames_drawn = 0_usize;
+    let mut next_frame_due_ms: Option<u64> = None;
+    let mut pending_input_at_ms: Option<u64> = None;
+    let mut max_input_to_frame = Duration::ZERO;
+    let mut input_to_frame_exceeded = false;
+    let mut retained_tail_rows = VecDeque::new();
+    let mut max_tail_rows = 0_usize;
+
+    for line in jsonl.lines().filter(|line| !line.trim().is_empty()) {
+        let row: serde_json::Value = serde_json::from_str(line)?;
+        let event: AttachStormReplayEvent = serde_json::from_value(row.clone())?;
+        events_seen = events_seen.saturating_add(1);
+        retained_tail_rows.push_back(row);
+        while retained_tail_rows.len() > config.tail_row_limit {
+            retained_tail_rows.pop_front();
+        }
+        max_tail_rows = max_tail_rows.max(retained_tail_rows.len());
+
+        if event.kind == "input" && pending_input_at_ms.is_none() {
+            pending_input_at_ms = Some(event.at_ms);
+        }
+        let due = next_frame_due_ms.get_or_insert(event.at_ms.saturating_add(frame_ms));
+        while event.at_ms >= *due {
+            record_storm_frame(
+                *due,
+                &mut pending_input_at_ms,
+                &mut max_input_to_frame,
+                &mut input_to_frame_exceeded,
+                &mut frames_drawn,
+                config,
+            );
+            *due = (*due).saturating_add(frame_ms);
+        }
+    }
+
+    if events_seen > 0
+        && let Some(due) = next_frame_due_ms
+    {
+        record_storm_frame(
+            due,
+            &mut pending_input_at_ms,
+            &mut max_input_to_frame,
+            &mut input_to_frame_exceeded,
+            &mut frames_drawn,
+            config,
+        );
+    }
+
+    Ok(AttachStormReplayResult {
+        events_seen,
+        frames_drawn,
+        max_input_to_frame,
+        input_to_frame_exceeded,
+        max_tail_rows,
+        retained_tail_rows: retained_tail_rows.len(),
+    })
+}
+
+#[cfg(test)]
+fn record_storm_frame(
+    frame_at_ms: u64,
+    pending_input_at_ms: &mut Option<u64>,
+    max_input_to_frame: &mut Duration,
+    input_to_frame_exceeded: &mut bool,
+    frames_drawn: &mut usize,
+    config: AttachStormReplayConfig,
+) {
+    *frames_drawn = frames_drawn.saturating_add(1);
+    if let Some(input_at_ms) = pending_input_at_ms.take() {
+        let elapsed = Duration::from_millis(frame_at_ms.saturating_sub(input_at_ms));
+        *max_input_to_frame = (*max_input_to_frame).max(elapsed);
+        let mut tick = AttachTickTiming::new(config.surface, config.budget);
+        tick.record(AttachLoopStage::InputToFrame, elapsed);
+        if tick.input_to_frame_exceeded() {
+            *input_to_frame_exceeded = true;
         }
     }
 }
