@@ -22,6 +22,11 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
 
 ## Helm (stable) — mission-control attach — 2026-07-03
 
+- attach is mission control: uniform five-question status spine, flattened
+  campaign -> plan -> run tree with optional zoom, event-driven input loop with
+  pinned latency budgets, `:` command mode, in-frame modals, cited `w` why
+  evidence, scrubable turn timeline, chain narrative parity, and a
+  motion-policy effects layer.
 - H-P1 (`b2a6a48`): render decomposition moves attach surface entry points into
   `tui/surfaces/{run,plan,chain,campaign}.rs` and routes shared chrome through
   `tui/panes/{header,activity,narrative,docs,footer}.rs`; characterization
@@ -81,6 +86,9 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
 - H-P15 (`6ce444e`): Helm discoverability is polished with sectioned `?`
   overlays, a command-mode verb reference, focused-pane footer hints, and a
   first-session footer cue for panes, why, and commands.
+- H-P16 (`5bf9dfb`): AS-BUILT §47 documents Helm mission-control attach,
+  updates cross-references and V1 deferrals, logs widget/effect dependencies,
+  and adds the Helm demo cast.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 
