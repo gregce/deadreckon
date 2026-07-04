@@ -19,10 +19,11 @@ use deadreckon_core::flight::{
     build_working_file_index, capture_delta_checkpoint,
 };
 use deadreckon_core::{
-    CodebaseMode, CodebaseRecord, DeadreckonPaths, PhaseId, PhaseStatus, PipelineState, RunOptions,
-    RunStatus, TraceRecord, acquire_lock, append_trace, create_run, list_runs, load_run,
-    promote_completed_run, read_codebase_record, save_state, snapshot_working,
-    write_acceptance_marker, write_codebase_record,
+    CodebaseMode, CodebaseRecord, DeadreckonPaths, PhaseId, PhaseStatus, PipelineState,
+    RunEventKind, RunOptions, RunStatus, SpendRecord, TraceRecord, acquire_lock, append_spend,
+    append_trace, create_run, emit_event, list_runs, load_run, promote_completed_run,
+    read_codebase_record, save_state, snapshot_working, write_acceptance_marker,
+    write_codebase_record,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -2227,6 +2228,215 @@ fn show_flight_missing_data_json_adds_verdict_and_primary_action() {
 }
 
 #[test]
+fn show_diff_prints_full_run_source_diff() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args(["show", &state.run_id, "--diff", "--plain"])
+        .output()
+        .expect("show diff");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("source diff:"), "{out}");
+    assert!(out.contains("README.md"), "{out}");
+    assert!(out.contains("+after"), "{out}");
+}
+
+#[test]
+fn show_diff_excludes_target_from_output() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args(["show", &state.run_id, "--diff", "--plain"])
+        .output()
+        .expect("show diff");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(!out.contains("target/debug/app"), "{out}");
+}
+
+#[test]
+fn show_turn_renders_diff_exchange_and_sandbox_events() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args(["show", &state.run_id, "--turn", "1", "--plain"])
+        .output()
+        .expect("show turn");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("turn 1"), "{out}");
+    assert!(out.contains("README.md"), "{out}");
+    assert!(out.contains("exchange"), "{out}");
+    assert!(out.contains("model exchange for turn one"), "{out}");
+    assert!(out.contains("sandbox events:"), "{out}");
+    assert!(out.contains("wrote README"), "{out}");
+}
+
+#[test]
+fn show_raw_dumps_named_artifact_verbatim() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args(["show", &state.run_id, "--raw", "sandbox.toml"])
+        .output()
+        .expect("show raw");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("[tools.bash]"), "{out}");
+    assert!(out.contains("network = []"), "{out}");
+}
+
+#[test]
+fn show_raw_gate_nonce_refuses_with_verdict_try() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args(["show", &state.run_id, "--raw", "gate-nonce"])
+        .output()
+        .expect("show raw nonce");
+
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("gate secret is not dumpable"), "{err}");
+    assert!(
+        err.contains(&format!("deadreckon verdict {}", &state.run_id[..8])),
+        "{err}"
+    );
+}
+
+#[test]
+fn show_turn_out_of_range_refuses_with_show_try() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args(["show", &state.run_id, "--turn", "9"])
+        .output()
+        .expect("show bad turn");
+
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("no snapshot for turn 9"), "{err}");
+    assert!(
+        err.contains(&format!("deadreckon show {}", &state.run_id[..8])),
+        "{err}"
+    );
+}
+
+#[test]
+fn show_new_flags_honor_plain_and_json() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args(["show", &state.run_id, "--turn", "1", "--json", "--plain"])
+        .output()
+        .expect("show turn json");
+
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["n"], 1);
+    assert!(value["diff"]["files_changed"].as_u64().unwrap_or_default() >= 1);
+}
+
+#[test]
+fn report_json_emits_run_view_struct() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args(["report", &state.run_id, "--json"])
+        .output()
+        .expect("report json");
+
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["id"]["run_id"], state.run_id);
+    assert_eq!(value["turns"].as_array().map(Vec::len), Some(1));
+    assert!(
+        value["changed"]["files_changed"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1
+    );
+}
+
+#[test]
+fn report_html_is_self_contained_no_external_refs() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+    let dest = temp.path().join("report.html");
+
+    let output = deadreckon(&paths)
+        .arg("report")
+        .arg(&state.run_id)
+        .arg("--html")
+        .arg("--dest")
+        .arg(&dest)
+        .output()
+        .expect("report html");
+
+    assert_success(&output);
+    let html = fs::read_to_string(dest).expect("html");
+    assert!(html.contains("<style>"), "{html}");
+    assert!(!html.contains("<script"), "{html}");
+    assert!(!html.contains("http://"), "{html}");
+    assert!(!html.contains("https://"), "{html}");
+}
+
+#[test]
+fn report_on_live_run_refuses_with_attach_try() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Executing);
+
+    let output = deadreckon(&paths)
+        .args(["report", &state.run_id])
+        .output()
+        .expect("report live");
+
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("still running"), "{err}");
+    assert!(
+        err.contains(&format!("deadreckon attach {}", &state.run_id[..8])),
+        "{err}"
+    );
+}
+
+#[test]
+fn history_grep_events_kind_matches_event_ledger() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args([
+            "history",
+            "grep",
+            "wrote README",
+            "--kind",
+            "events",
+            "--all",
+        ])
+        .output()
+        .expect("history grep events");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains(&state.run_id[..8]), "{out}");
+    assert!(out.contains("wrote README"), "{out}");
+}
+
+#[test]
 fn cleanup_refusal_surface_has_one_safe_recovery_command() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -2587,6 +2797,99 @@ fn count_action_label(out: &str, label: &str) -> usize {
     out.lines()
         .filter(|line| line.trim_start().starts_with(&format!("{label}:")))
         .count()
+}
+
+fn logbook_fixture_run(temp: &TempDir, status: RunStatus) -> (DeadreckonPaths, PipelineState) {
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("workspace");
+    fs::create_dir_all(&cwd).expect("workspace");
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "logbook fixture".to_string(),
+            cwd,
+            sandbox: "none".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(30.0),
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+    fs::write(state.working_dir.join("README.md"), "before\n").expect("readme before");
+    snapshot_working(&state, 0).expect("snapshot 0");
+    fs::write(state.working_dir.join("README.md"), "before\nafter\n").expect("readme after");
+    fs::create_dir_all(state.working_dir.join("target/debug")).expect("target");
+    fs::write(state.working_dir.join("target/debug/app"), "build output").expect("target output");
+    state.turn = 1;
+    state.status = status;
+    save_state(&state).expect("save");
+    snapshot_working(&state, 1).expect("snapshot 1");
+    fs::write(
+        state.run_root.join("history.json"),
+        serde_json::to_string_pretty(&vec!["model exchange for turn one"]).expect("history json"),
+    )
+    .expect("history");
+    fs::write(
+        state.run_root.join("sandbox.toml"),
+        "version = 1\n\n[tools.bash]\nread = []\nwrite = []\nnetwork = []\n",
+    )
+    .expect("sandbox");
+    fs::write(
+        state.run_root.join("acceptance.yaml"),
+        "name: logbook\nchecks: []\n",
+    )
+    .expect("acceptance");
+    fs::write(state.run_root.join("launch-plan.json"), "{}\n").expect("launch");
+    fs::write(state.run_root.join("seams.json"), "{}\n").expect("seams");
+    fs::create_dir_all(state.run_root.join("gate")).expect("gate");
+    fs::write(state.run_root.join("gate/nonce"), "secret").expect("nonce");
+    append_spend(
+        &state,
+        &SpendRecord {
+            timestamp: chrono::Utc::now(),
+            turn: 1,
+            provider: "smoke".to_string(),
+            model: "mock".to_string(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cost_usd: 0.01,
+            total_cost_usd: 0.01,
+            cap_usd: Some(1.0),
+            subscription: false,
+            estimated: false,
+            wall_time_seconds: Some(2.0),
+            wall_time_cap_seconds: Some(30.0),
+            kind: "loop".to_string(),
+        },
+    )
+    .expect("spend");
+    append_trace(
+        &state,
+        &TraceRecord {
+            timestamp: chrono::Utc::now(),
+            run_id: state.run_id.clone(),
+            turn: 1,
+            event: "provider_done".to_string(),
+            latency_ms: None,
+            detail: json!({"summary":"changed README"}),
+        },
+    )
+    .expect("trace");
+    emit_event(
+        &state,
+        None,
+        RunEventKind::ToolCallResult {
+            turn: 1,
+            tool_call_id: "tool-1".to_string(),
+            status: "ok".to_string(),
+            preview: "wrote README".to_string(),
+        },
+    )
+    .expect("event");
+    (paths, state)
 }
 
 #[derive(Clone)]

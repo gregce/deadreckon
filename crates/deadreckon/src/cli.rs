@@ -1726,6 +1726,24 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Inspect And Import",
+        about = "Write a static run report from the shared RunView model"
+    )]
+    Report {
+        #[arg(help = "Run id, unique prefix, or latest")]
+        run_id: String,
+        #[arg(long, help = "Write a self-contained HTML report instead of Markdown")]
+        html: bool,
+        #[arg(long, value_name = "PATH", help = "Report output path")]
+        dest: Option<PathBuf>,
+        #[arg(long, help = "Open the written report (interactive only)")]
+        open: bool,
+        #[arg(long, help = "Emit the RunView JSON instead of writing a report")]
+        json: bool,
+        #[arg(long, help = "Plain output without ANSI affordances")]
+        plain: bool,
+    },
+    #[command(
+        next_help_heading = "Inspect And Import",
         hide = true,
         visible_alias = "inspect",
         about = "Show full state, provenance, and trace details for a run, plan, or plan child",
@@ -1736,6 +1754,14 @@ pub(crate) enum Commands {
         run_id: String,
         #[arg(long, help = "Only show trace/provenance records for this turn")]
         turn: Option<u32>,
+        #[arg(long, help = "Show the full-run source diff (build output excluded)")]
+        diff: bool,
+        #[arg(
+            long,
+            value_name = "ARTIFACT",
+            help = "Dump a named run artifact verbatim"
+        )]
+        raw: Option<String>,
         #[arg(long, help = "Explain the most likely failure cause")]
         why_failed: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
@@ -2056,6 +2082,7 @@ pub(crate) struct OrchestrateFullPlanArgs {
 pub(crate) enum HistoryKind {
     Trace,
     Provenance,
+    Events,
 }
 
 #[derive(Subcommand)]
@@ -2072,7 +2099,7 @@ pub(crate) enum HistoryCommand {
         all: bool,
         #[arg(long, help = "Only search files modified within 7d, 24h, or 30m")]
         since: Option<String>,
-        #[arg(long, value_enum, default_value_t = HistoryKind::Trace, help = "Search trace or provenance JSONL")]
+        #[arg(long, value_enum, default_value_t = HistoryKind::Trace, help = "Search trace, provenance, or events JSONL")]
         kind: HistoryKind,
         #[arg(long, default_value_t = 100, help = "Maximum matches to print")]
         limit: usize,

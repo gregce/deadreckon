@@ -101,6 +101,26 @@
   V1 can expand input widgets to search, filtering, or multi-line editing once
   those workflows are designed.
 
+## Logbook follow-ups (§49)
+
+- Cross-run efficiency stats: Logbook makes single-run changed/spend/turn facts
+  consistent; V1 can aggregate spend per accepted change, turns to done, retry
+  loops, and regression rates across the library (`library stats` or
+  `verdict --all --stats`).
+- Context-health telemetry for CLI providers: Logbook records spend rows it can
+  see, but CLI-provider token/context telemetry is still incomplete. Parse
+  provider JSON usage where available and surface context headroom in attach
+  once the provider fixtures are stable.
+- Rich report UI: `deadreckon report --html` is static and self-contained.
+  Live web/desktop mirrors, syntax-highlighted diff browsing, collapsible turn
+  timelines, and shareable report bundles stay out until the terminal contract
+  and privacy posture settle.
+- MCP exposure: the shared `RunView` is a natural schema for a future
+  `deadreckon mcp serve` inspection tool, but the stable slice only exposes it
+  through the CLI and JSON.
+- Report provenance polish: add per-field citation links and schema-versioned
+  report manifests if external tools begin consuming report artifacts directly.
+
 ## Release integrity (embedded checksum verification)
 
 - Inner-installer embedded checksums: the cargo-dist 0.31 generated shell

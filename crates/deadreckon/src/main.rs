@@ -1368,9 +1368,29 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
+        Commands::Report {
+            run_id,
+            html,
+            dest,
+            open,
+            json,
+            plain,
+        } => {
+            ui::set_plain_output(plain);
+            commands::report::report_command(commands::report::ReportCommandArgs {
+                run_id,
+                html,
+                dest,
+                open,
+                json,
+                plain,
+            })
+        }
         Commands::Show {
             run_id,
             turn,
+            diff,
+            raw,
             why_failed,
             plain,
             json,
@@ -1378,15 +1398,16 @@ async fn main_inner() -> Result<()> {
             file,
         } => {
             ui::set_plain_output(plain);
-            show_command(
-                &run_id,
+            show_command(ShowCommandArgs {
+                run_id: &run_id,
                 turn,
+                diff,
+                raw: raw.as_deref(),
                 why_failed,
-                plain,
-                json,
+                json_output: json,
                 flight,
-                file.as_deref(),
-            )
+                file: file.as_deref(),
+            })
         }
         Commands::History { command } => commands::inspection::history_command(command),
         Commands::Status {
@@ -10472,24 +10493,30 @@ fn flight_session_status_label(status: FlightSessionStatus) -> &'static str {
     }
 }
 
-fn show_command(
-    run_id: &str,
+#[derive(Clone, Copy)]
+struct ShowCommandArgs<'a> {
+    run_id: &'a str,
     turn: Option<u32>,
+    diff: bool,
+    raw: Option<&'a str>,
     why_failed: bool,
-    _plain: bool,
     json_output: bool,
     flight: bool,
-    file: Option<&Path>,
-) -> Result<()> {
+    file: Option<&'a Path>,
+}
+
+fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    if let Some((campaign_dir, campaign)) = commands::campaign::resolve_campaign(&paths, run_id)? {
+    if let Some((campaign_dir, campaign)) =
+        commands::campaign::resolve_campaign(&paths, args.run_id)?
+    {
         let rollup = deadreckon_core::campaign::read_campaign_rollup(&campaign_dir).ok();
-        let report = if why_failed {
+        let report = if args.why_failed {
             commands::campaign::campaign_why_failed_report(&paths, &campaign, rollup.as_ref())
         } else {
             commands::campaign::campaign_attach_summary(Some(&paths), &campaign, rollup.as_ref())
         };
-        if json_output {
+        if args.json_output {
             let surface = commands::campaign::campaign_verdict_surface(
                 Some(&paths),
                 &campaign,
@@ -10515,17 +10542,17 @@ fn show_command(
         return Ok(());
     }
     let mut child_context: Option<PlanChildSelection> = None;
-    let state = if let Some(selection) = resolve_plan_child_ref(&paths, run_id)? {
+    let state = if let Some(selection) = resolve_plan_child_ref(&paths, args.run_id)? {
         let state = load_run(&paths, &selection.run_id)?;
         child_context = Some(selection);
         state
     } else {
-        match load_cli_run(&paths, run_id) {
+        match load_cli_run(&paths, args.run_id) {
             Ok(state) => state,
             Err(run_error) => {
-                if let Ok(plan_id) = resolve_plan_id(&paths, run_id) {
+                if let Ok(plan_id) = resolve_plan_id(&paths, args.run_id) {
                     let plan = load_plan(&paths, &plan_id)?;
-                    if json_output {
+                    if args.json_output {
                         let value = commands::plan::plan_verdict_surface(&paths, &plan)
                             .add_to_json(json!({
                                 "kind": "plan",
@@ -10546,7 +10573,7 @@ fn show_command(
                         println!("{}", serde_json::to_string_pretty(&value)?);
                         return Ok(());
                     }
-                    if why_failed {
+                    if args.why_failed {
                         show_plan_why_failed(&paths, &plan);
                         return Ok(());
                     }
@@ -10558,12 +10585,22 @@ fn show_command(
             }
         }
     };
-    if flight || file.is_some() {
-        return show_flight(&state, turn, file, json_output);
+    if args.flight || args.file.is_some() {
+        return show_flight(&state, args.turn, args.file, args.json_output);
+    }
+    if let Some(raw) = args.raw {
+        return show_raw_artifact(&state, raw);
+    }
+    if args.diff {
+        return show_run_diff(&state, args.json_output);
+    }
+    if let Some(turn) = args.turn {
+        return show_run_turn(&state, turn, args.json_output);
     }
     let plan_wrapper_context = plan_wrapper_context_from_run(&paths, &state)?;
-    if json_output {
+    if args.json_output {
         let status = run_status_label(state.status);
+        let run_view = deadreckon_core::RunView::from_state(&state).ok();
         let plan_result = plan_wrapper_context.as_ref().map(|context| {
             json!({
                 "plan_id": &context.plan_id,
@@ -10586,13 +10623,14 @@ fn show_command(
                     "artifact": &state.promoted_library_dir,
                 },
                 "run": state,
+                "run_view": run_view,
                 "plan_child": child_context,
                 "plan_result": plan_result,
             }))?
         );
         return Ok(());
     }
-    if why_failed {
+    if args.why_failed {
         return show_run_why_failed(&state);
     }
     if let Some(selection) = child_context.as_ref() {
@@ -10646,7 +10684,10 @@ fn show_command(
         let raw = std::fs::read_to_string(provenance_path)?;
         for line in raw.lines().filter(|line| !line.trim().is_empty()) {
             let record: ProvenanceRecord = serde_json::from_str(line)?;
-            if turn.is_some_and(|turn| record.prompt_id != format!("turn-{turn}")) {
+            if args
+                .turn
+                .is_some_and(|turn| record.prompt_id != format!("turn-{turn}"))
+            {
                 continue;
             }
             println!("{}", serde_json::to_string_pretty(&record)?);
@@ -10658,13 +10699,173 @@ fn show_command(
         let raw = std::fs::read_to_string(traces_path)?;
         for line in raw.lines().filter(|line| !line.trim().is_empty()) {
             let record: TraceRecord = serde_json::from_str(line)?;
-            if turn.is_some_and(|turn| record.turn != turn) {
+            if args.turn.is_some_and(|turn| record.turn != turn) {
                 continue;
             }
             println!("{}", serde_json::to_string_pretty(&record)?);
         }
     }
     Ok(())
+}
+
+fn show_run_diff(state: &deadreckon_core::PipelineState, json_output: bool) -> Result<()> {
+    let view = deadreckon_core::RunView::from_state(state)?;
+    if state.turn == 0
+        || view.missing.iter().any(|artifact| match artifact {
+            deadreckon_core::Artifact::Snapshot(turn) => *turn == 0 || *turn == state.turn,
+            _ => false,
+        })
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "no snapshots available for run diff",
+            &format!("deadreckon show {}", run_prefix(&state.run_id)),
+        )));
+    }
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&view.changed)?);
+        return Ok(());
+    }
+    print!("{}", render_diff_summary(&view.changed));
+    Ok(())
+}
+
+fn show_run_turn(
+    state: &deadreckon_core::PipelineState,
+    turn: u32,
+    json_output: bool,
+) -> Result<()> {
+    let view = deadreckon_core::RunView::from_state(state)?;
+    let Some(turn_view) = view.turns.iter().find(|candidate| candidate.n == turn) else {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("no snapshot for turn {turn}"),
+            &format!("deadreckon show {}", run_prefix(&state.run_id)),
+        )));
+    };
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(turn_view)?);
+        return Ok(());
+    }
+    println!("turn {}", turn_view.n);
+    println!("did {}", turn_view.did);
+    println!("diff:");
+    print!("{}", render_diff_summary(&turn_view.diff));
+    if let Some(exchange) = turn_view.exchange_ref.as_ref() {
+        println!("exchange {}#{}", exchange.path.display(), exchange.index);
+        println!("{}", exchange.preview);
+    } else {
+        println!("exchange none");
+    }
+    if turn_view.sandbox_events.is_empty() {
+        println!("sandbox events none");
+    } else {
+        println!("sandbox events:");
+        for event in &turn_view.sandbox_events {
+            println!("- {} {}", event.kind, event.summary);
+        }
+    }
+    if let Some(check) = turn_view.check.as_ref() {
+        println!("check {} {}/{}", check.status, check.index, check.total);
+    }
+    Ok(())
+}
+
+fn render_diff_summary(diff: &deadreckon_core::DiffSummary) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "source diff: {} file(s), +{} -{}\n",
+        diff.files_changed, diff.added, diff.removed
+    ));
+    if diff.files.is_empty() {
+        out.push_str("(no source changes)\n");
+        return out;
+    }
+    for file in &diff.files {
+        out.push_str(&format!(
+            "\n{:?} {} (+{} -{})\n",
+            file.status,
+            file.path.display(),
+            file.added,
+            file.removed
+        ));
+        if let Some(unified) = file.unified_diff.as_deref() {
+            out.push_str(unified);
+            if !unified.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            out.push_str("(binary or unreadable diff)\n");
+        }
+    }
+    out
+}
+
+fn show_raw_artifact(state: &deadreckon_core::PipelineState, raw: &str) -> Result<()> {
+    let path = raw_artifact_path(state, raw)?;
+    let bytes = fs::read(&path)?;
+    io::stdout().write_all(&bytes)?;
+    Ok(())
+}
+
+fn raw_artifact_path(state: &deadreckon_core::PipelineState, raw: &str) -> Result<PathBuf> {
+    let name = raw.trim().to_ascii_lowercase();
+    let name = name.trim_start_matches("./");
+    let secret_names = ["gate-nonce", "gate/nonce", "nonce"];
+    if secret_names.contains(&name) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "gate secret is not dumpable",
+            &format!("deadreckon verdict {}", run_prefix(&state.run_id)),
+        )));
+    }
+    let path = match name {
+        "state" | "state.json" => state.state_path(),
+        "history" | "history.json" => state.run_root.join("history.json"),
+        "spend" | "spend.jsonl" => state.run_root.join("spend.jsonl"),
+        "traces" | "trace" | "traces.jsonl" => state.run_root.join("traces.jsonl"),
+        "events" | "events.jsonl" => state.run_root.join(RUN_EVENTS_JSONL),
+        "provenance" | "provenance.jsonl" => state.run_root.join("provenance.jsonl"),
+        "acceptance" | "acceptance.yaml" => acceptance_spec_path_for_run_root(&state.run_root),
+        "sandbox" | "sandbox.toml" => state.run_root.join("sandbox.toml"),
+        "launch-plan" | "launch-plan.json" => state.run_root.join("launch-plan.json"),
+        "seams" | "seams.json" => state.run_root.join("seams.json"),
+        "marker" | "acceptance-marker" | "turn-acceptance" | "turn-acceptance.json" => {
+            marker_path_for_run_root(&state.run_root)
+        }
+        "acceptance-progress" | "acceptance-progress.jsonl" => {
+            acceptance_progress_path_for_run_root(&state.run_root)
+        }
+        "acceptance-tamper" | "acceptance-tamper.json" => {
+            deadreckon_core::tamper::acceptance_tamper_path_for_run_root(&state.run_root)
+        }
+        "narrative" | "run-narrative" | "run-narrative.md" => {
+            doc_path_for_kind(&state.working_dir, DocKind::Narrative)
+                .ok_or_else(|| DeadreckonError::NotFound("RUN-NARRATIVE.md".to_string()))?
+        }
+        "decisions" | "run-decisions" | "run-decisions.md" => {
+            doc_path_for_kind(&state.working_dir, DocKind::Decisions)
+                .ok_or_else(|| DeadreckonError::NotFound("RUN-DECISIONS.md".to_string()))?
+        }
+        "as-built" | "run-as-built" | "run-as-built.md" => {
+            doc_path_for_kind(&state.working_dir, DocKind::AsBuilt)
+                .ok_or_else(|| DeadreckonError::NotFound("RUN-AS-BUILT.md".to_string()))?
+        }
+        "flight" | "flight-events" | "flight-events.jsonl" => {
+            state.run_root.join(FLIGHT_EVENTS_JSONL)
+        }
+        _ => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("unknown artifact {raw}"),
+                &format!("deadreckon show {} --json", run_prefix(&state.run_id)),
+            )));
+        }
+    };
+    if !path.exists() {
+        return Err(CliError::Core(DeadreckonError::NotFound(format!(
+            "{} for run {}",
+            path.display(),
+            run_prefix(&state.run_id)
+        ))));
+    }
+    Ok(path)
 }
 
 fn read_parent_marker(root: &Path) -> Result<Option<commands::lifecycle::ParentMarker>> {
@@ -11480,9 +11681,16 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
                 }))
                 .await?
             }
-            Some(CompletionAction::Show) => {
-                show_command(&state.run_id, None, false, false, false, false, None)?
-            }
+            Some(CompletionAction::Show) => show_command(ShowCommandArgs {
+                run_id: &state.run_id,
+                turn: None,
+                diff: false,
+                raw: None,
+                why_failed: false,
+                json_output: false,
+                flight: false,
+                file: None,
+            })?,
             Some(CompletionAction::Quit) | None => break,
         }
     }

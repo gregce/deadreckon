@@ -95,6 +95,7 @@ pub(crate) fn render_attach(
             layout.activity,
             &RunNarrativeRenderInput {
                 state,
+                run_view: None,
                 spend,
                 traces,
                 events,

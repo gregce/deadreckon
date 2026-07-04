@@ -565,10 +565,12 @@ pub(crate) fn start_or_coalesce_run_narrative_refresh_job(
             config,
             kind,
         } = request;
+        let run_view = deadreckon_core::RunView::from_state(&state).ok();
         refresh_run_narrative_with_provider_for_kind_with_token(
             &paths,
             &RunNarrativeRenderInput {
                 state: &state,
+                run_view: run_view.as_ref(),
                 spend: &spend,
                 traces: &traces,
                 events: &events,

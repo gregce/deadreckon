@@ -3435,4 +3435,50 @@ missing project build/test harnesses are tracked in `docs/V1-CANDIDATES.md`.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-04 for Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+## 49. Logbook: stable run inspection
+
+Logbook makes post-run inspection a shared read model instead of several
+commands re-parsing nearby files differently. `deadreckon_core::RunView` loads
+a run's `state.json` and joins the surrounding durable artifacts into one
+projection: identity, goal/status, verdict/signature, sandbox facts,
+spend/wall-clock totals, full-run changed files, narrative/decision docs,
+per-turn records, proof files, and missing artifacts. Missing optional files are
+recorded in the projection rather than turning inspection into a panic path.
+
+Changed-file evidence comes from snapshot diffs. `DiffSummary` and `FileDelta`
+compare `snapshots/turn-{n}` directories, ignore `.git`, `target`, and
+`.deadreckon`, count additions/removals for text files, and tolerate binary or
+unreadable files without crashing. `RunView` uses the same primitive for the
+full run (`turn-0` to current turn) and for every per-turn view.
+
+The CLI surfaces are now projections over that same model:
+
+- `deadreckon show <run> --diff` prints or JSON-renders the full-run snapshot
+  diff.
+- `deadreckon show <run> --turn <n>` prints or JSON-renders the turn's did/diff,
+  model-exchange reference, sandbox events, spend delta, and final check
+  outcome when present.
+- `deadreckon show <run> --raw <artifact>` dumps stable run artifacts verbatim
+  and refuses gate nonce reads with a `verdict` hint.
+- `deadreckon report <run>` writes a static Markdown report by default, or
+  self-contained HTML with `--html`, and JSON with `--json`; live/pending runs
+  refuse with an attach command.
+- `deadreckon history grep --kind events` searches the durable run event ledger
+  alongside the existing trace and provenance ledgers.
+
+`verdict` derives marker presence/validity and changed-file counts from
+`RunView` while still re-running acceptance checks live before deciding
+Verified/Regressed/Unverified. `doc` resolves run narrative and decision docs
+through the same view after optional polish. Attach narrative inputs carry an
+optional `RunView`, so Helm can use the same snapshot diff facts when it builds
+run narrative and architecture evidence.
+
+Logbook closes the static-run-report slice of the old C3 observability/UI gap
+and the read-side introspection mismatch between `show`, `verdict`, docs, and
+attach. It does not close cross-run efficiency dashboards, CLI-provider context
+telemetry, a web/desktop live mirror, syntax-highlighted diff browsing, or MCP
+exposure; those remain V1 candidates.
+
+---
+
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
