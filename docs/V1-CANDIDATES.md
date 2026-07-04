@@ -78,13 +78,19 @@
 
 - Depth greater than 2 / cycle-safe arbitrary recursion: the campaign cap is a hard `CAMPAIGN_MAX_DEPTH = 2`. Deeper nesting needs a recursion-safe coordinator, cross-level cycle detection, and a blast-radius story before it earns its complexity.
 - Cross-sub dependency edges: campaign sub-goals are independent islands. A V1 could model dependencies between sub-orchestrators so later sub-goals can intentionally build on earlier campaign work instead of only reconciling at roll-up.
-- Flattened campaign live attach with a true event tree: production `attach <campaign-id>` is a navigated campaign TUI that drills into existing plan/run TUIs. A V1 could extend `PlanEventBus` to a hierarchy and stream the entire campaign -> plan -> run tree in one pane with expansion, filtering, and cross-level event correlation.
+- Campaign tree analytics beyond Helm: Helm ships the operator-facing flattened campaign -> plan -> run voyage tree in attach. V1 can still add expansion filters, cross-level event correlation diagnostics, replay/export of original event timing, and long-lived shared broadcasters for lower-latency multi-process attach.
 - Planner-chosen per-sub breadth and per-sub provider roles: each sub-orchestrator runs a fixed small `--n` today; the planner could size each front and choose its providers.
 - Tree-budget strategies beyond even split: weighted allocation by sub size, dynamic reallocation from finished subs, and concurrent (non-sequential) sub launch once aggregate-budget accounting stays correct under concurrency.
 - Sharing campaign records across machines.
 
 ## Attach TUI Uniformity (deferred)
 
+- `attach --web` / ratzilla mirror: Helm stays on ratatui in the terminal. A web
+  mirror should reuse the same render/read-model code only after the terminal
+  contract is stable.
+- Provider pty embedding: Helm renders captured provider activity and flight
+  files. Full live pty emulation inside attach remains a separate terminal
+  virtualization problem.
 - Live in-frame prompts beyond Helm: Helm P9 moves chain attach's kill confirm
   and extend input into in-frame modals. Remaining "press Enter to return"
   overlays around nested command output and completion actions still suspend the
