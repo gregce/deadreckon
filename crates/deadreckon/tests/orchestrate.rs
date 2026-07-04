@@ -7356,7 +7356,13 @@ fn write_start_ready_setup(paths: &DeadreckonPaths, root: &std::path::Path) {
     fs::create_dir_all(root.join(".deadreckon")).expect("acceptance dir");
     fs::write(
         root.join(".deadreckon/acceptance.yaml"),
-        "name: start ready\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        concat!(
+            "name: start ready plan root shape footer review json launch replayable quiet guided\n",
+            "checks:\n",
+            "  - kind: shell\n",
+            "    command: \"python3 -c 'from pathlib import Path; assert Path(\\\"README.md\\\").is_file()'\"\n",
+            "    cwd: \"{working_dir}\"\n",
+        ),
     )
     .expect("acceptance");
     if root.join(".git").is_dir() {

@@ -155,6 +155,27 @@
 - Learned shape priors from run history (self-improvement loop integration)
   and cross-machine launch plans.
 
+## Contract follow-ups (Contract, §48)
+
+- First-class behavioral check kinds: browser-driver and HTTP assertion checks
+  are still expressed as `shell` helpers. A V1 schema can add native kinds once
+  migration and gate rendering are designed.
+- Standalone contract report verb: reuse `acceptance` and `start` surfaces for
+  now; a future `deadreckon contract` or renamed detect-report command could
+  expose compiled checks, lint, and divergence without launching.
+- Multi-round critic and self-repair loops: stable Contract caps provider
+  critique at one critic pass plus one redraft. More repair rounds need budget,
+  loop detection, and human-review semantics.
+- Per-check provenance: the compiled model does not record which draft or
+  critic note produced a check. A V1 provenance ledger would need a sidecar
+  format and retention policy.
+- Semantic goal coverage: reconciliation is deterministic keyword coverage plus
+  the single critic. Embedding or semantic coverage remains out until privacy,
+  cost, and explainability are explicit.
+- Auto-generating missing build/test harnesses in the target project: the
+  compiler may propose helpers under `.deadreckon/acceptance/`, but scaffolding
+  the project itself is V1.
+
 ## Polyglot done-contract follow-ups (Polyglot, §13.1/§35.9)
 
 - Standalone `detect` report command: the project-kind + contract report is

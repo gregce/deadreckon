@@ -19,6 +19,425 @@ pub(crate) struct AcceptanceDraft {
     pub(crate) files: BTreeMap<PathBuf, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CheckKind {
+    FileExists,
+    ContentMatch,
+    Shell,
+    CargoTest,
+}
+
+impl CheckKind {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::FileExists => "file_exists",
+            Self::ContentMatch => "content_match",
+            Self::Shell => "shell",
+            Self::CargoTest => "cargo_test",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CompiledCheck {
+    pub(crate) index: u32,
+    pub(crate) kind: CheckKind,
+    pub(crate) summary: String,
+    pub(crate) behavioral: bool,
+    pub(crate) can_fail: bool,
+    pub(crate) raw: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CompiledContract {
+    pub(crate) name: String,
+    pub(crate) md_criteria: String,
+    pub(crate) checks: Vec<CompiledCheck>,
+    pub(crate) source_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum LintFinding {
+    NoBehavioralCheck,
+    OnlySourceScanIsSubstantive { index: u32 },
+    IfPresentOnlyBuildOrTest { index: u32 },
+    UnfalsifiableCheck { index: u32 },
+}
+
+impl LintFinding {
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::NoBehavioralCheck => "contract has no behavioral check".to_string(),
+            Self::OnlySourceScanIsSubstantive { index } => {
+                format!("check {index} is only a source-text scan")
+            }
+            Self::IfPresentOnlyBuildOrTest { index } => {
+                format!("check {index} relies on --if-present for build/test")
+            }
+            Self::UnfalsifiableCheck { index } => {
+                format!("check {index} is not falsifiable")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ContractDivergence {
+    pub(crate) goal_clauses: Vec<String>,
+    pub(crate) uncovered: Vec<String>,
+    pub(crate) weak: Vec<LintFinding>,
+}
+
+impl ContractDivergence {
+    pub(crate) fn clean(&self) -> bool {
+        self.uncovered.is_empty() && self.weak.is_empty()
+    }
+
+    pub(crate) fn strong(&self) -> bool {
+        !self.uncovered.is_empty() && !self.weak.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CriticDecision {
+    Pass,
+    Redraft,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CriticVerdict {
+    pub(crate) stub_would_pass: bool,
+    pub(crate) uncovered_goal_clauses: Vec<String>,
+    pub(crate) weak_check_indices: Vec<u32>,
+    pub(crate) verdict: CriticDecision,
+}
+
+#[cfg(test)]
+pub(crate) fn compile_contract(yaml: &str, md: Option<&str>) -> Result<CompiledContract> {
+    compile_contract_with_source(
+        yaml,
+        md,
+        PathBuf::from(PROJECT_ACCEPTANCE_DIR).join(PROJECT_ACCEPTANCE_YAML),
+    )
+}
+
+pub(crate) fn compile_contract_with_source(
+    yaml: &str,
+    md: Option<&str>,
+    source_path: PathBuf,
+) -> Result<CompiledContract> {
+    let root = acceptance_yaml_value(yaml)?;
+    let name = yaml_mapping_get(&root, "name")
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or("project acceptance")
+        .to_string();
+    let md_criteria = md
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| acceptance_markdown_from_yaml(yaml));
+    let mut checks = Vec::new();
+    for (group, value) in acceptance_check_groups(&root) {
+        for item in yaml_items(value) {
+            let index = u32::try_from(checks.len() + 1).unwrap_or(u32::MAX);
+            checks.push(compile_check(index, group, item));
+        }
+    }
+    if checks.is_empty() {
+        acceptance_check_count(yaml)?;
+    }
+    Ok(CompiledContract {
+        name,
+        md_criteria,
+        checks,
+        source_path,
+    })
+}
+
+fn compile_check(index: u32, group: &str, item: &serde_yaml::Value) -> CompiledCheck {
+    let kind = compiled_check_kind(group, item);
+    let summary = compiled_check_summary(&kind, item);
+    let raw = serde_json::to_value(item).unwrap_or(serde_json::Value::Null);
+    let command = yaml_mapping_get(item, "command").and_then(serde_yaml::Value::as_str);
+    let behavioral = compiled_check_behavioral(&kind, command);
+    let can_fail = compiled_check_can_fail(&kind, command);
+    CompiledCheck {
+        index,
+        kind,
+        summary,
+        behavioral,
+        can_fail,
+        raw,
+    }
+}
+
+fn compiled_check_kind(group: &str, item: &serde_yaml::Value) -> CheckKind {
+    let kind = yaml_mapping_get(item, "kind")
+        .and_then(serde_yaml::Value::as_str)
+        .or_else(|| single_key_check_kind(item))
+        .unwrap_or(group)
+        .replace('-', "_");
+    match kind.as_str() {
+        "file_exists" => CheckKind::FileExists,
+        "content_match" => CheckKind::ContentMatch,
+        "cargo_test" => CheckKind::CargoTest,
+        "build_success" | "shell" | "checks" | "required" | "optional" | "tests" => {
+            CheckKind::Shell
+        }
+        _ => CheckKind::Shell,
+    }
+}
+
+fn single_key_check_kind(item: &serde_yaml::Value) -> Option<&str> {
+    let mapping = item.as_mapping()?;
+    if mapping.len() != 1 {
+        return None;
+    }
+    mapping.keys().next().and_then(serde_yaml::Value::as_str)
+}
+
+fn compiled_check_summary(kind: &CheckKind, item: &serde_yaml::Value) -> String {
+    match kind {
+        CheckKind::FileExists => yaml_mapping_get(item, "path")
+            .and_then(serde_yaml::Value::as_str)
+            .map(|path| format!("requires file {}", one_line(path, 96)))
+            .unwrap_or_else(|| "requires file to exist".to_string()),
+        CheckKind::ContentMatch => {
+            let path = yaml_mapping_get(item, "path")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or("file");
+            let pattern = yaml_mapping_get(item, "pattern")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or("pattern");
+            format!(
+                "matches {} for {}",
+                one_line(path, 64),
+                one_line(pattern, 64)
+            )
+        }
+        CheckKind::CargoTest => "runs cargo test".to_string(),
+        CheckKind::Shell => yaml_mapping_get(item, "command")
+            .and_then(serde_yaml::Value::as_str)
+            .map(|command| format!("runs shell: {}", one_line(command, 120)))
+            .unwrap_or_else(|| "runs shell check".to_string()),
+    }
+}
+
+fn compiled_check_behavioral(kind: &CheckKind, command: Option<&str>) -> bool {
+    match kind {
+        CheckKind::CargoTest => true,
+        CheckKind::Shell => command.is_some_and(|command| {
+            let lower = command.to_ascii_lowercase();
+            !looks_like_source_scan(&lower)
+                && !looks_like_trivial_shell(&lower)
+                && [
+                    " build",
+                    "run build",
+                    " test",
+                    "npm test",
+                    "pnpm test",
+                    "yarn test",
+                    "bun test",
+                    "vitest",
+                    "jest",
+                    "cargo test",
+                    "cargo run",
+                    "go test",
+                    "pytest",
+                    "playwright",
+                    "cypress",
+                    "node ",
+                    "deno ",
+                    "python ",
+                    "python3 ",
+                    "serve",
+                    "preview",
+                    "start",
+                    "curl ",
+                    "http://",
+                    "https://",
+                ]
+                .iter()
+                .any(|needle| lower.contains(needle))
+        }),
+        CheckKind::FileExists | CheckKind::ContentMatch => false,
+    }
+}
+
+fn compiled_check_can_fail(kind: &CheckKind, command: Option<&str>) -> bool {
+    match kind {
+        CheckKind::CargoTest => true,
+        CheckKind::Shell => command.is_some_and(|command| {
+            let lower = command.to_ascii_lowercase();
+            !looks_like_source_scan(&lower)
+                && !looks_like_trivial_shell(&lower)
+                && !if_present_only_build_or_test(&lower)
+        }),
+        CheckKind::FileExists | CheckKind::ContentMatch => false,
+    }
+}
+
+fn looks_like_source_scan(lower_command: &str) -> bool {
+    lower_command.contains("grep ")
+        || lower_command.starts_with("grep")
+        || lower_command.contains("rg ")
+        || lower_command.starts_with("rg ")
+        || lower_command.contains("ag ")
+        || lower_command.starts_with("ag ")
+        || lower_command.contains("ripgrep")
+}
+
+fn looks_like_trivial_shell(lower_command: &str) -> bool {
+    let trimmed = lower_command.trim();
+    trimmed == "true"
+        || trimmed == ":"
+        || trimmed == "pwd"
+        || trimmed == "ls"
+        || trimmed == "echo ok"
+        || trimmed == "test -d ."
+        || trimmed.starts_with("test -s ")
+        || trimmed.starts_with("cat ")
+}
+
+fn if_present_only_build_or_test(lower_command: &str) -> bool {
+    lower_command.contains("--if-present")
+        && (lower_command.contains("build") || lower_command.contains("test"))
+}
+
+pub(crate) fn lint_contract(contract: &CompiledContract) -> Vec<LintFinding> {
+    let mut findings = Vec::new();
+    if !contract.checks.iter().any(|check| check.behavioral) {
+        findings.push(LintFinding::NoBehavioralCheck);
+    }
+    for check in &contract.checks {
+        let command = check
+            .raw
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if if_present_only_build_or_test(&command) {
+            findings.push(LintFinding::IfPresentOnlyBuildOrTest { index: check.index });
+        }
+    }
+    if let Some(check) = contract
+        .checks
+        .iter()
+        .find(|check| check_is_source_scan(check))
+        && contract.checks.iter().all(|candidate| {
+            candidate.kind == CheckKind::FileExists || check_is_source_scan(candidate)
+        })
+    {
+        findings.push(LintFinding::OnlySourceScanIsSubstantive { index: check.index });
+    }
+    for check in contract
+        .checks
+        .iter()
+        .filter(|check| check_is_substantive(check) && !check.can_fail)
+    {
+        findings.push(LintFinding::UnfalsifiableCheck { index: check.index });
+    }
+    findings
+}
+
+fn check_is_source_scan(check: &CompiledCheck) -> bool {
+    match check.kind {
+        CheckKind::ContentMatch => true,
+        CheckKind::Shell => check
+            .raw
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|command| looks_like_source_scan(&command.to_ascii_lowercase()))
+            .unwrap_or(false),
+        CheckKind::FileExists | CheckKind::CargoTest => false,
+    }
+}
+
+fn check_is_substantive(check: &CompiledCheck) -> bool {
+    !matches!(check.kind, CheckKind::FileExists)
+}
+
+pub(crate) fn reconcile(goal: &str, contract: &CompiledContract) -> ContractDivergence {
+    let goal_clauses = goal_clauses(goal);
+    let contract_text = compiled_contract_search_text(contract);
+    let uncovered = goal_clauses
+        .iter()
+        .filter(|clause| {
+            let tokens = salient_tokens(clause);
+            !tokens.is_empty() && tokens.iter().all(|token| !contract_text.contains(token))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    ContractDivergence {
+        goal_clauses,
+        uncovered,
+        weak: lint_contract(contract),
+    }
+}
+
+fn compiled_contract_search_text(contract: &CompiledContract) -> String {
+    let mut text = format!("{} {}\n", contract.name, contract.md_criteria).to_ascii_lowercase();
+    for check in &contract.checks {
+        text.push_str(&check.summary.to_ascii_lowercase());
+        text.push('\n');
+        text.push_str(&check.raw.to_string().to_ascii_lowercase());
+        text.push('\n');
+    }
+    text
+}
+
+fn goal_clauses(goal: &str) -> Vec<String> {
+    let mut normalized = goal
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\n' | '\r' | ';' | '.' | ':') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    for needle in [" and ", " then ", " plus ", " also "] {
+        normalized = normalized.replace(needle, "|");
+    }
+    normalized
+        .split('|')
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn salient_tokens(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .map(|token| token.trim_matches('-').to_ascii_lowercase())
+        .filter(|token| token.len() >= 4 && !GOAL_STOPWORDS.contains(&token.as_str()))
+        .collect()
+}
+
+const GOAL_STOPWORDS: &[&str] = &[
+    "about", "after", "also", "before", "build", "create", "done", "from", "goal", "into", "make",
+    "must", "need", "project", "should", "that", "then", "this", "with", "work", "works",
+];
+
+fn acceptance_check_groups(root: &serde_yaml::Value) -> Vec<(&'static str, &serde_yaml::Value)> {
+    [
+        "checks",
+        "required",
+        "optional",
+        "tests",
+        "file-exists",
+        "content-match",
+        "build-success",
+    ]
+    .into_iter()
+    .filter_map(|key| yaml_mapping_get(root, key).map(|value| (key, value)))
+    .collect()
+}
+
 pub(crate) async fn acceptance_command(command: AcceptanceCommand) -> Result<()> {
     match command {
         AcceptanceCommand::Setup {
@@ -27,8 +446,15 @@ pub(crate) async fn acceptance_command(command: AcceptanceCommand) -> Result<()>
             model,
             force,
         } => {
-            acceptance_agent_command(AcceptanceAgentMode::Draft, request, provider, model, force)
-                .await
+            acceptance_agent_command(
+                AcceptanceAgentMode::Draft,
+                request,
+                None,
+                provider,
+                model,
+                force,
+            )
+            .await
         }
         AcceptanceCommand::Add {
             request,
@@ -39,12 +465,20 @@ pub(crate) async fn acceptance_command(command: AcceptanceCommand) -> Result<()>
         AcceptanceCommand::Init { preset, force } => acceptance_init_command(preset, force),
         AcceptanceCommand::Draft {
             request,
+            goal,
             provider,
             model,
             force,
         } => {
-            acceptance_agent_command(AcceptanceAgentMode::Draft, request, provider, model, force)
-                .await
+            acceptance_agent_command(
+                AcceptanceAgentMode::Draft,
+                request,
+                goal.as_deref(),
+                provider,
+                model,
+                force,
+            )
+            .await
         }
         AcceptanceCommand::Refine {
             request,
@@ -52,8 +486,15 @@ pub(crate) async fn acceptance_command(command: AcceptanceCommand) -> Result<()>
             model,
             force,
         } => {
-            acceptance_agent_command(AcceptanceAgentMode::Refine, request, provider, model, force)
-                .await
+            acceptance_agent_command(
+                AcceptanceAgentMode::Refine,
+                request,
+                None,
+                provider,
+                model,
+                force,
+            )
+            .await
         }
         AcceptanceCommand::Explain { spec } => acceptance_explain_command(spec),
         AcceptanceCommand::Check { spec, against } => acceptance_check_command(spec, against),
@@ -92,15 +533,30 @@ pub(crate) async fn done_command(
                     "deadreckon def-done edit \"also require the gallery to persist\"",
                 )));
             }
-            acceptance_agent_command(AcceptanceAgentMode::Refine, request, provider, model, force)
-                .await
+            acceptance_agent_command(
+                AcceptanceAgentMode::Refine,
+                request,
+                None,
+                provider,
+                model,
+                force,
+            )
+            .await
         }
         "help" => {
             print_done_help();
             Ok(())
         }
         _ => {
-            acceptance_agent_command(AcceptanceAgentMode::Draft, args, provider, model, true).await
+            acceptance_agent_command(
+                AcceptanceAgentMode::Draft,
+                args,
+                None,
+                provider,
+                model,
+                true,
+            )
+            .await
         }
     }
 }
@@ -135,24 +591,33 @@ fn acceptance_init_command(preset: AcceptancePreset, force: bool) -> Result<()> 
     let draft = acceptance_template_for_preset(preset, &cwd);
     write_project_acceptance(&cwd, &draft, force, false)?;
     print_acceptance_written(&cwd, "template", acceptance_check_count(&draft.yaml)?);
+    let compiled = compile_contract_with_source(
+        &draft.yaml,
+        Some(&draft.markdown),
+        project_acceptance_yaml(&cwd),
+    )?;
+    println!("{}", ui_heading("compiled done contract"));
+    print_compiled_contract(&compiled, None);
     Ok(())
 }
 
 async fn acceptance_agent_command(
     mode: AcceptanceAgentMode,
     request: Vec<String>,
+    goal: Option<&str>,
     provider: Option<String>,
     model: Option<String>,
     force: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    acceptance_agent_command_in_dir(&cwd, mode, request, provider, model, force).await
+    acceptance_agent_command_in_dir(&cwd, mode, request, goal, provider, model, force).await
 }
 
 pub(crate) async fn acceptance_agent_command_in_dir(
     cwd: &Path,
     mode: AcceptanceAgentMode,
     request: Vec<String>,
+    goal: Option<&str>,
     provider: Option<String>,
     model: Option<String>,
     force: bool,
@@ -186,6 +651,7 @@ pub(crate) async fn acceptance_agent_command_in_dir(
     let prompt = acceptance_agent_prompt(
         mode,
         &request,
+        goal,
         cwd,
         existing_yaml.as_deref(),
         existing_md.as_deref(),
@@ -212,7 +678,59 @@ pub(crate) async fn acceptance_agent_command_in_dir(
             "deadreckon def-done \"builds and passes tests\"",
         ))
     })?;
-    let draft = parse_acceptance_agent_response(&response.content)?;
+    let mut draft = parse_acceptance_agent_response(&response.content)?;
+    let mut compiled = compile_contract_with_source(
+        &draft.yaml,
+        Some(&draft.markdown),
+        project_acceptance_yaml(cwd),
+    )?;
+    let mut lint_findings = lint_contract(&compiled);
+    let mut critic = if route.is_some() {
+        run_contract_critic(&router, cwd, goal, &compiled, &lint_findings).await
+    } else {
+        None
+    };
+    if let Some(verdict) = critic
+        .as_ref()
+        .filter(|verdict| matches!(verdict.verdict, CriticDecision::Redraft))
+    {
+        let redraft_request = critic_redraft_request(&request, verdict);
+        let redraft_prompt = acceptance_agent_prompt(
+            AcceptanceAgentMode::Draft,
+            &redraft_request,
+            goal,
+            cwd,
+            existing_yaml.as_deref(),
+            existing_md.as_deref(),
+        )?;
+        let redraft_response = with_cli_wait_status(
+            "redrafting done criteria once",
+            router.complete(&ProviderRequest {
+                prompt: redraft_prompt,
+                max_output_tokens: 6_000,
+                cwd: Some(cwd.to_path_buf()),
+                output_path: None,
+                sandbox_backend: None,
+                pid_file: None,
+                cancellation_token: None,
+            }),
+        )
+        .await
+        .map_err(|err| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!("done criteria redraft failed: {err}"),
+                "deadreckon def-done \"builds and passes tests\"",
+            ))
+        })?;
+        draft = parse_acceptance_agent_response(&redraft_response.content)?;
+        compiled = compile_contract_with_source(
+            &draft.yaml,
+            Some(&draft.markdown),
+            project_acceptance_yaml(cwd),
+        )?;
+        lint_findings = lint_contract(&compiled);
+        critic = Some(critic_floor_verdict(goal, &compiled, &lint_findings));
+    }
     acceptance_check_count(&draft.yaml)?;
     write_project_acceptance(cwd, &draft, true, true)?;
     let route_label = route
@@ -223,6 +741,17 @@ pub(crate) async fn acceptance_agent_command_in_dir(
         &format!("agent draft via {route_label}"),
         acceptance_check_count(&draft.yaml)?,
     );
+    let divergence = goal.map(|goal| reconcile(goal, &compiled));
+    if let Some(verdict) = critic.as_ref()
+        && verdict.stub_would_pass
+    {
+        println!(
+            "{}",
+            ui_warn("done contract critic: a keyword-only stub might pass; review before launch")
+        );
+    }
+    println!("{}", ui_heading("compiled done contract"));
+    print_compiled_contract(&compiled, divergence.as_ref());
     Ok(())
 }
 
@@ -242,7 +771,7 @@ async fn acceptance_add_command(
     } else {
         AcceptanceAgentMode::Draft
     };
-    acceptance_agent_command_in_dir(&cwd, mode, request, provider, model, force).await
+    acceptance_agent_command_in_dir(&cwd, mode, request, None, provider, model, force).await
 }
 
 fn acceptance_add_pack_command(cwd: &Path, pack: AcceptancePack, force: bool) -> Result<()> {
@@ -277,6 +806,13 @@ fn acceptance_add_pack_command(cwd: &Path, pack: AcceptancePack, force: bool) ->
         &format!("{} pack", pack.name()),
         acceptance_check_count(&draft.yaml)?,
     );
+    let compiled = compile_contract_with_source(
+        &draft.yaml,
+        Some(&draft.markdown),
+        project_acceptance_yaml(cwd),
+    )?;
+    println!("{}", ui_heading("compiled done contract"));
+    print_compiled_contract(&compiled, None);
     Ok(())
 }
 
@@ -575,9 +1111,10 @@ fn acceptance_request_text(request: &[String], mode: AcceptanceAgentMode) -> Res
     }
 }
 
-fn acceptance_agent_prompt(
+pub(crate) fn acceptance_agent_prompt(
     mode: AcceptanceAgentMode,
     request: &str,
+    goal: Option<&str>,
     cwd: &Path,
     existing_yaml: Option<&str>,
     existing_md: Option<&str>,
@@ -587,6 +1124,10 @@ fn acceptance_agent_prompt(
         AcceptanceAgentMode::Refine => "refine",
     };
     let project = acceptance_project_summary(cwd)?;
+    let goal_block = goal
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("(no run goal provided; derive from the request and project summary)");
     Ok(format!(
         "\
 You are helping configure deadreckon acceptance criteria for an unattended coding run.
@@ -595,22 +1136,30 @@ The user writes acceptance in plain English. Convert it into executable checks t
 Return JSON only, with exactly these keys:
 {{\"acceptance_yaml\":\"...\",\"acceptance_md\":\"...\",\"files\":{{}}}}
 
-The YAML must be valid deadreckon acceptance.yaml. Use only these check kinds:
+The YAML must be valid deadreckon acceptance.yaml. Keep the existing durable schema and use only these check kinds:
 - file_exists with path
 - content_match with path and pattern
 - shell with command and optional cwd
 - cargo_test
 
-Use {{working_dir}} for paths inside the run. Prefer stable, automatable checks over subjective claims.
+Derive the contract from the Run goal, not only the acceptance request. The request refines the goal; it does not replace it.
+Prefer checks that execute the software and observe outputs: build, start the app, drive it through a headless browser, HTTP call, or CLI invocation, and assert on the result.
+Unit or integration checks must use known inputs -> known expected outputs.
+Source-text scanning (keyword/vocabulary greps, content-only source checks) is INSUFFICIENT as the sole substantive check.
+A helper script is allowed only when it runs the product or asserts computed results, not when it merely greps for words.
+Every substantive check must be falsifiable: there must be a plausible wrong implementation that fails it.
+Never rely on `--if-present` as the only build/test gate. If the project lacks a build/test script, author a minimal real helper under `.deadreckon/acceptance/` or use a direct invocation.
 Do not include self-attestation checks, provider-output checks, or instructions that the agent can satisfy by writing a marker.
-For Node projects, prefer `npm run build --if-present` and `npm test --if-present` shell checks.
-For static apps, require the main HTML/CSS/JS files and one or two content_match checks for requested behavior.
-If a criterion needs a helper script, include it in files under `.deadreckon/acceptance/` and call it from a shell check.
-The acceptance_md must restate the user's criteria in readable English before listing the executable checks.
+Use {{working_dir}} for paths inside the run. Restate the criteria in acceptance_md before listing the executable checks.
 Keep the YAML concise and include at least one required check.
 
 Mode: {mode_label}
-User request: {request}
+
+Run goal:
+{goal_block}
+
+User request:
+{request}
 
 Project summary:
 {project}
@@ -844,6 +1393,7 @@ pub(crate) async fn ensure_acceptance_before_start(
         cwd,
         AcceptanceAgentMode::Draft,
         vec![request],
+        Some(goal),
         provider,
         model,
         false,
@@ -942,6 +1492,226 @@ pub(crate) fn done_criteria_selection(
         }
         None => Ok(setup::DoneCriteriaSelection::default_gate()),
     }
+}
+
+pub(crate) fn compiled_contract_for_selection(
+    selection: &setup::DoneCriteriaSelection,
+) -> Result<Option<CompiledContract>> {
+    let Some(path) = selection.path.as_ref() else {
+        return Ok(None);
+    };
+    let raw = fs::read_to_string(path)?;
+    let md = selection
+        .companion_doc
+        .as_ref()
+        .and_then(|path| fs::read_to_string(path).ok());
+    compile_contract_with_source(&raw, md.as_deref(), path.clone()).map(Some)
+}
+
+pub(crate) fn render_compiled_contract_lines(
+    contract: &CompiledContract,
+    divergence: Option<&ContractDivergence>,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{} from {}",
+        contract.name,
+        contract.source_path.display()
+    )];
+    for check in &contract.checks {
+        let behavior = if check.behavioral {
+            "behavior"
+        } else {
+            "inspection"
+        };
+        let falsifiable = if check.can_fail { "can fail" } else { "weak" };
+        lines.push(format!(
+            "{}. {} [{}; {}; {}]",
+            check.index,
+            check.summary,
+            check.kind.label(),
+            behavior,
+            falsifiable
+        ));
+    }
+    if let Some(divergence) = divergence {
+        if divergence.clean() {
+            lines.push("divergence: none".to_string());
+        } else {
+            if !divergence.uncovered.is_empty() {
+                lines.push(format!(
+                    "divergence: uncovered goal clause(s): {}",
+                    divergence.uncovered.join("; ")
+                ));
+            }
+            if !divergence.weak.is_empty() {
+                let weak = divergence
+                    .weak
+                    .iter()
+                    .map(LintFinding::summary)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                lines.push(format!("divergence: weak check(s): {weak}"));
+            }
+        }
+    }
+    lines
+}
+
+pub(crate) fn print_compiled_contract(
+    contract: &CompiledContract,
+    divergence: Option<&ContractDivergence>,
+) {
+    for line in render_compiled_contract_lines(contract, divergence) {
+        println!("  {line}");
+    }
+}
+
+fn critic_floor_verdict(
+    goal: Option<&str>,
+    contract: &CompiledContract,
+    lint_findings: &[LintFinding],
+) -> CriticVerdict {
+    let divergence = goal.map(|goal| reconcile(goal, contract));
+    let uncovered_goal_clauses = divergence
+        .as_ref()
+        .map(|divergence| divergence.uncovered.clone())
+        .unwrap_or_default();
+    let weak_check_indices = lint_findings
+        .iter()
+        .filter_map(|finding| match finding {
+            LintFinding::OnlySourceScanIsSubstantive { index }
+            | LintFinding::IfPresentOnlyBuildOrTest { index }
+            | LintFinding::UnfalsifiableCheck { index } => Some(*index),
+            LintFinding::NoBehavioralCheck => None,
+        })
+        .collect::<Vec<_>>();
+    let stub_would_pass = lint_findings.iter().any(|finding| {
+        matches!(
+            finding,
+            LintFinding::NoBehavioralCheck
+                | LintFinding::OnlySourceScanIsSubstantive { .. }
+                | LintFinding::UnfalsifiableCheck { .. }
+        )
+    });
+    let verdict = if stub_would_pass || !uncovered_goal_clauses.is_empty() {
+        CriticDecision::Redraft
+    } else {
+        CriticDecision::Pass
+    };
+    CriticVerdict {
+        stub_would_pass,
+        uncovered_goal_clauses,
+        weak_check_indices,
+        verdict,
+    }
+}
+
+fn critic_prompt(
+    goal: Option<&str>,
+    contract: &CompiledContract,
+    lint_findings: &[LintFinding],
+) -> String {
+    let contract_json = serde_json::to_string_pretty(contract).unwrap_or_else(|_| "{}".to_string());
+    let lint_json =
+        serde_json::to_string_pretty(lint_findings).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "\
+You are the done-contract critic for deadreckon.
+Return JSON only with this exact shape:
+{{\"stub_would_pass\":false,\"uncovered_goal_clauses\":[],\"weak_check_indices\":[],\"verdict\":\"pass\"}}
+
+Judge whether the contract covers the run goal and whether a keyword-only stub implementation would pass it.
+Reject contracts whose only substantive checks scan source text, whose build/test gates rely only on --if-present, or whose checks are not falsifiable.
+
+Run goal:
+{goal}
+
+Compiled contract:
+{contract_json}
+
+Deterministic lint findings:
+{lint_json}
+",
+        goal = goal.unwrap_or("(none)")
+    )
+}
+
+fn parse_critic_verdict(content: &str) -> Option<CriticVerdict> {
+    let cleaned = strip_code_fence(content.trim());
+    let json = extract_json_object(&cleaned).unwrap_or(cleaned);
+    let mut value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    if let Some(verdict) = value.get_mut("verdict")
+        && let Some(text) = verdict.as_str()
+    {
+        *verdict = serde_json::Value::String(text.to_ascii_lowercase());
+    }
+    serde_json::from_value(value).ok()
+}
+
+async fn run_contract_critic(
+    router: &ProviderRouter,
+    cwd: &Path,
+    goal: Option<&str>,
+    contract: &CompiledContract,
+    lint_findings: &[LintFinding],
+) -> Option<CriticVerdict> {
+    let prompt = critic_prompt(goal, contract, lint_findings);
+    let floor = || critic_floor_verdict(goal, contract, lint_findings);
+    match with_cli_wait_status(
+        "critiquing done criteria",
+        router.complete(&ProviderRequest {
+            prompt,
+            max_output_tokens: 1_000,
+            cwd: Some(cwd.to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            pid_file: None,
+            cancellation_token: None,
+        }),
+    )
+    .await
+    {
+        Ok(response) => Some(parse_critic_verdict(&response.content).unwrap_or_else(floor)),
+        Err(err) => {
+            eprintln!(
+                "{}",
+                ui_warn(format!(
+                    "done contract critic unavailable; using deterministic lint floor: {err}"
+                ))
+            );
+            None
+        }
+    }
+}
+
+fn critic_redraft_request(request: &str, verdict: &CriticVerdict) -> String {
+    format!(
+        "\
+{request}
+
+The done-contract critic rejected the prior draft. Redraft once to address:
+- stub_would_pass: {}
+- uncovered goal clauses: {}
+- weak check indices: {}
+
+Replace keyword-only or source-scan-only checks with behavioral checks that build, start, drive, and assert, or with known input -> known expected output tests.",
+        verdict.stub_would_pass,
+        if verdict.uncovered_goal_clauses.is_empty() {
+            "none".to_string()
+        } else {
+            verdict.uncovered_goal_clauses.join("; ")
+        },
+        if verdict.weak_check_indices.is_empty() {
+            "none".to_string()
+        } else {
+            verdict
+                .weak_check_indices
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    )
 }
 
 pub(crate) fn copy_acceptance_into_run(
@@ -1561,5 +2331,270 @@ fn yaml_items(value: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
         serde_yaml::Value::Sequence(items) => items.iter().collect(),
         serde_yaml::Value::Null => Vec::new(),
         value => vec![value],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compile(raw: &str) -> CompiledContract {
+        compile_contract(raw, Some("# Done\n")).expect("compile contract")
+    }
+
+    #[test]
+    fn compile_contract_classifies_shell_build_as_behavioral() {
+        let contract = compile(
+            r#"
+name: web app acceptance
+checks:
+  - kind: shell
+    command: "npm run build && node .deadreckon/acceptance/check-output.mjs"
+    cwd: "{working_dir}"
+"#,
+        );
+
+        assert_eq!(contract.checks[0].kind, CheckKind::Shell);
+        assert!(contract.checks[0].behavioral, "{contract:#?}");
+        assert!(contract.checks[0].can_fail, "{contract:#?}");
+    }
+
+    #[test]
+    fn compile_contract_marks_keyword_grep_unfalsifiable() {
+        let contract = compile(
+            r#"
+name: weak acceptance
+checks:
+  - kind: shell
+    command: "grep -R realtime src"
+    cwd: "{working_dir}"
+"#,
+        );
+
+        assert!(!contract.checks[0].behavioral, "{contract:#?}");
+        assert!(!contract.checks[0].can_fail, "{contract:#?}");
+    }
+
+    #[test]
+    fn compile_contract_summary_wording_is_stable() {
+        let contract = compile(
+            r#"
+name: stable acceptance
+checks:
+  - kind: shell
+    command: "npm run build"
+    cwd: "{working_dir}"
+  - kind: cargo_test
+"#,
+        );
+
+        assert_eq!(contract.checks[0].summary, "runs shell: npm run build");
+        assert_eq!(contract.checks[1].summary, "runs cargo test");
+    }
+
+    #[test]
+    fn acceptance_prompt_includes_run_goal_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prompt = acceptance_agent_prompt(
+            AcceptanceAgentMode::Draft,
+            "make it testable",
+            Some("build a realtime canvas app"),
+            dir.path(),
+            None,
+            None,
+        )
+        .expect("prompt");
+
+        assert!(
+            prompt.contains("Run goal:\nbuild a realtime canvas app"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn acceptance_prompt_demands_behavioral_over_source_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prompt = acceptance_agent_prompt(
+            AcceptanceAgentMode::Draft,
+            "draft",
+            Some("goal"),
+            dir.path(),
+            None,
+            None,
+        )
+        .expect("prompt");
+
+        assert!(
+            prompt.contains("execute the software and observe outputs"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Source-text scanning") && prompt.contains("INSUFFICIENT"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn acceptance_prompt_requires_every_check_be_falsifiable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prompt = acceptance_agent_prompt(
+            AcceptanceAgentMode::Draft,
+            "draft",
+            Some("goal"),
+            dir.path(),
+            None,
+            None,
+        )
+        .expect("prompt");
+
+        assert!(
+            prompt.contains("Every substantive check must be falsifiable"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("plausible wrong implementation that fails it"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn acceptance_prompt_bans_if_present_only_build_test() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prompt = acceptance_agent_prompt(
+            AcceptanceAgentMode::Draft,
+            "draft",
+            Some("goal"),
+            dir.path(),
+            None,
+            None,
+        )
+        .expect("prompt");
+
+        assert!(
+            prompt.contains("Never rely on `--if-present` as the only build/test gate"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn lint_flags_contract_with_no_behavioral_check() {
+        let contract = compile(
+            r#"
+name: weak
+checks:
+  - kind: file_exists
+    path: "{working_dir}/README.md"
+"#,
+        );
+
+        assert!(lint_contract(&contract).contains(&LintFinding::NoBehavioralCheck));
+    }
+
+    #[test]
+    fn lint_flags_if_present_only_build_and_test() {
+        let contract = compile(
+            r#"
+name: if present
+checks:
+  - kind: shell
+    command: "npm run build --if-present && npm test --if-present"
+    cwd: "{working_dir}"
+"#,
+        );
+
+        assert!(
+            lint_contract(&contract).iter().any(|finding| matches!(
+                finding,
+                LintFinding::IfPresentOnlyBuildOrTest { index: 1 }
+            ))
+        );
+    }
+
+    #[test]
+    fn lint_flags_source_scan_as_only_substantive_gate() {
+        let contract = compile(
+            r#"
+name: source scan
+checks:
+  - kind: content_match
+    path: "{working_dir}/src/main.js"
+    pattern: "realtime"
+"#,
+        );
+
+        assert!(lint_contract(&contract).iter().any(|finding| matches!(
+            finding,
+            LintFinding::OnlySourceScanIsSubstantive { index: 1 }
+        )));
+    }
+
+    #[test]
+    fn lint_clean_on_a_build_start_assert_contract() {
+        let contract = compile(
+            r#"
+name: behavior
+checks:
+  - kind: shell
+    command: "npm run build && node .deadreckon/acceptance/runtime-assert.mjs"
+    cwd: "{working_dir}"
+"#,
+        );
+
+        assert!(lint_contract(&contract).is_empty(), "{contract:#?}");
+    }
+
+    #[test]
+    fn critic_redraft_fires_at_most_once() {
+        let contract = compile(
+            r#"
+name: weak
+checks:
+  - kind: content_match
+    path: "{working_dir}/src/main.js"
+    pattern: "realtime"
+"#,
+        );
+        let lint = lint_contract(&contract);
+        let verdict = critic_floor_verdict(Some("build a realtime app"), &contract, &lint);
+        let request = critic_redraft_request("draft", &verdict);
+
+        assert_eq!(verdict.verdict, CriticDecision::Redraft);
+        assert_eq!(request.matches("Redraft once").count(), 1, "{request}");
+    }
+
+    #[test]
+    fn critic_absent_provider_falls_back_to_lint_floor() {
+        let contract = compile(
+            r#"
+name: behavior
+checks:
+  - kind: shell
+    command: "npm run build && node .deadreckon/acceptance/runtime-assert.mjs"
+    cwd: "{working_dir}"
+"#,
+        );
+        let lint = lint_contract(&contract);
+        let verdict = critic_floor_verdict(Some("build app"), &contract, &lint);
+
+        assert_eq!(verdict.verdict, CriticDecision::Pass);
+        assert!(!verdict.stub_would_pass);
+    }
+
+    #[test]
+    fn critic_flags_stub_passable_contract() {
+        let contract = compile(
+            r#"
+name: weak
+checks:
+  - kind: shell
+    command: "grep -R realtime src"
+    cwd: "{working_dir}"
+"#,
+        );
+        let lint = lint_contract(&contract);
+        let verdict = critic_floor_verdict(Some("build realtime app"), &contract, &lint);
+
+        assert!(verdict.stub_would_pass, "{verdict:#?}");
+        assert_eq!(verdict.verdict, CriticDecision::Redraft);
     }
 }

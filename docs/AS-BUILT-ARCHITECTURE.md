@@ -1654,6 +1654,7 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Shell tab-completion via `completion install` / `completion {bash,zsh,fish,elvish,powershell}` driven from the live clap command tree; `init` opt-out installs completions and (for zsh) appends a managed `.zshrc` block.
 - `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, campaign sub-plan cards, and completion action footer. Run, plan, chain, and campaign attach now share an explicit responsiveness contract: render paths are provider-free and write-free, JSONL streams are tailed or cached, provider narrative refreshes run in cancellable/coalesced background jobs, stale narrative snapshots survive redraw, and long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
 - Helm attach (§47): a uniform five-question status spine, flattened voyage tree for campaign -> plan -> run and chain steps, event-driven input loop with input-to-frame latency instrumentation, in-frame chain input/modals, `:` command mode for existing chain verbs, `w` why evidence panel, scrubable turn timeline, chain narrative parity, sectioned help overlays, focused footer hints, and `[ui] motion = full|reduced|off` effects. This moves the prior flattened-campaign-tree and in-frame-input items from thin to shipped; the attach daemon, ratzilla web mirror, cross-machine attach, and provider pty embedding remain V1 candidates.
+- Contract (§48): `.deadreckon/acceptance.yaml` remains the durable done-contract schema, but `acceptance` and `start` now compile it into a read model with stable per-check summaries, behavior/falsifiability labels, deterministic lint findings, and goal↔contract divergence. The compiler prompt sees the run goal, demands behavioral/falsifiable checks, bans source-scan-only contracts and `--if-present`-only build/test gates, and the Course plan/card/JSON carry compiled checks plus divergence.
 - Descriptor-driven provider activity ingest for Codex, Claude Code, Gemini JSON/JSONL, OpenCode file-mode logs, GitHub Copilot CLI session-state JSONL, and Pi session JSONL, normalized into `agent` / `thinking` / `tool` / `result` / `todo` / `tokens` rows without rewriting provider-owned logs.
 - Descriptor import hardening: `deadreckon import` accepts legacy aliases and provider descriptor ids, discovers CLI transcripts through descriptor `[ingest]`, selects concrete sessions by cwd or `--session`, writes `import.json`, refuses ambiguous/changed imports with `try:` lines, and normalizes trace/provenance rows for Codex, Claude Code, Gemini, OpenCode file-mode, GitHub Copilot CLI, Pi, and Cursor SQLite.
 - Streaming acceptance progress: `proofs/acceptance-progress.jsonl` reports per-check `started`/`running`/`passed`/`failed` transitions while `dr-gate` is mid-evaluation; the attach TUI tails it alongside the signed marker.
@@ -3385,4 +3386,53 @@ broader text input/search surfaces.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+## 48. Contract: Goal-Aware, Execution-Oriented Done Criteria
+
+Contract makes the definition of done a compiled read model before launch,
+without changing the durable acceptance schema. The persisted artifacts remain
+the Polyglot gate files from §13.1 and §35: `.deadreckon/acceptance.yaml`,
+`.deadreckon/acceptance.md`, and helper scripts under
+`.deadreckon/acceptance/`. `CompiledContract` is a projection over those files:
+each check gets a stable summary, one of the existing check kinds
+(`file_exists`, `content_match`, `shell`, `cargo_test`), a deterministic
+`behavioral` label, a deterministic `can_fail` label, and the raw YAML node.
+
+The acceptance compiler prompt now receives the run goal. `deadreckon
+acceptance draft --goal <text>` exposes that directly, and `deadreckon start`
+passes the actual launch goal when it materializes done criteria. The prompt
+requires contracts to derive from the goal plus the user's request, prefer
+checks that build/start/drive/assert or use known input -> known output tests,
+treat source-text scanning as insufficient as the sole substantive check, make
+every substantive check falsifiable, and avoid `--if-present` as the only
+build/test gate. The anti-self-attestation rule stays in force.
+
+The deterministic falsifiability lint is the floor. It flags contracts with no
+behavioral checks, source-scan-only substantive gates, `--if-present`-only
+build/test checks, and other unfalsifiable substantive checks. A bounded critic
+pass can run after a provider draft; it receives the goal, compiled contract,
+and lint findings, then can request at most one automatic redraft. If the critic
+is unavailable, the lint floor still surfaces.
+
+`start` reconciles the run goal against the compiled contract before launch.
+The deterministic reconciliation splits the goal into clauses and reports
+clauses whose salient terms appear in no check summary or raw node. This is a
+drift signal, not a semantic proof, and it is surfaced with lint findings as
+contract divergence. Under `--yes`, strong divergence refuses with a `try:`
+path to review the contract instead of silently launching.
+
+The human review path renders the real compiled checks, not just
+`project (N checks)`. Existing done criteria can be accepted, viewed, checked,
+re-prompted, or edited through the start review seam. The Course launch plan
+from §46 now records compiled checks and divergence in its contract section;
+the Course card lists `done 1`, `done 2`, etc., flags drift, and adds `d` as
+the done-review action. `start --json` includes the same checks and divergence
+in preview and launch envelopes.
+
+Deferred Contract work stays out of the stable slice: first-class browser/HTTP
+check kinds, a standalone `deadreckon contract` report verb, multi-round critic
+repair, per-check provenance, semantic/embedding coverage, and auto-generating
+missing project build/test harnesses are tracked in `docs/V1-CANDIDATES.md`.
+
+---
+
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-04 for Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

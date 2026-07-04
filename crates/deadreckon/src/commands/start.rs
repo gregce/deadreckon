@@ -254,6 +254,8 @@ pub(crate) struct StartLaunchDecision {
     pub(crate) done_criteria_source: StartDoneCriteriaSource,
     pub(crate) done_action: StartDoneAction,
     pub(crate) done_criteria_label: String,
+    pub(crate) done_contract: Option<commands::acceptance::CompiledContract>,
+    pub(crate) done_divergence: Option<commands::acceptance::ContractDivergence>,
     pub(crate) source_mode: StartSourceMode,
     pub(crate) source_mode_label: String,
     pub(crate) source_fresh: bool,
@@ -315,6 +317,8 @@ pub(crate) fn start_launch_decision(input: StartLaunchInput<'_>) -> StartLaunchD
         done_criteria_source: StartDoneCriteriaSource::Missing,
         done_action: StartDoneAction::Missing,
         done_criteria_label: StartDoneCriteriaSource::Missing.label().to_string(),
+        done_contract: None,
+        done_divergence: None,
         source_mode: StartSourceMode::Missing,
         source_mode_label: StartSourceMode::Missing.label().to_string(),
         source_fresh: false,
@@ -1405,6 +1409,50 @@ fn done_criteria_prompt_detail(selection: &setup::DoneCriteriaSelection) -> Stri
     }
 }
 
+fn apply_done_criteria_selection(
+    decision: &mut StartLaunchDecision,
+    source: StartDoneCriteriaSource,
+    action: StartDoneAction,
+    label: String,
+    selection: &setup::DoneCriteriaSelection,
+) -> Result<()> {
+    decision.done_criteria_source = source;
+    decision.done_action = action;
+    decision.done_criteria_label = label;
+    decision.done_contract = if selection.path.as_ref().is_some_and(|path| path.exists()) {
+        commands::acceptance::compiled_contract_for_selection(selection)?
+    } else {
+        None
+    };
+    decision.done_divergence = decision
+        .done_contract
+        .as_ref()
+        .map(|contract| commands::acceptance::reconcile(&decision.goal, contract));
+    Ok(())
+}
+
+fn contract_review_try_lines(decision: &StartLaunchDecision) -> Vec<String> {
+    vec![
+        "deadreckon acceptance refine \"add a check that builds and runs the app\"".to_string(),
+        format!(
+            "deadreckon start \"{}\" --review-done",
+            shell_display_quote(&decision.goal)
+        ),
+    ]
+}
+
+fn print_start_contract_divergence(decision: &StartLaunchDecision) {
+    let Some(contract) = decision.done_contract.as_ref() else {
+        return;
+    };
+    let divergence = decision.done_divergence.as_ref();
+    if divergence.is_some_and(commands::acceptance::ContractDivergence::clean) {
+        return;
+    }
+    println!("{}", ui_heading("done contract divergence"));
+    commands::acceptance::print_compiled_contract(contract, divergence);
+}
+
 fn print_start_done_criteria_summary(selection: &setup::DoneCriteriaSelection) {
     println!("{}", ui_heading(NOUN_DONE_CONTRACT));
     print_kv_block(&[
@@ -1460,22 +1508,32 @@ pub(crate) fn prompt_start_existing_done_criteria(
     prompter: &mut dyn StartPrompter,
 ) -> Result<()> {
     loop {
+        let compiled = commands::acceptance::compiled_contract_for_selection(selection)
+            .ok()
+            .flatten();
+        let divergence = compiled
+            .as_ref()
+            .map(|contract| commands::acceptance::reconcile(&decision.goal, contract));
+        if let Some(contract) = compiled.as_ref() {
+            println!("{}", ui_heading(format!("Review {NOUN_DONE_CONTRACT}")));
+            commands::acceptance::print_compiled_contract(contract, divergence.as_ref());
+        }
         let choice = prompter.select_one(prompt::SelectPrompt {
             title: format!("Review {NOUN_DONE_CONTRACT}"),
             help: Some(format!(
-                "Current {NOUN_DONE_CONTRACT}: {}. You can view, check, update, keep, or cancel before launch.",
+                "Current {NOUN_DONE_CONTRACT}: {}. You can accept, re-prompt, edit, check, or cancel before launch.",
                 done_criteria_prompt_detail(selection)
             )),
             choices: vec![
                 start_prompt_choice(
                     "keep",
-                    format!("Keep current {NOUN_DONE_CONTRACT}"),
-                    done_criteria_prompt_detail(selection),
+                    format!("Accept current {NOUN_DONE_CONTRACT}"),
+                    "uses the compiled checks shown above",
                 ),
                 start_prompt_choice(
                     "view",
-                    "View current contract summary",
-                    "prints source, path/check count, and manual commands",
+                    "View compiled checks",
+                    "prints real checks, behavior/falsifiability labels, and divergence",
                 ),
                 start_prompt_choice(
                     "check",
@@ -1484,8 +1542,13 @@ pub(crate) fn prompt_start_existing_done_criteria(
                 ),
                 start_prompt_choice(
                     "update",
-                    "Update contract before launch",
-                    "writes new plain-English criteria through the def-done flow",
+                    "Re-prompt compiler before launch",
+                    "uses your note plus the run goal to compile a replacement contract",
+                ),
+                start_prompt_choice(
+                    "edit",
+                    "Edit contract files",
+                    "prints the YAML and Markdown paths for manual editing, then returns here",
                 ),
                 prompt::SelectChoice::new(
                     "cancel",
@@ -1497,12 +1560,21 @@ pub(crate) fn prompt_start_existing_done_criteria(
 
         match choice.id.as_str() {
             "keep" => {
-                decision.done_criteria_source = StartDoneCriteriaSource::Project;
-                decision.done_action = StartDoneAction::Existing;
-                decision.done_criteria_label = selection.full_label();
+                apply_done_criteria_selection(
+                    decision,
+                    StartDoneCriteriaSource::Project,
+                    StartDoneAction::Existing,
+                    selection.full_label(),
+                    selection,
+                )?;
                 return Ok(());
             }
-            "view" => print_start_done_criteria_summary(selection),
+            "view" => {
+                print_start_done_criteria_summary(selection);
+                if let Some(contract) = compiled.as_ref() {
+                    commands::acceptance::print_compiled_contract(contract, divergence.as_ref());
+                }
+            }
             "check" => check_start_done_criteria(cwd, selection)?,
             "update" => {
                 let text = prompter.input("updated definition of done: ", None)?;
@@ -1510,7 +1582,7 @@ pub(crate) fn prompt_start_existing_done_criteria(
                     set_start_recovery(
                         decision,
                         format!("empty {NOUN_DONE_CONTRACT} was not saved"),
-                        done_criteria_inspection_try_lines(selection),
+                        vec!["deadreckon acceptance draft \"<criteria>\"".to_string()],
                     );
                     return Ok(());
                 }
@@ -1521,6 +1593,15 @@ pub(crate) fn prompt_start_existing_done_criteria(
                 };
                 decision.done_criteria_label = format!("update {NOUN_DONE_CONTRACT} before launch");
                 return Ok(());
+            }
+            "edit" => {
+                println!("{}", ui_heading(format!("Edit {NOUN_DONE_CONTRACT}")));
+                if let Some(path) = selection.path.as_ref() {
+                    println!("  yaml: {}", path.display());
+                }
+                if let Some(path) = selection.companion_doc.as_ref() {
+                    println!("  notes: {}", path.display());
+                }
             }
             _ => {
                 set_start_recovery(
@@ -1844,9 +1925,27 @@ pub(crate) fn resolve_start_done_criteria(
             prompt_start_existing_done_criteria(decision, cwd, &selection, prompter)?;
             return Ok(());
         }
-        decision.done_criteria_source = StartDoneCriteriaSource::Project;
-        decision.done_action = StartDoneAction::Existing;
-        decision.done_criteria_label = selection.full_label();
+        apply_done_criteria_selection(
+            decision,
+            StartDoneCriteriaSource::Project,
+            StartDoneAction::Existing,
+            selection.full_label(),
+            &selection,
+        )?;
+        if decision
+            .done_divergence
+            .as_ref()
+            .is_some_and(commands::acceptance::ContractDivergence::strong)
+            && yes
+        {
+            set_start_recovery(
+                decision,
+                "done contract does not cover the run goal strongly enough for --yes",
+                contract_review_try_lines(decision),
+            );
+        } else {
+            print_start_contract_divergence(decision);
+        }
         return Ok(());
     }
 
@@ -2168,6 +2267,7 @@ async fn materialize_start_done_criteria(decision: &mut StartLaunchDecision) -> 
         &cwd,
         commands::acceptance::AcceptanceAgentMode::Draft,
         vec![request],
+        Some(&decision.goal),
         decision.provider_route.clone(),
         None,
         overwrite_existing,
@@ -2177,9 +2277,13 @@ async fn materialize_start_done_criteria(decision: &mut StartLaunchDecision) -> 
         commands::acceptance::resolve_acceptance_source(&cwd, None)?,
     ) {
         let selection = commands::acceptance::done_criteria_selection(&Some(source))?;
-        decision.done_criteria_source = StartDoneCriteriaSource::Generated;
-        decision.done_action = StartDoneAction::Existing;
-        decision.done_criteria_label = selection.full_label();
+        apply_done_criteria_selection(
+            decision,
+            StartDoneCriteriaSource::Generated,
+            StartDoneAction::Existing,
+            selection.full_label(),
+            &selection,
+        )?;
     }
     Ok(())
 }
@@ -2252,6 +2356,31 @@ fn start_preview_primary_action(decision: &StartLaunchDecision) -> String {
                 decision.selected_mode.label()
             )
         }
+    }
+}
+
+fn start_done_contract_json(decision: &StartLaunchDecision) -> serde_json::Value {
+    json!({
+        "checks": decision.done_contract.as_ref().map(|contract| &contract.checks),
+        "divergence": decision.done_divergence,
+    })
+}
+
+fn apply_forced_contract_review_guard(
+    decision: &mut StartLaunchDecision,
+    eligibility: StartPromptEligibility,
+    force_contract_review: bool,
+) {
+    if force_contract_review && decision.recovery.is_none() && !eligibility.allows_prompts() {
+        let try_line = format!(
+            "deadreckon start \"{}\" --review-done",
+            shell_display_quote(&decision.goal)
+        );
+        set_start_recovery(
+            decision,
+            "done contract review needs an interactive terminal",
+            vec![try_line],
+        );
     }
 }
 
@@ -2495,6 +2624,12 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     } else if decision.recovery.is_none() {
         resolve_start_setup(&mut decision, &args, None, stdin_is_tty)?;
     }
+    let force_contract_review = args.review_done
+        || config_defaults(&paths)
+            .ok()
+            .and_then(|defaults| defaults.start_confirm_contract)
+            .unwrap_or(false);
+    apply_forced_contract_review_guard(&mut decision, eligibility, force_contract_review);
     if args.json && !args.yes {
         let surface = start_preview_surface(&decision, &args, &paths)?;
         let mut next_actions = vec![surface.primary_action.command.clone()];
@@ -2518,6 +2653,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             "provider_source": decision.provider_source.label(),
             "done_criteria": decision.done_criteria_label,
             "done_criteria_source": decision.done_criteria_source.label(),
+            "done_contract": start_done_contract_json(&decision),
             "source_mode": decision.source_mode.label(),
             "goal_shape": &decision.goal_shape,
             "requires_confirmation": decision.requires_confirmation,
@@ -2635,6 +2771,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             "goal": goal,
             "mode": mode_label,
             "plan": &launch_plan,
+            "done_contract": start_done_contract_json(&decision),
             "dispatched": { "mode": mode_label, "ids": dispatched_ids },
             "next_actions": next_actions,
         });
@@ -3078,5 +3215,284 @@ mod start_goal_tests {
             start_goal_plan(Some("ship it"), false),
             StartGoalPlan::Provided(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    fn contract(raw: &str) -> commands::acceptance::CompiledContract {
+        commands::acceptance::compile_contract(raw, Some("# Done\n")).expect("contract")
+    }
+
+    fn decision(goal: &str) -> StartLaunchDecision {
+        start_launch_decision(StartLaunchInput {
+            goal,
+            requested_mode: crate::cli::CliStartMode::Auto,
+            stdin_is_tty: false,
+        })
+    }
+
+    #[test]
+    fn start_draft_passes_goal_into_acceptance_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let decision = decision("build a realtime dashboard");
+        let prompt = commands::acceptance::acceptance_agent_prompt(
+            commands::acceptance::AcceptanceAgentMode::Draft,
+            "compile done criteria",
+            Some(&decision.goal),
+            dir.path(),
+            None,
+            None,
+        )
+        .expect("prompt");
+
+        assert!(
+            prompt.contains("Run goal:\nbuild a realtime dashboard"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn reconcile_reports_uncovered_realtime_clause() {
+        let contract = contract(
+            r#"
+name: weak
+checks:
+  - kind: shell
+    command: "npm run build"
+    cwd: "{working_dir}"
+"#,
+        );
+        let divergence = commands::acceptance::reconcile("build a realtime dashboard", &contract);
+
+        assert!(
+            divergence
+                .uncovered
+                .iter()
+                .any(|clause| clause.contains("realtime")),
+            "{divergence:#?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_clean_when_every_clause_has_a_check() {
+        let contract = contract(
+            r#"
+name: covered
+checks:
+  - kind: shell
+    command: "npm run build && node .deadreckon/acceptance/realtime-dashboard.mjs"
+    cwd: "{working_dir}"
+"#,
+        );
+        let divergence = commands::acceptance::reconcile("build realtime dashboard", &contract);
+
+        assert!(divergence.uncovered.is_empty(), "{divergence:#?}");
+    }
+
+    #[test]
+    fn review_renders_real_checks_not_just_count() {
+        let contract = contract(
+            r#"
+name: behavior
+checks:
+  - kind: shell
+    command: "npm run build && node .deadreckon/acceptance/check.mjs"
+    cwd: "{working_dir}"
+"#,
+        );
+        let lines = commands::acceptance::render_compiled_contract_lines(&contract, None);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("runs shell: npm run build"), "{joined}");
+        assert!(!joined.contains("(1 checks)"), "{joined}");
+    }
+
+    #[test]
+    fn reprompt_recompiles_and_reshows_until_accept() {
+        let weak = contract(
+            r#"
+name: weak
+checks:
+  - kind: content_match
+    path: "{working_dir}/src/main.js"
+    pattern: "realtime"
+"#,
+        );
+        let fixed = contract(
+            r#"
+name: fixed
+checks:
+  - kind: shell
+    command: "npm run build && node .deadreckon/acceptance/realtime.mjs"
+    cwd: "{working_dir}"
+"#,
+        );
+        let weak_lines = commands::acceptance::render_compiled_contract_lines(
+            &weak,
+            Some(&commands::acceptance::reconcile(
+                "build realtime app",
+                &weak,
+            )),
+        )
+        .join("\n");
+        let fixed_lines = commands::acceptance::render_compiled_contract_lines(
+            &fixed,
+            Some(&commands::acceptance::reconcile(
+                "build realtime app",
+                &fixed,
+            )),
+        )
+        .join("\n");
+
+        assert!(weak_lines.contains("weak check"), "{weak_lines}");
+        assert!(fixed_lines.contains("runs shell"), "{fixed_lines}");
+        assert_ne!(weak_lines, fixed_lines);
+    }
+
+    #[test]
+    fn edit_and_check_reuse_existing_paths() {
+        let selection = setup::DoneCriteriaSelection::project(
+            PathBuf::from(".deadreckon/acceptance.yaml"),
+            Some(PathBuf::from(".deadreckon/acceptance.md")),
+            Some(1),
+        );
+        let lines = done_criteria_inspection_try_lines(&selection);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("def-done show --spec"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("def-done check --spec"))
+        );
+    }
+
+    #[test]
+    fn yes_launch_still_surfaces_divergence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let acceptance_dir = dir.path().join(".deadreckon");
+        fs::create_dir_all(&acceptance_dir).expect("mkdir");
+        fs::write(
+            acceptance_dir.join("acceptance.yaml"),
+            r#"
+name: weak
+checks:
+  - kind: content_match
+    path: "{working_dir}/src/main.js"
+    pattern: "offline"
+"#,
+        )
+        .expect("write yaml");
+        fs::write(acceptance_dir.join("acceptance.md"), "# Done\n").expect("write md");
+        let mut decision = decision("build a realtime dashboard");
+
+        resolve_start_done_criteria(&mut decision, dir.path(), None, true).expect("resolve");
+
+        assert!(decision.done_divergence.is_some(), "{decision:#?}");
+    }
+
+    #[test]
+    fn strong_divergence_refuses_under_yes_with_try() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let acceptance_dir = dir.path().join(".deadreckon");
+        fs::create_dir_all(&acceptance_dir).expect("mkdir");
+        fs::write(
+            acceptance_dir.join("acceptance.yaml"),
+            r#"
+name: weak
+checks:
+  - kind: content_match
+    path: "{working_dir}/src/main.js"
+    pattern: "offline"
+"#,
+        )
+        .expect("write yaml");
+        let mut decision = decision("build a realtime dashboard");
+
+        resolve_start_done_criteria(&mut decision, dir.path(), None, true).expect("resolve");
+
+        assert!(decision.recovery.is_some(), "{decision:#?}");
+        assert!(
+            decision
+                .try_lines
+                .iter()
+                .any(|line| line.contains("--review-done")),
+            "{decision:#?}"
+        );
+    }
+
+    #[test]
+    fn review_done_flag_forces_loop_non_interactively() {
+        let mut decision = decision("build the app");
+        let eligibility = StartPromptEligibility {
+            stdin_is_tty: false,
+            json: false,
+            plain: false,
+            quiet: false,
+            yes: true,
+        };
+
+        apply_forced_contract_review_guard(&mut decision, eligibility, true);
+
+        assert!(decision.recovery.is_some(), "{decision:#?}");
+        assert!(
+            decision
+                .try_lines
+                .iter()
+                .any(|line| line.contains("--review-done")),
+            "{decision:#?}"
+        );
+    }
+
+    #[test]
+    fn plain_contract_review_prints_check_lines() {
+        let contract = contract(
+            r#"
+name: behavior
+checks:
+  - kind: shell
+    command: "npm run build && node .deadreckon/acceptance/check.mjs"
+    cwd: "{working_dir}"
+"#,
+        );
+        let lines = commands::acceptance::render_compiled_contract_lines(&contract, None);
+
+        assert!(lines.iter().any(|line| line.starts_with("1. runs shell:")));
+    }
+
+    #[test]
+    fn every_contract_refusal_emits_a_try_line() {
+        let decision = decision("build the app");
+        let lines = contract_review_try_lines(&decision);
+
+        assert!(!lines.is_empty());
+        assert!(lines.iter().all(|line| line.starts_with("deadreckon ")));
+    }
+
+    #[test]
+    fn start_json_emits_compiled_checks_and_divergence() {
+        let mut decision = decision("build realtime dashboard");
+        let contract = contract(
+            r#"
+name: behavior
+checks:
+  - kind: shell
+    command: "npm run build && node .deadreckon/acceptance/realtime-dashboard.mjs"
+    cwd: "{working_dir}"
+"#,
+        );
+        decision.done_contract = Some(contract.clone());
+        decision.done_divergence = Some(commands::acceptance::reconcile(&decision.goal, &contract));
+
+        let value = start_done_contract_json(&decision);
+
+        assert!(value.get("checks").is_some(), "{value}");
+        assert!(value.get("divergence").is_some(), "{value}");
     }
 }

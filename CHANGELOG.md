@@ -20,6 +20,15 @@ ships:
 No `PipelineState` schema changes — the plan is a file, not fields. See the
 milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §46.
 
+## Contract (stable) — a definition of done you can trust — 2026-07-04
+
+- the done contract is compiled from the run goal, forced to test behavior
+  (build/start/drive/assert; known input -> known output; every check
+  falsifiable; keyword-only scans and --if-present-only gates rejected),
+  checked by a deterministic falsifiability lint plus one clamped critic
+  pass, and shown for accept / re-prompt / edit before launch on the Course
+  card. Closes the acceptance scope-drift and stub-passable-gate gaps.
+
 ## Helm (stable) — mission-control attach — 2026-07-03
 
 - attach is mission control: uniform five-question status spine, flattened
