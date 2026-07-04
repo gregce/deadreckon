@@ -1,6 +1,10 @@
 status: 0
 --- stdout ---
 {
+  "done_contract": {
+    "checks": null,
+    "divergence": null
+  },
   "done_criteria": "missing done contract",
   "done_criteria_source": "missing",
   "goal": "characterize orchestration",

@@ -135,7 +135,7 @@ pub(crate) struct CourseBudget {
 
 /// The done contract as the launch saw it (summary, not the spec itself —
 /// the spec stays at `acceptance_spec_path_for_run_root`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CourseContract {
     pub(crate) source: ContractOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +144,10 @@ pub(crate) struct CourseContract {
     pub(crate) summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) caveat: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) checks: Vec<super::acceptance::CompiledCheck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) divergence: Option<super::acceptance::ContractDivergence>,
 }
 
 impl Default for CourseContract {
@@ -153,6 +157,8 @@ impl Default for CourseContract {
             kind: None,
             summary: None,
             caveat: None,
+            checks: Vec::new(),
+            divergence: None,
         }
     }
 }
@@ -989,6 +995,7 @@ pub(crate) fn accept_policy(input: AcceptPolicyInput<'_>) -> AcceptDecision {
 pub(crate) enum CardOutcome {
     Sail,
     Edit,
+    ReviewDone,
     ForceSingle,
     Abort,
 }
@@ -1070,6 +1077,19 @@ pub(crate) fn course_card(plan: &LaunchPlan) -> Card {
         (None, None) => format!("[{}]", plan.contract.source.label()),
     };
     rows.push(("done".to_string(), done));
+    for check in &plan.contract.checks {
+        rows.push((format!("done {}", check.index), check.summary.clone()));
+    }
+    if let Some(divergence) = plan.contract.divergence.as_ref()
+        && !divergence.clean()
+    {
+        let flag = if divergence.strong() {
+            "strong divergence"
+        } else {
+            "review suggested"
+        };
+        rows.push(("done drift".to_string(), flag.to_string()));
+    }
     rows.push(("why".to_string(), plan.resolution.rationale.clone()));
     rows.push((
         "escape".to_string(),
@@ -1087,6 +1107,10 @@ pub(crate) fn course_card(plan: &LaunchPlan) -> Card {
             command: "Enter (or --yes)".to_string(),
         }),
         hints: vec![
+            HintLine {
+                label: "done".to_string(),
+                command: "d".to_string(),
+            },
             HintLine {
                 label: "edit".to_string(),
                 command: "e".to_string(),
@@ -1117,7 +1141,7 @@ pub(crate) fn render_course_card(plan: &LaunchPlan, plain: bool) -> String {
 }
 
 /// Drive the card interaction through the existing prompter seam so tests
-/// script it: sail / edit / force-single / abort. Forcing single records the
+/// script it: sail / done / edit / force-single / abort. Forcing single records the
 /// operator as the resolution source (their override is part of the audit).
 pub(crate) fn prompt_course_card(
     plan: &mut LaunchPlan,
@@ -1125,9 +1149,12 @@ pub(crate) fn prompt_course_card(
 ) -> Result<CardOutcome> {
     let choice = prompter.select_one(prompt::SelectPrompt {
         title: "Sail this course?".to_string(),
-        help: Some("Enter sails - e edits - s forces a single run - q aborts".to_string()),
+        help: Some(
+            "Enter sails - d reviews done - e edits - s forces a single run - q aborts".to_string(),
+        ),
         choices: vec![
             prompt::SelectChoice::new("sail", "Sail (launch as planned)"),
+            prompt::SelectChoice::new("done", "Review done contract"),
             prompt::SelectChoice::new("edit", "Edit shape, count, or budget"),
             prompt::SelectChoice::new("single", "Force a single run"),
             prompt::SelectChoice::new("abort", "Abort"),
@@ -1136,6 +1163,7 @@ pub(crate) fn prompt_course_card(
     })?;
     Ok(match choice.id.as_str() {
         "edit" => CardOutcome::Edit,
+        "done" => CardOutcome::ReviewDone,
         "single" => {
             plan.shape = CourseShape::Single;
             plan.n = None;
@@ -1213,6 +1241,12 @@ pub(crate) fn launch_plan_from_decision(
         kind: None,
         summary: Some(decision.done_criteria_label.clone()),
         caveat: None,
+        checks: decision
+            .done_contract
+            .as_ref()
+            .map(|contract| contract.checks.clone())
+            .unwrap_or_default(),
+        divergence: decision.done_divergence.clone(),
     };
     plan.accepted_by = Some(accepted_by.to_string());
     plan
@@ -1290,7 +1324,10 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
         let mut prompter = super::start::TerminalStartPrompter;
         match prompt_course_card(&mut plan, &mut prompter)? {
             CardOutcome::Sail => {}
-            CardOutcome::ForceSingle | CardOutcome::Edit | CardOutcome::Abort => {
+            CardOutcome::ForceSingle
+            | CardOutcome::Edit
+            | CardOutcome::ReviewDone
+            | CardOutcome::Abort => {
                 return Err(CliError::Core(deadreckon_core::user_error(
                     "reshape not accepted",
                     &format!("deadreckon reshape {} --yes", state.run_id),
@@ -1490,6 +1527,8 @@ mod tests {
             kind: Some("Node(pnpm)".to_string()),
             summary: Some("pnpm test".to_string()),
             caveat: None,
+            checks: Vec::new(),
+            divergence: None,
         };
         plan
     }
@@ -1786,6 +1825,7 @@ mod tests {
 |   escape        deadreckon kill latest - deadreckon undo latest              |
 |                                                                              |
 |   sail          Enter (or --yes)                                             |
+|   done          d                                                            |
 |   edit          e                                                            |
 |   single        s                                                            |
 |   abort         q                                                            |
@@ -1849,6 +1889,62 @@ mod tests {
             CourseShape::Plan,
             "sail leaves the plan untouched"
         );
+    }
+
+    #[test]
+    fn course_card_done_lists_compiled_checks() {
+        let mut plan = sample_plan();
+        let contract = super::super::acceptance::compile_contract(
+            r#"
+name: behavior
+checks:
+  - kind: shell
+    command: "npm run build && node .deadreckon/acceptance/check.mjs"
+    cwd: "{working_dir}"
+"#,
+            Some("# Done\n"),
+        )
+        .expect("contract");
+        plan.contract.checks = contract.checks;
+
+        let rendered = render_course_card(&plan, true);
+
+        assert!(rendered.contains("done 1"), "{rendered}");
+        assert!(rendered.contains("runs shell: npm run build"), "{rendered}");
+    }
+
+    #[test]
+    fn course_card_flags_goal_divergence() {
+        let mut plan = sample_plan();
+        let contract = super::super::acceptance::compile_contract(
+            r#"
+name: weak
+checks:
+  - kind: content_match
+    path: "{working_dir}/src/main.js"
+    pattern: "offline"
+"#,
+            Some("# Done\n"),
+        )
+        .expect("contract");
+        plan.contract.divergence = Some(super::super::acceptance::reconcile(
+            "build a realtime dashboard",
+            &contract,
+        ));
+        plan.contract.checks = contract.checks;
+
+        let rendered = render_course_card(&plan, true);
+
+        assert!(rendered.contains("done drift"), "{rendered}");
+    }
+
+    #[test]
+    fn course_card_d_key_opens_review_loop() {
+        let mut plan = sample_plan();
+        let outcome = prompt_course_card(&mut plan, &mut ScriptedCardPrompter { choice: "done" })
+            .expect("outcome");
+
+        assert_eq!(outcome, CardOutcome::ReviewDone);
     }
 
     // ---- C-P6: guardrails + accept policy ----

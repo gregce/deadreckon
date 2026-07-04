@@ -2360,6 +2360,7 @@ fn start_args_for_test(goal: &str) -> StartCommandArgs {
         coder_provider: None,
         reviewer_provider: None,
         preview: true,
+        review_done: false,
         yes: false,
         no_seams: false,
         fresh: false,

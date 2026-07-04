@@ -698,6 +698,8 @@ pub(crate) enum Commands {
         reviewer_provider: Option<String>,
         #[arg(long, help = "Show the resolved launch preview without starting work")]
         preview: bool,
+        #[arg(long, help = "Review the compiled done contract before launch")]
+        review_done: bool,
         #[arg(
             long = "plan",
             value_name = "FILE",
@@ -2237,6 +2239,8 @@ pub(crate) enum AcceptanceCommand {
     Draft {
         #[arg(value_name = "REQUEST", num_args = 0.., help = "What should count as done")]
         request: Vec<String>,
+        #[arg(long, help = "Run goal the done contract must cover")]
+        goal: Option<String>,
         #[arg(long, help = "Provider route override for drafting")]
         provider: Option<String>,
         #[arg(long, help = "Model override for drafting")]
@@ -2521,6 +2525,7 @@ pub(crate) struct StartCommandArgs {
     pub(crate) coder_provider: Option<String>,
     pub(crate) reviewer_provider: Option<String>,
     pub(crate) preview: bool,
+    pub(crate) review_done: bool,
     pub(crate) yes: bool,
     pub(crate) no_seams: bool,
     pub(crate) fresh: bool,
