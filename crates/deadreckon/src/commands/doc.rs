@@ -150,7 +150,8 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
         }
         save_state(&state)?;
     }
-    let Some(path) = doc_path_for_kind(&state.working_dir, kind) else {
+    let view = deadreckon_core::RunView::from_state(&state)?;
+    let Some(path) = run_view_doc_path(&state, &view, kind) else {
         if kind == DocKind::Delta {
             return Err(CliError::Core(deadreckon_core::user_error(
                 "no delta produced; this run did not affect a project AS-BUILT",
@@ -186,6 +187,26 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
         print!("{}", fs::read_to_string(&path)?);
     }
     Ok(())
+}
+
+fn run_view_doc_path(
+    state: &deadreckon_core::PipelineState,
+    view: &deadreckon_core::RunView,
+    kind: DocKind,
+) -> Option<PathBuf> {
+    match kind {
+        DocKind::Narrative => view
+            .why
+            .narrative_path
+            .clone()
+            .or_else(|| doc_path_for_kind(&state.working_dir, kind)),
+        DocKind::Decisions => view
+            .why
+            .decisions_path
+            .clone()
+            .or_else(|| doc_path_for_kind(&state.working_dir, kind)),
+        DocKind::AsBuilt | DocKind::Delta => doc_path_for_kind(&state.working_dir, kind),
+    }
 }
 
 async fn doc_plan_command(paths: &DeadreckonPaths, args: DocPlanCommandArgs) -> Result<()> {

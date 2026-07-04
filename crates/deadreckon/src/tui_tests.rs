@@ -1020,6 +1020,7 @@ fn run_narrative_render_uses_cached_projection_when_coverage_unchanged() {
     };
     let input = RunNarrativeRenderInput {
         state: &state,
+        run_view: None,
         spend: &[],
         traces: &[],
         events: &[],
@@ -1102,6 +1103,7 @@ fn stale_provider_snapshot_survives_redraw_without_churn() {
     };
     let input = RunNarrativeRenderInput {
         state: &state,
+        run_view: None,
         spend: &[],
         traces: &[],
         events: &[],

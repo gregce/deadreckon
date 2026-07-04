@@ -42,6 +42,7 @@ pub(crate) fn render_run_docs(
 
 pub(crate) struct RunNarrativeRenderInput<'a> {
     pub(crate) state: &'a deadreckon_core::PipelineState,
+    pub(crate) run_view: Option<&'a deadreckon_core::RunView>,
     pub(crate) spend: &'a [SpendRecord],
     pub(crate) traces: &'a [TraceRecord],
     pub(crate) events: &'a [RunEvent],
@@ -132,8 +133,10 @@ pub(crate) fn run_narrative_lines(
     live: &AttachLive,
     tui_state: &AttachTuiState,
 ) -> Vec<String> {
+    let run_view = deadreckon_core::RunView::from_state(state).ok();
     let projection = run_narrative_projection_for_render(&RunNarrativeRenderInput {
         state,
+        run_view: run_view.as_ref(),
         spend,
         traces,
         events,
@@ -162,8 +165,10 @@ pub(crate) fn run_narrative_projection(
     live: &AttachLive,
     tui_state: &AttachTuiState,
 ) -> Result<narrative::NarrativeProjection> {
+    let run_view = deadreckon_core::RunView::from_state(state).ok();
     ensure_run_narrative_projection(&RunNarrativeRenderInput {
         state,
+        run_view: run_view.as_ref(),
         spend,
         traces,
         events,
@@ -201,6 +206,7 @@ fn run_narrative_input<'a>(
     let tui_state = input.tui_state;
     narrative::RunNarrativeInput {
         state,
+        run_view: input.run_view,
         spend: input.spend,
         traces: input.traces,
         events: input.events,
@@ -236,6 +242,17 @@ pub(crate) fn run_narrative_projection_signature(input: &RunNarrativeRenderInput
         .state
         .active_phase()
         .map(|phase| &phase.name)
+        .hash(&mut hasher);
+    input
+        .run_view
+        .map(|view| {
+            (
+                view.changed.files_changed,
+                view.changed.added,
+                view.changed.removed,
+                view.turns.len(),
+            )
+        })
         .hash(&mut hasher);
     input.spend.len().hash(&mut hasher);
     input

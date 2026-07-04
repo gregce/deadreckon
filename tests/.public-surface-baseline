@@ -3,9 +3,14 @@ crate: deadreckon-core
   artifacts::append_spend
   artifacts::append_trace
   artifacts::copy_tree
+  artifacts::diff_snapshots
+  artifacts::DiffSummary
+  artifacts::FileDelta
+  artifacts::FileDeltaStatus
   artifacts::inventory_files
   artifacts::ProvenanceRecord
   artifacts::restore_snapshot
+  artifacts::snapshot_diff
   artifacts::snapshot_working
   artifacts::SpendRecord
   artifacts::TraceRecord
@@ -208,6 +213,22 @@ crate: deadreckon-core
   promotion::promote_completed_run
   promotion::PromotionManifest
   promotion::recover_promotion
+  run_view::Artifact
+  run_view::CheckOutcome
+  run_view::ExchangeRef
+  run_view::Money
+  run_view::ProofBand
+  run_view::RunIdentity
+  run_view::RunView
+  run_view::RunViewDocKind
+  run_view::SandboxEvent
+  run_view::SandboxFact
+  run_view::SignatureFact
+  run_view::SignatureStatus
+  run_view::SpendBand
+  run_view::TurnView
+  run_view::VerdictBand
+  run_view::WhyBand
   state::create_run
   state::CurrentRunPointer
   state::list_runs

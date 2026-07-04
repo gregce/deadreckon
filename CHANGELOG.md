@@ -29,6 +29,21 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   pass, and shown for accept / re-prompt / edit before launch on the Course
   card. Closes the acceptance scope-drift and stub-passable-gate gaps.
 
+## Logbook (stable) — run inspection that agrees with itself — 2026-07-04
+
+- added the core `RunView` read model so `show`, `verdict`, `doc`, `report`,
+  and attach narrative projections assemble run identity, verdict/signature,
+  sandbox facts, spend, changed files, turn records, proof files, and missing
+  artifacts from one picture.
+- added snapshot-backed full-run and per-turn diffs (`show --diff`,
+  `show --turn <n>`) that exclude build output and deadreckon internals, plus
+  `show --raw <artifact>` for stable artifact reads with gate-secret refusal.
+- added `deadreckon report <run-id>` as a static Markdown/HTML/JSON run
+  report over verdict, changed files, why/docs, turns, and proof, refusing
+  live runs with an attach hint.
+- extended `history grep` with `--kind events`, and routed verdict signature /
+  changed-file facts plus doc path resolution through `RunView`.
+
 ## Helm (stable) — mission-control attach — 2026-07-03
 
 - attach is mission control: uniform five-question status spine, flattened

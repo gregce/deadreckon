@@ -89,6 +89,7 @@ pub(crate) struct ParentPlanFact {
 #[derive(Debug)]
 pub(crate) struct RunNarrativeInput<'a> {
     pub(crate) state: &'a deadreckon_core::PipelineState,
+    pub(crate) run_view: Option<&'a deadreckon_core::RunView>,
     pub(crate) spend: &'a [SpendRecord],
     pub(crate) traces: &'a [TraceRecord],
     pub(crate) events: &'a [RunEvent],
@@ -579,6 +580,18 @@ pub(crate) fn build_run_projection(input: &RunNarrativeInput<'_>) -> NarrativePr
         current_work.push(claim(
             format!("Latest trace: turn {} {}.", trace.turn, trace.event),
             vec![latest_trace_id],
+            "high",
+        ));
+    }
+    if let Some(view) = input.run_view
+        && view.changed.files_changed > 0
+    {
+        current_work.push(claim(
+            format!(
+                "Snapshot diff sees {} changed file(s), +{} -{} lines.",
+                view.changed.files_changed, view.changed.added, view.changed.removed
+            ),
+            file_evidence(&files).into_iter().take(5).collect(),
             "high",
         ));
     }
@@ -2997,6 +3010,14 @@ fn collect_run_files(input: &RunNarrativeInput<'_>, flight_events: &[FlightEvent
         .take(12)
         .map(|file| file.path.clone())
         .collect::<Vec<_>>();
+    if let Some(view) = input.run_view {
+        files.extend(
+            view.changed
+                .files
+                .iter()
+                .map(|file| file.path.display().to_string()),
+        );
+    }
     files.extend(
         flight_events
             .iter()
@@ -4072,6 +4093,7 @@ mod tests {
         .expect("child run");
         let mut child_projection = build_run_projection(&RunNarrativeInput {
             state: &child_state,
+            run_view: None,
             spend: &[],
             traces: &[],
             events: &[],
@@ -4400,6 +4422,7 @@ mod tests {
         fs::write(state.working_dir.join("src.txt"), "hello").expect("file");
         let projection = build_run_projection(&RunNarrativeInput {
             state: &state,
+            run_view: None,
             spend: &[],
             traces: &[],
             events: &[],
@@ -4442,6 +4465,7 @@ mod tests {
         .expect("run");
         let projection = build_run_projection(&RunNarrativeInput {
             state: &state,
+            run_view: None,
             spend: &[],
             traces: &[],
             events: &[],
@@ -4510,6 +4534,7 @@ mod tests {
 
         let projection = build_run_projection(&RunNarrativeInput {
             state: &state,
+            run_view: None,
             spend: &[],
             traces: &[],
             events: &[],
@@ -4566,6 +4591,7 @@ mod tests {
         .expect("child run");
         let mut child_projection = build_run_projection(&RunNarrativeInput {
             state: &child_state,
+            run_view: None,
             spend: &[],
             traces: &[],
             events: &[],
@@ -4883,6 +4909,7 @@ mod tests {
         .expect("run");
         let input = RunNarrativeInput {
             state: &state,
+            run_view: None,
             spend: &[],
             traces: &[],
             events: &[],
@@ -4957,6 +4984,7 @@ mod tests {
         }];
         let input = RunNarrativeInput {
             state: &state,
+            run_view: None,
             spend: &[],
             traces: &[],
             events: &[],
@@ -4997,6 +5025,7 @@ mod tests {
         }];
         let advanced_input = RunNarrativeInput {
             state: &state,
+            run_view: None,
             spend: &[],
             traces: &traces,
             events: &[],
@@ -5069,6 +5098,7 @@ mod tests {
         .expect("run");
         let input = RunNarrativeInput {
             state: &state,
+            run_view: None,
             spend: &[],
             traces: &[],
             events: &[],
@@ -5133,6 +5163,7 @@ mod tests {
         .expect("run");
         let input = RunNarrativeInput {
             state: &state,
+            run_view: None,
             spend: &[],
             traces: &[],
             events: &[],
@@ -5315,6 +5346,7 @@ mod tests {
         .expect("run");
         build_run_projection(&RunNarrativeInput {
             state: &state,
+            run_view: None,
             spend: &[],
             traces: &[],
             events: &[],

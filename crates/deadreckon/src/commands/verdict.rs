@@ -294,12 +294,10 @@ pub(crate) fn render_verdict_surface(
 /// the signed marker, and combine through `compute_verdict`. Read-only.
 pub(crate) fn build_verdict_report(state: &deadreckon_core::PipelineState) -> VerdictReport {
     let rerun = rerun_acceptance(state);
-    let marker_path = deadreckon_core::gate::marker_path_for_run_root(&state.run_root);
-    let had_signed_marker = marker_path.exists();
-    // A marker that no longer validates (signature mismatch, tampered tamper
-    // bytes, wrong run_id) is treated as not-valid → Regressed, never Verified.
-    let marker_valid =
-        had_signed_marker && deadreckon_core::gate::validate_acceptance_marker(state).is_ok();
+    if let Ok(view) = deadreckon_core::RunView::from_state(state) {
+        return build_verdict_report_from_view(state, &view, rerun);
+    }
+    let (had_signed_marker, marker_valid) = legacy_signature_fact(state);
     VerdictReport {
         schema: 1,
         run_id: state.run_id.clone(),
@@ -315,6 +313,55 @@ pub(crate) fn build_verdict_report(state: &deadreckon_core::PipelineState) -> Ve
             VerdictSource::Native
         },
     }
+}
+
+fn build_verdict_report_from_view(
+    state: &deadreckon_core::PipelineState,
+    view: &deadreckon_core::RunView,
+    rerun: RerunResult,
+) -> VerdictReport {
+    let had_signed_marker = view.signature.marker_path.is_some();
+    let marker_valid = matches!(
+        view.signature.status,
+        deadreckon_core::SignatureStatus::Valid
+    );
+    VerdictReport {
+        schema: 1,
+        run_id: state.run_id.clone(),
+        taken_at: chrono::Utc::now().to_rfc3339(),
+        state: compute_verdict(had_signed_marker, marker_valid, rerun.all_must_pass),
+        had_signed_marker,
+        marker_valid,
+        checks: rerun.checks,
+        changed_files: changed_file_counts_from_view(view),
+        source: if state.run_root.join("import.json").exists() {
+            VerdictSource::Imported
+        } else {
+            VerdictSource::Native
+        },
+    }
+}
+
+fn legacy_signature_fact(state: &deadreckon_core::PipelineState) -> (bool, bool) {
+    let marker_path = deadreckon_core::gate::marker_path_for_run_root(&state.run_root);
+    let had_signed_marker = marker_path.exists();
+    // A marker that no longer validates (signature mismatch, tampered tamper
+    // bytes, wrong run_id) is treated as not-valid → Regressed, never Verified.
+    let marker_valid =
+        had_signed_marker && deadreckon_core::gate::validate_acceptance_marker(state).is_ok();
+    (had_signed_marker, marker_valid)
+}
+
+fn changed_file_counts_from_view(view: &deadreckon_core::RunView) -> ChangedFiles {
+    let mut counts = ChangedFiles::default();
+    for file in &view.changed.files {
+        match file.status {
+            deadreckon_core::FileDeltaStatus::Added => counts.added += 1,
+            deadreckon_core::FileDeltaStatus::Modified => counts.modified += 1,
+            deadreckon_core::FileDeltaStatus::Removed => counts.deleted += 1,
+        }
+    }
+    counts
 }
 
 /// Cache the verdict report as a sidecar at `<run_root>/proofs/verdict-<ts>.json`.
@@ -488,7 +535,7 @@ mod tests {
     // ---- V-P2: run resolution ----
 
     use deadreckon_core::paths::DeadreckonPaths;
-    use deadreckon_core::state::{RunOptions, create_run};
+    use deadreckon_core::state::{RunOptions, create_run, save_state};
     use tempfile::TempDir;
 
     fn fixture_run(paths: &DeadreckonPaths, run_id: &str, repo: &std::path::Path) {
@@ -686,10 +733,13 @@ mod tests {
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo");
         fixture_run(&paths, "changed-run-0001", &repo);
-        let state = deadreckon_core::load_run(&paths, "changed-run-0001").expect("load");
+        let mut state = deadreckon_core::load_run(&paths, "changed-run-0001").expect("load");
 
         snapshot_working(&state, 0).expect("snapshot");
         std::fs::write(state.working_dir.join("new.txt"), "hello\n").expect("create");
+        state.turn = 1;
+        save_state(&state).expect("save");
+        snapshot_working(&state, 1).expect("snapshot 1");
         append_provenance(
             &state,
             &ProvenanceRecord {
@@ -708,6 +758,49 @@ mod tests {
             report.changed_files.added >= 1,
             "{:?}",
             report.changed_files
+        );
+    }
+
+    #[test]
+    fn verdict_derives_signature_and_tamper_from_run_view() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "view-sig-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "view-sig-run-0001").expect("load");
+        sign_marker(&state);
+
+        let view = deadreckon_core::RunView::from_state(&state).expect("view");
+        let report = build_verdict_report_from_view(&state, &view, rerun_acceptance(&state));
+
+        assert!(report.had_signed_marker);
+        assert_eq!(report.marker_valid, view.proof.marker_valid);
+    }
+
+    #[test]
+    fn verdict_and_show_report_identical_signature_fact() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "view-parity-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "view-parity-run-0001").expect("load");
+        sign_marker(&state);
+
+        let view = deadreckon_core::RunView::from_state(&state).expect("view");
+        let report = build_verdict_report(&state);
+
+        assert_eq!(
+            report.had_signed_marker,
+            view.signature.marker_path.is_some()
+        );
+        assert_eq!(
+            report.marker_valid,
+            matches!(
+                view.signature.status,
+                deadreckon_core::SignatureStatus::Valid
+            )
         );
     }
 

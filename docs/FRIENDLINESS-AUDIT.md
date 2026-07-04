@@ -190,6 +190,12 @@ verb.
 | `doc` | One-command rollback | n-a | Read paths are immutable; polish can be re-run. |
 | `doc` | One verdict + ONE primary action | pass | Doc export, missing-provider, polish budget, and polish completion surfaces render one primary action. |
 | `doc` | Lifecycle hint | pass | Help points at export/polish/finish paths. |
+| `report` | Auto-detect, don't ask | pass | The run target is explicit and the report derives from the shared RunView without prompting. |
+| `report` | Preview before mutate | n-a | It writes an additive report artifact or emits JSON; it does not alter run state or the workspace. |
+| `report` | Refuse with try: | pass | Live runs refuse with an attach command, and invalid ids flow through normal run lookup guidance. |
+| `report` | One-command rollback | n-a | Report files are additive inspection artifacts and can be regenerated. |
+| `report` | One verdict + ONE primary action | pass | Successful report writes render one VerdictSurface with one recommended inspect command. |
+| `report` | Lifecycle hint | pass | Output points at `show` and JSON report inspection. |
 | `attach` | Auto-detect, don't ask | pass | `latest`, run/plan/chain kind, and child refs resolve automatically. |
 | `attach` | Preview before mutate | n-a | Attach is observational unless the user presses an explicit action key. |
 | `attach` | Refuse with try: | pass | Unsupported narrative/target paths include recovery. |

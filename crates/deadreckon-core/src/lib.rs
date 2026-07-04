@@ -23,13 +23,15 @@ pub mod paths;
 pub mod plan;
 pub mod polish_subcalls;
 pub mod promotion;
+pub mod run_view;
 pub mod state;
 pub mod tamper;
 pub mod update_cache;
 
 pub use artifacts::{
-    ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
-    copy_tree, inventory_files, restore_snapshot, snapshot_working,
+    DiffSummary, FileDelta, FileDeltaStatus, ProvenanceRecord, SpendRecord, TraceRecord,
+    append_provenance, append_spend, append_trace, copy_tree, diff_snapshots, inventory_files,
+    restore_snapshot, snapshot_diff, snapshot_working,
 };
 pub use cancel::{
     CANCEL_MARKER, CancelMarker, cancel_marker_path, cancel_marker_path_for_run_root,
@@ -99,6 +101,11 @@ pub use polish_subcalls::{
     DocProviderSource, PolishDiffCoverage, PolishSubcallRecord,
 };
 pub use promotion::{PromotionManifest, promote_completed_run, recover_promotion};
+pub use run_view::{
+    Artifact, CheckOutcome, ExchangeRef, Money, ProofBand, RunIdentity, RunView, RunViewDocKind,
+    SandboxEvent, SandboxFact, SignatureFact, SignatureStatus, SpendBand, TurnView, VerdictBand,
+    WhyBand,
+};
 pub use state::{
     CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, RunListEntry, RunOptions,
     RunStatus, create_run, list_runs, load_run, save_state,

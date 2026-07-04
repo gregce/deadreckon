@@ -686,7 +686,7 @@ fn print_history_grep_no_matches_surface(
         Some(pattern),
         ExplanationPanel::new(
             format!("History grep scanned {search_scope} and found no matches for {pattern:?}."),
-            "This is a no-op because no trace/provenance lines matched; broadening the search to all scopes is the safest next check.",
+            "This is a no-op because no matching history ledger lines were found; broadening the search to all scopes is the safest next check.",
             vec![
                 ("pattern".to_string(), pattern.to_string()),
                 ("scope".to_string(), search_scope),
@@ -720,6 +720,7 @@ fn history_kind_file(kind: HistoryKind) -> &'static str {
     match kind {
         HistoryKind::Trace => "traces.jsonl",
         HistoryKind::Provenance => "provenance.jsonl",
+        HistoryKind::Events => RUN_EVENTS_JSONL,
     }
 }
 
@@ -727,6 +728,7 @@ fn history_kind_label(kind: HistoryKind) -> &'static str {
     match kind {
         HistoryKind::Trace => "trace",
         HistoryKind::Provenance => "provenance",
+        HistoryKind::Events => "events",
     }
 }
 
@@ -800,6 +802,9 @@ fn history_line_timestamp(kind: HistoryKind, line: &str) -> Option<DateTime<Utc>
             .ok()
             .map(|record| record.timestamp),
         HistoryKind::Provenance => serde_json::from_str::<ProvenanceRecord>(line)
+            .ok()
+            .map(|record| record.timestamp),
+        HistoryKind::Events => serde_json::from_str::<RunEvent>(line)
             .ok()
             .map(|record| record.timestamp),
     }

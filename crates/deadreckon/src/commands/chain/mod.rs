@@ -2323,7 +2323,16 @@ async fn chain_attach_tui(
                             .get(tui_state.selected_step)
                             .and_then(|step| step.run_id.clone())
                         {
-                            let _ = show_command(&run_id, None, false, false, false, false, None);
+                            let _ = show_command(ShowCommandArgs {
+                                run_id: &run_id,
+                                turn: None,
+                                diff: false,
+                                raw: None,
+                                why_failed: false,
+                                json_output: false,
+                                flight: false,
+                                file: None,
+                            });
                         } else {
                             eprintln!("selected step has no run yet");
                         }

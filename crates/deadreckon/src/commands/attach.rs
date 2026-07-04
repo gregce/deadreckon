@@ -287,6 +287,7 @@ fn run_projection_for_plain(
     parent_plan: Option<&AttachParentPlan>,
     visual: NarrativeVisualMode,
 ) -> Result<narrative::NarrativeProjection> {
+    let run_view = deadreckon_core::RunView::from_state(state).ok();
     let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl"))?;
     let traces = read_jsonl::<TraceRecord>(&state.run_root.join("traces.jsonl"))?;
     let events = read_jsonl::<RunEvent>(&state.run_root.join(RUN_EVENTS_JSONL))?;
@@ -297,7 +298,18 @@ fn run_projection_for_plain(
         parent_plan: parent_plan.cloned(),
         ..AttachTuiState::default()
     };
-    run_narrative_projection(state, &spend, &traces, &events, &live, &tui_state)
+    run_narrative_projection(state, &spend, &traces, &events, &live, &tui_state).or_else(|_| {
+        let input = RunNarrativeRenderInput {
+            state,
+            run_view: run_view.as_ref(),
+            spend: &spend,
+            traces: &traces,
+            events: &events,
+            live: &live,
+            tui_state: &tui_state,
+        };
+        Ok(build_run_narrative_projection(&input))
+    })
 }
 
 fn plan_projection_for_plain(
@@ -845,9 +857,15 @@ async fn attach_tui_with_parent(
             narrative_projection_cache.invalidate();
             tui_state.record_narrative_refresh(notice);
         }
+        let run_view = if tui_state.view.is_narrative() {
+            deadreckon_core::RunView::from_state(&state).ok()
+        } else {
+            None
+        };
         tui_state.narrative_projection = if tui_state.view.is_narrative() {
             let input = RunNarrativeRenderInput {
                 state: &state,
+                run_view: run_view.as_ref(),
                 spend,
                 traces,
                 events: &events,
@@ -885,6 +903,7 @@ async fn attach_tui_with_parent(
             let stage_started = Instant::now();
             let input = RunNarrativeRenderInput {
                 state: &state,
+                run_view: run_view.as_ref(),
                 spend,
                 traces,
                 events: &events,
@@ -955,6 +974,7 @@ async fn attach_tui_with_parent(
                     let provider_stage_started = Instant::now();
                     let input = RunNarrativeRenderInput {
                         state: &state,
+                        run_view: run_view.as_ref(),
                         spend,
                         traces,
                         events: &events,
@@ -1132,9 +1152,16 @@ async fn run_completion_action(
             }))
             .await
         }
-        CompletionAction::Show => {
-            show_command(&state.run_id, None, false, false, false, false, None)
-        }
+        CompletionAction::Show => show_command(ShowCommandArgs {
+            run_id: &state.run_id,
+            turn: None,
+            diff: false,
+            raw: None,
+            why_failed: false,
+            json_output: false,
+            flight: false,
+            file: None,
+        }),
         CompletionAction::Quit => Ok(()),
     };
     if let Err(err) = &action_result {
