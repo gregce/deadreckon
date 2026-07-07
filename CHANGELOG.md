@@ -1,5 +1,27 @@
 # Changelog
 
+## Orchestration completion polish — 2026-07-07
+
+Fixes four wonky moments in the full-plan orchestration completion experience,
+found by a real run:
+
+- The synthetic run that lands an orchestration's result no longer carries an
+  internal label as its goal. It was created with `goal = "merge orchestration
+  plan <goal>"`, which surfaced as a confusing goal line in `status` and — via
+  `task_key` — as a suggested export dir named `./merge-orchestration-plan`. The
+  merged run now carries the operator's goal verbatim.
+- The guided `start` completion footer recommends the right next action. A
+  synchronous full-plan returns already complete, but the footer always said
+  "attach to observe the launched work"; it now recommends `finish` when the
+  work is done and keeps `attach` only while it is still in flight.
+- `deadreckon status` on a merged run no longer reads as broken. The merge run
+  does no provider work, so its own spend/wall/turns are ~0; status now adds a
+  `merge:` line naming the source plan and a `rollup:` line with the child runs'
+  real spend, wall time, and turns (the orchestration's true cost).
+- Suggested and default export directories trim to a word boundary
+  (`./build-a-comprehensive`) instead of a mid-word cut
+  (`./build-a-comprehensive-fi`).
+
 ## 0.5.0 — The harness plots the course — 2026-07-03
 
 Makes `deadreckon start` the only launch decision a user needs. One milestone
