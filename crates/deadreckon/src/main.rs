@@ -4549,12 +4549,9 @@ fn failed_plan_result_surface(plan: &Plan, verb: &str) -> VerdictSurface {
 fn default_plan_materialize_dest(plan: &Plan) -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join(
-            deadreckon_core::paths::task_key(&plan.root_goal)
-                .chars()
-                .take(24)
-                .collect::<String>(),
-        )
+        .join(dest_slug(&deadreckon_core::paths::task_key(
+            &plan.root_goal,
+        )))
 }
 
 fn plan_apply_git_root(plan: &Plan) -> Result<Option<PathBuf>> {
@@ -7342,7 +7339,11 @@ fn create_merged_plan_run(
     let mut state = create_run(
         paths,
         RunOptions {
-            goal: format!("merge orchestration plan {}", plan.root_goal),
+            // The merged run IS the delivered result of the operator's goal, so it
+            // carries that goal verbatim. Prefixing an internal label ("merge
+            // orchestration plan …") leaked into the status goal line and, via
+            // task_key, into the suggested export dir (./merge-orchestration-plan).
+            goal: plan.root_goal.clone(),
             cwd,
             sandbox: "none".to_string(),
             provider: None,
@@ -7707,10 +7708,7 @@ fn print_merge_finished(
     secondary.push(format!(
         "deadreckon export {} --dest ./{}",
         id,
-        deadreckon_core::paths::task_key(&plan.root_goal)
-            .chars()
-            .take(24)
-            .collect::<String>()
+        dest_slug(&deadreckon_core::paths::task_key(&plan.root_goal))
     ));
     secondary.push(format!("deadreckon show {id}"));
     let completed = plan
@@ -10960,6 +10958,143 @@ fn status_command(run_id: Option<String>, all: bool, plain: bool, json_output: b
     Ok(())
 }
 
+/// A merge run is the synthetic run that lands an orchestration's result — it
+/// does no provider work itself, so its own spend/wall/turns are ~0 and read as
+/// broken in `status`. When the shown run is a plan's merged run, roll up the
+/// child runs' real metrics so the operator sees the orchestration's true cost.
+struct MergeRunRollup {
+    plan_prefix: String,
+    children: usize,
+    total_usd: f64,
+    wall_seconds: f64,
+    turns: usize,
+    any_estimated: bool,
+    partial: bool,
+}
+
+fn merge_run_rollup(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+) -> Option<MergeRunRollup> {
+    // A merged plan run is created with no provider (see create_merged_plan_run).
+    // Gate the plan scan on that so ordinary runs skip it on every status call.
+    if state.provider.is_some() {
+        return None;
+    }
+    let plan_entry = commands::inspection::list_plan_entries(paths, None)
+        .ok()?
+        .into_iter()
+        .find(|plan| plan.merged_run_id.as_deref() == Some(state.run_id.as_str()))?;
+    let plan = deadreckon_core::plan::load_plan(paths, &plan_entry.plan_id).ok()?;
+    let mut rollup = MergeRunRollup {
+        plan_prefix: run_prefix(&plan.plan_id),
+        children: 0,
+        total_usd: 0.0,
+        wall_seconds: 0.0,
+        turns: 0,
+        any_estimated: false,
+        partial: false,
+    };
+    let mut loaded = 0usize;
+    for task in &plan.tasks {
+        let (Some(run_id), Some(scope)) =
+            (task.child_run_id.as_deref(), task.child_scope.as_deref())
+        else {
+            continue;
+        };
+        rollup.children += 1;
+        let path = paths.run_root(scope, run_id).join("state.json");
+        let Ok(child) = deadreckon_core::state::load_state(&path) else {
+            continue;
+        };
+        if let Ok(summary) = deadreckon_core::state::spend_summary(&child) {
+            rollup.total_usd += summary.total_usd;
+            rollup.wall_seconds += summary.wall_seconds;
+            rollup.turns += summary.turns;
+            rollup.any_estimated |= summary.any_estimated_turn;
+            loaded += 1;
+        }
+    }
+    if rollup.children == 0 {
+        return None;
+    }
+    rollup.partial = loaded < rollup.children;
+    Some(rollup)
+}
+
+/// Shorten a task-key slug for a suggested/default export directory, trimming
+/// back to a hyphen boundary so it reads as whole words (`./build-a-comprehensive`)
+/// instead of a mid-word cut (`./build-a-comprehensive-fi`). task_key is ASCII.
+fn dest_slug(task_key: &str) -> String {
+    const MAX: usize = 24;
+    if task_key.len() <= MAX {
+        return task_key.trim_end_matches('-').to_string();
+    }
+    let head = &task_key[..MAX];
+    let trimmed = match head.rfind('-') {
+        Some(idx) if idx >= 8 => &head[..idx],
+        _ => head,
+    };
+    trimmed.trim_end_matches('-').to_string()
+}
+
+fn merge_rollup_label(rollup: &MergeRunRollup) -> String {
+    let estimate = if rollup.any_estimated { "~" } else { "" };
+    let partial = if rollup.partial { " (partial)" } else { "" };
+    format!(
+        "{estimate}${:.6} · wall {:.1}s · {} turns across {} children{partial}",
+        rollup.total_usd, rollup.wall_seconds, rollup.turns, rollup.children
+    )
+}
+
+#[cfg(test)]
+mod orchestration_status_tests {
+    use super::{MergeRunRollup, dest_slug, merge_rollup_label};
+
+    #[test]
+    fn dest_slug_trims_to_a_word_boundary() {
+        // The reported ugly case truncated mid-word at 24 chars.
+        assert_eq!(
+            dest_slug("build-a-comprehensive-financial-net-worth"),
+            "build-a-comprehensive"
+        );
+        // Short slugs pass through, sans trailing dash.
+        assert_eq!(dest_slug("financial-dashboard"), "financial-dashboard");
+        assert_eq!(dest_slug("networth-"), "networth");
+    }
+
+    #[test]
+    fn merge_rollup_label_reports_child_totals() {
+        let label = merge_rollup_label(&MergeRunRollup {
+            plan_prefix: "6119e8b2".to_string(),
+            children: 4,
+            total_usd: 0.42,
+            wall_seconds: 312.5,
+            turns: 58,
+            any_estimated: false,
+            partial: false,
+        });
+        assert!(label.contains("wall 312.5s"));
+        assert!(label.contains("58 turns across 4 children"));
+        assert!(!label.contains("partial"));
+    }
+
+    #[test]
+    fn merge_rollup_label_marks_partial_and_estimated() {
+        let label = merge_rollup_label(&MergeRunRollup {
+            plan_prefix: "abc".to_string(),
+            children: 3,
+            total_usd: 1.0,
+            wall_seconds: 10.0,
+            turns: 5,
+            any_estimated: true,
+            partial: true,
+        });
+        assert!(label.starts_with('~'));
+        assert!(label.contains("(partial)"));
+    }
+}
+
 fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
     let paths = DeadreckonPaths::discover();
     let short = run_prefix(&state.run_id);
@@ -11004,6 +11139,23 @@ fn print_status_report(state: &deadreckon_core::PipelineState, _plain: bool) {
                 "billing".to_string(),
                 "subscription: cost is not metered, time is the budget".to_string(),
             ),
+        );
+    }
+    if let Some(rollup) = merge_run_rollup(&paths, state) {
+        let insert_at = rows.len() - 1;
+        rows.insert(
+            insert_at,
+            (
+                "merge".to_string(),
+                format!(
+                    "plan {} · {} children (this run only lands the result)",
+                    rollup.plan_prefix, rollup.children
+                ),
+            ),
+        );
+        rows.insert(
+            insert_at + 1,
+            ("rollup".to_string(), merge_rollup_label(&rollup)),
         );
     }
     if let Some(sleep) = sleep_status_for_working(&state.working_dir) {
@@ -11527,7 +11679,7 @@ fn lifecycle_actions(state: &deadreckon_core::PipelineState) -> (HintLine, Vec<H
             ],
         );
     }
-    let task_prefix = state.task_key.chars().take(24).collect::<String>();
+    let task_prefix = dest_slug(&state.task_key);
     (
         HintLine {
             label: "next".to_string(),

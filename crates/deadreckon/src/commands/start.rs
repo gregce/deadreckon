@@ -2877,7 +2877,7 @@ async fn dispatch_start_command(
                 && !quiet
                 && let Some(run) = newest_start_run(&paths, &before, &goal)?
             {
-                print_start_lifecycle_footer("run", &run.run_id);
+                print_start_lifecycle_footer("run", &run.run_id, run_launch_state(run.status));
                 maybe_start_attach(&run.run_id, &args_snapshot).await;
             }
             result
@@ -2925,7 +2925,7 @@ async fn dispatch_start_command(
                     commands::course::save_launch_plan_best_effort(root, &launch_plan);
                 }
                 if !quiet {
-                    print_start_lifecycle_footer("run", &run.run_id);
+                    print_start_lifecycle_footer("run", &run.run_id, run_launch_state(run.status));
                     maybe_start_attach(&run.run_id, &args_snapshot).await;
                 }
             }
@@ -2983,7 +2983,11 @@ async fn dispatch_start_command(
                     &launch_plan,
                 );
                 if !quiet {
-                    print_start_lifecycle_footer("campaign", &plan.plan_id);
+                    print_start_lifecycle_footer(
+                        "campaign",
+                        &plan.plan_id,
+                        plan_launch_state(&plan),
+                    );
                     maybe_start_attach(&plan.plan_id, &args_snapshot).await;
                 }
             }
@@ -3094,7 +3098,7 @@ async fn dispatch_start_command(
                     &launch_plan,
                 );
                 if !quiet {
-                    print_start_lifecycle_footer("plan", &plan.plan_id);
+                    print_start_lifecycle_footer("plan", &plan.plan_id, plan_launch_state(&plan));
                     maybe_start_attach(&plan.plan_id, &args_snapshot).await;
                 }
             }
@@ -3155,12 +3159,85 @@ fn newest_start_plan(
     Ok(plans.pop())
 }
 
-fn print_start_lifecycle_footer(kind: &str, id: &str) {
+/// Whether the work a guided `start` launched is still running (recommend
+/// attach to observe) or has already finished (recommend finish to land it).
+/// A synchronous full-plan/run returns to the footer already terminal, so a
+/// fixed "attach to observe" recommendation pointed at nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StartLaunchState {
+    InFlight,
+    Completed,
+}
+
+fn run_launch_state(status: RunStatus) -> StartLaunchState {
+    match status {
+        RunStatus::Completed => StartLaunchState::Completed,
+        _ => StartLaunchState::InFlight,
+    }
+}
+
+fn plan_launch_state(plan: &super::inspection::PlanListEntry) -> StartLaunchState {
+    plan_launch_state_from(plan.status, plan.completed_children, plan.total_children)
+}
+
+fn plan_launch_state_from(
+    status: deadreckon_core::PlanStatus,
+    completed_children: usize,
+    total_children: usize,
+) -> StartLaunchState {
+    let all_children_done = total_children > 0 && completed_children == total_children;
+    match status {
+        deadreckon_core::PlanStatus::Merged => StartLaunchState::Completed,
+        deadreckon_core::PlanStatus::Forked if all_children_done => StartLaunchState::Completed,
+        _ => StartLaunchState::InFlight,
+    }
+}
+
+/// Pure (summary, detail, recommended-verb) for the footer — unit-tested so the
+/// recommendation tracks the launch state instead of always saying "attach".
+fn start_footer_content(
+    kind: &str,
+    launch_state: StartLaunchState,
+) -> (String, &'static str, &'static str) {
+    match launch_state {
+        StartLaunchState::Completed => (
+            format!("DeadReckon finished the guided start {kind}; all work is complete."),
+            "finish lands the result — apply it to your git source, or export with --dest; attach still replays what happened.",
+            "finish",
+        ),
+        StartLaunchState::InFlight => (
+            format!("DeadReckon launched the guided start path as a {kind}."),
+            "The id now exists; attach is the safest first command for observing the launched work before applying, finishing, or stopping it.",
+            "attach",
+        ),
+    }
+}
+
+fn print_start_lifecycle_footer(kind: &str, id: &str, launch_state: StartLaunchState) {
     let id = run_prefix(id);
     let attach = format!("deadreckon attach {id}");
     let status = format!("deadreckon status {id}");
     let kill = format!("deadreckon kill {id}");
     let finish = format!("deadreckon finish {id}");
+    let (summary, detail, recommended_verb) = start_footer_content(kind, launch_state);
+    let (recommended, secondary): (&str, Vec<(&str, &str)>) = match launch_state {
+        StartLaunchState::Completed => (
+            finish.as_str(),
+            vec![
+                ("Secondary", status.as_str()),
+                ("Secondary", attach.as_str()),
+            ],
+        ),
+        StartLaunchState::InFlight => (
+            attach.as_str(),
+            vec![
+                ("Secondary", status.as_str()),
+                ("Secondary", kill.as_str()),
+                ("Secondary", finish.as_str()),
+            ],
+        ),
+    };
+    debug_assert!(recommended.contains(recommended_verb));
     print!(
         "{}",
         VerdictSurface::must_new(
@@ -3168,22 +3245,73 @@ fn print_start_lifecycle_footer(kind: &str, id: &str) {
             "start",
             Some(&id),
             ExplanationPanel::new(
-                format!("DeadReckon launched the guided start path as a {kind}."),
-                "The id now exists; attach is the safest first command for observing the launched work before applying, finishing, or stopping it.",
+                summary,
+                detail,
                 vec![
                     ("target".to_string(), kind.to_string()),
                     ("id".to_string(), id.clone()),
                 ],
             ),
-            vec![("Recommended", attach.as_str())],
-            vec![
-                ("Secondary", status.as_str()),
-                ("Secondary", kill.as_str()),
-                ("Secondary", finish.as_str()),
-            ],
+            vec![("Recommended", recommended)],
+            secondary,
         )
         .render_plain(!completion_hints_enabled(false))
     );
+}
+
+#[cfg(test)]
+mod start_footer_tests {
+    use super::{StartLaunchState, plan_launch_state_from, run_launch_state, start_footer_content};
+    use deadreckon_core::{PlanStatus, RunStatus};
+
+    #[test]
+    fn completed_launch_recommends_finish_not_attach() {
+        let (summary, detail, verb) = start_footer_content("plan", StartLaunchState::Completed);
+        assert_eq!(verb, "finish");
+        assert!(summary.contains("finished"));
+        assert!(detail.contains("finish lands the result"));
+        assert!(!detail.starts_with("The id now exists"));
+    }
+
+    #[test]
+    fn in_flight_launch_recommends_attach() {
+        let (_summary, _detail, verb) = start_footer_content("run", StartLaunchState::InFlight);
+        assert_eq!(verb, "attach");
+    }
+
+    #[test]
+    fn completed_run_maps_to_completed_state() {
+        assert_eq!(
+            run_launch_state(RunStatus::Completed),
+            StartLaunchState::Completed
+        );
+        assert_eq!(
+            run_launch_state(RunStatus::Executing),
+            StartLaunchState::InFlight
+        );
+    }
+
+    #[test]
+    fn forked_plan_with_all_children_done_is_completed() {
+        // The reported case: a full-plan that ran all 4 children to completion
+        // returned to the footer as Forked 4/4 — the next action is finish.
+        assert_eq!(
+            plan_launch_state_from(PlanStatus::Forked, 4, 4),
+            StartLaunchState::Completed
+        );
+        assert_eq!(
+            plan_launch_state_from(PlanStatus::Forked, 2, 4),
+            StartLaunchState::InFlight
+        );
+        assert_eq!(
+            plan_launch_state_from(PlanStatus::Merged, 0, 0),
+            StartLaunchState::Completed
+        );
+        assert_eq!(
+            plan_launch_state_from(PlanStatus::Pending, 0, 4),
+            StartLaunchState::InFlight
+        );
+    }
 }
 
 #[cfg(test)]
