@@ -3735,6 +3735,7 @@ struct ConfigDefaults {
     prevent_sleep: Option<String>,
     plain: Option<bool>,
     ui_motion: Option<String>,
+    ui_input_latency_budget_ms: Option<u64>,
     doc_provider: Option<String>,
     doc_skill: Option<String>,
     doc_subskills: Option<Vec<String>>,
@@ -3779,6 +3780,9 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
         ui_motion: get_toml_path(&root, "ui.motion")
             .and_then(toml::Value::as_str)
             .map(ToString::to_string),
+        ui_input_latency_budget_ms: get_toml_path(&root, "ui.input_latency_budget_ms")
+            .and_then(toml::Value::as_integer)
+            .and_then(|ms| u64::try_from(ms).ok()),
         doc_provider: get_toml_path(&root, "defaults.doc_provider")
             .and_then(toml::Value::as_str)
             .map(ToString::to_string),

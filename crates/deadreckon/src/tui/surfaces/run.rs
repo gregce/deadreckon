@@ -90,12 +90,21 @@ pub(crate) fn render_attach(
     } else if tui_state.docs_open && state.status == RunStatus::Completed {
         render_run_docs(frame, layout.activity, state, tui_state);
     } else if tui_state.view.is_narrative() {
+        // The attach loop caches a RunView-backed projection; this cold path
+        // (first frame before the cache fills) builds one from the same shared
+        // model so the pane never renders a RunView-less picture. Reading the
+        // run files here is bounded to that single uncached frame.
+        let run_view = if tui_state.narrative_projection.is_none() {
+            deadreckon_core::RunView::from_state(state).ok()
+        } else {
+            None
+        };
         render_run_narrative(
             frame,
             layout.activity,
             &RunNarrativeRenderInput {
                 state,
-                run_view: None,
+                run_view: run_view.as_ref(),
                 spend,
                 traces,
                 events,

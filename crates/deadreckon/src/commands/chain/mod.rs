@@ -2216,11 +2216,12 @@ async fn chain_attach_tui(
     let mut tui_state = ChainAttachTuiState::new(narrative_open, motion_policy);
     let mut event_tail = AttachJsonlTail::<ChainEvent>::new(paths.chain_events(chain_id));
     let mut show_help = false;
-    let mut input_events = AttachInputEvents::new(AttachTickBudget::default());
+    let tick_budget = crate::commands::attach_runtime::attach_tick_budget_from_config(paths);
+    let mut input_events = AttachInputEvents::new(tick_budget);
     let mut pending_input_at: Option<Instant> = None;
 
     let result = loop {
-        let budget = AttachTickBudget::default();
+        let budget = tick_budget;
         let mut tick = AttachTickTiming::new(AttachSurface::Chain, budget);
         let stage_started = Instant::now();
         let chain = load_chain(paths, chain_id)?;

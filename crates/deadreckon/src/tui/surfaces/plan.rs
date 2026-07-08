@@ -282,11 +282,11 @@ pub(crate) fn plan_attach_footer(
     let mut has_primary_footer_action = false;
     let mut footer = if view.is_narrative() {
         format!(
-            "n narrative/activity  v visual={}  r refresh  |  arrows/Tab child  Enter zoom  q detach",
+            "n narrative/activity  v visual={}  r refresh  |  arrows/Tab child  Enter zoom, again attach run  q detach",
             visual.label()
         )
     } else {
-        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter zoom  |  Esc backs out of zoom  |  n narrative"
+        "q/Esc/Ctrl-D detach  |  arrows/Tab focus child  |  Enter zoom, again attach run  |  Esc backs out of zoom  |  n narrative"
             .to_string()
     };
     if let Some(task) = plan.tasks.get(selected) {

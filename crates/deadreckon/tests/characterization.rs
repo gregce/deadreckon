@@ -175,6 +175,156 @@ fn characterization_goldens_unchanged_after_split() {
 }
 
 #[test]
+fn attach_characterization_goldens_unchanged() {
+    // Logbook P9: attach's projections are backed by the shared RunView model;
+    // the pinned plain-attach frame must stay byte-identical to the golden
+    // recorded before the rewire. Same command, same golden — this test names
+    // the rider contract so the pin survives future refactors by name.
+    let temp = fixed_length_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let run = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "run",
+            "attach characterize",
+            "--smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "1",
+            "--yes",
+            "--fresh",
+            "--no-docs",
+            "--plain",
+        ])
+        .output()
+        .expect("smoke run");
+    assert_success(&run);
+    let run_prefix = started_run_prefix(&stdout(&run));
+
+    let attach = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["attach", &run_prefix, "--plain"])
+        .output()
+        .expect("attach");
+
+    assert_success(&attach);
+    assert_capture_matches_golden("attach-off-tty-frame.golden", &temp, &attach);
+}
+
+// Logbook P4/P6/P7 parity guards: `show`, `verdict`, and `doc` are projections
+// of the shared RunView model; these goldens pin their default output so a
+// future RunView change cannot silently drift what the operator reads.
+
+#[test]
+fn show_default_output_matches_characterization_golden() {
+    let temp = fixed_length_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let run = smoke_run(&paths, &repo);
+    let run_prefix = started_run_prefix(&stdout(&run));
+
+    let show = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["show", &run_prefix])
+        .output()
+        .expect("show");
+
+    assert_success(&show);
+    assert_capture_matches_golden("show-default-run.golden", &temp, &show);
+}
+
+#[test]
+fn verdict_default_output_matches_characterization_golden() {
+    let temp = fixed_length_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let run = smoke_run(&paths, &repo);
+    let run_prefix = started_run_prefix(&stdout(&run));
+
+    let verdict = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["verdict", &run_prefix])
+        .output()
+        .expect("verdict");
+
+    assert_success(&verdict);
+    assert_capture_matches_golden("verdict-default-run.golden", &temp, &verdict);
+}
+
+#[test]
+fn doc_default_output_matches_characterization_golden() {
+    let temp = fixed_length_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let run = smoke_run(&paths, &repo);
+    let run_prefix = started_run_prefix(&stdout(&run));
+
+    // The smoke run generates no docs (--no-docs); write a deterministic
+    // narrative into the promoted artifact so `doc` has real content to
+    // project through RunView.why.
+    let working = single_library_working_dir(&paths);
+    let docs = working.join("docs");
+    fs::create_dir_all(&docs).expect("docs dir");
+    fs::write(
+        docs.join("RUN-NARRATIVE.md"),
+        "# Run narrative\n\ncharacterized narrative body\n",
+    )
+    .expect("narrative doc");
+
+    let doc = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["doc", &run_prefix])
+        .output()
+        .expect("doc");
+
+    assert_success(&doc);
+    assert_capture_matches_golden("doc-default-run.golden", &temp, &doc);
+}
+
+fn smoke_run(paths: &DeadreckonPaths, repo: &Path) -> Output {
+    let run = deadreckon(paths)
+        .current_dir(repo)
+        .args([
+            "run",
+            "attach characterize",
+            "--smoke",
+            "--sandbox",
+            "none",
+            "--max-spend",
+            "1",
+            "--yes",
+            "--fresh",
+            "--no-docs",
+            "--plain",
+        ])
+        .output()
+        .expect("smoke run");
+    assert_success(&run);
+    run
+}
+
+fn single_library_working_dir(paths: &DeadreckonPaths) -> PathBuf {
+    let library = paths.home().join("library");
+    let scope = fs::read_dir(&library)
+        .expect("library dir")
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.path().is_dir())
+        .expect("one library scope");
+    fs::read_dir(scope.path())
+        .expect("scope dir")
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.path().is_dir())
+        .expect("one library artifact")
+        .path()
+}
+
+#[test]
 fn error_footers_match_canonical_goldens() {
     let temp = fixed_length_tempdir();
     let plain = temp.path().join("plain");
@@ -309,7 +459,30 @@ fn normalize_text(temp: &TempDir, text: &str) -> String {
     for path in temp_path_variants(temp.path()) {
         normalized = normalized.replace(&path, "<TMP>");
     }
+    // The deadreckon source checkout leaks into output that embeds skill
+    // paths (e.g. `show`'s state dump); normalize it so goldens survive
+    // being recorded on one machine and checked on another.
+    if let Some(src_root) = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .map(|root| root.display().to_string())
+    {
+        normalized = normalized.replace(&src_root, "<SRC>");
+    }
     for (pattern, replacement) in [
+        // Duration fields must normalize before the hex rules: a float's
+        // digit run is also valid hex and would otherwise be half-eaten.
+        (
+            r#""([a-z_]*wall_seconds)": [0-9.]+"#,
+            r#""$1": "<DURATION>""#,
+        ),
+        // Build-dir contents are never part of the contract; rustc's
+        // incremental artifact names vary per run and per toolchain.
+        (r#""[^"]*/working/target/[^"]*""#, r#""<BUILD_ARTIFACT>""#),
+        (r#""latency_ms": \d+"#, r#""latency_ms": "<LATENCY>""#),
+        // Captured tool output embeds cargo's timing and lock chatter.
+        (r"(?: *Blocking waiting for file lock on [a-z ]+\\n)+", ""),
+        (r"target\(s\) in [0-9.]+s", "target(s) in <DURATION>"),
         (r"([0-9a-f]{8,})(\.\.\.)", "<HEX>$2"),
         (r"\b[0-9a-f]{32}\b", "<ID32>"),
         (r"\b[0-9a-f]{12,40}\b", "<HEX>"),
@@ -319,6 +492,7 @@ fn normalize_text(temp: &TempDir, text: &str) -> String {
             r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ UTC",
             "<TIMESTAMP>",
         ),
+        (r"\d{4}-\d{2}-\d{2}T[0-9:.]+Z", "<TIMESTAMP>"),
         (r"wall [0-9]+(?:\.[0-9]+)?s", "wall <DURATION>"),
         (
             r"attach-characterize-[0-9a-f]{4}",
@@ -330,7 +504,27 @@ fn normalize_text(temp: &TempDir, text: &str) -> String {
             .replace_all(&normalized, replacement)
             .into_owned();
     }
-    normalized
+    collapse_adjacent_build_artifact_lines(&normalized)
+}
+
+/// The number of rustc incremental artifacts varies with the toolchain's
+/// codegen-unit split, so after tokenizing them, fold adjacent identical
+/// `<BUILD_ARTIFACT>` lines into one — the golden pins "build output was
+/// listed", not how many object files this rustc emitted.
+fn collapse_adjacent_build_artifact_lines(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if line.contains("<BUILD_ARTIFACT>") && out.last().is_some_and(|previous| *previous == line)
+        {
+            continue;
+        }
+        out.push(line);
+    }
+    let mut collapsed = out.join("\n");
+    if text.ends_with('\n') {
+        collapsed.push('\n');
+    }
+    collapsed
 }
 
 fn temp_path_variants(path: &Path) -> Vec<String> {
