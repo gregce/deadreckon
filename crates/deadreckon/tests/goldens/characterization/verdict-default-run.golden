@@ -1,0 +1,22 @@
+status: 0
+--- stdout ---
+verified run <ID32>
+
+Explanation
+Re-running this run's acceptance checks still passes.
+Valid signed marker, and every must-pass check passes now.
+
+Evidence
+checks: 1/1 passed
+changed files: +0 ~0 -0
+provenance: deadreckon-gated (valid)
+check · pass: cargo test
+
+Recommended
+deadreckon finish <ID8>
+
+Secondary
+deadreckon show <ID8>
+deadreckon verdict --all
+
+--- stderr ---

@@ -1,0 +1,196 @@
+status: 0
+--- stdout ---
+state     : <TMP>/home/runstate/repo-<ID8>/runs/<ID32>/state.js
+            on
+launch-dir: <TMP>/repo
+artifact  : <TMP>/home/library/repo-<ID8>/<ID32>
+note: launch-dir is unchanged; completed output lives in artifact
+Mode fresh
+Acceptance gate: PASSED 1/1; tests modified this run: no
+AcceptanceSpec <TMP>/home/runstate/repo-<ID8>/runs/<ID32>/acceptance.yaml
+{
+  "version": 1,
+  "goal": "attach characterize",
+  "task_key": "attach-characterize-<ID8>",
+  "run_id": "<ID32>",
+  "scope": "repo-<ID8>",
+  "status": "completed",
+  "current_phase_id": 60,
+  "started_at": "<TIMESTAMP>",
+  "updated_at": "<TIMESTAMP>",
+  "cwd": "<TMP>/repo",
+  "run_root": "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>",
+  "working_dir": "<TMP>/home/library/repo-<ID8>/<ID32>",
+  "skill_name": "default-coding",
+  "skill_path": "<SRC>/skills/default-coding/SKILL.md",
+  "sandbox": "none",
+  "provider": "smoke",
+  "max_spend_usd": 1.0,
+  "max_wall_seconds": "<DURATION>",
+  "total_spend_usd": 0.0,
+  "total_wall_seconds": "<DURATION>",
+  "turn": 3,
+  "pause_reason": null,
+  "failure_reason": null,
+  "child_pids": [],
+  "killed_at": null,
+  "promoted_library_dir": "<TMP>/home/library/repo-<ID8>/<ID32>",
+  "phases": [
+    {
+      "id": 0,
+      "name": "init",
+      "status": "planned",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 10,
+      "name": "plan",
+      "status": "pending",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 20,
+      "name": "provider",
+      "status": "executing",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 30,
+      "name": "sandbox",
+      "status": "executing",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 40,
+      "name": "execute",
+      "status": "executing",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 50,
+      "name": "verify",
+      "status": "pending",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    },
+    {
+      "id": 60,
+      "name": "complete",
+      "status": "completed",
+      "plan_path": null,
+      "updated_at": "<TIMESTAMP>"
+    }
+  ]
+}
+provenance:
+{
+  "timestamp": "<TIMESTAMP>",
+  "prompt_id": "turn-1",
+  "model": "local-scripted-smoke",
+  "tool_call_id": "smoke-bash-1",
+  "session_id": "<ID32>",
+  "files": [
+    "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/Cargo.lock",
+    "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/Cargo.toml",
+    "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/implementation-notes.html",
+    "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/src/main.rs",
+    "<BUILD_ARTIFACT>",
+    "<BUILD_ARTIFACT>"
+  ]
+}
+{
+  "timestamp": "<TIMESTAMP>",
+  "prompt_id": "turn-2",
+  "model": "local-scripted-smoke",
+  "tool_call_id": "smoke-bash-2",
+  "session_id": "<ID32>",
+  "files": [
+    "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/README.md",
+    "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/implementation-notes.html"
+  ]
+}
+traces:
+{
+  "timestamp": "<TIMESTAMP>",
+  "run_id": "<ID32>",
+  "turn": 1,
+  "event": "llm.complete",
+  "latency_ms": "<LATENCY>",
+  "detail": {
+    "model": "local-scripted-smoke",
+    "provider": "smoke",
+    "tool_call_id": "llm-turn-1",
+    "trace": {
+      "kind": "scripted_smoke",
+      "remaining_steps": 2
+    }
+  }
+}
+{
+  "timestamp": "<TIMESTAMP>",
+  "run_id": "<ID32>",
+  "turn": 1,
+  "event": "tool.bash",
+  "latency_ms": "<LATENCY>",
+  "detail": {
+    "command": "mkdir -p src\nprintf '[package]\\nname = \"working\"\\nversion = \"0.1.0\"\\nedition = \"2024\"\\n\\n[dependencies]\\n\\n[workspace]\\n' > Cargo.toml\nprintf 'fn main() {\\n    println!(\"hello from deadreckon\");\\n}\\n' > src/main.rs\nprintf '<!doctype html>\\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Implementation notes</title></head><body><h1>Implementation notes</h1><section id=\"design-decisions\"><h2>Design decisions</h2><p>Use a tiny Rust binary as the smoke artifact.</p></section><section id=\"deviations\"><h2>Deviations</h2><p>None.</p></section><section id=\"tradeoffs\"><h2>Tradeoffs</h2><p>Keep the smoke project minimal instead of adding dependencies.</p></section><section id=\"open-questions\"><h2>Open questions</h2><p>None.</p></section></body></html>\\n' > implementation-notes.html\ncargo test --manifest-path Cargo.toml",
+    "status_code": 0,
+    "stderr": "   Compiling working v0.1.0 (<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in <DURATION>\n     Running unittests src/main.rs (target/debug/deps/working-<HEX>)\n",
+    "stdout": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+    "tool_call_id": "smoke-bash-1",
+    "warning": "sandbox backend none is unsafe; use only for explicit local verification"
+  }
+}
+{
+  "timestamp": "<TIMESTAMP>",
+  "run_id": "<ID32>",
+  "turn": 2,
+  "event": "llm.complete",
+  "latency_ms": "<LATENCY>",
+  "detail": {
+    "model": "local-scripted-smoke",
+    "provider": "smoke",
+    "tool_call_id": "llm-turn-2",
+    "trace": {
+      "kind": "scripted_smoke",
+      "remaining_steps": 1
+    }
+  }
+}
+{
+  "timestamp": "<TIMESTAMP>",
+  "run_id": "<ID32>",
+  "turn": 2,
+  "event": "tool.bash",
+  "latency_ms": "<LATENCY>",
+  "detail": {
+    "command": "printf '# tiny hello rust\\n\\nGenerated by deadreckon --smoke.\\n' > README.md\nprintf '<!doctype html>\\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Implementation notes</title></head><body><h1>Implementation notes</h1><section id=\"design-decisions\"><h2>Design decisions</h2><p>Use a tiny Rust binary as the smoke artifact.</p></section><section id=\"deviations\"><h2>Deviations</h2><p>None.</p></section><section id=\"tradeoffs\"><h2>Tradeoffs</h2><p>Keep the smoke project minimal instead of adding dependencies.</p></section><section id=\"open-questions\"><h2>Open questions</h2><p>None after adding README.</p></section></body></html>\\n' > implementation-notes.html",
+    "status_code": 0,
+    "stderr": "",
+    "stdout": "",
+    "tool_call_id": "smoke-bash-2",
+    "warning": "sandbox backend none is unsafe; use only for explicit local verification"
+  }
+}
+{
+  "timestamp": "<TIMESTAMP>",
+  "run_id": "<ID32>",
+  "turn": 3,
+  "event": "llm.complete",
+  "latency_ms": "<LATENCY>",
+  "detail": {
+    "model": "local-scripted-smoke",
+    "provider": "smoke",
+    "tool_call_id": "llm-turn-3",
+    "trace": {
+      "kind": "scripted_smoke",
+      "remaining_steps": 0
+    }
+  }
+}
+--- stderr ---

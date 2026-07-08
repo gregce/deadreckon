@@ -53,6 +53,19 @@ impl VoyageZoomState {
     }
 }
 
+/// Enter on a node that is already zoomed promotes: when the node is backed by
+/// a child run, the attach session leaves the in-frame detail pane and opens
+/// the full run surface for it. First Enter (or Enter on a task with no child
+/// run yet) stays an in-frame zoom.
+pub(crate) fn zoomed_run_to_promote(
+    zoom: &VoyageZoomState,
+    target: &NodeId,
+    child_run_id: Option<&str>,
+) -> Option<String> {
+    let run_id = child_run_id?;
+    (zoom.zoomed() == Some(target)).then(|| run_id.to_string())
+}
+
 impl VoyagePaneState {
     #[cfg(test)]
     pub(crate) fn selected_path(&self) -> &[String] {

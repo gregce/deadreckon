@@ -3333,7 +3333,9 @@ Event folds update node status without rebuilding the tree.
 Attach loops use crossterm `EventStream` plus durable tail wakeups/adaptive
 backoff instead of a fixed 250ms poll. `AttachTickTiming` records load, JSONL
 tailing, draw, input poll, provider refresh polling, and `InputToFrame`; the
-budget tests pin input responsiveness and event-storm coalescing. Render paths
+budget tests pin input responsiveness and event-storm coalescing. The
+input-to-frame budget defaults to 32ms and is operator-tunable via
+`[ui] input_latency_budget_ms` (clamped to 8..=1000ms). Render paths
 stay provider-free and write-free. Background narrative refresh jobs are polled
 between frames and can improve a later frame, never block the current one.
 

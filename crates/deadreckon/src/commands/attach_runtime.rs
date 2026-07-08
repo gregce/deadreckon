@@ -31,6 +31,27 @@ impl Default for AttachTickBudget {
     }
 }
 
+impl AttachTickBudget {
+    /// Apply the operator's `[ui] input_latency_budget_ms` override. Values
+    /// are clamped to [8, 1000] — 0 would make every frame a violation and
+    /// anything past a second is no longer an input-latency budget.
+    pub(crate) fn with_input_latency_ms(mut self, ms: Option<u64>) -> Self {
+        if let Some(ms) = ms {
+            self.max_input_to_frame_ms = ms.clamp(8, 1000);
+        }
+        self
+    }
+}
+
+/// The tick budget every attach loop starts from: the built-in defaults with
+/// the `[ui] input_latency_budget_ms` config override applied.
+pub(crate) fn attach_tick_budget_from_config(paths: &DeadreckonPaths) -> AttachTickBudget {
+    let configured = crate::config_defaults(paths)
+        .ok()
+        .and_then(|defaults| defaults.ui_input_latency_budget_ms);
+    AttachTickBudget::default().with_input_latency_ms(configured)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttachSurface {
     Run,

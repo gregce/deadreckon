@@ -1,5 +1,33 @@
 # Changelog
 
+## Attach plan-run navigation + audit remediation — 2026-07-08
+
+Closes the gaps a post-hoc audit of the Helm/Contract/Logbook slices found,
+and makes attach navigation bidirectional:
+
+- attach now round-trips between the plan surface and full run surfaces:
+  Enter on a zoomed run node in the voyage tree promotes to the complete run
+  frame (narrative, visual map, live files, timeline, spine), and
+  b/Backspace/q/Esc there pops back to the plan surface instead of detaching
+  to the shell — the footer's "back to plan" is now literally true, from
+  plan attach, `attach <plan>:<task>`, and campaign drill-in alike. Detach
+  from the plan surface as before.
+- Logbook P9 landed for real: the run surface's narrative cold path builds
+  from the shared `RunView` (the loop already did), and new parity depth
+  tests pin attach's timeline turn count and why-panel evidence to
+  `RunView.turns` / `RunView.proof`, plus the attach characterization golden
+  under its rider name.
+- the five missing Logbook golden-parity guards now exist: `show`, `verdict`,
+  and `doc` default outputs are characterization-pinned (with normalization
+  for build-dir noise, ISO timestamps, and latencies), `doc` provably sources
+  narrative/decisions paths from `RunView.why`, and `report`'s footer names
+  exactly one primary action.
+- `[ui] input_latency_budget_ms` exists as the Helm rider prescribed: the
+  attach input-to-frame budget (default 32ms) is operator-tunable, clamped
+  to 8..=1000ms, honored by every attach loop (run/plan/campaign/chain).
+- CHANGELOG sections reordered newest-first (Helm/Contract/Logbook had landed
+  below the 0.5.0 release section they postdate).
+
 ## Orchestration completion polish — 2026-07-07
 
 Fixes four wonky moments in the full-plan orchestration completion experience,
@@ -22,35 +50,6 @@ found by a real run:
   (`./build-a-comprehensive`) instead of a mid-word cut
   (`./build-a-comprehensive-fi`).
 
-## 0.5.0 — The harness plots the course — 2026-07-03
-
-Makes `deadreckon start` the only launch decision a user needs. One milestone
-ships:
-
-- **Course launch planning** — the operator no longer picks the execution shape
-  (run / orchestrate / campaign) and hopes `start` softens it. A deterministic
-  SignalBundle (goal structure, the DETECTED done contract, workspace shape,
-  task history, budget fit) plus one clamped provider call resolves a typed,
-  durable `launch-plan.json` that lands in every dispatched root; a golden-pinned
-  course card previews WHAT/WHO/COST/DONE/WHY/ESCAPE; the only question `start`
-  may ask is "How will you know it worked?" (and only when the contract is
-  undetected). Campaign is never auto-chosen and never auto-accepted above the
-  confirm line; plans replay (`--plan`), state-changing launches gain JSON parity
-  (`--json --yes`), one-piece decompositions collapse to runs, and workers can
-  propose reshapes that stay inert until `deadreckon reshape` accepts them.
-
-No `PipelineState` schema changes — the plan is a file, not fields. See the
-milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §46.
-
-## Contract (stable) — a definition of done you can trust — 2026-07-04
-
-- the done contract is compiled from the run goal, forced to test behavior
-  (build/start/drive/assert; known input -> known output; every check
-  falsifiable; keyword-only scans and --if-present-only gates rejected),
-  checked by a deterministic falsifiability lint plus one clamped critic
-  pass, and shown for accept / re-prompt / edit before launch on the Course
-  card. Closes the acceptance scope-drift and stub-passable-gate gaps.
-
 ## Logbook (stable) — run inspection that agrees with itself — 2026-07-04
 
 - added the core `RunView` read model so `show`, `verdict`, `doc`, `report`,
@@ -65,6 +64,15 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
   live runs with an attach hint.
 - extended `history grep` with `--kind events`, and routed verdict signature /
   changed-file facts plus doc path resolution through `RunView`.
+
+## Contract (stable) — a definition of done you can trust — 2026-07-04
+
+- the done contract is compiled from the run goal, forced to test behavior
+  (build/start/drive/assert; known input -> known output; every check
+  falsifiable; keyword-only scans and --if-present-only gates rejected),
+  checked by a deterministic falsifiability lint plus one clamped critic
+  pass, and shown for accept / re-prompt / edit before launch on the Course
+  card. Closes the acceptance scope-drift and stub-passable-gate gaps.
 
 ## Helm (stable) — mission-control attach — 2026-07-03
 
@@ -135,6 +143,26 @@ milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §4
 - H-P16 (`5bf9dfb`): AS-BUILT §47 documents Helm mission-control attach,
   updates cross-references and V1 deferrals, logs widget/effect dependencies,
   and adds the Helm demo cast.
+
+## 0.5.0 — The harness plots the course — 2026-07-03
+
+Makes `deadreckon start` the only launch decision a user needs. One milestone
+ships:
+
+- **Course launch planning** — the operator no longer picks the execution shape
+  (run / orchestrate / campaign) and hopes `start` softens it. A deterministic
+  SignalBundle (goal structure, the DETECTED done contract, workspace shape,
+  task history, budget fit) plus one clamped provider call resolves a typed,
+  durable `launch-plan.json` that lands in every dispatched root; a golden-pinned
+  course card previews WHAT/WHO/COST/DONE/WHY/ESCAPE; the only question `start`
+  may ask is "How will you know it worked?" (and only when the contract is
+  undetected). Campaign is never auto-chosen and never auto-accepted above the
+  confirm line; plans replay (`--plan`), state-changing launches gain JSON parity
+  (`--json --yes`), one-piece decompositions collapse to runs, and workers can
+  propose reshapes that stay inert until `deadreckon reshape` accepts them.
+
+No `PipelineState` schema changes — the plan is a file, not fields. See the
+milestone section below for the per-phase detail (C-P1…C-P14) and AS-BUILT §46.
 
 ## Course (stable) — the harness plots the course — 2026-07-02
 

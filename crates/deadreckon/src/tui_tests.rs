@@ -222,6 +222,35 @@ fn input_to_frame_stage_recorded_and_budgeted() {
 }
 
 #[test]
+fn input_latency_budget_config_overrides_default() {
+    use crate::commands::attach_runtime::attach_tick_budget_from_config;
+
+    let temp = test_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    // No config: the built-in default holds.
+    assert_eq!(
+        attach_tick_budget_from_config(&paths).max_input_to_frame_ms,
+        AttachTickBudget::default().max_input_to_frame_ms
+    );
+
+    // [ui] input_latency_budget_ms overrides it.
+    std::fs::create_dir_all(paths.home()).expect("home dir");
+    std::fs::write(paths.config_path(), "[ui]\ninput_latency_budget_ms = 50\n").expect("config");
+    assert_eq!(
+        attach_tick_budget_from_config(&paths).max_input_to_frame_ms,
+        50
+    );
+
+    // Out-of-range values clamp instead of disabling the budget.
+    std::fs::write(paths.config_path(), "[ui]\ninput_latency_budget_ms = 0\n").expect("config");
+    assert_eq!(
+        attach_tick_budget_from_config(&paths).max_input_to_frame_ms,
+        8
+    );
+}
+
+#[test]
 fn event_storm_coalesces_frames_within_budget() {
     let budget = AttachTickBudget {
         target_frame_ms: 16,
@@ -4930,6 +4959,131 @@ fn timeline_entries_match_turn_checkpoints() {
     assert_eq!(timeline.entries[1].turn, 2);
     assert_eq!(timeline.entries[1].diff.deleted, 1);
     assert!((timeline.entries[1].spend_delta_usd - 0.34).abs() < f64::EPSILON);
+}
+
+#[test]
+fn plan_enter_on_zoomed_run_node_promotes_to_run_surface() {
+    use crate::tui::panes::voyage::{VoyageZoomState, zoomed_run_to_promote};
+    use crate::tui::tree::NodeId;
+
+    let run_node = NodeId::run("7fd5760acb69453f87260718719bdd78");
+    let mut zoom = VoyageZoomState::default();
+
+    // First Enter: nothing is zoomed yet, so no promotion — just zoom.
+    assert_eq!(
+        zoomed_run_to_promote(&zoom, &run_node, Some("7fd5760acb69453f87260718719bdd78")),
+        None
+    );
+    let _ = zoom.enter(run_node.clone());
+
+    // Second Enter on the same run-backed node promotes to the run surface.
+    assert_eq!(
+        zoomed_run_to_promote(&zoom, &run_node, Some("7fd5760acb69453f87260718719bdd78")),
+        Some("7fd5760acb69453f87260718719bdd78".to_string())
+    );
+
+    // A task with no child run never promotes, zoomed or not.
+    assert_eq!(zoomed_run_to_promote(&zoom, &run_node, None), None);
+
+    // Enter on a different node than the zoomed one re-zooms, not promotes.
+    let other = NodeId::run("0df4d89b4e504ab5b95b2bbb00fc6ba0");
+    assert_eq!(
+        zoomed_run_to_promote(&zoom, &other, Some("0df4d89b4e504ab5b95b2bbb00fc6ba0")),
+        None
+    );
+}
+
+#[test]
+fn run_surface_exit_keys_return_to_plan_when_parented() {
+    use crate::commands::attach::{RunAttachOutcome, run_attach_exit};
+
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+    // With a parent plan, every exit key pops back to the plan surface —
+    // the footer's "b/Backspace/q/Esc/Ctrl-D back to plan" promise.
+    for code in [
+        KeyCode::Char('b'),
+        KeyCode::Backspace,
+        KeyCode::Char('q'),
+        KeyCode::Esc,
+    ] {
+        assert_eq!(
+            run_attach_exit(true, key(code)),
+            Some(RunAttachOutcome::BackToPlan),
+            "{code:?} must return to plan when parented"
+        );
+    }
+
+    // Without a parent, quit keys detach and b/Backspace do nothing.
+    assert_eq!(
+        run_attach_exit(false, key(KeyCode::Char('q'))),
+        Some(RunAttachOutcome::Detach)
+    );
+    assert_eq!(run_attach_exit(false, key(KeyCode::Char('b'))), None);
+    assert_eq!(run_attach_exit(false, key(KeyCode::Backspace)), None);
+
+    // Non-exit keys never end the session.
+    assert_eq!(run_attach_exit(true, key(KeyCode::Char('n'))), None);
+}
+
+#[test]
+fn attach_timeline_turn_count_equals_run_view_turns() {
+    use deadreckon_core::flight::CheckpointChangeKind::{Created, Modified};
+
+    let (_temp, mut state) = doc_preview_state();
+    state.turn = 2;
+    deadreckon_core::save_state(&state).expect("save turn count");
+    write_timeline_checkpoint(
+        &state,
+        "cp-000001",
+        1,
+        vec![timeline_file_change("first.txt", Created)],
+    );
+    write_timeline_checkpoint(
+        &state,
+        "cp-000002",
+        2,
+        vec![timeline_file_change("second.txt", Modified)],
+    );
+
+    let timeline = timeline_for_run(&state, &[], &[], &[]).expect("timeline");
+    let view = deadreckon_core::RunView::from_state(&state).expect("run view");
+
+    assert_eq!(
+        timeline.entries.len(),
+        view.turns.len(),
+        "attach timeline and RunView must agree on the turn count"
+    );
+    for (entry, turn) in timeline.entries.iter().zip(view.turns.iter()) {
+        assert_eq!(entry.turn, turn.n, "turn numbering diverged");
+    }
+}
+
+#[test]
+fn attach_why_evidence_equals_run_view_proof() {
+    let (_temp, mut state) = doc_preview_state();
+    state.status = RunStatus::Failed;
+    state.failure_reason = Some("acceptance failed".to_string());
+    deadreckon_core::save_state(&state).expect("save failed state");
+    write_failed_acceptance_progress(&state, "cargo_test", "auth::tests::expired_token");
+
+    let report = why_for_run(&state).expect("why report");
+    let view = deadreckon_core::RunView::from_state(&state).expect("run view");
+
+    let progress_path = view
+        .proof
+        .progress_path
+        .clone()
+        .expect("RunView proof band records the acceptance progress path");
+    assert!(
+        report
+            .causes
+            .iter()
+            .any(|cause| cause.evidence_path == progress_path),
+        "why panel evidence must cite the same proof artifact as RunView.proof;\nwhy causes: {:#?}\nrun view proof path: {}",
+        report.causes,
+        progress_path.display()
+    );
 }
 
 #[test]

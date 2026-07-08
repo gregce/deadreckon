@@ -99,13 +99,13 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
                         print_plan_narrative_plain(&paths, &plan, args.visual)?;
                     } else if io::stdout().is_terminal() && !args.plain && !args.json {
                         print_attach_banner("plan", &plan.plan_id);
-                        attach_plan_tui(
+                        attach_plan_session(
                             &paths,
                             &plan.plan_id,
                             show_hints,
                             args.view,
                             args.visual,
-                            narrative_config.clone(),
+                            &narrative_config,
                             None,
                         )
                         .await?;
@@ -157,17 +157,49 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     }
     if io::stdout().is_terminal() && !args.plain && !args.json {
         print_attach_banner("run", &run_id);
-        if parent_plan.is_some() {
-            attach_tui_with_parent(
-                &paths,
-                &run_id,
-                show_hints,
-                parent_plan,
-                args.view,
-                args.visual,
-                narrative_config.clone(),
-            )
-            .await?;
+        let mut final_run_id = run_id.clone();
+        if let Some(mut parent) = parent_plan {
+            // The run <-> plan round trip: exit keys on a parented run pop to
+            // the plan surface; Enter on a zoomed run node there promotes back
+            // into a full run surface, until the operator detaches from the plan.
+            let mut current_run = run_id.clone();
+            loop {
+                let outcome = attach_tui_with_parent(
+                    &paths,
+                    &current_run,
+                    show_hints,
+                    Some(parent.clone()),
+                    args.view,
+                    args.visual,
+                    narrative_config.clone(),
+                )
+                .await?;
+                final_run_id = current_run.clone();
+                match outcome {
+                    RunAttachOutcome::Detach => break,
+                    RunAttachOutcome::BackToPlan => {
+                        print_attach_banner("plan", &parent.plan_id);
+                        match attach_plan_tui(
+                            &paths,
+                            &parent.plan_id.clone(),
+                            show_hints,
+                            args.view,
+                            args.visual,
+                            narrative_config.clone(),
+                            parent.campaign_parent.clone(),
+                        )
+                        .await?
+                        {
+                            PlanAttachOutcome::Detach => break,
+                            PlanAttachOutcome::PromoteRun { run_id, task_id } => {
+                                parent.task_id = task_id;
+                                print_attach_banner("run", &run_id);
+                                current_run = run_id;
+                            }
+                        }
+                    }
+                }
+            }
         } else {
             attach_tui(
                 &paths,
@@ -179,7 +211,7 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
             )
             .await?;
         }
-        let state = load_run(&paths, &run_id)?;
+        let state = load_run(&paths, &final_run_id)?;
         if state.status == RunStatus::Completed && show_hints {
             print_exit_summary_card(&state, &RunLoopOutcome::Done, args.plain, true);
             print_chain_context_for_working(&state.working_dir);
@@ -390,12 +422,13 @@ async fn attach_campaign_tui(
         state.campaign_dir.clone(),
         state.campaign.campaign_id.clone(),
     );
-    let mut input_events = AttachInputEvents::new(AttachTickBudget::default());
+    let tick_budget = attach_tick_budget_from_config(paths);
+    let mut input_events = AttachInputEvents::new(tick_budget);
     let mut pending_input_at: Option<Instant> = None;
 
     let mut show_help = false;
     let result = loop {
-        let mut tick = AttachTickTiming::new(AttachSurface::Campaign, AttachTickBudget::default());
+        let mut tick = AttachTickTiming::new(AttachSurface::Campaign, tick_budget);
         let stage_started = Instant::now();
         let events = feed.refresh(Duration::ZERO).await;
         state.apply_feed_events(events);
@@ -461,13 +494,13 @@ async fn attach_campaign_tui(
                         campaign_id: state.campaign.campaign_id.clone(),
                         sub_id,
                     };
-                    let child_result = attach_plan_tui(
+                    let child_result = attach_plan_session(
                         paths,
                         &plan_id,
                         show_hints,
                         initial_view,
                         initial_visual,
-                        narrative_config.clone(),
+                        &narrative_config,
                         Some(parent_campaign),
                     )
                     .await;
@@ -492,6 +525,60 @@ async fn attach_campaign_tui(
     result
 }
 
+/// Drive one plan attach session, following promote/back navigation between
+/// the plan surface and full child-run surfaces until the operator detaches:
+/// Enter on a zoomed run node opens the full run frame; b/Backspace/q/Esc
+/// there pops back to the plan surface (the footer's "back to plan" promise).
+async fn attach_plan_session(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+    show_hints: bool,
+    view: AttachViewMode,
+    visual: NarrativeVisualMode,
+    narrative_config: &NarrativeAttachConfig,
+    parent_campaign: Option<AttachCampaignParent>,
+) -> Result<()> {
+    loop {
+        match attach_plan_tui(
+            paths,
+            plan_id,
+            show_hints,
+            view,
+            visual,
+            narrative_config.clone(),
+            parent_campaign.clone(),
+        )
+        .await?
+        {
+            PlanAttachOutcome::Detach => return Ok(()),
+            PlanAttachOutcome::PromoteRun { run_id, task_id } => {
+                let parent = AttachParentPlan {
+                    plan_id: plan_id.to_string(),
+                    task_id,
+                    campaign_parent: parent_campaign.clone(),
+                };
+                print_attach_banner("run", &run_id);
+                match attach_tui_with_parent(
+                    paths,
+                    &run_id,
+                    show_hints,
+                    Some(parent),
+                    view,
+                    visual,
+                    narrative_config.clone(),
+                )
+                .await?
+                {
+                    RunAttachOutcome::Detach => return Ok(()),
+                    RunAttachOutcome::BackToPlan => {
+                        print_attach_banner("plan", plan_id);
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn attach_plan_tui(
     paths: &DeadreckonPaths,
     plan_id: &str,
@@ -500,7 +587,7 @@ async fn attach_plan_tui(
     initial_visual: NarrativeVisualMode,
     narrative_config: NarrativeAttachConfig,
     parent_campaign: Option<AttachCampaignParent>,
-) -> Result<()> {
+) -> Result<PlanAttachOutcome> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -521,11 +608,12 @@ async fn attach_plan_tui(
     let mut narrative_projection_cache = AttachNarrativeProjectionCache::default();
     let mut show_help = false;
     let mut zoom = VoyageZoomState::default();
-    let mut input_events = AttachInputEvents::new(AttachTickBudget::default());
+    let tick_budget = attach_tick_budget_from_config(paths);
+    let mut input_events = AttachInputEvents::new(tick_budget);
     let mut pending_input_at: Option<Instant> = None;
 
     let result = loop {
-        let mut tick = AttachTickTiming::new(AttachSurface::Plan, AttachTickBudget::default());
+        let mut tick = AttachTickTiming::new(AttachSurface::Plan, tick_budget);
         let now = Utc::now();
         let stage_started = Instant::now();
         let new_feed_events = feed.refresh(Duration::ZERO).await;
@@ -675,7 +763,9 @@ async fn attach_plan_tui(
                 {
                     let _ = zoom.escape();
                 }
-                Event::Key(key) if attach_should_quit(key) => break Ok(()),
+                Event::Key(key) if attach_should_quit(key) => {
+                    break Ok(PlanAttachOutcome::Detach);
+                }
                 Event::Key(key) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
                     view = toggle_attach_view(view);
                     narrative_scroll = 0;
@@ -709,9 +799,8 @@ async fn attach_plan_tui(
                     // background refresh job invalidates the narrative cache on completion.
                 }
                 Event::Key(key) if key.code == KeyCode::Enter => {
-                    let zoom_target = plan
-                        .tasks
-                        .get(selected)
+                    let task = plan.tasks.get(selected);
+                    let zoom_target = task
                         .map(|task| {
                             task.child_run_id
                                 .as_deref()
@@ -719,6 +808,14 @@ async fn attach_plan_tui(
                                 .unwrap_or_else(|| NodeId::task(&plan.plan_id, &task.task_id))
                         })
                         .unwrap_or_else(|| NodeId::plan(&plan.plan_id));
+                    if let Some(run_id) = crate::tui::panes::voyage::zoomed_run_to_promote(
+                        &zoom,
+                        &zoom_target,
+                        task.and_then(|task| task.child_run_id.as_deref()),
+                    ) {
+                        let task_id = task.map(|task| task.task_id.clone()).unwrap_or_default();
+                        break Ok(PlanAttachOutcome::PromoteRun { run_id, task_id });
+                    }
                     let _ = zoom.enter(zoom_target);
                 }
                 Event::Key(key) if view.is_narrative() => {
@@ -778,6 +875,7 @@ async fn attach_tui(
         narrative_config,
     )
     .await
+    .map(|_| ())
 }
 
 async fn attach_tui_with_parent(
@@ -788,12 +886,13 @@ async fn attach_tui_with_parent(
     initial_view: AttachViewMode,
     initial_visual: NarrativeVisualMode,
     narrative_config: NarrativeAttachConfig,
-) -> Result<()> {
+) -> Result<RunAttachOutcome> {
     let initial_state = load_run(paths, run_id)?;
     let mut event_feed =
         tui_events::TuiEventFeed::file_tail(initial_state.run_root.join(RUN_EVENTS_JSONL));
     let mut events = event_feed.refresh(std::time::Duration::ZERO).await?;
-    let mut input_events = AttachInputEvents::new(AttachTickBudget::default());
+    let tick_budget = attach_tick_budget_from_config(paths);
+    let mut input_events = AttachInputEvents::new(tick_budget);
     let mut pending_input_at: Option<Instant> = None;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -823,7 +922,7 @@ async fn attach_tui_with_parent(
     let mut show_help = false;
 
     let result = loop {
-        let mut tick = AttachTickTiming::new(AttachSurface::Run, AttachTickBudget::default());
+        let mut tick = AttachTickTiming::new(AttachSurface::Run, tick_budget);
         let now = Utc::now();
         let stage_started = Instant::now();
         let state = load_run(paths, run_id)?;
@@ -956,11 +1055,11 @@ async fn attach_tui_with_parent(
             }
             match event {
                 Event::Key(key)
-                    if tui_state.parent_plan.is_some() && attach_should_return_to_plan(key) =>
+                    if run_attach_exit(tui_state.parent_plan.is_some(), key).is_some() =>
                 {
-                    break Ok(());
+                    break Ok(run_attach_exit(tui_state.parent_plan.is_some(), key)
+                        .unwrap_or(RunAttachOutcome::Detach));
                 }
-                Event::Key(key) if attach_should_quit(key) => break Ok(()),
                 Event::Key(key) if key.code == KeyCode::Char('n') && key.modifiers.is_empty() => {
                     tui_state.toggle_view();
                 }
@@ -1217,6 +1316,33 @@ pub(crate) fn attach_should_return_to_plan(key: KeyEvent) -> bool {
     attach_should_quit(key)
         || matches!(key.code, KeyCode::Backspace)
         || (key.code == KeyCode::Char('b') && key.modifiers.is_empty())
+}
+
+/// How a plan attach session ended: a real detach, or the operator promoting
+/// a zoomed child run to the full run surface (the plan <-> run round trip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PlanAttachOutcome {
+    Detach,
+    PromoteRun { run_id: String, task_id: String },
+}
+
+/// How a run attach session ended. `BackToPlan` is only produced when the run
+/// carries a parent plan — the footer promises "back to plan" there, so every
+/// exit key pops to the plan surface instead of detaching to the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunAttachOutcome {
+    Detach,
+    BackToPlan,
+}
+
+pub(crate) fn run_attach_exit(has_parent_plan: bool, key: KeyEvent) -> Option<RunAttachOutcome> {
+    if has_parent_plan && attach_should_return_to_plan(key) {
+        return Some(RunAttachOutcome::BackToPlan);
+    }
+    if attach_should_quit(key) {
+        return Some(RunAttachOutcome::Detach);
+    }
+    None
 }
 
 /// Keys that dismiss a "press Enter to return" prompt: Enter, q, Esc, or

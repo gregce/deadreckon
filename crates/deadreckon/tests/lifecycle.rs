@@ -2414,6 +2414,71 @@ fn report_on_live_run_refuses_with_attach_try() {
 }
 
 #[test]
+fn report_footer_names_one_primary_action() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args(["report", &state.run_id])
+        .output()
+        .expect("report");
+
+    assert_success(&output);
+    let text = stdout(&output);
+    assert_eq!(
+        text.matches("Recommended").count(),
+        1,
+        "report footer must name exactly one primary action\n{text}"
+    );
+}
+
+#[test]
+fn doc_why_band_sources_narrative_and_decisions_from_run_view() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+    let docs = state.working_dir.join("docs");
+    fs::create_dir_all(&docs).expect("docs dir");
+    let narrative_path = docs.join("RUN-NARRATIVE.md");
+    let decisions_path = docs.join("RUN-DECISIONS.md");
+    fs::write(&narrative_path, "narrative sourced from run view\n").expect("narrative doc");
+    fs::write(&decisions_path, "- decision sourced from run view\n").expect("decisions doc");
+
+    let view = deadreckon_core::RunView::from_state(&state).expect("run view");
+    assert_eq!(
+        view.why.narrative_path.as_deref(),
+        Some(narrative_path.as_path()),
+        "RunView.why must cite the narrative doc"
+    );
+    assert_eq!(
+        view.why.decisions_path.as_deref(),
+        Some(decisions_path.as_path()),
+        "RunView.why must cite the decisions doc"
+    );
+
+    let narrative = deadreckon(&paths)
+        .args(["doc", &state.run_id])
+        .output()
+        .expect("doc narrative");
+    assert_success(&narrative);
+    assert!(
+        stdout(&narrative).contains("narrative sourced from run view"),
+        "doc must print the file RunView.why cites\n{}",
+        stdout(&narrative)
+    );
+
+    let decisions = deadreckon(&paths)
+        .args(["doc", &state.run_id, "--kind", "decisions"])
+        .output()
+        .expect("doc decisions");
+    assert_success(&decisions);
+    assert!(
+        stdout(&decisions).contains("decision sourced from run view"),
+        "doc --kind decisions must print the file RunView.why cites\n{}",
+        stdout(&decisions)
+    );
+}
+
+#[test]
 fn history_grep_events_kind_matches_event_ledger() {
     let temp = repo_tempdir();
     let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
