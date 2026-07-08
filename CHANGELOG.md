@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.6.0 — Mission control — 2026-07-08
+
+Three milestones ship together, plus completion polish found by real use:
+
+- **Helm** — attach is mission control: a uniform five-question status spine
+  on every surface (alive? doing what? on track? anything wrong? what next?),
+  a flattened campaign -> plan -> run voyage tree with zoom-free comprehension,
+  an event-driven input loop with pinned (and now config-tunable) latency
+  budgets, k9s-style `:` command mode, in-frame modals, `w`-for-why cited
+  evidence, a scrubable turn timeline, chain narrative parity, and a
+  motion-policy effects layer. Attach now round-trips: Enter on a zoomed run
+  node opens the full run surface and b/Esc pops back to the plan.
+- **Contract** — a definition of done you can trust before spending: the done
+  contract is compiled from the run goal, forced toward behavioral checks
+  (every check falsifiable; keyword-only scans and `--if-present`-only gates
+  rejected), linted deterministically, critiqued by one clamped provider
+  pass, and shown for accept / re-prompt / edit on the Course card
+  (`--review-done`, `[start] confirm_contract`).
+- **Logbook** — run inspection that agrees with itself: one `RunView` read
+  model behind `show`, `verdict`, `doc`, the new static `deadreckon report`,
+  and attach's projections; snapshot-backed full-run and per-turn diffs
+  (`show --diff/--turn/--raw`); every run artifact has a reader; parity
+  depth tests and characterization goldens pin the projections together.
+- **Orchestration completion polish** — the merged run carries the operator's
+  goal verbatim (no more `./merge-orchestration-plan` folders), the guided
+  start footer recommends `finish` when the work is already done, `status` on
+  a merged run rolls up the children's real spend/wall/turns, and export dirs
+  trim to word boundaries.
+
+No `PipelineState` schema changes. See the milestone sections below for
+per-phase detail and AS-BUILT §47 (Helm), §48 (Contract), §49 (Logbook).
+
 ## Attach plan-run navigation + audit remediation — 2026-07-08
 
 Closes the gaps a post-hoc audit of the Helm/Contract/Logbook slices found,

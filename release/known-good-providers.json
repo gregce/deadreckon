@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "recorded_at": "2026-07-03T15:12:11Z",
+  "recorded_at": "2026-07-08T17:38:02Z",
   "providers": [
-    {"route":"cli:claude-code","binary_version":"2.1.200 (Claude Code)","proof":"start -> real turns -> gate signed -> apply -> kill/resume","run_id":"0b4cf2506b2542e1a13253255854e5ef","operator":"gdc"},
-    {"route":"cli:codex","binary_version":"codex-cli 0.142.5","proof":"start -> real turns -> gate signed -> apply -> kill/resume","run_id":"ab91f977e3734243a1874887fac684ed","operator":"gdc"}
+    {"route":"cli:claude-code","binary_version":"2.1.204 (Claude Code)","proof":"start -> real turns -> gate signed -> apply -> kill/resume","run_id":"db8910cde66d4b2d967a02d48f320280","operator":"gdc"},
+    {"route":"cli:codex","binary_version":"codex-cli 0.142.5","proof":"start -> real turns -> gate signed -> apply -> kill/resume","run_id":"dc1b325a77ec4ae69d2f9226a0846bd6","operator":"gdc"}
   ]
 }
