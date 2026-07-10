@@ -2452,8 +2452,12 @@ fn deadreckon_pty(
     let answer = input.trim_end_matches('\n').to_string() + "\r";
     let log_dir = TempDir::new().expect("expect log dir");
     let log_path = log_dir.path().join("expect.log");
+    // The PTY drives a complete smoke run; its wall time scales with machine
+    // load (the parallel suite runs several cargo-building smoke tests that
+    // contend on the package-cache lock), so the ceiling must be generous —
+    // 30s flaked whenever two of these landed together.
     let script = format!(
-        "log_user 0\nlog_file -a {}\nset timeout 30\ncd {}\nset env(DEADRECKON_HOME) {}\nset env(DEADRECKON_PROMPT_LINE_MODE) 1\nspawn {}\nexpect \"choose \\[1\\]:\"\nsend -- \"{}\"\nexpect {{\n  \"completed run\" {{ exit 0 }}\n  \"cancelled\" {{ exit 0 }}\n  eof {{ exit 125 }}\n  timeout {{ exit 124 }}\n}}\n",
+        "log_user 0\nlog_file -a {}\nset timeout 90\ncd {}\nset env(DEADRECKON_HOME) {}\nset env(DEADRECKON_PROMPT_LINE_MODE) 1\nspawn {}\nexpect \"choose \\[1\\]:\"\nsend -- \"{}\"\nexpect {{\n  \"completed run\" {{ exit 0 }}\n  \"cancelled\" {{ exit 0 }}\n  eof {{ exit 125 }}\n  timeout {{ exit 124 }}\n}}\n",
         tcl_brace_quote(&log_path.display().to_string()),
         tcl_brace_quote(&cwd.display().to_string()),
         tcl_brace_quote(&paths.home().display().to_string()),
@@ -2473,7 +2477,7 @@ fn deadreckon_pty(
         if let Some(status) = child.try_wait().expect("expect status") {
             break status;
         }
-        if started.elapsed() > Duration::from_secs(45) {
+        if started.elapsed() > Duration::from_secs(120) {
             timed_out = true;
             let _ = child.kill();
             break child.wait().expect("expect wait after kill");
