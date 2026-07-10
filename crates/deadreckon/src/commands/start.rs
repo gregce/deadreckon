@@ -2258,24 +2258,31 @@ pub(crate) fn start_done_materialization_request(
     }
 }
 
-async fn materialize_start_done_criteria(decision: &mut StartLaunchDecision) -> Result<()> {
+async fn materialize_start_done_criteria(
+    decision: &mut StartLaunchDecision,
+    mut prompter: Option<&mut dyn StartPrompter>,
+) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let Some((request, overwrite_existing)) = start_done_materialization_request(decision) else {
-        return Ok(());
-    };
-    commands::acceptance::acceptance_agent_command_in_dir(
-        &cwd,
-        commands::acceptance::AcceptanceAgentMode::Draft,
-        vec![request],
-        Some(&decision.goal),
-        decision.provider_route.clone(),
-        None,
-        overwrite_existing,
-    )
-    .await?;
-    if let Some(source) = commands::acceptance::mark_generated_done_criteria(
-        commands::acceptance::resolve_acceptance_source(&cwd, None)?,
-    ) {
+    loop {
+        let Some((request, overwrite_existing)) = start_done_materialization_request(decision)
+        else {
+            return Ok(());
+        };
+        commands::acceptance::acceptance_agent_command_in_dir(
+            &cwd,
+            commands::acceptance::AcceptanceAgentMode::Draft,
+            vec![request],
+            Some(&decision.goal),
+            decision.provider_route.clone(),
+            None,
+            overwrite_existing,
+        )
+        .await?;
+        let Some(source) = commands::acceptance::mark_generated_done_criteria(
+            commands::acceptance::resolve_acceptance_source(&cwd, None)?,
+        ) else {
+            return Ok(());
+        };
         let selection = commands::acceptance::done_criteria_selection(&Some(source))?;
         apply_done_criteria_selection(
             decision,
@@ -2284,8 +2291,20 @@ async fn materialize_start_done_criteria(decision: &mut StartLaunchDecision) -> 
             selection.full_label(),
             &selection,
         )?;
+        // A contract the drafter just invented is one the operator has never
+        // seen — pause for accept / re-prompt / edit before anything launches.
+        // Choosing "update" sets a fresh ManualText action, so the loop
+        // re-drafts and re-reviews (the re-prompt). Non-interactive paths
+        // (--yes, --quiet, replay) keep zero-questions but still surface
+        // divergence via the printed compiled contract.
+        let Some(active_prompter) = prompter.as_mut() else {
+            return Ok(());
+        };
+        prompt_start_existing_done_criteria(decision, &cwd, &selection, &mut **active_prompter)?;
+        if decision.recovery.is_some() {
+            return Ok(());
+        }
     }
-    Ok(())
 }
 
 fn prompt_start_launch_confirmation(
@@ -2570,7 +2589,7 @@ async fn start_replay_command(args: StartCommandArgs, plan_path: &Path) -> Resul
                 .unwrap_or("deadreckon try"),
         )));
     }
-    materialize_start_done_criteria(&mut decision).await?;
+    materialize_start_done_criteria(&mut decision, None).await?;
     dispatch_start_command(replay_args, &decision, plan).await
 }
 
@@ -2727,7 +2746,13 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             .render_plain(!completion_hints_enabled(false));
         return Err(CliError::Surface { code: 1, surface });
     }
-    materialize_start_done_criteria(&mut decision).await?;
+    let review_prompter: Option<&mut dyn StartPrompter> = eligibility
+        .allows_prompts()
+        .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
+    materialize_start_done_criteria(&mut decision, review_prompter).await?;
+    if let Some(recovery) = decision.recovery.as_ref() {
+        return Err(start_recovery_error(recovery));
+    }
     // C-P9: the decision becomes the durable artifact before anything runs.
     let accepted_by = if decision.confirmed_by_start_picker {
         "operator"
@@ -3360,6 +3385,79 @@ mod contract_tests {
             requested_mode: crate::cli::CliStartMode::Auto,
             stdin_is_tty: false,
         })
+    }
+
+    struct PanickingPrompter;
+
+    impl StartPrompter for PanickingPrompter {
+        fn select_one(&mut self, _prompt: prompt::SelectPrompt) -> Result<prompt::SelectChoice> {
+            panic!("review must only fire after a fresh draft");
+        }
+        fn confirm(&mut self, _question: &str, _default_yes: bool) -> Result<bool> {
+            panic!("review must only fire after a fresh draft");
+        }
+        fn input(&mut self, _message: &str, _default: Option<&str>) -> Result<String> {
+            panic!("review must only fire after a fresh draft");
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_without_manual_text_never_prompts() {
+        // The post-draft review pauses only when the drafter actually ran:
+        // an Existing/DefaultGate/Missing action must pass straight through
+        // even with an interactive prompter available (zero-questions doctrine
+        // for previously accepted contracts).
+        let mut prompter = PanickingPrompter;
+        for action in [
+            StartDoneAction::Existing,
+            StartDoneAction::DefaultGate,
+            StartDoneAction::Missing,
+        ] {
+            let mut d = decision("build a realtime dashboard");
+            d.done_action = action;
+            materialize_start_done_criteria(&mut d, Some(&mut prompter))
+                .await
+                .expect("materialize");
+        }
+    }
+
+    #[test]
+    fn fresh_draft_review_cancel_maps_to_recovery_error() {
+        // The caller turns a review cancellation into a launch-stopping error;
+        // pin the message so cancel can never silently fall through to dispatch.
+        let mut d = decision("build a realtime dashboard");
+        set_start_recovery(
+            &mut d,
+            format!("guided start cancelled before accepting the {NOUN_DONE_CONTRACT}"),
+            vec!["deadreckon def-done show".to_string()],
+        );
+        let recovery = d.recovery.as_ref().expect("recovery");
+        let err = start_recovery_error(recovery);
+        let text = format!("{err:?}");
+        assert!(text.contains("cancelled before accepting"), "{text}");
+    }
+
+    #[test]
+    fn divergence_lines_carry_a_refine_remedy() {
+        let weak = contract(
+            r#"
+name: weak
+checks:
+  - kind: content_match
+    path: "{working_dir}/src/main.js"
+    pattern: "scalable"
+"#,
+        );
+        let divergence =
+            commands::acceptance::reconcile("build a scalable realtime slack clone", &weak);
+        let lines = commands::acceptance::render_compiled_contract_lines(&weak, Some(&divergence))
+            .join("\n");
+
+        assert!(!divergence.clean(), "{divergence:?}");
+        assert!(
+            lines.contains("try: deadreckon def-done refine"),
+            "divergence must name the command that closes the gap\n{lines}"
+        );
     }
 
     #[test]

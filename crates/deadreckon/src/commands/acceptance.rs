@@ -1552,6 +1552,14 @@ pub(crate) fn render_compiled_contract_lines(
                     .join("; ");
                 lines.push(format!("divergence: weak check(s): {weak}"));
             }
+            // Divergence without a remedy is just an accusation — always name
+            // the one command that closes the gap.
+            let refinement = if divergence.uncovered.is_empty() {
+                "replace the weak checks with ones that run the app".to_string()
+            } else {
+                format!("also verify: {}", divergence.uncovered.join("; "))
+            };
+            lines.push(format!("try: deadreckon def-done refine \"{refinement}\""));
         }
     }
     lines
