@@ -1571,7 +1571,12 @@ fn orchestrate_start_prints_run_like_context() {
     assert!(!out.contains("child:"), "{out}");
     assert!(!out.contains("when done:"), "{out}");
     assert!(!out.contains("history:"), "{out}");
-    assert!(out.contains("providers"), "{out}");
+    assert!(out.contains("provider"), "{out}");
+    assert!(out.contains("workspace"), "{out}");
+    // One vocabulary per fact: the launch rows must not duplicate under the
+    // legacy labels (providers/source/done next to provider/workspace/contract).
+    assert!(!out.contains("\nproviders "), "{out}");
+    assert!(!out.contains("\nsource "), "{out}");
     assert!(out.contains("merge repair"), "{out}");
     assert!(out.contains("automatic via"), "{out}");
     assert!(out.contains("plan"), "{out}");

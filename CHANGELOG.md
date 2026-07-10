@@ -1,5 +1,25 @@
 # Changelog
 
+## Contract review interstitial + launch surface dedupe — 2026-07-09
+
+Closes the gap a real slack-clone run exposed: the accept / re-prompt / edit
+review never fired for a contract drafted mid-start.
+
+- a freshly drafted done contract now pauses for review before anything
+  launches: after `start`'s def-done flow compiles the contract, the operator
+  gets keep / view / check / update / cancel — "update" re-drafts through the
+  compiler and re-reviews (the re-prompt loop), "cancel" stops the launch.
+  Zero-questions is preserved for previously accepted contracts and for
+  `--yes`/`--quiet`/replay paths, which still surface divergence.
+- divergence lines always carry a remedy: `divergence: uncovered goal
+  clause(s): ...` is followed by `try: deadreckon def-done refine "also
+  verify: ..."` so the gap names the command that closes it.
+- the orchestrate launch surface says each fact once: the preflight no longer
+  duplicates provider/workspace/done-contract rows under two label
+  vocabularies, and `started orchestration` prints only the launch delta
+  (children, plan path, events path, watch handle) instead of repeating the
+  ~40-line preflight block.
+
 ## 0.6.0 — Mission control — 2026-07-08
 
 Three milestones ship together, plus completion polish found by real use:

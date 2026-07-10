@@ -1355,12 +1355,9 @@ pub(crate) fn print_orchestrate_preflight(
         ("path".to_string(), path.to_string()),
         ("mode".to_string(), plan_mode_label(plan.mode).to_string()),
         ("children".to_string(), children),
-        ("providers".to_string(), providers.clone()),
         ("provider".to_string(), providers),
-        ("source".to_string(), source.clone()),
         ("workspace".to_string(), source),
-        (NOUN_DONE_CONTRACT.to_string(), gate.clone()),
-        ("done".to_string(), gate),
+        (NOUN_DONE_CONTRACT.to_string(), gate),
         ("merge repair".to_string(), repair),
         ("sandbox".to_string(), sandbox),
         ("spend".to_string(), spend),
@@ -1424,12 +1421,16 @@ fn orchestration_path_label(mode: PlanMode) -> &'static str {
     }
 }
 
+/// Printed immediately after the preflight in the same invocation, so it
+/// carries only the launch delta (durable artifact paths + watch handle) —
+/// the shape, providers, contract, and dependency tables are already on
+/// screen from `print_orchestrate_preflight`.
 pub(crate) fn print_orchestrate_started(
     plan: &Plan,
-    max_spend: Option<f64>,
-    max_wall_seconds: Option<f64>,
-    sandbox: Option<&str>,
-    no_repair: bool,
+    _max_spend: Option<f64>,
+    _max_wall_seconds: Option<f64>,
+    _sandbox: Option<&str>,
+    _no_repair: bool,
 ) {
     println!(
         "{} {}",
@@ -1438,39 +1439,19 @@ pub(crate) fn print_orchestrate_started(
     );
     let paths = DeadreckonPaths::discover();
     let children = plan.tasks.len().to_string();
-    let providers = plan_provider_summary(plan);
-    let source = plan_source_label(plan);
-    let gate = plan_acceptance_label(plan);
-    let repair = plan_repair_label(plan, no_repair);
-    let sandbox = sandbox.unwrap_or("config default").to_string();
-    let spend = max_spend
-        .map(|value| format!("${value:.2} per child"))
-        .unwrap_or_else(|| "config default".to_string());
-    let wall = max_wall_seconds
-        .map(|value| format!("{value:.0}s per child"))
-        .unwrap_or_else(|| "config default".to_string());
-    let plan_path = paths.plan_json(&plan.plan_id);
-    let plan_path_display = plan_path.to_string_lossy().to_string();
+    let plan_path_display = paths.plan_json(&plan.plan_id).to_string_lossy().to_string();
     let events_path_display = paths
         .plan_events(&plan.plan_id)
         .to_string_lossy()
         .to_string();
+    let watch = format!("deadreckon attach {}", run_prefix(&plan.plan_id));
     let items = [
-        ("mode", plan_mode_label(plan.mode)),
         ("children", children.as_str()),
-        ("providers", providers.as_str()),
-        ("source", source.as_str()),
-        (NOUN_DONE_CONTRACT, gate.as_str()),
-        ("merge repair", repair.as_str()),
-        ("sandbox", sandbox.as_str()),
-        ("spend", spend.as_str()),
-        ("wall", wall.as_str()),
         ("plan", plan_path_display.as_str()),
         ("events", events_path_display.as_str()),
+        ("watch", watch.as_str()),
     ];
     print_kv_block(&items);
-    print_orchestration_role_table(plan, !no_repair, None);
-    print_orchestration_dependency_summary(plan);
     let _ = io::stdout().flush();
 }
 
