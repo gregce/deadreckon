@@ -8467,6 +8467,37 @@ fn run_is_subscription_only(state: &deadreckon_core::PipelineState) -> bool {
         && (summary.any_subscription_turn || !provider_is_metered(state))
 }
 
+/// Render CLI token usage for a run summary, or `None` when no tokens were
+/// recorded (older CLI turns that reported 0/0 before Semaphore, or non-CLI
+/// runs). Shown on subscription surfaces where dollars stay $0.
+fn cli_token_usage_label(input_tokens: u64, output_tokens: u64) -> Option<String> {
+    if input_tokens == 0 && output_tokens == 0 {
+        return None;
+    }
+    Some(format!("{input_tokens} in / {output_tokens} out tokens"))
+}
+
+#[cfg(test)]
+mod semaphore_friendliness_tests {
+    use super::cli_token_usage_label;
+
+    #[test]
+    fn show_renders_cli_token_usage_for_both_providers() {
+        // codex-like and claude-like real token counts both render on the
+        // subscription surface where dollars stay $0.
+        assert_eq!(
+            cli_token_usage_label(100, 40).as_deref(),
+            Some("100 in / 40 out tokens")
+        );
+        assert_eq!(
+            cli_token_usage_label(2, 4).as_deref(),
+            Some("2 in / 4 out tokens")
+        );
+        // Pre-Semaphore 0/0 turns render nothing rather than a misleading zero.
+        assert!(cli_token_usage_label(0, 0).is_none());
+    }
+}
+
 fn spend_summary_label(
     state: &deadreckon_core::PipelineState,
     summary: &deadreckon_core::state::SpendSummary,
@@ -8484,13 +8515,19 @@ fn spend_summary_label(
         && (summary.any_subscription_turn || !provider_is_metered(state));
     if subscription_only {
         // Subscription runs are billed in time, not dollars: lead with the
-        // wall-time budget instead of a $0.00 the harness knows is false.
+        // wall-time budget instead of a $0.00 the harness knows is false. Since
+        // Semaphore, CLI turns report real tokens, so show them when present.
         let provider = state.provider.as_deref().unwrap_or("subscription CLI");
-        return format!(
+        let mut label = format!(
             "not metered (subscription) · {} of {provider} · {} turns",
             human_duration(wall_seconds),
             turns
         );
+        if let Some(tokens) = cli_token_usage_label(summary.input_tokens, summary.output_tokens) {
+            label.push_str(" · ");
+            label.push_str(&tokens);
+        }
+        return label;
     }
     let mut label = format!(
         "{}${:.6}",
@@ -10856,6 +10893,11 @@ fn raw_artifact_path(state: &deadreckon_core::PipelineState, raw: &str) -> Resul
         }
         "flight" | "flight-events" | "flight-events.jsonl" => {
             state.run_root.join(FLIGHT_EVENTS_JSONL)
+        }
+        // Semaphore: the per-run conversation record (codex thread / claude
+        // session id + resume-failure counter).
+        "provider-session" | "provider-session.json" => {
+            state.run_root.join("provider-session.json")
         }
         _ => {
             return Err(CliError::Core(deadreckon_core::user_error(

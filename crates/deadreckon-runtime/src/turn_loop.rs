@@ -441,6 +441,19 @@ pub async fn run_turn_loop(
                 )
                 .await?;
         }
+        // Semaphore: a degraded provider contract is not fatal, but it means we
+        // fell back to raw stdout — surface it on the attention/"anything wrong"
+        // channel (events.jsonl) so it isn't silently swallowed.
+        if let Some(message) = degraded_caveat_message(&response.trace, turn) {
+            emit_event(
+                state,
+                config.event_sender.as_ref(),
+                RunEventKind::Error {
+                    turn: Some(turn),
+                    message,
+                },
+            )?;
+        }
         let provider_trace_id = format!("llm-turn-{turn}");
         append_trace(
             state,
@@ -1209,6 +1222,23 @@ fn provider_flight_rows(trace: &serde_json::Value) -> Vec<serde_json::Value> {
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+/// A user-facing notice when the provider's contract degraded this turn (the
+/// driver fell back to raw stdout), for the attention / "anything wrong"
+/// surface. `None` when the turn read the contract cleanly.
+fn degraded_caveat_message(trace: &serde_json::Value, turn: u32) -> Option<String> {
+    let caveats = trace.get("caveats").and_then(serde_json::Value::as_array)?;
+    let caveat = caveats.iter().find(|caveat| {
+        caveat.get("code").and_then(serde_json::Value::as_str) == Some("provider.contract.degraded")
+    })?;
+    let detail = caveat
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("provider contract degraded");
+    Some(format!(
+        "turn {turn}: provider contract degraded — {detail}"
+    ))
 }
 
 fn is_direct_api_provider_kind(kind: &ProviderKind) -> bool {
@@ -4060,6 +4090,29 @@ exit 0\n",
         assert_eq!(
             claude_tokens, 55,
             "claude spend ledger carries real input tokens"
+        );
+    }
+
+    #[test]
+    fn degraded_contract_caveat_reaches_attention_surface() {
+        use super::degraded_caveat_message;
+        let trace = serde_json::json!({
+            "caveats": [
+                {"code": "provider.contract.degraded", "message": "fell back to raw stdout"}
+            ]
+        });
+        let message = degraded_caveat_message(&trace, 3).expect("degraded surfaces a notice");
+        assert!(message.contains("degraded"));
+        assert!(message.contains("turn 3"));
+        assert!(message.contains("raw stdout"));
+        // A clean contract raises nothing on the attention channel.
+        assert!(degraded_caveat_message(&serde_json::json!({}), 1).is_none());
+        assert!(
+            degraded_caveat_message(
+                &serde_json::json!({"caveats": [{"code": "provider.session.reset"}]}),
+                1
+            )
+            .is_none()
         );
     }
 }
