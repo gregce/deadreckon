@@ -224,6 +224,8 @@ async fn polish_run_docs_legacy(
                 sandbox_backend: Some(SandboxBackend::None),
                 pid_file: None,
                 cancellation_token: None,
+                session_dir: None,
+                output_schema: None,
             })
             .await
         {
@@ -510,6 +512,8 @@ async fn run_polish_subcall(
                 sandbox_backend: Some(SandboxBackend::None),
                 pid_file: None,
                 cancellation_token: None,
+                session_dir: None,
+                output_schema: None,
             })
             .await;
         let duration_ms = Some(started.elapsed().as_millis());

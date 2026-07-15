@@ -282,6 +282,8 @@ pub async fn run_turn_loop(
                     .join(format!("provider-turn-{turn}.pid")),
             ),
             cancellation_token: Some(turn_token.clone()),
+            session_dir: None,
+            output_schema: None,
         };
 
         let mut flight_recorder: Option<ProviderFlightRecorderHandle> =

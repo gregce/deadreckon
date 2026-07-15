@@ -470,6 +470,8 @@ async fn provider_course_plan(
         sandbox_backend: None,
         pid_file: None,
         cancellation_token: None,
+        session_dir: None,
+        output_schema: None,
     };
     let response = tokio::time::timeout(
         course_planner_timeout(provider),

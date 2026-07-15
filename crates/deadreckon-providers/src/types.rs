@@ -85,7 +85,7 @@ pub struct SpendEstimate {
     pub wall_time_seconds: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProviderRequest {
     pub prompt: String,
     pub max_output_tokens: u32,
@@ -94,6 +94,12 @@ pub struct ProviderRequest {
     pub sandbox_backend: Option<SandboxBackend>,
     pub pid_file: Option<PathBuf>,
     pub cancellation_token: Option<CancellationToken>,
+    /// Run root holding the per-run `provider-session.json` (Semaphore).
+    /// Threaded from the turn loop; providers that don't resume ignore it.
+    pub session_dir: Option<PathBuf>,
+    /// JSON Schema for schema-constrained final output where the binary
+    /// supports it (codex `--output-schema`); a caveat elsewhere.
+    pub output_schema: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -391,6 +391,8 @@ impl NarratorEngine {
                 // so emit() falls through to a floor beat instead of the task
                 // being killed mid-call with no beat written.
                 cancellation_token: Some(self.cancel.clone()),
+                session_dir: None,
+                output_schema: None,
             };
             if let Ok(response) = router.complete(&request).await
                 && self.commit_model_beat(&response, now).is_ok()

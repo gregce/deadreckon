@@ -73,6 +73,8 @@ async fn mock_provider_records_three_turns() {
                 sandbox_backend: None,
                 pid_file: None,
                 cancellation_token: None,
+                session_dir: None,
+                output_schema: None,
             })
             .await
             .expect("completion");
@@ -124,6 +126,8 @@ async fn mock_provider_supports_error_fixture() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect_err("fixture error");

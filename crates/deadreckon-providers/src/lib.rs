@@ -408,6 +408,8 @@ api_key = "anthropic-key"
                 sandbox_backend: None,
                 pid_file: None,
                 cancellation_token: None,
+                session_dir: None,
+                output_schema: None,
             })
             .await
             .expect_err("missing credentials");
@@ -426,6 +428,8 @@ api_key = "anthropic-key"
                 sandbox_backend: None,
                 pid_file: None,
                 cancellation_token: None,
+                session_dir: None,
+                output_schema: None,
             })
             .await
             .expect("smoke response");

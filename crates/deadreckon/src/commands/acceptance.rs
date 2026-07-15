@@ -669,6 +669,8 @@ pub(crate) async fn acceptance_agent_command_in_dir(
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         }),
     )
     .await
@@ -713,6 +715,8 @@ pub(crate) async fn acceptance_agent_command_in_dir(
                 sandbox_backend: None,
                 pid_file: None,
                 cancellation_token: None,
+                session_dir: None,
+                output_schema: None,
             }),
         )
         .await
@@ -1675,6 +1679,8 @@ async fn run_contract_critic(
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         }),
     )
     .await

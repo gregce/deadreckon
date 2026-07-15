@@ -346,6 +346,8 @@ async fn learn_propose_command(
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await?;
     let reflection_provider = LearningInsightProvider {

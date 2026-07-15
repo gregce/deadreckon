@@ -469,7 +469,9 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
-        }),
+                    session_dir: None,
+            output_schema: None,
+}),
     )
     .await
     .map_err(|err| {
