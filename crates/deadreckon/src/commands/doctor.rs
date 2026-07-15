@@ -525,6 +525,8 @@ async fn collect_doctor_provider_ping(
         sandbox_backend: None,
         pid_file: None,
         cancellation_token: None,
+        session_dir: None,
+        output_schema: None,
     };
     let subject = format!("provider {name} kind={kind_label}");
     match tokio::time::timeout(

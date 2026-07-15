@@ -47,6 +47,8 @@ async fn cli_claude_code_provider_runs_fake_binary_and_captures_output() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -106,6 +108,8 @@ async fn cli_provider_cancellation_stops_non_sandbox_process() {
         sandbox_backend: None,
         pid_file: Some(pid_file.clone()),
         cancellation_token: Some(token.clone()),
+        session_dir: None,
+        output_schema: None,
     };
     let completion = router.complete(&request);
     tokio::pin!(completion);
@@ -156,6 +160,8 @@ async fn cli_codex_provider_uses_exec_verb() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -206,6 +212,8 @@ async fn cli_codex_provider_delimits_option_like_prompt_payload() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -267,6 +275,8 @@ async fn cli_codex_model_override_passes_model_flag() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -318,6 +328,8 @@ async fn cli_claude_model_config_passes_model_flag() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -375,6 +387,8 @@ try_lines = ["install local-test"]
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -445,6 +459,8 @@ args_template = ["exec", "--", "{{prompt}}"]
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -504,6 +520,8 @@ model_arg = "--model"
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -559,6 +577,8 @@ model_arg = "--model"
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -609,6 +629,8 @@ async fn generic_cli_provider_runs_builtin_copilot_descriptor() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -664,6 +686,8 @@ async fn generic_cli_provider_passes_copilot_model_arg() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -713,6 +737,8 @@ async fn generic_cli_provider_runs_builtin_pi_descriptor() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -768,6 +794,8 @@ async fn generic_cli_provider_passes_pi_model_arg() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -821,6 +849,8 @@ args_template = ["run", "{{prompt}}"]
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -878,6 +908,8 @@ async fn cli_provider_runs_inside_requested_sandbox_backend() {
             sandbox_backend: Some(SandboxBackend::None),
             pid_file: Some(pid_file.clone()),
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect("completion");
@@ -934,6 +966,8 @@ async fn cli_provider_resolves_user_path_binary_inside_sandbox_exec() {
                 sandbox_backend: Some(SandboxBackend::SandboxExec),
                 pid_file: None,
                 cancellation_token: None,
+                session_dir: None,
+                output_schema: None,
             })
             .await
             .expect("sandboxed completion");
@@ -1017,6 +1051,8 @@ async fn cli_provider_errors_on_nonzero_exit_after_capturing_output() {
             sandbox_backend: None,
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await
         .expect_err("nonzero exit should fail");

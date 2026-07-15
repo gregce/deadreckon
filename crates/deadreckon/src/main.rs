@@ -5050,6 +5050,8 @@ async fn refresh_plan_docs(
             sandbox_backend: Some(SandboxBackend::None),
             pid_file: None,
             cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
         })
         .await;
     let response = match response {
@@ -6918,6 +6920,8 @@ async fn invoke_merge_repair_planner(
         sandbox_backend: None,
         pid_file: None,
         cancellation_token: None,
+        session_dir: None,
+        output_schema: None,
     };
     let response =
         maybe_with_cli_wait_status(!quiet, "planning merge repair", router.complete(&request))
@@ -14484,6 +14488,8 @@ async fn refresh_narrative_projection_with_provider(
             sandbox_backend: None,
             pid_file: None,
             cancellation_token,
+            session_dir: None,
+            output_schema: None,
         })
         .await
     {

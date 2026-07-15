@@ -538,6 +538,8 @@ async fn provider_plan_drafts(
         sandbox_backend: None,
         pid_file: None,
         cancellation_token: None,
+        session_dir: None,
+        output_schema: None,
     };
     let response =
         maybe_with_cli_wait_status(!plain, "planning child graph", router.complete(&request))

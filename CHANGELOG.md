@@ -17,6 +17,10 @@ caveat instead of failing the turn. Landed in phases, each `make verify` green:
   fixtures recorded from the real binary; the `result` line yields session id,
   usage, reported cost, and answer at once; `rate_limit_event`/hook noise
   degrades to Unknown.
+- P4: per-run `provider-session.json` (schema 1, provider-scoped, atomic) with
+  a resume-failure counter that forces a fresh conversation; `ProviderRequest`
+  gains `session_dir`/`output_schema`; the id is a file, not a PipelineState
+  field.
 
 ## Contract review interstitial + launch surface dedupe — 2026-07-09
 
