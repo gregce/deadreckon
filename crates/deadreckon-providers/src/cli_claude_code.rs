@@ -1,14 +1,19 @@
+use std::path::PathBuf;
 use std::time::Instant;
 
 use serde_json::json;
 use which::which;
 
-use crate::cli_common::{ensure_success, run_cli, write_output};
-use crate::{
-    Provider, ProviderEntry, ProviderFuture, ProviderKind, ProviderRequest, ProviderResponse,
-    ProviderUsage, Result, SpendEstimate,
+use crate::claude_events::{parse_claude_line, probe_claude_capabilities};
+use crate::cli_common::{CliOutput, ensure_success, run_cli, write_output};
+use crate::cli_contract::{
+    PROVIDER_ID_CLAUDE, ParsedStream, ProviderSession, add_caveat, flight_rows_from, parse_stream,
+    session_not_found,
 };
-use std::path::PathBuf;
+use crate::{
+    Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
+    ProviderResponse, ProviderUsage, Result, SpendEstimate,
+};
 
 #[derive(Clone)]
 pub struct CliClaudeCodeProvider {
@@ -17,6 +22,11 @@ pub struct CliClaudeCodeProvider {
     extra_args: Vec<String>,
     model: String,
     model_arg: Option<String>,
+}
+
+struct ClaudeAttempt {
+    output: CliOutput,
+    args: Vec<String>,
 }
 
 impl CliClaudeCodeProvider {
@@ -31,20 +41,39 @@ impl CliClaudeCodeProvider {
         }
     }
 
-    async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let started = Instant::now();
+    fn build_args(
+        &self,
+        request: &ProviderRequest,
+        caps: &crate::claude_events::ClaudeCapabilities,
+        resume_id: Option<&str>,
+    ) -> Vec<String> {
         let mut args = self.extra_args.clone();
         if let Some(model) = self.model_arg.as_deref() {
             args.extend(["--model".to_string(), model.to_string()]);
         }
-        // `claude --help` on this machine documents `-p, --print` for
-        // non-interactive output and `--dangerously-skip-permissions` for
-        // bypassing Claude Code prompts inside an outer sandbox.
-        args.extend([
-            "--dangerously-skip-permissions".to_string(),
-            "-p".to_string(),
-            request.prompt.clone(),
-        ]);
+        args.push("--dangerously-skip-permissions".to_string());
+        if caps.stream_json {
+            args.extend([
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+            ]);
+        }
+        if let Some(id) = resume_id {
+            args.extend(["--resume".to_string(), id.to_string()]);
+        }
+        args.push("-p".to_string());
+        args.push(request.prompt.clone());
+        args
+    }
+
+    async fn run_attempt(
+        &self,
+        request: &ProviderRequest,
+        caps: &crate::claude_events::ClaudeCapabilities,
+        resume_id: Option<&str>,
+    ) -> Result<ClaudeAttempt> {
+        let args = self.build_args(request, caps, resume_id);
         let output = run_cli(
             &self.name,
             &self.binary,
@@ -55,35 +84,147 @@ impl CliClaudeCodeProvider {
             request.cancellation_token.clone(),
         )
         .await?;
+        Ok(ClaudeAttempt { output, args })
+    }
+
+    async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+        let caps = probe_claude_capabilities(&self.binary);
+        let session_dir = request.session_dir.clone();
+        let session = session_dir
+            .as_deref()
+            .and_then(|dir| ProviderSession::read(dir, PROVIDER_ID_CLAUDE));
+        let resume_id = session
+            .as_ref()
+            .filter(|_| caps.resume)
+            .filter(|s| s.can_resume())
+            .map(|s| s.conversation_id.clone());
+
+        let started = Instant::now();
+        let attempt = self
+            .run_attempt(request, &caps, resume_id.as_deref())
+            .await?;
+        let (output, args, resumed, reset) = if attempt.output.status_code != Some(0)
+            && resume_id.is_some()
+            && session_not_found(&attempt.output)
+        {
+            if let (Some(dir), Some(mut s)) = (session_dir.as_deref(), session.clone()) {
+                s.mark_resume_failure(chrono::Utc::now());
+                let _ = s.write(dir);
+            }
+            let fresh = self.run_attempt(request, &caps, None).await?;
+            (fresh.output, fresh.args, false, true)
+        } else {
+            (attempt.output, attempt.args, resume_id.is_some(), false)
+        };
+
         write_output(request.output_path.as_ref(), &output).await?;
         ensure_success(&self.name, &output)?;
-        let wall_time_seconds = started.elapsed().as_secs_f64();
-        let usage = ProviderUsage {
-            input_tokens: 0,
-            output_tokens: 0,
+
+        let parsed = if caps.stream_json {
+            parse_stream(&output.stdout, parse_claude_line)
+        } else {
+            ParsedStream::default()
         };
-        let spend = self
-            .estimate_spend(usage.clone())
-            .with_wall_time(wall_time_seconds);
+        let degraded = !caps.stream_json || parsed.degraded();
+
+        // is_error in the structured result maps to a provider error.
+        if let Some(message) = parsed.failure.clone() {
+            return Err(ProviderError::Cli {
+                provider: self.name.clone(),
+                detail: format!("claude reported an error result: {message}"),
+            });
+        }
+
+        if let (Some(dir), Some(id)) = (session_dir.as_deref(), parsed.conversation_id.as_deref()) {
+            persist_session(dir, PROVIDER_ID_CLAUDE, id, reset);
+        }
+
+        let content = match (&parsed.answer, degraded) {
+            (Some(answer), false) => answer.clone(),
+            _ => output.stdout.clone(),
+        };
+        let usage = usage_from(&parsed);
+        let reported_cost = parsed.usage.and_then(|u| u.cost_usd);
+        let wall = started.elapsed().as_secs_f64();
+        let spend = self.estimate_spend(usage.clone()).with_wall_time(wall);
+
+        let mut trace = json!({
+            "kind": "cli_subagent",
+            "binary": self.binary,
+            "args": args,
+            "stdout_path": request.output_path,
+            "duration_ms": (wall * 1000.0).round() as u64,
+            "exit_code": output.status_code,
+            "pid": output.pid,
+            "sandbox_backend": output.sandbox_backend,
+            "sandbox_warning": output.sandbox_warning,
+            "contract": {
+                "stream_json": caps.stream_json,
+                "resume": caps.resume,
+                "resumed": resumed,
+                "reset": reset,
+                "reported_cost_usd": reported_cost,
+                "unknown_lines": parsed.unknown_lines,
+                "garbage_lines": parsed.garbage_lines,
+            },
+            "flight_rows": flight_rows_from(&parsed),
+        });
+        if degraded {
+            add_caveat(
+                &mut trace,
+                "provider.contract.degraded",
+                "claude output was not the structured stream-json contract; fell back to raw stdout",
+            );
+        }
+        if reset {
+            add_caveat(
+                &mut trace,
+                "provider.session.reset",
+                "resume target vanished; retried once with a fresh conversation",
+            );
+        }
+        if request.output_schema.is_some() {
+            add_caveat(
+                &mut trace,
+                "provider.output_schema.unsupported",
+                "cli:claude-code structured output is not wired in Semaphore; proceeded unconstrained",
+            );
+        }
+
         Ok(ProviderResponse {
             provider: self.name.clone(),
             model: self.model.clone(),
-            content: output.stdout.clone(),
+            content,
             usage,
             spend,
-            trace: json!({
-                "kind": "cli_subagent",
-                "binary": self.binary,
-                "args": args,
-                "stdout_path": request.output_path,
-                "duration_ms": (wall_time_seconds * 1000.0).round() as u64,
-                "exit_code": output.status_code,
-                "pid": output.pid,
-                "sandbox_backend": output.sandbox_backend,
-                "sandbox_warning": output.sandbox_warning,
-            }),
+            trace,
         })
     }
+}
+
+fn usage_from(parsed: &ParsedStream) -> ProviderUsage {
+    parsed
+        .usage
+        .map(|u| ProviderUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        })
+        .unwrap_or(ProviderUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        })
+}
+
+fn persist_session(dir: &std::path::Path, provider: &str, id: &str, reset: bool) {
+    let now = chrono::Utc::now();
+    let record = match ProviderSession::read(dir, provider) {
+        Some(mut existing) if existing.conversation_id == id && !reset => {
+            existing.touch(now);
+            existing
+        }
+        _ => ProviderSession::new(provider, id, now),
+    };
+    let _ = record.write(dir);
 }
 
 fn cli_model(model: Option<String>, legacy_label: &str) -> (String, Option<String>) {
@@ -100,19 +241,15 @@ impl Provider for CliClaudeCodeProvider {
     fn name(&self) -> &str {
         &self.name
     }
-
     fn kind(&self) -> ProviderKind {
         ProviderKind::CliClaudeCode
     }
-
     fn model(&self) -> &str {
         &self.model
     }
-
     fn has_credential(&self) -> bool {
         which(&self.binary).is_ok() || PathBuf::from(&self.binary).exists()
     }
-
     fn estimate_spend(&self, usage: ProviderUsage) -> SpendEstimate {
         SpendEstimate {
             provider: self.name.clone(),
@@ -124,7 +261,6 @@ impl Provider for CliClaudeCodeProvider {
             wall_time_seconds: None,
         }
     }
-
     fn complete<'a>(&'a self, request: &'a ProviderRequest) -> ProviderFuture<'a> {
         Box::pin(async move { self.run(request).await })
     }
@@ -133,7 +269,6 @@ impl Provider for CliClaudeCodeProvider {
 trait WithWallTime {
     fn with_wall_time(self, seconds: f64) -> Self;
 }
-
 impl WithWallTime for SpendEstimate {
     fn with_wall_time(mut self, seconds: f64) -> Self {
         self.wall_time_seconds = Some(seconds);

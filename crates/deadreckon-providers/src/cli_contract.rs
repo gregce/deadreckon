@@ -1,6 +1,3 @@
-// Wired into the codex/claude drivers across phases P5–P9; the `dead_code`
-// allow is removed once every item has a caller.
-#![allow(dead_code)]
 //! Shared machinery for CLI agent wire contracts (Semaphore).
 //!
 //! Provider-neutral: the codex and claude mirrors each translate their JSONL
