@@ -13,6 +13,10 @@ caveat instead of failing the turn. Landed in phases, each `make verify` green:
 - P2: codex `exec --json` event mirror over a provider-neutral `CliStreamEvent`
   vocabulary; unknown `type` tags degrade to Unknown, non-JSON lines skip as
   garbage, tool items lift into flight rows.
+- P3: claude `-p --output-format stream-json` event mirror, grounded on
+  fixtures recorded from the real binary; the `result` line yields session id,
+  usage, reported cost, and answer at once; `rate_limit_event`/hook noise
+  degrades to Unknown.
 
 ## Contract review interstitial + launch surface dedupe — 2026-07-09
 
