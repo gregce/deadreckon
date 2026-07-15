@@ -1,5 +1,19 @@
 # Changelog
 
+## Semaphore (stable) — read the CLI agents' signal flags — 2026-07-15
+
+cli:codex and cli:claude-code read their structured contracts instead of
+scraping raw stdout: real token usage, per-run conversation resume, live
+flight ingestion, answers from the structured result, and schema-constrained
+output where the binary supports it; unparseable contracts degrade with a
+caveat instead of failing the turn. Landed in phases, each `make verify` green:
+
+- P1 (2526f27): per-binary capability probes for both wire contracts, cached
+  and parsed from `--help`; absent flags disable features instead of erroring.
+- P2: codex `exec --json` event mirror over a provider-neutral `CliStreamEvent`
+  vocabulary; unknown `type` tags degrade to Unknown, non-JSON lines skip as
+  garbage, tool items lift into flight rows.
+
 ## Contract review interstitial + launch surface dedupe — 2026-07-09
 
 Closes the gap a real slack-clone run exposed: the accept / re-prompt / edit

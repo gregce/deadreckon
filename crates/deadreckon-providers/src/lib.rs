@@ -6,6 +6,7 @@
 mod auth_probe;
 mod claude_events;
 mod cli_common;
+mod cli_contract;
 mod cli_generic;
 mod codex_events;
 mod config;
