@@ -1487,3 +1487,82 @@ async fn vanished_conversation_retries_fresh_once_with_reset_trace() {
     let args = second.trace["args"].as_array().expect("args");
     assert!(!args.iter().any(|a| a == "resume"));
 }
+
+// ---------------------------------------------------------------------------
+// P9 — schema-constrained output (codex --output-schema).
+// ---------------------------------------------------------------------------
+
+// A capability-capable codex whose help LACKS --output-schema (has --json).
+const FAKE_CODEX_HELP_NO_SCHEMA: &str = "\
+Run Codex non-interactively
+Commands:
+  resume  Resume a previous session by id
+Options:
+      --json
+  -o, --output-last-message <FILE>
+";
+
+#[allow(clippy::expect_used)]
+fn write_fake_codex_no_schema(path: &std::path::Path, jsonl: &str) {
+    let script = format!(
+        "#!/bin/sh\n\
+for a in \"$@\"; do\n\
+  if [ \"$a\" = \"--help\" ]; then\ncat <<'HELP'\n{help}\nHELP\n  exit 0; fi\n\
+done\n\
+cat <<'JSONL'\n{jsonl}\nJSONL\n\
+exit 0\n",
+        help = FAKE_CODEX_HELP_NO_SCHEMA,
+        jsonl = jsonl,
+    );
+    fs::write(path, script).expect("write fake codex no-schema");
+    chmod_exec(path);
+}
+
+#[tokio::test]
+async fn output_schema_passes_schema_file_to_codex() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    write_fake_codex(&binary, CODEX_TURN_JSONL, "{\"action\":\"done\"}");
+    let session_dir = temp.path().join("run");
+    let schema = serde_json::json!({"type":"object","properties":{"action":{"type":"string"}}});
+    let response = codex_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "hi".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: Some(temp.path().join("turns/turn-1/codex.out")),
+            session_dir: Some(session_dir.clone()),
+            output_schema: Some(schema),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+    let args = response.trace["args"].as_array().expect("args");
+    assert!(args.iter().any(|a| a == "--output-schema"));
+    assert!(session_dir.join("provider-output-schema.json").exists());
+}
+
+#[tokio::test]
+async fn schema_incapable_provider_caveats_and_proceeds() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    write_fake_codex_no_schema(&binary, CODEX_TURN_JSONL);
+    let response = codex_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "hi".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: Some(temp.path().join("turns/turn-1/codex.out")),
+            session_dir: Some(temp.path().join("run")),
+            output_schema: Some(serde_json::json!({"type":"object"})),
+            ..Default::default()
+        })
+        .await
+        .expect("completion proceeds unconstrained");
+    let args = response.trace["args"].as_array().expect("args");
+    assert!(!args.iter().any(|a| a == "--output-schema"));
+    let caveats = response.trace["caveats"].as_array().expect("caveats");
+    assert!(
+        caveats
+            .iter()
+            .any(|c| c["code"] == "provider.output_schema.unsupported")
+    );
+}
