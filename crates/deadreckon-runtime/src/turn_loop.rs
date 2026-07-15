@@ -282,7 +282,9 @@ pub async fn run_turn_loop(
                     .join(format!("provider-turn-{turn}.pid")),
             ),
             cancellation_token: Some(turn_token.clone()),
-            session_dir: None,
+            // Semaphore: the run root holds this run's provider-session.json and
+            // any per-turn output-schema file. Non-CLI providers ignore it.
+            session_dir: Some(state.run_root.clone()),
             output_schema: None,
         };
 
@@ -2079,7 +2081,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use deadreckon_providers::{ProviderKind, ProviderRouter};
+    use deadreckon_providers::{ProviderConfigFile, ProviderEntry, ProviderKind, ProviderRouter};
     use deadreckon_sandbox::SandboxBackend;
     use serde_json::Value;
     use tempfile::TempDir;
@@ -2093,7 +2095,7 @@ mod tests {
     };
     use deadreckon_core::gate::{run_acceptance_gate_and_write_marker, validate_acceptance_marker};
     use deadreckon_core::paths::DeadreckonPaths;
-    use deadreckon_core::state::{PipelineState, RunOptions, RunStatus, create_run};
+    use deadreckon_core::state::{PipelineState, RunOptions, RunStatus, create_run, spend_summary};
     use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
 
     use super::{
@@ -3950,6 +3952,114 @@ network = []
         assert!(
             state.total_wall_seconds > 0.0,
             "elapsed wall time must accrue even when the provider reports none"
+        );
+    }
+
+    // --- Semaphore P9: spend ledger carries real CLI tokens ----------------
+
+    fn write_exec(path: &Path, body: &str) {
+        std::fs::write(path, body).expect("write fake bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("chmod");
+        }
+    }
+
+    fn cli_route_config(name: &str, kind: ProviderKind, binary: &Path) -> ProviderConfigFile {
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec![name.to_string()]),
+            providers: [(
+                name.to_string(),
+                ProviderEntry {
+                    kind: Some(kind),
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: Some(name.to_string()),
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    async fn spend_after_cli_turn(name: &str, kind: ProviderKind, binary: &Path) -> u64 {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "spend".to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: Some(name.to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let router = ProviderRouter::from_config(cli_route_config(name, kind, binary), None)
+            .expect("router");
+        let mut config = base_run_loop_config();
+        config.provider = Some(name.to_string());
+        config.max_spend_usd = Some(1.0);
+        config.docs.home = paths.home().to_path_buf();
+        run_turn_loop(&mut state, &router, config)
+            .await
+            .expect("loop");
+        spend_summary(&state).expect("spend").input_tokens
+    }
+
+    #[tokio::test]
+    async fn spend_ledger_records_cli_tokens_per_turn_both_providers() {
+        let temp = TempDir::new().expect("tempdir");
+
+        // Fake codex: capability-capable; emits usage 111 and a Done action.
+        let codex = temp.path().join("fake-codex");
+        write_exec(
+            &codex,
+            "#!/bin/sh\n\
+for a in \"$@\"; do [ \"$a\" = \"--help\" ] && { printf -- '--json\\n-o, --output-last-message <FILE>\\nresume\\n'; exit 0; }; done\n\
+prev=\"\"; out=\"\"\n\
+for a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
+printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"t\"}' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":111,\"cached_input_tokens\":0,\"output_tokens\":9}}'\n\
+[ -n \"$out\" ] && printf '%s' '{\"action\":\"done\",\"summary\":\"ok\"}' > \"$out\"\n\
+exit 0\n",
+        );
+        let codex_tokens =
+            spend_after_cli_turn("cli:codex-test", ProviderKind::CliCodex, &codex).await;
+        assert_eq!(
+            codex_tokens, 111,
+            "codex spend ledger carries real input tokens"
+        );
+
+        // Fake claude: capability-capable; emits usage 55 and a Done result.
+        let claude = temp.path().join("fake-claude");
+        write_exec(
+            &claude,
+            "#!/bin/sh\n\
+for a in \"$@\"; do [ \"$a\" = \"--help\" ] && { printf -- '--output-format stream-json\\n-r, --resume\\n'; exit 0; }; done\n\
+printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{\\\"action\\\":\\\"done\\\"}\",\"session_id\":\"s\",\"usage\":{\"input_tokens\":55,\"output_tokens\":7}}'\n\
+exit 0\n",
+        );
+        let claude_tokens =
+            spend_after_cli_turn("cli:claude-test", ProviderKind::CliClaudeCode, &claude).await;
+        assert_eq!(
+            claude_tokens, 55,
+            "claude spend ledger carries real input tokens"
         );
     }
 }

@@ -36,6 +36,10 @@ caveat instead of failing the turn. Landed in phases, each `make verify` green:
 - P8: tool rows parsed from the stream ingest into the flight ledger live; a
   descriptor `[ingest] live_contract` flag makes the post-hoc file scraper
   yield for that provider, so the two never double-count.
+- P9: `ProviderRequest.output_schema` becomes codex `--output-schema` where the
+  binary is probed capable (a caveat elsewhere); the turn loop threads the run
+  root as `session_dir`, and the spend ledger records real CLI tokens per turn
+  for both providers.
 
 ## Contract review interstitial + launch surface dedupe — 2026-07-09
 
