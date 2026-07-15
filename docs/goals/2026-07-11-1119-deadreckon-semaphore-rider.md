@@ -131,6 +131,16 @@ resume exits nonzero with a session-not-found signature:
 state): `session_dir: Option<PathBuf>` (threaded from `turn_loop.rs:272`) and
 `output_schema: Option<serde_json::Value>`. Other providers ignore both.
 
+**Build the machinery descriptor-aware.** The shared pieces (capability
+probe, session file, tolerant-parse dispatch, live flight append, degraded
+fallback) must be parameterized by a `ProviderContract` value — for codex and
+claude that value is constructed in code from the table above; a follow-up
+slice (Pennant) will construct it from descriptor TOML for the generic fleet
+(cli:pi, cli:copilot, cli:gemini, cli:opencode). Do not implement descriptor
+parsing here; do keep the machinery free of codex/claude-specific branching
+outside the two mirror modules, so Pennant is data plus fixtures, not a
+refactor.
+
 ## Phases (eleven)
 
 Each phase: named depth test(s) **first** (watch them fail) → implement →
@@ -236,7 +246,8 @@ Depth tests:
 
 - The app-server route, steering, interrupts, approvals (Rudder's slice; Rudder's session-file extension keys still apply on top of this schema).
 - Metered pricing / billing semantics for subscription CLIs (claude's reported cost stays informational trace detail).
-- `cli:generic` structured contracts (no standard exists; capability probe reports "no contract detected").
+- Descriptor-declared contracts for the generic fleet — cli:pi and cli:copilot (whose descriptors already request JSON output nothing parses), cli:gemini, cli:opencode — are the Pennant slice (`2026-07-15-1658-deadreckon-pennant-{goal,rider}.md`); Semaphore only keeps the machinery contract-shaped for it.
+- Bare `cli:generic` entries with no descriptor contract (no standard exists; capability probe reports "no contract detected").
 - Parsing `reasoning`/thinking items into narrative (flight records them verbatim).
 - Claude `--json-schema`-style structured output if/when the binary grows it — the capability probe is forward-ready; wiring it is a follow-up.
 
