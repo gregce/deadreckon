@@ -4,8 +4,10 @@
 //! Provider routing and adapters for deadreckon.
 
 mod auth_probe;
+mod claude_events;
 mod cli_common;
 mod cli_generic;
+mod codex_events;
 mod config;
 mod error;
 mod http;
