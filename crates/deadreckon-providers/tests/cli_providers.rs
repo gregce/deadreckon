@@ -1358,3 +1358,132 @@ async fn claude_is_error_result_maps_to_provider_error() {
         .expect_err("is_error maps to provider error");
     assert!(err.to_string().contains("error result"));
 }
+
+// ---------------------------------------------------------------------------
+// P7 — per-run resume.
+// ---------------------------------------------------------------------------
+
+const CODEX_TURN_JSONL: &str = "{\"type\":\"thread.started\",\"thread_id\":\"t-run1\"}\n\
+{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":5,\"cached_input_tokens\":0,\"output_tokens\":2}}";
+
+#[tokio::test]
+async fn codex_second_turn_resumes_persisted_thread() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    write_fake_codex(&binary, CODEX_TURN_JSONL, "{\"action\":\"done\"}");
+    let session_dir = temp.path().join("run");
+    let req = |turn: u32| ProviderRequest {
+        prompt: "hi".to_string(),
+        cwd: Some(temp.path().to_path_buf()),
+        output_path: Some(temp.path().join(format!("turns/turn-{turn}/codex.out"))),
+        session_dir: Some(session_dir.clone()),
+        ..Default::default()
+    };
+    let router = codex_router(&binary);
+    let first = router.complete(&req(1)).await.expect("turn 1");
+    assert_eq!(first.trace["contract"]["resumed"], false);
+    let second = router.complete(&req(2)).await.expect("turn 2");
+    assert_eq!(second.trace["contract"]["resumed"], true);
+    let args = second.trace["args"].as_array().expect("args");
+    assert!(args.iter().any(|a| a == "resume"));
+    assert!(args.iter().any(|a| a == "t-run1"));
+}
+
+#[tokio::test]
+async fn claude_second_turn_resumes_persisted_session() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-claude");
+    let jsonl = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-run1\"}\n\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"s-run1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}";
+    write_fake_claude(&binary, jsonl);
+    let session_dir = temp.path().join("run");
+    let req = || ProviderRequest {
+        prompt: "hi".to_string(),
+        cwd: Some(temp.path().to_path_buf()),
+        session_dir: Some(session_dir.clone()),
+        ..Default::default()
+    };
+    let router = claude_router(&binary);
+    router.complete(&req()).await.expect("turn 1");
+    let second = router.complete(&req()).await.expect("turn 2");
+    assert_eq!(second.trace["contract"]["resumed"], true);
+    let args = second.trace["args"].as_array().expect("args");
+    assert!(args.iter().any(|a| a == "--resume"));
+    assert!(args.iter().any(|a| a == "s-run1"));
+}
+
+#[tokio::test]
+async fn distinct_runs_never_share_a_conversation() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    write_fake_codex(&binary, CODEX_TURN_JSONL, "{\"action\":\"done\"}");
+    let router = codex_router(&binary);
+    let mk = |run: &str| ProviderRequest {
+        prompt: "hi".to_string(),
+        cwd: Some(temp.path().to_path_buf()),
+        output_path: Some(temp.path().join(format!("{run}/codex.out"))),
+        session_dir: Some(temp.path().join(run)),
+        ..Default::default()
+    };
+    let a = router.complete(&mk("run-a")).await.expect("run a");
+    let b = router.complete(&mk("run-b")).await.expect("run b");
+    // Each run's first turn is fresh — a distinct run never resumes another's.
+    assert_eq!(a.trace["contract"]["resumed"], false);
+    assert_eq!(b.trace["contract"]["resumed"], false);
+}
+
+#[allow(clippy::expect_used)]
+fn write_fake_codex_vanishing(path: &std::path::Path) {
+    let script = format!(
+        "#!/bin/sh\n\
+for a in \"$@\"; do\n\
+  if [ \"$a\" = \"--help\" ]; then\ncat <<'HELP'\n{help}\nHELP\n  exit 0; fi\n\
+done\n\
+for a in \"$@\"; do\n\
+  if [ \"$a\" = \"resume\" ]; then echo 'error: session not found' >&2; exit 1; fi\n\
+done\n\
+prev=\"\"; out=\"\"\n\
+for a in \"$@\"; do\n\
+  if [ \"$prev\" = \"-o\" ]; then out=\"$a\"; fi\n\
+  prev=\"$a\"\n\
+done\n\
+cat <<'JSONL'\n{jsonl}\nJSONL\n\
+if [ -n \"$out\" ]; then printf '%s' '{{\"action\":\"done\"}}' > \"$out\"; fi\n\
+exit 0\n",
+        help = FAKE_CODEX_HELP,
+        jsonl = CODEX_TURN_JSONL,
+    );
+    fs::write(path, script).expect("write vanishing codex");
+    chmod_exec(path);
+}
+
+#[tokio::test]
+async fn vanished_conversation_retries_fresh_once_with_reset_trace() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    write_fake_codex_vanishing(&binary);
+    let session_dir = temp.path().join("run");
+    let req = |turn: u32| ProviderRequest {
+        prompt: "hi".to_string(),
+        cwd: Some(temp.path().to_path_buf()),
+        output_path: Some(temp.path().join(format!("turns/turn-{turn}/codex.out"))),
+        session_dir: Some(session_dir.clone()),
+        ..Default::default()
+    };
+    let router = codex_router(&binary);
+    // Turn 1 writes a session (t-run1).
+    router.complete(&req(1)).await.expect("turn 1");
+    // Turn 2 tries to resume t-run1; the fake reports it vanished; the driver
+    // retries once fresh and records a reset caveat.
+    let second = router.complete(&req(2)).await.expect("turn 2 recovers");
+    assert_eq!(second.trace["contract"]["reset"], true);
+    let caveats = second.trace["caveats"].as_array().expect("caveats");
+    assert!(
+        caveats
+            .iter()
+            .any(|c| c["code"] == "provider.session.reset")
+    );
+    // The final (fresh) attempt did not carry a resume verb.
+    let args = second.trace["args"].as_array().expect("args");
+    assert!(!args.iter().any(|a| a == "resume"));
+}
