@@ -25,6 +25,10 @@ caveat instead of failing the turn. Landed in phases, each `make verify` green:
   real token usage from `turn.completed`, the answer from `--output-last-message`
   (raw stdout only in degraded mode with a `provider.contract.degraded` caveat);
   parsed tool rows ride the response trace for live flight ingestion.
+- P6: the claude driver reads `--output-format stream-json --verbose` — real
+  token usage and the answer from the `result` event, `is_error` maps to a
+  provider error, and the reported `total_cost_usd` lands in the trace detail
+  only (spend stays subscription/$0). Shared degraded fallback with codex.
 
 ## Contract review interstitial + launch surface dedupe — 2026-07-09
 

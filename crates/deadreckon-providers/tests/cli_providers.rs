@@ -1230,3 +1230,131 @@ async fn codex_unparseable_stdout_degrades_with_caveat() {
             .any(|c| c["code"] == "provider.contract.degraded")
     );
 }
+
+const FAKE_CLAUDE_HELP: &str = "\
+Claude Code
+  --json-schema <schema>   JSON Schema for structured output
+  --output-format <format> choices: text, json, stream-json
+  -r, --resume [sessionId] Resume a conversation
+  -p, --print
+";
+
+#[allow(clippy::expect_used)]
+fn write_fake_claude(path: &std::path::Path, jsonl: &str) {
+    let script = format!(
+        "#!/bin/sh\n\
+for a in \"$@\"; do\n\
+  if [ \"$a\" = \"--help\" ]; then\n\
+cat <<'HELP'\n{help}\nHELP\n    exit 0\n  fi\n\
+done\n\
+cat <<'JSONL'\n{jsonl}\nJSONL\n\
+exit 0\n",
+        help = FAKE_CLAUDE_HELP,
+        jsonl = jsonl,
+    );
+    fs::write(path, script).expect("write fake claude");
+    chmod_exec(path);
+}
+
+#[allow(clippy::expect_used)]
+fn claude_router(binary: &std::path::Path) -> ProviderRouter {
+    ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:claude-code".to_string()]),
+            providers: [(
+                "cli:claude-code".to_string(),
+                ProviderEntry {
+                    kind: Some(ProviderKind::CliClaudeCode),
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: Some("cli:claude-code".to_string()),
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router")
+}
+
+const CLAUDE_SIMPLE_FIXTURE: &str = include_str!("fixtures/semaphore/claude-simple.jsonl");
+
+#[tokio::test]
+async fn claude_turn_reports_real_token_usage() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-claude");
+    write_fake_claude(&binary, CLAUDE_SIMPLE_FIXTURE);
+    let response = claude_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "hi".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+    assert_eq!(response.usage.input_tokens, 2);
+    assert_eq!(response.usage.output_tokens, 4);
+    assert_eq!(response.spend.input_tokens, 2);
+}
+
+#[tokio::test]
+async fn claude_reported_cost_lands_in_trace_detail_not_spend() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-claude");
+    write_fake_claude(&binary, CLAUDE_SIMPLE_FIXTURE);
+    let response = claude_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "hi".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+    // Reported cost is trace detail only.
+    assert_eq!(response.trace["contract"]["reported_cost_usd"], 0.131228);
+    // Spend stays subscription/$0.
+    assert_eq!(response.spend.cost_usd, 0.0);
+    assert!(response.spend.subscription);
+}
+
+#[tokio::test]
+async fn claude_response_content_is_result_text() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-claude");
+    write_fake_claude(&binary, CLAUDE_SIMPLE_FIXTURE);
+    let response = claude_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "hi".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+    assert_eq!(response.content, "pong");
+    assert!(!response.content.contains("\"type\":\"system\""));
+}
+
+#[tokio::test]
+async fn claude_is_error_result_maps_to_provider_error() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-claude");
+    let jsonl = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-1\"}\n\
+                 {\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"boom\",\"session_id\":\"s-1\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}";
+    write_fake_claude(&binary, jsonl);
+    let err = claude_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "hi".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect_err("is_error maps to provider error");
+    assert!(err.to_string().contains("error result"));
+}

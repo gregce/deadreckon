@@ -1,6 +1,3 @@
-// Wired into the claude driver across phases P5–P9; the `dead_code` allow is
-// removed once every item has a caller.
-#![allow(dead_code)]
 //! Claude Code `-p --output-format stream-json` wire contract mirror +
 //! capability probe.
 //!
@@ -95,10 +92,10 @@ enum ClaudeStreamEvent {
     Assistant {
         message: Value,
     },
-    User {
-        #[serde(default)]
-        message: Value,
-    },
+    // Tool-result echoes — recognized so they are not Unknown; their content is
+    // already captured from the matching assistant `tool_use`, so no fields are
+    // read structurally.
+    User,
     Result {
         #[serde(default)]
         result: Option<String>,
@@ -128,7 +125,7 @@ pub(crate) fn parse_claude_line(line: &str) -> Option<Vec<CliStreamEvent>> {
         ClaudeStreamEvent::Assistant { message } => claude_content_events(&message, line),
         // Tool results echo rows already lifted from the assistant tool_use;
         // recognized, not re-appended.
-        ClaudeStreamEvent::User { .. } => vec![CliStreamEvent::Recognized],
+        ClaudeStreamEvent::User => vec![CliStreamEvent::Recognized],
         ClaudeStreamEvent::Result {
             result,
             usage,
