@@ -1,6 +1,3 @@
-// Wired into the codex driver across phases P5–P9; the `dead_code` allow is
-// removed once every item has a caller.
-#![allow(dead_code)]
 //! Codex `exec --json` wire contract mirror + capability probe.
 //!
 //! The wire shapes mirror `codex-rs/exec/src/exec_events.rs` but are never

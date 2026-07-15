@@ -1083,3 +1083,150 @@ fn chmod_exec(path: &std::path::Path) {
         fs::set_permissions(path, perms).expect("chmod");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Semaphore: capability-capable fake CLIs. `--help` prints the real flags so
+// the probe lights up; a real run replays canned JSONL (and, for codex, writes
+// the -o last-message file).
+// ---------------------------------------------------------------------------
+
+const FAKE_CODEX_HELP: &str = "\
+Run Codex non-interactively
+Commands:
+  resume  Resume a previous session by id
+Options:
+      --output-schema <FILE>
+      --json
+  -o, --output-last-message <FILE>
+";
+
+#[allow(clippy::expect_used)]
+fn write_fake_codex(path: &std::path::Path, jsonl: &str, answer: &str) {
+    let script = format!(
+        "#!/bin/sh\n\
+for a in \"$@\"; do\n\
+  if [ \"$a\" = \"--help\" ]; then\n\
+cat <<'HELP'\n{help}\nHELP\n    exit 0\n  fi\n\
+done\n\
+prev=\"\"; out=\"\"\n\
+for a in \"$@\"; do\n\
+  if [ \"$prev\" = \"-o\" ] || [ \"$prev\" = \"--output-last-message\" ]; then out=\"$a\"; fi\n\
+  prev=\"$a\"\n\
+done\n\
+cat <<'JSONL'\n{jsonl}\nJSONL\n\
+if [ -n \"$out\" ]; then\ncat > \"$out\" <<'ANSWER'\n{answer}\nANSWER\nfi\n\
+exit 0\n",
+        help = FAKE_CODEX_HELP,
+        jsonl = jsonl,
+        answer = answer,
+    );
+    fs::write(path, script).expect("write fake codex");
+    chmod_exec(path);
+}
+
+#[allow(clippy::expect_used)]
+fn codex_router(binary: &std::path::Path) -> ProviderRouter {
+    ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:codex".to_string()]),
+            providers: [(
+                "cli:codex".to_string(),
+                ProviderEntry {
+                    kind: Some(ProviderKind::CliCodex),
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: Some("cli:codex".to_string()),
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router")
+}
+
+#[tokio::test]
+async fn codex_turn_reports_real_token_usage() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    let jsonl = "{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}\n\
+                 {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":10,\"output_tokens\":40,\"reasoning_output_tokens\":0}}";
+    write_fake_codex(&binary, jsonl, "{\"action\":\"done\"}");
+    let out = temp.path().join("turns/turn-1/codex.out");
+    let response = codex_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "hi".to_string(),
+            output_path: Some(out),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+    assert_eq!(response.usage.input_tokens, 100);
+    assert_eq!(response.usage.output_tokens, 40);
+    assert_eq!(response.spend.input_tokens, 100);
+    assert!(response.spend.subscription);
+    assert_eq!(response.spend.cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn codex_response_content_is_last_message_not_stdout_noise() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    let jsonl = "{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}\n\
+                 {\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"noise\"}}\n\
+                 {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}";
+    write_fake_codex(
+        &binary,
+        jsonl,
+        "{\"action\":\"finish\",\"summary\":\"clean\"}",
+    );
+    let out = temp.path().join("turns/turn-1/codex.out");
+    let response = codex_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "hi".to_string(),
+            output_path: Some(out),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+    assert_eq!(
+        response.content,
+        "{\"action\":\"finish\",\"summary\":\"clean\"}"
+    );
+    assert!(!response.content.contains("thread.started"));
+}
+
+#[tokio::test]
+async fn codex_unparseable_stdout_degrades_with_caveat() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    // Capability-capable binary, but the run prints non-JSON and writes no
+    // meaningful last-message: the driver degrades to raw stdout with a caveat.
+    write_fake_codex(&binary, "this is not json\njust plain text", "");
+    let out = temp.path().join("turns/turn-1/codex.out");
+    let response = codex_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "hi".to_string(),
+            output_path: Some(out),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+    assert!(response.content.contains("this is not json"));
+    let caveats = response.trace["caveats"].as_array().expect("caveats");
+    assert!(
+        caveats
+            .iter()
+            .any(|c| c["code"] == "provider.contract.degraded")
+    );
+}

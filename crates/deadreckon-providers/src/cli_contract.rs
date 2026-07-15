@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::ProviderError;
 
@@ -160,6 +161,182 @@ impl ProviderSession {
             source,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tolerant stream fold + degraded detection (driver machinery).
+// ---------------------------------------------------------------------------
+
+/// Result of folding a provider's stdout through its line parser.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ParsedStream {
+    pub conversation_id: Option<String>,
+    pub usage: Option<CliUsage>,
+    pub answer: Option<String>,
+    pub tool_rows: Vec<CliToolRow>,
+    pub failure: Option<String>,
+    pub unknown_lines: u64,
+    pub garbage_lines: u64,
+    pub structured_events: u64,
+}
+
+impl ParsedStream {
+    /// Nothing structured could be read — an old binary predating the JSONL
+    /// flags, or output that is not the contract at all. The driver falls back
+    /// to raw stdout with a caveat instead of failing the turn.
+    pub(crate) fn degraded(&self) -> bool {
+        self.structured_events == 0
+    }
+}
+
+/// Fold a provider's stdout through its per-line parser. `parse_line` returns
+/// `None` for a line that is not JSON at all (counted as garbage, skipped);
+/// `Some(events)` for a parsed line (possibly `[Unknown]`).
+pub(crate) fn parse_stream(
+    stdout: &str,
+    parse_line: impl Fn(&str) -> Option<Vec<CliStreamEvent>>,
+) -> ParsedStream {
+    let mut parsed = ParsedStream::default();
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some(events) = parse_line(line) else {
+            parsed.garbage_lines += 1;
+            continue;
+        };
+        for event in events {
+            match event {
+                CliStreamEvent::Conversation(id) => {
+                    parsed.conversation_id = Some(id);
+                    parsed.structured_events += 1;
+                }
+                CliStreamEvent::Usage(u) => {
+                    parsed.usage = Some(u);
+                    parsed.structured_events += 1;
+                }
+                CliStreamEvent::Answer(t) => {
+                    parsed.answer = Some(t);
+                    parsed.structured_events += 1;
+                }
+                CliStreamEvent::Tool(row) => {
+                    upsert_tool_row(&mut parsed.tool_rows, row);
+                    parsed.structured_events += 1;
+                }
+                CliStreamEvent::Failure(m) => {
+                    parsed.failure = Some(m);
+                    parsed.structured_events += 1;
+                }
+                CliStreamEvent::Recognized => {
+                    parsed.structured_events += 1;
+                }
+                CliStreamEvent::Unknown => {
+                    parsed.unknown_lines += 1;
+                }
+            }
+        }
+    }
+    parsed
+}
+
+/// A later row for the same item id supersedes an earlier one (an
+/// `item.completed` replaces the `item.started` it upgraded from), so the
+/// ledger keeps one row per logical tool call in terminal state.
+fn upsert_tool_row(rows: &mut Vec<CliToolRow>, row: CliToolRow) {
+    if let Some(existing) = rows.iter_mut().find(|existing| existing.id == row.id) {
+        *existing = row;
+    } else {
+        rows.push(row);
+    }
+}
+
+/// A tool-call row lifted from the live stream, carried in the response trace
+/// (`trace.flight_rows`) for the runtime to ingest into the flight ledger.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderFlightRow {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_category: Option<String>,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    pub raw: String,
+}
+
+pub(crate) fn flight_rows_from(parsed: &ParsedStream) -> Vec<ProviderFlightRow> {
+    parsed
+        .tool_rows
+        .iter()
+        .map(|row| ProviderFlightRow {
+            id: row.id.clone(),
+            tool_name: row.tool_name.clone(),
+            tool_category: row.tool_category.clone(),
+            summary: row.summary.clone(),
+            status: row.status.clone(),
+            raw: row.raw.clone(),
+        })
+        .collect()
+}
+
+/// True when a nonzero-exit resume output looks like the conversation is gone
+/// (as opposed to a transient error), so the driver retries once fresh.
+pub(crate) fn session_not_found(output: &crate::cli_common::CliOutput) -> bool {
+    let haystack = format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase();
+    [
+        "session not found",
+        "no such session",
+        "unknown session",
+        "conversation not found",
+        "could not find session",
+        "no rollout",
+        "not found",
+    ]
+    .iter()
+    .any(|marker| haystack.contains(marker))
+}
+
+/// Append a `{code, message}` caveat to the response trace. Degraded contracts,
+/// session resets, and unsupported schema requests all surface this way instead
+/// of failing the turn.
+pub(crate) fn add_caveat(trace: &mut Value, code: &str, message: &str) {
+    let caveat = serde_json::json!({ "code": code, "message": message });
+    match trace.get_mut("caveats").and_then(Value::as_array_mut) {
+        Some(arr) => arr.push(caveat),
+        None => {
+            if let Some(obj) = trace.as_object_mut() {
+                obj.insert("caveats".to_string(), Value::Array(vec![caveat]));
+            }
+        }
+    }
+}
+
+/// Write the request's JSON Schema to a file for codex `--output-schema`.
+pub(crate) async fn write_schema_file(
+    dir: &Path,
+    schema: &Value,
+) -> Result<PathBuf, ProviderError> {
+    let path = dir.join("provider-output-schema.json");
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|source| ProviderError::Io {
+                path: parent.display().to_string(),
+                source,
+            })?;
+    }
+    let body = serde_json::to_string_pretty(schema).map_err(|source| ProviderError::Io {
+        path: path.display().to_string(),
+        source: std::io::Error::other(source),
+    })?;
+    tokio::fs::write(&path, body)
+        .await
+        .map_err(|source| ProviderError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(path)
 }
 
 #[cfg(test)]

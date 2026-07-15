@@ -21,6 +21,10 @@ caveat instead of failing the turn. Landed in phases, each `make verify` green:
   a resume-failure counter that forces a fresh conversation; `ProviderRequest`
   gains `session_dir`/`output_schema`; the id is a file, not a PipelineState
   field.
+- P5: the codex driver reads its contract — `--json` stream folded tolerantly,
+  real token usage from `turn.completed`, the answer from `--output-last-message`
+  (raw stdout only in degraded mode with a `provider.contract.degraded` caveat);
+  parsed tool rows ride the response trace for live flight ingestion.
 
 ## Contract review interstitial + launch surface dedupe — 2026-07-09
 
