@@ -33,6 +33,9 @@ caveat instead of failing the turn. Landed in phases, each `make verify` green:
   `--resume <session>` after turn 1 persists the id; distinct runs never share
   a conversation; a vanished conversation retries fresh once and records a
   `provider.session.reset` caveat.
+- P8: tool rows parsed from the stream ingest into the flight ledger live; a
+  descriptor `[ingest] live_contract` flag makes the post-hoc file scraper
+  yield for that provider, so the two never double-count.
 
 ## Contract review interstitial + launch surface dedupe — 2026-07-09
 
