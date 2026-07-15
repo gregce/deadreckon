@@ -10,39 +10,40 @@ caveat instead of failing the turn. Landed in phases, each `make verify` green:
 
 - P1 (2526f27): per-binary capability probes for both wire contracts, cached
   and parsed from `--help`; absent flags disable features instead of erroring.
-- P2: codex `exec --json` event mirror over a provider-neutral `CliStreamEvent`
+- P2 (b0a88f0): codex `exec --json` event mirror over a provider-neutral `CliStreamEvent`
   vocabulary; unknown `type` tags degrade to Unknown, non-JSON lines skip as
   garbage, tool items lift into flight rows.
-- P3: claude `-p --output-format stream-json` event mirror, grounded on
+- P3 (e8d7e7c): claude `-p --output-format stream-json` event mirror, grounded on
   fixtures recorded from the real binary; the `result` line yields session id,
   usage, reported cost, and answer at once; `rate_limit_event`/hook noise
   degrades to Unknown.
-- P4: per-run `provider-session.json` (schema 1, provider-scoped, atomic) with
+- P4 (d152363): per-run `provider-session.json` (schema 1, provider-scoped, atomic) with
   a resume-failure counter that forces a fresh conversation; `ProviderRequest`
   gains `session_dir`/`output_schema`; the id is a file, not a PipelineState
   field.
-- P5: the codex driver reads its contract — `--json` stream folded tolerantly,
+- P5 (81f79f4): the codex driver reads its contract — `--json` stream folded tolerantly,
   real token usage from `turn.completed`, the answer from `--output-last-message`
   (raw stdout only in degraded mode with a `provider.contract.degraded` caveat);
   parsed tool rows ride the response trace for live flight ingestion.
-- P6: the claude driver reads `--output-format stream-json --verbose` — real
+- P6 (1c44745): the claude driver reads `--output-format stream-json --verbose` — real
   token usage and the answer from the `result` event, `is_error` maps to a
   provider error, and the reported `total_cost_usd` lands in the trace detail
   only (spend stays subscription/$0). Shared degraded fallback with codex.
-- P7: per-run conversation resume for both — `exec resume <thread>` /
+- P7 (c1fdf9d): per-run conversation resume for both — `exec resume <thread>` /
   `--resume <session>` after turn 1 persists the id; distinct runs never share
   a conversation; a vanished conversation retries fresh once and records a
   `provider.session.reset` caveat.
-- P8: tool rows parsed from the stream ingest into the flight ledger live; a
+- P8 (f537587): tool rows parsed from the stream ingest into the flight ledger live; a
   descriptor `[ingest] live_contract` flag makes the post-hoc file scraper
   yield for that provider, so the two never double-count.
-- P9: `ProviderRequest.output_schema` becomes codex `--output-schema` where the
+- P9 (3542d18): `ProviderRequest.output_schema` becomes codex `--output-schema` where the
   binary is probed capable (a caveat elsewhere); the turn loop threads the run
   root as `session_dir`, and the spend ledger records real CLI tokens per turn
   for both providers.
-- P10: `show`/`report` render CLI token usage on the subscription surface; a
+- P10 (0c5f41f): `show`/`report` render CLI token usage on the subscription surface; a
   degraded contract raises an attention notice instead of being silently
   swallowed; `show <run> --raw provider-session` dumps the conversation record.
+- P11: architecture (AS-BUILT §50) and deferrals (V1-CANDIDATES) documented.
 
 ## Contract review interstitial + launch surface dedupe — 2026-07-09
 

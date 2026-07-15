@@ -216,3 +216,29 @@
   native table is extensible.
 - Auto-installing missing toolchains/deps so a detected command can actually run.
 - Blanket pytest `-k 'not …'` skip detection in the suppression lint.
+
+## Semaphore follow-ups (Semaphore, §50)
+
+- Claude `--json-schema` structured output: the capability probe already
+  detects it (`ClaudeCapabilities.json_schema`), but wiring `output_schema` into
+  the claude driver is a follow-up — Semaphore emits a caveat and proceeds
+  unconstrained for claude today.
+- Descriptor-declared contracts for the generic fleet (cli:pi, cli:copilot,
+  cli:gemini, cli:opencode): Semaphore keeps the machinery contract-shaped
+  (parameterized by a per-provider parser + capability set) but constructs the
+  contract in code for codex/claude only. The Pennant slice builds it from
+  descriptor TOML plus recorded fixtures.
+- Metered pricing / billing semantics for subscription CLIs: claude's reported
+  `total_cost_usd` lands in the turn trace detail as informational only;
+  `SpendEstimate` stays subscription/$0. Turning reported cost into a real
+  dollar ledger is out of scope.
+- The app-server route, steering, interrupts, and approvals (Rudder) layer on
+  top of the per-run session file; Semaphore only lays the session-file
+  foundation.
+- Parsing codex `reasoning` / claude thinking items into narrative: the flight
+  ledger records tool rows verbatim; a thinking-to-narrative projection is
+  deferred.
+- Cross-source flight dedup by semantic identity: Semaphore dedupes by
+  suppression (a `live_contract` provider's post-hoc file scraper yields to live
+  ingestion). Matching individual on-disk rows to live rows by content would let
+  both sources run — unnecessary while live ingestion is authoritative.

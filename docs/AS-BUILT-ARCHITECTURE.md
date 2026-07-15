@@ -3481,6 +3481,92 @@ attach. It does not close cross-run efficiency dashboards, CLI-provider context
 telemetry, a web/desktop live mirror, syntax-highlighted diff browsing, or MCP
 exposure; those remain V1 candidates.
 
+## 50. Semaphore: The CLI Agent Wire Contracts
+
+Before Semaphore the two workhorse CLI drivers (`cli:codex`, `cli:claude-code`)
+scraped raw stdout as the whole response, hardcoded `usage: 0/0`, and started a
+fresh conversation every turn. Both tools already published structured
+contracts deadreckon ignored. Semaphore reads them.
+
+**Shared machinery, two thin mirrors.** `deadreckon-providers::cli_contract`
+holds everything provider-neutral: the `CliStreamEvent` vocabulary
+(conversation id, usage, answer, tool row, failure, recognized, unknown), the
+tolerant JSONL fold (`parse_stream`), degraded-mode detection, the per-run
+`provider-session.json` record, live flight-row extraction, and the resume
+helpers. Two mirror modules translate each binary's JSONL into that vocabulary
+and nothing more: `codex_events` (wire per codex-rs `exec_events.rs`) and
+`claude_events` (wire per fixtures recorded from the real binary, checked into
+`crates/deadreckon-providers/tests/fixtures/semaphore/`). No codex/claude
+specifics leak outside the two mirror modules, so a follow-up slice (Pennant)
+constructs the contract from descriptor TOML for the generic fleet without a
+refactor.
+
+**Feature detection, not version pinning.** Each binary is probed once per
+process from `--help` (`codex exec --help`, `claude --help`) and the capability
+set is cached. Absent flags disable the corresponding behavior with a caveat —
+a binary that predates the structured flags keeps working, degrading to the old
+raw-stdout path.
+
+**Tolerant parsing is the law.** Unknown `type` tags become
+`CliStreamEvent::Unknown` (counted, preserved, never fatal). A line that is not
+JSON at all is counted as garbage and skipped. Output that yields no structured
+event at all degrades to raw stdout and appends a `provider.contract.degraded`
+caveat to the turn trace instead of failing the turn; the turn loop raises that
+caveat on the attention channel (events.jsonl) so it isn't silently swallowed.
+
+**Per-run conversation resume.** The conversation id is a file, not a
+`PipelineState` field: `<run_root>/provider-session.json` (schema 1, provider,
+conversation_id, created_at, last_turn_at, resume_failures). It is
+provider-scoped — a run whose provider changes mid-life (rescue) ignores a
+session recorded by a different provider name. Turn 1 persists the id; later
+turns resume (`codex exec resume <id>` / `claude --resume <id>`). A resume that
+exits nonzero with a session-not-found signature increments `resume_failures`,
+retries once fresh, and records a `provider.session.reset` caveat;
+`resume_failures >= 1` forces a fresh conversation next turn. Resume never
+crosses runs or providers. `deadreckon show <run> --raw provider-session` dumps
+the record.
+
+**Real tokens; dollars unchanged.** Usage comes from `turn.completed.usage`
+(codex) and `result.usage` (claude) into a real `ProviderUsage`, which flows
+into the spend ledger per turn and renders on the subscription surface.
+`SpendEstimate` stays `subscription: true, cost_usd: 0.0`; claude's reported
+`total_cost_usd` is recorded in the turn trace detail as informational only —
+billing semantics for subscription CLIs are out of scope.
+
+**Answers from the structured result.** codex reads the final message from the
+`--output-last-message` file; claude reads `result.result`. Raw stdout is used
+only in degraded mode.
+
+**Live flight ingestion (§33).** Tool/item events parsed from the stream are
+carried on the response trace as `trace.flight_rows` and ingested into the
+flight ledger during the turn. A descriptor `[ingest] live_contract` flag tells
+the recorder the driver owns tool-row ingestion, so the post-hoc file scraper
+yields for that provider — the two never double-count. Cross-reference §33
+(Provider Flight Recorder & Rewind).
+
+**Schema-constrained output.** `ProviderRequest.output_schema` becomes codex
+`--output-schema <file>` where the binary is probed capable (§46 planner);
+claude and incapable codex binaries record a caveat and proceed unconstrained.
+Claude's own `--json-schema` is left for a follow-up — the probe is
+forward-ready.
+
+Per-provider contract table:
+
+| | cli:codex | cli:claude-code |
+|---|---|---|
+| stream flag | `--json` | `--output-format stream-json --verbose` |
+| conversation id | `thread.started.thread_id` | `system(init)/result.session_id` |
+| resume | `exec resume <id>` (no `--sandbox`) | `--resume <id>` |
+| usage | `turn.completed.usage` | `result.usage` |
+| answer | `--output-last-message <file>` | `result.result` |
+| failure | `turn.failed` / `error` | `result.is_error == true` |
+| output schema | `--output-schema <file>` | caveat (not wired) |
+
+Semaphore does not touch the app-server route, steering, interrupts, or
+approvals (Rudder), nor metered pricing for subscription CLIs, nor
+descriptor-declared contracts for the generic fleet (Pennant) — it only keeps
+the machinery contract-shaped for them.
+
 ---
 
 *This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
