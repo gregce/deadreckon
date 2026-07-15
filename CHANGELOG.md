@@ -40,6 +40,9 @@ caveat instead of failing the turn. Landed in phases, each `make verify` green:
   binary is probed capable (a caveat elsewhere); the turn loop threads the run
   root as `session_dir`, and the spend ledger records real CLI tokens per turn
   for both providers.
+- P10: `show`/`report` render CLI token usage on the subscription surface; a
+  degraded contract raises an attention notice instead of being silently
+  swallowed; `show <run> --raw provider-session` dumps the conversation record.
 
 ## Contract review interstitial + launch surface dedupe — 2026-07-09
 
