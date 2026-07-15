@@ -29,6 +29,10 @@ caveat instead of failing the turn. Landed in phases, each `make verify` green:
   token usage and the answer from the `result` event, `is_error` maps to a
   provider error, and the reported `total_cost_usd` lands in the trace detail
   only (spend stays subscription/$0). Shared degraded fallback with codex.
+- P7: per-run conversation resume for both — `exec resume <thread>` /
+  `--resume <session>` after turn 1 persists the id; distinct runs never share
+  a conversation; a vanished conversation retries fresh once and records a
+  `provider.session.reset` caveat.
 
 ## Contract review interstitial + launch surface dedupe — 2026-07-09
 
