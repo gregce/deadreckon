@@ -234,6 +234,10 @@ pub struct IngestDescriptor {
     pub file_glob: Option<String>,
     pub freshness_minutes: Option<i64>,
     pub storage: Option<IngestStorage>,
+    /// The driver ingests tool rows live from the provider's structured stream
+    /// (Semaphore); the post-hoc file scraper yields to it so the two never
+    /// double-count. Old descriptors default false and keep file scraping.
+    pub live_contract: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

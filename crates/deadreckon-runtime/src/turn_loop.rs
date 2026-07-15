@@ -346,7 +346,9 @@ pub async fn run_turn_loop(
         let response = match completion {
             None => {
                 if let Some(recorder) = flight_recorder.take() {
-                    recorder.finish(state, FlightSessionStatus::Killed).await?;
+                    recorder
+                        .finish(state, FlightSessionStatus::Killed, &[])
+                        .await?;
                 }
                 // The cut turn produced no provider result, but its wall time
                 // was really consumed: account for it honestly.
@@ -390,7 +392,9 @@ pub async fn run_turn_loop(
             Some(Ok(response)) => response,
             Some(Err(err)) if should_cancel_run(state, &run_token) => {
                 if let Some(recorder) = flight_recorder.take() {
-                    recorder.finish(state, FlightSessionStatus::Killed).await?;
+                    recorder
+                        .finish(state, FlightSessionStatus::Killed, &[])
+                        .await?;
                 }
                 state.status = deadreckon_core::state::RunStatus::Killed;
                 state.failure_reason = Some(format!("run cancelled during provider call: {err}"));
@@ -400,7 +404,9 @@ pub async fn run_turn_loop(
             }
             Some(Err(err)) => {
                 if let Some(recorder) = flight_recorder.take() {
-                    recorder.finish(state, FlightSessionStatus::Failed).await?;
+                    recorder
+                        .finish(state, FlightSessionStatus::Failed, &[])
+                        .await?;
                 }
                 // Persist the failure before surfacing it: a dead run must
                 // show as Failed with a reason in list/status, never linger
@@ -414,7 +420,9 @@ pub async fn run_turn_loop(
         };
         if should_cancel_run(state, &run_token) {
             if let Some(recorder) = flight_recorder.take() {
-                recorder.finish(state, FlightSessionStatus::Killed).await?;
+                recorder
+                    .finish(state, FlightSessionStatus::Killed, &[])
+                    .await?;
             }
             state.status = deadreckon_core::state::RunStatus::Killed;
             state.failure_reason = Some("run cancelled after provider call".to_string());
@@ -424,7 +432,11 @@ pub async fn run_turn_loop(
         }
         if let Some(recorder) = flight_recorder.take() {
             recorder
-                .finish(state, FlightSessionStatus::Completed)
+                .finish(
+                    state,
+                    FlightSessionStatus::Completed,
+                    &provider_flight_rows(&response.trace),
+                )
                 .await?;
         }
         let provider_trace_id = format!("llm-turn-{turn}");
@@ -1184,6 +1196,17 @@ fn acceptance_prompt_text(state: &PipelineState) -> String {
 
 fn is_cli_provider_name(provider: &str) -> bool {
     provider.starts_with("cli:") || provider.starts_with("cli-")
+}
+
+/// Tool rows a Semaphore driver lifted live from its structured stream, carried
+/// on the response trace as `flight_rows`. Empty for providers that don't emit
+/// them (the post-hoc file scraper covers those).
+fn provider_flight_rows(trace: &serde_json::Value) -> Vec<serde_json::Value> {
+    trace
+        .get("flight_rows")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn is_direct_api_provider_kind(kind: &ProviderKind) -> bool {

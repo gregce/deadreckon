@@ -44,6 +44,10 @@ pub struct ProviderFlightRecorder {
     pending_checkpoint_since: Option<Instant>,
     anchor_every: u32,
     quiet_duration: Duration,
+    // Semaphore: when the descriptor declares a live contract, the driver
+    // ingests tool rows from its own structured stream and the post-hoc file
+    // scraper yields (so the two never double-count).
+    live_ingestion: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,12 +88,13 @@ impl ProviderFlightRecorderHandle {
         self,
         state: &PipelineState,
         status: FlightSessionStatus,
+        live_rows: &[Value],
     ) -> Result<Option<String>> {
         self.shutdown.cancel();
         let mut recorder = self.handle.await.map_err(|err| {
             DeadreckonError::InvalidInput(format!("provider flight recorder task failed: {err}"))
         })??;
-        recorder.finish(state, status)
+        recorder.finish(state, status, live_rows)
     }
 }
 
@@ -111,6 +116,10 @@ impl ProviderFlightRecorder {
         let ingest = descriptor
             .as_ref()
             .and_then(|descriptor| descriptor.ingest.clone());
+        let live_ingestion = ingest
+            .as_ref()
+            .map(|ingest| ingest.live_contract)
+            .unwrap_or(false);
         let schema = ingest
             .as_ref()
             .map(|ingest| ingest.schema.clone())
@@ -170,6 +179,7 @@ impl ProviderFlightRecorder {
             pending_checkpoint_since: None,
             anchor_every,
             quiet_duration,
+            live_ingestion,
         };
         recorder.append_session_event(state, "started provider flight session")?;
         Ok(Some(recorder))
@@ -192,8 +202,12 @@ impl ProviderFlightRecorder {
         &mut self,
         state: &PipelineState,
         status: FlightSessionStatus,
+        live_rows: &[Value],
     ) -> Result<Option<String>> {
-        let saw_tool_event = self.ingest_new_log_rows(state)?;
+        // Semaphore: ingest the driver's structured tool rows first; the file
+        // scraper is a no-op for a live-contract provider.
+        let saw_live = self.ingest_live_rows(state, live_rows)?;
+        let saw_tool_event = self.ingest_new_log_rows(state)? || saw_live;
         let mut checkpoint_id = None;
         if saw_tool_event {
             checkpoint_id =
@@ -219,7 +233,67 @@ impl ProviderFlightRecorder {
         Ok(checkpoint_id)
     }
 
+    /// Append flight rows lifted live from the provider's structured stream
+    /// (Semaphore). Each row is a `{id, tool_name, tool_category, summary,
+    /// status, raw}` object carried on the response trace. Returns whether any
+    /// tool row was appended.
+    fn ingest_live_rows(&mut self, state: &PipelineState, rows: &[Value]) -> Result<bool> {
+        let mut saw_tool = false;
+        for row in rows {
+            let raw = row
+                .get("raw")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| row.to_string());
+            let summary = row
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("tool call")
+                .to_string();
+            let event = FlightEvent {
+                version: 1,
+                seq: self.next_seq,
+                run_id: state.run_id.clone(),
+                flight_session_id: self.flight_session_id.clone(),
+                deadreckon_turn: self.deadreckon_turn,
+                attempt: self.attempt,
+                provider: self.provider.clone(),
+                schema: self.schema.clone(),
+                timestamp: Some(Utc::now()),
+                source_path: None,
+                source_line: None,
+                raw_hash: sha256_text(&raw),
+                source_event: raw,
+                kind: FlightEventKind::Tool,
+                role: None,
+                summary,
+                tool_name: row
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                tool_category: row
+                    .get("tool_category")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                files: Vec::new(),
+                usage: None,
+                checkpoint_id: None,
+            };
+            append_flight_event(state, &event)?;
+            self.last_provider_event_seq = Some(event.seq);
+            self.next_seq += 1;
+            saw_tool = true;
+        }
+        Ok(saw_tool)
+    }
+
     fn ingest_new_log_rows(&mut self, state: &PipelineState) -> Result<bool> {
+        // A live-contract provider's driver already ingested the tool rows from
+        // its structured stream; scraping the provider's on-disk session log
+        // would double-count, so the post-hoc scraper yields.
+        if self.live_ingestion {
+            return Ok(false);
+        }
         let Some(ingest) = self.ingest.clone() else {
             return Ok(false);
         };
@@ -1136,7 +1210,7 @@ storage = "jsonl"
         )
         .expect("provider log");
         let checkpoint = recorder
-            .finish(&state, FlightSessionStatus::Completed)
+            .finish(&state, FlightSessionStatus::Completed, &[])
             .expect("finish")
             .expect("checkpoint");
 
@@ -1245,7 +1319,7 @@ storage = "jsonl"
         .expect("unrelated log");
 
         recorder
-            .finish(&state, FlightSessionStatus::Completed)
+            .finish(&state, FlightSessionStatus::Completed, &[])
             .expect("finish");
 
         let events = read_flight_events(&state).expect("events");
@@ -1422,5 +1496,171 @@ args_template = ["{prompt}"]
             ProviderFlightRecorder::start(&state, "openai", paths.home(), 1).expect("start");
         assert!(recorder.is_none());
         assert!(!flight_manifest_path(&state).exists());
+    }
+
+    // --- Semaphore P8: live flight ingestion -------------------------------
+
+    fn live_contract_run(
+        paths: &DeadreckonPaths,
+        cwd: PathBuf,
+        provider: &str,
+        ingest_dir: &Path,
+    ) -> PipelineState {
+        fs::create_dir_all(&cwd).expect("cwd");
+        let state = create_run(
+            paths,
+            RunOptions {
+                goal: "live flight".to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: Some(provider.to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        fs::create_dir_all(paths.home().join("providers.d")).expect("providers");
+        let slug = provider.trim_start_matches("cli:");
+        fs::write(
+            paths.home().join(format!("providers.d/{slug}.toml")),
+            format!(
+                r#"
+id = "{provider}"
+display_name = "Live Flight"
+kind = "cli"
+default_binary = "x"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["{{{{prompt}}}}"]
+
+[ingest]
+default_dirs = ["{dir}"]
+schema = "codex-cli"
+file_glob = "*.jsonl"
+storage = "jsonl"
+live_contract = true
+"#,
+                dir = ingest_dir.display()
+            ),
+        )
+        .expect("descriptor");
+        deadreckon_core::snapshot_working(&state, 0).expect("snapshot");
+        state
+    }
+
+    #[test]
+    fn codex_items_stream_into_flight_ledger_during_turn() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let ingest = temp.path().join("ingest");
+        fs::create_dir_all(&ingest).expect("ingest");
+        let state = live_contract_run(
+            &paths,
+            temp.path().join("cwd"),
+            "cli:test-codex-live",
+            &ingest,
+        );
+        let mut recorder =
+            ProviderFlightRecorder::start(&state, "cli:test-codex-live", paths.home(), 1)
+                .expect("start")
+                .expect("recorder");
+        // A row shaped exactly as the codex driver emits on `trace.flight_rows`.
+        let rows = vec![json!({
+            "id": "item_1",
+            "tool_name": "command_execution",
+            "tool_category": "shell",
+            "summary": "/bin/zsh -lc 'echo hello-from-codex'",
+            "raw": "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\"}}"
+        })];
+        recorder
+            .finish(&state, FlightSessionStatus::Completed, &rows)
+            .expect("finish");
+        let events = read_flight_events(&state).expect("events");
+        assert!(events.iter().any(|e| e.kind == FlightEventKind::Tool
+            && e.tool_name.as_deref() == Some("command_execution")
+            && e.summary.contains("echo hello-from-codex")));
+    }
+
+    #[test]
+    fn claude_tool_use_streams_into_flight_ledger_during_turn() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let ingest = temp.path().join("ingest");
+        fs::create_dir_all(&ingest).expect("ingest");
+        let state = live_contract_run(
+            &paths,
+            temp.path().join("cwd"),
+            "cli:test-claude-live",
+            &ingest,
+        );
+        let mut recorder =
+            ProviderFlightRecorder::start(&state, "cli:test-claude-live", paths.home(), 1)
+                .expect("start")
+                .expect("recorder");
+        let rows = vec![json!({
+            "id": "toolu_01",
+            "tool_name": "Bash",
+            "tool_category": "shell",
+            "summary": "Bash: echo hello-from-claude",
+            "raw": "{\"type\":\"assistant\"}"
+        })];
+        recorder
+            .finish(&state, FlightSessionStatus::Completed, &rows)
+            .expect("finish");
+        let events = read_flight_events(&state).expect("events");
+        assert!(events.iter().any(|e| e.kind == FlightEventKind::Tool
+            && e.tool_name.as_deref() == Some("Bash")
+            && e.summary.contains("hello-from-claude")));
+    }
+
+    #[test]
+    fn post_hoc_import_dedupes_live_ingested_items() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let ingest = temp.path().join("ingest");
+        fs::create_dir_all(&ingest).expect("ingest");
+        let state = live_contract_run(
+            &paths,
+            temp.path().join("cwd"),
+            "cli:test-codex-live",
+            &ingest,
+        );
+        let mut recorder =
+            ProviderFlightRecorder::start(&state, "cli:test-codex-live", paths.home(), 1)
+                .expect("start")
+                .expect("recorder");
+        // A file the post-hoc scraper WOULD ingest — but the live contract makes
+        // it yield, so it is not double-counted.
+        fs::write(
+            ingest.join("session.jsonl"),
+            r#"{"type":"tool_call","tool_name":"command_execution","message":"echo hello-from-codex"}"#,
+        )
+        .expect("provider log");
+        let rows = vec![json!({
+            "id": "item_1",
+            "tool_name": "command_execution",
+            "tool_category": "shell",
+            "summary": "echo hello-from-codex",
+            "raw": "live"
+        })];
+        recorder
+            .finish(&state, FlightSessionStatus::Completed, &rows)
+            .expect("finish");
+        let tool_events = read_flight_events(&state)
+            .expect("events")
+            .into_iter()
+            .filter(|e| e.kind == FlightEventKind::Tool)
+            .count();
+        assert_eq!(
+            tool_events, 1,
+            "live row ingested once; file scrape suppressed"
+        );
     }
 }

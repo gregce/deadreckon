@@ -49,6 +49,7 @@ cwd_match_path = "payload.cwd"
 file_glob = "*.jsonl"
 freshness_minutes = 2
 storage = "jsonl"
+live_contract = true
 
 [[model_catalog]]
 id = "provider default"

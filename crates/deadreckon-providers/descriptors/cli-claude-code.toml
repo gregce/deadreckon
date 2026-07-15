@@ -40,6 +40,7 @@ cwd_match = "claude-project-dir"
 file_glob = "*.jsonl"
 freshness_minutes = 2
 storage = "jsonl"
+live_contract = true
 
 [[model_catalog]]
 id = "provider default"
