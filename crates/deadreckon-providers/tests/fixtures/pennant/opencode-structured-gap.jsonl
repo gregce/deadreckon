@@ -1,0 +1,4 @@
+{"type":"step_start","sessionID":"ses_093b27e5affekT015kGfNSr62x","part":{"id":"prt_f6c4d8609001POoWfyZ04AtJrc","type":"step-start","sessionID":"ses_093b27e5affekT015kGfNSr62x","messageID":"msg_f6c4d81f3001ksffOiPrZdS5Ll"}}
+{"type":"text","sessionID":"ses_093b27e5affekT015kGfNSr62x","part":{"id":"prt_f6c4d8f15001z7QRgz9dbJVexD","type":"text","text":"OPENCODE_FIXTURE_OK","sessionID":"ses_093b27e5affekT015kGfNSr62x","messageID":"msg_f6c4d81f3001ksffOiPrZdS5Ll"}}
+{"type":"error","sessionID":"ses_093b27e5affekT015kGfNSr62x","error":{"name":"UnknownError","data":{"message":"Error: [DecimalError] Invalid argument: [object Object]"}}}
+{"type":"text","sessionID":"ses_093b27e5affekT015kGfNSr62x","part":{"id":null,"type":null,"text":null,"sessionID":null,"messageID":null}}

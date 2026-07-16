@@ -51,6 +51,27 @@ fn gemini_contract_or_documented_gap() {
 }
 
 #[test]
+fn opencode_contract_or_documented_gap() {
+    let registry = ProviderRegistry::builtin().expect("builtin registry");
+    let opencode = registry.get("cli:opencode").expect("opencode descriptor");
+    let source = include_str!("../descriptors/cli-opencode.toml");
+    let events = include_str!("fixtures/pennant/opencode-structured-gap.jsonl")
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("OpenCode gap fixture");
+
+    assert!(opencode.contract.is_none());
+    assert_eq!(opencode.exec_template.args_template, ["run", "{prompt}"]);
+    assert!(source.contains("OpenCode CLI 0.15.5"));
+    assert!(source.contains("text(answer), error, then text(null)"));
+    assert!(source.contains("richer event mirror is a V1 escalation"));
+    assert_eq!(events[1]["part"]["text"], "OPENCODE_FIXTURE_OK");
+    assert_eq!(events[2]["type"], "error");
+    assert!(events[3]["part"]["text"].is_null());
+}
+
+#[test]
 fn descriptor_toml_round_trips_serde() {
     let registry = ProviderRegistry::builtin().expect("builtin registry");
     let descriptor = registry.get("anthropic").expect("anthropic descriptor");
