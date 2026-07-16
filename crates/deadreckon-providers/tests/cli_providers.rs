@@ -806,6 +806,7 @@ async fn pi_response_content_is_answer_not_json_blob() {
 }
 
 const COPILOT_PENNANT_FIXTURE: &str = include_str!("fixtures/pennant/copilot-simple.jsonl");
+const COPILOT_TOOL_FIXTURE: &str = include_str!("fixtures/pennant/copilot-tool.jsonl");
 
 #[allow(clippy::expect_used)]
 fn write_copilot_pennant_binary(path: &std::path::Path) {
@@ -896,6 +897,41 @@ fn copilot_document_dialect_parses_single_json() {
     assert_eq!(
         documents[1]["sessionId"],
         "c35073fd-b43b-4b04-8dea-f47047d0bbb0"
+    );
+}
+
+#[tokio::test]
+async fn copilot_tool_fixture_yields_one_terminal_flight_row() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-copilot-tool-pennant");
+    let script = format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"--help\" ]; then printf '%s\\n' 'Options: --output-format --resume'; exit 0; fi\n\
+cat <<'JSONL'\n{COPILOT_TOOL_FIXTURE}\n{COPILOT_PENNANT_FIXTURE}\nJSONL\n"
+    );
+    fs::write(&binary, script).expect("copilot tool fixture binary");
+    chmod_exec(&binary);
+
+    let response = copilot_pennant_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "fixture".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+
+    let rows = response.trace["flight_rows"]
+        .as_array()
+        .expect("flight rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "call_cqEGNV54zsmiZPCpaRIlA40u");
+    assert_eq!(rows[0]["tool_name"], "bash");
+    assert_eq!(rows[0]["status"], "tool.execution_complete");
+    assert!(
+        rows[0]["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("COPILOT_TOOL_OK"))
     );
 }
 

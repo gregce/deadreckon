@@ -2417,6 +2417,13 @@ pub(crate) enum ProvidersCommand {
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
     },
+    #[command(about = "Check one registered provider route and its descriptor warnings")]
+    Check {
+        #[arg(help = "Provider route ID")]
+        id: String,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

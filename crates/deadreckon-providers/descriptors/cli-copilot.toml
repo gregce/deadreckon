@@ -29,7 +29,7 @@ conversation_id_path = "/sessionId"
 usage_output_path = "/data/outputTokens"
 answer_path = "/data/content"
 error_flag_path = "/exitCode"
-flight_event_paths = ["/data/toolRequests/0"]
+flight_event_paths = ["/data/toolRequests/0", "/data/toolCallId"]
 resume_args = ["--resume={conversation_id}"]
 probe_substring = "--output-format"
 
@@ -48,6 +48,7 @@ cwd_match_path = "data.context.cwd"
 file_glob = "*.jsonl"
 freshness_minutes = 2
 storage = "jsonl"
+live_contract = true
 
 [[model_catalog]]
 id = "provider default"

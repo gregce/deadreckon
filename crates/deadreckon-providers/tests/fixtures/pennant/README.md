@@ -10,6 +10,9 @@ the fixture is normalized to the contract-relevant fields with `jq`.
 - `copilot-simple.jsonl`: GitHub Copilot CLI 1.0.45, recorded 2026-07-16 with
   `--output-format json --stream off`; normalized to omit opaque reasoning
   payloads while retaining answer, usage, session, and terminal status fields.
+- `copilot-tool.jsonl`: GitHub Copilot CLI 1.0.45, recorded 2026-07-16 from a
+  real shell-tool turn; normalized to the request, execution-start, and
+  execution-complete events used by live flight ingestion.
 - `opencode-structured-gap.jsonl`: OpenCode CLI 0.15.5, recorded 2026-07-16
   with `run --model opencode/deepseek-v4-flash-free --format json`; normalized
   to show the answer/error/null-text ordering that the pointer dialect cannot

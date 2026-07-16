@@ -123,6 +123,7 @@ fn descriptor_ingest_round_trips_for_copilot_and_pi() {
         Some("data.context.cwd")
     );
     assert_eq!(copilot_ingest.storage, Some(IngestStorage::Jsonl));
+    assert!(copilot_ingest.live_contract);
 
     let pi = registry.get("cli:pi").expect("pi descriptor");
     let pi_ingest = pi.ingest.as_ref().expect("pi ingest");
@@ -135,6 +136,7 @@ fn descriptor_ingest_round_trips_for_copilot_and_pi() {
     assert_eq!(pi_ingest.schema, "pi");
     assert_eq!(pi_ingest.cwd_match, IngestCwdMatch::TopLevel);
     assert_eq!(pi_ingest.storage, Some(IngestStorage::Jsonl));
+    assert!(pi_ingest.live_contract);
 
     let encoded = toml::to_string(copilot).expect("serialize copilot descriptor");
     let decoded: ProviderDescriptor = toml::from_str(&encoded).expect("decode copilot descriptor");

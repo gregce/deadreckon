@@ -1540,6 +1540,11 @@ kind = "subscription"
 [exec_template]
 args_template = ["{{{{prompt}}}}"]
 
+[contract]
+stream_args = ["--json"]
+dialect = "json-lines"
+flight_event_paths = ["/toolCallId"]
+
 [ingest]
 default_dirs = ["{dir}"]
 schema = "codex-cli"
@@ -1621,7 +1626,7 @@ live_contract = true
     }
 
     #[test]
-    fn post_hoc_import_dedupes_live_ingested_items() {
+    fn descriptor_flight_events_stream_live_and_dedupe() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let ingest = temp.path().join("ingest");
