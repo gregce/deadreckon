@@ -16,8 +16,14 @@ kind = "subscription"
 [version_probe]
 args = ["--version"]
 
+# Pennant probe (OpenCode CLI 0.15.5, 2026-07-16): `run` supports
+# `--format json` and `--session`, but a real successful free-model invocation
+# emitted text(answer), error, then text(null) while exiting zero. The pointer
+# dialect cannot select the last non-null answer or classify that interleaved
+# error safely; a richer event mirror is a V1 escalation. This version also
+# rejects the old hidden `--dangerously-skip-permissions` flag.
 [exec_template]
-args_template = ["run", "--dangerously-skip-permissions", "{prompt}"]
+args_template = ["run", "{prompt}"]
 model_arg = "--model"
 timeout_seconds = 1800
 
