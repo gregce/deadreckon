@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ProviderError;
+use crate::registry::{ContractDialect, ContractSection};
 
 pub(crate) const PROVIDER_ID_CODEX: &str = "cli:codex";
 pub(crate) const PROVIDER_ID_CLAUDE: &str = "cli:claude-code";
@@ -236,6 +237,259 @@ pub(crate) fn parse_stream(
     parsed
 }
 
+// ---------------------------------------------------------------------------
+// Descriptor-declared JSON-pointer extraction (Pennant).
+// ---------------------------------------------------------------------------
+
+/// The shared stream facts plus declared pointers that did not resolve. A
+/// missing pointer disables only that capability and becomes a caveat at the
+/// driver boundary; it is never a parse error.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // Constructed by the generic driver in Pennant P3/P4.
+pub(crate) struct DescriptorParse {
+    pub parsed: ParsedStream,
+    pub missing_fields: Vec<&'static str>,
+}
+
+/// Extract a descriptor contract from stdout. JSONL terminal facts use
+/// last-resolution-wins, except the conversation id, which is deliberately
+/// pinned to the first resolution so later status rows cannot switch sessions.
+#[allow(dead_code)] // Wired into ProviderContract by the next Pennant phase.
+pub(crate) fn extract_descriptor_output(
+    contract: &ContractSection,
+    stdout: &str,
+) -> DescriptorParse {
+    let mut state = DescriptorExtractionState::default();
+    match contract.dialect {
+        ContractDialect::JsonLines => {
+            for (index, raw) in stdout.lines().enumerate() {
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Value>(raw) {
+                    Ok(value) => {
+                        state.parsed.structured_events += 1;
+                        extract_descriptor_value(contract, &value, Some(raw), index, &mut state);
+                    }
+                    Err(_) => state.parsed.garbage_lines += 1,
+                }
+            }
+        }
+        ContractDialect::JsonDocument => match serde_json::from_str::<Value>(stdout) {
+            Ok(value) => {
+                state.parsed.structured_events = 1;
+                extract_descriptor_value(contract, &value, None, 0, &mut state);
+            }
+            Err(_) => state.parsed.garbage_lines = u64::from(!stdout.trim().is_empty()),
+        },
+    }
+    state.finish(contract)
+}
+
+#[derive(Debug, Default)]
+struct DescriptorExtractionState {
+    parsed: ParsedStream,
+    usage_input: Option<u64>,
+    usage_output: Option<u64>,
+    cost: Option<f64>,
+    seen_conversation: bool,
+    seen_usage_input: bool,
+    seen_usage_output: bool,
+    seen_cost: bool,
+    seen_answer: bool,
+    seen_error_flag: bool,
+    seen_error_message: bool,
+}
+
+impl DescriptorExtractionState {
+    fn finish(mut self, contract: &ContractSection) -> DescriptorParse {
+        if self.seen_usage_input || self.seen_usage_output || self.seen_cost {
+            self.parsed.usage = Some(CliUsage {
+                input_tokens: self.usage_input.unwrap_or(0),
+                output_tokens: self.usage_output.unwrap_or(0),
+                cost_usd: self.cost,
+            });
+        }
+        let mut missing = Vec::new();
+        for (declared, seen, field) in [
+            (
+                contract.conversation_id_path.is_some(),
+                self.seen_conversation,
+                "conversation_id_path",
+            ),
+            (
+                contract.usage_input_path.is_some(),
+                self.seen_usage_input,
+                "usage_input_path",
+            ),
+            (
+                contract.usage_output_path.is_some(),
+                self.seen_usage_output,
+                "usage_output_path",
+            ),
+            (contract.cost_path.is_some(), self.seen_cost, "cost_path"),
+            (
+                contract.answer_path.is_some(),
+                self.seen_answer,
+                "answer_path",
+            ),
+            (
+                contract.error_flag_path.is_some(),
+                self.seen_error_flag,
+                "error_flag_path",
+            ),
+            (
+                contract.error_message_path.is_some(),
+                self.seen_error_message,
+                "error_message_path",
+            ),
+        ] {
+            if declared && !seen {
+                missing.push(field);
+            }
+        }
+        DescriptorParse {
+            parsed: self.parsed,
+            missing_fields: missing,
+        }
+    }
+}
+
+fn extract_descriptor_value(
+    contract: &ContractSection,
+    value: &Value,
+    raw_line: Option<&str>,
+    line_index: usize,
+    state: &mut DescriptorExtractionState,
+) {
+    if !state.seen_conversation
+        && let Some(found) = pointer_value(value, contract.conversation_id_path.as_deref())
+    {
+        state.seen_conversation = true;
+        state.parsed.conversation_id = scalar_text(found);
+    }
+    if let Some(found) = pointer_value(value, contract.usage_input_path.as_deref()) {
+        state.seen_usage_input = true;
+        state.usage_input = token_count(found);
+    }
+    if let Some(found) = pointer_value(value, contract.usage_output_path.as_deref()) {
+        state.seen_usage_output = true;
+        state.usage_output = token_count(found);
+    }
+    if let Some(found) = pointer_value(value, contract.cost_path.as_deref()) {
+        state.seen_cost = true;
+        state.cost = number(found);
+    }
+    if let Some(found) = pointer_value(value, contract.answer_path.as_deref()) {
+        state.seen_answer = true;
+        state.parsed.answer = scalar_text(found);
+    }
+
+    let error_message = pointer_value(value, contract.error_message_path.as_deref());
+    if let Some(found) = error_message {
+        state.seen_error_message = true;
+        if let Some(text) = scalar_text(found) {
+            // Retain the last message in case the flag resolves on another
+            // terminal row.
+            state.parsed.failure = Some(text);
+        }
+    }
+    if let Some(found) = pointer_value(value, contract.error_flag_path.as_deref()) {
+        state.seen_error_flag = true;
+        if truthy(found) {
+            if state.parsed.failure.is_none() {
+                state.parsed.failure = Some("provider reported an error".to_string());
+            }
+        } else {
+            state.parsed.failure = None;
+        }
+    }
+
+    if let Some(raw) = raw_line
+        && contract
+            .flight_event_paths
+            .iter()
+            .any(|pointer| value.pointer(pointer).is_some())
+    {
+        let row = descriptor_flight_row(value, raw, line_index);
+        upsert_tool_row(&mut state.parsed.tool_rows, row);
+    }
+}
+
+fn pointer_value<'a>(value: &'a Value, pointer: Option<&str>) -> Option<&'a Value> {
+    pointer.and_then(|pointer| value.pointer(pointer))
+}
+
+fn scalar_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        other => serde_json::to_string(other).ok(),
+    }
+}
+
+fn token_count(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty() && !value.eq_ignore_ascii_case("false"),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
+fn descriptor_flight_row(value: &Value, raw: &str, line_index: usize) -> CliToolRow {
+    let id = [
+        "/id",
+        "/item/id",
+        "/tool_call_id",
+        "/toolCallId",
+        "/data/id",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(scalar_text))
+    .unwrap_or_else(|| format!("descriptor:{:016x}", fnv1a(raw.as_bytes())));
+    let tool_name = ["/tool_name", "/toolName", "/name", "/item/type", "/type"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(scalar_text));
+    let summary = ["/summary", "/message", "/text", "/content"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(scalar_text))
+        .unwrap_or_else(|| format!("structured provider event {}", line_index + 1));
+    CliToolRow {
+        id,
+        tool_name,
+        tool_category: None,
+        summary: truncate_summary(&summary),
+        status: None,
+        raw: raw.to_string(),
+    }
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// A later row for the same item id supersedes an earlier one (an
 /// `item.completed` replaces the `item.started` it upgraded from), so the
 /// ledger keeps one row per logical tool call in terminal state.
@@ -343,6 +597,77 @@ mod tests {
 
     fn ts(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).single().expect("ts")
+    }
+
+    fn pointer_contract(dialect: ContractDialect) -> ContractSection {
+        ContractSection {
+            stream_args: vec!["--json".to_string()],
+            dialect,
+            conversation_id_path: Some("/session/id".to_string()),
+            usage_input_path: Some("/usage/input".to_string()),
+            usage_output_path: Some("/usage/output".to_string()),
+            answer_path: Some("/answer".to_string()),
+            ..ContractSection::default()
+        }
+    }
+
+    #[test]
+    fn pointers_extract_from_json_lines_last_wins() {
+        let contract = pointer_contract(ContractDialect::JsonLines);
+        let output = concat!(
+            "{\"session\":{\"id\":\"s-1\"},\"usage\":{\"input\":3,\"output\":4},\"answer\":\"draft\"}\n",
+            "{\"session\":{\"id\":\"s-2\"},\"usage\":{\"input\":7,\"output\":8},\"answer\":\"final\"}\n"
+        );
+        let extracted = extract_descriptor_output(&contract, output);
+        assert_eq!(extracted.parsed.answer.as_deref(), Some("final"));
+        assert_eq!(
+            extracted.parsed.usage,
+            Some(CliUsage {
+                input_tokens: 7,
+                output_tokens: 8,
+                cost_usd: None,
+            })
+        );
+        assert!(extracted.missing_fields.is_empty());
+    }
+
+    #[test]
+    fn conversation_id_takes_first_resolution() {
+        let contract = pointer_contract(ContractDialect::JsonLines);
+        let output = concat!(
+            "{\"session\":{\"id\":\"first\"}}\n",
+            "{\"session\":{\"id\":\"later\"}}\n"
+        );
+        let extracted = extract_descriptor_output(&contract, output);
+        assert_eq!(extracted.parsed.conversation_id.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn document_dialect_extracts_from_single_json() {
+        let contract = pointer_contract(ContractDialect::JsonDocument);
+        let extracted = extract_descriptor_output(
+            &contract,
+            r#"{"session":{"id":"doc-1"},"usage":{"input":11,"output":12},"answer":"document answer"}"#,
+        );
+        assert_eq!(extracted.parsed.conversation_id.as_deref(), Some("doc-1"));
+        assert_eq!(extracted.parsed.answer.as_deref(), Some("document answer"));
+        assert_eq!(extracted.parsed.usage.expect("usage").output_tokens, 12);
+    }
+
+    #[test]
+    fn missing_pointer_is_capability_caveat_not_error() {
+        let contract = pointer_contract(ContractDialect::JsonDocument);
+        let extracted = extract_descriptor_output(&contract, r#"{"answer":"still works"}"#);
+        assert_eq!(extracted.parsed.answer.as_deref(), Some("still works"));
+        assert!(extracted.parsed.failure.is_none());
+        assert_eq!(
+            extracted.missing_fields,
+            [
+                "conversation_id_path",
+                "usage_input_path",
+                "usage_output_path"
+            ]
+        );
     }
 
     #[test]
