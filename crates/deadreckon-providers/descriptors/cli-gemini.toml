@@ -16,6 +16,11 @@ kind = "subscription"
 [version_probe]
 args = ["--version"]
 
+# Pennant probe (Gemini CLI 0.42.0, 2026-07-16): the binary advertises
+# `--output-format stream-json`, `--resume`, and `--session-id`, but the
+# installed credentials exit with IneligibleTierError/UNSUPPORTED_CLIENT
+# before any structured event is emitted. Keep this descriptor contract-less
+# until a real successful stream can be recorded as a fixture.
 [exec_template]
 args_template = ["-p", "{prompt}"]
 model_arg = "--model"
