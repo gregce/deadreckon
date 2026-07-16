@@ -54,7 +54,51 @@ pub(crate) async fn providers_command(command: ProvidersCommand) -> Result<()> {
             full,
             json,
         } => providers_list_command(models, all, full, json).await,
+        ProvidersCommand::Check { id, json } => providers_check_command(&id, json).await,
     }
+}
+
+async fn providers_check_command(id: &str, json_output: bool) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let Some(descriptor) = registry.get(id) else {
+        let message = format!("no provider '{id}' in registry");
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &message,
+            "deadreckon providers list --all",
+        )));
+    };
+    let result = descriptor.probe(ProviderProbeOptions { ping: false }).await;
+    let results = vec![result];
+    let warnings = descriptor.warnings.clone();
+    let surface = detect_verdict_surface(&results, Some(id));
+    if json_output {
+        let primary_action = surface.primary_action.command.clone();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&surface.add_to_json(json!({
+                "kind": "provider_check",
+                "id": id,
+                "status": "ok",
+                "next_actions": [primary_action],
+                "try_lines": Vec::<String>::new(),
+                "providers": results,
+                "warnings": warnings,
+            })))?
+        );
+        return Ok(());
+    }
+
+    print_detect_results(&results);
+    if warnings.is_empty() {
+        println!("  {}", ui_muted("descriptor warnings: none"));
+    } else {
+        for warning in &warnings {
+            println!("  {} {}", ui_warn("warning:"), warning);
+        }
+    }
+    println!("{}", surface.render_plain(!completion_hints_enabled(false)));
+    Ok(())
 }
 
 pub(crate) async fn update_command(
@@ -692,6 +736,11 @@ async fn providers_list_command(
             missing.push(id);
         }
     }
+    let warnings = results
+        .iter()
+        .filter_map(|result| registry.get(&result.id))
+        .flat_map(|descriptor| descriptor.warnings.iter().cloned())
+        .collect::<Vec<_>>();
     let surface = providers_list_verdict_surface(&results, &missing, all);
     if json_output {
         let primary_action = surface.primary_action.command.clone();
@@ -709,6 +758,7 @@ async fn providers_list_command(
                 },
                 "providers": results,
                 "missing_providers": missing,
+                "warnings": warnings,
                 "active": active,
             })))?
         );
@@ -742,6 +792,9 @@ async fn providers_list_command(
         if models {
             print_provider_models(descriptor);
         }
+    }
+    for warning in &warnings {
+        println!("  {} {}", ui_warn("warning:"), warning);
     }
     println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
@@ -854,12 +907,14 @@ fn print_provider_list_row(
     let location = result.location.as_deref().unwrap_or("-");
     let version = result.version.as_deref().unwrap_or("-");
     let model = descriptor.default_model.as_deref().unwrap_or("-");
+    let contract = if result.contract { "yes" } else { "no" };
     if full {
         println!(
-            "{marker} {} {} kind={} credential={} model={} metering={} location={} version={}",
+            "{marker} {} {} kind={} contract={} credential={} model={} metering={} location={} version={}",
             ui_id(&result.id),
             symbol,
             descriptor_kind_label(&descriptor.kind),
+            contract,
             result.credential,
             model,
             result.metering,
@@ -868,10 +923,11 @@ fn print_provider_list_row(
         );
     } else {
         println!(
-            "{marker} {} {}  kind={:<10} credential={:<8} model={} metering={} location={} version={}",
+            "{marker} {} {}  kind={:<10} contract={:<3} credential={:<8} model={} metering={} location={} version={}",
             crate::ui::pad_visible(&ui_id(&result.id), 20),
             symbol,
             descriptor_kind_label(&descriptor.kind),
+            contract,
             result.credential,
             model,
             result.metering,
@@ -923,10 +979,11 @@ fn print_detect_results(results: &[ProviderProbeResult]) {
         let version = result.version.as_deref().unwrap_or("-");
         let message = result.message.as_deref().unwrap_or("");
         println!(
-            "{} {}  kind={:<10} credential={:<14} location={:<36} version={:<18} metering={}",
+            "{} {}  kind={:<10} contract={:<3} credential={:<14} location={:<36} version={:<18} metering={}",
             crate::ui::pad_visible(&ui_id(&result.id), 20),
             symbol,
             descriptor_kind_label(&result.kind),
+            if result.contract { "yes" } else { "no" },
             result.credential,
             location,
             version,

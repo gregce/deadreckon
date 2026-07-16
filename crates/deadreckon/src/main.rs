@@ -8496,6 +8496,21 @@ mod semaphore_friendliness_tests {
         // Pre-Semaphore 0/0 turns render nothing rather than a misleading zero.
         assert!(cli_token_usage_label(0, 0).is_none());
     }
+
+    #[test]
+    fn show_and_report_render_descriptor_provider_tokens() {
+        // Descriptor providers use the same spend summary renderer as the
+        // bespoke CLI mirrors: Pi reports both sides, while Copilot 1.0.45
+        // currently exposes output tokens only.
+        assert_eq!(
+            cli_token_usage_label(403, 25).as_deref(),
+            Some("403 in / 25 out tokens")
+        );
+        assert_eq!(
+            cli_token_usage_label(0, 26).as_deref(),
+            Some("0 in / 26 out tokens")
+        );
+    }
 }
 
 fn spend_summary_label(

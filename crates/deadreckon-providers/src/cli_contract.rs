@@ -554,14 +554,23 @@ fn extract_descriptor_value(
         }
     }
 
-    if let Some(raw) = raw_line
-        && contract
-            .flight_event_paths
-            .iter()
-            .any(|pointer| value.pointer(pointer).is_some())
-    {
-        let row = descriptor_flight_row(value, raw, line_index);
-        upsert_tool_row(&mut state.parsed.tool_rows, row);
+    if let Some(raw) = raw_line {
+        for pointer in &contract.flight_event_paths {
+            let Some(selected) = value.pointer(pointer) else {
+                continue;
+            };
+            // A selector may point at a nested tool-request object (Copilot)
+            // or at a scalar marker on the root event (Pi). Prefer the nested
+            // object when it carries fields of its own; otherwise retain the
+            // root event so sibling tool metadata remains visible.
+            let event = if selected.is_object() {
+                selected
+            } else {
+                value
+            };
+            let row = descriptor_flight_row(event, raw, line_index);
+            upsert_tool_row(&mut state.parsed.tool_rows, row);
+        }
     }
 }
 
@@ -604,28 +613,54 @@ fn truthy(value: &Value) -> bool {
 
 fn descriptor_flight_row(value: &Value, raw: &str, line_index: usize) -> CliToolRow {
     let id = [
-        "/id",
-        "/item/id",
         "/tool_call_id",
         "/toolCallId",
+        "/data/toolCallId",
+        "/item/id",
+        "/id",
         "/data/id",
     ]
     .iter()
     .find_map(|pointer| value.pointer(pointer).and_then(scalar_text))
     .unwrap_or_else(|| format!("descriptor:{:016x}", fnv1a(raw.as_bytes())));
-    let tool_name = ["/tool_name", "/toolName", "/name", "/item/type", "/type"]
+    let tool_name = [
+        "/tool_name",
+        "/toolName",
+        "/data/toolName",
+        "/name",
+        "/item/type",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(scalar_text));
+    let tool_category = ["/tool_category", "/toolType", "/data/toolType", "/category"]
         .iter()
         .find_map(|pointer| value.pointer(pointer).and_then(scalar_text));
-    let summary = ["/summary", "/message", "/text", "/content"]
+    let summary = [
+        "/summary",
+        "/intentionSummary",
+        "/message",
+        "/text",
+        "/content",
+        "/arguments",
+        "/args",
+        "/result",
+        "/data/result/content",
+        "/data/arguments",
+        "/data/partialOutput",
+        "/data/inputDelta",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(scalar_text))
+    .unwrap_or_else(|| format!("structured provider event {}", line_index + 1));
+    let status = ["/status", "/state", "/type"]
         .iter()
-        .find_map(|pointer| value.pointer(pointer).and_then(scalar_text))
-        .unwrap_or_else(|| format!("structured provider event {}", line_index + 1));
+        .find_map(|pointer| value.pointer(pointer).and_then(scalar_text));
     CliToolRow {
         id,
         tool_name,
-        tool_category: None,
+        tool_category,
         summary: truncate_summary(&summary),
-        status: None,
+        status,
         raw: raw.to_string(),
     }
 }
@@ -644,7 +679,13 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// ledger keeps one row per logical tool call in terminal state.
 fn upsert_tool_row(rows: &mut Vec<CliToolRow>, row: CliToolRow) {
     if let Some(existing) = rows.iter_mut().find(|existing| existing.id == row.id) {
-        *existing = row;
+        let mut terminal = row;
+        terminal.tool_name = terminal.tool_name.or_else(|| existing.tool_name.clone());
+        terminal.tool_category = terminal
+            .tool_category
+            .or_else(|| existing.tool_category.clone());
+        terminal.status = terminal.status.or_else(|| existing.status.clone());
+        *existing = terminal;
     } else {
         rows.push(row);
     }

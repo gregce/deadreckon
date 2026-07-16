@@ -143,6 +143,97 @@ kind = "cli-codex"
 }
 
 #[test]
+fn providers_listing_marks_contract_bearing_routes() {
+    let temp = repo_tempdir();
+
+    let plain = deadreckon(temp.path())
+        .args(["providers", "list", "--all"])
+        .env("PATH", temp.path().join("empty-bin"))
+        .output()
+        .expect("providers list contracts");
+    assert_success(&plain);
+    let stdout = String::from_utf8_lossy(&plain.stdout);
+    let pi = stdout
+        .lines()
+        .find(|line| line.contains("cli:pi"))
+        .expect("Pi row");
+    let copilot = stdout
+        .lines()
+        .find(|line| line.contains("cli:copilot"))
+        .expect("Copilot row");
+    let gemini = stdout
+        .lines()
+        .find(|line| line.contains("cli:gemini"))
+        .expect("Gemini row");
+    assert!(pi.contains("contract=yes"), "{pi}");
+    assert!(copilot.contains("contract=yes"), "{copilot}");
+    assert!(gemini.contains("contract=no"), "{gemini}");
+
+    let json_output = deadreckon(temp.path())
+        .args(["providers", "list", "--all", "--json"])
+        .env("PATH", temp.path().join("empty-bin"))
+        .output()
+        .expect("providers list contracts json");
+    assert_success(&json_output);
+    let json: Value = serde_json::from_slice(&json_output.stdout).expect("json");
+    let providers = json["providers"].as_array().expect("providers");
+    let contract = |id: &str| {
+        providers
+            .iter()
+            .find(|provider| provider["id"] == id)
+            .and_then(|provider| provider["contract"].as_bool())
+    };
+    assert_eq!(contract("cli:pi"), Some(true));
+    assert_eq!(contract("cli:copilot"), Some(true));
+    assert_eq!(contract("cli:gemini"), Some(false));
+    assert_eq!(contract("cli:opencode"), Some(false));
+}
+
+#[test]
+fn providers_list_surfaces_malformed_contract_warning() {
+    let temp = repo_tempdir();
+    write_provider_override(
+        temp.path(),
+        "pi.toml",
+        r#"
+id = "cli:pi"
+
+[contract]
+stream_args = []
+dialect = "json-lines"
+"#,
+    );
+
+    let output = deadreckon(temp.path())
+        .args(["providers", "list", "--all"])
+        .env("PATH", temp.path().join("empty-bin"))
+        .output()
+        .expect("providers list malformed contract");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("malformed [contract] field stream_args"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("try: deadreckon providers check cli:pi"),
+        "{stdout}"
+    );
+
+    let check = deadreckon(temp.path())
+        .args(["providers", "check", "cli:pi"])
+        .env("PATH", temp.path().join("empty-bin"))
+        .output()
+        .expect("providers check malformed contract");
+    assert_success(&check);
+    let check_stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        check_stdout.contains("malformed [contract] field stream_args"),
+        "{check_stdout}"
+    );
+}
+
+#[test]
 fn providers_list_models_includes_aliases() {
     let temp = repo_tempdir();
 
