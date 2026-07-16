@@ -601,6 +601,111 @@ async fn unparseable_output_degrades_with_caveat_generic() {
     );
 }
 
+#[allow(clippy::expect_used)]
+fn generic_resume_router(temp: &TempDir) -> ProviderRouter {
+    let home = temp.path().join("resume-home");
+    fs::create_dir_all(home.join("providers.d")).expect("providers dir");
+    let binary = temp.path().join("fake-resume-cli");
+    write_generic_contract_binary(
+        &binary,
+        r#"{"session_id":"resume-session-1","usage":{"input":2,"output":3},"answer":"resumed","is_error":false}"#,
+    );
+    fs::write(
+        home.join("providers.d/resume-cli.toml"),
+        format!(
+            r#"
+id = "cli:resume-cli"
+display_name = "Resume CLI"
+kind = "cli"
+default_binary = "{}"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["run", "{{prompt}}"]
+
+[contract]
+stream_args = ["--structured"]
+dialect = "json-lines"
+conversation_id_path = "/session_id"
+usage_input_path = "/usage/input"
+usage_output_path = "/usage/output"
+answer_path = "/answer"
+error_flag_path = "/is_error"
+resume_args = ["--session", "{{conversation_id}}"]
+probe_substring = "--structured"
+"#,
+            binary.display()
+        ),
+    )
+    .expect("descriptor");
+    let config_path = home.join("config.toml");
+    fs::write(&config_path, "default_provider = \"cli:resume-cli\"\n").expect("config");
+    ProviderRouter::from_config_path(&config_path, None).expect("router")
+}
+
+#[tokio::test]
+async fn descriptor_resume_substitutes_conversation_id() {
+    let temp = TempDir::new().expect("tempdir");
+    let router = generic_resume_router(&temp);
+    let session_dir = temp.path().join("run");
+    let request = || ProviderRequest {
+        prompt: "work".to_string(),
+        cwd: Some(temp.path().to_path_buf()),
+        session_dir: Some(session_dir.clone()),
+        ..Default::default()
+    };
+    router.complete(&request()).await.expect("first turn");
+    let second = router.complete(&request()).await.expect("second turn");
+
+    assert_eq!(second.trace["contract"]["resumed"], true);
+    assert_eq!(
+        second.trace["args"],
+        serde_json::json!([
+            "run",
+            "--structured",
+            "--session",
+            "resume-session-1",
+            "work"
+        ])
+    );
+    let session: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(session_dir.join("provider-session.json")).expect("session file"),
+    )
+    .expect("session json");
+    assert_eq!(session["provider"], "cli:resume-cli");
+    assert_eq!(session["conversation_id"], "resume-session-1");
+}
+
+#[tokio::test]
+async fn no_resume_args_means_fresh_turns_without_caveat() {
+    let temp = TempDir::new().expect("tempdir");
+    let router = generic_contract_router(
+        &temp,
+        r#"{"session_id":"fresh-only","usage":{"input":1,"output":1},"answer":"fresh","is_error":false}"#,
+    );
+    let session_dir = temp.path().join("run");
+    let request = || ProviderRequest {
+        prompt: "work".to_string(),
+        cwd: Some(temp.path().to_path_buf()),
+        session_dir: Some(session_dir.clone()),
+        ..Default::default()
+    };
+    router.complete(&request()).await.expect("first turn");
+    let second = router.complete(&request()).await.expect("second turn");
+
+    assert_eq!(second.trace["contract"]["resume"], false);
+    assert_eq!(second.trace["contract"]["resumed"], false);
+    assert!(!session_dir.join("provider-session.json").exists());
+    assert!(second.trace["caveats"].as_array().is_none_or(|caveats| {
+        caveats
+            .iter()
+            .all(|caveat| caveat["code"] != "provider.session.reset")
+    }));
+}
+
 #[tokio::test]
 async fn generic_cli_provider_preserves_codex_prompt_delimiter() {
     let temp = TempDir::new().expect("tempdir");

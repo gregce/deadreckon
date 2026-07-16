@@ -4,9 +4,12 @@ use std::time::Instant;
 use serde_json::json;
 use which::which;
 
-use crate::cli_common::{CliRunOptions, ensure_success, run_cli_with_options, write_output};
+use crate::cli_common::{
+    CliOutput, CliRunOptions, ensure_success, run_cli_with_options, write_output,
+};
 use crate::cli_contract::{
-    ProviderContract, add_caveat, flight_rows_from, probe_descriptor_contract,
+    ProviderContract, ProviderSession, add_caveat, flight_rows_from, probe_descriptor_contract,
+    session_not_found,
 };
 use crate::registry::ProviderDescriptor;
 use crate::{
@@ -128,26 +131,40 @@ impl GenericCliProvider {
         contract: &ProviderContract,
     ) -> Result<ProviderResponse> {
         let probe = probe_descriptor_contract(&self.binary, contract);
-        let started = Instant::now();
-        let args = if probe.active {
-            self.render_contract_args(request, contract)
-        } else {
-            self.render_args(request)
+        let Some(section) = contract.descriptor() else {
+            return Err(ProviderError::InvalidConfig(format!(
+                "{} generic driver received a bespoke contract",
+                self.descriptor.id
+            )));
         };
-        let sandbox_writes = self.sandbox_writes();
-        let output = run_cli_with_options(
-            &self.name,
-            &self.binary,
-            &args,
-            CliRunOptions {
-                cwd: request.cwd.clone(),
-                sandbox_backend: request.sandbox_backend,
-                pid_file: request.pid_file.clone(),
-                cancellation_token: request.cancellation_token.clone(),
-                extra_write_allowlist: sandbox_writes.clone(),
-            },
-        )
-        .await?;
+        let resume_capable = probe.active && !section.resume_args.is_empty();
+        let session_dir = request.session_dir.as_deref();
+        let session = resume_capable
+            .then(|| session_dir.and_then(|dir| ProviderSession::read(dir, &self.descriptor.id)))
+            .flatten();
+        let resume_id = session
+            .as_ref()
+            .filter(|session| session.can_resume())
+            .map(|session| session.conversation_id.clone());
+        let started = Instant::now();
+        let attempt = self
+            .run_contract_attempt(request, contract, probe.active, resume_id.as_deref())
+            .await?;
+        let (output, args, resumed, reset) = if attempt.output.status_code != Some(0)
+            && resume_id.is_some()
+            && session_not_found(&attempt.output)
+        {
+            if let (Some(dir), Some(mut session)) = (session_dir, session.clone()) {
+                session.mark_resume_failure(chrono::Utc::now());
+                let _ = session.write(dir);
+            }
+            let fresh = self
+                .run_contract_attempt(request, contract, probe.active, None)
+                .await?;
+            (fresh.output, fresh.args, false, true)
+        } else {
+            (attempt.output, attempt.args, resume_id.is_some(), false)
+        };
         write_output(request.output_path.as_ref(), &output).await?;
         ensure_success(&self.name, &output)?;
 
@@ -160,6 +177,16 @@ impl GenericCliProvider {
                 provider: self.name.clone(),
                 detail: format!("provider contract reported an error: {message}"),
             });
+        }
+        if resume_capable
+            && let (Some(dir), Some(id)) = (
+                session_dir,
+                extracted
+                    .as_ref()
+                    .and_then(|extracted| extracted.parsed.conversation_id.as_deref()),
+            )
+        {
+            persist_session(dir, &self.descriptor.id, id, reset);
         }
         let degraded = extracted
             .as_ref()
@@ -188,6 +215,7 @@ impl GenericCliProvider {
         let spend = self
             .estimate_spend(usage.clone())
             .with_wall_time(wall_time_seconds);
+        let sandbox_writes = self.sandbox_writes();
         let mut trace = json!({
             "kind": "cli_subagent",
             "binary": self.binary,
@@ -207,6 +235,9 @@ impl GenericCliProvider {
                     crate::registry::ContractDialect::JsonDocument => "json-document",
                 }),
                 "reported_cost_usd": reported_cost,
+                "resume": resume_capable,
+                "resumed": resumed,
+                "reset": reset,
                 "missing_fields": extracted.as_ref().map(|value| &value.missing_fields),
                 "garbage_lines": extracted.as_ref().map(|value| value.parsed.garbage_lines),
             },
@@ -226,6 +257,13 @@ impl GenericCliProvider {
                     "{} output was not its descriptor-declared structured contract; fell back to raw stdout",
                     self.descriptor.id
                 ),
+            );
+        }
+        if reset {
+            add_caveat(
+                &mut trace,
+                "provider.session.reset",
+                "resume target vanished; retried once with a fresh conversation",
             );
         }
         if let Some(extracted) = &extracted {
@@ -251,30 +289,57 @@ impl GenericCliProvider {
         })
     }
 
+    async fn run_contract_attempt(
+        &self,
+        request: &ProviderRequest,
+        contract: &ProviderContract,
+        active: bool,
+        resume_id: Option<&str>,
+    ) -> Result<GenericContractAttempt> {
+        let args = if active {
+            self.render_contract_args(request, contract, resume_id)
+        } else {
+            self.render_args(request)
+        };
+        let output = run_cli_with_options(
+            &self.name,
+            &self.binary,
+            &args,
+            CliRunOptions {
+                cwd: request.cwd.clone(),
+                sandbox_backend: request.sandbox_backend,
+                pid_file: request.pid_file.clone(),
+                cancellation_token: request.cancellation_token.clone(),
+                extra_write_allowlist: self.sandbox_writes(),
+            },
+        )
+        .await?;
+        Ok(GenericContractAttempt { output, args })
+    }
+
     fn render_contract_args(
         &self,
         request: &ProviderRequest,
         contract: &ProviderContract,
+        resume_id: Option<&str>,
     ) -> Vec<String> {
         let mut args = self.render_args(request);
         let Some(section) = contract.descriptor() else {
             return args;
         };
-        if contains_arg_sequence(&args, &section.stream_args) {
-            return args;
+        if !contains_arg_sequence(&args, &section.stream_args) {
+            insert_arg_sequence_before_prompt(&mut args, request, section.stream_args.clone());
         }
-        let prompt_index = args
-            .iter()
-            .rposition(|arg| arg == &request.prompt)
-            .unwrap_or(args.len());
-        let insert_at = prompt_index.checked_sub(1).map_or(prompt_index, |before| {
-            if prompt_value_flag_requires_next_arg(&args[before]) {
-                before
-            } else {
-                prompt_index
+        if let Some(conversation_id) = resume_id {
+            let resume_args = section
+                .resume_args
+                .iter()
+                .map(|arg| arg.replace("{conversation_id}", conversation_id))
+                .collect::<Vec<_>>();
+            if !contains_arg_sequence(&args, &resume_args) {
+                insert_arg_sequence_before_prompt(&mut args, request, resume_args);
             }
-        });
-        args.splice(insert_at..insert_at, section.stream_args.clone());
+        }
         args
     }
 
@@ -345,8 +410,32 @@ impl GenericCliProvider {
     }
 }
 
+struct GenericContractAttempt {
+    output: CliOutput,
+    args: Vec<String>,
+}
+
 fn prompt_value_flag_requires_next_arg(arg: &str) -> bool {
     matches!(arg, "-p" | "--prompt" | "--interactive")
+}
+
+fn insert_arg_sequence_before_prompt(
+    args: &mut Vec<String>,
+    request: &ProviderRequest,
+    sequence: Vec<String>,
+) {
+    let prompt_index = args
+        .iter()
+        .rposition(|arg| arg == &request.prompt)
+        .unwrap_or(args.len());
+    let insert_at = prompt_index.checked_sub(1).map_or(prompt_index, |before| {
+        if prompt_value_flag_requires_next_arg(&args[before]) {
+            before
+        } else {
+            prompt_index
+        }
+    });
+    args.splice(insert_at..insert_at, sequence);
 }
 
 fn contains_arg_sequence(args: &[String], expected: &[String]) -> bool {
@@ -354,6 +443,18 @@ fn contains_arg_sequence(args: &[String], expected: &[String]) -> bool {
         && args
             .windows(expected.len())
             .any(|window| window == expected)
+}
+
+fn persist_session(dir: &std::path::Path, provider: &str, id: &str, reset: bool) {
+    let now = chrono::Utc::now();
+    let record = match ProviderSession::read(dir, provider) {
+        Some(mut existing) if existing.conversation_id == id && !reset => {
+            existing.touch(now);
+            existing
+        }
+        _ => ProviderSession::new(provider, id, now),
+    };
+    let _ = record.write(dir);
 }
 
 fn render_template_part(part: &str, request: &ProviderRequest) -> String {
