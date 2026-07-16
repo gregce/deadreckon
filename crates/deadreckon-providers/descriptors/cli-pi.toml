@@ -22,6 +22,18 @@ args_template = ["--mode", "json", "--print", "{prompt}"]
 model_arg = "--model"
 timeout_seconds = 1800
 
+[contract]
+stream_args = ["--mode", "json", "--print"]
+dialect = "json-lines"
+conversation_id_path = "/id"
+usage_input_path = "/message/usage/input"
+usage_output_path = "/message/usage/output"
+cost_path = "/message/usage/cost/total"
+answer_path = "/assistantMessageEvent/content"
+flight_event_paths = ["/toolCallId"]
+resume_args = ["--session", "{conversation_id}"]
+probe_substring = "--mode"
+
 [install_hint]
 url = "https://pi.dev/"
 try_lines = ["npm install -g @earendil-works/pi-coding-agent"]

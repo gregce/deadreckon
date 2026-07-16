@@ -1,0 +1,2 @@
+{"type":"tool_execution_start","toolCallId":"call_00_xOau81hjsYGX37C5fe975384","toolName":"ls","args":{"path":"/tmp"}}
+{"type":"tool_execution_end","toolCallId":"call_00_xOau81hjsYGX37C5fe975384","toolName":"ls","result":{"content":[{"type":"text","text":"fixture output"}]},"isError":false}

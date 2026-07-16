@@ -706,6 +706,105 @@ async fn no_resume_args_means_fresh_turns_without_caveat() {
     }));
 }
 
+const PI_PENNANT_FIXTURE: &str = include_str!("fixtures/pennant/pi-simple.jsonl");
+
+#[allow(clippy::expect_used)]
+fn write_pi_pennant_binary(path: &std::path::Path) {
+    let script = format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"--help\" ]; then printf '%s\\n' 'Options: --mode --session'; exit 0; fi\n\
+cat <<'JSONL'\n{PI_PENNANT_FIXTURE}\nJSONL\n"
+    );
+    fs::write(path, script).expect("pi fixture binary");
+    chmod_exec(path);
+}
+
+#[allow(clippy::expect_used)]
+fn pi_pennant_router(binary: &std::path::Path) -> ProviderRouter {
+    ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:pi".to_string()]),
+            providers: [(
+                "cli:pi".to_string(),
+                ProviderEntry {
+                    kind: None,
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: None,
+                    input_cost_per_million: None,
+                    output_cost_per_million: None,
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("pi router")
+}
+
+#[tokio::test]
+async fn pi_fixture_yields_usage_answer_and_session() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-pi-pennant");
+    write_pi_pennant_binary(&binary);
+    let session_dir = temp.path().join("run");
+    let response = pi_pennant_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "fixture".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            session_dir: Some(session_dir.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+
+    assert_eq!(
+        response.content, "PI_FIXTURE_OK",
+        "trace: {}",
+        response.trace
+    );
+    assert_eq!(response.usage.input_tokens, 403);
+    assert_eq!(response.usage.output_tokens, 25);
+    let reported_cost = response.trace["contract"]["reported_cost_usd"]
+        .as_f64()
+        .expect("reported cost");
+    assert!((reported_cost - 0.000197055).abs() < f64::EPSILON);
+    let session: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(session_dir.join("provider-session.json")).expect("session file"),
+    )
+    .expect("session json");
+    assert_eq!(
+        session["conversation_id"],
+        "019f6c15-c7c8-7936-b475-1637f9d25191"
+    );
+}
+
+#[tokio::test]
+async fn pi_response_content_is_answer_not_json_blob() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-pi-pennant");
+    write_pi_pennant_binary(&binary);
+    let response = pi_pennant_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "fixture".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+
+    assert_eq!(response.content, "PI_FIXTURE_OK");
+    assert!(!response.content.contains("\"type\""));
+    let args = response.trace["args"].as_array().expect("args");
+    assert_eq!(args.iter().filter(|arg| *arg == "--mode").count(), 1);
+    assert_eq!(args.iter().filter(|arg| *arg == "--print").count(), 1);
+}
+
 #[tokio::test]
 async fn generic_cli_provider_preserves_codex_prompt_delimiter() {
     let temp = TempDir::new().expect("tempdir");
