@@ -22,6 +22,17 @@ args_template = ["-p", "{prompt}", "--output-format", "json", "--stream", "off",
 model_arg = "--model"
 timeout_seconds = 1800
 
+[contract]
+stream_args = ["--output-format", "json", "--stream", "off"]
+dialect = "json-lines"
+conversation_id_path = "/sessionId"
+usage_output_path = "/data/outputTokens"
+answer_path = "/data/content"
+error_flag_path = "/exitCode"
+flight_event_paths = ["/data/toolRequests/0"]
+resume_args = ["--resume={conversation_id}"]
+probe_substring = "--output-format"
+
 [install_hint]
 url = "https://docs.github.com/copilot"
 try_lines = ["npm install -g @github/copilot"]

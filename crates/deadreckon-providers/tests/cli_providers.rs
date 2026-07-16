@@ -805,6 +805,100 @@ async fn pi_response_content_is_answer_not_json_blob() {
     assert_eq!(args.iter().filter(|arg| *arg == "--print").count(), 1);
 }
 
+const COPILOT_PENNANT_FIXTURE: &str = include_str!("fixtures/pennant/copilot-simple.jsonl");
+
+#[allow(clippy::expect_used)]
+fn write_copilot_pennant_binary(path: &std::path::Path) {
+    let script = format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"--help\" ]; then printf '%s\\n' 'Options: --output-format --resume'; exit 0; fi\n\
+cat <<'JSONL'\n{COPILOT_PENNANT_FIXTURE}\nJSONL\n"
+    );
+    fs::write(path, script).expect("copilot fixture binary");
+    chmod_exec(path);
+}
+
+#[allow(clippy::expect_used)]
+fn copilot_pennant_router(binary: &std::path::Path) -> ProviderRouter {
+    ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:copilot".to_string()]),
+            providers: [(
+                "cli:copilot".to_string(),
+                ProviderEntry {
+                    kind: None,
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: None,
+                    input_cost_per_million: None,
+                    output_cost_per_million: None,
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("copilot router")
+}
+
+#[tokio::test]
+async fn copilot_fixture_yields_usage_and_answer() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-copilot-pennant");
+    write_copilot_pennant_binary(&binary);
+    let session_dir = temp.path().join("run");
+    let response = copilot_pennant_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "fixture".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            session_dir: Some(session_dir.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+
+    assert_eq!(response.content, "COPILOT_FIXTURE_OK");
+    assert_eq!(response.usage.input_tokens, 0);
+    assert_eq!(response.usage.output_tokens, 26);
+    assert_eq!(response.trace["contract"]["dialect"], "json-lines");
+    assert_eq!(
+        response.trace["contract"]["missing_fields"],
+        serde_json::json!([])
+    );
+    let session: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(session_dir.join("provider-session.json")).expect("session file"),
+    )
+    .expect("session json");
+    assert_eq!(
+        session["conversation_id"],
+        "c35073fd-b43b-4b04-8dea-f47047d0bbb0"
+    );
+}
+
+#[test]
+fn copilot_document_dialect_parses_single_json() {
+    // The rider's pre-probe name is retained as an audit trail. Copilot 1.0.45
+    // actually emits a sequence of standalone JSON documents even with
+    // `--stream off`, so the honest descriptor dialect is JSON Lines.
+    assert!(serde_json::from_str::<serde_json::Value>(COPILOT_PENNANT_FIXTURE).is_err());
+    let documents = COPILOT_PENNANT_FIXTURE
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("each Copilot line is one JSON document");
+    assert_eq!(documents.len(), 2);
+    assert_eq!(documents[0]["data"]["content"], "COPILOT_FIXTURE_OK");
+    assert_eq!(
+        documents[1]["sessionId"],
+        "c35073fd-b43b-4b04-8dea-f47047d0bbb0"
+    );
+}
+
 #[tokio::test]
 async fn generic_cli_provider_preserves_codex_prompt_delimiter() {
     let temp = TempDir::new().expect("tempdir");
