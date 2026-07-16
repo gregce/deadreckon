@@ -7,8 +7,8 @@ use which::which;
 use crate::claude_events::{parse_claude_line, probe_claude_capabilities};
 use crate::cli_common::{CliOutput, ensure_success, run_cli, write_output};
 use crate::cli_contract::{
-    PROVIDER_ID_CLAUDE, ParsedStream, ProviderSession, add_caveat, flight_rows_from, parse_stream,
-    session_not_found,
+    PROVIDER_ID_CLAUDE, ParsedStream, ProviderContract, ProviderSession, add_caveat,
+    flight_rows_from, session_not_found,
 };
 use crate::{
     Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
@@ -121,7 +121,9 @@ impl CliClaudeCodeProvider {
         ensure_success(&self.name, &output)?;
 
         let parsed = if caps.stream_json {
-            parse_stream(&output.stdout, parse_claude_line)
+            ProviderContract::from_event_mirror(parse_claude_line)
+                .parse(&output.stdout)
+                .parsed
         } else {
             ParsedStream::default()
         };

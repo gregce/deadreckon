@@ -6,7 +6,10 @@
 //! codex/claude specifics, so a follow-up slice (Pennant) can drive the generic
 //! fleet from descriptor TOML without a refactor.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -38,6 +41,153 @@ pub(crate) enum CliStreamEvent {
     Recognized,
     /// A JSON line whose `type` tag we do not model — preserved, never fatal.
     Unknown,
+}
+
+type EventMirror = fn(&str) -> Option<Vec<CliStreamEvent>>;
+
+/// One provider-neutral entry into Semaphore's parse/degrade/flight
+/// machinery. Codex and Claude construct it with their richer event mirrors;
+/// generic providers construct it from descriptor TOML.
+#[derive(Clone)]
+pub(crate) struct ProviderContract {
+    parser: ContractParser,
+}
+
+#[derive(Clone)]
+enum ContractParser {
+    EventMirror(EventMirror),
+    Descriptor(Box<ContractSection>),
+}
+
+type ContractProbeCache = Mutex<HashMap<(String, String), Option<String>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContractError {
+    pub field: &'static str,
+    pub detail: String,
+}
+
+impl std::fmt::Display for ContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.field, self.detail)
+    }
+}
+
+impl ProviderContract {
+    pub(crate) fn from_descriptor(section: &ContractSection) -> Result<Self, ContractError> {
+        section.validate().map_err(|error| ContractError {
+            field: error.field,
+            detail: error.detail,
+        })?;
+        Ok(Self {
+            parser: ContractParser::Descriptor(Box::new(section.clone())),
+        })
+    }
+
+    pub(crate) fn from_event_mirror(parser: EventMirror) -> Self {
+        Self {
+            parser: ContractParser::EventMirror(parser),
+        }
+    }
+
+    pub(crate) fn parse(&self, stdout: &str) -> DescriptorParse {
+        match &self.parser {
+            ContractParser::EventMirror(parser) => DescriptorParse {
+                parsed: parse_stream(stdout, *parser),
+                missing_fields: Vec::new(),
+            },
+            ContractParser::Descriptor(section) => extract_descriptor_output(section, stdout),
+        }
+    }
+
+    #[allow(dead_code)] // Generic driver wiring lands in Pennant P4.
+    pub(crate) fn descriptor(&self) -> Option<&ContractSection> {
+        match &self.parser {
+            ContractParser::Descriptor(section) => Some(section),
+            ContractParser::EventMirror(_) => None,
+        }
+    }
+}
+
+/// Result of applying the optional descriptor probe expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContractProbe {
+    pub active: bool,
+    pub caveat: Option<String>,
+}
+
+pub(crate) fn evaluate_contract_probe(
+    binary: &str,
+    contract: &ProviderContract,
+    help: Option<&str>,
+) -> ContractProbe {
+    let Some(section) = contract.descriptor() else {
+        return ContractProbe {
+            active: true,
+            caveat: None,
+        };
+    };
+    let Some(expected) = section.probe_substring.as_deref() else {
+        return ContractProbe {
+            active: true,
+            caveat: None,
+        };
+    };
+    if help.is_some_and(|help| help.contains(expected)) {
+        ContractProbe {
+            active: true,
+            caveat: None,
+        }
+    } else {
+        ContractProbe {
+            active: false,
+            caveat: Some(format!(
+                "installed {binary} predates its contract; upgrade to enable token accounting"
+            )),
+        }
+    }
+}
+
+/// Probe `binary --help` once per binary/expectation pair. Failure to execute
+/// or a missing marker disables the contract with a caveat, never an error.
+#[allow(dead_code)] // Generic driver wiring lands in Pennant P4.
+pub(crate) fn probe_descriptor_contract(
+    binary: &str,
+    contract: &ProviderContract,
+) -> ContractProbe {
+    let expected = contract
+        .descriptor()
+        .and_then(|section| section.probe_substring.as_deref());
+    let Some(expected) = expected else {
+        return ContractProbe {
+            active: true,
+            caveat: None,
+        };
+    };
+    static CACHE: OnceLock<ContractProbeCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (binary.to_string(), expected.to_string());
+    if let Ok(guard) = cache.lock()
+        && let Some(found) = guard.get(&key)
+    {
+        return evaluate_contract_probe(binary, contract, found.as_deref());
+    }
+    let help = Command::new(binary)
+        .arg("--help")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, help.clone());
+    }
+    evaluate_contract_probe(binary, contract, help.as_deref())
 }
 
 /// Token usage lifted from a provider's terminal event.
@@ -245,16 +395,15 @@ pub(crate) fn parse_stream(
 /// missing pointer disables only that capability and becomes a caveat at the
 /// driver boundary; it is never a parse error.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Constructed by the generic driver in Pennant P3/P4.
 pub(crate) struct DescriptorParse {
     pub parsed: ParsedStream,
+    #[allow(dead_code)] // Surfaced as generic-driver caveats in Pennant P4.
     pub missing_fields: Vec<&'static str>,
 }
 
 /// Extract a descriptor contract from stdout. JSONL terminal facts use
 /// last-resolution-wins, except the conversation id, which is deliberately
 /// pinned to the first resolution so later status rows cannot switch sessions.
-#[allow(dead_code)] // Wired into ProviderContract by the next Pennant phase.
 pub(crate) fn extract_descriptor_output(
     contract: &ContractSection,
     stdout: &str,
@@ -609,6 +758,44 @@ mod tests {
             answer_path: Some("/answer".to_string()),
             ..ContractSection::default()
         }
+    }
+
+    #[test]
+    fn descriptor_contract_flows_through_semaphore_machinery() {
+        let section = pointer_contract(ContractDialect::JsonDocument);
+        let contract = ProviderContract::from_descriptor(&section).expect("contract");
+        let extracted = contract.parse(
+            r#"{"session":{"id":"shared-1"},"usage":{"input":21,"output":22},"answer":"shared machinery"}"#,
+        );
+        assert_eq!(extracted.parsed.answer.as_deref(), Some("shared machinery"));
+        assert_eq!(extracted.parsed.usage.expect("usage").input_tokens, 21);
+
+        // A bespoke mirror enters through the same parse facade.
+        let bespoke = ProviderContract::from_event_mirror(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .map(|_| vec![CliStreamEvent::Recognized])
+        });
+        assert_eq!(
+            bespoke
+                .parse("{\"type\":\"event\"}\n")
+                .parsed
+                .structured_events,
+            1
+        );
+    }
+
+    #[test]
+    fn probe_substring_miss_disables_contract_with_caveat() {
+        let mut section = pointer_contract(ContractDialect::JsonDocument);
+        section.probe_substring = Some("--structured".to_string());
+        let contract = ProviderContract::from_descriptor(&section).expect("contract");
+        let probe = evaluate_contract_probe("example-cli", &contract, Some("--plain only"));
+        assert!(!probe.active);
+        assert_eq!(
+            probe.caveat.as_deref(),
+            Some("installed example-cli predates its contract; upgrade to enable token accounting")
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@ use which::which;
 
 use crate::cli_common::{CliOutput, ensure_success, run_cli, write_output};
 use crate::cli_contract::{
-    PROVIDER_ID_CODEX, ParsedStream, ProviderSession, add_caveat, flight_rows_from, parse_stream,
-    session_not_found, write_schema_file,
+    PROVIDER_ID_CODEX, ParsedStream, ProviderContract, ProviderSession, add_caveat,
+    flight_rows_from, session_not_found, write_schema_file,
 };
 use crate::codex_events::{parse_codex_line, probe_codex_capabilities};
 use crate::{
@@ -186,7 +186,9 @@ impl CliCodexProvider {
         ensure_success(&self.name, &output)?;
 
         let parsed = if caps.json {
-            parse_stream(&output.stdout, parse_codex_line)
+            ProviderContract::from_event_mirror(parse_codex_line)
+                .parse(&output.stdout)
+                .parsed
         } else {
             ParsedStream::default()
         };

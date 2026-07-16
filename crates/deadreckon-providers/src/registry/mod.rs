@@ -159,13 +159,13 @@ pub struct ContractSection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ContractValidationError {
-    field: &'static str,
-    detail: String,
+pub(crate) struct ContractValidationError {
+    pub(crate) field: &'static str,
+    pub(crate) detail: String,
 }
 
 impl ContractSection {
-    fn validate(&self) -> std::result::Result<(), ContractValidationError> {
+    pub(crate) fn validate(&self) -> std::result::Result<(), ContractValidationError> {
         if self.stream_args.is_empty() {
             return Err(ContractValidationError {
                 field: "stream_args",

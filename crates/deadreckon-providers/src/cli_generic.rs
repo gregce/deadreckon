@@ -5,6 +5,7 @@ use serde_json::json;
 use which::which;
 
 use crate::cli_common::{CliRunOptions, ensure_success, run_cli_with_options, write_output};
+use crate::cli_contract::ProviderContract;
 use crate::registry::ProviderDescriptor;
 use crate::{
     Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
@@ -19,6 +20,8 @@ pub(crate) struct GenericCliProvider {
     extra_args: Vec<String>,
     model: String,
     model_arg: Option<String>,
+    #[allow(dead_code)] // Consumed by the generic run algorithm in Pennant P4.
+    contract: Option<ProviderContract>,
 }
 
 impl GenericCliProvider {
@@ -34,6 +37,17 @@ impl GenericCliProvider {
             )));
         }
         let (model, model_arg) = cli_model(entry.model, &descriptor);
+        let contract = descriptor
+            .contract
+            .as_ref()
+            .map(ProviderContract::from_descriptor)
+            .transpose()
+            .map_err(|error| {
+                ProviderError::InvalidConfig(format!(
+                    "{} descriptor contract is invalid: {error}",
+                    descriptor.id
+                ))
+            })?;
         let binary = entry
             .binary
             .or_else(|| descriptor.default_binary.clone())
@@ -45,6 +59,7 @@ impl GenericCliProvider {
             extra_args: entry.extra_args,
             model,
             model_arg,
+            contract,
         })
     }
 
