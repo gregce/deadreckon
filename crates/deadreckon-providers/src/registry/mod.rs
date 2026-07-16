@@ -128,6 +128,118 @@ pub struct ExecTemplate {
     pub path_template: Option<String>,
 }
 
+/// The stdout encoding used by a descriptor-declared CLI wire contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContractDialect {
+    #[default]
+    JsonLines,
+    JsonDocument,
+}
+
+/// Declarative subset of a CLI provider's wire contract (Pennant).
+///
+/// JSON locations are RFC 6901 pointers. Missing optional pointers disable only
+/// that capability; they never make the descriptor unusable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ContractSection {
+    pub stream_args: Vec<String>,
+    pub dialect: ContractDialect,
+    pub conversation_id_path: Option<String>,
+    pub usage_input_path: Option<String>,
+    pub usage_output_path: Option<String>,
+    pub cost_path: Option<String>,
+    pub answer_path: Option<String>,
+    pub error_flag_path: Option<String>,
+    pub error_message_path: Option<String>,
+    pub flight_event_paths: Vec<String>,
+    pub resume_args: Vec<String>,
+    pub probe_substring: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContractValidationError {
+    field: &'static str,
+    detail: String,
+}
+
+impl ContractSection {
+    fn validate(&self) -> std::result::Result<(), ContractValidationError> {
+        if self.stream_args.is_empty() {
+            return Err(ContractValidationError {
+                field: "stream_args",
+                detail: "must contain at least one argument".to_string(),
+            });
+        }
+        if self.stream_args.iter().any(|arg| arg.is_empty()) {
+            return Err(ContractValidationError {
+                field: "stream_args",
+                detail: "arguments must not be empty".to_string(),
+            });
+        }
+        if self.dialect == ContractDialect::JsonDocument && !self.flight_event_paths.is_empty() {
+            return Err(ContractValidationError {
+                field: "flight_event_paths",
+                detail: "is only valid with dialect = \"json-lines\"".to_string(),
+            });
+        }
+
+        for (field, pointer) in [
+            ("conversation_id_path", self.conversation_id_path.as_deref()),
+            ("usage_input_path", self.usage_input_path.as_deref()),
+            ("usage_output_path", self.usage_output_path.as_deref()),
+            ("cost_path", self.cost_path.as_deref()),
+            ("answer_path", self.answer_path.as_deref()),
+            ("error_flag_path", self.error_flag_path.as_deref()),
+            ("error_message_path", self.error_message_path.as_deref()),
+        ] {
+            if let Some(pointer) = pointer
+                && !valid_json_pointer(pointer)
+            {
+                return Err(ContractValidationError {
+                    field,
+                    detail: format!("{pointer:?} is not an RFC 6901 JSON pointer"),
+                });
+            }
+        }
+        for pointer in &self.flight_event_paths {
+            if !valid_json_pointer(pointer) {
+                return Err(ContractValidationError {
+                    field: "flight_event_paths",
+                    detail: format!("{pointer:?} is not an RFC 6901 JSON pointer"),
+                });
+            }
+        }
+        if self
+            .resume_args
+            .iter()
+            .any(|arg| arg.contains('{') && !arg.contains("{conversation_id}"))
+        {
+            return Err(ContractValidationError {
+                field: "resume_args",
+                detail: "only the {conversation_id} placeholder is supported".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn valid_json_pointer(pointer: &str) -> bool {
+    pointer.is_empty()
+        || (pointer.starts_with('/') && !pointer.split('/').skip(1).any(invalid_pointer_escape))
+}
+
+fn invalid_pointer_escape(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' && !matches!(chars.next(), Some('0' | '1')) {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ModelEntry {
@@ -262,6 +374,11 @@ pub struct ProviderDescriptor {
     pub docs_url: Option<String>,
     pub subscription: bool,
     pub ingest: Option<IngestDescriptor>,
+    pub contract: Option<ContractSection>,
+    /// Non-fatal descriptor-load diagnostics. These are runtime metadata, not
+    /// part of the TOML schema, so descriptor round-trips do not persist them.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -364,6 +481,12 @@ impl ProviderRegistry {
         self.descriptors.keys().cloned().collect()
     }
 
+    pub fn warnings(&self) -> impl Iterator<Item = &str> {
+        self.descriptors
+            .values()
+            .flat_map(|descriptor| descriptor.warnings.iter().map(String::as_str))
+    }
+
     pub async fn probe_all(&self, options: ProviderProbeOptions) -> Vec<ProviderProbeResult> {
         let mut results = Vec::new();
         for descriptor in self.iter() {
@@ -401,11 +524,14 @@ impl ProviderRegistry {
 }
 
 pub fn parse_descriptor(raw: &str, label: &str) -> Result<ProviderDescriptor> {
-    let descriptor: ProviderDescriptor =
-        toml::from_str(raw).map_err(|source| ProviderError::Toml {
-            path: label.to_string(),
-            source,
-        })?;
+    let value: Value = toml::from_str(raw).map_err(|source| ProviderError::Toml {
+        path: label.to_string(),
+        source,
+    })?;
+    parse_descriptor_value(value, label)
+}
+
+fn validate_descriptor(descriptor: ProviderDescriptor, label: &str) -> Result<ProviderDescriptor> {
     // A catalog with zero or several recommended entries gives pickers no
     // honest default; fail closed at parse time like other descriptor
     // validation. Catalogs are optional, but once present exactly one entry
@@ -423,6 +549,44 @@ pub fn parse_descriptor(raw: &str, label: &str) -> Result<ProviderDescriptor> {
         }
     }
     Ok(descriptor)
+}
+
+fn parse_descriptor_value(mut value: Value, label: &str) -> Result<ProviderDescriptor> {
+    let contract_value = value
+        .as_table_mut()
+        .and_then(|table| table.remove("contract"));
+    let mut descriptor: ProviderDescriptor =
+        value.try_into().map_err(|source| ProviderError::Toml {
+            path: label.to_string(),
+            source,
+        })?;
+
+    if let Some(contract_value) = contract_value {
+        match contract_value.try_into::<ContractSection>() {
+            Ok(contract) => match contract.validate() {
+                Ok(()) => descriptor.contract = Some(contract),
+                Err(error) => descriptor.warnings.push(contract_warning(
+                    label,
+                    &descriptor.id,
+                    error.field,
+                    &error.detail,
+                )),
+            },
+            Err(source) => descriptor.warnings.push(contract_warning(
+                label,
+                &descriptor.id,
+                "section",
+                &source.to_string(),
+            )),
+        }
+    }
+    validate_descriptor(descriptor, label)
+}
+
+fn contract_warning(label: &str, id: &str, field: &str, detail: &str) -> String {
+    format!(
+        "{label}: malformed [contract] field {field}: {detail}; try: deadreckon providers check {id}"
+    )
 }
 
 pub fn parse_custom_command(command: &str) -> Result<(String, Vec<String>)> {
@@ -859,10 +1023,7 @@ fn descriptor_to_value(descriptor: &ProviderDescriptor) -> Result<Value> {
 }
 
 fn value_to_descriptor(value: Value, path: &Path) -> Result<ProviderDescriptor> {
-    value.try_into().map_err(|source| ProviderError::Toml {
-        path: path.display().to_string(),
-        source,
-    })
+    parse_descriptor_value(value, &path.display().to_string())
 }
 
 fn merge_values(base: &mut Value, override_value: Value) {
