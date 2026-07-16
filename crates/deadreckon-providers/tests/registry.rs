@@ -1,6 +1,7 @@
 use std::fs;
 
 use deadreckon_providers::ProviderKind;
+use deadreckon_providers::registry::ContractDialect;
 use deadreckon_providers::registry::IngestCwdMatch;
 use deadreckon_providers::registry::IngestStorage;
 use deadreckon_providers::registry::ProviderDescriptor;
@@ -161,6 +162,111 @@ args_template = ["run", "{prompt}"]
     .expect("parse descriptor without ingest");
 
     assert!(descriptor.ingest.is_none());
+}
+
+#[test]
+fn contract_section_parses_full_and_minimal_forms() {
+    let full = parse_descriptor(
+        r#"
+id = "cli:contract-full"
+display_name = "Contract Full"
+kind = "cli"
+default_binary = "contract-full"
+
+[exec_template]
+args_template = ["{prompt}"]
+
+[contract]
+stream_args = ["--json"]
+dialect = "json-lines"
+conversation_id_path = "/session_id"
+usage_input_path = "/usage/input"
+usage_output_path = "/usage/output"
+cost_path = "/cost"
+answer_path = "/answer"
+error_flag_path = "/is_error"
+error_message_path = "/error/message"
+flight_event_paths = ["/type"]
+resume_args = ["--session", "{conversation_id}"]
+probe_substring = "--json"
+"#,
+        "test:contract-full",
+    )
+    .expect("full contract");
+    let contract = full.contract.expect("contract");
+    assert_eq!(contract.dialect, ContractDialect::JsonLines);
+    assert_eq!(contract.answer_path.as_deref(), Some("/answer"));
+    assert_eq!(contract.resume_args, ["--session", "{conversation_id}"]);
+
+    let minimal = parse_descriptor(
+        r#"
+id = "cli:contract-minimal"
+display_name = "Contract Minimal"
+kind = "cli"
+default_binary = "contract-minimal"
+
+[exec_template]
+args_template = ["{prompt}"]
+
+[contract]
+stream_args = ["--json"]
+"#,
+        "test:contract-minimal",
+    )
+    .expect("minimal contract");
+    assert_eq!(
+        minimal.contract.expect("contract").dialect,
+        ContractDialect::JsonLines
+    );
+}
+
+#[test]
+fn malformed_contract_warns_and_provider_stays_usable() {
+    let descriptor = parse_descriptor(
+        r#"
+id = "cli:contract-bad"
+display_name = "Contract Bad"
+kind = "cli"
+default_binary = "contract-bad"
+
+[exec_template]
+args_template = ["run", "{prompt}"]
+
+[contract]
+stream_args = []
+answer_path = "/answer"
+"#,
+        "test:contract-bad",
+    )
+    .expect("provider remains usable");
+    assert!(descriptor.contract.is_none());
+    assert_eq!(descriptor.exec_template.args_template, ["run", "{prompt}"]);
+    assert!(descriptor.warnings[0].contains("field stream_args"));
+    assert!(descriptor.warnings[0].contains("deadreckon providers check cli:contract-bad"));
+}
+
+#[test]
+fn document_dialect_rejects_flight_selectors() {
+    let descriptor = parse_descriptor(
+        r#"
+id = "cli:contract-document"
+display_name = "Contract Document"
+kind = "cli"
+default_binary = "contract-document"
+
+[exec_template]
+args_template = ["{prompt}"]
+
+[contract]
+stream_args = ["--json"]
+dialect = "json-document"
+flight_event_paths = ["/type"]
+"#,
+        "test:contract-document",
+    )
+    .expect("provider remains usable");
+    assert!(descriptor.contract.is_none());
+    assert!(descriptor.warnings[0].contains("field flight_event_paths"));
 }
 
 #[test]
