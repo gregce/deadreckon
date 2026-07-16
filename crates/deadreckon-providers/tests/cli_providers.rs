@@ -418,6 +418,190 @@ try_lines = ["install local-test"]
 }
 
 #[tokio::test]
+async fn contractless_descriptor_behavior_is_byte_identical() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join("providers.d")).expect("providers dir");
+    let binary = temp.path().join("fake-contractless");
+    write_fake_binary(&binary, "legacy-output");
+    fs::write(
+        home.join("providers.d/contractless.toml"),
+        format!(
+            r#"
+id = "cli:contractless"
+display_name = "Contractless"
+kind = "cli"
+default_binary = "{}"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["run", "{{prompt}}"]
+"#,
+            binary.display()
+        ),
+    )
+    .expect("descriptor");
+    let config_path = home.join("config.toml");
+    fs::write(&config_path, "default_provider = \"cli:contractless\"\n").expect("config");
+
+    let response = ProviderRouter::from_config_path(&config_path, None)
+        .expect("router")
+        .complete(&ProviderRequest {
+            prompt: "unchanged".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+
+    assert_eq!(response.content, "legacy-output\nargs:run unchanged\n");
+    assert_eq!(response.usage.input_tokens, 0);
+    assert_eq!(response.usage.output_tokens, 0);
+    assert_eq!(
+        response.trace["args"],
+        serde_json::json!(["run", "unchanged"])
+    );
+    assert!(
+        response.trace.get("contract").is_none(),
+        "{}",
+        response.trace
+    );
+    assert!(
+        response.trace.get("flight_rows").is_none(),
+        "{}",
+        response.trace
+    );
+    let mut keys = response
+        .trace
+        .as_object()
+        .expect("trace object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "args",
+            "binary",
+            "descriptor",
+            "duration_ms",
+            "exit_code",
+            "kind",
+            "pid",
+            "sandbox_backend",
+            "sandbox_warning",
+            "sandbox_write_allowlist",
+            "stdout_path",
+        ]
+    );
+}
+
+#[allow(clippy::expect_used)]
+fn write_generic_contract_binary(path: &std::path::Path, stdout: &str) {
+    let script = format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"--help\" ]; then printf '%s\\n' 'Options: --structured'; exit 0; fi\n\
+cat <<'OUTPUT'\n{stdout}\nOUTPUT\n",
+    );
+    fs::write(path, script).expect("contract binary");
+    chmod_exec(path);
+}
+
+#[allow(clippy::expect_used)]
+fn generic_contract_router(temp: &TempDir, stdout: &str) -> ProviderRouter {
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join("providers.d")).expect("providers dir");
+    let binary = temp.path().join("fake-contract-cli");
+    write_generic_contract_binary(&binary, stdout);
+    fs::write(
+        home.join("providers.d/contract-cli.toml"),
+        format!(
+            r#"
+id = "cli:contract-cli"
+display_name = "Contract CLI"
+kind = "cli"
+default_binary = "{}"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["run", "{{prompt}}"]
+
+[contract]
+stream_args = ["--structured"]
+dialect = "json-lines"
+conversation_id_path = "/session_id"
+usage_input_path = "/usage/input"
+usage_output_path = "/usage/output"
+answer_path = "/answer"
+error_flag_path = "/is_error"
+probe_substring = "--structured"
+"#,
+            binary.display()
+        ),
+    )
+    .expect("descriptor");
+    let config_path = home.join("config.toml");
+    fs::write(&config_path, "default_provider = \"cli:contract-cli\"\n").expect("config");
+    ProviderRouter::from_config_path(&config_path, None).expect("router")
+}
+
+#[tokio::test]
+async fn contract_provider_reports_real_usage_and_answer() {
+    let temp = TempDir::new().expect("tempdir");
+    let router = generic_contract_router(
+        &temp,
+        r#"{"session_id":"session-1","usage":{"input":41,"output":9},"answer":"extracted answer","is_error":false}"#,
+    );
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "work".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+
+    assert_eq!(response.content, "extracted answer");
+    assert_eq!(response.usage.input_tokens, 41);
+    assert_eq!(response.usage.output_tokens, 9);
+    assert_eq!(response.trace["contract"]["active"], true);
+    assert_eq!(
+        response.trace["args"],
+        serde_json::json!(["run", "--structured", "work"])
+    );
+}
+
+#[tokio::test]
+async fn unparseable_output_degrades_with_caveat_generic() {
+    let temp = TempDir::new().expect("tempdir");
+    let router = generic_contract_router(&temp, "plain fallback response");
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "work".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+
+    assert_eq!(response.content, "plain fallback response\n");
+    assert_eq!(response.usage.input_tokens, 0);
+    let caveats = response.trace["caveats"].as_array().expect("caveats");
+    assert!(
+        caveats
+            .iter()
+            .any(|caveat| caveat["code"] == "provider.contract.degraded")
+    );
+}
+
+#[tokio::test]
 async fn generic_cli_provider_preserves_codex_prompt_delimiter() {
     let temp = TempDir::new().expect("tempdir");
     let home = temp.path().join("home");

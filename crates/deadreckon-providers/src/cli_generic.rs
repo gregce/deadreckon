@@ -5,7 +5,9 @@ use serde_json::json;
 use which::which;
 
 use crate::cli_common::{CliRunOptions, ensure_success, run_cli_with_options, write_output};
-use crate::cli_contract::ProviderContract;
+use crate::cli_contract::{
+    ProviderContract, add_caveat, flight_rows_from, probe_descriptor_contract,
+};
 use crate::registry::ProviderDescriptor;
 use crate::{
     Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
@@ -20,7 +22,6 @@ pub(crate) struct GenericCliProvider {
     extra_args: Vec<String>,
     model: String,
     model_arg: Option<String>,
-    #[allow(dead_code)] // Consumed by the generic run algorithm in Pennant P4.
     contract: Option<ProviderContract>,
 }
 
@@ -64,6 +65,15 @@ impl GenericCliProvider {
     }
 
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+        match self.contract.as_ref() {
+            Some(contract) => self.run_contract(request, contract).await,
+            None => self.run_contractless(request).await,
+        }
+    }
+
+    /// The pre-Pennant runner, deliberately kept as an intact branch so a
+    /// descriptor without `[contract]` remains byte-for-byte compatible.
+    async fn run_contractless(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let started = Instant::now();
         let args = self.render_args(request);
         let sandbox_writes = self.sandbox_writes();
@@ -110,6 +120,162 @@ impl GenericCliProvider {
                 "sandbox_write_allowlist": sandbox_writes,
             }),
         })
+    }
+
+    async fn run_contract(
+        &self,
+        request: &ProviderRequest,
+        contract: &ProviderContract,
+    ) -> Result<ProviderResponse> {
+        let probe = probe_descriptor_contract(&self.binary, contract);
+        let started = Instant::now();
+        let args = if probe.active {
+            self.render_contract_args(request, contract)
+        } else {
+            self.render_args(request)
+        };
+        let sandbox_writes = self.sandbox_writes();
+        let output = run_cli_with_options(
+            &self.name,
+            &self.binary,
+            &args,
+            CliRunOptions {
+                cwd: request.cwd.clone(),
+                sandbox_backend: request.sandbox_backend,
+                pid_file: request.pid_file.clone(),
+                cancellation_token: request.cancellation_token.clone(),
+                extra_write_allowlist: sandbox_writes.clone(),
+            },
+        )
+        .await?;
+        write_output(request.output_path.as_ref(), &output).await?;
+        ensure_success(&self.name, &output)?;
+
+        let extracted = probe.active.then(|| contract.parse(&output.stdout));
+        if let Some(message) = extracted
+            .as_ref()
+            .and_then(|extracted| extracted.parsed.failure.as_ref())
+        {
+            return Err(ProviderError::Cli {
+                provider: self.name.clone(),
+                detail: format!("provider contract reported an error: {message}"),
+            });
+        }
+        let degraded = extracted
+            .as_ref()
+            .is_some_and(|extracted| extracted.parsed.degraded());
+        let content = extracted
+            .as_ref()
+            .filter(|_| !degraded)
+            .and_then(|extracted| extracted.parsed.answer.clone())
+            .unwrap_or_else(|| output.stdout.clone());
+        let usage = extracted
+            .as_ref()
+            .and_then(|extracted| extracted.parsed.usage)
+            .map(|usage| ProviderUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            })
+            .unwrap_or(ProviderUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+            });
+        let reported_cost = extracted
+            .as_ref()
+            .and_then(|extracted| extracted.parsed.usage)
+            .and_then(|usage| usage.cost_usd);
+        let wall_time_seconds = started.elapsed().as_secs_f64();
+        let spend = self
+            .estimate_spend(usage.clone())
+            .with_wall_time(wall_time_seconds);
+        let mut trace = json!({
+            "kind": "cli_subagent",
+            "binary": self.binary,
+            "args": args,
+            "stdout_path": request.output_path,
+            "duration_ms": (wall_time_seconds * 1000.0).round() as u64,
+            "exit_code": output.status_code,
+            "pid": output.pid,
+            "sandbox_backend": output.sandbox_backend,
+            "sandbox_warning": output.sandbox_warning,
+            "descriptor": self.descriptor.id,
+            "sandbox_write_allowlist": sandbox_writes,
+            "contract": {
+                "active": probe.active,
+                "dialect": contract.descriptor().map(|section| match section.dialect {
+                    crate::registry::ContractDialect::JsonLines => "json-lines",
+                    crate::registry::ContractDialect::JsonDocument => "json-document",
+                }),
+                "reported_cost_usd": reported_cost,
+                "missing_fields": extracted.as_ref().map(|value| &value.missing_fields),
+                "garbage_lines": extracted.as_ref().map(|value| value.parsed.garbage_lines),
+            },
+            "flight_rows": extracted
+                .as_ref()
+                .map(|value| flight_rows_from(&value.parsed))
+                .unwrap_or_default(),
+        });
+        if let Some(message) = probe.caveat.as_deref() {
+            add_caveat(&mut trace, "provider.contract.unavailable", message);
+        }
+        if degraded {
+            add_caveat(
+                &mut trace,
+                "provider.contract.degraded",
+                &format!(
+                    "{} output was not its descriptor-declared structured contract; fell back to raw stdout",
+                    self.descriptor.id
+                ),
+            );
+        }
+        if let Some(extracted) = &extracted {
+            for field in &extracted.missing_fields {
+                add_caveat(
+                    &mut trace,
+                    "provider.contract.capability_missing",
+                    &format!(
+                        "{} contract pointer for {field} did not resolve; that capability is unavailable for this turn",
+                        self.descriptor.id
+                    ),
+                );
+            }
+        }
+
+        Ok(ProviderResponse {
+            provider: self.name.clone(),
+            model: self.model.clone(),
+            content,
+            usage,
+            spend,
+            trace,
+        })
+    }
+
+    fn render_contract_args(
+        &self,
+        request: &ProviderRequest,
+        contract: &ProviderContract,
+    ) -> Vec<String> {
+        let mut args = self.render_args(request);
+        let Some(section) = contract.descriptor() else {
+            return args;
+        };
+        if contains_arg_sequence(&args, &section.stream_args) {
+            return args;
+        }
+        let prompt_index = args
+            .iter()
+            .rposition(|arg| arg == &request.prompt)
+            .unwrap_or(args.len());
+        let insert_at = prompt_index.checked_sub(1).map_or(prompt_index, |before| {
+            if prompt_value_flag_requires_next_arg(&args[before]) {
+                before
+            } else {
+                prompt_index
+            }
+        });
+        args.splice(insert_at..insert_at, section.stream_args.clone());
+        args
     }
 
     fn render_args(&self, request: &ProviderRequest) -> Vec<String> {
@@ -181,6 +347,13 @@ impl GenericCliProvider {
 
 fn prompt_value_flag_requires_next_arg(arg: &str) -> bool {
     matches!(arg, "-p" | "--prompt" | "--interactive")
+}
+
+fn contains_arg_sequence(args: &[String], expected: &[String]) -> bool {
+    !expected.is_empty()
+        && args
+            .windows(expected.len())
+            .any(|window| window == expected)
 }
 
 fn render_template_part(part: &str, request: &ProviderRequest) -> String {
