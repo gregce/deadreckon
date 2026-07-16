@@ -38,6 +38,19 @@ fn registry_builtin_lists_copilot_and_pi() {
 }
 
 #[test]
+fn gemini_contract_or_documented_gap() {
+    let registry = ProviderRegistry::builtin().expect("builtin registry");
+    let gemini = registry.get("cli:gemini").expect("gemini descriptor");
+    let source = include_str!("../descriptors/cli-gemini.toml");
+
+    assert!(gemini.contract.is_none());
+    assert_eq!(gemini.exec_template.args_template, ["-p", "{prompt}"]);
+    assert!(source.contains("Gemini CLI 0.42.0"));
+    assert!(source.contains("IneligibleTierError/UNSUPPORTED_CLIENT"));
+    assert!(source.contains("before any structured event is emitted"));
+}
+
+#[test]
 fn descriptor_toml_round_trips_serde() {
     let registry = ProviderRegistry::builtin().expect("builtin registry");
     let descriptor = registry.get("anthropic").expect("anthropic descriptor");
