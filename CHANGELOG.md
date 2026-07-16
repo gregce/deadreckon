@@ -1,5 +1,39 @@
 # Changelog
 
+## Pennant (stable) — contracts as descriptor data — 2026-07-16
+
+CLI provider wire contracts can now live in descriptor TOML. `[contract]`
+declares structured-output arguments, JSON pointers, resume arguments and
+capability probes. Pi and Copilot now report real available usage, extract
+answers, resume sessions and stream live flight events. Gemini and OpenCode
+remain explicit evidence-backed gaps rather than guessed contracts. A new
+compatible agent CLI needs a descriptor edit plus recorded fixtures. Every
+phase passed `make verify`:
+
+- P1 (`592fec3`): added the validated `[contract]` schema. A malformed section
+  warns, drops only the contract and keeps the provider usable.
+- P2 (`4417505`): added tolerant JSON Lines and JSON document pointer
+  extraction, with first-session and latest-terminal resolution rules.
+- P3 (`7fdd0e4`): bridged descriptor contracts into Semaphore's shared
+  machinery and added cached `--help` capability probes.
+- P4 (`619af8a`): made the generic CLI driver honour stream arguments, answers,
+  usage, cost, failures, flight rows and degraded raw-output fallback.
+- P5 (`32de8a5`): added provider-scoped descriptor sessions and resume argument
+  substitution, including the inherited one-time fresh retry.
+- P6 (`a9913af`): onboarded Pi 0.79.1 from real fixtures, including input/output
+  tokens, reported cost, answer extraction, session resume and the recorded
+  tool-event shape.
+- P7 (`720a112`): onboarded GitHub Copilot CLI 1.0.45 from real fixtures. The
+  installed binary emits JSON Lines, output tokens, answers and session IDs.
+- P8 (`570ddb7`): recorded the Gemini CLI 0.42.0 gap. Its installed credentials
+  fail before structured output, so the descriptor remains contract-less.
+- P9 (`844c455`): recorded the OpenCode CLI 0.15.5 event-model gap and removed
+  its rejected `--dangerously-skip-permissions` argument.
+- P10 (`a7cd2bf`): added nested tool-event extraction, live-flight dedupe,
+  descriptor token rendering, `contract=yes|no` listings, warning output and
+  the actionable `providers check` recovery command.
+- P11: documented AS-BUILT §55 and the remaining V1 boundaries.
+
 ## Semaphore (stable) — read the CLI agents' signal flags — 2026-07-15
 
 cli:codex and cli:claude-code read their structured contracts instead of

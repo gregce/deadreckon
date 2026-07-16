@@ -223,11 +223,6 @@
   detects it (`ClaudeCapabilities.json_schema`), but wiring `output_schema` into
   the claude driver is a follow-up — Semaphore emits a caveat and proceeds
   unconstrained for claude today.
-- Descriptor-declared contracts for the generic fleet (cli:pi, cli:copilot,
-  cli:gemini, cli:opencode): Semaphore keeps the machinery contract-shaped
-  (parameterized by a per-provider parser + capability set) but constructs the
-  contract in code for codex/claude only. The Pennant slice builds it from
-  descriptor TOML plus recorded fixtures.
 - Metered pricing / billing semantics for subscription CLIs: claude's reported
   `total_cost_usd` lands in the turn trace detail as informational only;
   `SpendEstimate` stays subscription/$0. Turning reported cost into a real
@@ -242,3 +237,18 @@
   suppression (a `live_contract` provider's post-hoc file scraper yields to live
   ingestion). Matching individual on-disk rows to live rows by content would let
   both sources run — unnecessary while live ingestion is authoritative.
+
+## Pennant follow-ups (Pennant, §55)
+
+- Contract hot reload: the registry reads and validates descriptor contracts at
+  process start. Reloading `providers.d` safely during a running command needs
+  cache invalidation for descriptors and capability probes.
+- Operator contract overrides in `config.toml`: provider route entries can
+  override binaries, models and arguments, but they cannot declare or replace a
+  `[contract]`. A route-level override needs validation and clear precedence
+  against built-in and `providers.d` descriptors.
+- Richer event-mirror escalation: JSON pointers cover stable scalar and nested
+  event shapes. Providers such as OpenCode need a registered event mirror when
+  answer, error and terminal semantics depend on event order or predicates.
+  This must reuse Semaphore's shared machinery without forking the generic
+  driver.
