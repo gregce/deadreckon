@@ -3497,9 +3497,8 @@ helpers. Two mirror modules translate each binary's JSONL into that vocabulary
 and nothing more: `codex_events` (wire per codex-rs `exec_events.rs`) and
 `claude_events` (wire per fixtures recorded from the real binary, checked into
 `crates/deadreckon-providers/tests/fixtures/semaphore/`). No codex/claude
-specifics leak outside the two mirror modules, so a follow-up slice (Pennant)
-constructs the contract from descriptor TOML for the generic fleet without a
-refactor.
+specifics leak outside the two mirror modules. Pennant uses the same machinery
+for descriptor TOML in §55 without a refactor.
 
 **Feature detection, not version pinning.** Each binary is probed once per
 process from `--help` (`codex exec --help`, `claude --help`) and the capability
@@ -3563,10 +3562,103 @@ Per-provider contract table:
 | output schema | `--output-schema <file>` | caveat (not wired) |
 
 Semaphore does not touch the app-server route, steering, interrupts, or
-approvals (Rudder), nor metered pricing for subscription CLIs, nor
-descriptor-declared contracts for the generic fleet (Pennant) — it only keeps
-the machinery contract-shaped for them.
+approvals (Rudder), nor metered pricing for subscription CLIs. It only kept the
+machinery contract-shaped for the generic fleet; Pennant adds descriptor
+contracts in §55.
+
+## 55. Pennant: Descriptor-Declared Contracts
+
+Pennant extends the shared contract machinery from §50 to generic CLI
+providers. A provider can now declare its structured output in descriptor TOML.
+Adding a compatible CLI needs a descriptor edit and recorded fixtures, not a
+new Rust driver.
+
+### 55.1 Contract schema
+
+The optional `[contract]` section has this shape:
+
+```toml
+[contract]
+stream_args = ["--format", "json"]
+dialect = "json-lines" # or "json-document"
+conversation_id_path = "/sessionId"
+usage_input_path = "/usage/input"
+usage_output_path = "/usage/output"
+cost_path = "/usage/cost"
+answer_path = "/answer"
+error_flag_path = "/exitCode"
+error_message_path = "/error/message"
+flight_event_paths = ["/toolCallId"]
+resume_args = ["--resume", "{conversation_id}"]
+probe_substring = "--format"
+```
+
+`stream_args` must be non-empty. Every declared path must be an RFC 6901 JSON
+Pointer. A `json-document` contract cannot declare live flight selectors
+because it has no event stream. Only `resume_args` can use the
+`{conversation_id}` placeholder.
+
+The registry validates the section separately from the provider descriptor. A
+malformed contract produces a warning, drops only the contract and leaves the
+provider usable through its old raw-output path. `deadreckon providers check
+<id>` shows the warning and probe result. `deadreckon providers list` and its
+plain output mark routes with `contract=yes|no`; JSON uses a boolean
+`contract` field.
+
+### 55.2 Pointer extraction and compatibility
+
+`json-lines` parses each non-empty output line as one JSON value.
+`json-document` parses stdout as one value. The extractor applies the declared
+pointers without provider-specific branches.
+
+Conversation IDs use the first value found. Usage, cost, answer, error and
+flight facts use the latest matching event. Missing pointers disable only that
+capability for the turn and add a caveat. Output with no structured events
+falls back to raw stdout with the inherited `provider.contract.degraded`
+caveat.
+
+The driver adds `stream_args` only when the descriptor template does not
+already contain them. A successful first turn stores the conversation ID in
+the provider-scoped `provider-session.json` from §50. Later turns substitute it
+into `resume_args`. Providers without `resume_args` stay fresh per turn without
+warning.
+
+`probe_substring` checks `binary --help` once per process. A miss disables the
+contract and reports that the installed binary predates token accounting. The
+contract-less branch remains unchanged, so old descriptors keep their previous
+arguments, response content and trace shape.
+
+### 55.3 Usage and live flight events
+
+Descriptor usage enters the same `ProviderUsage` and spend-ledger path as the
+codex and claude mirrors. `show` and `report` therefore render descriptor
+tokens on subscription runs. Reported cost remains trace information and does
+not change subscription billing.
+
+`flight_event_paths` can select a root marker or a nested tool-request object.
+Rows with the same tool-call ID collapse to the latest state while retaining
+earlier metadata such as the tool name. The response carries the terminal rows
+in `trace.flight_rows`. `[ingest] live_contract = true` makes the §33 file
+scraper yield, so live and post-hoc ingestion do not double-count.
+
+Fixtures recorded from the installed binaries live under
+`crates/deadreckon-providers/tests/fixtures/pennant/`.
+
+### 55.4 Provider onboarding results
+
+| Route | Probe result | Contract status | Shipped behavior |
+|---|---|---|---|
+| `cli:pi` | Pi 0.79.1 | onboarded, JSON Lines | extracts session ID, input/output tokens, reported cost and answer; resumes with `--session`; ingests tool execution live |
+| `cli:copilot` | GitHub Copilot CLI 1.0.45 | onboarded, JSON Lines | extracts session ID, output tokens and answer; resumes with `--resume=<id>`; ingests nested tool requests and execution events live |
+| `cli:gemini` | Gemini CLI 0.42.0 | documented gap | the binary advertises `stream-json`, resume and session flags, but the installed credentials fail with `IneligibleTierError/UNSUPPORTED_CLIENT` before any JSON event; no contract was guessed |
+| `cli:opencode` | OpenCode CLI 0.15.5 | documented gap | removed the rejected `--dangerously-skip-permissions` flag; real JSON output emitted answer, error and null-text events while exiting zero, which the pointer dialect cannot classify safely |
+
+Copilot 1.0.45 emits several standalone JSON documents even with `--stream
+off`, so its honest dialect is `json-lines`, not `json-document`. It exposes
+output tokens but no input-token count in the recorded result. OpenCode needs a
+richer event mirror before onboarding. Gemini needs a successful current
+structured fixture before onboarding.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-16 for Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
