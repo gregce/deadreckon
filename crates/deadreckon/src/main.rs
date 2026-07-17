@@ -9430,6 +9430,14 @@ fn kill_loaded_run(
             status: "killed".to_string(),
         },
     )?;
+    if !force && app_server_turn_active(state) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4500);
+        while app_server_turn_active(state) && std::time::Instant::now() < deadline {
+            // The runtime's cancel-marker watcher maps this request to
+            // turn/interrupt and clears active_turn_id after Codex answers.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
     for pid in &pids {
         if *pid != std::process::id() {
             let _ = terminate_pid(*pid, force);
@@ -9459,6 +9467,24 @@ fn kill_loaded_run(
     state.updated_at = Utc::now();
     save_state(state)?;
     Ok(())
+}
+
+fn app_server_turn_active(state: &deadreckon_core::PipelineState) -> bool {
+    if state.provider.as_deref() != Some("cli:codex-server") {
+        return false;
+    }
+    let path = state.run_root.join("provider-session.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(session) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    session.get("route").and_then(serde_json::Value::as_str) == Some("cli:codex-server")
+        && session
+            .get("active_turn_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|turn| !turn.is_empty())
 }
 
 fn supervised_pids(state: &deadreckon_core::PipelineState) -> Vec<u32> {
