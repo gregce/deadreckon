@@ -671,6 +671,7 @@ pub(crate) async fn acceptance_agent_command_in_dir(
             cancellation_token: None,
             session_dir: None,
             output_schema: None,
+            capability_posture: None,
         }),
     )
     .await
@@ -717,6 +718,7 @@ pub(crate) async fn acceptance_agent_command_in_dir(
                 cancellation_token: None,
                 session_dir: None,
                 output_schema: None,
+                capability_posture: None,
             }),
         )
         .await
@@ -1681,6 +1683,7 @@ async fn run_contract_critic(
             cancellation_token: None,
             session_dir: None,
             output_schema: None,
+            capability_posture: None,
         }),
     )
     .await

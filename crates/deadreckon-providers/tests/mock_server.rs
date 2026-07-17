@@ -75,6 +75,7 @@ async fn mock_provider_records_three_turns() {
                 cancellation_token: None,
                 session_dir: None,
                 output_schema: None,
+                capability_posture: None,
             })
             .await
             .expect("completion");
@@ -128,6 +129,7 @@ async fn mock_provider_supports_error_fixture() {
             cancellation_token: None,
             session_dir: None,
             output_schema: None,
+            capability_posture: None,
         })
         .await
         .expect_err("fixture error");

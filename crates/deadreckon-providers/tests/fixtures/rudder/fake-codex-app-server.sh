@@ -48,9 +48,15 @@ while IFS= read -r line; do
       fi
       if [ -n "$log" ]; then printf 'turn/start\n' >> "$log"; fi
       printf '{"id":%s,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}\n' "$id" "$turn_id"
-      if [ "$mode" != "wait-for-steer" ]; then
+      if [ "$mode" = "approval-command" ]; then
+        printf '{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-fixture","turnId":"%s","itemId":"command-1","startedAtMs":1,"command":"curl https://api.example.com/v1","cwd":"/workspace"}}\n' "$turn_id"
+      elif [ "$mode" != "wait-for-steer" ]; then
         emit_turn_completion "$turn_id"
       fi
+      ;;
+    *'"id":"approval-1"'*)
+      if [ -n "$log" ]; then printf '%s\n' "$line" >> "$log"; fi
+      emit_turn_completion "turn-fixture"
       ;;
     *'"method":"turn/steer"'*)
       id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')

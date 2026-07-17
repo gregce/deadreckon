@@ -471,6 +471,7 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
             cancellation_token: None,
                     session_dir: None,
             output_schema: None,
+            capability_posture: None,
 }),
     )
     .await

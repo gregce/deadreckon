@@ -226,6 +226,7 @@ async fn polish_run_docs_legacy(
                 cancellation_token: None,
                 session_dir: None,
                 output_schema: None,
+                capability_posture: None,
             })
             .await
         {
@@ -514,6 +515,7 @@ async fn run_polish_subcall(
                 cancellation_token: None,
                 session_dir: None,
                 output_schema: None,
+                capability_posture: None,
             })
             .await;
         let duration_ms = Some(started.elapsed().as_millis());

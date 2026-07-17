@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
+use deadreckon_core::NetworkCapability;
 use deadreckon_sandbox::SandboxBackend;
 use serde::Deserializer;
 use serde::Serializer;
@@ -100,6 +101,41 @@ pub struct ProviderRequest {
     /// JSON Schema for schema-constrained final output where the binary
     /// supports it (codex `--output-schema`); a caveat elsewhere.
     pub output_schema: Option<Value>,
+    /// Existing run capability facts used to answer app-server approvals.
+    /// This is request-scoped transport, not a second persisted policy schema.
+    pub capability_posture: Option<CapabilityPosture>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityPosture {
+    pub network: NetworkCapability,
+    pub network_allowlist: Vec<String>,
+    pub deploy: bool,
+    pub install: bool,
+    pub working_dir: PathBuf,
+    pub additional_write_roots: Vec<PathBuf>,
+}
+
+impl ProviderRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_capability_posture(
+        &mut self,
+        network: NetworkCapability,
+        network_allowlist: Vec<String>,
+        deploy: bool,
+        install: bool,
+        working_dir: PathBuf,
+        additional_write_roots: Vec<PathBuf>,
+    ) {
+        self.capability_posture = Some(CapabilityPosture {
+            network,
+            network_allowlist,
+            deploy,
+            install,
+            working_dir,
+            additional_write_roots,
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

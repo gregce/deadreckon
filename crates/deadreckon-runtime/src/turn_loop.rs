@@ -269,7 +269,7 @@ pub async fn run_turn_loop(
             .as_deref()
             .map(provider_output_name)
             .unwrap_or_else(|| "provider.out".to_string());
-        let request = ProviderRequest {
+        let mut request = ProviderRequest {
             prompt,
             max_output_tokens: 2048,
             cwd: Some(state.working_dir.clone()),
@@ -286,7 +286,9 @@ pub async fn run_turn_loop(
             // any per-turn output-schema file. Non-CLI providers ignore it.
             session_dir: Some(state.run_root.clone()),
             output_schema: None,
+            capability_posture: None,
         };
+        apply_provider_capability_posture(&mut request, state, &config.docs.home)?;
 
         let mut flight_recorder: Option<ProviderFlightRecorderHandle> =
             match selected_provider.as_deref() {
@@ -454,6 +456,7 @@ pub async fn run_turn_loop(
                 },
             )?;
         }
+        append_provider_approval_traces(state, turn, &response.trace)?;
         let provider_trace_id = format!("llm-turn-{turn}");
         append_trace(
             state,
@@ -1261,6 +1264,30 @@ fn is_cli_subagent(response: &ProviderResponse) -> bool {
     response.trace.get("kind").and_then(Value::as_str) == Some("cli_subagent")
 }
 
+fn append_provider_approval_traces(
+    state: &PipelineState,
+    turn: u32,
+    provider_trace: &Value,
+) -> Result<()> {
+    let Some(approvals) = provider_trace.get("approvals").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for approval in approvals {
+        append_trace(
+            state,
+            &TraceRecord {
+                timestamp: Utc::now(),
+                run_id: state.run_id.clone(),
+                turn,
+                event: "provider.approval".to_string(),
+                latency_ms: None,
+                detail: approval.clone(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn safe_working_path(root: &Path, relative: &Path) -> Result<PathBuf> {
     if relative.is_absolute()
         || relative
@@ -1355,6 +1382,64 @@ fn load_tool_policy_from_sandbox_toml(
         write_allowlist: tool.write,
         network_allowlist: tool.network,
     })
+}
+
+fn apply_provider_capability_posture(
+    request: &mut ProviderRequest,
+    state: &PipelineState,
+    home: &Path,
+) -> Result<()> {
+    let command_policy = load_tool_policy_from_sandbox_toml(state, "bash")?;
+    let file_policy = load_tool_policy_from_sandbox_toml(state, "write_file")?;
+    let preview = capability_preview_for_run(state, home);
+    let network = if command_policy
+        .network_allowlist
+        .iter()
+        .any(|host| host == "*")
+    {
+        deadreckon_core::NetworkCapability::Full
+    } else if command_policy.network_allowlist.is_empty() {
+        preview.network
+    } else {
+        deadreckon_core::NetworkCapability::Allowlist
+    };
+    let working_dir = state.working_dir.clone();
+    let mut additional_write_roots = command_policy.write_allowlist;
+    additional_write_roots.extend(file_policy.write_allowlist);
+    additional_write_roots.retain(|root| root != &working_dir);
+    additional_write_roots.sort();
+    additional_write_roots.dedup();
+    request.set_capability_posture(
+        network,
+        command_policy.network_allowlist,
+        preview.deploy,
+        preview.global_install,
+        working_dir,
+        additional_write_roots,
+    );
+    Ok(())
+}
+
+fn capability_preview_for_run(
+    state: &PipelineState,
+    home: &Path,
+) -> deadreckon_core::CapabilityPreview {
+    let marker_path = state
+        .working_dir
+        .join(deadreckon_core::PLAN_CHILD_PARENT_JSON);
+    let Ok(raw) = std::fs::read_to_string(marker_path) else {
+        return deadreckon_core::CapabilityPreview::default();
+    };
+    let Ok(marker) = serde_json::from_str::<deadreckon_core::PlanChildMarker>(&raw) else {
+        return deadreckon_core::CapabilityPreview::default();
+    };
+    let paths = DeadreckonPaths::from_home(home.to_path_buf());
+    let Ok(raw) = std::fs::read_to_string(paths.plan_json(&marker.parent_plan_id)) else {
+        return deadreckon_core::CapabilityPreview::default();
+    };
+    serde_json::from_str::<deadreckon_core::Plan>(&raw)
+        .map(|plan| plan.capability_preview)
+        .unwrap_or_default()
 }
 
 fn bash_policy_refusal(
@@ -2113,7 +2198,7 @@ mod tests {
 
     use deadreckon_providers::{ProviderConfigFile, ProviderEntry, ProviderKind, ProviderRouter};
     use deadreckon_sandbox::SandboxBackend;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use crate::seam::{SeamRunCtx, read_seams_config};
@@ -2129,13 +2214,13 @@ mod tests {
     use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
 
     use super::{
-        NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, append_tool_refusal,
-        bash_policy_refusal, build_cli_subagent_prompt, build_prompt, complete_within_wall_budget,
-        ensure_sandbox_toml, implementation_notes_ready_or_request_followup,
-        is_direct_api_provider_kind, load_or_reconstruct_history,
-        load_tool_policy_from_sandbox_toml, policy_seam_refusal, policy_seam_refusal_message,
-        provider_output_name, run_turn_loop, safe_working_path, safe_working_path_with_policy,
-        save_history,
+        NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
+        append_provider_approval_traces, append_tool_refusal, bash_policy_refusal,
+        build_cli_subagent_prompt, build_prompt, complete_within_wall_budget, ensure_sandbox_toml,
+        implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
+        load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, policy_seam_refusal,
+        policy_seam_refusal_message, provider_output_name, run_turn_loop, safe_working_path,
+        safe_working_path_with_policy, save_history,
     };
 
     fn base_run_loop_config() -> RunLoopConfig {
@@ -2162,6 +2247,47 @@ mod tests {
             },
             narrate: None,
         }
+    }
+
+    #[test]
+    fn every_approval_decision_appends_trace() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, state) = create_smoke_run(&temp, "trace provider approvals");
+        let provider_trace = json!({
+            "approvals": [
+                {
+                    "kind": "commandExecution",
+                    "command": "curl https://example.com",
+                    "decision": "deny",
+                    "reason": "network denied by run capabilities",
+                    "capability": "network"
+                },
+                {
+                    "kind": "fileChange",
+                    "path": "/workspace/src/lib.rs",
+                    "decision": "allow",
+                    "reason": "file change stays within writable roots",
+                    "capability": "filesystem"
+                }
+            ]
+        });
+
+        append_provider_approval_traces(&state, 1, &provider_trace).expect("append approvals");
+
+        let raw =
+            std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("approval traces");
+        let traces = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("trace json"))
+            .collect::<Vec<_>>();
+        assert_eq!(traces.len(), 2);
+        assert!(
+            traces
+                .iter()
+                .all(|trace| trace["event"] == "provider.approval")
+        );
+        assert_eq!(traces[0]["detail"]["decision"], "deny");
+        assert_eq!(traces[1]["detail"]["decision"], "allow");
     }
 
     #[test]
