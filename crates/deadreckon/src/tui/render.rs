@@ -638,6 +638,11 @@ pub(crate) fn footer_for_state(
         items.push(("q/Esc/Ctrl-D".to_string(), "detach".to_string()));
     }
 
+    if state.status == RunStatus::Executing && state.provider.as_deref() == Some("cli:codex-server")
+    {
+        items.push((":".to_string(), "steer".to_string()));
+    }
+
     if state.run_root.join("abandoned.json").exists() {
         push(
             &mut items,
@@ -869,10 +874,11 @@ pub(crate) fn help_overlay_lines(mode: AttachHelpMode) -> Vec<(&'static str, &'s
 
 fn command_mode_help_text(mode: AttachHelpMode) -> &'static str {
     match mode {
+        AttachHelpMode::Run => ":steer <instruction> (executing cli:codex-server runs)",
         AttachHelpMode::Chain => {
             ":attach <id> · :kill [id] · :motion full|reduced|off · :q · :reshape [id] · :resume [id] · :verdict [id] · :why [id]"
         }
-        AttachHelpMode::Run | AttachHelpMode::Plan | AttachHelpMode::Campaign => {
+        AttachHelpMode::Plan | AttachHelpMode::Campaign => {
             "chain attach: :attach <id> · :kill [id] · :motion full|reduced|off · :q · :reshape [id] · :resume [id] · :verdict [id] · :why [id]"
         }
     }

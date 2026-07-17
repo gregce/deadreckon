@@ -6,6 +6,10 @@ use super::panes::docs::render_markdown_doc_lines;
 use super::panes::narrative::run_narrative_lines;
 use super::timeline::{timeline_detail_lines, timeline_for_run_lossy};
 use super::why::{why_for_run_lossy, why_panel_lines};
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use tui_textarea::{Input, Key, TextArea};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttachPanel {
@@ -45,6 +49,46 @@ pub(crate) struct AttachParentPlan {
     pub(crate) campaign_parent: Option<AttachCampaignParent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RunCommandModeAction {
+    Steer(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RunCommandModal {
+    title: String,
+    body: String,
+    kind: RunCommandModalKind,
+}
+
+#[derive(Debug, Clone)]
+enum RunCommandModalKind {
+    Input(Box<TextArea<'static>>),
+    Notice,
+}
+
+impl RunCommandModal {
+    fn input() -> Self {
+        let mut textarea = TextArea::default();
+        textarea.set_placeholder_text(":steer <instruction>");
+        textarea.set_cursor_line_style(Style::default());
+        textarea.set_cursor_style(Style::default().fg(Color::Cyan));
+        Self {
+            title: "command".to_string(),
+            body: "Enter run    Esc cancel".to_string(),
+            kind: RunCommandModalKind::Input(Box::new(textarea)),
+        }
+    }
+
+    fn notice(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            kind: RunCommandModalKind::Notice,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AttachTuiState {
     pub(crate) focused_panel: AttachPanel,
@@ -71,6 +115,7 @@ pub(crate) struct AttachTuiState {
     pub(crate) narrative_projection: Option<narrative::NarrativeProjection>,
     pub(crate) parent_plan: Option<AttachParentPlan>,
     pub(crate) pending_confirm: Option<CompletionAction>,
+    pub(crate) run_command_modal: Option<RunCommandModal>,
 }
 
 impl Default for AttachTuiState {
@@ -100,11 +145,61 @@ impl Default for AttachTuiState {
             narrative_projection: None,
             parent_plan: None,
             pending_confirm: None,
+            run_command_modal: None,
         }
     }
 }
 
 impl AttachTuiState {
+    pub(crate) fn run_command_modal_is_open(&self) -> bool {
+        self.run_command_modal.is_some()
+    }
+
+    pub(crate) fn handle_run_command_key(&mut self, key: KeyEvent) -> Option<RunCommandModeAction> {
+        let Some(mut modal) = self.run_command_modal.take() else {
+            if key.code == KeyCode::Char(':') && key.modifiers.is_empty() {
+                self.run_command_modal = Some(RunCommandModal::input());
+            }
+            return None;
+        };
+
+        match &mut modal.kind {
+            RunCommandModalKind::Notice => match key.code {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => None,
+                _ => {
+                    self.run_command_modal = Some(modal);
+                    None
+                }
+            },
+            RunCommandModalKind::Input(textarea) => match key.code {
+                KeyCode::Enter => {
+                    let input = textarea.lines().first().cloned().unwrap_or_default();
+                    match parse_run_command(&input) {
+                        Ok(action) => Some(action),
+                        Err((title, body)) => {
+                            self.run_command_modal = Some(RunCommandModal::notice(title, body));
+                            None
+                        }
+                    }
+                }
+                KeyCode::Esc => None,
+                _ => {
+                    let _ = textarea.input(run_textarea_input(key));
+                    self.run_command_modal = Some(modal);
+                    None
+                }
+            },
+        }
+    }
+
+    pub(crate) fn open_run_command_notice(
+        &mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) {
+        self.run_command_modal = Some(RunCommandModal::notice(title, body));
+    }
+
     pub(crate) fn handle_key(
         &mut self,
         key: KeyEvent,
@@ -342,6 +437,90 @@ impl AttachTuiState {
             AttachPanel::Files => self.files_scroll = offset,
             AttachPanel::Processes => self.processes_scroll = offset,
         }
+    }
+}
+
+fn parse_run_command(
+    input: &str,
+) -> std::result::Result<RunCommandModeAction, (&'static str, &'static str)> {
+    let normalized = input.trim().trim_start_matches(':').trim();
+    let Some(raw_verb) = normalized.split_whitespace().next() else {
+        return Err(("unknown command", "try: :steer <instruction>"));
+    };
+    if raw_verb.is_empty() || !"steer".starts_with(raw_verb) {
+        return Err(("unknown command", "try: :steer <instruction>"));
+    }
+    let instruction = normalized[raw_verb.len()..].trim();
+    if instruction.is_empty() {
+        return Err(("steer needs instruction", "try: :steer <instruction>"));
+    }
+    Ok(RunCommandModeAction::Steer(instruction.to_string()))
+}
+
+fn run_textarea_input(key: KeyEvent) -> Input {
+    let input_key = match key.code {
+        KeyCode::Char(value) => Key::Char(value),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        _ => Key::Null,
+    };
+    Input {
+        key: input_key,
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+    }
+}
+
+pub(crate) fn render_run_command_modal(frame: &mut ratatui::Frame<'_>, tui_state: &AttachTuiState) {
+    let Some(modal) = tui_state.run_command_modal.as_ref() else {
+        return;
+    };
+    let area = centered_run_modal(
+        frame.area(),
+        58,
+        match modal.kind {
+            RunCommandModalKind::Input(_) => 4,
+            RunCommandModalKind::Notice => 5,
+        },
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(modal.title.as_str())
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    match &modal.kind {
+        RunCommandModalKind::Input(textarea) => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(modal.body.as_str()).alignment(Alignment::Center),
+                rows[0],
+            );
+            frame.render_widget(textarea.as_ref(), rows[1]);
+        }
+        RunCommandModalKind::Notice => {
+            let text = format!("{}\n{}", modal.title, modal.body);
+            frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
+        }
+    }
+}
+
+fn centered_run_modal(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     }
 }
 
