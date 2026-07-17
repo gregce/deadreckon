@@ -5061,6 +5061,7 @@ async fn refresh_plan_docs(
             cancellation_token: None,
             session_dir: None,
             output_schema: None,
+            capability_posture: None,
         })
         .await;
     let response = match response {
@@ -6931,6 +6932,7 @@ async fn invoke_merge_repair_planner(
         cancellation_token: None,
         session_dir: None,
         output_schema: None,
+        capability_posture: None,
     };
     let response =
         maybe_with_cli_wait_status(!quiet, "planning merge repair", router.complete(&request))
@@ -14557,6 +14559,7 @@ async fn refresh_narrative_projection_with_provider(
             cancellation_token,
             session_dir: None,
             output_schema: None,
+            capability_posture: None,
         })
         .await
     {

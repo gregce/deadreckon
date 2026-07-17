@@ -186,6 +186,7 @@ pub(crate) async fn propose_contract(
         cancellation_token: None,
         session_dir: None,
         output_schema: None,
+        capability_posture: None,
     };
     let response = tokio::time::timeout(Duration::from_secs(8), router.complete(&request))
         .await

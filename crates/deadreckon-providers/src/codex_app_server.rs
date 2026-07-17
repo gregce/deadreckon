@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -11,9 +12,12 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use which::which;
 
+use deadreckon_core::NetworkCapability;
+
 use crate::cli_codex::CliCodexProvider;
 use crate::cli_contract::ProviderSession;
 use crate::cli_contract::add_caveat;
+use crate::types::CapabilityPosture;
 use crate::{
     Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
     ProviderResponse, ProviderUsage, Result, SpendEstimate,
@@ -339,6 +343,335 @@ fn id_key(id: &Value) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovalRequest {
+    CommandExecution { command: Option<String> },
+    FileChange { paths: Vec<PathBuf> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionOutcome {
+    Allow,
+    Deny,
+}
+
+impl DecisionOutcome {
+    fn trace_label(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+
+    fn wire_label(self) -> &'static str {
+        match self {
+            Self::Allow => "accept",
+            Self::Deny => "decline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Decision {
+    outcome: DecisionOutcome,
+    reason: &'static str,
+    capability: &'static str,
+}
+
+impl Decision {
+    fn allow(reason: &'static str, capability: &'static str) -> Self {
+        Self {
+            outcome: DecisionOutcome::Allow,
+            reason,
+            capability,
+        }
+    }
+
+    fn deny(reason: &'static str, capability: &'static str) -> Self {
+        Self {
+            outcome: DecisionOutcome::Deny,
+            reason,
+            capability,
+        }
+    }
+}
+
+/// Deterministically answer one app-server approval from the run's existing
+/// capability posture. This function deliberately has no I/O: callers are
+/// responsible for building the posture and recording the returned decision.
+fn answer_approval(posture: &CapabilityPosture, request: &ApprovalRequest) -> Decision {
+    match request {
+        ApprovalRequest::CommandExecution { command: None } => {
+            Decision::deny("command could not be determined", "commandExecution")
+        }
+        ApprovalRequest::CommandExecution {
+            command: Some(command),
+        } if install_intent(command) => {
+            if posture.install {
+                Decision::allow("global install allowed by run capabilities", "install")
+            } else {
+                Decision::deny("global install denied by run capabilities", "install")
+            }
+        }
+        ApprovalRequest::CommandExecution {
+            command: Some(command),
+        } if network_intent(command) => match posture.network {
+            NetworkCapability::Deny => {
+                Decision::deny("network denied by run capabilities", "network")
+            }
+            NetworkCapability::Full => {
+                Decision::allow("network allowed by run capabilities", "network")
+            }
+            NetworkCapability::Allowlist => {
+                let Some(host) = extract_network_host(command) else {
+                    return Decision::deny("network host could not be determined", "network");
+                };
+                if posture
+                    .network_allowlist
+                    .iter()
+                    .any(|allowed| host_matches(allowed, &host))
+                {
+                    Decision::allow("network host is in run allowlist", "network")
+                } else {
+                    Decision::deny("network host is not in run allowlist", "network")
+                }
+            }
+        },
+        ApprovalRequest::CommandExecution { command: Some(_) } => Decision::allow(
+            "command stays within the workspace-write sandbox",
+            "workspace-write",
+        ),
+        ApprovalRequest::FileChange { paths } => {
+            let mut roots = vec![normalize_path(&posture.working_dir)];
+            roots.extend(posture.additional_write_roots.iter().map(|path| {
+                if path.is_absolute() {
+                    normalize_path(path)
+                } else {
+                    normalize_path(&posture.working_dir.join(path))
+                }
+            }));
+            let allowed = !paths.is_empty()
+                && paths.iter().all(|path| {
+                    let path = if path.is_absolute() {
+                        normalize_path(path)
+                    } else {
+                        normalize_path(&posture.working_dir.join(path))
+                    };
+                    roots.iter().any(|root| path.starts_with(root))
+                });
+            if allowed {
+                Decision::allow("file change stays within writable roots", "filesystem")
+            } else {
+                Decision::deny("file change outside writable roots", "filesystem")
+            }
+        }
+    }
+}
+
+fn install_intent(command: &str) -> bool {
+    let tokens = command_tokens(command);
+    tokens.windows(3).any(|window| {
+        matches!(window[0].as_str(), "npm" | "pnpm" | "yarn")
+            && matches!(window[1].as_str(), "i" | "install" | "add")
+            && matches!(window[2].as_str(), "-g" | "--global")
+    }) || tokens.windows(2).any(|window| {
+        (matches!(window[0].as_str(), "brew" | "apt" | "apt-get") && window[1] == "install")
+            || (matches!(window[0].as_str(), "npm" | "pnpm" | "yarn")
+                && matches!(window[1].as_str(), "-g" | "--global"))
+    })
+}
+
+fn network_intent(command: &str) -> bool {
+    let tokens = command_tokens(command);
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "curl" | "wget" | "npm" | "npx" | "pnpm" | "yarn" | "pip" | "pip3" | "cargo"
+        )
+    }) {
+        return true;
+    }
+    tokens.windows(2).any(|window| {
+        window[0] == "git"
+            && matches!(
+                window[1].as_str(),
+                "clone" | "fetch" | "pull" | "push" | "remote" | "ls-remote"
+            )
+    })
+}
+
+fn command_tokens(command: &str) -> Vec<String> {
+    command
+        .split_ascii_whitespace()
+        .map(|token| {
+            let token = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                )
+            });
+            Path::new(token)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(token)
+                .to_ascii_lowercase()
+        })
+        .collect()
+}
+
+fn extract_network_host(command: &str) -> Option<String> {
+    for raw in command.split_ascii_whitespace() {
+        let token = raw.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+        });
+        if let Some((_, rest)) = token.split_once("://") {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            let host = host.split(':').next().unwrap_or(host);
+            if !host.is_empty() {
+                return Some(host.to_ascii_lowercase());
+            }
+        }
+        if let Some((_, rest)) = token.split_once('@') {
+            let host = rest.split([':', '/', '?', '#']).next().unwrap_or(rest);
+            if host.contains('.') {
+                return Some(host.to_ascii_lowercase());
+            }
+        }
+        let candidate = token
+            .trim_start_matches("--registry=")
+            .split(['/', '?', '#', ':'])
+            .next()
+            .unwrap_or(token);
+        if candidate.contains('.')
+            && candidate
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+        {
+            return Some(candidate.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn host_matches(allowed: &str, host: &str) -> bool {
+    let allowed = allowed.trim().to_ascii_lowercase();
+    allowed == "*"
+        || allowed == host
+        || allowed
+            .strip_prefix("*.")
+            .is_some_and(|suffix| host.ends_with(&format!(".{suffix}")))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+struct ApprovalSession {
+    posture: CapabilityPosture,
+    traces: Vec<Value>,
+}
+
+impl ApprovalSession {
+    fn new(posture: CapabilityPosture) -> Self {
+        Self {
+            posture,
+            traces: Vec::new(),
+        }
+    }
+
+    fn handle(&mut self, method: &str, params: &Value) -> Result<Value> {
+        let request = match method {
+            "item/commandExecution/requestApproval" => ApprovalRequest::CommandExecution {
+                command: params
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            },
+            "item/fileChange/requestApproval" => {
+                let paths = params
+                    .get("grantRoot")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                ApprovalRequest::FileChange {
+                    paths: if paths.is_empty() {
+                        vec![self.posture.working_dir.clone()]
+                    } else {
+                        paths
+                    },
+                }
+            }
+            _ => {
+                return Err(ProviderError::Cli {
+                    provider: "cli:codex-server".to_string(),
+                    detail: format!("unsupported app-server request: {method}"),
+                });
+            }
+        };
+        let decision = answer_approval(&self.posture, &request);
+        self.traces
+            .push(approval_trace(&request, &decision, &self.posture));
+        Ok(json!({"decision": decision.outcome.wire_label()}))
+    }
+}
+
+fn approval_trace(
+    request: &ApprovalRequest,
+    decision: &Decision,
+    posture: &CapabilityPosture,
+) -> Value {
+    let (kind, subject_key, subject) = match request {
+        ApprovalRequest::CommandExecution { command } => (
+            "commandExecution",
+            "command",
+            command.clone().unwrap_or_else(|| "<unknown>".to_string()),
+        ),
+        ApprovalRequest::FileChange { paths } => (
+            "fileChange",
+            "path",
+            paths
+                .first()
+                .unwrap_or(&posture.working_dir)
+                .display()
+                .to_string(),
+        ),
+    };
+    let mut trace = json!({
+        "kind": kind,
+        "decision": decision.outcome.trace_label(),
+        "reason": decision.reason,
+        "capability": decision.capability,
+    });
+    trace[subject_key] = Value::String(subject);
+    trace
+}
+
+fn default_capability_posture(cwd: &Path) -> CapabilityPosture {
+    CapabilityPosture {
+        network: NetworkCapability::Deny,
+        network_allowlist: Vec::new(),
+        deploy: false,
+        install: false,
+        working_dir: cwd.to_path_buf(),
+        additional_write_roots: Vec::new(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CodexAppServerSpec {
     pub(crate) provider: String,
@@ -364,6 +697,7 @@ pub(crate) struct ServerTurn {
     pub(crate) content: String,
     pub(crate) usage: ProviderUsage,
     pub(crate) unknown_notifications: Vec<String>,
+    pub(crate) approvals: Vec<Value>,
 }
 
 impl CodexAppServer {
@@ -516,8 +850,10 @@ impl CodexAppServer {
         thread_id: &str,
         prompt: &str,
         output_schema: Option<&Value>,
+        capability_posture: CapabilityPosture,
     ) -> Result<ServerTurn> {
         const ROUTE: &str = "cli:codex-server";
+        let mut approval_session = ApprovalSession::new(capability_posture);
         let mut params = json!({
             "threadId": thread_id,
             "input": [{"type": "text", "text": prompt, "textElements": []}]
@@ -527,7 +863,9 @@ impl CodexAppServer {
         }
         let result = self
             .rpc
-            .request("turn/start", params, &mut default_server_request)
+            .request("turn/start", params, &mut |method, params| {
+                approval_session.handle(method, params)
+            })
             .await?;
         let turn_id = result
             .pointer("/turn/id")
@@ -540,10 +878,15 @@ impl CodexAppServer {
             .to_string();
         update_active_turn(session_dir, Some(&turn_id))?;
 
-        let outcome = self.read_turn(session_dir, thread_id, &turn_id).await;
+        let outcome = self
+            .read_turn(session_dir, thread_id, &turn_id, &mut approval_session)
+            .await;
         let cleared = update_active_turn(session_dir, None);
         match (outcome, cleared) {
-            (Ok(turn), Ok(())) => Ok(turn),
+            (Ok(mut turn), Ok(())) => {
+                turn.approvals = approval_session.traces;
+                Ok(turn)
+            }
             (Err(err), _) => Err(err),
             (Ok(_), Err(err)) => Err(err),
         }
@@ -554,6 +897,7 @@ impl CodexAppServer {
         session_dir: Option<&Path>,
         thread_id: &str,
         turn_id: &str,
+        approval_session: &mut ApprovalSession,
     ) -> Result<ServerTurn> {
         const ROUTE: &str = "cli:codex-server";
         let mut usage = ProviderUsage {
@@ -561,18 +905,18 @@ impl CodexAppServer {
             output_tokens: 0,
         };
         let mut content = None;
-        self.deliver_pending_steers(session_dir, thread_id, turn_id)
+        self.deliver_pending_steers(session_dir, thread_id, turn_id, approval_session)
             .await?;
         loop {
             let Some(notification) = self
                 .rpc
                 .next_notification_with_timeout(
                     Duration::from_millis(100),
-                    &mut default_server_request,
+                    &mut |method, params| approval_session.handle(method, params),
                 )
                 .await?
             else {
-                self.deliver_pending_steers(session_dir, thread_id, turn_id)
+                self.deliver_pending_steers(session_dir, thread_id, turn_id, approval_session)
                     .await?;
                 continue;
             };
@@ -647,6 +991,7 @@ impl CodexAppServer {
                         content,
                         usage,
                         unknown_notifications: self.rpc.unknown_notifications().to_vec(),
+                        approvals: Vec::new(),
                     });
                 }
                 _ => {}
@@ -659,6 +1004,7 @@ impl CodexAppServer {
         session_dir: Option<&Path>,
         thread_id: &str,
         turn_id: &str,
+        approval_session: &mut ApprovalSession,
     ) -> Result<()> {
         let Some(run_root) = session_dir else {
             return Ok(());
@@ -679,7 +1025,7 @@ impl CodexAppServer {
                         }],
                         "expectedTurnId": turn_id
                     }),
-                    &mut default_server_request,
+                    &mut |method, params| approval_session.handle(method, params),
                 )
                 .await;
             let response = match result {
@@ -728,18 +1074,6 @@ fn stale_steer_precondition(error: &ProviderError) -> bool {
     detail.contains("app-server turn/steer failed (-32600)")
         && (detail.contains("no active turn to steer")
             || detail.contains("expected active turn id"))
-}
-
-fn default_server_request(method: &str, _params: &Value) -> Result<Value> {
-    match method {
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            Ok(json!({"decision": "decline"}))
-        }
-        _ => Err(ProviderError::Cli {
-            provider: "cli:codex-server".to_string(),
-            detail: format!("unsupported app-server request: {method}"),
-        }),
-    }
 }
 
 fn update_active_turn(session_dir: Option<&Path>, turn_id: Option<&str>) -> Result<()> {
@@ -825,7 +1159,7 @@ impl CliCodexServerProvider {
                 provider: self.name.clone(),
                 binary: self.binary.clone(),
                 extra_args: self.extra_args.clone(),
-                cwd,
+                cwd: cwd.clone(),
                 pid_file: request.pid_file.clone(),
             })
             .await
@@ -851,6 +1185,10 @@ impl CliCodexServerProvider {
                 &thread_id,
                 &request.prompt,
                 request.output_schema.as_ref(),
+                request
+                    .capability_posture
+                    .clone()
+                    .unwrap_or_else(|| default_capability_posture(&cwd)),
             )
             .await?;
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -890,6 +1228,7 @@ impl CliCodexServerProvider {
                 "duration_ms": duration_ms,
                 "stdout_path": request.output_path,
                 "unknown_notifications": turn.unknown_notifications,
+                "approvals": turn.approvals,
                 "flight_rows": [],
             }),
         })
@@ -982,15 +1321,70 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    use super::{CodexAppServerSpec, RpcClient, ServerStart, start_server_or_degrade};
+    use super::{
+        ApprovalRequest, CapabilityPosture, CodexAppServerSpec, DecisionOutcome, RpcClient,
+        ServerStart, answer_approval, default_capability_posture, start_server_or_degrade,
+    };
     use crate::cli_contract::ProviderSession;
     use crate::{
         ProviderConfigFile, ProviderEntry, ProviderRequest, ProviderRouter, ProviderUsage,
     };
+    use deadreckon_core::NetworkCapability;
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/rudder/fake-codex-app-server.sh")
+    }
+
+    fn approval_posture(network: NetworkCapability) -> CapabilityPosture {
+        CapabilityPosture {
+            network,
+            network_allowlist: Vec::new(),
+            deploy: false,
+            install: false,
+            working_dir: PathBuf::from("/workspace"),
+            additional_write_roots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn network_deny_capability_denies_curl_command() {
+        let request = ApprovalRequest::CommandExecution {
+            command: Some("curl https://api.example.com/v1".to_string()),
+        };
+
+        let decision = answer_approval(&approval_posture(NetworkCapability::Deny), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(decision.reason, "network denied by run capabilities");
+        assert_eq!(decision.capability, "network");
+    }
+
+    #[test]
+    fn allowlisted_host_command_is_approved() {
+        let mut posture = approval_posture(NetworkCapability::Allowlist);
+        posture.network_allowlist = vec!["api.example.com".to_string()];
+        let request = ApprovalRequest::CommandExecution {
+            command: Some("wget https://api.example.com/v1".to_string()),
+        };
+
+        let decision = answer_approval(&posture, &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(decision.capability, "network");
+    }
+
+    #[test]
+    fn file_change_outside_workspace_is_denied() {
+        let request = ApprovalRequest::FileChange {
+            paths: vec![PathBuf::from("/outside/secrets.txt")],
+        };
+
+        let decision = answer_approval(&approval_posture(NetworkCapability::Deny), &request);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(decision.reason, "file change outside writable roots");
+        assert_eq!(decision.capability, "filesystem");
     }
 
     #[tokio::test]
@@ -1185,7 +1579,13 @@ mod tests {
             .expect("thread");
 
         let turn = server
-            .run_turn(Some(temp.path()), &thread_id, "finish the task", None)
+            .run_turn(
+                Some(temp.path()),
+                &thread_id,
+                "finish the task",
+                None,
+                default_capability_posture(temp.path()),
+            )
             .await
             .expect("turn");
 
@@ -1217,7 +1617,13 @@ mod tests {
             .expect("thread");
 
         let error = server
-            .run_turn(Some(temp.path()), &thread_id, "fail this turn", None)
+            .run_turn(
+                Some(temp.path()),
+                &thread_id,
+                "fail this turn",
+                None,
+                default_capability_posture(temp.path()),
+            )
             .await
             .expect_err("failed turn");
 
@@ -1251,7 +1657,13 @@ mod tests {
             .expect("thread");
 
         server
-            .run_turn(Some(temp.path()), &thread_id, "finish the task", None)
+            .run_turn(
+                Some(temp.path()),
+                &thread_id,
+                "finish the task",
+                None,
+                default_capability_posture(temp.path()),
+            )
             .await
             .expect("turn");
 
@@ -1305,7 +1717,13 @@ mod tests {
             .expect("thread");
 
         server
-            .run_turn(Some(temp.path()), &thread_id, "first turn", None)
+            .run_turn(
+                Some(temp.path()),
+                &thread_id,
+                "first turn",
+                None,
+                default_capability_posture(temp.path()),
+            )
             .await
             .expect("first turn");
         assert_eq!(
@@ -1316,7 +1734,13 @@ mod tests {
         );
 
         server
-            .run_turn(Some(temp.path()), &thread_id, "second turn", None)
+            .run_turn(
+                Some(temp.path()),
+                &thread_id,
+                "second turn",
+                None,
+                default_capability_posture(temp.path()),
+            )
             .await
             .expect("second turn");
         assert!(
@@ -1370,7 +1794,13 @@ mod tests {
             .expect("thread");
 
         server
-            .run_turn(Some(temp.path()), &thread_id, "finish", None)
+            .run_turn(
+                Some(temp.path()),
+                &thread_id,
+                "finish",
+                None,
+                default_capability_posture(temp.path()),
+            )
             .await
             .expect("turn");
 
@@ -1406,7 +1836,13 @@ mod tests {
 
         let (turn, appended) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(
-                server.run_turn(Some(&run_root), &thread_id, "keep working", None),
+                server.run_turn(
+                    Some(&run_root),
+                    &thread_id,
+                    "keep working",
+                    None,
+                    default_capability_posture(&run_root),
+                ),
                 async {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     deadreckon_core::steer_inbox::append_steer(
@@ -1479,6 +1915,55 @@ mod tests {
             }
         );
         assert_eq!(response.trace["transport"], "app-server-stdio-jsonl");
+    }
+
+    #[tokio::test]
+    async fn server_approval_is_answered_and_returned_for_trace() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join("rpc.log");
+        let router = ProviderRouter::from_config(
+            ProviderConfigFile {
+                default_provider: Some("cli:codex-server".to_string()),
+                fallback: None,
+                providers: BTreeMap::from([(
+                    "cli:codex-server".to_string(),
+                    ProviderEntry {
+                        kind: None,
+                        api_key: None,
+                        api_key_env: None,
+                        base_url: None,
+                        model: None,
+                        input_cost_per_million: None,
+                        output_cost_per_million: None,
+                        binary: Some(fixture().display().to_string()),
+                        extra_args: vec!["approval-command".to_string(), log.display().to_string()],
+                    },
+                )]),
+            },
+            None,
+        )
+        .expect("router");
+        let mut posture = approval_posture(NetworkCapability::Deny);
+        posture.working_dir = temp.path().to_path_buf();
+
+        let response = router
+            .complete(&ProviderRequest {
+                prompt: "try the network".to_string(),
+                cwd: Some(temp.path().to_path_buf()),
+                session_dir: Some(temp.path().to_path_buf()),
+                capability_posture: Some(posture),
+                ..ProviderRequest::default()
+            })
+            .await
+            .expect("response");
+
+        assert_eq!(response.trace["approvals"][0]["decision"], "deny");
+        assert_eq!(
+            response.trace["approvals"][0]["reason"],
+            "network denied by run capabilities"
+        );
+        let reply = std::fs::read_to_string(log).expect("approval reply");
+        assert!(reply.contains("\"decision\":\"decline\""), "{reply}");
     }
 
     #[test]

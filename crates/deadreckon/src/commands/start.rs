@@ -472,6 +472,7 @@ async fn provider_course_plan(
         cancellation_token: None,
         session_dir: None,
         output_schema: None,
+        capability_posture: None,
     };
     let response = tokio::time::timeout(
         course_planner_timeout(provider),
