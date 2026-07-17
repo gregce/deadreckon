@@ -3,6 +3,7 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -10,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use which::which;
 
 use deadreckon_core::NetworkCapability;
@@ -851,6 +853,7 @@ impl CodexAppServer {
         prompt: &str,
         output_schema: Option<&Value>,
         capability_posture: CapabilityPosture,
+        cancellation_token: Option<&CancellationToken>,
     ) -> Result<ServerTurn> {
         const ROUTE: &str = "cli:codex-server";
         let mut approval_session = ApprovalSession::new(capability_posture);
@@ -878,9 +881,32 @@ impl CodexAppServer {
             .to_string();
         update_active_turn(session_dir, Some(&turn_id))?;
 
-        let outcome = self
-            .read_turn(session_dir, thread_id, &turn_id, &mut approval_session)
-            .await;
+        let outcome = if let Some(token) = cancellation_token {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => {
+                    let interrupted = self
+                        .interrupt_turn(thread_id, &turn_id, &mut approval_session)
+                        .await;
+                    if interrupted.is_err() {
+                        self.kill_child().await;
+                    }
+                    Err(ProviderError::Cli {
+                        provider: ROUTE.to_string(),
+                        detail: "request cancelled after app-server interrupt".to_string(),
+                    })
+                }
+                result = self.read_turn(
+                    session_dir,
+                    thread_id,
+                    &turn_id,
+                    &mut approval_session,
+                ) => result,
+            }
+        } else {
+            self.read_turn(session_dir, thread_id, &turn_id, &mut approval_session)
+                .await
+        };
         let cleared = update_active_turn(session_dir, None);
         match (outcome, cleared) {
             (Ok(mut turn), Ok(())) => {
@@ -889,6 +915,58 @@ impl CodexAppServer {
             }
             (Err(err), _) => Err(err),
             (Ok(_), Err(err)) => Err(err),
+        }
+    }
+
+    async fn interrupt_turn(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        approval_session: &mut ApprovalSession,
+    ) -> Result<()> {
+        const ROUTE: &str = "cli:codex-server";
+        tokio::time::timeout(Duration::from_secs(5), async {
+            self.rpc
+                .request(
+                    "turn/interrupt",
+                    json!({"threadId": thread_id, "turnId": turn_id}),
+                    &mut |method, params| approval_session.handle(method, params),
+                )
+                .await?;
+            loop {
+                let Some(notification) = self
+                    .rpc
+                    .next_notification_with_timeout(
+                        Duration::from_millis(100),
+                        &mut |method, params| approval_session.handle(method, params),
+                    )
+                    .await?
+                else {
+                    continue;
+                };
+                if notification.method == "turn/completed"
+                    && notification
+                        .params
+                        .pointer("/turn/id")
+                        .and_then(Value::as_str)
+                        == Some(turn_id)
+                {
+                    return Ok(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| ProviderError::Cli {
+            provider: ROUTE.to_string(),
+            detail: "app-server turn/interrupt grace period expired".to_string(),
+        })?
+    }
+
+    async fn kill_child(&mut self) {
+        let _ = self.child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await;
+        if let Some(pid_file) = self.pid_file.as_ref() {
+            let _ = tokio::fs::remove_file(pid_file).await;
         }
     }
 
@@ -1126,6 +1204,7 @@ pub(crate) struct CliCodexServerProvider {
     model_arg: Option<String>,
     fallback: CliCodexProvider,
     server: Mutex<Option<Box<CodexAppServer>>>,
+    degraded: AtomicBool,
 }
 
 impl CliCodexServerProvider {
@@ -1144,6 +1223,7 @@ impl CliCodexServerProvider {
             model_arg,
             fallback: CliCodexProvider::new("cli:codex", fallback_entry),
             server: Mutex::new(None),
+            degraded: AtomicBool::new(false),
         }
     }
 
@@ -1153,6 +1233,17 @@ impl CliCodexServerProvider {
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        if self.degraded.load(Ordering::Acquire) {
+            return self
+                .run_fallback(
+                    request,
+                    json!({
+                        "route": self.name,
+                        "reason": "app-server route was degraded earlier in this run"
+                    }),
+                )
+                .await;
+        }
         let mut server_slot = self.server.lock().await;
         if server_slot.is_none() {
             match start_server_or_degrade(CodexAppServerSpec {
@@ -1166,31 +1257,63 @@ impl CliCodexServerProvider {
             {
                 ServerStart::Ready(server) => *server_slot = Some(server),
                 ServerStart::Degraded { trace } => {
+                    self.degraded.store(true, Ordering::Release);
                     drop(server_slot);
                     return self.run_fallback(request, trace).await;
                 }
             }
         }
-        let server = server_slot.as_mut().ok_or_else(|| ProviderError::Cli {
-            provider: self.name.clone(),
-            detail: "app-server was not retained after startup".to_string(),
-        })?;
-        let thread_id = server
-            .ensure_thread(request.session_dir.as_deref(), self.model_arg.as_deref())
-            .await?;
-        let pid = server.pid();
-        let turn = server
-            .run_turn(
-                request.session_dir.as_deref(),
-                &thread_id,
-                &request.prompt,
-                request.output_schema.as_ref(),
-                request
-                    .capability_posture
-                    .clone()
-                    .unwrap_or_else(|| default_capability_posture(&cwd)),
-            )
-            .await?;
+        let server_result = async {
+            let server = server_slot.as_mut().ok_or_else(|| ProviderError::Cli {
+                provider: self.name.clone(),
+                detail: "app-server was not retained after startup".to_string(),
+            })?;
+            let thread_id = server
+                .ensure_thread(request.session_dir.as_deref(), self.model_arg.as_deref())
+                .await?;
+            let pid = server.pid();
+            let turn = server
+                .run_turn(
+                    request.session_dir.as_deref(),
+                    &thread_id,
+                    &request.prompt,
+                    request.output_schema.as_ref(),
+                    request
+                        .capability_posture
+                        .clone()
+                        .unwrap_or_else(|| default_capability_posture(&cwd)),
+                    request.cancellation_token.as_ref(),
+                )
+                .await?;
+            Ok::<_, ProviderError>((thread_id, pid, turn))
+        }
+        .await;
+        let (thread_id, pid, turn) = match server_result {
+            Ok(result) => result,
+            Err(error)
+                if request
+                    .cancellation_token
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled) =>
+            {
+                return Err(error);
+            }
+            Err(error) => {
+                self.degraded.store(true, Ordering::Release);
+                server_slot.take();
+                drop(server_slot);
+                return self
+                    .run_fallback(
+                        request,
+                        json!({
+                            "route": self.name,
+                            "reason": "app-server request failed structurally",
+                            "error": error.to_string(),
+                        }),
+                    )
+                    .await;
+            }
+        };
         let duration_ms = started.elapsed().as_millis() as u64;
         if let Some(path) = request.output_path.as_ref() {
             if let Some(parent) = path.parent() {
@@ -1243,10 +1366,21 @@ impl CliCodexServerProvider {
         response.provider = self.name.clone();
         response.trace["requested_route"] = Value::String(self.name.clone());
         response.trace["degraded_from"] = degraded_trace;
+        let pending_steers = request
+            .session_dir
+            .as_deref()
+            .and_then(|run_root| deadreckon_core::steer_inbox::pending_steers(run_root).ok())
+            .map_or(0, |pending| pending.len());
+        response.trace["pending_steers"] = json!(pending_steers);
+        let pending_notice = if pending_steers == 0 {
+            String::new()
+        } else {
+            format!("; {pending_steers} pending steers remain undelivered")
+        };
         add_caveat(
             &mut response.trace,
             "provider.route.degraded",
-            "codex app-server was unavailable; used cli:codex exec",
+            &format!("codex app-server was unavailable; used cli:codex exec{pending_notice}"),
         );
         Ok(response)
     }
@@ -1320,6 +1454,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio_util::sync::CancellationToken;
 
     use super::{
         ApprovalRequest, CapabilityPosture, CodexAppServerSpec, DecisionOutcome, RpcClient,
@@ -1577,7 +1712,6 @@ mod tests {
             .ensure_thread(Some(temp.path()), None)
             .await
             .expect("thread");
-
         let turn = server
             .run_turn(
                 Some(temp.path()),
@@ -1585,6 +1719,7 @@ mod tests {
                 "finish the task",
                 None,
                 default_capability_posture(temp.path()),
+                None,
             )
             .await
             .expect("turn");
@@ -1623,6 +1758,7 @@ mod tests {
                 "fail this turn",
                 None,
                 default_capability_posture(temp.path()),
+                None,
             )
             .await
             .expect_err("failed turn");
@@ -1663,6 +1799,7 @@ mod tests {
                 "finish the task",
                 None,
                 default_capability_posture(temp.path()),
+                None,
             )
             .await
             .expect("turn");
@@ -1723,6 +1860,7 @@ mod tests {
                 "first turn",
                 None,
                 default_capability_posture(temp.path()),
+                None,
             )
             .await
             .expect("first turn");
@@ -1740,6 +1878,7 @@ mod tests {
                 "second turn",
                 None,
                 default_capability_posture(temp.path()),
+                None,
             )
             .await
             .expect("second turn");
@@ -1800,6 +1939,7 @@ mod tests {
                 "finish",
                 None,
                 default_capability_posture(temp.path()),
+                None,
             )
             .await
             .expect("turn");
@@ -1842,6 +1982,7 @@ mod tests {
                     "keep working",
                     None,
                     default_capability_posture(&run_root),
+                    None,
                 ),
                 async {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1964,6 +2105,147 @@ mod tests {
         );
         let reply = std::fs::read_to_string(log).expect("approval reply");
         assert!(reply.contains("\"decision\":\"decline\""), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn kill_sends_interrupt_before_process_kill() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join("rpc.log");
+        let ServerStart::Ready(mut server) = start_server_or_degrade(CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["wait-for-interrupt".to_string(), log.display().to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+        })
+        .await
+        else {
+            panic!("server")
+        };
+        let thread_id = server
+            .ensure_thread(Some(temp.path()), None)
+            .await
+            .expect("thread");
+        let pid = server.pid().expect("server pid");
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                server.run_turn(
+                    Some(temp.path()),
+                    &thread_id,
+                    "keep working",
+                    None,
+                    default_capability_posture(temp.path()),
+                    Some(&token),
+                ),
+                async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    cancel.cancel();
+                }
+            )
+        })
+        .await
+        .expect("cancellation timeout")
+        .0;
+        assert!(
+            result
+                .expect_err("cancelled turn")
+                .to_string()
+                .contains("cancelled")
+        );
+
+        let calls = std::fs::read_to_string(&log).expect("rpc log");
+        assert!(calls.contains("turn/interrupt"), "{calls}");
+        assert!(deadreckon_core::pid_is_alive(pid));
+
+        drop(server);
+        for _ in 0..40 {
+            if !deadreckon_core::pid_is_alive(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!deadreckon_core::pid_is_alive(pid));
+    }
+
+    #[tokio::test]
+    async fn server_death_degrades_to_exec_route_with_caveat() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join("rpc.log");
+        deadreckon_core::steer_inbox::append_steer(
+            temp.path(),
+            deadreckon_core::steer_inbox::SteerSource::Cli,
+            "keep this durable",
+        )
+        .expect("pending steer");
+        let router = ProviderRouter::from_config(
+            ProviderConfigFile {
+                default_provider: Some("cli:codex-server".to_string()),
+                fallback: None,
+                providers: BTreeMap::from([(
+                    "cli:codex-server".to_string(),
+                    ProviderEntry {
+                        kind: None,
+                        api_key: None,
+                        api_key_env: None,
+                        base_url: None,
+                        model: None,
+                        input_cost_per_million: None,
+                        output_cost_per_million: None,
+                        binary: Some(fixture().display().to_string()),
+                        extra_args: vec!["die-mid-turn".to_string(), log.display().to_string()],
+                    },
+                )]),
+            },
+            None,
+        )
+        .expect("router");
+
+        let response = router
+            .complete(&ProviderRequest {
+                prompt: "finish despite server death".to_string(),
+                cwd: Some(temp.path().to_path_buf()),
+                session_dir: Some(temp.path().to_path_buf()),
+                ..ProviderRequest::default()
+            })
+            .await
+            .expect("exec fallback response");
+
+        assert!(response.content.contains("exec fallback completed"));
+        assert_eq!(response.trace["pending_steers"], 1);
+        assert!(response.trace["caveats"].as_array().is_some_and(|caveats| {
+            caveats
+                .iter()
+                .any(|caveat| caveat["code"] == "provider.route.degraded")
+        }));
+        assert!(response.trace["caveats"].as_array().is_some_and(|caveats| {
+            caveats.iter().any(|caveat| {
+                caveat["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("1 pending steers remain undelivered"))
+            })
+        }));
+        assert_eq!(
+            deadreckon_core::steer_inbox::pending_steers(temp.path())
+                .expect("pending after degrade")
+                .len(),
+            1
+        );
+
+        let second = router
+            .complete(&ProviderRequest {
+                prompt: "use the degraded route".to_string(),
+                cwd: Some(temp.path().to_path_buf()),
+                session_dir: Some(temp.path().to_path_buf()),
+                ..ProviderRequest::default()
+            })
+            .await
+            .expect("next turn stays on exec fallback");
+        assert!(second.content.contains("exec fallback completed"));
+        let calls = std::fs::read_to_string(log).expect("rpc log");
+        assert_eq!(calls.matches("initialize").count(), 1, "{calls}");
     }
 
     #[test]

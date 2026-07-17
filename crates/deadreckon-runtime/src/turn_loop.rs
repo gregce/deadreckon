@@ -1227,21 +1227,34 @@ fn provider_flight_rows(trace: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// A user-facing notice when the provider's contract degraded this turn (the
-/// driver fell back to raw stdout), for the attention / "anything wrong"
-/// surface. `None` when the turn read the contract cleanly.
+/// A user-facing notice when either the provider contract or route degraded
+/// this turn, for the attention / "anything wrong" surface.
 fn degraded_caveat_message(trace: &serde_json::Value, turn: u32) -> Option<String> {
     let caveats = trace.get("caveats").and_then(serde_json::Value::as_array)?;
-    let caveat = caveats.iter().find(|caveat| {
-        caveat.get("code").and_then(serde_json::Value::as_str) == Some("provider.contract.degraded")
-    })?;
+    let caveat = caveats
+        .iter()
+        .find(|caveat| {
+            caveat.get("code").and_then(serde_json::Value::as_str)
+                == Some("provider.route.degraded")
+        })
+        .or_else(|| {
+            caveats.iter().find(|caveat| {
+                caveat.get("code").and_then(serde_json::Value::as_str)
+                    == Some("provider.contract.degraded")
+            })
+        })?;
+    let kind = if caveat.get("code").and_then(serde_json::Value::as_str)
+        == Some("provider.route.degraded")
+    {
+        "provider route degraded"
+    } else {
+        "provider contract degraded"
+    };
     let detail = caveat
         .get("message")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("provider contract degraded");
-    Some(format!(
-        "turn {turn}: provider contract degraded — {detail}"
-    ))
+        .unwrap_or(kind);
+    Some(format!("turn {turn}: {kind} — {detail}"))
 }
 
 fn is_direct_api_provider_kind(kind: &ProviderKind) -> bool {
@@ -2288,6 +2301,22 @@ mod tests {
         );
         assert_eq!(traces[0]["detail"]["decision"], "deny");
         assert_eq!(traces[1]["detail"]["decision"], "allow");
+    }
+
+    #[test]
+    fn undelivered_steers_surface_as_attention() {
+        let trace = json!({
+            "caveats": [{
+                "code": "provider.route.degraded",
+                "message": "codex app-server died; used cli:codex exec; 2 pending steers remain undelivered"
+            }],
+            "pending_steers": 2
+        });
+
+        let message = super::degraded_caveat_message(&trace, 4).expect("attention message");
+
+        assert!(message.contains("provider route degraded"), "{message}");
+        assert!(message.contains("2 pending steers"), "{message}");
     }
 
     #[test]
