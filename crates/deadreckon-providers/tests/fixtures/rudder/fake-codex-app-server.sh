@@ -3,6 +3,19 @@ set -eu
 
 mode="${2:-normal}"
 log="${3:-}"
+turn_count=0
+steer_count=0
+
+emit_turn_completion() {
+  completed_turn_id="$1"
+  if [ "$mode" = "turn-failed" ]; then
+    printf '{"method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"%s","status":"failed","items":[],"error":{"message":"fixture turn failed"}}}}\n' "$completed_turn_id"
+  else
+    printf '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-fixture","turnId":"%s","tokenUsage":{"total":{"inputTokens":321,"cachedInputTokens":0,"outputTokens":45,"reasoningOutputTokens":0,"totalTokens":366},"last":{"inputTokens":321,"cachedInputTokens":0,"outputTokens":45,"reasoningOutputTokens":0,"totalTokens":366},"modelContextWindow":258400}}}\n' "$completed_turn_id"
+    printf '{"method":"item/completed","params":{"threadId":"thread-fixture","turnId":"%s","item":{"type":"agentMessage","id":"item-fixture","text":"fixture answer"}}}\n' "$completed_turn_id"
+    printf '{"method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"%s","status":"completed","items":[]}}}\n' "$completed_turn_id"
+  fi
+}
 
 while IFS= read -r line; do
   case "$line" in
@@ -28,14 +41,29 @@ while IFS= read -r line; do
       ;;
     *'"method":"turn/start"'*)
       id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      turn_count=$((turn_count + 1))
+      turn_id="turn-fixture"
+      if [ "$mode" = "stale-steer-once" ]; then
+        turn_id="turn-stale-$turn_count"
+      fi
       if [ -n "$log" ]; then printf 'turn/start\n' >> "$log"; fi
-      printf '{"id":%s,"result":{"turn":{"id":"turn-fixture","status":"inProgress","items":[]}}}\n' "$id"
-      if [ "$mode" = "turn-failed" ]; then
-        printf '{"method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"turn-fixture","status":"failed","items":[],"error":{"message":"fixture turn failed"}}}}\n'
+      printf '{"id":%s,"result":{"turn":{"id":"%s","status":"inProgress","items":[]}}}\n' "$id" "$turn_id"
+      if [ "$mode" != "wait-for-steer" ]; then
+        emit_turn_completion "$turn_id"
+      fi
+      ;;
+    *'"method":"turn/steer"'*)
+      id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      expected_turn_id=$(printf '%s\n' "$line" | sed -n 's/.*"expectedTurnId":"\([^"]*\)".*/\1/p')
+      steer_count=$((steer_count + 1))
+      if [ -n "$log" ]; then printf '%s\n' "$line" >> "$log"; fi
+      if [ "$mode" = "stale-steer-once" ] && [ "$steer_count" -eq 1 ]; then
+        printf '{"id":%s,"error":{"code":-32600,"message":"no active turn to steer"}}\n' "$id"
       else
-        printf '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-fixture","turnId":"turn-fixture","tokenUsage":{"total":{"inputTokens":321,"cachedInputTokens":0,"outputTokens":45,"reasoningOutputTokens":0,"totalTokens":366},"last":{"inputTokens":321,"cachedInputTokens":0,"outputTokens":45,"reasoningOutputTokens":0,"totalTokens":366},"modelContextWindow":258400}}}\n'
-        printf '{"method":"item/completed","params":{"threadId":"thread-fixture","turnId":"turn-fixture","item":{"type":"agentMessage","id":"item-fixture","text":"fixture answer"}}}\n'
-        printf '{"method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"turn-fixture","status":"completed","items":[]}}}\n'
+        printf '{"id":%s,"result":{"turnId":"%s"}}\n' "$id" "$expected_turn_id"
+      fi
+      if [ "$mode" = "wait-for-steer" ]; then
+        emit_turn_completion "$expected_turn_id"
       fi
       ;;
   esac

@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 use std::time::Instant;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use which::which;
@@ -68,7 +69,7 @@ enum PendingReply {
 /// order, and server requests can arrive while a client request is pending.
 pub(crate) struct RpcClient<R, W> {
     provider: String,
-    reader: R,
+    reader: Lines<R>,
     writer: W,
     next_id: u64,
     pending: BTreeMap<String, PendingReply>,
@@ -84,7 +85,7 @@ where
     pub(crate) fn new(provider: impl Into<String>, reader: R, writer: W) -> Self {
         Self {
             provider: provider.into(),
-            reader,
+            reader: reader.lines(),
             writer,
             next_id: 1,
             pending: BTreeMap::new(),
@@ -161,16 +162,24 @@ where
         self.write_value(&message).await
     }
 
-    pub(crate) async fn next_notification<F>(&mut self, handler: &mut F) -> Result<RpcNotification>
+    async fn next_notification_with_timeout<F>(
+        &mut self,
+        timeout: Duration,
+        handler: &mut F,
+    ) -> Result<Option<RpcNotification>>
     where
         F: FnMut(&str, &Value) -> Result<Value>,
     {
         if let Some(notification) = self.notifications.pop_front() {
-            return Ok(notification);
+            return Ok(Some(notification));
         }
         loop {
-            match self.read_incoming().await? {
-                Incoming::Notification(notification) => return Ok(notification),
+            let incoming = match tokio::time::timeout(timeout, self.read_incoming()).await {
+                Ok(incoming) => incoming?,
+                Err(_) => return Ok(None),
+            };
+            match incoming {
+                Incoming::Notification(notification) => return Ok(Some(notification)),
                 Incoming::Request { id, method, params } => {
                     self.answer_server_request(id, &method, &params, handler)
                         .await?;
@@ -221,21 +230,18 @@ where
     }
 
     async fn read_incoming(&mut self) -> Result<Incoming> {
-        let mut line = String::new();
-        let read = self
+        let line = self
             .reader
-            .read_line(&mut line)
+            .next_line()
             .await
             .map_err(|source| ProviderError::Io {
                 path: format!("{} app-server stdout", self.provider),
                 source,
-            })?;
-        if read == 0 {
-            return Err(ProviderError::Cli {
+            })?
+            .ok_or_else(|| ProviderError::Cli {
                 provider: self.provider.clone(),
                 detail: "app-server closed its JSON-RPC stream".to_string(),
-            });
-        }
+            })?;
         let value: Value = serde_json::from_str(&line).map_err(|source| ProviderError::Cli {
             provider: self.provider.clone(),
             detail: format!("invalid app-server JSON-RPC line: {source}"),
@@ -534,7 +540,7 @@ impl CodexAppServer {
             .to_string();
         update_active_turn(session_dir, Some(&turn_id))?;
 
-        let outcome = self.read_turn(thread_id, &turn_id).await;
+        let outcome = self.read_turn(session_dir, thread_id, &turn_id).await;
         let cleared = update_active_turn(session_dir, None);
         match (outcome, cleared) {
             (Ok(turn), Ok(())) => Ok(turn),
@@ -543,18 +549,33 @@ impl CodexAppServer {
         }
     }
 
-    async fn read_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<ServerTurn> {
+    async fn read_turn(
+        &mut self,
+        session_dir: Option<&Path>,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<ServerTurn> {
         const ROUTE: &str = "cli:codex-server";
         let mut usage = ProviderUsage {
             input_tokens: 0,
             output_tokens: 0,
         };
         let mut content = None;
+        self.deliver_pending_steers(session_dir, thread_id, turn_id)
+            .await?;
         loop {
-            let notification = self
+            let Some(notification) = self
                 .rpc
-                .next_notification(&mut default_server_request)
-                .await?;
+                .next_notification_with_timeout(
+                    Duration::from_millis(100),
+                    &mut default_server_request,
+                )
+                .await?
+            else {
+                self.deliver_pending_steers(session_dir, thread_id, turn_id)
+                    .await?;
+                continue;
+            };
             match notification.method.as_str() {
                 "thread/tokenUsage/updated" => {
                     if notification
@@ -632,6 +653,81 @@ impl CodexAppServer {
             }
         }
     }
+
+    async fn deliver_pending_steers(
+        &mut self,
+        session_dir: Option<&Path>,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<()> {
+        let Some(run_root) = session_dir else {
+            return Ok(());
+        };
+        let pending = deadreckon_core::steer_inbox::pending_steers(run_root)
+            .map_err(|error| steer_inbox_error(&error))?;
+        for entry in pending {
+            let result = self
+                .rpc
+                .request(
+                    "turn/steer",
+                    json!({
+                        "threadId": thread_id,
+                        "input": [{
+                            "type": "text",
+                            "text": entry.text,
+                            "textElements": []
+                        }],
+                        "expectedTurnId": turn_id
+                    }),
+                    &mut default_server_request,
+                )
+                .await;
+            let response = match result {
+                Ok(response) => response,
+                Err(error) if stale_steer_precondition(&error) => break,
+                Err(error) => return Err(error),
+            };
+            let delivered_turn_id = response
+                .pointer("/turnId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| ProviderError::Cli {
+                    provider: "cli:codex-server".to_string(),
+                    detail: "app-server turn/steer response omitted turnId".to_string(),
+                })?;
+            if delivered_turn_id != turn_id {
+                return Err(ProviderError::Cli {
+                    provider: "cli:codex-server".to_string(),
+                    detail: format!(
+                        "app-server turn/steer returned turn {delivered_turn_id}, expected {turn_id}"
+                    ),
+                });
+            }
+            deadreckon_core::steer_inbox::mark_steer_delivered(
+                run_root,
+                &entry.identity(),
+                delivered_turn_id,
+            )
+            .map_err(|error| steer_inbox_error(&error))?;
+        }
+        Ok(())
+    }
+}
+
+fn steer_inbox_error(error: &deadreckon_core::DeadreckonError) -> ProviderError {
+    ProviderError::Cli {
+        provider: "cli:codex-server".to_string(),
+        detail: format!("steer inbox error: {error}"),
+    }
+}
+
+fn stale_steer_precondition(error: &ProviderError) -> bool {
+    let ProviderError::Cli { detail, .. } = error else {
+        return false;
+    };
+    detail.contains("app-server turn/steer failed (-32600)")
+        && (detail.contains("no active turn to steer")
+            || detail.contains("expected active turn id"))
 }
 
 fn default_server_request(method: &str, _params: &Value) -> Result<Value> {
@@ -1126,6 +1222,213 @@ mod tests {
             .expect_err("failed turn");
 
         assert!(error.to_string().contains("fixture turn failed"));
+    }
+
+    #[tokio::test]
+    async fn pending_steer_delivers_with_expected_turn_id() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join("rpc.log");
+        deadreckon_core::steer_inbox::append_steer(
+            temp.path(),
+            deadreckon_core::steer_inbox::SteerSource::Cli,
+            "prefer the smaller patch",
+        )
+        .expect("append steer");
+        let ServerStart::Ready(mut server) = start_server_or_degrade(CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["normal".to_string(), log.display().to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+        })
+        .await
+        else {
+            panic!("server")
+        };
+        let thread_id = server
+            .ensure_thread(Some(temp.path()), None)
+            .await
+            .expect("thread");
+
+        server
+            .run_turn(Some(temp.path()), &thread_id, "finish the task", None)
+            .await
+            .expect("turn");
+
+        let calls = std::fs::read_to_string(log).expect("rpc log");
+        let steer = calls
+            .lines()
+            .find(|line| line.contains("\"method\":\"turn/steer\""))
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("steer json"))
+            .expect("turn/steer request");
+        assert_eq!(steer["params"]["threadId"], "thread-fixture");
+        assert_eq!(steer["params"]["expectedTurnId"], "turn-fixture");
+        assert_eq!(
+            steer["params"]["input"][0]["text"],
+            "prefer the smaller patch"
+        );
+        let entries = deadreckon_core::steer_inbox::read_steer_inbox(temp.path()).expect("inbox");
+        assert_eq!(
+            entries[0].status,
+            deadreckon_core::steer_inbox::SteerStatus::Delivered
+        );
+        assert_eq!(
+            entries[0].delivered_turn_id.as_deref(),
+            Some("turn-fixture")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_turn_precondition_retries_not_drops() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join("rpc.log");
+        deadreckon_core::steer_inbox::append_steer(
+            temp.path(),
+            deadreckon_core::steer_inbox::SteerSource::Cli,
+            "keep this instruction pending",
+        )
+        .expect("append steer");
+        let ServerStart::Ready(mut server) = start_server_or_degrade(CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["stale-steer-once".to_string(), log.display().to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+        })
+        .await
+        else {
+            panic!("server")
+        };
+        let thread_id = server
+            .ensure_thread(Some(temp.path()), None)
+            .await
+            .expect("thread");
+
+        server
+            .run_turn(Some(temp.path()), &thread_id, "first turn", None)
+            .await
+            .expect("first turn");
+        assert_eq!(
+            deadreckon_core::steer_inbox::pending_steers(temp.path())
+                .expect("pending after stale")
+                .len(),
+            1
+        );
+
+        server
+            .run_turn(Some(temp.path()), &thread_id, "second turn", None)
+            .await
+            .expect("second turn");
+        assert!(
+            deadreckon_core::steer_inbox::pending_steers(temp.path())
+                .expect("pending after retry")
+                .is_empty()
+        );
+        let entries = deadreckon_core::steer_inbox::read_steer_inbox(temp.path()).expect("inbox");
+        assert_eq!(
+            entries[0].delivered_turn_id.as_deref(),
+            Some("turn-stale-2")
+        );
+        let calls = std::fs::read_to_string(log).expect("rpc log");
+        assert_eq!(calls.matches("\"method\":\"turn/steer\"").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_delivery_is_harmless() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join("rpc.log");
+        deadreckon_core::steer_inbox::append_steer(
+            temp.path(),
+            deadreckon_core::steer_inbox::SteerSource::Cli,
+            "send this once",
+        )
+        .expect("append steer");
+        let inbox = temp.path().join("steer-inbox.jsonl");
+        let row = std::fs::read_to_string(&inbox).expect("inbox row");
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&inbox)
+            .expect("open inbox")
+            .write_all(row.as_bytes())
+            .expect("duplicate physical row");
+
+        let ServerStart::Ready(mut server) = start_server_or_degrade(CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["normal".to_string(), log.display().to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+        })
+        .await
+        else {
+            panic!("server")
+        };
+        let thread_id = server
+            .ensure_thread(Some(temp.path()), None)
+            .await
+            .expect("thread");
+
+        server
+            .run_turn(Some(temp.path()), &thread_id, "finish", None)
+            .await
+            .expect("turn");
+
+        let calls = std::fs::read_to_string(log).expect("rpc log");
+        assert_eq!(calls.matches("\"method\":\"turn/steer\"").count(), 1);
+        assert!(
+            deadreckon_core::steer_inbox::pending_steers(temp.path())
+                .expect("pending")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_appended_mid_turn_is_polled_and_delivered() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join("rpc.log");
+        let ServerStart::Ready(mut server) = start_server_or_degrade(CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["wait-for-steer".to_string(), log.display().to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+        })
+        .await
+        else {
+            panic!("server")
+        };
+        let thread_id = server
+            .ensure_thread(Some(temp.path()), None)
+            .await
+            .expect("thread");
+        let run_root = temp.path().to_path_buf();
+
+        let (turn, appended) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                server.run_turn(Some(&run_root), &thread_id, "keep working", None),
+                async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    deadreckon_core::steer_inbox::append_steer(
+                        &run_root,
+                        deadreckon_core::steer_inbox::SteerSource::Cli,
+                        "stop refactoring and ship",
+                    )
+                }
+            )
+        })
+        .await
+        .expect("mid-turn steer timeout");
+
+        appended.expect("append steer");
+        turn.expect("turn");
+        assert!(
+            deadreckon_core::steer_inbox::pending_steers(temp.path())
+                .expect("pending")
+                .is_empty()
+        );
+        let calls = std::fs::read_to_string(log).expect("rpc log");
+        assert!(calls.contains("stop refactoring and ship"), "{calls}");
     }
 
     #[tokio::test]
