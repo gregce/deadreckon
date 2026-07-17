@@ -171,6 +171,7 @@ pub(crate) fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Opt
         .filter(|descriptor| {
             descriptor.kind == DescriptorKind::Cli
                 && descriptor.subscription
+                && provider_route_is_auto_selectable(&descriptor.id)
                 && descriptor
                     .default_binary
                     .as_deref()
@@ -183,6 +184,10 @@ pub(crate) fn auto_subscription_cli_provider(registry: &ProviderRegistry) -> Opt
     } else {
         None
     }
+}
+
+pub(crate) fn provider_route_is_auto_selectable(provider: &str) -> bool {
+    provider != "cli:codex-server"
 }
 
 pub(crate) fn select_provider_setup(
@@ -713,6 +718,14 @@ mod tests {
 
         assert_eq!(selection.provider.as_deref(), Some("cli:codex"));
         assert_eq!(selection.source, SetupProviderSource::AutoSubscription);
+    }
+
+    #[test]
+    fn codex_server_route_is_opt_in_only() {
+        assert!(super::provider_route_is_auto_selectable("cli:codex"));
+        assert!(!super::provider_route_is_auto_selectable(
+            "cli:codex-server"
+        ));
     }
 
     #[test]

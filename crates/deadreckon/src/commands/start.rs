@@ -730,6 +730,7 @@ fn start_detected_cli_provider_ids(paths: &DeadreckonPaths) -> Result<Vec<String
     for descriptor in registry.iter() {
         if descriptor.kind == DescriptorKind::Cli
             && descriptor.subscription
+            && setup::provider_route_is_auto_selectable(&descriptor.id)
             && descriptor
                 .default_binary
                 .as_deref()

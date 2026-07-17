@@ -8179,6 +8179,7 @@ pub(crate) fn provider_picker_choices(registry: &ProviderRegistry) -> Vec<prompt
     for descriptor in registry.iter() {
         if descriptor.kind != deadreckon_providers::registry::DescriptorKind::Cli
             || !descriptor.subscription
+            || !setup::provider_route_is_auto_selectable(&descriptor.id)
         {
             continue;
         }

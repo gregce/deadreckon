@@ -1,0 +1,64 @@
+id = "cli:codex-server"
+display_name = "Codex app-server"
+kind = "cli"
+default_binary = "codex"
+allow_network_default = true
+default_model = "provider default"
+sandbox_writes = ["~/.codex"]
+sandbox_reads = ["~/.codex"]
+fs_detection_paths = ["~/.codex/sessions"]
+docs_url = "https://developers.openai.com/codex/app-server"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[version_probe]
+args = ["--version"]
+
+[auth_probe]
+args = ["login", "status"]
+logged_in_substring = "Logged in"
+logged_out_substring = "Not logged in"
+login_try_lines = ["codex login"]
+
+[exec_template]
+args_template = ["app-server"]
+model_arg = "--model"
+timeout_seconds = 1800
+
+[install_hint]
+url = "https://developers.openai.com/codex/quickstart"
+try_lines = ["npm i -g @openai/codex"]
+
+[ingest]
+id_prefix = "codex-server:"
+env_var = "CODEX_SESSIONS_DIR"
+default_dirs = ["~/.codex/sessions", "~/.codex/archived_sessions"]
+schema = "codex-app-server"
+cwd_match = "session-meta"
+cwd_match_path = "payload.cwd"
+file_glob = "*.jsonl"
+freshness_minutes = 2
+storage = "jsonl"
+live_contract = true
+
+[[model_catalog]]
+id = "provider default"
+context_window = 258400
+aliases = ["codex-default"]
+input_per_million = 0.0
+output_per_million = 0.0
+recommended = true
+
+[[model_catalog]]
+id = "gpt-5.1-codex"
+context_window = 258400
+
+[[model_catalog]]
+id = "gpt-5.1-codex-mini"
+context_window = 258400
+
+[[model_catalog]]
+id = "gpt-5.1"
+context_window = 258400

@@ -135,6 +135,7 @@ fn preferred_init_subscription_cli_provider(registry: &ProviderRegistry) -> Opti
         .filter(|descriptor| {
             descriptor.kind == DescriptorKind::Cli
                 && descriptor.subscription
+                && setup::provider_route_is_auto_selectable(&descriptor.id)
                 && descriptor
                     .default_binary
                     .as_deref()
