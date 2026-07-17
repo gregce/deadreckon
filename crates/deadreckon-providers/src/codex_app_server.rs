@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -6,6 +7,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use crate::cli_contract::ProviderSession;
 use crate::cli_contract::add_caveat;
 use crate::{ProviderError, Result};
 
@@ -338,6 +340,7 @@ type ChildRpcClient = RpcClient<BufReader<ChildStdout>, ChildStdin>;
 pub(crate) struct CodexAppServer {
     child: Child,
     rpc: ChildRpcClient,
+    cwd: PathBuf,
     pid_file: Option<PathBuf>,
 }
 
@@ -384,6 +387,7 @@ impl CodexAppServer {
         let mut server = Self {
             child,
             rpc: RpcClient::new(spec.provider, BufReader::new(stdout), stdin),
+            cwd: spec.cwd,
             pid_file: spec.pid_file,
         };
         server.initialize().await?;
@@ -415,6 +419,66 @@ impl CodexAppServer {
 
     pub(crate) fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    pub(crate) async fn ensure_thread(
+        &mut self,
+        session_dir: &Path,
+        model: Option<&str>,
+    ) -> Result<String> {
+        const ROUTE: &str = "cli:codex-server";
+        let prior = ProviderSession::read(session_dir, ROUTE);
+        let (method, mut params) = match prior.as_ref() {
+            Some(session) => (
+                "thread/resume",
+                json!({
+                    "threadId": session.conversation_id,
+                    "cwd": self.cwd.display().to_string(),
+                    "approvalPolicy": "on-request",
+                    "approvalsReviewer": "user",
+                    "sandbox": "workspace-write"
+                }),
+            ),
+            None => (
+                "thread/start",
+                json!({
+                    "cwd": self.cwd.display().to_string(),
+                    "approvalPolicy": "on-request",
+                    "approvalsReviewer": "user",
+                    "sandbox": "workspace-write"
+                }),
+            ),
+        };
+        if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+            params["model"] = Value::String(model.to_string());
+        }
+        let result = self
+            .rpc
+            .request(method, params, &mut |request_method, _| {
+                Err(ProviderError::Cli {
+                    provider: ROUTE.to_string(),
+                    detail: format!("unexpected server request before a turn: {request_method}"),
+                })
+            })
+            .await?;
+        let thread_id = result
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| ProviderError::Cli {
+                provider: ROUTE.to_string(),
+                detail: format!("app-server {method} response omitted thread.id"),
+            })?
+            .to_string();
+        let now = chrono::Utc::now();
+        let mut session = prior
+            .filter(|session| session.conversation_id == thread_id)
+            .unwrap_or_else(|| ProviderSession::new(ROUTE, &thread_id, now));
+        session.touch(now);
+        session.route = Some(ROUTE.to_string());
+        session.server_pid = self.pid();
+        session.write(session_dir)?;
+        Ok(thread_id)
     }
 }
 
@@ -457,6 +521,7 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::{CodexAppServerSpec, RpcClient, ServerStart, start_server_or_degrade};
+    use crate::cli_contract::ProviderSession;
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -593,5 +658,62 @@ mod tests {
                 .expect("message")
                 .contains("initialize")
         );
+    }
+
+    #[tokio::test]
+    async fn server_route_persists_thread_and_resumes_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join("rpc.log");
+        let spec = || CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["normal".to_string(), log.display().to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+        };
+
+        let ServerStart::Ready(mut first) = start_server_or_degrade(spec()).await else {
+            panic!("first server")
+        };
+        let first_id = first
+            .ensure_thread(temp.path(), None)
+            .await
+            .expect("start thread");
+        assert_eq!(first_id, "thread-fixture");
+        drop(first);
+
+        let session = ProviderSession::read(temp.path(), "cli:codex-server").expect("session");
+        assert_eq!(session.route.as_deref(), Some("cli:codex-server"));
+        assert_eq!(session.conversation_id, "thread-fixture");
+        assert!(session.server_pid.is_some());
+
+        let ServerStart::Ready(mut second) = start_server_or_degrade(spec()).await else {
+            panic!("second server")
+        };
+        let resumed_id = second
+            .ensure_thread(temp.path(), None)
+            .await
+            .expect("resume thread");
+        assert_eq!(resumed_id, "thread-fixture");
+        let calls = std::fs::read_to_string(log).expect("rpc log");
+        assert!(calls.contains("thread/start"));
+        assert!(calls.contains("thread/resume"));
+    }
+
+    #[test]
+    fn semaphore_session_schema_still_readable() {
+        let legacy = json!({
+            "schema": 1,
+            "provider": "cli:codex",
+            "conversation_id": "thread-old",
+            "created_at": "2026-07-11T18:00:00Z",
+            "last_turn_at": "2026-07-11T18:04:12Z",
+            "resume_failures": 0
+        });
+        let session: ProviderSession = serde_json::from_value(legacy).expect("legacy session");
+        assert_eq!(session.conversation_id, "thread-old");
+        assert_eq!(session.route, None);
+        assert_eq!(session.server_pid, None);
+        assert_eq!(session.active_turn_id, None);
     }
 }

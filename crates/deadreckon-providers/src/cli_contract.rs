@@ -244,6 +244,12 @@ pub(crate) struct ProviderSession {
     pub last_turn_at: DateTime<Utc>,
     #[serde(default)]
     pub resume_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<String>,
 }
 
 impl ProviderSession {
@@ -255,6 +261,9 @@ impl ProviderSession {
             created_at: now,
             last_turn_at: now,
             resume_failures: 0,
+            route: None,
+            server_pid: None,
+            active_turn_id: None,
         }
     }
 
