@@ -1290,6 +1290,7 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
+        Commands::Steer { run_id, text } => commands::steer::steer_command(&run_id, text),
         Commands::Kill {
             run_id,
             force,
@@ -1746,6 +1747,14 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         purpose: "continue from a completed run",
         audience: CommandAudience::Advanced,
         top_group: None,
+        all_group: Some(HelpAllGroup::ContinueRecover),
+    },
+    CommandHelpEntry {
+        display: "steer",
+        clap_name: Some("steer"),
+        purpose: "guide an executing Codex app-server run",
+        audience: CommandAudience::Primary,
+        top_group: Some(TopHelpGroup::Control),
         all_group: Some(HelpAllGroup::ContinueRecover),
     },
     CommandHelpEntry {

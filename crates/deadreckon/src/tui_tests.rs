@@ -1419,7 +1419,8 @@ fn command_help_catalog_classifies_advanced_and_compatibility_surfaces() {
         CommandDiscovery::Compatibility
     );
     for name in [
-        "start", "attach", "status", "list", "finish", "doctor", "kill", "resume", "cleanup",
+        "start", "attach", "status", "list", "finish", "doctor", "steer", "kill", "resume",
+        "cleanup",
     ] {
         assert_eq!(command_discovery(entry(name)), CommandDiscovery::Public);
         assert_eq!(

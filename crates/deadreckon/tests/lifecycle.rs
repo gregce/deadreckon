@@ -99,6 +99,85 @@ fn materialize_refuses_existing_nonempty_dest() {
 }
 
 #[test]
+fn steer_verb_appends_pending_line() {
+    let temp = repo_tempdir();
+    let (paths, mut state) = logbook_fixture_run(&temp, RunStatus::Executing);
+    state.provider = Some("cli:codex-server".to_string());
+    save_state(&state).expect("save server route");
+
+    let output = deadreckon(&paths)
+        .args([
+            "steer",
+            &state.run_id,
+            "keep the public API backward compatible",
+        ])
+        .output()
+        .expect("steer");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("queued steer"), "{stdout}");
+    assert!(stdout.contains("active or next Codex turn"), "{stdout}");
+    let pending =
+        deadreckon_core::steer_inbox::pending_steers(&state.run_root).expect("pending steers");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].text, "keep the public API backward compatible");
+    assert_eq!(
+        pending[0].source,
+        deadreckon_core::steer_inbox::SteerSource::Cli
+    );
+}
+
+#[test]
+fn steer_refuses_dead_run_with_extend_try() {
+    let temp = repo_tempdir();
+    let (paths, mut state) = logbook_fixture_run(&temp, RunStatus::Completed);
+    state.provider = Some("cli:codex-server".to_string());
+    save_state(&state).expect("save server route");
+
+    let output = deadreckon(&paths)
+        .args(["steer", &state.run_id, "add one more test"])
+        .output()
+        .expect("steer dead run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains(&format!(
+            "try: deadreckon extend {} \"add one more test\"",
+            &state.run_id[..8]
+        )),
+        "{stderr}"
+    );
+    assert!(
+        !state.run_root.join("steer-inbox.jsonl").exists(),
+        "a refused steer must not mutate the inbox"
+    );
+}
+
+#[test]
+fn steer_refuses_exec_route_with_config_try() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Executing);
+
+    let output = deadreckon(&paths)
+        .args(["steer", &state.run_id, "prefer the smaller change"])
+        .output()
+        .expect("steer exec route");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("try: deadreckon config provider cli:codex-server"),
+        "{stderr}"
+    );
+    assert!(
+        !state.run_root.join("steer-inbox.jsonl").exists(),
+        "a refused steer must not mutate the inbox"
+    );
+}
+
+#[test]
 fn materialize_refuses_incomplete_run_with_one_primary_action() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1189,6 +1268,7 @@ fn every_top_level_help_shows_lifecycle_usage() {
         "extend",
         "doc",
         "attach",
+        "steer",
         "kill",
         "resume",
         "undo",

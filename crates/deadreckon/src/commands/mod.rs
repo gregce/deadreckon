@@ -22,4 +22,5 @@ pub(crate) mod report;
 pub(crate) mod run;
 pub(crate) mod seams;
 pub(crate) mod start;
+pub(crate) mod steer;
 pub(crate) mod verdict;
