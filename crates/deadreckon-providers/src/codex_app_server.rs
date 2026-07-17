@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
+use std::process::Stdio;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use crate::cli_contract::add_caveat;
 use crate::{ProviderError, Result};
 
 const KNOWN_NOTIFICATIONS: &[&str] = &[
@@ -138,6 +142,14 @@ where
                 }
             }
         }
+    }
+
+    pub(crate) async fn notification(&mut self, method: &str, params: Option<Value>) -> Result<()> {
+        let mut message = json!({"method": method});
+        if let Some(params) = params {
+            message["params"] = params;
+        }
+        self.write_value(&message).await
     }
 
     pub(crate) async fn next_notification<F>(&mut self, handler: &mut F) -> Result<RpcNotification>
@@ -312,12 +324,144 @@ fn id_key(id: &Value) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CodexAppServerSpec {
+    pub(crate) provider: String,
+    pub(crate) binary: String,
+    pub(crate) extra_args: Vec<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) pid_file: Option<PathBuf>,
+}
+
+type ChildRpcClient = RpcClient<BufReader<ChildStdout>, ChildStdin>;
+
+pub(crate) struct CodexAppServer {
+    child: Child,
+    rpc: ChildRpcClient,
+    pid_file: Option<PathBuf>,
+}
+
+impl CodexAppServer {
+    async fn spawn(spec: CodexAppServerSpec) -> Result<Self> {
+        let mut command = Command::new(&spec.binary);
+        command
+            .arg("app-server")
+            .args(&spec.extra_args)
+            .current_dir(&spec.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|source| ProviderError::Cli {
+            provider: spec.provider.clone(),
+            detail: format!("could not start codex app-server: {source}"),
+        })?;
+        let pid = child.id();
+        let stdin = child.stdin.take().ok_or_else(|| ProviderError::Cli {
+            provider: spec.provider.clone(),
+            detail: "codex app-server stdin was unavailable".to_string(),
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| ProviderError::Cli {
+            provider: spec.provider.clone(),
+            detail: "codex app-server stdout was unavailable".to_string(),
+        })?;
+        if let (Some(pid), Some(pid_file)) = (pid, spec.pid_file.as_ref()) {
+            if let Some(parent) = pid_file.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|source| ProviderError::Io {
+                        path: parent.display().to_string(),
+                        source,
+                    })?;
+            }
+            tokio::fs::write(pid_file, format!("{pid}\n"))
+                .await
+                .map_err(|source| ProviderError::Io {
+                    path: pid_file.display().to_string(),
+                    source,
+                })?;
+        }
+        let mut server = Self {
+            child,
+            rpc: RpcClient::new(spec.provider, BufReader::new(stdout), stdin),
+            pid_file: spec.pid_file,
+        };
+        server.initialize().await?;
+        Ok(server)
+    }
+
+    async fn initialize(&mut self) -> Result<()> {
+        self.rpc
+            .request(
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "deadreckon",
+                        "title": "DeadReckon",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": {"experimentalApi": false}
+                }),
+                &mut |method, _| {
+                    Err(ProviderError::Cli {
+                        provider: "cli:codex-server".to_string(),
+                        detail: format!("unexpected server request during initialize: {method}"),
+                    })
+                },
+            )
+            .await?;
+        self.rpc.notification("initialized", None).await
+    }
+
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+}
+
+impl Drop for CodexAppServer {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        if let Some(pid_file) = self.pid_file.as_ref() {
+            let _ = std::fs::remove_file(pid_file);
+        }
+    }
+}
+
+pub(crate) enum ServerStart {
+    Ready(Box<CodexAppServer>),
+    Degraded { trace: Value },
+}
+
+pub(crate) async fn start_server_or_degrade(spec: CodexAppServerSpec) -> ServerStart {
+    match CodexAppServer::spawn(spec).await {
+        Ok(server) => ServerStart::Ready(Box::new(server)),
+        Err(err) => {
+            let mut trace = json!({"route": "cli:codex-server"});
+            add_caveat(
+                &mut trace,
+                "provider.route.degraded",
+                &format!("codex app-server initialize failed; using cli:codex exec: {err}"),
+            );
+            ServerStart::Degraded { trace }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
     use serde_json::json;
+    use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    use super::RpcClient;
+    use super::{CodexAppServerSpec, RpcClient, ServerStart, start_server_or_degrade};
+
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rudder/fake-codex-app-server.sh")
+    }
 
     #[tokio::test]
     async fn rpc_client_correlates_responses_by_id() {
@@ -393,5 +537,61 @@ mod tests {
 
         assert_eq!(response["ok"], true);
         assert_eq!(client.unknown_notifications(), ["future/notification"]);
+    }
+
+    #[tokio::test]
+    async fn server_child_pid_is_supervised_and_killed_on_drop() {
+        let temp = TempDir::new().expect("tempdir");
+        let pid_file = temp.path().join("child-pids/codex-app-server.pid");
+        let started = start_server_or_degrade(CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["normal".to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: Some(pid_file.clone()),
+        })
+        .await;
+        let ServerStart::Ready(server) = started else {
+            panic!("server should start")
+        };
+        let pid = server.pid().expect("pid");
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).expect("pid file").trim(),
+            pid.to_string()
+        );
+        assert!(deadreckon_core::pid_is_alive(pid));
+
+        drop(server);
+        for _ in 0..40 {
+            if !deadreckon_core::pid_is_alive(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!deadreckon_core::pid_is_alive(pid));
+        assert!(!pid_file.exists());
+    }
+
+    #[tokio::test]
+    async fn handshake_failure_degrades_route_with_trace() {
+        let temp = TempDir::new().expect("tempdir");
+        let started = start_server_or_degrade(CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["handshake-failure".to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+        })
+        .await;
+        let ServerStart::Degraded { trace } = started else {
+            panic!("handshake failure should degrade")
+        };
+        assert_eq!(trace["caveats"][0]["code"], "provider.route.degraded");
+        assert!(
+            trace["caveats"][0]["message"]
+                .as_str()
+                .expect("message")
+                .contains("initialize")
+        );
     }
 }
