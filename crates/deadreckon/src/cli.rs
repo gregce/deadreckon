@@ -433,6 +433,16 @@ Lifecycle:
 
 Attach opens the live TUI for a run, chain, or plan. The default activity view keeps raw logs visible; `--view narrative` shows cited prose plus an evidence-backed visual map. `q`, Esc, and Ctrl-D detach without killing the work.";
 
+const STEER_HELP: &str = "\
+Lifecycle:
+  deadreckon steer latest \"focus on the failing integration test\"
+  deadreckon attach latest
+  deadreckon kill latest
+
+Steer queues one instruction for an executing run that uses the opt-in
+`cli:codex-server` provider route. Delivery begins on the active Codex turn,
+or on the next turn if there is no active turn yet.";
+
 const KILL_HELP: &str = "\
 Lifecycle:
   deadreckon kill latest
@@ -1612,6 +1622,17 @@ pub(crate) enum Commands {
         no_hints: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Queue an instruction for an executing Codex app-server run",
+        after_help = STEER_HELP
+    )]
+    Steer {
+        #[arg(help = "Run id, unique prefix, or latest")]
+        run_id: String,
+        #[arg(help = "One concrete instruction for the running agent")]
+        text: String,
     },
     #[command(
         next_help_heading = "Run Lifecycle",

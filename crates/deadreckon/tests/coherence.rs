@@ -703,7 +703,8 @@ fn audience_copy_does_not_call_deadreckon_a_provider_replacement() {
 fn top_help_uses_canonical_discovery_words() {
     let top = help(["--help"]);
     for command in [
-        "start", "attach", "status", "list", "finish", "doctor", "kill", "resume", "cleanup",
+        "start", "attach", "status", "list", "finish", "doctor", "steer", "kill", "resume",
+        "cleanup",
     ] {
         assert!(
             top.contains(command),

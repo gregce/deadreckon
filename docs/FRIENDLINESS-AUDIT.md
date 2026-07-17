@@ -202,6 +202,12 @@ verb.
 | `attach` | One-command rollback | n-a | Read-only watch surface. |
 | `attach` | One verdict + ONE primary action | pass | Attach post-action notices and paused/plan TUI footers now derive one verdict or one subordinate `next` command. |
 | `attach` | Lifecycle hint | pass | Footer points at finish/show/apply or detach. |
+| `steer` | Auto-detect, don't ask | pass | Run prefixes and `latest` resolve through the shared run loader; the recorded route decides whether steering is supported. |
+| `steer` | Preview before mutate | n-a | The explicit instruction is the append operation; no workspace files are changed. |
+| `steer` | Refuse with try: | pass | Empty text, dead runs, and exec routes point at a concrete steer, extend, or provider-config command. |
+| `steer` | One-command rollback | n-a | The durable append-only inbox is an audit ledger; delivered instructions are corrected with later rows rather than deleted. |
+| `steer` | One verdict + ONE primary action | pass | Success reports one queued outcome; every refusal reports one recovery command. |
+| `steer` | Lifecycle hint | pass | Success points at `deadreckon attach <run-id>` and help covers steer, attach, and kill. |
 | `kill` | Auto-detect, don't ask | pass | Run/plan/chain/campaign ids resolve by prefix/latest. |
 | `kill` | Preview before mutate | pass | Confirms destructive stop unless explicitly scripted. |
 | `kill` | Refuse with try: | pass | Missing/not-running targets include status/list recovery. |
