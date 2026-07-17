@@ -707,6 +707,76 @@ fn v1_candidates_records_out_of_scope_attach_daemon() {
     assert!(candidates.contains("diagnostic dashboard"));
 }
 
+#[test]
+fn as_built_documents_rudder_connection_inbox_approvals_and_degrade_rules() {
+    let as_built = repo_file("docs/AS-BUILT-ARCHITECTURE.md");
+
+    assert!(
+        as_built.contains("## 51. Rudder: Steering the Running Child"),
+        "missing Rudder section"
+    );
+    for required in [
+        "cli:codex-server",
+        "codex app-server",
+        "provider-session.json",
+        "steer-inbox.jsonl",
+        "at-least-once",
+        "turn/steer",
+        "expectedTurnId",
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "provider.approval",
+        "turn/interrupt",
+        "provider.route.degraded",
+    ] {
+        assert!(as_built.contains(required), "missing {required}");
+    }
+    assert!(as_built.contains("§47"));
+    assert!(as_built.contains("§50"));
+    assert!(as_built.contains(":steer <instruction>"));
+}
+
+#[test]
+fn changelog_records_rudder_stable_with_every_implementation_phase_sha() {
+    let changelog = repo_file("CHANGELOG.md");
+
+    assert!(changelog.contains("## Rudder (stable) — steer the running child — 2026-07-16"));
+    assert!(changelog.contains("durable at-least-once inbox"));
+    assert!(changelog.contains("interrupt-before-kill"));
+    assert!(changelog.contains("danger-full-access inversion"));
+    assert!(changelog.contains("server loss degrades to the exec route"));
+    for (phase, sha) in [
+        ("P1", "731c907"),
+        ("P2", "e4df6b9"),
+        ("P3", "0a5bc0e"),
+        ("P4", "be439d2"),
+        ("P5", "ab8d0b3"),
+        ("P6", "f86fdff"),
+        ("P7", "14f6402"),
+        ("P8", "a8319d1"),
+        ("P9", "0ca9328"),
+        ("P10", "efc22c3"),
+    ] {
+        assert!(
+            changelog.contains(&format!("- {phase} (`{sha}`):")),
+            "missing {phase} {sha}"
+        );
+    }
+}
+
+#[test]
+fn v1_candidates_record_rudder_boundaries() {
+    let candidates = repo_file("docs/V1-CANDIDATES.md");
+    let lowercase = candidates.to_lowercase();
+
+    assert!(candidates.contains("Rudder follow-ups"));
+    assert!(candidates.contains("shared app-server daemon and Unix socket"));
+    assert!(lowercase.contains("cross-run server reuse"));
+    assert!(candidates.contains("thread/fork"));
+    assert!(candidates.contains("rewind"));
+    assert!(candidates.contains("steering for `cli:claude-code`"));
+}
+
 fn append_component_turn(state: &deadreckon_core::PipelineState, file: &str) {
     append_turn_doc(
         state,

@@ -238,6 +238,20 @@
   ingestion). Matching individual on-disk rows to live rows by content would let
   both sources run — unnecessary while live ingestion is authoritative.
 
+## Rudder follow-ups (Rudder, §51)
+
+- A shared app-server daemon and Unix socket transport. Stable Rudder keeps one
+  supervised stdio child inside the provider instance so lifecycle and failure
+  ownership stay local to the run.
+- Cross-run server reuse. Threads and inboxes are deliberately run-scoped today;
+  pooling a process needs isolation, cleanup and credential-boundary rules.
+- Map Codex `thread/fork` and rollback operations onto DeadReckon rewind. The
+  two histories need an explicit identity and proof-preservation contract before
+  they can move together.
+- Live steering for `cli:claude-code` or other provider routes. The stable
+  command refuses them until a provider exposes a steer-and-acknowledge wire
+  contract with the same no-drop guarantees.
+
 ## Pennant follow-ups (Pennant, §55)
 
 - Contract hot reload: the registry reads and validates descriptor contracts at
