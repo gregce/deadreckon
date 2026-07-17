@@ -98,7 +98,7 @@ pub(crate) const SPINE_CONTRACT_TABLE: &[SpineContractCell] = &[
     SpineContractCell {
         surface: SpineSurface::Run,
         question: SpineQuestion::Wrong,
-        source: "failure_reason, pause_reason, Error events, quiet-event age, and reshape-proposal.json",
+        source: "failure_reason, pause_reason, Error events, quiet-event age, reshape-proposal.json, and pending steer-inbox.jsonl entries",
     },
     SpineContractCell {
         surface: SpineSurface::Run,
@@ -255,6 +255,7 @@ pub(crate) enum AttentionKind {
     Stall,
     PausedAtCap,
     ReshapeProposed,
+    SteerPending,
     Failure,
     Killed,
 }
@@ -292,6 +293,20 @@ pub(crate) fn spine_for_run_with_events(
             AttentionKind::ReshapeProposed,
             "reshape proposal waiting for explicit operator acceptance",
             Some(reshape_path),
+        ));
+    }
+
+    if let Ok(pending) = deadreckon_core::steer_inbox::pending_steers(&state.run_root)
+        && !pending.is_empty()
+    {
+        let count = pending.len();
+        let noun = if count == 1 { "steer" } else { "steers" };
+        wrong.push(Attention::new(
+            AttentionKind::SteerPending,
+            format!("{count} pending {noun} waiting for delivery"),
+            Some(deadreckon_core::steer_inbox::steer_inbox_path(
+                &state.run_root,
+            )),
         ));
     }
 

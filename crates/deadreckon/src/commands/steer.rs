@@ -3,16 +3,36 @@ use super::super::*;
 const STEERABLE_PROVIDER_ROUTE: &str = "cli:codex-server";
 
 pub(crate) fn steer_command(run_id: &str, text: String) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let state = load_cli_run(&paths, run_id)?;
+    let prefix = run_prefix(&state.run_id);
+    queue_steer_for_state(&state, deadreckon_core::steer_inbox::SteerSource::Cli, text)?;
+
+    println!("{} {}", ui_ok("queued steer for"), ui_id(&prefix));
+    println!(
+        "  {} delivery will begin on the active or next Codex turn",
+        ui_muted("delivery:")
+    );
+    println!(
+        "  {} {}",
+        ui_muted("watch:"),
+        ui_command(format!("deadreckon attach {prefix}"))
+    );
+    Ok(())
+}
+
+pub(crate) fn queue_steer_for_state(
+    state: &deadreckon_core::PipelineState,
+    source: deadreckon_core::steer_inbox::SteerSource,
+    text: String,
+) -> Result<deadreckon_core::steer_inbox::SteerInboxEntry> {
+    let prefix = run_prefix(&state.run_id);
     if text.trim().is_empty() {
         return Err(CliError::Core(deadreckon_core::user_error(
             "steer text must not be empty",
             "deadreckon steer <run-id> \"one concrete instruction\"",
         )));
     }
-
-    let paths = DeadreckonPaths::discover();
-    let state = load_cli_run(&paths, run_id)?;
-    let prefix = run_prefix(&state.run_id);
 
     if state.status != RunStatus::Executing {
         return Err(CliError::Core(deadreckon_core::user_error(
@@ -38,23 +58,11 @@ pub(crate) fn steer_command(run_id: &str, text: String) -> Result<()> {
         )));
     }
 
-    deadreckon_core::steer_inbox::append_steer(
+    Ok(deadreckon_core::steer_inbox::append_steer(
         &state.run_root,
-        deadreckon_core::steer_inbox::SteerSource::Cli,
+        source,
         text,
-    )?;
-
-    println!("{} {}", ui_ok("queued steer for"), ui_id(&prefix));
-    println!(
-        "  {} delivery will begin on the active or next Codex turn",
-        ui_muted("delivery:")
-    );
-    println!(
-        "  {} {}",
-        ui_muted("watch:"),
-        ui_command(format!("deadreckon attach {prefix}"))
-    );
-    Ok(())
+    )?)
 }
 
 fn quoted_shell_argument(text: &str) -> String {

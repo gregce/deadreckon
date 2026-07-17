@@ -2,6 +2,7 @@
 
 use std::fs;
 
+use deadreckon_core::steer_inbox::{SteerSource, append_steer, mark_steer_delivered};
 use deadreckon_core::{DeadreckonPaths, RunOptions, RunStatus, create_run, save_state};
 use tempfile::TempDir;
 
@@ -41,6 +42,48 @@ fn attach_exit_preserves_ctrl_d_detach_during_running_state() {
     let out = stdout(&output);
     assert!(out.contains("run "), "{out}");
     assert!(!out.contains("completed run"), "{out}");
+}
+
+#[test]
+fn plain_attach_lists_steer_inbox_state() {
+    let temp = repo_tempdir();
+    let (paths, mut state) = state(&temp, RunStatus::Executing);
+    state.provider = Some("cli:codex-server".to_string());
+    save_state(&state).expect("save server route");
+    let delivered = append_steer(
+        &state.run_root,
+        SteerSource::Cli,
+        "keep the public API stable",
+    )
+    .expect("append delivered steer");
+    mark_steer_delivered(&state.run_root, &delivered.identity(), "turn_2").expect("mark delivered");
+    append_steer(
+        &state.run_root,
+        SteerSource::Tui,
+        "focus on the failing integration test",
+    )
+    .expect("append pending steer");
+
+    let output = deadreckon(&paths)
+        .current_dir(&state.cwd)
+        .args(["attach", &state.run_id, "--plain"])
+        .output()
+        .expect("attach");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(
+        out.contains("steer delivered (turn turn_2): keep the public API stable"),
+        "{out}"
+    );
+    assert!(
+        out.contains("steer pending: focus on the failing integration test"),
+        "{out}"
+    );
+    assert!(
+        out.contains("1 pending steer waiting for delivery"),
+        "{out}"
+    );
 }
 
 fn state(temp: &TempDir, status: RunStatus) -> (DeadreckonPaths, deadreckon_core::PipelineState) {

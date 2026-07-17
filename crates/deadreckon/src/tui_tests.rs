@@ -4,8 +4,8 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::commands::attach::{
-    attach_should_quit, attach_should_return_to_plan, run_narrative_json_text,
-    run_narrative_plain_text,
+    attach_should_quit, attach_should_return_to_plan, dispatch_run_command_mode,
+    run_narrative_json_text, run_narrative_plain_text,
 };
 use super::commands::attach_runtime::{
     AttachIdleBackoff, AttachLoopStage, AttachNarrativeRefreshState, AttachPlanNarrativeRefreshJob,
@@ -6830,6 +6830,73 @@ fn command_table_contains_only_existing_verbs() {
         table
             .iter()
             .all(|spec| spec.cli_command.is_some() || matches!(spec.verb, "motion" | "q"))
+    );
+}
+
+#[test]
+fn colon_steer_appends_to_inbox_from_attach() {
+    let (_temp, mut state) = doc_preview_state();
+    state.status = RunStatus::Executing;
+    state.provider = Some("cli:codex-server".to_string());
+    let mut tui_state = AttachTuiState::default();
+
+    assert!(
+        tui_state
+            .handle_run_command_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE))
+            .is_none()
+    );
+    let modal =
+        render_attach_text_with_tui_state(&state, &[], &AttachLive::default(), tui_state.clone());
+    assert!(modal.contains(":steer <instruction>"), "{modal}");
+    let footer = footer_for_state(&state, &tui_state);
+    assert!(footer.contains(": steer"), "{footer}");
+    for ch in "steer focus on the failing integration test".chars() {
+        assert!(
+            tui_state
+                .handle_run_command_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .is_none()
+        );
+    }
+    let action = tui_state
+        .handle_run_command_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("steer action");
+
+    dispatch_run_command_mode(&state, action).expect("dispatch :steer");
+
+    let inbox = deadreckon_core::steer_inbox::read_steer_inbox(&state.run_root).expect("inbox");
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(
+        inbox[0].source,
+        deadreckon_core::steer_inbox::SteerSource::Tui
+    );
+    assert_eq!(inbox[0].text, "focus on the failing integration test");
+}
+
+#[test]
+fn steer_verb_absent_from_non_run_surfaces() {
+    let run_help = help_overlay_lines(AttachHelpMode::Run)
+        .into_iter()
+        .map(|(key, action)| format!("{key} {action}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(run_help.contains(":steer <instruction>"), "{run_help}");
+
+    for mode in [
+        AttachHelpMode::Plan,
+        AttachHelpMode::Campaign,
+        AttachHelpMode::Chain,
+    ] {
+        let help = help_overlay_lines(mode)
+            .into_iter()
+            .map(|(key, action)| format!("{key} {action}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!help.contains(":steer"), "{mode:?}: {help}");
+    }
+    assert!(
+        attach_command_table()
+            .iter()
+            .all(|spec| spec.verb != "steer")
     );
 }
 

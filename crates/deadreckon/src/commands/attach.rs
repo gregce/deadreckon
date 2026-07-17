@@ -6,9 +6,9 @@ use crate::tui::surfaces::chain::{chain_narrative_json_text, chain_narrative_pla
 use crate::tui::tree::NodeId;
 use crate::tui::{
     AttachActionNotice, AttachHelpMode, AttachParentPlan, AttachTuiState, MotionPolicy,
-    RunNarrativeRenderInput, attach_panel_counts, build_run_narrative_projection,
-    render_help_overlay, run_narrative_projection, toggle_attach_view, why_for_run,
-    why_plain_lines,
+    RunCommandModeAction, RunNarrativeRenderInput, attach_panel_counts,
+    build_run_narrative_projection, render_help_overlay, run_narrative_projection,
+    toggle_attach_view, why_for_run, why_plain_lines,
 };
 
 #[derive(Debug)]
@@ -232,7 +232,40 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     } else {
         print_run_summary(&state);
     }
+    print_steer_inbox_state(&state)?;
     Ok(())
+}
+
+fn print_steer_inbox_state(state: &deadreckon_core::PipelineState) -> Result<()> {
+    for entry in deadreckon_core::steer_inbox::read_steer_inbox(&state.run_root)? {
+        let text = one_line(&entry.text, 120);
+        match entry.status {
+            deadreckon_core::steer_inbox::SteerStatus::Pending => {
+                println!("steer pending: {text}");
+            }
+            deadreckon_core::steer_inbox::SteerStatus::Delivered => {
+                let turn_id = entry.delivered_turn_id.as_deref().unwrap_or("unknown");
+                println!("steer delivered (turn {turn_id}): {text}");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn dispatch_run_command_mode(
+    state: &deadreckon_core::PipelineState,
+    action: RunCommandModeAction,
+) -> Result<String> {
+    match action {
+        RunCommandModeAction::Steer(text) => {
+            commands::steer::queue_steer_for_state(
+                state,
+                deadreckon_core::steer_inbox::SteerSource::Tui,
+                text,
+            )?;
+            Ok("delivery will begin on the active or next Codex turn".to_string())
+        }
+    }
 }
 
 pub(crate) fn run_why_plain_text(state: &deadreckon_core::PipelineState) -> Result<String> {
@@ -1054,6 +1087,24 @@ async fn attach_tui_with_parent(
                 }
             }
             match event {
+                Event::Key(key)
+                    if tui_state.run_command_modal_is_open()
+                        || (key.code == KeyCode::Char(':') && key.modifiers.is_empty()) =>
+                {
+                    if let Some(action) = tui_state.handle_run_command_key(key) {
+                        match dispatch_run_command_mode(&state, action) {
+                            Ok(notice) => {
+                                tui_state.open_run_command_notice("steer queued", notice);
+                            }
+                            Err(err) => {
+                                tui_state.open_run_command_notice(
+                                    "steer failed",
+                                    one_line(&err.to_string(), 96),
+                                );
+                            }
+                        }
+                    }
+                }
                 Event::Key(key)
                     if run_attach_exit(tui_state.parent_plan.is_some(), key).is_some() =>
                 {

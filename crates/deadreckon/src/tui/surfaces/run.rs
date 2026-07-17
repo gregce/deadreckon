@@ -1,4 +1,6 @@
-use crate::tui::attach_state::{AttachPanel, AttachTuiState, attach_panel_layout};
+use crate::tui::attach_state::{
+    AttachPanel, AttachTuiState, attach_panel_layout, render_run_command_modal,
+};
 use crate::tui::effects::EffectTrigger;
 use crate::tui::panes::activity::{
     attach_activity_lines_for_tui, panel_border_style, panel_title, render_live_files,
@@ -164,6 +166,7 @@ pub(crate) fn render_attach(
         ]),
         layout.footer,
     );
+    render_run_command_modal(frame, tui_state);
 }
 
 fn render_active_effects(

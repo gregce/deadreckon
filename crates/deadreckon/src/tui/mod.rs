@@ -11,7 +11,7 @@ pub(crate) mod why;
 
 pub(crate) use attach_state::{
     AttachActionNotice, AttachCampaignParent, AttachPanel, AttachParentPlan, AttachTuiState,
-    attach_panel_counts, attach_panel_layout, toggle_attach_view,
+    RunCommandModeAction, attach_panel_counts, attach_panel_layout, toggle_attach_view,
 };
 pub(crate) use effects::MotionPolicy;
 #[cfg(test)]
