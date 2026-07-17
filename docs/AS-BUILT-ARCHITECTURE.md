@@ -3346,12 +3346,13 @@ detail toggles. `?` renders sectioned per-surface help, and footers lead with
 the focused context while preserving detach on narrow terminals. A first-session
 cue points at panes, why, and command mode.
 
-Chain attach owns the in-frame modal/input path today: kill confirm, extend
+Chain attach owns the general in-frame modal/input path: kill confirm, extend
 input, and `:` command mode are ratatui modals backed by `tui-textarea`.
-Command mode is a fixed table of existing verbs only (`attach`, `kill`,
+Its fixed table contains the existing chain verbs only (`attach`, `kill`,
 `motion`, `q`, `reshape`, `resume`, `verdict`, `why`), with confirm preserved
 for dispatching/destructive paths and nearest-match `try:` guidance for unknown
-commands.
+commands. Rudder (§51) adds a separate run-only `:steer <instruction>` modal.
+Plan, campaign and chain surfaces do not advertise or accept `:steer`.
 
 ### 47.5 Why and Timeline
 
@@ -3562,9 +3563,95 @@ Per-provider contract table:
 | output schema | `--output-schema <file>` | caveat (not wired) |
 
 Semaphore does not touch the app-server route, steering, interrupts, or
-approvals (Rudder), nor metered pricing for subscription CLIs. It only kept the
-machinery contract-shaped for the generic fleet; Pennant adds descriptor
-contracts in §55.
+approvals. Rudder layers those controls onto the per-run session foundation in
+§51. Semaphore only kept the machinery contract-shaped for the generic fleet;
+Pennant adds descriptor contracts in §55.
+
+## 51. Rudder: Steering the Running Child
+
+Rudder adds an explicit `cli:codex-server` route for operators who need to
+change the direction of a live Codex run. The route is opt-in and is not added
+to the default fallback order. It reuses Semaphore's per-run sidecar (§50), the
+existing sandbox and launch-plan capabilities, and Helm's run attach surface
+(§47). It adds no `PipelineState` field.
+
+### 51.1 Connection and thread model
+
+The route starts `codex app-server` as a supervised child and speaks newline-
+delimited JSON-RPC over stdin and stdout. It completes the
+`initialize`/`initialized` handshake, then uses `thread/start` for a new run or
+`thread/resume` when the run already has a Codex thread. Each provider instance
+keeps one child for its turns; there is no shared daemon, socket or cross-run
+server pool.
+
+`provider-session.json` stays at schema 1. For this route its existing
+`conversation_id` stores the Codex thread ID, while additive optional fields
+record `route`, `server_pid` and `active_turn_id`. Writes remain atomic. The
+active turn is set after `turn/start` and cleared after completion or failure,
+which gives kill a durable way to tell whether protocol interruption is
+possible. Child PIDs also use the existing supervised PID directory. Unknown
+server notifications are recorded in the response trace and do not fail a
+turn.
+
+### 51.2 Durable steering inbox
+
+Both `deadreckon steer <run-id> "instruction"` and the run-only Helm command
+`:steer <instruction>` validate that the run is executing on
+`cli:codex-server`. They append an entry to `<run_root>/steer-inbox.jsonl` with
+timestamp, source (`cli` or `tui`), text and `pending` status. The file is an
+append-only ledger. Reading it folds updates by timestamp and text to recover
+the effective pending or delivered state after a restart.
+
+Delivery is at-least-once. The provider sends pending entries with
+`turn/steer`, including the current `expectedTurnId`, once after `turn/start`
+and again while polling the live turn. It appends the `delivered` update only
+after the server returns the same turn ID. A stale-turn precondition or process
+loss leaves the entry pending so a later valid turn can retry it; neither path
+silently drops the instruction.
+
+Plain attach prints one `steer pending` or `steer delivered` line per effective
+entry. Pending entries also appear in the run status spine's attention answer.
+The `:steer` footer and help entry exist only on run attach; §47's chain command
+table is unchanged.
+
+### 51.3 Capability-answered approvals
+
+The app-server thread runs with `sandbox = workspace-write` and
+`approvalPolicy = on-request`. Deadreckon answers server approval requests from
+the run's existing capability posture, built from `sandbox.toml` and the parent
+launch plan's capability preview. It does not ask Codex to bypass those limits.
+
+| Server request | Allow | Deny |
+|---|---|---|
+| `item/commandExecution/requestApproval` for network | network is `full`, or an extracted host matches the allowlist | network is denied, the host cannot be determined, or it is not allowlisted |
+| `item/commandExecution/requestApproval` for global install | install capability is enabled | install capability is disabled |
+| other command execution | command stays inside the workspace-write sandbox | command cannot be determined |
+| `item/fileChange/requestApproval` | the grant root (defaulting to the working directory) is inside the working directory or an additional writable root | the grant root is outside the writable roots |
+
+Wire replies use Codex's `accept` or `decline` decision. Every answer also
+appends a `provider.approval` trace with the request kind, subject, capability,
+decision and reason. This replaces the former danger-full-access inversion
+with an auditable map that cannot widen the run's policy.
+
+### 51.4 Interrupt and degradation rules
+
+A normal `deadreckon kill` still writes the durable cancel marker first. When
+`provider-session.json` names an active app-server turn, the provider sends
+`turn/interrupt` and waits for `turn/completed` before the existing process
+termination path runs. If the protocol grace period fails, child supervision
+escalates to process kill. The explicit force-kill path remains the immediate
+operator override.
+
+If startup, the handshake or a live server request fails structurally, the
+provider uses the existing `cli:codex` exec driver and marks the server route
+degraded for the rest of that provider instance. The response still identifies
+the requested route and carries a `provider.route.degraded` caveat. The turn
+loop mirrors that caveat into run attention. Cancellation errors do not start a
+replacement exec turn.
+
+Fallback never marks a steer delivered. It records the pending count in the
+trace, keeps the ledger entries pending and names them in attach attention, so
+the operator can see that the run continued without accepting those directions.
 
 ## 55. Pennant: Descriptor-Declared Contracts
 
@@ -3661,4 +3748,4 @@ structured fixture before onboarding.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-16 for Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

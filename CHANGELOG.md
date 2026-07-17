@@ -1,5 +1,36 @@
 # Changelog
 
+## Rudder (stable) — steer the running child — 2026-07-16
+
+- `cli:codex-server` drives codex over its app-server: operator steering
+  (`deadreckon steer` / `:steer`) with a durable at-least-once inbox,
+  interrupt-before-kill, and capability-answered approvals replacing the
+  danger-full-access inversion; server loss degrades to the exec route.
+
+Every implementation phase passed `make verify`:
+
+- P1 (`731c907`): added the JSONL JSON-RPC client, initialize handshake and
+  explicit opt-in `cli:codex-server` route with exec fallback.
+- P2 (`e4df6b9`): supervised the app-server child, registered its PID and
+  guaranteed cleanup on provider drop.
+- P3 (`0a5bc0e`): persisted app-server thread identity, route and PID in the
+  existing per-run `provider-session.json` sidecar.
+- P4 (`be439d2`): completed real app-server turns with answer and token-usage
+  extraction, active-turn tracking and non-fatal unknown notifications.
+- P5 (`ab8d0b3`): added the durable append-only `steer-inbox.jsonl` ledger and
+  effective pending/delivered fold.
+- P6 (`f86fdff`): added `deadreckon steer` with live-run and route validation,
+  actionable refusals and pending-entry append.
+- P7 (`14f6402`): delivered pending and mid-turn steers with
+  `expectedTurnId`, marking them delivered only after a matching reply.
+- P8 (`a8319d1`): answered command and file approvals from the run's existing
+  capability posture and appended one audit trace for every decision.
+- P9 (`0ca9328`): mapped normal kill to interrupt, grace and process kill;
+  app-server loss now degrades to exec and leaves undelivered steers visible.
+- P10 (`efc22c3`): added run-only Helm `:steer`, run help/footer affordances,
+  plain-attach inbox state and pending-steer spine attention.
+- P11: documented AS-BUILT §51 and the remaining V1 boundaries.
+
 ## Pennant (stable) — contracts as descriptor data — 2026-07-16
 
 CLI provider wire contracts can now live in descriptor TOML. `[contract]`
