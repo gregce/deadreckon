@@ -1316,7 +1316,7 @@ fn acceptance_json_payload(value: &Value) -> Result<Option<AcceptanceDraft>> {
     }))
 }
 
-fn strip_code_fence(value: &str) -> String {
+pub(crate) fn strip_code_fence(value: &str) -> String {
     let trimmed = value.trim();
     if !trimmed.starts_with("```") {
         return trimmed.to_string();
@@ -1339,7 +1339,7 @@ fn extract_json_object(value: &str) -> Option<String> {
     Some(value[start..=end].to_string())
 }
 
-fn extract_fenced_block(value: &str, languages: &[&str]) -> Option<String> {
+pub(crate) fn extract_fenced_block(value: &str, languages: &[&str]) -> Option<String> {
     let mut in_block = false;
     let mut capture = false;
     let mut lines = Vec::new();

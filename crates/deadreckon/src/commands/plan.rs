@@ -555,26 +555,45 @@ fn planner_prompt(goal: &str, n: u8) -> String {
 }
 
 fn parse_planner_response(content: &str) -> Result<Vec<PlannerDraft>> {
-    if let Ok(object) = serde_json::from_str::<PlannerObjectDraft>(content) {
-        return Ok(object.tasks);
-    }
-    if let Ok(tasks) = serde_json::from_str::<Vec<PlannerDraft>>(content) {
-        return Ok(tasks);
-    }
-    if let Some(slice) = json_slice(content, '{', '}')
-        && let Ok(object) = serde_json::from_str::<PlannerObjectDraft>(slice)
-    {
-        return Ok(object.tasks);
-    }
-    if let Some(slice) = json_slice(content, '[', ']')
-        && let Ok(tasks) = serde_json::from_str::<Vec<PlannerDraft>>(slice)
-    {
-        return Ok(tasks);
+    // Providers rarely return bare JSON: cli:claude-code (and others) wrap the
+    // object in a ```json fence and often add prose around it. Try candidates in
+    // robustness order — the fenced block first (immune to surrounding prose),
+    // then the fence-stripped body, then the raw content, then the brace/bracket
+    // slice as a last resort — so a chatty answer no longer fails the plan.
+    for candidate in planner_json_candidates(content) {
+        if let Ok(object) = serde_json::from_str::<PlannerObjectDraft>(&candidate) {
+            return Ok(object.tasks);
+        }
+        if let Ok(tasks) = serde_json::from_str::<Vec<PlannerDraft>>(&candidate) {
+            return Ok(tasks);
+        }
     }
     Err(CliError::Core(deadreckon_core::user_error(
         "planner provider did not return a valid child JSON object",
         "deadreckon plan ... --planner-provider <other>",
     )))
+}
+
+/// Ordered JSON-bearing candidate strings from a provider's free-text answer.
+/// Reuses the same fence-aware extraction the acceptance-draft parser uses, so
+/// the planner is no longer defeated by a ```json block wrapped in prose.
+fn planner_json_candidates(content: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(block) = crate::commands::acceptance::extract_fenced_block(content, &["json"]) {
+        candidates.push(block);
+    }
+    let stripped = crate::commands::acceptance::strip_code_fence(content.trim());
+    if !stripped.is_empty() {
+        candidates.push(stripped);
+    }
+    candidates.push(content.to_string());
+    if let Some(slice) = json_slice(content, '{', '}') {
+        candidates.push(slice.to_string());
+    }
+    if let Some(slice) = json_slice(content, '[', ']') {
+        candidates.push(slice.to_string());
+    }
+    candidates
 }
 
 pub(crate) fn json_slice(content: &str, open: char, close: char) -> Option<&str> {
@@ -3095,6 +3114,32 @@ mod tests {
         // --no-narrate / --quiet still win regardless.
         assert!(!orchestrate_aggregate_enabled(false, false, false));
         assert!(!orchestrate_aggregate_enabled(true, true, false));
+    }
+
+    const PLAN_JSON: &str = r#"{"tasks":[{"subject":"scaffold","goal":"g0","active_form":"scaffolding","depends_on":[]},{"subject":"sync","goal":"g1","active_form":"syncing","depends_on":["task-0"]}]}"#;
+
+    #[test]
+    fn parse_planner_response_reads_bare_object() {
+        let tasks = parse_planner_response(PLAN_JSON).expect("bare object");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].depends_on, vec!["task-0".to_string()]);
+    }
+
+    #[test]
+    fn parse_planner_response_survives_fenced_json_with_surrounding_prose() {
+        // The real cli:claude-code failure shape: a ```json block wrapped in
+        // prose whose braces defeat the old first-{-to-last-} slice.
+        let content = format!(
+            "Here's the plan — I split it into two slices:\n\n```json\n{PLAN_JSON}\n```\n\ntask-0 unblocks task-1 {{like so}}."
+        );
+        let tasks = parse_planner_response(&content).expect("fence-aware parse");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].subject, "scaffold");
+    }
+
+    #[test]
+    fn parse_planner_response_rejects_non_json() {
+        assert!(parse_planner_response("I could not produce a plan.").is_err());
     }
 }
 
