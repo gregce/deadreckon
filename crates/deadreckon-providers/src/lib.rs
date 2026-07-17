@@ -8,6 +8,8 @@ mod claude_events;
 mod cli_common;
 mod cli_contract;
 mod cli_generic;
+#[allow(dead_code)]
+mod codex_app_server;
 mod codex_events;
 mod config;
 mod error;
