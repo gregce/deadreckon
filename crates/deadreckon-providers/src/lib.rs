@@ -8,7 +8,6 @@ mod claude_events;
 mod cli_common;
 mod cli_contract;
 mod cli_generic;
-#[allow(dead_code)]
 mod codex_app_server;
 mod codex_events;
 mod config;
@@ -74,6 +73,31 @@ api_key = "test"
         assert_eq!(router.routes().len(), 2);
         assert_eq!(router.routes()[0].kind(), ProviderKind::OpenAiCompatible);
         assert!(router.routes()[0].has_credential());
+    }
+
+    #[test]
+    fn codex_server_route_is_registered_but_not_a_default() {
+        let empty = || ProviderConfigFile {
+            default_provider: None,
+            fallback: None,
+            providers: std::collections::BTreeMap::new(),
+        };
+        let defaults = ProviderRouter::from_config(empty(), None).expect("default router");
+        assert!(
+            defaults
+                .routes()
+                .iter()
+                .all(|route| route.name() != "cli:codex-server")
+        );
+
+        let explicit = ProviderRouter::from_config(empty(), Some("cli:codex-server"))
+            .expect("explicit server route");
+        assert_eq!(explicit.routes().len(), 1);
+        assert_eq!(explicit.routes()[0].name(), "cli:codex-server");
+        assert_eq!(
+            explicit.routes()[0].kind(),
+            ProviderKind::Generic("cli:codex-server".to_string())
+        );
     }
 
     #[test]

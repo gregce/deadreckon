@@ -35,6 +35,10 @@ const BUILTIN_DESCRIPTOR_SOURCES: &[(&str, &str)] = &[
         include_str!("../../descriptors/cli-codex.toml"),
     ),
     (
+        "cli:codex-server",
+        include_str!("../../descriptors/cli-codex-server.toml"),
+    ),
+    (
         "cli:gemini",
         include_str!("../../descriptors/cli-gemini.toml"),
     ),

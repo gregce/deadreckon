@@ -115,7 +115,7 @@ impl CliCodexProvider {
         Ok(CodexAttempt { output, args })
     }
 
-    async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+    pub(crate) async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let caps = probe_codex_capabilities(&self.binary);
         let session_dir = request.session_dir.clone();
         let session = session_dir

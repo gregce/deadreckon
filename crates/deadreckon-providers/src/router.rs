@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::cli_claude_code::CliClaudeCodeProvider;
 use crate::cli_codex::CliCodexProvider;
 use crate::cli_generic::GenericCliProvider;
+use crate::codex_app_server::CliCodexServerProvider;
 use crate::config::{
     CatalogEntrySource, apply_catalog_to_provider_entry, kind_from_name, merge_provider_entry,
     provider_entries_from_registry, read_config,
@@ -311,6 +312,9 @@ fn build_provider(
         ProviderKind::ScriptedSmoke => Ok(Box::new(ScriptedSmokeProvider::new())),
         ProviderKind::Anthropic | ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => {
             Ok(Box::new(ProviderAdapter::new(name, kind, entry)))
+        }
+        ProviderKind::Generic(id) if id == "cli:codex-server" || name == "cli:codex-server" => {
+            Ok(Box::new(CliCodexServerProvider::new(name, entry)))
         }
         ProviderKind::Generic(id) => {
             let descriptor = registry

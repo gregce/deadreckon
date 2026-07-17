@@ -2,14 +2,21 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+use which::which;
 
+use crate::cli_codex::CliCodexProvider;
 use crate::cli_contract::ProviderSession;
 use crate::cli_contract::add_caveat;
-use crate::{ProviderError, Result};
+use crate::{
+    Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
+    ProviderResponse, ProviderUsage, Result, SpendEstimate,
+};
 
 const KNOWN_NOTIFICATIONS: &[&str] = &[
     "turn/started",
@@ -341,7 +348,16 @@ pub(crate) struct CodexAppServer {
     child: Child,
     rpc: ChildRpcClient,
     cwd: PathBuf,
+    thread_id: Option<String>,
     pid_file: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ServerTurn {
+    pub(crate) turn_id: String,
+    pub(crate) content: String,
+    pub(crate) usage: ProviderUsage,
+    pub(crate) unknown_notifications: Vec<String>,
 }
 
 impl CodexAppServer {
@@ -388,6 +404,7 @@ impl CodexAppServer {
             child,
             rpc: RpcClient::new(spec.provider, BufReader::new(stdout), stdin),
             cwd: spec.cwd,
+            thread_id: None,
             pid_file: spec.pid_file,
         };
         server.initialize().await?;
@@ -423,11 +440,14 @@ impl CodexAppServer {
 
     pub(crate) async fn ensure_thread(
         &mut self,
-        session_dir: &Path,
+        session_dir: Option<&Path>,
         model: Option<&str>,
     ) -> Result<String> {
         const ROUTE: &str = "cli:codex-server";
-        let prior = ProviderSession::read(session_dir, ROUTE);
+        if let Some(thread_id) = self.thread_id.as_ref() {
+            return Ok(thread_id.clone());
+        }
+        let prior = session_dir.and_then(|dir| ProviderSession::read(dir, ROUTE));
         let (method, mut params) = match prior.as_ref() {
             Some(session) => (
                 "thread/resume",
@@ -477,9 +497,166 @@ impl CodexAppServer {
         session.touch(now);
         session.route = Some(ROUTE.to_string());
         session.server_pid = self.pid();
-        session.write(session_dir)?;
+        if let Some(session_dir) = session_dir {
+            session.write(session_dir)?;
+        }
+        self.thread_id = Some(thread_id.clone());
         Ok(thread_id)
     }
+
+    pub(crate) async fn run_turn(
+        &mut self,
+        session_dir: Option<&Path>,
+        thread_id: &str,
+        prompt: &str,
+        output_schema: Option<&Value>,
+    ) -> Result<ServerTurn> {
+        const ROUTE: &str = "cli:codex-server";
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt, "textElements": []}]
+        });
+        if let Some(schema) = output_schema {
+            params["outputSchema"] = schema.clone();
+        }
+        let result = self
+            .rpc
+            .request("turn/start", params, &mut default_server_request)
+            .await?;
+        let turn_id = result
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| ProviderError::Cli {
+                provider: ROUTE.to_string(),
+                detail: "app-server turn/start response omitted turn.id".to_string(),
+            })?
+            .to_string();
+        update_active_turn(session_dir, Some(&turn_id))?;
+
+        let outcome = self.read_turn(thread_id, &turn_id).await;
+        let cleared = update_active_turn(session_dir, None);
+        match (outcome, cleared) {
+            (Ok(turn), Ok(())) => Ok(turn),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+        }
+    }
+
+    async fn read_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<ServerTurn> {
+        const ROUTE: &str = "cli:codex-server";
+        let mut usage = ProviderUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let mut content = None;
+        loop {
+            let notification = self
+                .rpc
+                .next_notification(&mut default_server_request)
+                .await?;
+            match notification.method.as_str() {
+                "thread/tokenUsage/updated" => {
+                    if notification
+                        .params
+                        .pointer("/threadId")
+                        .and_then(Value::as_str)
+                        == Some(thread_id)
+                    {
+                        usage.input_tokens = notification
+                            .params
+                            .pointer("/tokenUsage/last/inputTokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(usage.input_tokens);
+                        usage.output_tokens = notification
+                            .params
+                            .pointer("/tokenUsage/last/outputTokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(usage.output_tokens);
+                    }
+                }
+                "item/completed" => {
+                    let item = notification.params.pointer("/item");
+                    if notification
+                        .params
+                        .pointer("/turnId")
+                        .and_then(Value::as_str)
+                        == Some(turn_id)
+                        && item
+                            .and_then(|item| item.get("type"))
+                            .and_then(Value::as_str)
+                            == Some("agentMessage")
+                        && let Some(text) = item
+                            .and_then(|item| item.get("text"))
+                            .and_then(Value::as_str)
+                    {
+                        content = Some(text.to_string());
+                    }
+                }
+                "turn/completed" => {
+                    let turn = notification.params.pointer("/turn");
+                    if turn.and_then(|turn| turn.get("id")).and_then(Value::as_str) != Some(turn_id)
+                    {
+                        continue;
+                    }
+                    let status = turn
+                        .and_then(|turn| turn.get("status"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed");
+                    if status != "completed" {
+                        let detail = turn
+                            .and_then(|turn| turn.pointer("/error/message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("app-server turn did not complete");
+                        return Err(ProviderError::Cli {
+                            provider: ROUTE.to_string(),
+                            detail: format!("app-server turn {status}: {detail}"),
+                        });
+                    }
+                    let content =
+                        content
+                            .filter(|text| !text.trim().is_empty())
+                            .ok_or_else(|| ProviderError::Cli {
+                                provider: ROUTE.to_string(),
+                                detail: "app-server completed without a final agent message"
+                                    .to_string(),
+                            })?;
+                    return Ok(ServerTurn {
+                        turn_id: turn_id.to_string(),
+                        content,
+                        usage,
+                        unknown_notifications: self.rpc.unknown_notifications().to_vec(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn default_server_request(method: &str, _params: &Value) -> Result<Value> {
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            Ok(json!({"decision": "decline"}))
+        }
+        _ => Err(ProviderError::Cli {
+            provider: "cli:codex-server".to_string(),
+            detail: format!("unsupported app-server request: {method}"),
+        }),
+    }
+}
+
+fn update_active_turn(session_dir: Option<&Path>, turn_id: Option<&str>) -> Result<()> {
+    const ROUTE: &str = "cli:codex-server";
+    let Some(session_dir) = session_dir else {
+        return Ok(());
+    };
+    let Some(mut session) = ProviderSession::read(session_dir, ROUTE) else {
+        return Ok(());
+    };
+    session.active_turn_id = turn_id.map(str::to_string);
+    session.touch(chrono::Utc::now());
+    session.write(session_dir)
 }
 
 impl Drop for CodexAppServer {
@@ -511,8 +688,197 @@ pub(crate) async fn start_server_or_degrade(spec: CodexAppServerSpec) -> ServerS
     }
 }
 
+pub(crate) struct CliCodexServerProvider {
+    name: String,
+    binary: String,
+    extra_args: Vec<String>,
+    model: String,
+    model_arg: Option<String>,
+    fallback: CliCodexProvider,
+    server: Mutex<Option<Box<CodexAppServer>>>,
+}
+
+impl CliCodexServerProvider {
+    pub(crate) fn new(name: impl Into<String>, entry: ProviderEntry) -> Self {
+        let name = name.into();
+        let binary = entry.binary.clone().unwrap_or_else(|| "codex".to_string());
+        let (model, model_arg) = server_model(entry.model.clone());
+        let mut fallback_entry = entry.clone();
+        fallback_entry.model = model_arg.clone();
+        fallback_entry.extra_args.clear();
+        Self {
+            name,
+            binary,
+            extra_args: entry.extra_args,
+            model,
+            model_arg,
+            fallback: CliCodexProvider::new("cli:codex", fallback_entry),
+            server: Mutex::new(None),
+        }
+    }
+
+    async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+        let started = Instant::now();
+        let cwd = request
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let mut server_slot = self.server.lock().await;
+        if server_slot.is_none() {
+            match start_server_or_degrade(CodexAppServerSpec {
+                provider: self.name.clone(),
+                binary: self.binary.clone(),
+                extra_args: self.extra_args.clone(),
+                cwd,
+                pid_file: request.pid_file.clone(),
+            })
+            .await
+            {
+                ServerStart::Ready(server) => *server_slot = Some(server),
+                ServerStart::Degraded { trace } => {
+                    drop(server_slot);
+                    return self.run_fallback(request, trace).await;
+                }
+            }
+        }
+        let server = server_slot.as_mut().ok_or_else(|| ProviderError::Cli {
+            provider: self.name.clone(),
+            detail: "app-server was not retained after startup".to_string(),
+        })?;
+        let thread_id = server
+            .ensure_thread(request.session_dir.as_deref(), self.model_arg.as_deref())
+            .await?;
+        let pid = server.pid();
+        let turn = server
+            .run_turn(
+                request.session_dir.as_deref(),
+                &thread_id,
+                &request.prompt,
+                request.output_schema.as_ref(),
+            )
+            .await?;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        if let Some(path) = request.output_path.as_ref() {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|source| ProviderError::Io {
+                        path: parent.display().to_string(),
+                        source,
+                    })?;
+            }
+            tokio::fs::write(path, &turn.content)
+                .await
+                .map_err(|source| ProviderError::Io {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+        }
+        let spend = self
+            .estimate_spend(turn.usage.clone())
+            .with_wall_time(started.elapsed().as_secs_f64());
+        Ok(ProviderResponse {
+            provider: self.name.clone(),
+            model: self.model.clone(),
+            content: turn.content,
+            usage: turn.usage,
+            spend,
+            trace: json!({
+                "kind": "cli_subagent",
+                "route": self.name,
+                "transport": "app-server-stdio-jsonl",
+                "binary": self.binary,
+                "pid": pid,
+                "thread_id": thread_id,
+                "turn_id": turn.turn_id,
+                "duration_ms": duration_ms,
+                "stdout_path": request.output_path,
+                "unknown_notifications": turn.unknown_notifications,
+                "flight_rows": [],
+            }),
+        })
+    }
+
+    async fn run_fallback(
+        &self,
+        request: &ProviderRequest,
+        degraded_trace: Value,
+    ) -> Result<ProviderResponse> {
+        let mut response = self.fallback.run(request).await?;
+        response.provider = self.name.clone();
+        response.trace["requested_route"] = Value::String(self.name.clone());
+        response.trace["degraded_from"] = degraded_trace;
+        add_caveat(
+            &mut response.trace,
+            "provider.route.degraded",
+            "codex app-server was unavailable; used cli:codex exec",
+        );
+        Ok(response)
+    }
+}
+
+impl Provider for CliCodexServerProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Generic("cli:codex-server".to_string())
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn has_credential(&self) -> bool {
+        which(&self.binary).is_ok() || PathBuf::from(&self.binary).exists()
+    }
+
+    fn estimate_spend(&self, usage: ProviderUsage) -> SpendEstimate {
+        SpendEstimate {
+            provider: self.name.clone(),
+            model: self.model.clone(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cost_usd: 0.0,
+            subscription: true,
+            wall_time_seconds: None,
+        }
+    }
+
+    fn complete<'a>(&'a self, request: &'a ProviderRequest) -> ProviderFuture<'a> {
+        Box::pin(async move { self.run(request).await })
+    }
+}
+
+fn server_model(model: Option<String>) -> (String, Option<String>) {
+    match model {
+        Some(model)
+            if model.trim().is_empty()
+                || model == "provider default"
+                || model == "cli:codex-server" =>
+        {
+            ("provider default".to_string(), None)
+        }
+        Some(model) => (model.clone(), Some(model)),
+        None => ("provider default".to_string(), None),
+    }
+}
+
+trait WithWallTime {
+    fn with_wall_time(self, seconds: f64) -> Self;
+}
+
+impl WithWallTime for SpendEstimate {
+    fn with_wall_time(mut self, seconds: f64) -> Self {
+        self.wall_time_seconds = Some(seconds);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -522,6 +888,9 @@ mod tests {
 
     use super::{CodexAppServerSpec, RpcClient, ServerStart, start_server_or_degrade};
     use crate::cli_contract::ProviderSession;
+    use crate::{
+        ProviderConfigFile, ProviderEntry, ProviderRequest, ProviderRouter, ProviderUsage,
+    };
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -676,7 +1045,7 @@ mod tests {
             panic!("first server")
         };
         let first_id = first
-            .ensure_thread(temp.path(), None)
+            .ensure_thread(Some(temp.path()), None)
             .await
             .expect("start thread");
         assert_eq!(first_id, "thread-fixture");
@@ -691,13 +1060,122 @@ mod tests {
             panic!("second server")
         };
         let resumed_id = second
-            .ensure_thread(temp.path(), None)
+            .ensure_thread(Some(temp.path()), None)
             .await
             .expect("resume thread");
         assert_eq!(resumed_id, "thread-fixture");
         let calls = std::fs::read_to_string(log).expect("rpc log");
         assert!(calls.contains("thread/start"));
         assert!(calls.contains("thread/resume"));
+    }
+
+    #[tokio::test]
+    async fn server_turn_completes_with_real_usage() {
+        let temp = TempDir::new().expect("tempdir");
+        let ServerStart::Ready(mut server) = start_server_or_degrade(CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["normal".to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+        })
+        .await
+        else {
+            panic!("server")
+        };
+        let thread_id = server
+            .ensure_thread(Some(temp.path()), None)
+            .await
+            .expect("thread");
+
+        let turn = server
+            .run_turn(Some(temp.path()), &thread_id, "finish the task", None)
+            .await
+            .expect("turn");
+
+        assert_eq!(turn.turn_id, "turn-fixture");
+        assert_eq!(turn.content, "fixture answer");
+        assert_eq!(turn.usage.input_tokens, 321);
+        assert_eq!(turn.usage.output_tokens, 45);
+        let session = ProviderSession::read(temp.path(), "cli:codex-server").expect("session");
+        assert_eq!(session.active_turn_id, None);
+    }
+
+    #[tokio::test]
+    async fn turn_failed_surfaces_provider_error() {
+        let temp = TempDir::new().expect("tempdir");
+        let ServerStart::Ready(mut server) = start_server_or_degrade(CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["turn-failed".to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+        })
+        .await
+        else {
+            panic!("server")
+        };
+        let thread_id = server
+            .ensure_thread(Some(temp.path()), None)
+            .await
+            .expect("thread");
+
+        let error = server
+            .run_turn(Some(temp.path()), &thread_id, "fail this turn", None)
+            .await
+            .expect_err("failed turn");
+
+        assert!(error.to_string().contains("fixture turn failed"));
+    }
+
+    #[tokio::test]
+    async fn explicit_server_provider_route_round_trips() {
+        let temp = TempDir::new().expect("tempdir");
+        let router = ProviderRouter::from_config(
+            ProviderConfigFile {
+                default_provider: Some("cli:codex-server".to_string()),
+                fallback: None,
+                providers: BTreeMap::from([(
+                    "cli:codex-server".to_string(),
+                    ProviderEntry {
+                        kind: None,
+                        api_key: None,
+                        api_key_env: None,
+                        base_url: None,
+                        model: None,
+                        input_cost_per_million: None,
+                        output_cost_per_million: None,
+                        binary: Some(fixture().display().to_string()),
+                        extra_args: vec!["normal".to_string()],
+                    },
+                )]),
+            },
+            None,
+        )
+        .expect("router");
+
+        let response = router
+            .complete(&ProviderRequest {
+                prompt: "finish the task".to_string(),
+                cwd: Some(temp.path().to_path_buf()),
+                output_path: Some(temp.path().join("turns/turn-1/codex-server.out")),
+                pid_file: Some(temp.path().join("child-pids/provider-turn-1.pid")),
+                session_dir: Some(temp.path().to_path_buf()),
+                ..ProviderRequest::default()
+            })
+            .await
+            .expect("response");
+
+        assert_eq!(response.provider, "cli:codex-server");
+        assert_eq!(response.content, "fixture answer");
+        assert_eq!(
+            response.usage,
+            ProviderUsage {
+                input_tokens: 321,
+                output_tokens: 45
+            }
+        );
+        assert_eq!(response.trace["transport"], "app-server-stdio-jsonl");
     }
 
     #[test]
