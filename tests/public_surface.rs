@@ -7,6 +7,10 @@ use std::path::PathBuf;
 const LIB_CRATES: &[(&str, &str)] = &[
     ("deadreckon-core", "crates/deadreckon-core/src/lib.rs"),
     (
+        "deadreckon-protocol",
+        "crates/deadreckon-protocol/src/lib.rs",
+    ),
+    (
         "deadreckon-providers",
         "crates/deadreckon-providers/src/lib.rs",
     ),
@@ -21,18 +25,18 @@ const LIB_CRATES: &[(&str, &str)] = &[
 ];
 
 #[test]
-fn public_surface_set_matches_pre_rider_head() {
+fn public_surface_set_matches_checked_in_baseline() {
     let root = workspace_root();
     let expected = parse_baseline(&root.join("tests/.public-surface-baseline"));
     let actual = current_public_surface(&root);
     assert_eq!(
         expected, actual,
-        "public re-export set drifted; this rider may only regroup lib.rs exports"
+        "public re-export set drifted; update the baseline with the intentional visibility change"
     );
 }
 
 #[test]
-fn public_surface_baseline_lists_all_four_library_crates() {
+fn public_surface_baseline_lists_all_five_library_crates() {
     let root = workspace_root();
     let baseline = parse_baseline(&root.join("tests/.public-surface-baseline"));
     let crates = baseline.keys().cloned().collect::<BTreeSet<_>>();
