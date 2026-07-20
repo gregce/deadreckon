@@ -25,6 +25,16 @@ fn drift_message(detail: &str) -> String {
 }
 
 #[test]
+fn schema_drift_failure_names_update_command() {
+    let message = drift_message("schema drifted");
+    assert!(message.contains(UPDATE_COMMAND), "{message}");
+
+    let readme = fs::read_to_string(schemas_dir().join("README.md"))
+        .expect("docs/schemas/README.md must explain checked schema regeneration");
+    assert!(readme.contains(UPDATE_COMMAND), "{readme}");
+}
+
+#[test]
 fn generated_schemas_match_checked_in_files() {
     let schemas = all_schemas();
     let expected_names = schemas

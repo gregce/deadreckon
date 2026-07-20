@@ -1,0 +1,998 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AcceptanceCheckResult": {
+      "properties": {
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "type": "string"
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "must_pass": {
+          "type": "boolean"
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "stderr": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stdout": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "detail",
+        "kind",
+        "must_pass",
+        "passed"
+      ],
+      "type": "object"
+    },
+    "AcceptanceMarker": {
+      "properties": {
+        "check_count": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "checked_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "checks": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/AcceptanceCheckResult"
+          },
+          "type": "array"
+        },
+        "produced_by": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "signature": {
+          "default": "",
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "working_dir": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "checked_at",
+        "produced_by",
+        "run_id",
+        "schema_version",
+        "status",
+        "working_dir"
+      ],
+      "type": "object"
+    },
+    "AcceptanceTamper": {
+      "properties": {
+        "caveats": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "covered_files_touched": {
+          "items": {
+            "$ref": "#/definitions/CoveredFileTouch"
+          },
+          "type": "array"
+        },
+        "evaluated_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "lint_findings": {
+          "items": {
+            "$ref": "#/definitions/SuppressionFinding"
+          },
+          "type": "array"
+        },
+        "refusal_reasons": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "spec_modified": {
+          "type": "boolean"
+        },
+        "verdict": {
+          "$ref": "#/definitions/AcceptanceTamperVerdict"
+        }
+      },
+      "required": [
+        "caveats",
+        "covered_files_touched",
+        "evaluated_at",
+        "lint_findings",
+        "refusal_reasons",
+        "run_id",
+        "schema_version",
+        "spec_modified",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "AcceptanceTamperVerdict": {
+      "enum": [
+        "clean",
+        "caveat",
+        "refuse"
+      ],
+      "type": "string"
+    },
+    "Artifact": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "state"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "history"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "spend"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "traces"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "events"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "provenance"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "acceptance"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "sandbox"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "launch_plan"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "seams"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "proofs"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "gate_nonce"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "snapshot"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "doc"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/definitions/RunViewDocKind"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CheckOutcome": {
+      "properties": {
+        "index": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AcceptanceCheckResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "total": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "index",
+        "status",
+        "total"
+      ],
+      "type": "object"
+    },
+    "CoverageClassification": {
+      "enum": [
+        "test",
+        "target",
+        "build",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "CoveredFileTouch": {
+      "properties": {
+        "by_check": {
+          "type": "string"
+        },
+        "change": {
+          "$ref": "#/definitions/TouchedChange"
+        },
+        "classification": {
+          "$ref": "#/definitions/CoverageClassification"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "by_check",
+        "change",
+        "classification",
+        "path"
+      ],
+      "type": "object"
+    },
+    "DiffSummary": {
+      "properties": {
+        "added": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "files": {
+          "items": {
+            "$ref": "#/definitions/FileDelta"
+          },
+          "type": "array"
+        },
+        "files_changed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "removed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "added",
+        "files",
+        "files_changed",
+        "removed"
+      ],
+      "type": "object"
+    },
+    "ExchangeRef": {
+      "properties": {
+        "index": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "preview": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "path",
+        "preview"
+      ],
+      "type": "object"
+    },
+    "FileDelta": {
+      "properties": {
+        "added": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "removed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/definitions/FileDeltaStatus"
+        },
+        "unified_diff": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "added",
+        "path",
+        "removed",
+        "status"
+      ],
+      "type": "object"
+    },
+    "FileDeltaStatus": {
+      "enum": [
+        "added",
+        "removed",
+        "modified"
+      ],
+      "type": "string"
+    },
+    "Money": {
+      "properties": {
+        "input_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "wall_seconds": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "usd",
+        "wall_seconds"
+      ],
+      "type": "object"
+    },
+    "ProofBand": {
+      "properties": {
+        "checks": {
+          "items": {
+            "$ref": "#/definitions/AcceptanceCheckResult"
+          },
+          "type": "array"
+        },
+        "marker": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AcceptanceMarker"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "marker_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "marker_valid": {
+          "type": "boolean"
+        },
+        "progress_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tamper": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AcceptanceTamper"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tamper_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "checks",
+        "marker_valid"
+      ],
+      "type": "object"
+    },
+    "RunIdentity": {
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "short": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "scope",
+        "short"
+      ],
+      "type": "object"
+    },
+    "RunStatus": {
+      "enum": [
+        "pending",
+        "planned",
+        "executing",
+        "completed",
+        "failed",
+        "killed"
+      ],
+      "type": "string"
+    },
+    "RunViewDocKind": {
+      "enum": [
+        "narrative",
+        "as_built",
+        "decisions",
+        "delta"
+      ],
+      "type": "string"
+    },
+    "SandboxEvent": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "raw": true,
+        "summary": {
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "raw",
+        "summary",
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "SandboxFact": {
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "fallback_note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tools": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "backend",
+        "tools"
+      ],
+      "type": "object"
+    },
+    "SignatureFact": {
+      "properties": {
+        "marker_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/SignatureStatus"
+        },
+        "tamper_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tamper_verdict": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "SignatureStatus": {
+      "enum": [
+        "valid",
+        "invalid",
+        "absent"
+      ],
+      "type": "string"
+    },
+    "SpendBand": {
+      "properties": {
+        "input_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "subscription_turns": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "turns": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "wall_seconds": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "subscription_turns",
+        "total_usd",
+        "turns",
+        "wall_seconds"
+      ],
+      "type": "object"
+    },
+    "SuppressionFinding": {
+      "properties": {
+        "check_kind": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "check_kind",
+        "command",
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "TouchedChange": {
+      "enum": [
+        "modified",
+        "deleted",
+        "created"
+      ],
+      "type": "string"
+    },
+    "TurnView": {
+      "properties": {
+        "check": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CheckOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "did": {
+          "type": "string"
+        },
+        "diff": {
+          "$ref": "#/definitions/DiffSummary"
+        },
+        "exchange_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ExchangeRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "n": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "sandbox_events": {
+          "items": {
+            "$ref": "#/definitions/SandboxEvent"
+          },
+          "type": "array"
+        },
+        "spend_delta": {
+          "$ref": "#/definitions/Money"
+        }
+      },
+      "required": [
+        "did",
+        "diff",
+        "n",
+        "sandbox_events",
+        "spend_delta"
+      ],
+      "type": "object"
+    },
+    "VerdictBand": {
+      "properties": {
+        "state": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "WhyBand": {
+      "properties": {
+        "decision_refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "decisions_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "narrative_excerpt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "narrative_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "decision_refs"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "changed": {
+      "$ref": "#/definitions/DiffSummary"
+    },
+    "goal": {
+      "type": "string"
+    },
+    "id": {
+      "$ref": "#/definitions/RunIdentity"
+    },
+    "missing": {
+      "items": {
+        "$ref": "#/definitions/Artifact"
+      },
+      "type": "array"
+    },
+    "proof": {
+      "$ref": "#/definitions/ProofBand"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "sandbox": {
+      "$ref": "#/definitions/SandboxFact"
+    },
+    "signature": {
+      "$ref": "#/definitions/SignatureFact"
+    },
+    "spend": {
+      "$ref": "#/definitions/SpendBand"
+    },
+    "status": {
+      "$ref": "#/definitions/RunStatus"
+    },
+    "turns": {
+      "items": {
+        "$ref": "#/definitions/TurnView"
+      },
+      "type": "array"
+    },
+    "verdict": {
+      "$ref": "#/definitions/VerdictBand"
+    },
+    "wall_secs": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "why": {
+      "$ref": "#/definitions/WhyBand"
+    }
+  },
+  "required": [
+    "changed",
+    "goal",
+    "id",
+    "missing",
+    "proof",
+    "provider",
+    "sandbox",
+    "signature",
+    "spend",
+    "status",
+    "turns",
+    "verdict",
+    "why"
+  ],
+  "title": "RunView",
+  "type": "object"
+}

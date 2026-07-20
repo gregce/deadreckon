@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{RunEvent, RunEventKind, SpendRecord, TraceRecord};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -20,7 +21,7 @@ use crate::paths::DeadreckonPaths;
 use crate::state::{PipelineState, RunStatus, load_state, spend_summary};
 use crate::tamper::{AcceptanceTamper, acceptance_tamper_path_for_run_root};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RunView {
     pub id: RunIdentity,
     pub goal: String,
@@ -129,20 +130,20 @@ impl RunView {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RunIdentity {
     pub scope: String,
     pub run_id: String,
     pub short: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct VerdictBand {
     pub state: String,
     pub summary: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SignatureFact {
     pub status: SignatureStatus,
     pub marker_path: Option<PathBuf>,
@@ -150,7 +151,7 @@ pub struct SignatureFact {
     pub tamper_verdict: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SignatureStatus {
     Valid,
@@ -158,7 +159,7 @@ pub enum SignatureStatus {
     Absent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxFact {
     pub backend: String,
     pub path: Option<PathBuf>,
@@ -166,7 +167,7 @@ pub struct SandboxFact {
     pub fallback_note: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SpendBand {
     pub total_usd: f64,
     pub input_tokens: u64,
@@ -176,7 +177,7 @@ pub struct SpendBand {
     pub subscription_turns: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WhyBand {
     pub narrative_path: Option<PathBuf>,
     pub decisions_path: Option<PathBuf>,
@@ -184,7 +185,7 @@ pub struct WhyBand {
     pub decision_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TurnView {
     pub n: u32,
     pub did: String,
@@ -195,7 +196,7 @@ pub struct TurnView {
     pub sandbox_events: Vec<SandboxEvent>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Money {
     pub usd: f64,
     pub input_tokens: u64,
@@ -203,7 +204,7 @@ pub struct Money {
     pub wall_seconds: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CheckOutcome {
     pub status: String,
     pub index: usize,
@@ -211,14 +212,14 @@ pub struct CheckOutcome {
     pub result: Option<AcceptanceCheckResult>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ExchangeRef {
     pub path: PathBuf,
     pub index: usize,
     pub preview: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxEvent {
     pub timestamp: DateTime<Utc>,
     pub kind: String,
@@ -226,7 +227,7 @@ pub struct SandboxEvent {
     pub raw: Value,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ProofBand {
     pub marker_path: Option<PathBuf>,
     pub marker_valid: bool,
@@ -237,7 +238,7 @@ pub struct ProofBand {
     pub tamper: Option<AcceptanceTamper>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Artifact {
     State,
@@ -256,7 +257,7 @@ pub enum Artifact {
     Doc(RunViewDocKind),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RunViewDocKind {
     Narrative,

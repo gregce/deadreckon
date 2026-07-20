@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 #[cfg(test)]
 use deadreckon_protocol::spend_kind_loop;
 use deadreckon_protocol::{LedgerItem, SpendRecord, TraceRecord};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use walkdir::WalkDir;
@@ -25,7 +26,7 @@ pub struct ProvenanceRecord {
     pub files: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DiffSummary {
     pub files_changed: usize,
     pub added: usize,
@@ -44,7 +45,7 @@ impl DiffSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FileDelta {
     pub path: PathBuf,
     pub added: usize,
@@ -54,7 +55,7 @@ pub struct FileDelta {
     pub unified_diff: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FileDeltaStatus {
     Added,

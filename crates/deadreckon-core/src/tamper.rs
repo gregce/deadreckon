@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -18,7 +19,9 @@ use crate::gate::AcceptanceCheck;
 
 pub const ACCEPTANCE_TAMPER: &str = "acceptance-tamper.json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TouchedChange {
     Modified,
@@ -26,7 +29,9 @@ pub enum TouchedChange {
     Created,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageClassification {
     Test,
@@ -35,7 +40,7 @@ pub enum CoverageClassification {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AcceptanceTamperVerdict {
     Clean,
@@ -43,7 +48,7 @@ pub enum AcceptanceTamperVerdict {
     Refuse,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SuppressionFinding {
     pub check_kind: String,
     pub command: String,
@@ -58,7 +63,7 @@ pub struct CheckCoverage {
     pub directory: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CoveredFileTouch {
     pub path: String,
     pub change: TouchedChange,
@@ -66,7 +71,7 @@ pub struct CoveredFileTouch {
     pub classification: CoverageClassification,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AcceptanceTamper {
     pub schema_version: u32,
     pub run_id: String,

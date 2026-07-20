@@ -1758,7 +1758,10 @@ pub(crate) enum Commands {
         dest: Option<PathBuf>,
         #[arg(long, help = "Open the written report (interactive only)")]
         open: bool,
-        #[arg(long, help = "Emit the RunView JSON instead of writing a report")]
+        #[arg(
+            long,
+            help = "Emit RunView JSON (schema: docs/schemas/projections/run-view.schema.json)"
+        )]
         json: bool,
         #[arg(long, help = "Plain output without ANSI affordances")]
         plain: bool,
@@ -1780,7 +1783,7 @@ pub(crate) enum Commands {
         #[arg(
             long,
             value_name = "ARTIFACT",
-            help = "Dump a named run artifact verbatim"
+            help = "Dump a named run artifact verbatim (ledger schemas: docs/schemas/*.schema.json)"
         )]
         raw: Option<String>,
         #[arg(long, help = "Explain the most likely failure cause")]
