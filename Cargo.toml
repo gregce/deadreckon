@@ -2,6 +2,7 @@
 members = [
   "crates/deadreckon",
   "crates/deadreckon-core",
+  "crates/deadreckon-protocol",
   "crates/deadreckon-runtime",
   "crates/deadreckon-providers",
   "crates/deadreckon-sandbox",
@@ -25,6 +26,7 @@ clap_complete = "4.5"
 inquire = { version = "0.9.4", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 deadreckon-core = { path = "crates/deadreckon-core" }
+deadreckon-protocol = { path = "crates/deadreckon-protocol" }
 deadreckon-providers = { path = "crates/deadreckon-providers" }
 deadreckon-runtime = { path = "crates/deadreckon-runtime" }
 deadreckon-sandbox = { path = "crates/deadreckon-sandbox" }
@@ -40,6 +42,7 @@ semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_yaml = "0.9.34"
+schemars = { version = "0.8.22", features = ["chrono"] }
 sha2 = "0.10.9"
 similar = "2.7.0"
 tachyonfx = "0.25.0"

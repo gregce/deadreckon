@@ -1,0 +1,16 @@
+[package]
+name = "deadreckon-protocol"
+version.workspace = true
+edition.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

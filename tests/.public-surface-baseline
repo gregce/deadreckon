@@ -268,6 +268,10 @@ crate: deadreckon-providers
   types::ProviderRouteInfo
   types::ProviderUsage
   types::SpendEstimate
+crate: deadreckon-protocol
+  ids::PlanId
+  ids::RunId
+  ids::TurnId
 crate: deadreckon-runtime
   compaction::append_compaction_record
   compaction::COMPACTION_JSONL
