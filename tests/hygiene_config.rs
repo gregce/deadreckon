@@ -10,6 +10,7 @@ use serde_json::Value;
 const CRATE_MANIFESTS: &[&str] = &[
     "crates/deadreckon/Cargo.toml",
     "crates/deadreckon-core/Cargo.toml",
+    "crates/deadreckon-protocol/Cargo.toml",
     "crates/deadreckon-providers/Cargo.toml",
     "crates/deadreckon-runtime/Cargo.toml",
     "crates/deadreckon-sandbox/Cargo.toml",
@@ -17,6 +18,10 @@ const CRATE_MANIFESTS: &[&str] = &[
 
 const LIB_CRATES: &[(&str, &str)] = &[
     ("deadreckon-core", "crates/deadreckon-core/src/lib.rs"),
+    (
+        "deadreckon-protocol",
+        "crates/deadreckon-protocol/src/lib.rs",
+    ),
     (
         "deadreckon-providers",
         "crates/deadreckon-providers/src/lib.rs",
@@ -207,6 +212,7 @@ fn internal_crates_listed_in_workspace_dependencies() {
     let text = fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read Cargo.toml");
     for (name, path) in [
         ("deadreckon-core", "crates/deadreckon-core"),
+        ("deadreckon-protocol", "crates/deadreckon-protocol"),
         ("deadreckon-providers", "crates/deadreckon-providers"),
         ("deadreckon-runtime", "crates/deadreckon-runtime"),
         ("deadreckon-sandbox", "crates/deadreckon-sandbox"),

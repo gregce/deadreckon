@@ -684,6 +684,7 @@ name = "deadreckon-core"
 version = "0.6.0"
 dependencies = [
  "chrono",
+ "deadreckon-protocol",
  "fs2",
  "ignore",
  "nix",

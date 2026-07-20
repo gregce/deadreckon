@@ -1,0 +1,1 @@
+{"timestamp":"2026-07-01T12:00:01Z","turn":1,"provider":"cli:codex","model":"gpt-5.2-codex","input_tokens":120,"output_tokens":45,"cost_usd":0.01,"total_cost_usd":0.01,"cap_usd":1.0,"subscription":false,"estimated":true,"wall_time_seconds":2.5,"wall_time_cap_seconds":60.0,"kind":"loop"}
