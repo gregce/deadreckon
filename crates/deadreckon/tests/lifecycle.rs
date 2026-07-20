@@ -19,12 +19,12 @@ use deadreckon_core::flight::{
     build_working_file_index, capture_delta_checkpoint,
 };
 use deadreckon_core::{
-    CodebaseMode, CodebaseRecord, DeadreckonPaths, PhaseId, PhaseStatus, PipelineState,
-    RunEventKind, RunOptions, RunStatus, SpendRecord, TraceRecord, acquire_lock, append_spend,
-    append_trace, create_run, emit_event, list_runs, load_run, promote_completed_run,
-    read_codebase_record, save_state, snapshot_working, write_acceptance_marker,
-    write_codebase_record,
+    CodebaseMode, CodebaseRecord, DeadreckonPaths, PhaseId, PhaseStatus, PipelineState, RunOptions,
+    RunStatus, acquire_lock, append_spend, append_trace, create_run, emit_event, list_runs,
+    load_run, promote_completed_run, read_codebase_record, save_state, snapshot_working,
+    write_acceptance_marker, write_codebase_record,
 };
+use deadreckon_protocol::{RunEventKind, SpendRecord, TraceRecord};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -1941,7 +1941,7 @@ fn finish_exports_completed_fresh_run() {
     let dest = temp.path().join("finished-export");
     deadreckon_core::append_spend(
         &parent,
-        &deadreckon_core::SpendRecord {
+        &SpendRecord {
             timestamp: chrono::Utc::now(),
             turn: 1,
             provider: "cli:test".to_string(),

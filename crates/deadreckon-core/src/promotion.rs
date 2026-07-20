@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifacts::copy_tree;
 use crate::error::{DeadreckonError, IoContext, Result};
-use crate::events::{RunEventKind, emit_event};
+use crate::events::emit_event;
 use crate::gate::validate_acceptance_marker;
 use crate::paths::DeadreckonPaths;
 use crate::state::{PipelineState, save_state};
+use deadreckon_protocol::RunEventKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromotionManifest {

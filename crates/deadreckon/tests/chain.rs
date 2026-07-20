@@ -20,9 +20,10 @@ use axum::routing::post;
 use axum::{Json, Router};
 use deadreckon_core::{
     ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainNewOptions, ChainStatus, ChainStepStatus,
-    DeadreckonPaths, OnFail, RunEvent, RunEventKind, RunOptions, chain_task_key, create_run,
-    load_chain, load_run, promote_completed_run, save_chain,
+    DeadreckonPaths, OnFail, RunOptions, chain_task_key, create_run, load_chain, load_run,
+    promote_completed_run, save_chain,
 };
+use deadreckon_protocol::{RunEvent, RunEventKind};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;

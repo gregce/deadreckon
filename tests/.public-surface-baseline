@@ -12,8 +12,6 @@ crate: deadreckon-core
   artifacts::restore_snapshot
   artifacts::snapshot_diff
   artifacts::snapshot_working
-  artifacts::SpendRecord
-  artifacts::TraceRecord
   cancel::CANCEL_MARKER
   cancel::cancel_marker_path
   cancel::cancel_marker_path_for_run_root
@@ -124,9 +122,7 @@ crate: deadreckon-core
   events::emit_event
   events::event_preview
   events::RUN_EVENTS_JSONL
-  events::RunEvent
   events::RunEventBus
-  events::RunEventKind
   gate::ACCEPTANCE_PROGRESS_JSONL
   gate::acceptance_progress_path_for_run_root
   gate::acceptance_spec_path_for_run_root

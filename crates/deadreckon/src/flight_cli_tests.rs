@@ -1,9 +1,10 @@
 use super::*;
 use deadreckon_core::flight::{
     CheckpointBase, CheckpointBaseKind, CheckpointCaptureRequest, CheckpointTrigger,
-    FlightManifest, FlightSession, FlightUsage, append_flight_event, capture_delta_checkpoint,
+    FlightManifest, FlightSession, append_flight_event, capture_delta_checkpoint,
     write_flight_manifest,
 };
+use deadreckon_protocol::FlightUsage;
 use tempfile::TempDir;
 
 fn checkpoint_fixture() -> (TempDir, deadreckon_core::PipelineState) {

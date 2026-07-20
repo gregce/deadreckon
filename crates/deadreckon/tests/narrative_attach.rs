@@ -5,11 +5,12 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use chrono::Utc;
-use deadreckon_core::flight::{FlightEvent, FlightEventKind, append_flight_event};
+use deadreckon_core::flight::append_flight_event;
 use deadreckon_core::{
     DeadreckonPaths, DocKind, Plan, PlanMode, PlanProviders, PlanRole, PlanTask, RunOptions,
     RunStatus, create_run, doc_path_for_kind, save_plan, save_state,
 };
+use deadreckon_protocol::{FlightEvent, FlightEventKind};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 

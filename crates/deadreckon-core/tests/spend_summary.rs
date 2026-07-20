@@ -2,7 +2,8 @@
 
 use chrono::Utc;
 use deadreckon_core::state::spend_summary;
-use deadreckon_core::{DeadreckonPaths, RunOptions, SpendRecord, append_spend, create_run};
+use deadreckon_core::{DeadreckonPaths, RunOptions, append_spend, create_run};
+use deadreckon_protocol::SpendRecord;
 use tempfile::TempDir;
 
 fn state() -> (TempDir, deadreckon_core::PipelineState) {

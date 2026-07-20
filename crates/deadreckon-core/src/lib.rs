@@ -31,9 +31,9 @@ pub mod tamper;
 pub mod update_cache;
 
 pub use artifacts::{
-    DiffSummary, FileDelta, FileDeltaStatus, ProvenanceRecord, SpendRecord, TraceRecord,
-    append_provenance, append_spend, append_trace, copy_tree, diff_snapshots, inventory_files,
-    restore_snapshot, snapshot_diff, snapshot_working,
+    DiffSummary, FileDelta, FileDeltaStatus, ProvenanceRecord, append_provenance, append_spend,
+    append_trace, copy_tree, diff_snapshots, inventory_files, restore_snapshot, snapshot_diff,
+    snapshot_working,
 };
 pub use cancel::{
     CANCEL_MARKER, CancelMarker, cancel_marker_path, cancel_marker_path_for_run_root,
@@ -67,9 +67,7 @@ pub use docs::{
     rewrite_templated_docs, should_emit_delta, source_layout, tool_stdio_markdown,
 };
 pub use error::{DeadreckonError, Result, is_retryable_io_kind};
-pub use events::{
-    RUN_EVENTS_JSONL, RunEvent, RunEventBus, RunEventKind, emit_event, event_preview,
-};
+pub use events::{RUN_EVENTS_JSONL, RunEventBus, emit_event, event_preview};
 pub use gate::{
     ACCEPTANCE_PROGRESS_JSONL, AcceptanceCheck, AcceptanceCheckResult, AcceptanceMarker,
     AcceptanceProgressEntry, AcceptanceSpec, acceptance_progress_path_for_run_root,

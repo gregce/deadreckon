@@ -9,11 +9,12 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::artifacts::{TraceRecord, append_trace, copy_tree, inventory_files};
+use crate::artifacts::{append_trace, copy_tree, inventory_files};
 use crate::codebase::{CodebaseMode, read_codebase_record};
 use crate::error::{DeadreckonError, IoContext, Result};
 use crate::git::run_git;
 use crate::state::{PipelineState, append_json_line};
+use deadreckon_protocol::TraceRecord;
 
 pub const DOCS_DIR: &str = ".deadreckon/docs";
 pub const PUBLIC_DOCS_DIR: &str = "docs";
