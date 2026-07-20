@@ -272,6 +272,8 @@ crate: deadreckon-protocol
   ids::PlanId
   ids::RunId
   ids::TurnId
+  ledger::RunEvent
+  ledger::RunEventKind
 crate: deadreckon-runtime
   compaction::append_compaction_record
   compaction::COMPACTION_JSONL

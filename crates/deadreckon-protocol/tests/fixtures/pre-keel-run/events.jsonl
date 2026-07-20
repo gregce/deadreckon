@@ -1,0 +1,1 @@
+{"timestamp":"2026-07-01T12:00:00Z","run_id":"pre-keel-run","event":{"kind":"tool_call_result","turn":1,"tool_call_id":"tool-1","status":"ok","preview":"wrote src/lib.rs"}}
