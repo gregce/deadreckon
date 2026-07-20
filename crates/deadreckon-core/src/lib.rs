@@ -18,6 +18,7 @@ pub mod git;
 pub mod glossary;
 pub mod install_receipt;
 pub mod learning;
+pub mod ledger_io;
 pub mod lock;
 pub mod paths;
 pub mod plan;

@@ -288,6 +288,9 @@ crate: deadreckon-protocol
   ledger::TraceLine
   ledger::TraceRecord
   ledger::spend_kind_loop
+  policy::is_persisted
+  policy::ledger_file_for
+  policy::redact_for_persistence
 crate: deadreckon-runtime
   compaction::append_compaction_record
   compaction::COMPACTION_JSONL

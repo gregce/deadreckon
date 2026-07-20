@@ -1,10 +1,12 @@
 use chrono::Utc;
+use deadreckon_protocol::LedgerItem;
 pub use deadreckon_protocol::{RunEvent, RunEventKind};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::error::Result;
-use crate::state::{PipelineState, append_json_line};
+use crate::ledger_io::append_ledger_item;
+use crate::state::PipelineState;
 
 pub const RUN_EVENTS_JSONL: &str = "events.jsonl";
 
@@ -42,7 +44,7 @@ pub fn emit_event(
         run_id: state.run_id.clone(),
         event,
     };
-    append_json_line(&state.run_root.join(RUN_EVENTS_JSONL), &event)?;
+    append_ledger_item(&state.run_root, LedgerItem::Event(event.clone()))?;
     if let Some(sender) = sender {
         let _ = sender.send(event);
     }

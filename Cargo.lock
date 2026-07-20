@@ -651,6 +651,7 @@ dependencies = [
  "clap_complete",
  "crossterm 0.29.0",
  "deadreckon-core",
+ "deadreckon-protocol",
  "deadreckon-providers",
  "deadreckon-runtime",
  "deadreckon-sandbox",
