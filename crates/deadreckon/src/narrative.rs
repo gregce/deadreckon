@@ -2089,6 +2089,21 @@ pub(crate) fn append_narrative_snapshot(
     narrative_dir: &Path,
     snapshot: &NarrativeSnapshot,
 ) -> crate::Result<()> {
+    let (file, _) = deadreckon_core::ledger_io::prepare_ledger_item(
+        deadreckon_protocol::LedgerItem::NarrativeSnapshotRef(
+            deadreckon_protocol::NarrativeSnapshotRef {
+                snapshot_id: snapshot.snapshot_id.clone(),
+                path: PathBuf::from("narrative").join(NARRATIVE_SNAPSHOTS_JSONL),
+            },
+        ),
+    )?;
+    if file != deadreckon_protocol::LedgerFile::NarrativeSnapshots {
+        return Err(crate::CliError::Exit {
+            code: 1,
+            message: "narrative snapshot policy selected the wrong ledger".to_string(),
+            hint: "rerun after verifying the installed DeadReckon build".to_string(),
+        });
+    }
     fs::create_dir_all(narrative_dir)?;
     append_json_line(&narrative_dir.join(NARRATIVE_SNAPSHOTS_JSONL), snapshot)
 }

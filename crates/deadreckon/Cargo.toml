@@ -24,6 +24,7 @@ clap_complete.workspace = true
 inquire.workspace = true
 crossterm.workspace = true
 deadreckon-core = { workspace = true }
+deadreckon-protocol = { workspace = true }
 deadreckon-providers = { workspace = true }
 deadreckon-runtime = { workspace = true }
 deadreckon-sandbox = { workspace = true }

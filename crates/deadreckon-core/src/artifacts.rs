@@ -4,12 +4,14 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use deadreckon_protocol::LedgerItem;
 pub use deadreckon_protocol::{SpendRecord, TraceRecord, spend_kind_loop};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use walkdir::WalkDir;
 
 use crate::error::{DeadreckonError, IoContext, Result};
+use crate::ledger_io::append_ledger_item;
 use crate::state::{PipelineState, append_json_line};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +63,7 @@ pub enum FileDeltaStatus {
 
 pub fn append_spend(state: &PipelineState, record: &SpendRecord) -> Result<()> {
     // REPORT.md: Live Context & Spend Meter is durable JSONL, not terminal-only UI.
-    append_json_line(&state.run_root.join("spend.jsonl"), record)
+    append_ledger_item(&state.run_root, LedgerItem::Spend(record.clone()))
 }
 
 pub fn append_provenance(state: &PipelineState, record: &ProvenanceRecord) -> Result<()> {
@@ -72,7 +74,7 @@ pub fn append_provenance(state: &PipelineState, record: &ProvenanceRecord) -> Re
 
 pub fn append_trace(state: &PipelineState, record: &TraceRecord) -> Result<()> {
     // REPORT.md: Agent Observability keeps local traces exportable as JSONL.
-    append_json_line(&state.run_root.join("traces.jsonl"), record)
+    append_ledger_item(&state.run_root, LedgerItem::Trace(record.clone()))
 }
 
 pub fn snapshot_working(state: &PipelineState, turn: u32) -> Result<PathBuf> {

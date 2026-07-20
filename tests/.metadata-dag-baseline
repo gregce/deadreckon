@@ -1,5 +1,6 @@
 deadreckon -> deadreckon-core [dev]
 deadreckon -> deadreckon-core [normal]
+deadreckon -> deadreckon-protocol [normal]
 deadreckon -> deadreckon-providers [normal]
 deadreckon -> deadreckon-runtime [normal]
 deadreckon -> deadreckon-sandbox [normal]

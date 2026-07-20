@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use deadreckon_protocol::LedgerItem;
 pub use deadreckon_protocol::{FlightEvent, FlightEventKind, FlightUsage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,6 +14,7 @@ use walkdir::WalkDir;
 
 use crate::artifacts::copy_tree;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
+use crate::ledger_io::append_ledger_item;
 use crate::state::{PipelineState, append_json_line, atomic_write_json};
 
 pub const FLIGHT_MANIFEST_JSON: &str = "flight-manifest.json";
@@ -258,7 +260,7 @@ pub fn read_flight_manifest(state: &PipelineState) -> Result<Option<FlightManife
 }
 
 pub fn append_flight_event(state: &PipelineState, event: &FlightEvent) -> Result<()> {
-    append_json_line(&flight_events_path(state), event)
+    append_ledger_item(&state.run_root, LedgerItem::Flight(event.clone()))
 }
 
 pub fn read_flight_events(state: &PipelineState) -> Result<Vec<FlightEvent>> {

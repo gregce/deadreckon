@@ -17,3 +17,4 @@ pub use ledger::{
     NarrativeSnapshotRef, NarrativeSnapshotRefLine, RunEvent, RunEventKind, SpendLine, SpendRecord,
     TraceLine, TraceRecord, spend_kind_loop,
 };
+pub use policy::{is_persisted, ledger_file_for, redact_for_persistence};
