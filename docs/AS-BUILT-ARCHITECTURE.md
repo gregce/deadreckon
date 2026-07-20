@@ -1622,6 +1622,11 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Workspace lint discipline (deny-tier clippy + rustc), tuned release profile, registry-shaped library `lib.rs`, library print refusal, and error retryable/fatal taxonomy as vocabulary for future watchdog work.
 - Binary module layout: the former 40.6k-line `crates/deadreckon/src/main.rs` has been split into private `commands/` and `tui/` modules behind `main_inner` dispatch. `cli.rs`, the `Command` enum, all verbs, all user-facing output, and the public library surface remain unchanged by that split.
 - `PipelineState` shape, phase machine, atomic state writes, schema version.
+- Keel protocol vocabulary (§52): the pure `deadreckon-protocol` crate owns
+  the event, spend, trace, flight, and narrative-snapshot-reference wire
+  types; `LedgerItem`, `LedgerFile`, one persistence policy, and generated
+  checked schemas give readers and writers one vocabulary while the five
+  existing JSONL paths and bytes remain unchanged.
 - PID-aware locks + heartbeats + stale reclaim.
 - Atomic working→library promotion with crash recovery.
 - Sandbox dispatch for sandbox-exec / bwrap / docker / none + auto resolution.
@@ -3447,6 +3452,11 @@ projection: identity, goal/status, verdict/signature, sandbox facts,
 spend/wall-clock totals, full-run changed files, narrative/decision docs,
 per-turn records, proof files, and missing artifacts. Missing optional files are
 recorded in the projection rather than turning inspection into a panic path.
+Since Keel (§52), RunView is a projection over one protocol vocabulary: its
+event, spend, and trace inputs use the canonical `deadreckon-protocol` types,
+while attach, history, verdict, docs, and flight inspection use those same
+types rather than local copies. `PipelineState` remains application state and
+is deliberately outside that wire vocabulary.
 
 Changed-file evidence comes from snapshot diffs. `DiffSummary` and `FileDelta`
 compare `snapshots/turn-{n}` directories, ignore `.git`, `target`, and
@@ -3462,10 +3472,12 @@ The CLI surfaces are now projections over that same model:
   model-exchange reference, sandbox events, spend delta, and final check
   outcome when present.
 - `deadreckon show <run> --raw <artifact>` dumps stable run artifacts verbatim
-  and refuses gate nonce reads with a `verdict` hint.
+  and refuses gate nonce reads with a `verdict` hint; its help points to the
+  checked ledger schemas under `docs/schemas/*.schema.json`.
 - `deadreckon report <run>` writes a static Markdown report by default, or
   self-contained HTML with `--html`, and JSON with `--json`; live/pending runs
-  refuse with an attach command.
+  refuse with an attach command. The JSON projection is checked against
+  `docs/schemas/projections/run-view.schema.json`.
 - `deadreckon history grep --kind events` searches the durable run event ledger
   alongside the existing trace and provenance ledgers.
 
@@ -3652,6 +3664,81 @@ replacement exec turn.
 Fallback never marks a steer delivered. It records the pending count in the
 trace, keeps the ledger entries pending and names them in attach attention, so
 the operator can see that the run continued without accepting those directions.
+
+## 52. Keel: The Protocol Crate
+
+Keel places one pure persisted-wire vocabulary below the readers and writers.
+`crates/deadreckon-protocol` owns the run event, spend, trace and flight line
+types plus a pointer-only narrative snapshot reference. The crate depends only
+on `serde`, `serde_json`, `schemars`, `chrono`, and `thiserror`. It has no I/O,
+async runtime, or dependency on another DeadReckon crate; the
+`protocol_crate_has_no_internal_dependencies` test enforces that direction.
+Ledger consumers depend downward on the protocol crate, never the reverse.
+
+### 52.1 One vocabulary, unchanged files
+
+`LedgerItem` is the in-memory tagged union of `Event`, `Spend`, `Trace`,
+`Flight`, and `NarrativeSnapshotRef`. Its tag and alias rules provide one name
+for mixed-source inspection and future evolution, and an unknown tag folds to
+`LedgerItem::Unknown` instead of making an older reader fail. `LedgerFile`
+totally maps the five persisted kinds to their existing locations:
+
+| Kind | Existing file | Bare line written today |
+|---|---|---|
+| Event | `events.jsonl` | `EventLine(RunEvent)` |
+| Spend | `spend.jsonl` | `SpendLine(SpendRecord)` |
+| Trace | `traces.jsonl` | `TraceLine(TraceRecord)` |
+| Flight | `flight-events.jsonl` | `FlightLine(FlightEvent)` |
+| Narrative snapshot reference | `narrative/snapshots.jsonl` | application-local snapshot body after reference policy routing |
+
+The `EventLine`, `SpendLine`, `TraceLine`, `FlightLine`, and
+`NarrativeSnapshotRefLine` wrappers are serde-transparent. The union's
+`kind`/`value` envelope is not added to those files. Narrative snapshots keep
+their application-local body because the protocol owns only the stable
+`snapshot_id` and path reference. Recorded pre-Keel fixtures round-trip all
+five ledgers byte-identically, and the characterization/smoke goldens pin the
+normal `show`, verdict, report, and attach surfaces.
+
+### 52.2 Persistence policy and writer boundary
+
+`deadreckon-protocol/src/policy.rs` is the single pure answer to whether a
+`LedgerItem` persists, which `LedgerFile` receives it, and what redaction must
+happen before it reaches disk. Unknown items do not persist. Event tool
+arguments and trace details recursively redact gate-nonce keys; spend, flight,
+and narrative references pass through unchanged.
+
+`deadreckon_core::ledger_io` is the I/O adapter above that policy.
+`prepare_ledger_item` applies redaction and resolves the path;
+`append_ledger_item` then unwraps the transparent per-file line type and calls
+the existing JSONL appender. Events, spend, traces, and flight events use that
+append path directly. The narrative writer calls `prepare_ledger_item` with a
+`NarrativeSnapshotRef`, verifies `LedgerFile::NarrativeSnapshots`, then writes
+the unchanged application-local snapshot body. Policy therefore governs all
+five writers without moving I/O into the protocol crate or changing bytes.
+
+### 52.3 Schemas are checked artifacts
+
+`deadreckon_protocol::all_schemas` derives the tagged union schema and a schema
+for every public wire line type from the same Rust definitions. The generated
+files under `docs/schemas/` are checked artifacts: the protocol test compares
+both their exact filename set and pretty-printed contents, so drift or deletion
+fails verification. Intentional changes regenerate them with
+`DEADRECKON_UPDATE_SCHEMAS=1 cargo test -p deadreckon-protocol`; the failure
+footer and `docs/schemas/README.md` carry that command.
+
+`deadreckon report --json` is an application projection rather than a ledger
+line. Its real `RunView` type graph generates the separate checked
+`docs/schemas/projections/run-view.schema.json`, and the report renderer is
+validated against that schema. This keeps the protocol schema set exact while
+still giving report consumers a truthful schema path.
+
+### 52.4 Boundary of the stable slice
+
+Keel relocates type ownership and makes the existing persistence decisions
+explicit. It does not merge files, add envelopes to bare JSONL rows, compress
+old runs, add an index, move `PipelineState`, or export TypeScript types. Those
+layout and publication changes require migrations and remain the explicit §52
+V1 candidates.
 
 ## 55. Pennant: Descriptor-Declared Contracts
 

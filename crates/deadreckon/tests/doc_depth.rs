@@ -777,6 +777,69 @@ fn v1_candidates_record_rudder_boundaries() {
     assert!(candidates.contains("steering for `cli:claude-code`"));
 }
 
+#[test]
+fn as_built_documents_keel_dependency_policy_and_projection() {
+    let as_built = repo_file("docs/AS-BUILT-ARCHITECTURE.md");
+
+    assert!(
+        as_built.contains("## 52. Keel: The Protocol Crate"),
+        "missing Keel section"
+    );
+    for required in [
+        "deadreckon-protocol",
+        "LedgerItem",
+        "LedgerFile",
+        "policy.rs",
+        "all_schemas",
+        "DEADRECKON_UPDATE_SCHEMAS=1",
+        "byte-identical",
+        "RunView",
+        "projection over one protocol vocabulary",
+    ] {
+        assert!(as_built.contains(required), "missing {required}");
+    }
+}
+
+#[test]
+fn changelog_and_v1_candidates_record_keel_stable_boundaries() {
+    let changelog = repo_file("CHANGELOG.md");
+    let candidates = repo_file("docs/V1-CANDIDATES.md");
+    let candidates_lowercase = candidates.to_lowercase().replace('`', "");
+
+    assert!(
+        changelog.contains("## Keel (stable) — one protocol crate under the ledgers — 2026-07-20")
+    );
+    for (phase, sha) in [
+        ("P1", "41e5b40"),
+        ("P2", "70dbe64"),
+        ("P3", "e96c491"),
+        ("P4", "4cd0dac"),
+        ("P5", "ae857dc"),
+        ("P6", "50f2f9e"),
+        ("P7", "6884bf8"),
+        ("P8", "9e60d35"),
+        ("P9", "31893bf"),
+        ("P10", "fdb2da2"),
+    ] {
+        assert!(
+            changelog.contains(&format!("- {phase} (`{sha}`):")),
+            "missing {phase} {sha}"
+        );
+    }
+    for required in [
+        "single physical ledger",
+        "background gzip compression",
+        "sqlite index",
+        "pipelinestate relocation",
+        "ts-rs export",
+    ] {
+        assert!(
+            candidates_lowercase.contains(required),
+            "missing {required}"
+        );
+    }
+}
+
 fn append_component_turn(state: &deadreckon_core::PipelineState, file: &str) {
     append_turn_doc(
         state,
