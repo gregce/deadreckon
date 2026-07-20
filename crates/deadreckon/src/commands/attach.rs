@@ -10,6 +10,7 @@ use crate::tui::{
     build_run_narrative_projection, render_help_overlay, run_narrative_projection,
     toggle_attach_view, why_for_run, why_plain_lines,
 };
+use deadreckon_protocol::{RunEvent, SpendRecord, TraceRecord};
 
 #[derive(Debug)]
 pub(crate) struct AttachCommandArgs {

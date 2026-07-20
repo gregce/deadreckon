@@ -7,8 +7,9 @@ use deadreckon_core::campaign::{Campaign, CampaignEvent, CampaignStatus, SubGoal
 use deadreckon_core::glossary::run_status_label;
 use deadreckon_core::{
     Chain, ChainEvent, ChainStatus, ChainStepStatus, DeadreckonPaths, PipelineState, Plan,
-    PlanEvent, PlanStatus, PlanTaskStatus, RUN_EVENTS_JSONL, RunEvent, RunEventKind, RunStatus,
+    PlanEvent, PlanStatus, PlanTaskStatus, RUN_EVENTS_JSONL, RunStatus,
 };
+use deadreckon_protocol::{RunEvent, RunEventKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -1032,7 +1033,7 @@ mod tests {
 
     use chrono::Duration as ChronoDuration;
     use deadreckon_core::state::{RunOptions, append_json_line, create_run};
-    use deadreckon_core::{RunEvent, RunEventKind};
+    use deadreckon_protocol::{RunEvent, RunEventKind};
     use tempfile::TempDir;
 
     use super::*;

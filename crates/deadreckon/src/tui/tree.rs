@@ -6,9 +6,10 @@ use deadreckon_core::campaign::{Campaign, CampaignEvent, CampaignStatus, SubGoal
 use deadreckon_core::state::{load_state, spend_summary};
 use deadreckon_core::{
     Chain, ChainEvent, ChainEventKind, ChainStatus, ChainStep, ChainStepStatus, DeadreckonPaths,
-    PipelineState, Plan, PlanEvent, PlanEventKind, PlanStatus, PlanTask, PlanTaskStatus, RunEvent,
-    RunEventKind, RunStatus, load_chain, load_plan, load_run,
+    PipelineState, Plan, PlanEvent, PlanEventKind, PlanStatus, PlanTask, PlanTaskStatus, RunStatus,
+    load_chain, load_plan, load_run,
 };
+use deadreckon_protocol::{RunEvent, RunEventKind};
 
 use crate::commands::campaign::CampaignFeedEvent;
 use crate::plan_event_bus::PlanFeedEvent;

@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-use deadreckon_core::flight::{FlightEvent, read_flight_events};
+use deadreckon_core::flight::read_flight_events;
 use deadreckon_core::{
     DeadreckonPaths, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind, PlanStatus,
-    PlanTaskStatus, RUN_EVENTS_JSONL, RunEvent, RunEventKind, RunStatus, SpendRecord, TraceRecord,
-    TurnRecord, acceptance_progress_path_for_run_root, load_run, marker_path_for_run_root,
-    plan_status_label, plan_task_status_label, run_status_label,
+    PlanTaskStatus, RUN_EVENTS_JSONL, RunStatus, TurnRecord, acceptance_progress_path_for_run_root,
+    load_run, marker_path_for_run_root, plan_status_label, plan_task_status_label,
+    run_status_label,
 };
+use deadreckon_protocol::{FlightEvent, RunEvent, RunEventKind, SpendRecord, TraceRecord};
 use regex::Regex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};

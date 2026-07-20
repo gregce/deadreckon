@@ -1,9 +1,10 @@
 use crate::tui::panes::activity::attach_activity_lines_for_tui;
 use crate::{
-    AttachLive, AttachTuiState, SpendRecord, TraceRecord, acceptance_status_value, one_line,
-    read_jsonl, run_prefix, run_spend_label,
+    AttachLive, AttachTuiState, acceptance_status_value, one_line, read_jsonl, run_prefix,
+    run_spend_label,
 };
-use deadreckon_core::{PipelineState, RUN_EVENTS_JSONL, RunEvent};
+use deadreckon_core::{PipelineState, RUN_EVENTS_JSONL};
+use deadreckon_protocol::{RunEvent, SpendRecord, TraceRecord};
 
 pub(crate) fn run_detail_lines(state: &PipelineState, width: usize) -> Vec<String> {
     let spend = read_jsonl::<SpendRecord>(&state.run_root.join("spend.jsonl")).unwrap_or_default();
