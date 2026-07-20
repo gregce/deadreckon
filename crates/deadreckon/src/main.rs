@@ -43,10 +43,10 @@ use deadreckon::ui_card::{
 };
 use deadreckon::verdict_surface::{ExplanationPanel, VerdictKind, VerdictSurface};
 use deadreckon_core::flight::{
-    CheckpointManifest, FLIGHT_EVENTS_JSONL, FLIGHT_MANIFEST_JSON, FlightEvent, FlightEventKind,
-    FlightSessionStatus, RewindEvent, RewindMode, RewindStatus, RewindTarget, RewindTargetKind,
-    append_rewind_event, build_working_file_index, list_checkpoint_manifests,
-    materialize_checkpoint, read_flight_events, read_flight_manifest,
+    CheckpointManifest, FLIGHT_EVENTS_JSONL, FLIGHT_MANIFEST_JSON, FlightSessionStatus,
+    RewindEvent, RewindMode, RewindStatus, RewindTarget, RewindTargetKind, append_rewind_event,
+    build_working_file_index, list_checkpoint_manifests, materialize_checkpoint,
+    read_flight_events, read_flight_manifest,
 };
 use deadreckon_core::glossary::{NOUN_DONE_CONTRACT, NOUN_VERIFIED_RUN};
 use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt, write_receipt};
@@ -70,11 +70,10 @@ use deadreckon_core::{
     DocKind, DocProviderSelection, DocProviderSource, DocsStatus, ModeFlags, OnFail, PhaseId,
     PhaseStatus, Plan, PlanChildMarker, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind,
     PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest,
-    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunEvent, RunEventKind, RunListEntry,
-    RunOptions, RunStatus, SpendRecord, TraceRecord, WorktreeOptions,
-    acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root, acquire_lock,
-    append_chain_event, append_parent_narrative_update, append_plan_event, append_plan_message,
-    append_provenance, append_trace, apply_commit_body, cancel_marker_present,
+    ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunListEntry, RunOptions, RunStatus,
+    WorktreeOptions, acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root,
+    acquire_lock, append_chain_event, append_parent_narrative_update, append_plan_event,
+    append_plan_message, append_provenance, append_trace, apply_commit_body, cancel_marker_present,
     chain_status_label as glossary_chain_status_label,
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
     copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
@@ -86,6 +85,9 @@ use deadreckon_core::{
     save_state, terminate_pid, validate_acceptance_marker, validate_task_count,
     write_acceptance_marker, write_cancel_marker, write_chain_step_marker, write_child_summary,
     write_coordinator_state, write_plan_child_marker, write_worker_spec,
+};
+use deadreckon_protocol::{
+    FlightEvent, FlightEventKind, RunEvent, RunEventKind, SpendRecord, TraceRecord,
 };
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
@@ -9426,7 +9428,7 @@ fn kill_loaded_run(
     emit_event(
         state,
         None,
-        deadreckon_core::RunEventKind::RunCompleted {
+        RunEventKind::RunCompleted {
             status: "killed".to_string(),
         },
     )?;
@@ -14641,27 +14643,27 @@ fn narrative_refresh_notice(projection: &narrative::NarrativeProjection) -> Stri
 
 fn event_line(event: &RunEvent, show_cost: bool) -> String {
     match &event.event {
-        deadreckon_core::RunEventKind::TurnStarted { turn } => {
+        RunEventKind::TurnStarted { turn } => {
             format!("turn {turn} started")
         }
-        deadreckon_core::RunEventKind::ToolCallStarted {
+        RunEventKind::ToolCallStarted {
             turn,
             tool_call_id,
             tool_name,
             ..
         } => format!("turn {turn} {tool_name} {tool_call_id} started"),
-        deadreckon_core::RunEventKind::ToolCallResult {
+        RunEventKind::ToolCallResult {
             turn,
             tool_call_id,
             status,
             preview,
         } => format!("turn {turn} {tool_call_id} {status} {preview}"),
-        deadreckon_core::RunEventKind::TokenUsageDelta {
+        RunEventKind::TokenUsageDelta {
             turn,
             input_tokens,
             output_tokens,
         } => format!("turn {turn} tokens +{}", input_tokens + output_tokens),
-        deadreckon_core::RunEventKind::SpendDelta {
+        RunEventKind::SpendDelta {
             turn,
             cost_usd,
             wall_time_seconds,
@@ -14676,16 +14678,16 @@ fn event_line(event: &RunEvent, show_cost: bool) -> String {
                 format!("turn {turn} wall {}s", wall_time_seconds.unwrap_or(0.0))
             }
         }
-        deadreckon_core::RunEventKind::DocsCheckpoint { turn, path, status } => {
+        RunEventKind::DocsCheckpoint { turn, path, status } => {
             format!("turn {turn} docs {status} {}", path.display())
         }
-        deadreckon_core::RunEventKind::RunCompleted { status } => {
+        RunEventKind::RunCompleted { status } => {
             format!("run {status}")
         }
-        deadreckon_core::RunEventKind::RunPromoted { library_dir } => {
+        RunEventKind::RunPromoted { library_dir } => {
             format!("promoted {}", library_dir.display())
         }
-        deadreckon_core::RunEventKind::Error { turn, message } => {
+        RunEventKind::Error { turn, message } => {
             format!("turn {} error {message}", turn.unwrap_or_default())
         }
     }

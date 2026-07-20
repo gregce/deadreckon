@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use deadreckon_core::flight::{CheckpointChangeKind, list_checkpoint_manifests};
 use deadreckon_core::{
-    AcceptanceProgressEntry, PipelineState, RunEvent, SpendRecord, TraceRecord,
-    acceptance_progress_path_for_run_root,
+    AcceptanceProgressEntry, PipelineState, acceptance_progress_path_for_run_root,
 };
+use deadreckon_protocol::{RunEvent, SpendRecord, TraceRecord};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};

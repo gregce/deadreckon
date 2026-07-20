@@ -1,4 +1,5 @@
 use super::super::*;
+use deadreckon_protocol::{RunEvent, TraceRecord};
 
 pub(crate) fn list_command(
     scope: Option<String>,

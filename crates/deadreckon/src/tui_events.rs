@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use deadreckon_core::RunEvent;
+use deadreckon_protocol::RunEvent;
 use tokio::sync::broadcast;
 
 pub(crate) struct TuiEventFeed {
@@ -175,7 +175,8 @@ mod tests {
     use deadreckon_core::events::emit_event;
     use deadreckon_core::paths::DeadreckonPaths;
     use deadreckon_core::state::{RunOptions, create_run};
-    use deadreckon_core::{RUN_EVENTS_JSONL, RunEvent, RunEventBus, RunEventKind};
+    use deadreckon_core::{RUN_EVENTS_JSONL, RunEventBus};
+    use deadreckon_protocol::{RunEvent, RunEventKind};
     use tempfile::TempDir;
 
     use super::TuiEventFeed;

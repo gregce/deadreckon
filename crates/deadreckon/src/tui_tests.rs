@@ -81,14 +81,17 @@ use crate::cli::{Cli, CliPlanMode, CliStartMode, StartCommandArgs};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::CommandFactory;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use deadreckon_core::flight::{FLIGHT_EVENTS_JSONL, FlightEvent, FlightEventKind, FlightUsage};
+use deadreckon_core::flight::FLIGHT_EVENTS_JSONL;
 use deadreckon_core::{
     ApplyMode, ApplyStrategy, BranchPolicy, CapabilityPreview, Chain, ChainEvent, ChainEventKind,
     ChainNewOptions, ChainStatus, ChainStepStatus, DeadreckonPaths, DocKind, NetworkCapability,
     OnFail, Plan, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanProviders,
-    PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunEvent, RunEventKind, RunListEntry,
-    RunOptions, RunStatus, SpendRecord, TraceRecord, append_plan_event, append_trace, create_run,
-    doc_path_for_kind, save_plan, write_child_summary, write_worker_spec,
+    PlanRole, PlanStatus, PlanTask, PlanTaskStatus, RunListEntry, RunOptions, RunStatus,
+    append_plan_event, append_trace, create_run, doc_path_for_kind, save_plan, write_child_summary,
+    write_worker_spec,
+};
+use deadreckon_protocol::{
+    FlightEvent, FlightEventKind, FlightUsage, RunEvent, RunEventKind, SpendRecord, TraceRecord,
 };
 use deadreckon_providers::SpendEstimate;
 use deadreckon_providers::registry::{

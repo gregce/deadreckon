@@ -176,6 +176,15 @@ fn characterization_goldens_unchanged_after_split() {
 
 #[test]
 fn attach_characterization_goldens_unchanged() {
+    assert_attach_characterization_golden();
+}
+
+#[test]
+fn attach_goldens_unchanged_after_reader_rewire() {
+    assert_attach_characterization_golden();
+}
+
+fn assert_attach_characterization_golden() {
     // Logbook P9: attach's projections are backed by the shared RunView model;
     // the pinned plain-attach frame must stay byte-identical to the golden
     // recorded before the rewire. Same command, same golden — this test names

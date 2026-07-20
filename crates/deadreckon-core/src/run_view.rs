@@ -3,13 +3,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use deadreckon_protocol::{RunEvent, RunEventKind, SpendRecord, TraceRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::artifacts::{DiffSummary, SpendRecord, TraceRecord, snapshot_diff};
+use crate::artifacts::{DiffSummary, snapshot_diff};
 use crate::docs::{DocKind, doc_path_for_kind};
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
-use crate::events::{RUN_EVENTS_JSONL, RunEvent, RunEventKind};
+use crate::events::RUN_EVENTS_JSONL;
 use crate::gate::{
     AcceptanceCheckResult, AcceptanceMarker, AcceptanceProgressEntry,
     acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root,
@@ -739,10 +740,10 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
 
-    use crate::artifacts::{
-        SpendRecord, TraceRecord, append_spend, append_trace, snapshot_working,
-    };
-    use crate::events::{RunEventKind, emit_event};
+    use deadreckon_protocol::{RunEventKind, SpendRecord, TraceRecord};
+
+    use crate::artifacts::{append_spend, append_trace, snapshot_working};
+    use crate::events::emit_event;
     use crate::gate::{AcceptanceCheckResult, AcceptanceProgressEntry};
     use crate::state::{RunOptions, create_run, save_state};
     use crate::{DeadreckonPaths, RunStatus};

@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use deadreckon_core::glossary::run_status_label;
 use deadreckon_core::{
-    AcceptanceProgressEntry, PipelineState, TraceRecord, acceptance_progress_path_for_run_root,
+    AcceptanceProgressEntry, PipelineState, acceptance_progress_path_for_run_root,
 };
+use deadreckon_protocol::TraceRecord;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};

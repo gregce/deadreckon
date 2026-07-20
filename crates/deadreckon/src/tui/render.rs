@@ -1178,12 +1178,11 @@ pub(crate) fn turn_timer(
     traces: &[TraceRecord],
     state: &deadreckon_core::PipelineState,
 ) -> String {
-    let Some(started) = events.iter().rev().find(|event| {
-        matches!(
-            event.event,
-            deadreckon_core::RunEventKind::TurnStarted { .. }
-        )
-    }) else {
+    let Some(started) = events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.event, RunEventKind::TurnStarted { .. }))
+    else {
         return "-".to_string();
     };
     if state.status == RunStatus::Executing {
@@ -1194,7 +1193,7 @@ pub(crate) fn turn_timer(
         return format!("{elapsed}s running");
     }
     if let Some(done_at) = events.iter().rev().find_map(|event| match event.event {
-        deadreckon_core::RunEventKind::RunCompleted { .. } => Some(event.timestamp),
+        RunEventKind::RunCompleted { .. } => Some(event.timestamp),
         _ => None,
     }) {
         let elapsed = done_at
@@ -1216,12 +1215,7 @@ pub(crate) fn turn_timer(
     if let Some(done_at) = events
         .iter()
         .rev()
-        .find(|event| {
-            !matches!(
-                event.event,
-                deadreckon_core::RunEventKind::TurnStarted { .. }
-            )
-        })
+        .find(|event| !matches!(event.event, RunEventKind::TurnStarted { .. }))
         .map(|event| event.timestamp)
     {
         let elapsed = done_at
