@@ -121,6 +121,22 @@
 - Report provenance polish: add per-field citation links and schema-versioned
   report manifests if external tools begin consuming report artifacts directly.
 
+## Keel follow-ups (§52)
+
+- Single physical ledger: merge the five existing JSONL files only with an
+  explicit migration and compatibility plan. Keel keeps their paths, bare line
+  forms, and byte contract unchanged.
+- Background gzip compression: compress old completed-run ledgers only after
+  retention, atomic replacement, crash recovery, and transparent-reader rules
+  are specified.
+- SQLite index: add a rebuildable query index for large run libraries while
+  retaining the ledger files as the authoritative record.
+- `PipelineState` relocation: decide separately whether application state
+  belongs in the protocol crate; stable Keel intentionally moves no state or
+  config schema.
+- `ts-rs` export: generate TypeScript types or publish schemas externally only
+  after versioning, package ownership, and compatibility support are defined.
+
 ## Release integrity (embedded checksum verification)
 
 - Inner-installer embedded checksums: the cargo-dist 0.31 generated shell

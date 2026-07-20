@@ -1,5 +1,38 @@
 # Changelog
 
+## Keel (stable) — one protocol crate under the ledgers — 2026-07-20
+
+- `deadreckon-protocol` owns every persisted ledger line type as one tagged
+  `LedgerItem` vocabulary with generated, drift-tested JSON Schemas and a
+  single persistence policy module; writers and readers were rewired without
+  changing behavior — file layout and bytes are unchanged.
+
+Every implementation phase passed `make verify`:
+
+- P1 (`41e5b40`): added the pure protocol crate, transparent ID newtypes and
+  a dependency-law guard that rejects internal crate dependencies.
+- P2 (`70dbe64`): moved `RunEvent` and recorded the five pre-Keel fixture
+  ledgers that pin the existing wire bytes.
+- P3 (`e96c491`): moved `SpendRecord` and `TraceRecord` with legacy-field and
+  unknown-field tolerance intact.
+- P4 (`4cd0dac`): moved flight event types and added the pointer-only
+  `NarrativeSnapshotRef` vocabulary.
+- P5 (`ae857dc`): added the tagged `LedgerItem` union, transparent per-file
+  line wrappers, `LedgerFile` mapping and unknown-kind tolerance.
+- P6 (`50f2f9e`): centralized persistence routing and gate-nonce redaction in
+  the pure protocol policy.
+- P7 (`6884bf8`): generated and checked in the union and per-kind JSON Schemas
+  with exact-set and drift-failing tests.
+- P8 (`9e60d35`): rewired RunView, attach and history readers to import the
+  protocol vocabulary directly with characterization goldens unchanged.
+- P9 (`31893bf`): routed all five writer paths through policy, removed the
+  temporary core re-exports and proved fixture output byte-identical.
+- P10 (`fdb2da2`): documented schema paths in CLI help, added regeneration
+  guidance and checked the `report --json` projection against its generated
+  schema.
+- P11: documented AS-BUILT §52, updated the shipped/RunView architecture, and
+  recorded only the rider's V1 layout and export boundaries.
+
 ## Rudder (stable) — steer the running child — 2026-07-16
 
 - `cli:codex-server` drives codex over its app-server: operator steering
