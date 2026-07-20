@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TraceRecord",
+  "type": "object",
+  "required": [
+    "detail",
+    "event",
+    "run_id",
+    "timestamp",
+    "turn"
+  ],
+  "properties": {
+    "detail": true,
+    "event": {
+      "type": "string"
+    },
+    "latency_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint128",
+      "minimum": 0.0
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "turn": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  }
+}
