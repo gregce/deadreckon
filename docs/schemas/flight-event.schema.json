@@ -1,0 +1,171 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FlightEvent",
+  "type": "object",
+  "required": [
+    "attempt",
+    "deadreckon_turn",
+    "flight_session_id",
+    "kind",
+    "provider",
+    "raw_hash",
+    "run_id",
+    "schema",
+    "seq",
+    "source_event",
+    "summary",
+    "version"
+  ],
+  "properties": {
+    "attempt": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "checkpoint_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "deadreckon_turn": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "files": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "flight_session_id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/definitions/FlightEventKind"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "raw_hash": {
+      "type": "string"
+    },
+    "role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "seq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "source_event": {
+      "type": "string"
+    },
+    "source_line": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "source_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "tool_category": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "usage": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FlightUsage"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "definitions": {
+    "FlightEventKind": {
+      "type": "string",
+      "enum": [
+        "agent",
+        "thinking",
+        "tool",
+        "result",
+        "todo",
+        "tokens",
+        "session",
+        "checkpoint",
+        "warning",
+        "error"
+      ]
+    },
+    "FlightUsage": {
+      "type": "object",
+      "required": [
+        "input_tokens",
+        "output_tokens"
+      ],
+      "properties": {
+        "context_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    }
+  }
+}

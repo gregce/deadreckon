@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SpendRecord",
+  "type": "object",
+  "required": [
+    "cost_usd",
+    "input_tokens",
+    "model",
+    "output_tokens",
+    "provider",
+    "timestamp",
+    "total_cost_usd",
+    "turn"
+  ],
+  "properties": {
+    "cap_usd": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "cost_usd": {
+      "type": "number",
+      "format": "double"
+    },
+    "estimated": {
+      "default": false,
+      "type": "boolean"
+    },
+    "input_tokens": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "kind": {
+      "description": "`\"loop\"` for the run loop's own turns, `\"narrator\"` for live-narration calls. Defaulted so legacy spend.jsonl rows still parse.",
+      "default": "loop",
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "output_tokens": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "provider": {
+      "type": "string"
+    },
+    "subscription": {
+      "default": false,
+      "type": "boolean"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "total_cost_usd": {
+      "type": "number",
+      "format": "double"
+    },
+    "turn": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "wall_time_cap_seconds": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "wall_time_seconds": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    }
+  }
+}

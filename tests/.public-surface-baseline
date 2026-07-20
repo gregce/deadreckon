@@ -291,6 +291,7 @@ crate: deadreckon-protocol
   policy::is_persisted
   policy::ledger_file_for
   policy::redact_for_persistence
+  schema::all_schemas
 crate: deadreckon-runtime
   compaction::append_compaction_record
   compaction::COMPACTION_JSONL

@@ -1,0 +1,269 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunEvent",
+  "type": "object",
+  "required": [
+    "event",
+    "run_id",
+    "timestamp"
+  ],
+  "properties": {
+    "event": {
+      "$ref": "#/definitions/RunEventKind"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "definitions": {
+    "RunEventKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "turn"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "turn_started"
+              ]
+            },
+            "turn": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "args",
+            "kind",
+            "tool_call_id",
+            "tool_name",
+            "turn"
+          ],
+          "properties": {
+            "args": true,
+            "kind": {
+              "type": "string",
+              "enum": [
+                "tool_call_started"
+              ]
+            },
+            "tool_call_id": {
+              "type": "string"
+            },
+            "tool_name": {
+              "type": "string"
+            },
+            "turn": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "preview",
+            "status",
+            "tool_call_id",
+            "turn"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "tool_call_result"
+              ]
+            },
+            "preview": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "tool_call_id": {
+              "type": "string"
+            },
+            "turn": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "input_tokens",
+            "kind",
+            "output_tokens",
+            "turn"
+          ],
+          "properties": {
+            "input_tokens": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "token_usage_delta"
+              ]
+            },
+            "output_tokens": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "turn": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "cost_usd",
+            "kind",
+            "total_cost_usd",
+            "turn"
+          ],
+          "properties": {
+            "cost_usd": {
+              "type": "number",
+              "format": "double"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "spend_delta"
+              ]
+            },
+            "total_cost_usd": {
+              "type": "number",
+              "format": "double"
+            },
+            "turn": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "wall_time_seconds": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "path",
+            "status",
+            "turn"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "docs_checkpoint"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "turn": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "status"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "run_completed"
+              ]
+            },
+            "status": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "library_dir"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "run_promoted"
+              ]
+            },
+            "library_dir": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "message"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "error"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "turn": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "NarrativeSnapshotRef",
+  "description": "A stable pointer to a narrative snapshot row. The snapshot body remains an application-local projection and is intentionally not part of the protocol.",
+  "type": "object",
+  "required": [
+    "path",
+    "snapshot_id"
+  ],
+  "properties": {
+    "path": {
+      "type": "string"
+    },
+    "snapshot_id": {
+      "type": "string"
+    }
+  }
+}
