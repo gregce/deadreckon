@@ -6,12 +6,13 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::Utc;
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::flight::{
-    CheckpointBase, CheckpointBaseKind, CheckpointCaptureRequest, CheckpointTrigger, FlightEvent,
-    FlightEventKind, FlightManifest, FlightSession, FlightSessionStatus, FlightSourcePath,
-    FlightUsage, WorkingFileIndex, append_flight_event, build_working_file_index,
-    capture_delta_checkpoint, list_checkpoint_manifests, read_flight_events, read_flight_manifest,
-    sha256_text, write_flight_manifest,
+    CheckpointBase, CheckpointBaseKind, CheckpointCaptureRequest, CheckpointTrigger,
+    FlightManifest, FlightSession, FlightSessionStatus, FlightSourcePath, WorkingFileIndex,
+    append_flight_event, build_working_file_index, capture_delta_checkpoint,
+    list_checkpoint_manifests, read_flight_events, read_flight_manifest, sha256_text,
+    write_flight_manifest,
 };
+use deadreckon_protocol::{FlightEvent, FlightEventKind, FlightUsage};
 use deadreckon_providers::registry::{
     DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProviderDescriptor,
     ProviderRegistry,

@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use deadreckon_core::{RunEvent, RunEventBus, RunEventKind, SpendRecord};
+use deadreckon_core::RunEventBus;
+use deadreckon_protocol::{LedgerItem, RunEvent, RunEventKind, SpendRecord};
 use deadreckon_providers::{
     NarratorBackend, ProviderRequest, ProviderResponse, ProviderRouter, select_narrator_backend,
 };
@@ -215,18 +216,8 @@ pub(crate) fn build_run_narration(
     (Some(sender), Some(handle))
 }
 
-fn append_narrator_spend(run_root: &Path, record: &SpendRecord) {
-    let Ok(line) = serde_json::to_string(record) else {
-        return;
-    };
-    let path = run_root.join("spend.jsonl");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "{line}");
-    }
+fn append_narrator_spend(run_root: &Path, record: &SpendRecord) -> deadreckon_core::Result<()> {
+    deadreckon_core::ledger_io::append_ledger_item(run_root, LedgerItem::Spend(record.clone()))
 }
 
 /// Write append-only beat lines to a sink (stderr in production). Plain,
@@ -437,7 +428,7 @@ impl NarratorEngine {
             self.ledger.spent_usd(),
             self.ctx.config.budget_usd,
         );
-        append_narrator_spend(&self.ctx.run_root, &spend);
+        let _ = append_narrator_spend(&self.ctx.run_root, &spend);
         self.current = beat;
         self.beats_emitted += 1;
         self.last_beat_at = Some(now);
@@ -720,6 +711,18 @@ mod tests {
     use super::*;
     use crate::narrative::LiveTurnInput;
 
+    const EVENTS_FIXTURE: &str =
+        include_str!("../../deadreckon-protocol/tests/fixtures/pre-keel-run/events.jsonl");
+    const SPEND_FIXTURE: &str =
+        include_str!("../../deadreckon-protocol/tests/fixtures/pre-keel-run/spend.jsonl");
+    const TRACES_FIXTURE: &str =
+        include_str!("../../deadreckon-protocol/tests/fixtures/pre-keel-run/traces.jsonl");
+    const FLIGHT_FIXTURE: &str =
+        include_str!("../../deadreckon-protocol/tests/fixtures/pre-keel-run/flight-events.jsonl");
+    const NARRATIVE_FIXTURE: &str = include_str!(
+        "../../deadreckon-protocol/tests/fixtures/pre-keel-run/narrative/snapshots.jsonl"
+    );
+
     fn floor_ctx(run_root: PathBuf) -> NarratorCtx {
         NarratorCtx {
             run_id: "run-x".to_string(),
@@ -752,6 +755,45 @@ mod tests {
             resolve_narrator_config(true, false, true, None).is_none(),
             "--no-narrate disables narration even on a tty"
         );
+    }
+
+    #[test]
+    fn writer_output_bytes_unchanged_on_fixture_run() {
+        use deadreckon_core::ledger_io::append_ledger_item;
+        use deadreckon_protocol::LedgerItem;
+
+        let temp = TempDir::new().expect("tempdir");
+        let run_root = temp.path();
+
+        append_ledger_item(run_root, LedgerItem::Event(parse_fixture(EVENTS_FIXTURE)))
+            .expect("append event fixture");
+        append_narrator_spend(run_root, &parse_fixture(SPEND_FIXTURE))
+            .expect("append spend fixture through policy");
+        append_ledger_item(run_root, LedgerItem::Trace(parse_fixture(TRACES_FIXTURE)))
+            .expect("append trace fixture");
+        append_ledger_item(run_root, LedgerItem::Flight(parse_fixture(FLIGHT_FIXTURE)))
+            .expect("append flight fixture");
+        let snapshot = parse_fixture(NARRATIVE_FIXTURE);
+        crate::narrative::append_narrative_snapshot(&run_root.join("narrative"), &snapshot)
+            .expect("append narrative fixture");
+
+        for (relative, expected) in [
+            ("events.jsonl", EVENTS_FIXTURE),
+            ("spend.jsonl", SPEND_FIXTURE),
+            ("traces.jsonl", TRACES_FIXTURE),
+            ("flight-events.jsonl", FLIGHT_FIXTURE),
+            ("narrative/snapshots.jsonl", NARRATIVE_FIXTURE),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(run_root.join(relative)).expect("read written ledger"),
+                expected,
+                "{relative} bytes changed during writer rewire"
+            );
+        }
+
+        fn parse_fixture<T: serde::de::DeserializeOwned>(fixture: &str) -> T {
+            serde_json::from_str(fixture.trim_end()).expect("parse pre-Keel fixture")
+        }
     }
 
     #[test]

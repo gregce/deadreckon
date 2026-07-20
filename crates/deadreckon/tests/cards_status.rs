@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use chrono::Utc;
 use deadreckon::sleep::{SleepMetadata, SleepMode, metadata_path};
 use deadreckon_core::{
-    DeadreckonPaths, RunOptions, RunStatus, SpendRecord, append_spend, create_run, save_state,
+    DeadreckonPaths, RunOptions, RunStatus, append_spend, create_run, save_state,
 };
+use deadreckon_protocol::SpendRecord;
 use serde_json::json;
 use tempfile::TempDir;
 

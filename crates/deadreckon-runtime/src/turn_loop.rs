@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use deadreckon_protocol::{RunEvent, RunEventKind, SpendRecord, TraceRecord};
 use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderResponse, ProviderRouter};
 use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as run_sandbox};
 use serde::{Deserialize, Serialize};
@@ -16,8 +17,8 @@ use crate::error::IoContext;
 use crate::flight::{ProviderFlightRecorder, ProviderFlightRecorderHandle};
 use crate::polish::{PolishConfig, polish_run_docs};
 use deadreckon_core::artifacts::{
-    ProvenanceRecord, SpendRecord, TraceRecord, append_provenance, append_spend, append_trace,
-    inventory_files, snapshot_working,
+    ProvenanceRecord, append_provenance, append_spend, append_trace, inventory_files,
+    snapshot_working,
 };
 use deadreckon_core::cancel::{cancel_marker_path_for_run_root, cancel_marker_present};
 use deadreckon_core::codebase::{CodebaseMode, read_codebase_record};
@@ -26,7 +27,7 @@ use deadreckon_core::docs::{
     check_implementation_notes_current, incremental_path, rewrite_templated_docs,
 };
 use deadreckon_core::error::{DeadreckonError, Result};
-use deadreckon_core::events::{RunEvent, RunEventKind, emit_event, event_preview, tool_args_json};
+use deadreckon_core::events::{emit_event, event_preview, tool_args_json};
 use deadreckon_core::flight::FlightSessionStatus;
 use deadreckon_core::gate::{acceptance_spec_path_for_run_root, validate_acceptance_marker};
 use deadreckon_core::git::run_git;
@@ -2216,15 +2217,15 @@ mod tests {
 
     use crate::seam::{SeamRunCtx, read_seams_config};
 
-    use deadreckon_core::events::{RunEventBus, RunEventKind};
+    use deadreckon_core::events::RunEventBus;
     use deadreckon_core::flight::{
-        FlightEventKind, FlightSessionStatus, list_checkpoint_manifests, read_flight_events,
-        read_flight_manifest,
+        FlightSessionStatus, list_checkpoint_manifests, read_flight_events, read_flight_manifest,
     };
     use deadreckon_core::gate::{run_acceptance_gate_and_write_marker, validate_acceptance_marker};
     use deadreckon_core::paths::DeadreckonPaths;
     use deadreckon_core::state::{PipelineState, RunOptions, RunStatus, create_run, spend_summary};
     use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
+    use deadreckon_protocol::{FlightEventKind, RunEventKind};
 
     use super::{
         NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,

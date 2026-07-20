@@ -683,7 +683,7 @@ fn run_cancelled_before_turn_loop(
     emit_event(
         state,
         None,
-        deadreckon_core::RunEventKind::RunCompleted {
+        RunEventKind::RunCompleted {
             status: "killed".to_string(),
         },
     )?;

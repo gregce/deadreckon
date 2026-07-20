@@ -2709,10 +2709,7 @@ fn persist_projection(projection: &NarrativeProjection, narrative_dir: &Path) ->
         return Ok(());
     }
     fs::create_dir_all(narrative_dir)?;
-    append_json_line(
-        &narrative_dir.join(NARRATIVE_SNAPSHOTS_JSONL),
-        &projection.snapshot,
-    )?;
+    append_narrative_snapshot(narrative_dir, &projection.snapshot)?;
     write_json_pretty(&narrative_dir.join(NARRATIVE_STATE_JSON), &projection.state)?;
     write_json_pretty(
         &narrative_dir.join(ARCHITECTURE_GRAPH_JSON),

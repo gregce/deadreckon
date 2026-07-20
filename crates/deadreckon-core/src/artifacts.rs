@@ -4,8 +4,9 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use deadreckon_protocol::LedgerItem;
-pub use deadreckon_protocol::{SpendRecord, TraceRecord, spend_kind_loop};
+#[cfg(test)]
+use deadreckon_protocol::spend_kind_loop;
+use deadreckon_protocol::{LedgerItem, SpendRecord, TraceRecord};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use walkdir::WalkDir;

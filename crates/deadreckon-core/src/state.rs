@@ -9,11 +9,11 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-use crate::artifacts::SpendRecord;
 use crate::codebase::{CodebaseMode, CodebaseRecord, write_codebase_record};
 use crate::docs::ensure_docs_started;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::paths::{DeadreckonPaths, source_root, task_key, workspace_scope};
+use deadreckon_protocol::SpendRecord;
 
 pub const STATE_VERSION: u32 = 1;
 

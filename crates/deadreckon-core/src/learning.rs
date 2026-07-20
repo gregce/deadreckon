@@ -11,7 +11,7 @@ use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
-use crate::events::{RUN_EVENTS_JSONL, RunEvent, RunEventKind};
+use crate::events::RUN_EVENTS_JSONL;
 use crate::flight::{FLIGHT_EVENTS_JSONL, FLIGHT_MANIFEST_JSON, read_rewind_events};
 use crate::gate::{
     ACCEPTANCE_PROGRESS_JSONL, AcceptanceProgressEntry, acceptance_spec_path_for_run_root,
@@ -20,6 +20,7 @@ use crate::paths::{DeadreckonPaths, source_root};
 use crate::state::{
     PipelineState, RunStatus, append_json_line, atomic_write_json, load_state, spend_summary,
 };
+use deadreckon_protocol::{RunEvent, RunEventKind};
 
 pub const LEARNING_SCHEMA_VERSION: u32 = 1;
 
@@ -1929,9 +1930,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::flight::{FlightEvent, FlightEventKind, append_flight_event};
+    use crate::flight::append_flight_event;
     use crate::gate::AcceptanceProgressEntry;
     use crate::state::{RunOptions, create_run, save_state};
+    use deadreckon_protocol::{FlightEvent, FlightEventKind};
 
     fn temp_paths() -> (TempDir, DeadreckonPaths) {
         let temp = TempDir::new().expect("tempdir");

@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use deadreckon_core::{
-    DeadreckonPaths, Plan, PlanEvent, PlanEventKind, RUN_EVENTS_JSONL, RunEvent, load_plan,
-    load_run,
+    DeadreckonPaths, Plan, PlanEvent, PlanEventKind, RUN_EVENTS_JSONL, load_plan, load_run,
 };
+use deadreckon_protocol::RunEvent;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::broadcast;
 
@@ -403,9 +403,10 @@ mod tests {
     use chrono::Utc;
     use deadreckon_core::{
         CapabilityPreview, DeadreckonPaths, NetworkCapability, Plan, PlanEvent, PlanEventKind,
-        PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, RunEventKind, RunOptions,
-        append_plan_event, create_run, emit_event, save_plan,
+        PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, RunOptions, append_plan_event,
+        create_run, emit_event, save_plan,
     };
+    use deadreckon_protocol::RunEventKind;
     use tempfile::TempDir;
 
     use super::{PlanEventBus, PlanFeedEvent};

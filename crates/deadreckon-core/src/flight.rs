@@ -5,8 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use deadreckon_protocol::LedgerItem;
-pub use deadreckon_protocol::{FlightEvent, FlightEventKind, FlightUsage};
+use deadreckon_protocol::{FlightEvent, LedgerItem};
+#[cfg(test)]
+use deadreckon_protocol::{FlightEventKind, FlightUsage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;

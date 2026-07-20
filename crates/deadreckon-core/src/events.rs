@@ -1,6 +1,5 @@
 use chrono::Utc;
-use deadreckon_protocol::LedgerItem;
-pub use deadreckon_protocol::{RunEvent, RunEventKind};
+use deadreckon_protocol::{LedgerItem, RunEvent, RunEventKind};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 

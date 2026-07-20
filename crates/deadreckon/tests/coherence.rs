@@ -8,9 +8,10 @@ use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
     ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainNewOptions, ChainStatus, ChainStepStatus,
     DeadreckonPaths, OnFail, Plan, PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask,
-    PlanTaskStatus, RunOptions, RunStatus, TraceRecord, append_trace, create_run, run_status_label,
-    save_chain, save_plan, save_state,
+    PlanTaskStatus, RunOptions, RunStatus, append_trace, create_run, run_status_label, save_chain,
+    save_plan, save_state,
 };
+use deadreckon_protocol::TraceRecord;
 use serde_json::{Value, json};
 
 mod common;
