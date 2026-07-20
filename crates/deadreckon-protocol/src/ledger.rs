@@ -59,3 +59,44 @@ pub struct RunEvent {
     pub run_id: String,
     pub event: RunEventKind,
 }
+
+/// Default `kind` for spend rows written before the field existed and for the
+/// run loop's own turns. The live narrator writes `"narrator"` instead.
+pub fn spend_kind_loop() -> String {
+    "loop".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SpendRecord {
+    pub timestamp: DateTime<Utc>,
+    pub turn: u32,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+    pub total_cost_usd: f64,
+    pub cap_usd: Option<f64>,
+    #[serde(default)]
+    pub subscription: bool,
+    #[serde(default)]
+    pub estimated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_time_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_time_cap_seconds: Option<f64>,
+    /// `"loop"` for the run loop's own turns, `"narrator"` for live-narration
+    /// calls. Defaulted so legacy spend.jsonl rows still parse.
+    #[serde(default = "spend_kind_loop")]
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TraceRecord {
+    pub timestamp: DateTime<Utc>,
+    pub run_id: String,
+    pub turn: u32,
+    pub event: String,
+    pub latency_ms: Option<u128>,
+    pub detail: Value,
+}

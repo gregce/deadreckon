@@ -4,43 +4,13 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+pub use deadreckon_protocol::{SpendRecord, TraceRecord, spend_kind_loop};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use walkdir::WalkDir;
 
 use crate::error::{DeadreckonError, IoContext, Result};
 use crate::state::{PipelineState, append_json_line};
-
-/// Default `kind` for spend rows written before the field existed and for the
-/// run loop's own turns. The live narrator writes `"narrator"` instead.
-pub fn spend_kind_loop() -> String {
-    "loop".to_string()
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SpendRecord {
-    pub timestamp: DateTime<Utc>,
-    pub turn: u32,
-    pub provider: String,
-    pub model: String,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cost_usd: f64,
-    pub total_cost_usd: f64,
-    pub cap_usd: Option<f64>,
-    #[serde(default)]
-    pub subscription: bool,
-    #[serde(default)]
-    pub estimated: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wall_time_seconds: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wall_time_cap_seconds: Option<f64>,
-    /// `"loop"` for the run loop's own turns, `"narrator"` for live-narration
-    /// calls. Defaulted so legacy spend.jsonl rows still parse.
-    #[serde(default = "spend_kind_loop")]
-    pub kind: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvenanceRecord {
@@ -50,16 +20,6 @@ pub struct ProvenanceRecord {
     pub tool_call_id: String,
     pub session_id: String,
     pub files: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TraceRecord {
-    pub timestamp: DateTime<Utc>,
-    pub run_id: String,
-    pub turn: u32,
-    pub event: String,
-    pub latency_ms: Option<u128>,
-    pub detail: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

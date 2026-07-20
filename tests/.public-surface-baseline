@@ -274,6 +274,9 @@ crate: deadreckon-protocol
   ids::TurnId
   ledger::RunEvent
   ledger::RunEventKind
+  ledger::SpendRecord
+  ledger::TraceRecord
+  ledger::spend_kind_loop
 crate: deadreckon-runtime
   compaction::append_compaction_record
   compaction::COMPACTION_JSONL

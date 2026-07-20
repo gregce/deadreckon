@@ -12,4 +12,4 @@ pub mod policy;
 pub mod schema;
 
 pub use ids::{PlanId, RunId, TurnId};
-pub use ledger::{RunEvent, RunEventKind};
+pub use ledger::{RunEvent, RunEventKind, SpendRecord, TraceRecord, spend_kind_loop};
