@@ -5,6 +5,7 @@ use std::process::{Command, Output};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 
@@ -17,7 +18,7 @@ pub const ACCEPTANCE_PROGRESS_JSONL: &str = "acceptance-progress.jsonl";
 pub const ACCEPTANCE_SPEC: &str = "acceptance.yaml";
 const GATE_NONCE: &str = "gate/nonce";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AcceptanceMarker {
     pub schema_version: u32,
     pub run_id: String,
@@ -74,7 +75,7 @@ pub enum AcceptanceCheck {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct AcceptanceCheckResult {
     pub kind: String,
     pub passed: bool,

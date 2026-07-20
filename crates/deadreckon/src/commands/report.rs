@@ -29,7 +29,7 @@ pub(crate) fn report_command(args: ReportCommandArgs) -> Result<()> {
     }
     let view = deadreckon_core::RunView::from_state(&state)?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&view)?);
+        println!("{}", render_report_json(&view)?);
         return Ok(());
     }
     let dest = args.dest.unwrap_or_else(|| {
@@ -66,6 +66,10 @@ pub(crate) fn report_command(args: ReportCommandArgs) -> Result<()> {
         report_surface(&view, &dest).render_plain(!crate::completion_hints_enabled(false))
     );
     Ok(())
+}
+
+fn render_report_json(view: &deadreckon_core::RunView) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(view)
 }
 
 fn report_surface(view: &deadreckon_core::RunView, dest: &Path) -> VerdictSurface {
@@ -270,5 +274,207 @@ mod tests {
         assert!(!report.contains("<script"), "{report}");
         assert!(!report.contains("http://"), "{report}");
         assert!(!report.contains("https://"), "{report}");
+    }
+
+    #[test]
+    fn report_json_validates_against_generated_schema() {
+        let schema = schemars::schema_for!(deadreckon_core::RunView);
+        let rendered = serde_json::to_value(&schema).expect("serialize generated RunView schema");
+        let report =
+            serde_json::from_str(&render_report_json(&minimal_view()).expect("render report JSON"))
+                .expect("report renderer must emit JSON");
+
+        assert_json_matches_schema(&report, &rendered, &rendered);
+        let mut invalid_report = report.clone();
+        invalid_report
+            .as_object_mut()
+            .expect("RunView JSON object")
+            .remove("goal");
+        assert!(
+            json_matches_schema(&invalid_report, &rendered, &rendered, "$").is_err(),
+            "schema validator must reject a report missing a required field"
+        );
+
+        let checked_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("docs/schemas/projections/run-view.schema.json");
+        let update_command = "DEADRECKON_UPDATE_SCHEMAS=1 cargo test -p deadreckon report_json_validates_against_generated_schema";
+        if std::env::var_os("DEADRECKON_UPDATE_SCHEMAS").as_deref() == Some("1".as_ref()) {
+            fs::create_dir_all(checked_path.parent().unwrap()).unwrap();
+            let mut bytes = serde_json::to_vec_pretty(&rendered).unwrap();
+            bytes.push(b'\n');
+            fs::write(&checked_path, bytes).unwrap();
+        }
+        let checked: serde_json::Value = serde_json::from_slice(
+            &fs::read(&checked_path).unwrap_or_else(|error| {
+                panic!(
+                    "checked RunView schema must exist: {error}\n\nregenerate it with:\n  {update_command}"
+                )
+            }),
+        )
+        .expect("checked RunView schema must be JSON");
+        assert_eq!(
+            checked, rendered,
+            "checked RunView schema drifted\n\nregenerate it with:\n  {update_command}"
+        );
+    }
+
+    fn assert_json_matches_schema(
+        instance: &serde_json::Value,
+        schema: &serde_json::Value,
+        root: &serde_json::Value,
+    ) {
+        if let Err(error) = json_matches_schema(instance, schema, root, "$") {
+            panic!("report JSON does not match generated RunView schema: {error}");
+        }
+    }
+
+    fn json_matches_schema(
+        instance: &serde_json::Value,
+        schema: &serde_json::Value,
+        root: &serde_json::Value,
+        path: &str,
+    ) -> std::result::Result<(), String> {
+        if let Some(allowed) = schema.as_bool() {
+            return allowed
+                .then_some(())
+                .ok_or_else(|| format!("{path}: rejected by false schema"));
+        }
+        let object = schema
+            .as_object()
+            .ok_or_else(|| format!("{path}: schema is not an object"))?;
+
+        if let Some(reference) = object.get("$ref").and_then(serde_json::Value::as_str) {
+            let pointer = reference.strip_prefix('#').ok_or_else(|| {
+                format!("{path}: unsupported external schema reference {reference}")
+            })?;
+            let target = root
+                .pointer(pointer)
+                .ok_or_else(|| format!("{path}: unresolved schema reference {reference}"))?;
+            return json_matches_schema(instance, target, root, path);
+        }
+
+        if let Some(values) = object.get("enum").and_then(serde_json::Value::as_array)
+            && !values.contains(instance)
+        {
+            return Err(format!("{path}: value is outside schema enum"));
+        }
+
+        validate_subschemas(instance, object, root, path)?;
+
+        if let Some(expected) = object.get("type")
+            && !schema_type_matches(instance, expected)
+        {
+            return Err(format!(
+                "{path}: expected schema type {expected}, got {instance}"
+            ));
+        }
+
+        if let Some(minimum) = object.get("minimum").and_then(serde_json::Value::as_f64)
+            && instance.as_f64().is_some_and(|number| number < minimum)
+        {
+            return Err(format!("{path}: number is below schema minimum {minimum}"));
+        }
+
+        if let Some(instance_object) = instance.as_object() {
+            if let Some(required) = object.get("required").and_then(serde_json::Value::as_array) {
+                for key in required.iter().filter_map(serde_json::Value::as_str) {
+                    if !instance_object.contains_key(key) {
+                        return Err(format!("{path}: missing required property {key:?}"));
+                    }
+                }
+            }
+            let properties = object
+                .get("properties")
+                .and_then(serde_json::Value::as_object);
+            for (key, value) in instance_object {
+                let child_path = format!("{path}.{key}");
+                if let Some(child_schema) = properties.and_then(|values| values.get(key)) {
+                    json_matches_schema(value, child_schema, root, &child_path)?;
+                } else if let Some(additional) = object.get("additionalProperties") {
+                    json_matches_schema(value, additional, root, &child_path)?;
+                }
+            }
+        }
+
+        if let Some(instance_array) = instance.as_array()
+            && let Some(items) = object.get("items")
+        {
+            if let Some(tuple) = items.as_array() {
+                for (index, (value, child_schema)) in
+                    instance_array.iter().zip(tuple.iter()).enumerate()
+                {
+                    json_matches_schema(value, child_schema, root, &format!("{path}[{index}]"))?;
+                }
+            } else {
+                for (index, value) in instance_array.iter().enumerate() {
+                    json_matches_schema(value, items, root, &format!("{path}[{index}]"))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_subschemas(
+        instance: &serde_json::Value,
+        schema: &serde_json::Map<String, serde_json::Value>,
+        root: &serde_json::Value,
+        path: &str,
+    ) -> std::result::Result<(), String> {
+        if let Some(all_of) = schema.get("allOf").and_then(serde_json::Value::as_array) {
+            for child in all_of {
+                json_matches_schema(instance, child, root, path)?;
+            }
+        }
+        for keyword in ["anyOf", "oneOf"] {
+            let Some(children) = schema.get(keyword).and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            let matches = children
+                .iter()
+                .filter(|child| json_matches_schema(instance, child, root, path).is_ok())
+                .count();
+            let valid = if keyword == "oneOf" {
+                matches == 1
+            } else {
+                matches >= 1
+            };
+            if !valid {
+                return Err(format!(
+                    "{path}: matched {matches} branches of schema keyword {keyword}"
+                ));
+            }
+        }
+        if let Some(not_schema) = schema.get("not")
+            && json_matches_schema(instance, not_schema, root, path).is_ok()
+        {
+            return Err(format!("{path}: matched forbidden schema"));
+        }
+        Ok(())
+    }
+
+    fn schema_type_matches(instance: &serde_json::Value, expected: &serde_json::Value) -> bool {
+        match expected {
+            serde_json::Value::String(kind) => instance_matches_type(instance, kind),
+            serde_json::Value::Array(kinds) => kinds.iter().any(|kind| {
+                kind.as_str()
+                    .is_some_and(|kind| instance_matches_type(instance, kind))
+            }),
+            _ => false,
+        }
+    }
+
+    fn instance_matches_type(instance: &serde_json::Value, kind: &str) -> bool {
+        match kind {
+            "null" => instance.is_null(),
+            "boolean" => instance.is_boolean(),
+            "object" => instance.is_object(),
+            "array" => instance.is_array(),
+            "number" => instance.is_number(),
+            "integer" => instance.as_i64().is_some() || instance.as_u64().is_some(),
+            "string" => instance.is_string(),
+            _ => false,
+        }
     }
 }
