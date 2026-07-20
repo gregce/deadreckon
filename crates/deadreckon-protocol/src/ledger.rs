@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -165,3 +166,127 @@ pub struct NarrativeSnapshotRef {
     pub snapshot_id: String,
     pub path: PathBuf,
 }
+
+/// One in-memory vocabulary for every line kind persisted by a run.
+///
+/// The adjacent payload is used only when serializing the union itself. The
+/// per-file line wrappers below remain transparent and preserve today's bare
+/// JSONL shapes.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // protocol shape is stable; variants mirror bare line types
+pub enum LedgerItem {
+    #[serde(alias = "run_event")]
+    Event(RunEvent),
+    #[serde(alias = "spend_record")]
+    Spend(SpendRecord),
+    #[serde(alias = "trace_record")]
+    Trace(TraceRecord),
+    #[serde(alias = "flight_event")]
+    Flight(FlightEvent),
+    #[serde(alias = "narrative_snapshot")]
+    NarrativeSnapshotRef(NarrativeSnapshotRef),
+    #[serde(other)]
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for LedgerItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut wire = Value::deserialize(deserializer)?;
+        let kind = wire
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| D::Error::custom("ledger item is missing string field `kind`"))?
+            .to_string();
+        let payload = wire
+            .as_object_mut()
+            .and_then(|object| object.remove("value"))
+            .unwrap_or(Value::Null);
+
+        match kind.as_str() {
+            "event" | "run_event" => decode_payload(payload).map(Self::Event),
+            "spend" | "spend_record" => decode_payload(payload).map(Self::Spend),
+            "trace" | "trace_record" => decode_payload(payload).map(Self::Trace),
+            "flight" | "flight_event" => decode_payload(payload).map(Self::Flight),
+            "narrative_snapshot_ref" | "narrative_snapshot" => {
+                decode_payload(payload).map(Self::NarrativeSnapshotRef)
+            }
+            _ => Ok(Self::Unknown),
+        }
+        .map_err(D::Error::custom)
+    }
+}
+
+fn decode_payload<T>(payload: Value) -> serde_json::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(payload)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+pub enum LedgerFile {
+    Events,
+    Spend,
+    Traces,
+    FlightEvents,
+    NarrativeSnapshots,
+}
+
+impl LedgerFile {
+    pub const ALL: [Self; 5] = [
+        Self::Events,
+        Self::Spend,
+        Self::Traces,
+        Self::FlightEvents,
+        Self::NarrativeSnapshots,
+    ];
+
+    pub const fn relative_path(self) -> &'static str {
+        match self {
+            Self::Events => "events.jsonl",
+            Self::Spend => "spend.jsonl",
+            Self::Traces => "traces.jsonl",
+            Self::FlightEvents => "flight-events.jsonl",
+            Self::NarrativeSnapshots => "narrative/snapshots.jsonl",
+        }
+    }
+
+    pub const fn for_item(item: &LedgerItem) -> Option<Self> {
+        match item {
+            LedgerItem::Event(_) => Some(Self::Events),
+            LedgerItem::Spend(_) => Some(Self::Spend),
+            LedgerItem::Trace(_) => Some(Self::Traces),
+            LedgerItem::Flight(_) => Some(Self::FlightEvents),
+            LedgerItem::NarrativeSnapshotRef(_) => Some(Self::NarrativeSnapshots),
+            LedgerItem::Unknown => None,
+        }
+    }
+}
+
+macro_rules! ledger_line {
+    ($line:ident, $record:ty, $variant:ident) => {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+        #[serde(transparent)]
+        pub struct $line(pub $record);
+
+        impl From<$line> for LedgerItem {
+            fn from(line: $line) -> Self {
+                Self::$variant(line.0)
+            }
+        }
+    };
+}
+
+ledger_line!(EventLine, RunEvent, Event);
+ledger_line!(SpendLine, SpendRecord, Spend);
+ledger_line!(TraceLine, TraceRecord, Trace);
+ledger_line!(FlightLine, FlightEvent, Flight);
+ledger_line!(
+    NarrativeSnapshotRefLine,
+    NarrativeSnapshotRef,
+    NarrativeSnapshotRef
+);

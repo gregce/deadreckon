@@ -13,6 +13,7 @@ pub mod schema;
 
 pub use ids::{PlanId, RunId, TurnId};
 pub use ledger::{
-    FlightEvent, FlightEventKind, FlightUsage, NarrativeSnapshotRef, RunEvent, RunEventKind,
-    SpendRecord, TraceRecord, spend_kind_loop,
+    EventLine, FlightEvent, FlightEventKind, FlightLine, FlightUsage, LedgerFile, LedgerItem,
+    NarrativeSnapshotRef, NarrativeSnapshotRefLine, RunEvent, RunEventKind, SpendLine, SpendRecord,
+    TraceLine, TraceRecord, spend_kind_loop,
 };
