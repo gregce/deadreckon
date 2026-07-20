@@ -272,6 +272,10 @@ crate: deadreckon-protocol
   ids::PlanId
   ids::RunId
   ids::TurnId
+  ledger::FlightEvent
+  ledger::FlightEventKind
+  ledger::FlightUsage
+  ledger::NarrativeSnapshotRef
   ledger::RunEvent
   ledger::RunEventKind
   ledger::SpendRecord

@@ -1,9 +1,13 @@
 use chrono::{TimeZone, Utc};
-use deadreckon_protocol::{RunEvent, RunEventKind, SpendRecord, TraceRecord};
+use deadreckon_protocol::{
+    FlightEvent, NarrativeSnapshotRef, RunEvent, RunEventKind, SpendRecord, TraceRecord,
+};
+use std::path::PathBuf;
 
 const EVENTS: &str = include_str!("fixtures/pre-keel-run/events.jsonl");
 const SPEND: &str = include_str!("fixtures/pre-keel-run/spend.jsonl");
 const TRACES: &str = include_str!("fixtures/pre-keel-run/traces.jsonl");
+const FLIGHT_EVENTS: &str = include_str!("fixtures/pre-keel-run/flight-events.jsonl");
 
 #[test]
 fn run_event_wire_bytes_unchanged_after_move() {
@@ -52,6 +56,35 @@ fn unknown_fields_still_tolerated() {
 
     serde_json::from_str::<SpendRecord>(spend).expect("spend ignores unknown fields");
     serde_json::from_str::<TraceRecord>(trace).expect("trace ignores unknown fields");
+}
+
+#[test]
+fn flight_rows_roundtrip_from_recorded_fixture() {
+    assert_fixture_roundtrips::<FlightEvent>(FLIGHT_EVENTS, "flight event");
+}
+
+#[test]
+fn narrative_snapshot_ref_points_not_embeds() {
+    let reference = NarrativeSnapshotRef {
+        snapshot_id: "snapshot-1".to_string(),
+        path: PathBuf::from("narrative/snapshots.jsonl"),
+    };
+    let value = serde_json::to_value(reference).expect("snapshot ref json");
+
+    assert_eq!(value["snapshot_id"], "snapshot-1");
+    assert_eq!(value["path"], "narrative/snapshots.jsonl");
+    for body_field in [
+        "headline",
+        "current_work",
+        "architecture_notes",
+        "risks",
+        "citations",
+    ] {
+        assert!(
+            value.get(body_field).is_none(),
+            "narrative pointer embedded body field {body_field}"
+        );
+    }
 }
 
 fn assert_fixture_roundtrips<T>(fixture: &str, label: &str)

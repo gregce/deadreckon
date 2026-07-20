@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+pub use deadreckon_protocol::{FlightEvent, FlightEventKind, FlightUsage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -89,63 +90,6 @@ impl Default for CheckpointPolicy {
             anchor_every: 20,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FlightEvent {
-    pub version: u32,
-    pub seq: u64,
-    pub run_id: String,
-    pub flight_session_id: String,
-    pub deadreckon_turn: u32,
-    pub attempt: u32,
-    pub provider: String,
-    pub schema: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_line: Option<u64>,
-    pub source_event: String,
-    pub raw_hash: String,
-    pub kind: FlightEventKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    pub summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_category: Option<String>,
-    #[serde(default)]
-    pub files: Vec<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<FlightUsage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FlightEventKind {
-    Agent,
-    Thinking,
-    Tool,
-    Result,
-    Todo,
-    Tokens,
-    Session,
-    Checkpoint,
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FlightUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
