@@ -392,8 +392,11 @@ Depth tests (`coherence.rs`):
 - `kill_resolves_a_plan_child_ref`
 - `steer_on_a_plan_id_points_at_attach`
 - `resume_on_a_chain_id_points_at_chain_resume`
-- `every_id_taking_verb_declares_its_accepted_kinds` (source-level assertion
-  that no command module calls a kind loader directly)
+- ~~`every_id_taking_verb_declares_its_accepted_kinds`~~ **moved to P8.** The
+  rider mis-sequenced it: the assertion is that nothing calls `load_cli_run`,
+  and `load_cli_run` is not deleted until P8, so it cannot go green in P7
+  without leaving a red test behind. It is the "no second resolver" guard and
+  belongs with the deletion.
 - `journey_ids_from_list_are_accepted_or_redirected_by_finish_and_kill`
   (completes the six-verb journey matrix)
 
@@ -402,6 +405,12 @@ Depth tests (`coherence.rs`):
 - Remove `load_cli_run`, `load_cli_run_with_scope`, `latest_run`,
   `resolve_verdict_run`, `resolve_latest_run` and every per-verb probe
   sequence. All 58 call sites now route through `resolve_ref`.
+- Rewire the remaining `load_cli_run` callers (`doc`, and the `finish` /
+  `export` / `apply` / `abandon` / `extend` paths in `lifecycle.rs`). These map
+  a plan reference onto that plan's merged result run via
+  `resolve_plan_result_run` -- a real feature, not a guessing cascade -- so the
+  mapping is preserved and only the resolution beneath it moves.
+- Add `every_id_taking_verb_declares_its_accepted_kinds`, moved here from P7.
 - Remove the `#![allow(dead_code)]` P1 added to `reference.rs`. If anything in
   the module is still unreachable with every verb rewired, it is unused code
   and gets deleted, not re-allowed.

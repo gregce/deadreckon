@@ -1634,6 +1634,37 @@ fn section_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str>
 // closed.
 // ---------------------------------------------------------------------------
 
+/// Assert a refusal leads somewhere.
+///
+/// DeadReckon has two idioms for "the next command": a `try:` footer on plain
+/// errors and a `Recommended` line on a VerdictSurface. Either is a legitimate
+/// way forward; what the journey forbids is a refusal with neither, or one that
+/// names `deadreckon list` for an id `list` itself just printed.
+fn assert_refusal_leads_somewhere(verb: &str, id: &str, combined: &str) {
+    let mut next_commands = Vec::new();
+    let lines = combined.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
+        if line.contains("try:") {
+            next_commands.push((*line).to_string());
+        }
+        if line.trim() == "Recommended"
+            && let Some(command) = lines.get(index + 1)
+        {
+            next_commands.push((*command).to_string());
+        }
+    }
+    assert!(
+        !next_commands.is_empty(),
+        "{verb} refused {id} with no way forward: {combined}"
+    );
+    for command in &next_commands {
+        assert!(
+            !command.contains("deadreckon list"),
+            "{verb} sent {id} back to the command that printed it: {command}"
+        );
+    }
+}
+
 /// Every id `deadreckon list` prints, as an operator would read them off the
 /// table. The journey tests cross these with each rewired verb.
 fn shakedown_listed_ids(paths: &DeadreckonPaths, cwd: &std::path::Path) -> Vec<String> {
@@ -1814,18 +1845,7 @@ fn journey_ids_from_list_are_accepted_by_status() {
             continue;
         }
         let combined = format!("{}{}", stdout(&output), stderr(&output));
-        let try_line = combined
-            .lines()
-            .find(|line| line.contains("try:"))
-            .unwrap_or_default();
-        assert!(
-            !try_line.is_empty(),
-            "status refused {id} with no way forward: {combined}"
-        );
-        assert!(
-            !try_line.contains("deadreckon list"),
-            "status sent {id} back to the command that printed it: {try_line}"
-        );
+        assert_refusal_leads_somewhere("status", &id, &combined);
     }
 }
 
@@ -1982,18 +2002,7 @@ fn journey_ids_from_list_are_accepted_or_redirected_by_verdict() {
             continue;
         }
         let combined = format!("{}{}", stdout(&output), stderr(&output));
-        let try_line = combined
-            .lines()
-            .find(|line| line.contains("try:"))
-            .unwrap_or_default();
-        assert!(
-            !try_line.is_empty(),
-            "verdict refused {id} with no way forward: {combined}"
-        );
-        assert!(
-            !try_line.contains("deadreckon list"),
-            "verdict sent {id} back to the command that printed it: {try_line}"
-        );
+        assert_refusal_leads_somewhere("verdict", &id, &combined);
     }
 }
 
@@ -2094,18 +2103,164 @@ fn journey_ids_from_list_are_accepted_by_show_and_attach() {
                 continue;
             }
             let combined = format!("{}{}", stdout(&output), stderr(&output));
-            let try_line = combined
-                .lines()
-                .find(|line| line.contains("try:"))
-                .unwrap_or_default();
-            assert!(
-                !try_line.is_empty(),
-                "{verb} refused {id} with no way forward: {combined}"
-            );
-            assert!(
-                !try_line.contains("deadreckon list"),
-                "{verb} sent {id} back to the command that printed it: {try_line}"
-            );
+            assert_refusal_leads_somewhere(verb, &id, &combined);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shakedown P7 — the lifecycle tail.
+//
+// `kill`, `steer`, `resume`, `undo`, `rewind` and `merge` each hand-rolled a
+// different subset of kinds. `kill` probed campaign, run, plan, chain and missed
+// plan children; the rest saw runs only and answered "not found" for ids that
+// plainly exist. This phase gives them the shared resolver and the refusal
+// table, and completes the six-verb journey matrix.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kill_resolves_a_plan_child_ref() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "a child run".to_string(),
+            cwd: cwd.clone(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+    state.status = RunStatus::Completed;
+    save_state(&state).expect("save");
+
+    let mut first = PlanTask::new(0, "First", "Do the first thing", PlanRole::Child, None);
+    first.child_run_id = Some(state.run_id.clone());
+    let second = PlanTask::new(1, "Second", "Do the second thing", PlanRole::Child, None);
+    let mut plan = Plan::new(
+        "a plan with a child",
+        PlanMode::FullPlan,
+        vec![first, second],
+        PlanProviders::default(),
+        Some(scope.clone()),
+        "0.1.0",
+    )
+    .expect("plan");
+    plan.status = PlanStatus::Forked;
+    save_plan(&paths, &plan).expect("save plan");
+
+    // `kill` never resolved `<plan>:<task>`, though `show` and `attach` did.
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["kill", &format!("{}:task-0", &plan.plan_id[..8]), "--plain"])
+        .output()
+        .expect("kill plan child");
+
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        !combined.contains("not found"),
+        "kill must resolve a plan child ref: {combined}"
+    );
+}
+
+#[test]
+fn steer_on_a_plan_id_points_at_attach() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    let plan = shakedown_plan_fixture(&paths, &scope);
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["steer", &plan.plan_id[..8], "go left"])
+        .output()
+        .expect("steer");
+
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        !output.status.success(),
+        "a plan cannot be steered: {combined}"
+    );
+    assert!(
+        combined.contains(&format!("deadreckon attach {}", &plan.plan_id[..8])),
+        "steering a plan should offer to watch it: {combined}"
+    );
+}
+
+#[test]
+fn resume_on_a_plan_id_points_at_fork() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    let plan = shakedown_plan_fixture(&paths, &scope);
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["resume", &plan.plan_id[..8], "--plain"])
+        .output()
+        .expect("resume");
+
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(!output.status.success(), "{combined}");
+    assert!(
+        combined.contains(&format!("deadreckon fork {}", &plan.plan_id[..8])),
+        "a pending plan is advanced by forking it: {combined}"
+    );
+}
+
+#[test]
+fn journey_ids_from_list_are_accepted_or_redirected_by_finish_and_kill() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    shakedown_plan_fixture(&paths, &scope);
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "a real run".to_string(),
+            cwd: cwd.clone(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+    state.status = RunStatus::Completed;
+    save_state(&state).expect("save");
+
+    for id in shakedown_listed_ids(&paths, &cwd) {
+        for verb in ["finish", "kill"] {
+            // Neither verb takes `--plain`; the journey is about resolution.
+            let output = deadreckon(&paths)
+                .current_dir(&cwd)
+                .args([verb, &id])
+                .output()
+                .expect(verb);
+            if output.status.success() {
+                continue;
+            }
+            let combined = format!("{}{}", stdout(&output), stderr(&output));
+            assert_refusal_leads_somewhere(verb, &id, &combined);
         }
     }
 }
