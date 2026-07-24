@@ -1070,20 +1070,27 @@ fn detect_verdict_surface(
             evidence.push(("error kind".to_string(), format!("{kind:?}")));
         }
     }
-    let mut secondary = vec![
+    // Shakedown P10: a per-provider install command is evidence about what the
+    // probe found, not one of the operator's next actions. Carrying ten of them
+    // as "Secondary" made `detect` a catalog wearing an action list, and the
+    // three-action cap would drop most of them -- losing information that exists
+    // nowhere else in the output. Evidence is uncapped and is where they belong.
+    for result in &failed {
+        for line in result
+            .try_lines
+            .iter()
+            .filter(|line| line.as_str() != primary)
+        {
+            evidence.push((result.id.clone(), line.clone()));
+        }
+    }
+    let secondary = [
         (
             "Secondary".to_string(),
             "deadreckon providers list".to_string(),
         ),
         ("Secondary".to_string(), "deadreckon doctor".to_string()),
     ];
-    for line in failed
-        .iter()
-        .flat_map(|result| result.try_lines.iter())
-        .filter(|line| line.as_str() != primary)
-    {
-        secondary.push(("Secondary".to_string(), line.clone()));
-    }
     VerdictSurface::must_new(
         kind,
         "detect",

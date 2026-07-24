@@ -2037,16 +2037,20 @@ fn chain_paused_why(reason: Option<&str>) -> &'static str {
 fn chain_secondary_actions(chain: &Chain, primary: &str) -> Vec<String> {
     let id = chain_prefix(&chain.chain_id);
     let mut actions = Vec::new();
-    let mut candidates = vec![
-        format!("deadreckon chain attach {id}"),
-        format!("deadreckon chain show {id}"),
-        format!("deadreckon chain show {id} --why-failed"),
-        format!("deadreckon chain resume {id}"),
-    ];
+    // Order is priority: the supporting list is capped, so whatever is listed
+    // last is what an operator loses. A paused chain's recovery actions outrank
+    // generic inspection.
+    let mut candidates = Vec::new();
     if chain.status == ChainStatus::Paused {
         candidates.push(format!("deadreckon chain resume {id} --apply-mode preview"));
         candidates.push(format!("deadreckon chain undo {id}"));
     }
+    candidates.extend([
+        format!("deadreckon chain show {id}"),
+        format!("deadreckon chain attach {id}"),
+        format!("deadreckon chain show {id} --why-failed"),
+        format!("deadreckon chain resume {id}"),
+    ]);
     for command in candidates {
         if command != primary && !actions.contains(&command) {
             actions.push(command);
