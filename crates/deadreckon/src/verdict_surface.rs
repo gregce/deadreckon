@@ -167,6 +167,12 @@ impl ExplanationPanel {
     }
 }
 
+/// At most this many supporting actions are shown, plus a `help-all` pointer
+/// when any were dropped; see `try_new`. The pointer is disclosure, not an
+/// action on the subject, so it does not consume one of the three -- spending a
+/// slot on it cost a paused chain its `undo`, which is the recovery path.
+pub const MAX_SECONDARY_ACTIONS: usize = 3;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerdictSurface {
     pub kind: VerdictKind,
@@ -246,14 +252,27 @@ impl VerdictSurface {
         }
 
         let primary_command = primary_action.command.clone();
-        let secondary_actions = secondary_actions
+        let mut secondary_actions = secondary_actions
             .into_iter()
             .map(|(label, command)| HintLine {
                 label: label.into(),
                 command: command.into(),
             })
             .filter(|action| action.command != primary_command)
-            .collect();
+            .collect::<Vec<_>>();
+        // Shakedown P10: one verdict promises one obvious next action, so the
+        // supporting list stays short. `doctor` printed ten, six of them
+        // near-identical sandbox variants -- a wall of noise where guidance was
+        // promised. The cap lives here rather than in any one verb so every
+        // surface inherits it, and the last slot goes to a pointer so
+        // truncating never implies there is nothing else.
+        if secondary_actions.len() > MAX_SECONDARY_ACTIONS {
+            secondary_actions.truncate(MAX_SECONDARY_ACTIONS);
+            secondary_actions.push(HintLine {
+                label: "Secondary".to_string(),
+                command: "deadreckon help-all".to_string(),
+            });
+        }
 
         Ok(Self {
             kind,
@@ -372,4 +391,86 @@ pub enum VerdictSurfaceError {
     MissingExplanation,
     MissingSubjectKind,
     MissingPrimaryCommand,
+}
+
+#[cfg(test)]
+mod shakedown_cap_tests {
+    use super::*;
+
+    #[test]
+    fn secondary_actions_never_exceed_three() {
+        // Ten was not hypothetical: `deadreckon doctor` printed exactly that,
+        // six of them near-identical sandbox variants.
+        let many = (0..10)
+            .map(|index| ("Secondary", format!("deadreckon thing-{index}")))
+            .collect::<Vec<_>>();
+        let surface = VerdictSurface::try_new(
+            VerdictKind::Verified,
+            "run",
+            Some("abc12345"),
+            ExplanationPanel::new("what", "why", [("k".to_string(), "v".to_string())]),
+            [("Recommended", "deadreckon status")],
+            many,
+        )
+        .expect("surface");
+
+        let actions = surface
+            .secondary_actions
+            .iter()
+            .filter(|action| action.command != "deadreckon help-all")
+            .count();
+        assert!(actions <= 3, "{:?}", surface.secondary_actions);
+    }
+
+    #[test]
+    fn overflowing_secondary_actions_keep_a_way_to_the_rest() {
+        // Truncating in silence would tell the operator there is nothing else.
+        let many = (0..10)
+            .map(|index| ("Secondary", format!("deadreckon thing-{index}")))
+            .collect::<Vec<_>>();
+        let surface = VerdictSurface::try_new(
+            VerdictKind::Verified,
+            "run",
+            Some("abc12345"),
+            ExplanationPanel::new("what", "why", [("k".to_string(), "v".to_string())]),
+            [("Recommended", "deadreckon status")],
+            many,
+        )
+        .expect("surface");
+
+        assert!(
+            surface
+                .secondary_actions
+                .iter()
+                .any(|action| action.command == "deadreckon help-all"),
+            "{:?}",
+            surface.secondary_actions
+        );
+    }
+
+    #[test]
+    fn three_or_fewer_secondary_actions_are_left_alone() {
+        let few = vec![
+            ("Secondary", "deadreckon show abc12345".to_string()),
+            ("Secondary", "deadreckon attach abc12345".to_string()),
+        ];
+        let surface = VerdictSurface::try_new(
+            VerdictKind::Verified,
+            "run",
+            Some("abc12345"),
+            ExplanationPanel::new("what", "why", [("k".to_string(), "v".to_string())]),
+            [("Recommended", "deadreckon status")],
+            few,
+        )
+        .expect("surface");
+
+        assert_eq!(surface.secondary_actions.len(), 2);
+        assert!(
+            !surface
+                .secondary_actions
+                .iter()
+                .any(|action| action.command == "deadreckon help-all"),
+            "no pointer when nothing was dropped"
+        );
+    }
 }

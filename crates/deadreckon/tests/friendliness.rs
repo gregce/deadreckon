@@ -228,3 +228,94 @@ fn workspace_root() -> std::path::PathBuf {
     }
     dir
 }
+
+// ---------------------------------------------------------------------------
+// Shakedown P10 — one verdict, one primary action, at most three secondary ones.
+//
+// `deadreckon doctor` ended with one Recommended and ten Secondary lines, six of
+// them near-identical `run "goal" --sandbox X --preview` variants. That is a
+// wall of noise where the surface promises one obvious next action. The cap
+// lives in the surface constructor, not in doctor, so every surface inherits it
+// and no individual verb has to remember.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_secondary_actions_collapse_to_the_cap() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .args(["doctor"])
+        .output()
+        .expect("doctor");
+    let stdout = stdout(&output);
+
+    // No early return on a missing block: a doctor that failed to run would
+    // otherwise pass this test by printing nothing at all.
+    let index = stdout
+        .lines()
+        .position(|line| line.trim() == "Secondary")
+        .unwrap_or_else(|| panic!("doctor printed no Secondary block:\n{stdout}"));
+    let lines = stdout
+        .lines()
+        .skip(index + 1)
+        .take_while(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    // The `help-all` pointer is disclosure, not an action on the subject, so it
+    // does not consume one of the three. Spending a slot on it cost a paused
+    // chain its `undo`.
+    let actions = lines
+        .iter()
+        .filter(|line| line.trim() != "deadreckon help-all")
+        .count();
+    assert!(
+        actions <= 3,
+        "doctor printed {actions} secondary actions; the cap is three:\n{stdout}"
+    );
+    assert!(
+        lines.len() <= 4,
+        "at most three actions plus one pointer:\n{stdout}"
+    );
+}
+
+#[test]
+fn refusal_try_line_is_identical_in_json_and_human_output() {
+    // A refusal that leads somewhere in one rendering and nowhere in the other
+    // is the same defect wearing a different coat.
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+
+    let plain = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["verdict", "nonexistent", "--plain"])
+        .output()
+        .expect("verdict");
+    let json = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["verdict", "nonexistent", "--json"])
+        .output()
+        .expect("verdict json");
+
+    let plain_text = format!("{}{}", stdout(&plain), common::stderr(&plain));
+    let json_text = format!("{}{}", stdout(&json), common::stderr(&json));
+
+    let plain_try = plain_text
+        .lines()
+        .find(|line| line.contains("try:"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert!(
+        !plain_try.is_empty(),
+        "no try line in plain output: {plain_text}"
+    );
+
+    let command = plain_try.split("try:").nth(1).unwrap_or_default().trim();
+    assert!(
+        json_text.contains(command),
+        "the json refusal must name the same command as the plain one.\nplain: {command}\njson: {json_text}"
+    );
+}
