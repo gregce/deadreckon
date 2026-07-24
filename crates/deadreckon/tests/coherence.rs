@@ -2310,3 +2310,271 @@ fn journey_ids_from_list_are_accepted_or_redirected_by_finish_and_kill() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shakedown P9 — `list` shows one row per plan.
+//
+// On a real home, one plan with six children rendered as seven peer rows, each
+// repeating the same four-line root goal, and each child's goal column carried
+// the launch scaffolding it was prompted with:
+//
+//   "This is one full-plan child run in a larger plan. Root goal: ..."
+//
+// That is prompt plumbing leaking into the operator's inventory. Children fold
+// under their parent and show the task subject they were given.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_children_fold_under_the_parent_plan_row() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+
+    let child = create_run(
+        &paths,
+        RunOptions {
+            goal: "This is one full-plan child run in a larger plan. Root goal: build the thing"
+                .to_string(),
+            cwd: cwd.clone(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("child run");
+
+    let mut first = PlanTask::new(0, "Build the API", "do the api", PlanRole::Child, None);
+    first.child_run_id = Some(child.run_id.clone());
+    let second = PlanTask::new(1, "Build the UI", "do the ui", PlanRole::Child, None);
+    let mut plan = Plan::new(
+        "build the thing",
+        PlanMode::FullPlan,
+        vec![first, second],
+        PlanProviders::default(),
+        Some(scope.clone()),
+        "0.1.0",
+    )
+    .expect("plan");
+    plan.status = PlanStatus::Forked;
+    save_plan(&paths, &plan).expect("save plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["list", "--all", "--plain"])
+        .output()
+        .expect("list");
+    let stdout = stdout(&output);
+
+    // The child must not appear as a peer of its parent.
+    let plan_line = stdout
+        .lines()
+        .position(|line| line.starts_with(&plan.plan_id[..8]))
+        .expect("plan row");
+    let child_line = stdout
+        .lines()
+        .position(|line| line.contains(&child.run_id[..8]))
+        .expect("child row");
+    assert!(
+        child_line > plan_line,
+        "a child must render under its parent, not before it:\n{stdout}"
+    );
+    let between = stdout.lines().nth(child_line).unwrap_or_default();
+    assert!(
+        between.starts_with(' ') || between.trim_start().starts_with('\\'),
+        "a folded child row must be visibly subordinate: {between:?}\n{stdout}"
+    );
+}
+
+#[test]
+fn child_goal_scaffolding_is_stripped_from_the_goal_column() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+
+    let child = create_run(
+        &paths,
+        RunOptions {
+            goal: "This is one full-plan child run in a larger plan. Root goal: build the thing"
+                .to_string(),
+            cwd: cwd.clone(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("child run");
+
+    let mut first = PlanTask::new(0, "Build the API", "do the api", PlanRole::Child, None);
+    first.child_run_id = Some(child.run_id.clone());
+    let second = PlanTask::new(1, "Build the UI", "do the ui", PlanRole::Child, None);
+    let mut plan = Plan::new(
+        "build the thing",
+        PlanMode::FullPlan,
+        vec![first, second],
+        PlanProviders::default(),
+        Some(scope),
+        "0.1.0",
+    )
+    .expect("plan");
+    plan.status = PlanStatus::Forked;
+    save_plan(&paths, &plan).expect("save plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["list", "--all", "--plain"])
+        .output()
+        .expect("list");
+    let stdout = stdout(&output);
+
+    assert!(
+        !stdout.contains("This is one full-plan child run"),
+        "launch scaffolding must not reach the inventory:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Build the API"),
+        "a folded child shows the task subject it was given:\n{stdout}"
+    );
+}
+
+#[test]
+fn plan_goal_is_printed_once_per_plan() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+
+    let mut children = Vec::new();
+    for index in 0..3 {
+        let run = create_run(
+            &paths,
+            RunOptions {
+                goal: format!(
+                    "This is one full-plan child run in a larger plan. Root goal: shared root goal text {index}"
+                ),
+                cwd: cwd.clone(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("child run");
+        children.push(run);
+    }
+
+    let tasks = children
+        .iter()
+        .enumerate()
+        .map(|(index, run)| {
+            let mut task = PlanTask::new(
+                index as u32,
+                format!("Child {index}"),
+                "do it",
+                PlanRole::Child,
+                None,
+            );
+            task.child_run_id = Some(run.run_id.clone());
+            task
+        })
+        .collect::<Vec<_>>();
+    let mut plan = Plan::new(
+        "shared root goal text",
+        PlanMode::FullPlan,
+        tasks,
+        PlanProviders::default(),
+        Some(scope),
+        "0.1.0",
+    )
+    .expect("plan");
+    plan.status = PlanStatus::Forked;
+    save_plan(&paths, &plan).expect("save plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["list", "--all", "--plain"])
+        .output()
+        .expect("list");
+    let stdout = stdout(&output);
+
+    assert_eq!(
+        stdout.matches("shared root goal text").count(),
+        1,
+        "the root goal belongs on the plan row and nowhere else:\n{stdout}"
+    );
+}
+
+#[test]
+fn list_json_shape_is_unchanged_by_folding() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+
+    let child = create_run(
+        &paths,
+        RunOptions {
+            goal: "This is one full-plan child run in a larger plan. Root goal: build".to_string(),
+            cwd: cwd.clone(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("child run");
+    let mut first = PlanTask::new(0, "Build the API", "do the api", PlanRole::Child, None);
+    first.child_run_id = Some(child.run_id.clone());
+    let second = PlanTask::new(1, "Build the UI", "do the ui", PlanRole::Child, None);
+    let mut plan = Plan::new(
+        "build",
+        PlanMode::FullPlan,
+        vec![first, second],
+        PlanProviders::default(),
+        Some(scope),
+        "0.1.0",
+    )
+    .expect("plan");
+    plan.status = PlanStatus::Forked;
+    save_plan(&paths, &plan).expect("save plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["list", "--all", "--json"])
+        .output()
+        .expect("list json");
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("json");
+
+    // Folding is a rendering concern. The machine shape stays flat so existing
+    // consumers keep working; changing it is a compatibility decision of its own
+    // and is logged in V1-CANDIDATES.
+    let runs = value["runs"].as_array().expect("runs array");
+    assert!(
+        runs.iter()
+            .any(|run| run["run_id"].as_str() == Some(child.run_id.as_str())),
+        "the child must still appear flat in --json: {value}"
+    );
+    assert!(
+        runs.iter().all(|run| run["goal"].is_string()),
+        "run goals stay verbatim in --json: {value}"
+    );
+}
