@@ -3191,7 +3191,10 @@ fn print_chain_table(chains: &[Chain], full: bool) {
 
 // SAFETY: Chain list filters are owned clap values at the command boundary.
 #[allow(clippy::needless_pass_by_value)]
-fn list_chain_records(paths: &DeadreckonPaths, scope: Option<String>) -> Result<Vec<Chain>> {
+pub(crate) fn list_chain_records(
+    paths: &DeadreckonPaths,
+    scope: Option<String>,
+) -> Result<Vec<Chain>> {
     if !paths.chains_dir().exists() {
         return Ok(Vec::new());
     }

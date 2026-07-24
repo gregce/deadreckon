@@ -126,6 +126,11 @@ mod tui;
 mod tui_events;
 mod ui;
 
+// Shakedown moved id resolution into `commands::reference`. Re-exporting at the
+// crate root keeps it reachable through the `use super::super::*` that every
+// command module already relies on, so no call site had to change with the move.
+pub(crate) use commands::reference::{PlanChildSelection, resolve_plan_child_ref, resolve_plan_id};
+
 use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, CampaignCommand, ChainCommandArgs, Cli,
     CliDocKind, CliPlanMode, CliSeamKind, Commands, CompletionCommand, ConfigCommand,
@@ -4332,50 +4337,6 @@ fn sleep_secondary_commands(reason: sleep::SkipReason) -> Vec<(&'static str, &'s
     }
 }
 
-fn resolve_plan_id(paths: &DeadreckonPaths, id: &str) -> Result<String> {
-    let mut plans = fs::read_dir(paths.plans_dir())
-        .map_err(|source| DeadreckonError::Io {
-            path: paths.plans_dir(),
-            source,
-        })?
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.path().join("plan.json").is_file())
-        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-        .collect::<Vec<_>>();
-    plans.sort();
-    if matches!(id, "latest" | "last") {
-        plans.sort_by_key(|plan_id| {
-            fs::metadata(paths.plan_json(plan_id))
-                .and_then(|metadata| metadata.modified())
-                .ok()
-        });
-        return plans.last().cloned().ok_or_else(|| {
-            CliError::Core(deadreckon_core::user_error(
-                "no plans",
-                "deadreckon plan \"your goal\"",
-            ))
-        });
-    }
-    let matches = plans
-        .into_iter()
-        .filter(|plan_id| plan_id.starts_with(id))
-        .collect::<Vec<_>>();
-    match matches.len() {
-        1 => Ok(matches[0].clone()),
-        0 => Err(CliError::Core(deadreckon_core::user_error(
-            &format!("no plan {id}"),
-            "deadreckon plan \"your goal\"",
-        ))),
-        _ => Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "ambiguous plan id prefix {id}; matches {}",
-                matches.join(", ")
-            ),
-            "use a longer plan id prefix",
-        ))),
-    }
-}
-
 #[derive(Debug, Clone)]
 struct PlanResultRun {
     plan: Plan,
@@ -6160,63 +6121,6 @@ fn commit_plan_apply_docs_update(
             ),
         ],
     )
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PlanChildSelection {
-    plan_id: String,
-    task_id: String,
-    run_id: String,
-}
-
-fn resolve_plan_child_ref(paths: &DeadreckonPaths, id: &str) -> Result<Option<PlanChildSelection>> {
-    let Some((plan_ref, child_ref)) = id
-        .split_once(':')
-        .or_else(|| id.split_once('/'))
-        .map(|(plan_ref, child_ref)| (plan_ref.trim(), child_ref.trim()))
-    else {
-        return Ok(None);
-    };
-    if plan_ref.is_empty() || child_ref.is_empty() {
-        return Ok(None);
-    }
-    let plan_id = resolve_plan_id(paths, plan_ref)?;
-    let plan = load_plan(paths, &plan_id)?;
-    let task = resolve_plan_child_task(&plan, child_ref).ok_or_else(|| {
-        CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "plan {} has no child {child_ref}",
-                run_prefix(&plan.plan_id)
-            ),
-            &format!("deadreckon show {}", run_prefix(&plan.plan_id)),
-        ))
-    })?;
-    let run_id = task.child_run_id.clone().ok_or_else(|| {
-        CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "{} in plan {} has no run id yet",
-                task.task_id,
-                run_prefix(&plan.plan_id)
-            ),
-            &format!("deadreckon attach {}", run_prefix(&plan.plan_id)),
-        ))
-    })?;
-    Ok(Some(PlanChildSelection {
-        plan_id: plan.plan_id.clone(),
-        task_id: task.task_id.clone(),
-        run_id,
-    }))
-}
-
-fn resolve_plan_child_task<'a>(plan: &'a Plan, child_ref: &str) -> Option<&'a PlanTask> {
-    if let Some(task) = plan.task_by_id(child_ref) {
-        return Some(task);
-    }
-    let normalized = child_ref.strip_prefix("task-").unwrap_or(child_ref);
-    normalized
-        .parse::<u32>()
-        .ok()
-        .and_then(|index| plan.tasks.iter().find(|task| task.index == index))
 }
 
 #[cfg(test)]
