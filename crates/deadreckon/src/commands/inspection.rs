@@ -87,7 +87,26 @@ pub(crate) fn list_command(
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
-    let mut entries = runs
+    // Shakedown P9: children of a listed plan fold under it. One plan with six
+    // children used to render as seven peer rows, each repeating the same root
+    // goal. A child whose parent is not in this listing stays top-level, so
+    // nothing disappears from the inventory.
+    let child_index = plan_child_index(&paths, &plans);
+    let listed_plans = plans
+        .iter()
+        .map(|plan| plan.plan_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut folded: BTreeMap<String, Vec<RunListEntry>> = BTreeMap::new();
+    let mut top_level_runs = Vec::new();
+    for run in runs {
+        match child_index.get(&run.run_id) {
+            Some((plan_id, _)) if listed_plans.contains(plan_id) => {
+                folded.entry(plan_id.clone()).or_default().push(run);
+            }
+            _ => top_level_runs.push(run),
+        }
+    }
+    let mut entries = top_level_runs
         .into_iter()
         .map(ListEntry::Run)
         .chain(plans.into_iter().map(ListEntry::Plan))
@@ -131,6 +150,7 @@ pub(crate) fn list_command(
                         goal: run.goal.clone(),
                         goal_width,
                         orchestration: false,
+                        child: false,
                     },
                 );
             }
@@ -148,8 +168,38 @@ pub(crate) fn list_command(
                         goal: plan.goal.clone(),
                         goal_width,
                         orchestration: true,
+                        child: false,
                     },
                 );
+                for child in folded.get(&plan.plan_id).into_iter().flatten() {
+                    let state = load_state(&child.state_path).ok();
+                    let subject = child_index
+                        .get(&child.run_id)
+                        .map(|(_, subject)| subject.clone())
+                        .unwrap_or_else(|| child.goal.clone());
+                    append_list_row(
+                        &mut output,
+                        &ListRow {
+                            id: run_prefix(&child.run_id),
+                            status: run_status_label(child.status).to_string(),
+                            age: relative_age(child.updated_at),
+                            scope: child.scope.clone(),
+                            kind: "child".to_string(),
+                            mode: state
+                                .as_ref()
+                                .map(|state| codebase_mode_status(&paths, state))
+                                .unwrap_or_else(|| "-".to_string()),
+                            action: state
+                                .as_ref()
+                                .map(|state| next_action_label(&paths, state))
+                                .unwrap_or_else(|| "-".to_string()),
+                            goal: subject,
+                            goal_width,
+                            orchestration: false,
+                            child: true,
+                        },
+                    );
+                }
             }
         }
     }
@@ -239,6 +289,9 @@ struct ListRow {
     pub(crate) goal: String,
     goal_width: usize,
     orchestration: bool,
+    /// A run folded under its parent plan: indented, so the inventory reads as
+    /// one row per plan rather than N peers repeating the same root goal.
+    child: bool,
 }
 
 fn list_header() -> String {
@@ -252,6 +305,35 @@ fn list_header() -> String {
         pad_plain("mode", LIST_MODE_WIDTH),
         pad_plain("action", LIST_ACTION_WIDTH)
     )
+}
+
+/// Shakedown P9: which runs are children of which listed plan, and the subject
+/// each was given.
+///
+/// A child run's goal is the launch prompt it was handed -- "This is one
+/// full-plan child run in a larger plan. Root goal: ..." -- which is plumbing,
+/// not inventory. The plan task's `subject` is the operator-meaningful name for
+/// that piece of work, so folded children show it instead of a string-surgery
+/// attempt on the prompt.
+fn plan_child_index(
+    paths: &DeadreckonPaths,
+    plans: &[PlanListEntry],
+) -> BTreeMap<String, (String, String)> {
+    let mut index = BTreeMap::new();
+    for entry in plans {
+        let Ok(plan) = load_plan(paths, &entry.plan_id) else {
+            continue;
+        };
+        for task in &plan.tasks {
+            if let Some(child_run_id) = task.child_run_id.as_ref() {
+                index.insert(
+                    child_run_id.clone(),
+                    (plan.plan_id.clone(), task.subject.clone()),
+                );
+            }
+        }
+    }
+    index
 }
 
 fn append_list_row(output: &mut String, row: &ListRow) {
@@ -271,7 +353,11 @@ fn append_list_row(output: &mut String, row: &ListRow) {
     );
     let continuation_prefix = " ".repeat(list_prefix_width());
     let goal_lines = wrap_list_goal(&row.goal, row.goal_width);
+    // A folded child is indented as a whole line. Putting the marker inside the
+    // id cell would overflow its fixed width and truncate the id itself.
+    let indent = if row.child { "  " } else { "" };
     for (index, line) in goal_lines.iter().enumerate() {
+        output.push_str(indent);
         if index == 0 {
             output.push_str(&first_prefix);
             output.push_str(line);
