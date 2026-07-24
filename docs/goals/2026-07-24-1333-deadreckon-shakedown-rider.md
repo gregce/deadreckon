@@ -132,11 +132,16 @@ loop — the tool quietly deciding what the operator meant. The spec is therefor
    contains `:` or `/` (`resolve_plan_child_ref`, now in `reference.rs`), which
    a bare id never does. The shapes are disjoint, so checking it first is
    disambiguation, not ranking.
-2. **Every other accepted kind is probed, and all matches are collected** — run
-   (`deadreckon_core::load_run`), plan (`plan_ids_matching`), chain
-   (`commands::chain::list_chain_records`), campaign
+2. **Every other kind is probed — regardless of `accepts` — and all matches are
+   collected**: run (`deadreckon_core::load_run`), plan (`plan_ids_matching`),
+   chain (`commands::chain::list_chain_records`), campaign
    (`commands::campaign::resolve_campaign`). Exactly one match resolves; two or
    more is the cross-kind ambiguity refusal below.
+3. **`accepts` narrows the decision, not the probe** (settled in P3). Probing
+   only the accepted kinds is exactly what produced `not found: run 0c11f68e`
+   for an id that existed and was simply a plan — a false statement, and the far
+   end of the loop. Identify what the reference names first, then decide whether
+   this verb can take it; if it cannot, refuse by kind via the table below.
 
 The listed order still governs which id a refusal names first, so messages stay
 deterministic. Probing every kind costs no more than the old cascade: the plan
@@ -299,7 +304,8 @@ Depth tests (`crates/deadreckon/src/commands/reference/tests.rs`):
 - `ambiguous_prefix_across_run_and_plan_names_both_full_ids`
 - `unknown_reference_with_no_state_refuses_with_start_not_list`
 - `unknown_reference_with_existing_state_refuses_with_list`
-- `accepts_narrows_which_kinds_are_probed`
+- `accepts_narrows_which_kinds_a_verb_will_take` (renamed in P3: every kind is
+  probed and `accepts` narrows the decision, not the probe)
 - `ref_kinds_all_contains_every_kind`
 - `plan_ids_matching_with_empty_prefix_lists_every_plan`
 - `plan_ids_matching_ignores_directories_without_plan_json`
