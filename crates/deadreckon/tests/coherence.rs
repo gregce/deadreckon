@@ -1624,3 +1624,203 @@ fn section_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str>
             .map_or(after_start, |(section, _)| section),
     )
 }
+
+// ---------------------------------------------------------------------------
+// Shakedown P4 — `status` is the orientation verb, so it orients across kinds.
+//
+// Before this phase `status` saw runs only. Handed a plan id that `list` had
+// just printed, it answered "not found: run <id>" and pointed at `list`, which
+// recommended `status latest`, which refused the same way. These pin the loop
+// closed.
+// ---------------------------------------------------------------------------
+
+/// A plan attributable to `scope`, with no runs anywhere — the exact shape the
+/// reproduction was found in.
+fn shakedown_plan_fixture(paths: &DeadreckonPaths, scope: &str) -> Plan {
+    let first = PlanTask::new(0, "First", "Do the first thing", PlanRole::Child, None);
+    let second = PlanTask::new(1, "Second", "Do the second thing", PlanRole::Child, None);
+    let plan = Plan::new(
+        "Build from review shorthand",
+        PlanMode::FullPlan,
+        vec![first, second],
+        PlanProviders::default(),
+        Some(scope.to_string()),
+        "0.1.0",
+    )
+    .expect("plan");
+    save_plan(paths, &plan).expect("save plan");
+    plan
+}
+
+#[test]
+fn status_on_a_plan_id_describes_the_plan_instead_of_refusing() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    let plan = shakedown_plan_fixture(&paths, &scope);
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["status", &plan.plan_id[..8], "--plain"])
+        .output()
+        .expect("status");
+
+    let stdout = stdout(&output);
+    let stderr = stderr(&output);
+    assert!(
+        output.status.success(),
+        "status must answer for a plan id, not refuse: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not found"),
+        "the id exists; it is a plan: {stderr}"
+    );
+    assert!(
+        stdout.contains(&plan.plan_id[..8]),
+        "status must name the plan it described: {stdout}"
+    );
+}
+
+#[test]
+fn status_latest_resolves_a_plan_when_the_scope_has_no_runs() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    let plan = shakedown_plan_fixture(&paths, &scope);
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["status", "latest", "--plain"])
+        .output()
+        .expect("status latest");
+
+    assert!(
+        output.status.success(),
+        "a scope holding only plans still has a latest: {}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains(&plan.plan_id[..8]),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn status_list_status_sequence_terminates_in_an_answer() {
+    // The reproduction, run end to end: status -> list -> status <printed id>.
+    // Every step must either answer or hand over a command that answers.
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    let plan = shakedown_plan_fixture(&paths, &scope);
+
+    let bare = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["status", "--plain"])
+        .output()
+        .expect("status");
+    assert!(
+        bare.status.success(),
+        "bare status must not dead-end when the scope has a plan: {}",
+        stderr(&bare)
+    );
+
+    let listed = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["list", "--plain"])
+        .output()
+        .expect("list");
+    let listed_stdout = stdout(&listed);
+    assert!(
+        listed_stdout.contains(&plan.plan_id[..8]),
+        "list must print the plan id: {listed_stdout}"
+    );
+
+    let again = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["status", &plan.plan_id[..8], "--plain"])
+        .output()
+        .expect("status by id");
+    assert!(
+        again.status.success(),
+        "an id printed by list must be answerable by status: {}",
+        stderr(&again)
+    );
+}
+
+#[test]
+fn journey_ids_from_list_are_accepted_by_status() {
+    // The cross-verb invariant, for the one verb rewired in this phase: every id
+    // `list` prints must be answered by `status`, or refused with a `try:` that
+    // is not `list` itself.
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    shakedown_plan_fixture(&paths, &scope);
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "a real run".to_string(),
+            cwd: cwd.clone(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+    state.status = RunStatus::Completed;
+    save_state(&state).expect("save");
+
+    let listed = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["list", "--plain"])
+        .output()
+        .expect("list");
+    let listed_stdout = stdout(&listed);
+
+    let ids = listed_stdout
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|token| token.len() == 8 && token.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(!ids.is_empty(), "list printed no ids: {listed_stdout}");
+
+    for id in ids {
+        let output = deadreckon(&paths)
+            .current_dir(&cwd)
+            .args(["status", &id, "--plain"])
+            .output()
+            .expect("status");
+        if output.status.success() {
+            continue;
+        }
+        let combined = format!("{}{}", stdout(&output), stderr(&output));
+        let try_line = combined
+            .lines()
+            .find(|line| line.contains("try:"))
+            .unwrap_or_default();
+        assert!(
+            !try_line.is_empty(),
+            "status refused {id} with no way forward: {combined}"
+        );
+        assert!(
+            !try_line.contains("deadreckon list"),
+            "status sent {id} back to the command that printed it: {try_line}"
+        );
+    }
+}
