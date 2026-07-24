@@ -8960,22 +8960,6 @@ fn current_scope() -> Result<String> {
     workspace_scope(&cwd).map_err(CliError::from)
 }
 
-fn load_cli_run(paths: &DeadreckonPaths, run_id: &str) -> Result<deadreckon_core::PipelineState> {
-    load_cli_run_with_scope(paths, run_id, false)
-}
-
-fn load_cli_run_with_scope(
-    paths: &DeadreckonPaths,
-    run_id: &str,
-    all: bool,
-) -> Result<deadreckon_core::PipelineState> {
-    if matches!(run_id, "latest" | "last") {
-        latest_run(paths, all)
-    } else {
-        load_run(paths, run_id).map_err(CliError::from)
-    }
-}
-
 fn next_action_label(paths: &DeadreckonPaths, state: &deadreckon_core::PipelineState) -> String {
     if state.run_root.join("abandoned.json").exists() {
         return cleanup_action_label(state);
@@ -9118,7 +9102,6 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
         &paths,
         commands::reference::RefQuery {
             reference: Some(&run_id),
-            accepts: commands::reference::RefKinds::ALL,
             all_scopes: false,
             verb: "kill",
         },
@@ -10526,7 +10509,6 @@ fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
         &paths,
         commands::reference::RefQuery {
             reference: Some(args.run_id),
-            accepts: commands::reference::RefKinds::ALL,
             all_scopes: false,
             verb: "show",
         },
@@ -10946,27 +10928,6 @@ fn provider_ingest_roots_for_working_dirs(
     roots
 }
 
-/// Shakedown P2: a thin shim over the one `latest` rule, pinned to runs so every
-/// existing caller keeps its current behavior. P8 deletes it once the verbs call
-/// `resolve_ref` directly.
-fn latest_run(paths: &DeadreckonPaths, all: bool) -> Result<deadreckon_core::PipelineState> {
-    let scope = if all { None } else { Some(current_scope()?) };
-    match commands::reference::resolve_latest_in_scope(
-        paths,
-        commands::reference::RefKinds::RUN,
-        scope.as_deref(),
-    )? {
-        commands::reference::ResolvedRef::Run(state) => Ok(*state),
-        other => Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "latest resolved a {} where a run was required",
-                other.kind().noun()
-            ),
-            "deadreckon list",
-        ))),
-    }
-}
-
 /// `status` is the orientation verb, so it orients across every kind.
 ///
 /// It used to resolve runs only. Handed a plan id that `list` had just printed
@@ -10981,7 +10942,6 @@ fn status_command(run_id: Option<&str>, all: bool, plain: bool, json_output: boo
         &paths,
         commands::reference::RefQuery {
             reference: run_id,
-            accepts: commands::reference::RefKinds::ALL,
             all_scopes: all,
             verb: "status",
         },

@@ -28,20 +28,21 @@ pub(crate) fn materialize_command(
     include_manifest: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let (state, plan_context, dest) = match load_cli_run(&paths, &run_id) {
-        Ok(state) => (state, None, dest),
-        Err(run_error) => match resolve_plan_result_run(&paths, &run_id, "export")? {
-            Some(result) => {
-                let dest = dest.or_else(|| Some(default_plan_materialize_dest(&result.plan)));
-                (result.state, Some(result.plan), dest)
-            }
-            None => {
-                return Err(super::reference::refusal_for_reference(
-                    &paths, &run_id, "finish", run_error,
-                ));
-            }
-        },
-    };
+    let (state, plan_context, dest) =
+        match super::reference::try_resolve_run(&paths, &run_id, "export")? {
+            Some(state) => (state, None, dest),
+            None => match resolve_plan_result_run(&paths, &run_id, "export")? {
+                Some(result) => {
+                    let dest = dest.or_else(|| Some(default_plan_materialize_dest(&result.plan)));
+                    (result.state, Some(result.plan), dest)
+                }
+                None => {
+                    return Err(super::reference::refusal_for_reference(
+                        &paths, &run_id, "export",
+                    ));
+                }
+            },
+        };
     if let Some(plan) = plan_context.as_ref() {
         print_plan_result_context(plan, &state);
         let library_dir = paths.library_dir(&state.scope, &state.run_id);
@@ -67,27 +68,28 @@ pub(crate) fn finish_command(
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let requested = run_id.unwrap_or_else(|| "latest".to_string());
-    let (state, plan_context, dest) = match load_cli_run(&paths, &requested) {
-        Ok(state) => (state, None, dest),
-        Err(run_error) => match resolve_plan_result_run(&paths, &requested, "finish")? {
-            Some(result) => {
-                if dest.is_none() && plan_apply_git_root(&result.plan)?.is_some() {
-                    return apply_command_inner(
-                        requested, strategy, branch, no_confirm, autostash, cleanup, message,
-                        false, false,
-                    );
+    let (state, plan_context, dest) =
+        match super::reference::try_resolve_run(&paths, &requested, "finish")? {
+            Some(state) => (state, None, dest),
+            None => match resolve_plan_result_run(&paths, &requested, "finish")? {
+                Some(result) => {
+                    if dest.is_none() && plan_apply_git_root(&result.plan)?.is_some() {
+                        return apply_command_inner(
+                            requested, strategy, branch, no_confirm, autostash, cleanup, message,
+                            false, false,
+                        );
+                    }
+                    let dest =
+                        Some(dest.unwrap_or_else(|| default_plan_materialize_dest(&result.plan)));
+                    (result.state, Some(result.plan), dest)
                 }
-                let dest =
-                    Some(dest.unwrap_or_else(|| default_plan_materialize_dest(&result.plan)));
-                (result.state, Some(result.plan), dest)
-            }
-            None => {
-                return Err(super::reference::refusal_for_reference(
-                    &paths, &requested, "finish", run_error,
-                ));
-            }
-        },
-    };
+                None => {
+                    return Err(super::reference::refusal_for_reference(
+                        &paths, &requested, "finish",
+                    ));
+                }
+            },
+        };
     if let Some(plan) = plan_context.as_ref() {
         print_plan_result_context(plan, &state);
         let library_dir = paths.library_dir(&state.scope, &state.run_id);
@@ -349,9 +351,9 @@ fn apply_command_inner(
     _plain: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let mut state = match load_cli_run(&paths, &run_id) {
-        Ok(state) => state,
-        Err(run_error) => match resolve_plan_result_run(&paths, &run_id, "apply")? {
+    let mut state = match super::reference::try_resolve_run(&paths, &run_id, "apply")? {
+        Some(state) => state,
+        None => match resolve_plan_result_run(&paths, &run_id, "apply")? {
             Some(result) => {
                 if !quiet {
                     print_plan_result_context(&result.plan, &result.state);
@@ -360,7 +362,7 @@ fn apply_command_inner(
             }
             None => {
                 return Err(super::reference::refusal_for_reference(
-                    &paths, &run_id, "finish", run_error,
+                    &paths, &run_id, "apply",
                 ));
             }
         },
@@ -868,7 +870,7 @@ fn should_prompt_cleanup(no_confirm: bool) -> Result<bool> {
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let mut state = load_cli_run(&paths, &run_id)?;
+    let mut state = super::reference::resolve_run_like(&paths, Some(&run_id), "abandon")?;
     let Ok(record) = read_codebase_record(&state.working_dir) else {
         print!(
             "{}",
@@ -946,7 +948,7 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
     } = args;
     let paths = DeadreckonPaths::discover();
     if let Some(run_id) = run_id {
-        let mut state = load_cli_run(&paths, &run_id)?;
+        let mut state = super::reference::resolve_run_like(&paths, Some(&run_id), "cleanup")?;
         if state.status == RunStatus::Executing {
             if !escalate {
                 return Err(CliError::Core(deadreckon_core::user_error(
@@ -1387,7 +1389,7 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     }
 
     let paths = DeadreckonPaths::discover();
-    let parent = load_cli_run(&paths, &parent_run_id)?;
+    let parent = super::reference::resolve_run_like(&paths, Some(&parent_run_id), "extend")?;
     if parent.status != RunStatus::Completed {
         return Err(CliError::Surface {
             code: 1,

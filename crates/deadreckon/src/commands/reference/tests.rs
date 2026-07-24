@@ -126,7 +126,6 @@ impl Fixture {
     fn query<'a>(&self, reference: &'a str) -> RefQuery<'a> {
         RefQuery {
             reference: Some(reference),
-            accepts: RefKinds::ALL,
             all_scopes: true,
             verb: "status",
         }
@@ -270,20 +269,21 @@ fn accepts_narrows_which_kinds_a_verb_will_take() {
 
     let run_only = RefQuery {
         reference: Some("5555"),
-        accepts: RefKinds::RUN,
         all_scopes: true,
         verb: "verdict",
     };
     resolve_ref(&fx.paths, run_only).expect_err("a run-only verb must not resolve a plan");
 
+    // Only the verb name differs, which is the point: acceptance is data in
+    // VERB_REF_SPECS, not something a call site restates.
     let resolved = resolve_ref(
         &fx.paths,
         RefQuery {
-            accepts: RefKinds::RUN.union(RefKinds::PLAN),
+            verb: "status",
             ..run_only
         },
     )
-    .expect("resolves once plans are accepted");
+    .expect("status accepts plans");
     assert_eq!(resolved_id(&resolved), plan.plan_id);
 }
 
@@ -362,7 +362,6 @@ fn latest_and_last_are_the_same_reference() {
         &fx.paths,
         RefQuery {
             reference: Some("last"),
-            accepts: RefKinds::RUN,
             all_scopes: true,
             verb: "status",
         },
@@ -651,9 +650,8 @@ fn a_plan_given_to_a_run_only_verb_is_refused_by_kind_not_by_absence() {
         &fx.paths,
         RefQuery {
             reference: Some("0c11f68e"),
-            accepts: RefKinds::RUN,
             all_scopes: true,
-            verb: "status",
+            verb: "verdict",
         },
     )
     .expect_err("a run-only verb cannot take a plan");
@@ -704,4 +702,92 @@ fn every_ambiguity_refusal_carries_a_runnable_try() {
         assert!(text.contains("try:"), "{prefix}: no way forward: {text}");
         assert!(text.contains("deadreckon "), "{prefix}: {text}");
     }
+}
+
+#[test]
+fn every_verb_used_in_source_is_listed_in_the_acceptance_table() {
+    // `RefQuery` derives `accepts` from the verb name, so a verb absent from the
+    // table silently gets `ALL`. That is the safe direction -- it can only make a
+    // refusal less likely, never send an operator somewhere wrong -- but it would
+    // also mean the matrix the tests iterate is not the one the code obeys. This
+    // keeps them the same list.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let callers = [
+        "resolve_run_like(",
+        "refusal_for_reference(",
+        "try_resolve_run(",
+    ];
+    let mut missing = Vec::new();
+    for file in rust_files(&src) {
+        if file.to_string_lossy().contains("commands/reference") {
+            continue;
+        }
+        let text = fs::read_to_string(&file).expect("source");
+        let lines = text.lines().collect::<Vec<_>>();
+        for (index, line) in lines.iter().enumerate() {
+            // A `verb:` field, but only inside a RefQuery literal.
+            if line.contains("verb: \"")
+                && lines[index.saturating_sub(6)..index]
+                    .iter()
+                    .any(|prior| prior.contains("RefQuery {"))
+                && let Some(verb) = quoted_after(line, "verb: \"")
+                && !VERB_REF_SPECS.iter().any(|spec| spec.verb == verb)
+            {
+                missing.push(format!("{}: {verb}", file.display()));
+            }
+            // A verb name passed positionally to a resolver helper.
+            for caller in callers {
+                if let Some(rest) = line.split_once(caller)
+                    && let Some(verb) = last_quoted(rest.1)
+                    && !VERB_REF_SPECS.iter().any(|spec| spec.verb == verb)
+                {
+                    missing.push(format!("{}: {verb}", file.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these verbs resolve references but are absent from VERB_REF_SPECS:\n{}",
+        missing.join("\n")
+    );
+}
+
+/// The verb is the last argument these helpers take, so a leading string
+/// argument (a run id in a test fixture, say) must not be mistaken for it.
+fn last_quoted(rest: &str) -> Option<String> {
+    let mut parts = rest.split('"');
+    let mut last = None;
+    // Quoted segments sit at odd indexes once split on the quote character.
+    for (index, part) in parts.by_ref().enumerate() {
+        if index % 2 == 1 {
+            last = Some(part.to_string());
+        }
+    }
+    last.filter(|value| {
+        !value.is_empty() && value.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+    })
+}
+
+fn quoted_after(line: &str, marker: &str) -> Option<String> {
+    let (_, rest) = line.split_once(marker)?;
+    let (value, _) = rest.split_once('"')?;
+    (!value.is_empty() && value.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+        .then(|| value.to_string())
+}
+
+fn rust_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rust_files(&path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    out
 }

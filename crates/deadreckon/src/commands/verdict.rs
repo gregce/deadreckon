@@ -31,7 +31,8 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     if args.all {
         return verdict_all_command(&paths, args.limit.unwrap_or(10), args.json);
     }
-    let state = resolve_verdict_run(&paths, args.run_id.as_deref())?;
+    let state =
+        crate::commands::reference::resolve_run_like(&paths, args.run_id.as_deref(), "verdict")?;
     let report = build_verdict_report(&state);
     // The sidecar is an additive audit artifact; a read-only filesystem must not
     // turn a verdict into a hard failure, so a write error is swallowed.
@@ -49,39 +50,6 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
         println!("{}", surface.render_plain(args.quiet));
     }
     Ok(())
-}
-
-/// Resolve the run to verify.
-///
-/// A verdict is a statement about a gate, and only runs have one, so this stays
-/// run-only. What changed in Shakedown is the refusal: a plan id used to come
-/// back as "unknown run <id>" pointing at `deadreckon list` — false, because the
-/// id was perfectly well known, and circular, because `list` is where the
-/// operator read it. The shared resolver identifies the kind first and names a
-/// verb that accepts it.
-pub(crate) fn resolve_verdict_run(
-    paths: &DeadreckonPaths,
-    id_arg: Option<&str>,
-) -> Result<deadreckon_core::PipelineState> {
-    let resolved = crate::commands::reference::resolve_ref(
-        paths,
-        crate::commands::reference::RefQuery {
-            reference: id_arg,
-            accepts: crate::commands::reference::RefKinds::RUN
-                .union(crate::commands::reference::RefKinds::PLAN_CHILD),
-            all_scopes: false,
-            verb: "verdict",
-        },
-    )?;
-    match resolved {
-        crate::commands::reference::ResolvedRef::Run(state) => Ok(*state),
-        crate::commands::reference::ResolvedRef::PlanChild { state, .. } => Ok(*state),
-        other => Err(crate::commands::reference::refusal_for(
-            other.kind(),
-            "verdict",
-            &crate::commands::reference::resolved_id(&other),
-        )),
-    }
 }
 
 /// A one-row verdict summary for the `--all` comparison.
@@ -618,7 +586,8 @@ mod tests {
         std::fs::create_dir_all(&repo).expect("repo");
         fixture_run(&paths, "real-run-0001", &repo);
 
-        let err = resolve_verdict_run(&paths, Some("nope")).expect_err("refuse");
+        let err = crate::commands::reference::resolve_run_like(&paths, Some("nope"), "verdict")
+            .expect_err("refuse");
         assert!(err.to_string().contains("deadreckon list"), "{err}");
     }
 
@@ -631,7 +600,8 @@ mod tests {
         fixture_run(&paths, "ambig-run-0001", &repo);
         fixture_run(&paths, "ambig-run-0002", &repo);
 
-        let err = resolve_verdict_run(&paths, Some("ambig")).expect_err("refuse");
+        let err = crate::commands::reference::resolve_run_like(&paths, Some("ambig"), "verdict")
+            .expect_err("refuse");
         let message = err.to_string();
         assert!(message.contains("ambiguous"), "{message}");
         assert!(message.contains("deadreckon list"), "{message}");

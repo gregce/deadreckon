@@ -1281,7 +1281,7 @@ pub(crate) fn save_launch_plan_best_effort(root: &Path, plan: &LaunchPlan) {
 /// The proposal NEVER executes without this explicit accept.
 pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = super::verdict::resolve_verdict_run(&paths, Some(&args.run_id))?;
+    let state = super::reference::resolve_run_like(&paths, Some(&args.run_id), "verdict")?;
     if matches!(state.status, deadreckon_core::RunStatus::Executing) {
         return Err(CliError::Core(deadreckon_core::user_error(
             &format!("run {} is still running", state.run_id),

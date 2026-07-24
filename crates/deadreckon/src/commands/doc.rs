@@ -35,11 +35,10 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
         budget_cap,
     } = args;
     let paths = DeadreckonPaths::discover();
-    let loaded_state = load_cli_run(&paths, &run_id);
-    if let Some(target) = match loaded_state.as_ref() {
-        Ok(state) => resolve_plan_doc_target(&paths, &run_id, Some(state))?,
-        Err(_) => resolve_plan_doc_target(&paths, &run_id, None)?,
-    } {
+    // `doc` maps a plan reference onto that plan's doc target, so resolution must
+    // not refuse a non-run kind before the mapping gets its turn.
+    let loaded_state = super::reference::try_resolve_run(&paths, &run_id, "doc")?;
+    if let Some(target) = resolve_plan_doc_target(&paths, &run_id, loaded_state.as_ref())? {
         return doc_plan_command(
             &paths,
             DocPlanCommandArgs {
@@ -54,7 +53,11 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
         )
         .await;
     }
-    let mut state = loaded_state?;
+    let Some(mut state) = loaded_state else {
+        return Err(super::reference::refusal_for_reference(
+            &paths, &run_id, "doc",
+        ));
+    };
     let kind_arg = cli_doc_kind_arg(kind);
     let kind = run_doc_kind(kind)?;
     if polish {

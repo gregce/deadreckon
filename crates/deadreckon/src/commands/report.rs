@@ -18,7 +18,6 @@ pub(crate) fn report_command(args: ReportCommandArgs) -> Result<()> {
         &paths,
         super::reference::RefQuery {
             reference: Some(&args.run_id),
-            accepts: super::reference::RefKinds::RUN.union(super::reference::RefKinds::PLAN_CHILD),
             all_scopes: false,
             verb: "report",
         },
