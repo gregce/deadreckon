@@ -33,113 +33,122 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     };
     let mut parent_plan = None;
     let run_ref = args.run_id.clone();
-    if let Some((campaign_dir, campaign)) = commands::campaign::resolve_campaign(&paths, &run_ref)?
-    {
-        let state = commands::campaign::CampaignAttachState::new(&paths, &campaign_dir, campaign);
-        if args.why {
-            print!(
-                "{}",
-                commands::campaign::campaign_why_failed_report(
+    // Shakedown P6: one resolution replaces the hand-rolled
+    // campaign/plan-child/run/plan/chain cascade. Every arm below is the body
+    // that was already here, so the characterization goldens should not move.
+    let resolved = super::reference::resolve_ref(
+        &paths,
+        super::reference::RefQuery {
+            reference: Some(&run_ref),
+            accepts: super::reference::RefKinds::ALL,
+            all_scopes: false,
+            verb: "attach",
+        },
+    )?;
+    let state = match resolved {
+        super::reference::ResolvedRef::Campaign {
+            dir: campaign_dir,
+            campaign,
+        } => {
+            let state =
+                commands::campaign::CampaignAttachState::new(&paths, &campaign_dir, *campaign);
+            if args.why {
+                print!(
+                    "{}",
+                    commands::campaign::campaign_why_failed_report(
+                        &paths,
+                        &state.campaign,
+                        state.rollup.as_ref()
+                    )
+                );
+            } else if args.view.is_narrative() && args.json {
+                print_campaign_narrative_json(&paths, &state.campaign, args.visual)?;
+            } else if args.view.is_narrative() && (!io::stdout().is_terminal() || args.plain) {
+                print_campaign_narrative_plain(&paths, &state.campaign, args.visual)?;
+            } else if args.json {
+                print!(
+                    "{}",
+                    commands::campaign::campaign_attach_json_text(Some(&paths), &state)?
+                );
+            } else if io::stdout().is_terminal() && !args.plain {
+                let show_hints = completion_hints_enabled(args.no_hints);
+                print_attach_banner("campaign", &state.campaign.campaign_id);
+                attach_campaign_tui(
                     &paths,
-                    &state.campaign,
-                    state.rollup.as_ref()
+                    state,
+                    show_hints,
+                    args.view,
+                    args.visual,
+                    narrative_config.clone(),
                 )
-            );
-        } else if args.view.is_narrative() && args.json {
-            print_campaign_narrative_json(&paths, &state.campaign, args.visual)?;
-        } else if args.view.is_narrative() && (!io::stdout().is_terminal() || args.plain) {
-            print_campaign_narrative_plain(&paths, &state.campaign, args.visual)?;
-        } else if args.json {
-            print!(
-                "{}",
-                commands::campaign::campaign_attach_json_text(Some(&paths), &state)?
-            );
-        } else if io::stdout().is_terminal() && !args.plain {
-            let show_hints = completion_hints_enabled(args.no_hints);
-            print_attach_banner("campaign", &state.campaign.campaign_id);
-            attach_campaign_tui(
-                &paths,
-                state,
-                show_hints,
-                args.view,
-                args.visual,
-                narrative_config.clone(),
-            )
-            .await?;
-        } else {
-            print!(
-                "{}",
-                commands::campaign::campaign_attach_summary(
-                    Some(&paths),
-                    &state.campaign,
-                    state.rollup.as_ref(),
-                )
-            );
-        }
-        return Ok(());
-    }
-    let state = if let Some(selection) = resolve_plan_child_ref(&paths, &run_ref)? {
-        parent_plan = Some(AttachParentPlan {
-            plan_id: selection.plan_id,
-            task_id: selection.task_id,
-            campaign_parent: None,
-        });
-        load_run(&paths, &selection.run_id)?
-    } else {
-        match load_cli_run(&paths, &run_ref) {
-            Ok(state) => state,
-            Err(run_error) => {
-                if let Ok(plan_id) = resolve_plan_id(&paths, &run_ref) {
-                    let plan = load_plan(&paths, &plan_id)?;
-                    let show_hints = completion_hints_enabled(args.no_hints);
-                    if args.view.is_narrative() && args.json {
-                        print_plan_narrative_json(&paths, &plan, args.visual)?;
-                    } else if args.view.is_narrative()
-                        && (!io::stdout().is_terminal() || args.plain)
-                    {
-                        print_plan_narrative_plain(&paths, &plan, args.visual)?;
-                    } else if io::stdout().is_terminal() && !args.plain && !args.json {
-                        print_attach_banner("plan", &plan.plan_id);
-                        attach_plan_session(
-                            &paths,
-                            &plan.plan_id,
-                            show_hints,
-                            args.view,
-                            args.visual,
-                            &narrative_config,
-                            None,
-                        )
-                        .await?;
-                    } else {
-                        print_plan_summary(&paths, &plan, show_hints);
-                    }
-                    return Ok(());
-                }
-                if let Ok(chain_id) = commands::chain::resolve_chain_id(&paths, &run_ref, false) {
-                    if args.why {
-                        return commands::chain::chain_show_command(&paths, &chain_id, true, false);
-                    }
-                    if args.view.is_narrative() {
-                        let chain = load_chain(&paths, &chain_id)?;
-                        let events = read_jsonl::<ChainEvent>(&paths.chain_events(&chain_id))
-                            .unwrap_or_default();
-                        if args.json {
-                            print!("{}", chain_narrative_json_text(&chain, &events)?);
-                        } else if io::stdout().is_terminal() && !args.plain {
-                            return commands::chain::chain_attach_command_with_view(
-                                &paths, &chain_id, args.plain, true,
-                            )
-                            .await;
-                        } else {
-                            print!("{}", chain_narrative_plain_text(&chain, &events));
-                        }
-                        return Ok(());
-                    }
-                    return commands::chain::chain_attach_command(&paths, &chain_id, args.plain)
-                        .await;
-                }
-                return Err(run_error);
+                .await?;
+            } else {
+                print!(
+                    "{}",
+                    commands::campaign::campaign_attach_summary(
+                        Some(&paths),
+                        &state.campaign,
+                        state.rollup.as_ref(),
+                    )
+                );
             }
+            return Ok(());
+        }
+        super::reference::ResolvedRef::Run(state) => *state,
+        super::reference::ResolvedRef::PlanChild { selection, state } => {
+            parent_plan = Some(AttachParentPlan {
+                plan_id: selection.plan_id,
+                task_id: selection.task_id,
+                campaign_parent: None,
+            });
+            *state
+        }
+        super::reference::ResolvedRef::Plan(plan) => {
+            let plan = *plan;
+            let show_hints = completion_hints_enabled(args.no_hints);
+            if args.view.is_narrative() && args.json {
+                print_plan_narrative_json(&paths, &plan, args.visual)?;
+            } else if args.view.is_narrative() && (!io::stdout().is_terminal() || args.plain) {
+                print_plan_narrative_plain(&paths, &plan, args.visual)?;
+            } else if io::stdout().is_terminal() && !args.plain && !args.json {
+                print_attach_banner("plan", &plan.plan_id);
+                attach_plan_session(
+                    &paths,
+                    &plan.plan_id,
+                    show_hints,
+                    args.view,
+                    args.visual,
+                    &narrative_config,
+                    None,
+                )
+                .await?;
+            } else {
+                print_plan_summary(&paths, &plan, show_hints);
+            }
+            return Ok(());
+        }
+        super::reference::ResolvedRef::Chain(chain) => {
+            let chain_id = chain.chain_id.clone();
+            if args.why {
+                return commands::chain::chain_show_command(&paths, &chain_id, true, false);
+            }
+            if args.view.is_narrative() {
+                let chain = *chain;
+                let events =
+                    read_jsonl::<ChainEvent>(&paths.chain_events(&chain_id)).unwrap_or_default();
+                if args.json {
+                    print!("{}", chain_narrative_json_text(&chain, &events)?);
+                } else if io::stdout().is_terminal() && !args.plain {
+                    return commands::chain::chain_attach_command_with_view(
+                        &paths, &chain_id, args.plain, true,
+                    )
+                    .await;
+                } else {
+                    print!("{}", chain_narrative_plain_text(&chain, &events));
+                }
+                return Ok(());
+            }
+            return commands::chain::chain_attach_command(&paths, &chain_id, args.plain).await;
         }
     };
     let run_id = state.run_id.clone();
