@@ -114,6 +114,128 @@ impl ResolvedRef {
     }
 }
 
+/// Every kind, in the order refusals and ambiguity messages name them.
+pub(crate) const ALL_REF_KINDS: [RefKind; 5] = [
+    RefKind::Run,
+    RefKind::PlanChild,
+    RefKind::Plan,
+    RefKind::Chain,
+    RefKind::Campaign,
+];
+
+/// What one verb can be handed. This table is the acceptance matrix: a verb can
+/// only disagree with another verb by differing here, which makes the
+/// disagreement reviewable instead of buried in a hand-rolled cascade.
+pub(crate) struct VerbRefSpec {
+    pub(crate) verb: &'static str,
+    pub(crate) accepts: RefKinds,
+}
+
+const RUN_LIKE: RefKinds = RefKinds::RUN.union(RefKinds::PLAN_CHILD);
+
+pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
+    // Orientation and inspection see everything.
+    VerbRefSpec {
+        verb: "status",
+        accepts: RefKinds::ALL,
+    },
+    VerbRefSpec {
+        verb: "show",
+        accepts: RefKinds::ALL,
+    },
+    VerbRefSpec {
+        verb: "attach",
+        accepts: RefKinds::ALL,
+    },
+    VerbRefSpec {
+        verb: "kill",
+        accepts: RefKinds::ALL,
+    },
+    // Finish promotes work; a campaign is inspected, not promoted directly.
+    VerbRefSpec {
+        verb: "finish",
+        accepts: RUN_LIKE.union(RefKinds::PLAN).union(RefKinds::CHAIN),
+    },
+    // A verdict describes one gated run, so plans and chains redirect.
+    VerbRefSpec {
+        verb: "verdict",
+        accepts: RUN_LIKE,
+    },
+    VerbRefSpec {
+        verb: "report",
+        accepts: RUN_LIKE,
+    },
+    VerbRefSpec {
+        verb: "resume",
+        accepts: RUN_LIKE,
+    },
+    VerbRefSpec {
+        verb: "steer",
+        accepts: RUN_LIKE,
+    },
+    VerbRefSpec {
+        verb: "undo",
+        accepts: RUN_LIKE,
+    },
+    VerbRefSpec {
+        verb: "rewind",
+        accepts: RUN_LIKE,
+    },
+    VerbRefSpec {
+        verb: "extend",
+        accepts: RUN_LIKE,
+    },
+    VerbRefSpec {
+        verb: "doc",
+        accepts: RUN_LIKE.union(RefKinds::PLAN),
+    },
+    VerbRefSpec {
+        verb: "merge",
+        accepts: RefKinds::PLAN,
+    },
+];
+
+/// The verb a refusal should name. `show` is the default because it accepts
+/// every kind, so it is always a real answer rather than another refusal.
+pub(crate) fn redirect_verb_for(kind: RefKind, verb: &str) -> &'static str {
+    match (verb, kind) {
+        // Steering targets one executing run; watching is the nearest thing a
+        // plan or campaign can offer.
+        ("steer", _) => "attach",
+        // A pending plan is advanced by forking it, not by resuming a run.
+        ("resume" | "extend", RefKind::Plan) => "fork",
+        ("resume", RefKind::Chain) => "chain resume",
+        ("extend", RefKind::Chain) => "chain",
+        _ => "show",
+    }
+}
+
+/// The one place a "wrong kind" refusal is written.
+///
+/// Every message names the reference, the kind it actually is, and one command
+/// that accepts that kind. `deadreckon list` is deliberately absent: an id that
+/// came from `list` must never be sent back to `list`.
+pub(crate) fn refusal_for(kind: RefKind, verb: &str, reference: &str) -> CliError {
+    let noun = kind.noun();
+    let redirect = redirect_verb_for(kind, verb);
+    let message = match (verb, kind) {
+        ("verdict", RefKind::Plan) => {
+            format!("{reference} is a plan; verdicts describe gated runs")
+        }
+        ("verdict", RefKind::Chain) => {
+            format!("{reference} is a chain; verdicts describe gated runs")
+        }
+        ("steer", _) => {
+            format!("{reference} is a {noun}; steering targets one executing run")
+        }
+        _ => format!("{reference} is a {noun}, not a run"),
+    };
+    CliError::Core(deadreckon_core::user_error(
+        &message,
+        &format!("deadreckon {redirect} {reference}"),
+    ))
+}
+
 /// One resolution request. `verb` appears only in refusal text.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RefQuery<'a> {
@@ -148,9 +270,14 @@ pub(crate) fn resolve_ref(paths: &DeadreckonPaths, query: RefQuery<'_>) -> Resul
         return resolve_latest(paths, query);
     }
 
-    if query.accepts.contains(RefKind::PlanChild)
-        && let Some(selection) = resolve_plan_child_ref(paths, reference)?
-    {
+    // Every kind is probed regardless of what the verb accepts. Probing only the
+    // accepted kinds is what produced "not found: run 0c11f68e" for an id that
+    // existed and was simply a plan -- a false statement, and the far end of the
+    // status/list loop. Identify first, then decide whether this verb can take it.
+    if let Some(selection) = resolve_plan_child_ref(paths, reference)? {
+        if !query.accepts.contains(RefKind::PlanChild) {
+            return Err(refusal_for(RefKind::PlanChild, query.verb, reference));
+        }
         let state = load_run(paths, &selection.run_id)?;
         return Ok(ResolvedRef::PlanChild {
             selection,
@@ -159,24 +286,16 @@ pub(crate) fn resolve_ref(paths: &DeadreckonPaths, query: RefQuery<'_>) -> Resul
     }
 
     let mut matches = Vec::new();
-    if query.accepts.contains(RefKind::Run)
-        && let Some(state) = probe_run(paths, reference)?
-    {
+    if let Some(state) = probe_run(paths, reference)? {
         matches.push(ResolvedRef::Run(Box::new(state)));
     }
-    if query.accepts.contains(RefKind::Plan)
-        && let Some(plan) = probe_plan(paths, reference)?
-    {
+    if let Some(plan) = probe_plan(paths, reference)? {
         matches.push(ResolvedRef::Plan(Box::new(plan)));
     }
-    if query.accepts.contains(RefKind::Chain)
-        && let Some(chain) = probe_chain(paths, reference, query.all_scopes)?
-    {
+    if let Some(chain) = probe_chain(paths, reference, query.all_scopes)? {
         matches.push(ResolvedRef::Chain(Box::new(chain)));
     }
-    if query.accepts.contains(RefKind::Campaign)
-        && let Some((dir, campaign)) = super::campaign::resolve_campaign(paths, reference)?
-    {
+    if let Some((dir, campaign)) = super::campaign::resolve_campaign(paths, reference)? {
         matches.push(ResolvedRef::Campaign {
             dir,
             campaign: Box::new(campaign),
@@ -184,8 +303,22 @@ pub(crate) fn resolve_ref(paths: &DeadreckonPaths, query: RefQuery<'_>) -> Resul
     }
 
     match matches.len() {
-        1 => Ok(matches.remove(0)),
+        1 => {
+            let resolved = matches.remove(0);
+            if query.accepts.contains(resolved.kind()) {
+                Ok(resolved)
+            } else {
+                Err(refusal_for(
+                    resolved.kind(),
+                    query.verb,
+                    &resolved_id(&resolved),
+                ))
+            }
+        }
         0 => Err(unresolved_reference(paths, reference, query)),
+        // Ambiguity is judged across every kind, not just the accepted ones: the
+        // operator typed a prefix that names two things, and narrowing by verb
+        // would resolve it by guessing which one they meant.
         _ => Err(ambiguous_across_kinds(reference, &matches)),
     }
 }

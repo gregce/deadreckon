@@ -264,7 +264,7 @@ fn unknown_reference_with_existing_state_refuses_with_list() {
 }
 
 #[test]
-fn accepts_narrows_which_kinds_are_probed() {
+fn accepts_narrows_which_kinds_a_verb_will_take() {
     let fx = fixture();
     let plan = fx.plan("5555555555555555555555555555eeee", None);
 
@@ -533,4 +533,153 @@ fn campaigns_are_not_candidates_for_a_scope_bound_latest() {
 
     let resolved = resolve_latest_in_scope(&fx.paths, RefKinds::ALL, None).expect("latest --all");
     assert_eq!(resolved.kind(), RefKind::Campaign);
+}
+
+// ---------------------------------------------------------------------------
+// P3 — refusals that go somewhere
+//
+// The defect this slice exists to remove is not "a verb refused". It is "a verb
+// refused and sent the operator to a command that refuses too". These pin the
+// refusal *quality*: every cell of the table has a message and a `try:`, and no
+// `try:` points back at the verb that produced it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_refusal_pair_in_the_table_has_a_message_and_a_try() {
+    for spec in VERB_REF_SPECS {
+        for kind in ALL_REF_KINDS {
+            if spec.accepts.contains(kind) {
+                continue;
+            }
+            let error = refusal_for(kind, spec.verb, "0c11f68e");
+            let text = err_text(&error);
+
+            assert!(
+                text.contains("0c11f68e"),
+                "{} x {}: refusal must name the reference: {text}",
+                spec.verb,
+                kind.noun()
+            );
+            assert!(
+                text.contains("try:"),
+                "{} x {}: refusal must carry a try line: {text}",
+                spec.verb,
+                kind.noun()
+            );
+            assert!(
+                text.contains("deadreckon "),
+                "{} x {}: the try line must be a command: {text}",
+                spec.verb,
+                kind.noun()
+            );
+        }
+    }
+}
+
+#[test]
+fn refusal_try_target_is_never_the_originating_verb() {
+    for spec in VERB_REF_SPECS {
+        for kind in ALL_REF_KINDS {
+            if spec.accepts.contains(kind) {
+                continue;
+            }
+            let text = err_text(&refusal_for(kind, spec.verb, "0c11f68e"));
+            let try_line = text
+                .lines()
+                .find(|line| line.contains("try:"))
+                .unwrap_or_default()
+                .to_string();
+
+            assert!(
+                !try_line.contains(&format!("deadreckon {} ", spec.verb)),
+                "{} x {}: refusal sends the operator back to itself: {try_line}",
+                spec.verb,
+                kind.noun()
+            );
+        }
+    }
+}
+
+#[test]
+fn refusal_try_target_accepts_the_kind_it_was_given() {
+    // The invariant in one assertion: the verb a refusal names must itself
+    // accept the kind that was refused. Without this, "try: deadreckon show"
+    // is just a different dead end.
+    for spec in VERB_REF_SPECS {
+        for kind in ALL_REF_KINDS {
+            if spec.accepts.contains(kind) {
+                continue;
+            }
+            let redirect = redirect_verb_for(kind, spec.verb);
+            let Some(target) = VERB_REF_SPECS
+                .iter()
+                .find(|candidate| candidate.verb == redirect)
+            else {
+                // Sub-commands like `chain resume` are not top-level rows.
+                continue;
+            };
+            assert!(
+                target.accepts.contains(kind),
+                "{} refuses a {} and names `{}`, which does not accept one either",
+                spec.verb,
+                kind.noun(),
+                redirect
+            );
+        }
+    }
+}
+
+#[test]
+fn refusal_names_the_operator_noun_not_the_rust_type() {
+    let text = err_text(&refusal_for(RefKind::Plan, "status", "0c11f68e"));
+
+    assert!(text.contains("plan"), "{text}");
+    for rust_name in ["Plan", "PipelineState", "ResolvedRef", "RefKind"] {
+        assert!(
+            !text.contains(rust_name),
+            "operator text leaked the type name {rust_name}: {text}"
+        );
+    }
+}
+
+#[test]
+fn a_plan_given_to_a_run_only_verb_is_refused_by_kind_not_by_absence() {
+    let fx = fixture();
+    let plan = fx.plan("0c11f68e00000000000000000000aaaa", None);
+
+    let error = resolve_ref(
+        &fx.paths,
+        RefQuery {
+            reference: Some("0c11f68e"),
+            accepts: RefKinds::RUN,
+            all_scopes: true,
+            verb: "status",
+        },
+    )
+    .expect_err("a run-only verb cannot take a plan");
+    let text = err_text(&error);
+
+    // "not found: run 0c11f68e" was the old answer, and it was false -- the id
+    // exists, it is simply a plan.
+    assert!(!text.contains("not found"), "{text}");
+    assert!(text.contains("is a plan"), "{text}");
+    assert!(
+        text.contains(&format!("deadreckon show {}", plan.plan_id)),
+        "{text}"
+    );
+}
+
+#[test]
+fn steering_a_plan_points_at_attach_and_resuming_one_points_at_fork() {
+    let steer = err_text(&refusal_for(RefKind::Plan, "steer", "0c11f68e"));
+    assert!(steer.contains("deadreckon attach 0c11f68e"), "{steer}");
+
+    let resume = err_text(&refusal_for(RefKind::Plan, "resume", "0c11f68e"));
+    assert!(resume.contains("deadreckon fork 0c11f68e"), "{resume}");
+
+    let chain = err_text(&refusal_for(RefKind::Chain, "resume", "0c11f68e"));
+    assert!(
+        chain.contains("deadreckon chain resume 0c11f68e"),
+        "{chain}"
+    );
 }
