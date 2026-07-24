@@ -1425,7 +1425,7 @@ async fn main_inner() -> Result<()> {
             json,
         } => {
             ui::set_plain_output(plain);
-            status_command(run_id, all, plain, json)
+            status_command(run_id.as_deref(), all, plain, json)
         }
         Commands::Import {
             source,
@@ -10934,11 +10934,42 @@ fn latest_run(paths: &DeadreckonPaths, all: bool) -> Result<deadreckon_core::Pip
     }
 }
 
-fn status_command(run_id: Option<String>, all: bool, plain: bool, json_output: bool) -> Result<()> {
+/// `status` is the orientation verb, so it orients across every kind.
+///
+/// It used to resolve runs only. Handed a plan id that `list` had just printed
+/// it answered "not found: run <id>" and pointed back at `list`, which
+/// recommended `status latest`, which refused identically — a closed loop
+/// between the two most-used commands. It now answers for whatever the
+/// reference names, delegating to the same renderers `show` uses so the two
+/// cannot describe the same object differently.
+fn status_command(run_id: Option<&str>, all: bool, plain: bool, json_output: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = match run_id {
-        Some(run_id) => load_cli_run_with_scope(&paths, &run_id, all)?,
-        None => latest_run(&paths, all)?,
+    let resolved = commands::reference::resolve_ref(
+        &paths,
+        commands::reference::RefQuery {
+            reference: run_id,
+            accepts: commands::reference::RefKinds::ALL,
+            all_scopes: all,
+            verb: "status",
+        },
+    )?;
+    let state = match resolved {
+        commands::reference::ResolvedRef::Run(state) => *state,
+        commands::reference::ResolvedRef::PlanChild { state, .. } => *state,
+        commands::reference::ResolvedRef::Plan(plan) => {
+            return status_plan(&paths, &plan, json_output);
+        }
+        commands::reference::ResolvedRef::Chain(chain) => {
+            return commands::chain::chain_show_command(
+                &paths,
+                &chain.chain_id,
+                false,
+                json_output,
+            );
+        }
+        commands::reference::ResolvedRef::Campaign { campaign, dir } => {
+            return status_campaign(&paths, &campaign, &dir, json_output);
+        }
     };
     if json_output {
         let next_action = next_action_label(&paths, &state);
@@ -10971,6 +11002,53 @@ fn status_command(run_id: Option<String>, all: bool, plain: bool, json_output: b
     }
     print_status_report(&state, plain);
     print_lifecycle_hints(&state);
+    Ok(())
+}
+
+/// Plan orientation reuses `show`'s renderers verbatim, so `status <plan>` and
+/// `show <plan>` cannot disagree about the same plan.
+fn status_plan(paths: &DeadreckonPaths, plan: &Plan, json_output: bool) -> Result<()> {
+    if json_output {
+        let value = commands::plan::plan_verdict_surface(paths, plan).add_to_json(json!({
+            "kind": "plan",
+            "id": &plan.plan_id,
+            "status": plan_status_label(plan.status),
+            "next_actions": commands::plan::plan_next_actions_with_context(paths, plan),
+            "try_lines": Vec::<String>::new(),
+            "paths": commands::plan::plan_paths_json(plan),
+            "plan": plan,
+        }));
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    print_plan_summary(paths, plan, true);
+    Ok(())
+}
+
+fn status_campaign(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+    dir: &Path,
+    json_output: bool,
+) -> Result<()> {
+    let rollup = deadreckon_core::campaign::read_campaign_rollup(dir).ok();
+    if json_output {
+        let surface =
+            commands::campaign::campaign_verdict_surface(Some(paths), campaign, rollup.as_ref());
+        let value = surface.add_to_json(json!({
+            "kind": "campaign",
+            "id": &campaign.campaign_id,
+            "status": commands::campaign::campaign_status_text(campaign.status),
+            "next_actions": [surface.primary_action.command.clone()],
+            "try_lines": Vec::<String>::new(),
+        }));
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    print!(
+        "{}",
+        commands::campaign::campaign_attach_summary(Some(paths), campaign, rollup.as_ref())
+    );
     Ok(())
 }
 
