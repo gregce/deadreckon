@@ -10913,18 +10913,25 @@ fn provider_ingest_roots_for_working_dirs(
     roots
 }
 
+/// Shakedown P2: a thin shim over the one `latest` rule, pinned to runs so every
+/// existing caller keeps its current behavior. P8 deletes it once the verbs call
+/// `resolve_ref` directly.
 fn latest_run(paths: &DeadreckonPaths, all: bool) -> Result<deadreckon_core::PipelineState> {
     let scope = if all { None } else { Some(current_scope()?) };
-    let latest = list_runs(paths, scope.as_deref())?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            DeadreckonError::NotFound(match scope {
-                Some(scope) => format!("latest run for current project ({scope})"),
-                None => "latest run".to_string(),
-            })
-        })?;
-    load_run(paths, &latest.run_id).map_err(CliError::from)
+    match commands::reference::resolve_latest_in_scope(
+        paths,
+        commands::reference::RefKinds::RUN,
+        scope.as_deref(),
+    )? {
+        commands::reference::ResolvedRef::Run(state) => Ok(*state),
+        other => Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "latest resolved a {} where a run was required",
+                other.kind().noun()
+            ),
+            "deadreckon list",
+        ))),
+    }
 }
 
 fn status_command(run_id: Option<String>, all: bool, plain: bool, json_output: bool) -> Result<()> {

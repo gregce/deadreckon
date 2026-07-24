@@ -282,3 +282,9 @@
   answer, error and terminal semantics depend on event order or predicates.
   This must reuse Semaphore's shared machinery without forking the generic
   driver.
+
+## Shakedown follow-ups (Shakedown, §56)
+
+- Scope-widening flag for `verdict`: P2 gave every verb one scope-bound `latest`, which is correct but leaves `verdict` with no way to widen — `verdict --all` is already taken by "compare several recent runs side by side". The refusal is actionable (`deadreckon list --all` finds the id, and `verdict <id>` accepts it), so this is ergonomics rather than a dead end. V1 should pick one widening spelling and apply it uniformly (`--any-scope`, or promote `--all` to widening and rename the comparison flag) rather than letting each verb improvise, which is the class of drift Shakedown exists to remove.
+- Scope for campaigns: a `Campaign` carries no scope field — only its sub-goals do — so a campaign cannot be attributed to a project and is excluded from a scope-bound `latest` (explicit ids and `--all` still reach it). Giving campaigns a real scope is a schema change and therefore out of a slice that changes no persisted bytes.
+- `list --json` plan-child folding: P9 folds children under their parent in the rendered table only. The JSON stays flat so existing consumers keep working; folding the machine-readable shape is a compatibility decision of its own.

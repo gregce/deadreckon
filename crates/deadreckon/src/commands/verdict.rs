@@ -72,18 +72,15 @@ pub(crate) fn resolve_verdict_run(
     }
 }
 
-/// The most recently updated run across every scope (so `verdict` works from any
-/// directory), or a refusal when there are no runs at all.
+/// Shakedown P2: `latest` now means the same thing here as everywhere else.
+///
+/// This used to search every scope and sort by `updated_at` while `main.rs`'s
+/// `latest_run` was scope-bound — so `deadreckon status` and `deadreckon verdict`
+/// could land on different runs from the same directory. Both now share one rule,
+/// which makes `verdict latest` scope-bound like the rest of the surface. P8
+/// deletes this shim.
 fn resolve_latest_run(paths: &DeadreckonPaths) -> Result<deadreckon_core::PipelineState> {
-    let mut runs = deadreckon_core::list_runs(paths, None)?;
-    runs.sort_by_key(|entry| entry.updated_at);
-    match runs.last() {
-        Some(entry) => Ok(deadreckon_core::load_run(paths, &entry.run_id)?),
-        None => Err(CliError::Core(deadreckon_core::user_error(
-            "no runs to verify",
-            "deadreckon start \"<goal>\"",
-        ))),
-    }
+    latest_run(paths, false)
 }
 
 /// A one-row verdict summary for the `--all` comparison.
@@ -564,8 +561,52 @@ mod tests {
         std::fs::create_dir_all(&repo).expect("repo");
         fixture_run(&paths, "only-run-0001", &repo);
 
-        let state = resolve_verdict_run(&paths, None).expect("latest");
-        assert_eq!(state.run_id, "only-run-0001");
+        // Shakedown P2: `latest` is scope-bound for every verb, so this asserts
+        // the shared rule against the fixture's own scope. It used to assert
+        // verdict's private all-scopes search, which is the divergence the
+        // slice removes -- `status` and `verdict` could land on different runs
+        // from the same directory.
+        let scope = deadreckon_core::paths::workspace_scope(&repo).expect("scope");
+        let resolved = crate::commands::reference::resolve_latest_in_scope(
+            &paths,
+            crate::commands::reference::RefKinds::RUN,
+            Some(&scope),
+        )
+        .expect("latest");
+
+        match resolved {
+            crate::commands::reference::ResolvedRef::Run(state) => {
+                assert_eq!(state.run_id, "only-run-0001");
+            }
+            other => panic!("expected a run, got {}", other.kind().noun()),
+        }
+    }
+
+    #[test]
+    fn verdict_latest_outside_the_scope_refuses_with_a_command_that_works() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "only-run-0001", &repo);
+
+        // A scope with no work of its own, while another scope has some. The
+        // refusal must name a command that actually leads somewhere -- this is
+        // the half of the status/list loop that pointed back at an empty table.
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        let scope = deadreckon_core::paths::workspace_scope(&elsewhere).expect("scope");
+
+        let err = crate::commands::reference::resolve_latest_in_scope(
+            &paths,
+            crate::commands::reference::RefKinds::RUN,
+            Some(&scope),
+        )
+        .expect_err("no run in this scope");
+        let message = err.to_string();
+
+        assert!(message.contains("nothing in this project yet"), "{message}");
+        assert!(message.contains("deadreckon list --all"), "{message}");
     }
 
     #[test]

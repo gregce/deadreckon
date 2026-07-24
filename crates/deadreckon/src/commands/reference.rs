@@ -190,11 +190,188 @@ pub(crate) fn resolve_ref(paths: &DeadreckonPaths, query: RefQuery<'_>) -> Resul
     }
 }
 
-/// P1 keeps today's `latest` semantics verbatim; P2 replaces this with the one
-/// scope-bound, `updated_at`-ordered rule that every verb shares.
 fn resolve_latest(paths: &DeadreckonPaths, query: RefQuery<'_>) -> Result<ResolvedRef> {
-    let state = latest_run(paths, query.all_scopes)?;
-    Ok(ResolvedRef::Run(Box::new(state)))
+    let scope = if query.all_scopes {
+        None
+    } else {
+        Some(current_scope()?)
+    };
+    resolve_latest_in_scope(paths, query.accepts, scope.as_deref())
+}
+
+/// One candidate for `latest`, reduced to the only two things the ranking needs.
+struct LatestCandidate {
+    kind: RefKind,
+    id: String,
+    updated_at: DateTime<Utc>,
+}
+
+/// The single meaning of `latest`: the most recently updated item, among the
+/// kinds the calling verb accepts, attributable to `scope` (or to anywhere when
+/// `scope` is `None`).
+///
+/// Scope is taken from the same fields `list` uses — `PipelineState::scope` for
+/// runs, `Plan::parent_scope` for plans, `Chain::scope` for chains — so `latest`
+/// and the top row of `list` cannot disagree. Campaigns carry no scope of their
+/// own and are therefore candidates only under `--all`; they remain resolvable
+/// by explicit id in every scope.
+///
+/// The ordering key is last-write time with a status-timestamp fallback, matching
+/// `list_plan_entries` rather than introducing a second notion of "recent".
+///
+/// Taking `scope` as a parameter instead of reading the process cwd is what makes
+/// the rule unit-testable; `resolve_latest` above is the one place that consults
+/// `current_scope`.
+pub(crate) fn resolve_latest_in_scope(
+    paths: &DeadreckonPaths,
+    accepts: RefKinds,
+    scope: Option<&str>,
+) -> Result<ResolvedRef> {
+    let candidates = latest_candidates(paths, accepts, scope)?;
+    let Some(newest) = candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.updated_at)
+    else {
+        return Err(empty_latest(paths, accepts, scope));
+    };
+    match newest.kind {
+        RefKind::Run => Ok(ResolvedRef::Run(Box::new(load_run(paths, &newest.id)?))),
+        RefKind::Plan => Ok(ResolvedRef::Plan(Box::new(load_plan(paths, &newest.id)?))),
+        RefKind::Chain => Ok(ResolvedRef::Chain(Box::new(deadreckon_core::load_chain(
+            paths, &newest.id,
+        )?))),
+        RefKind::Campaign => match super::campaign::resolve_campaign(paths, &newest.id)? {
+            Some((dir, campaign)) => Ok(ResolvedRef::Campaign {
+                dir,
+                campaign: Box::new(campaign),
+            }),
+            None => Err(CliError::Core(deadreckon_core::user_error(
+                &format!("campaign {} disappeared while resolving latest", newest.id),
+                "deadreckon list",
+            ))),
+        },
+        // Plan children are addressed by an explicit `<plan>:<task>` reference;
+        // there is no "latest child" to rank across plans.
+        RefKind::PlanChild => Err(CliError::Core(deadreckon_core::user_error(
+            "latest does not name a plan child",
+            "deadreckon show <plan-id>",
+        ))),
+    }
+}
+
+fn latest_candidates(
+    paths: &DeadreckonPaths,
+    accepts: RefKinds,
+    scope: Option<&str>,
+) -> Result<Vec<LatestCandidate>> {
+    let mut candidates = Vec::new();
+    if accepts.contains(RefKind::Run) {
+        for run in deadreckon_core::list_runs(paths, scope)? {
+            candidates.push(LatestCandidate {
+                kind: RefKind::Run,
+                id: run.run_id,
+                updated_at: run.updated_at,
+            });
+        }
+    }
+    if accepts.contains(RefKind::Plan) {
+        for plan in super::inspection::list_plan_entries(paths, scope)? {
+            candidates.push(LatestCandidate {
+                kind: RefKind::Plan,
+                id: plan.plan_id,
+                updated_at: plan.updated_at,
+            });
+        }
+    }
+    if accepts.contains(RefKind::Chain) {
+        for chain in super::chain::list_chain_records(paths, scope.map(str::to_string))? {
+            let updated_at = file_mtime(&deadreckon_core::chain_json_path(paths, &chain.chain_id))
+                .unwrap_or_else(|| {
+                    chain
+                        .completed_at
+                        .or(chain.started_at)
+                        .unwrap_or(chain.created_at)
+                });
+            candidates.push(LatestCandidate {
+                kind: RefKind::Chain,
+                id: chain.chain_id,
+                updated_at,
+            });
+        }
+    }
+    // A campaign has no scope field, so it can only be ranked when the caller has
+    // not asked for one. Narrowing to a scope it cannot claim would be a guess.
+    if accepts.contains(RefKind::Campaign) && scope.is_none() {
+        for (dir, campaign) in all_campaigns(paths)? {
+            let updated_at =
+                file_mtime(&deadreckon_core::campaign::campaign_path_for_plan_dir(&dir))
+                    .unwrap_or_else(|| {
+                        campaign
+                            .merged_at
+                            .or(campaign.forked_at)
+                            .unwrap_or(campaign.created_at)
+                    });
+            candidates.push(LatestCandidate {
+                kind: RefKind::Campaign,
+                id: campaign.campaign_id,
+                updated_at,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+fn all_campaigns(paths: &DeadreckonPaths) -> Result<Vec<(PathBuf, Campaign)>> {
+    let plans = paths.plans_dir();
+    if !plans.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut campaigns = Vec::new();
+    for entry in fs::read_dir(&plans).map_err(|source| DeadreckonError::Io {
+        path: plans.clone(),
+        source,
+    })? {
+        let dir = entry
+            .map_err(|source| DeadreckonError::Io {
+                path: plans.clone(),
+                source,
+            })?
+            .path();
+        if !deadreckon_core::campaign::campaign_path_for_plan_dir(&dir).is_file() {
+            continue;
+        }
+        let campaign = deadreckon_core::campaign::read_campaign(&dir)?;
+        campaigns.push((dir, campaign));
+    }
+    Ok(campaigns)
+}
+
+fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map(DateTime::<Utc>::from)
+        .ok()
+}
+
+/// An empty scope and an empty machine are different problems. Sending someone
+/// with no work anywhere to `list` shows them an empty table; sending someone
+/// whose work lives in another project to `start` would have them redo it.
+fn empty_latest(paths: &DeadreckonPaths, accepts: RefKinds, scope: Option<&str>) -> CliError {
+    let elsewhere = scope.is_some()
+        && latest_candidates(paths, accepts, None)
+            .map(|candidates| !candidates.is_empty())
+            .unwrap_or(false);
+    if elsewhere {
+        CliError::Core(deadreckon_core::user_error(
+            "nothing in this project yet; other projects have work",
+            "deadreckon list --all",
+        ))
+    } else {
+        CliError::Core(deadreckon_core::user_error(
+            "nothing in this project yet",
+            "deadreckon start \"<goal>\"",
+        ))
+    }
 }
 
 /// A missing run is "no match"; an ambiguous prefix is the loader's own message,

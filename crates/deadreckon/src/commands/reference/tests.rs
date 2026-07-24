@@ -324,3 +324,213 @@ fn plan_ids_matching_ignores_directories_without_plan_json() {
         "a campaign dir is not a plan for prefix purposes: {all:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P2 — one `latest`
+//
+// Before Shakedown `latest` meant two things: `main.rs`'s `latest_run` was
+// scope-bound and took the head of `list_runs` order, while `verdict.rs`'s
+// private `resolve_latest_run` ignored scope entirely and sorted by
+// `updated_at`. These pin the single rule both collapse into.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Move a run's clock so ordering assertions do not race the wall clock.
+    fn touch_run(&self, state: &mut PipelineState, updated_at: DateTime<Utc>) {
+        state.updated_at = updated_at;
+        deadreckon_core::save_state(state).expect("save state");
+    }
+
+    fn scope(&self) -> String {
+        workspace_scope(&self.cwd).expect("scope")
+    }
+}
+
+/// A second workspace, so scope-bound behavior has something to exclude.
+fn other_cwd() -> TempDir {
+    tempfile::tempdir().expect("other cwd")
+}
+
+#[test]
+fn latest_and_last_are_the_same_reference() {
+    let fx = fixture();
+    let state = fx.run("1111111111111111111111111111aaaa", "only run");
+
+    let by_latest =
+        resolve_latest_in_scope(&fx.paths, RefKinds::RUN, Some(&fx.scope())).expect("latest");
+    let by_word = resolve_ref(
+        &fx.paths,
+        RefQuery {
+            reference: Some("last"),
+            accepts: RefKinds::RUN,
+            all_scopes: true,
+            verb: "status",
+        },
+    )
+    .expect("last");
+
+    assert_eq!(resolved_id(&by_latest), state.run_id);
+    assert_eq!(resolved_id(&by_word), state.run_id);
+}
+
+#[test]
+fn latest_is_scope_bound_by_default() {
+    let fx = fixture();
+    let mine = fx.run("1111111111111111111111111111aaaa", "in scope");
+
+    // A newer run in a different workspace must not win a scoped `latest`.
+    let elsewhere = other_cwd();
+    let mut theirs = create_run(
+        &fx.paths,
+        RunOptions {
+            goal: "out of scope".to_string(),
+            cwd: elsewhere.path().to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: Some("2222222222222222222222222222bbbb".to_string()),
+            codebase: None,
+        },
+    )
+    .expect("other run");
+    fx.touch_run(&mut theirs, Utc::now() + chrono::Duration::hours(1));
+
+    let resolved =
+        resolve_latest_in_scope(&fx.paths, RefKinds::RUN, Some(&fx.scope())).expect("latest");
+
+    assert_eq!(resolved_id(&resolved), mine.run_id);
+}
+
+#[test]
+fn latest_all_widens_to_every_scope() {
+    let fx = fixture();
+    let mut mine = fx.run("1111111111111111111111111111aaaa", "in scope");
+    fx.touch_run(&mut mine, Utc::now() - chrono::Duration::hours(1));
+
+    let elsewhere = other_cwd();
+    let mut theirs = create_run(
+        &fx.paths,
+        RunOptions {
+            goal: "out of scope".to_string(),
+            cwd: elsewhere.path().to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: Some("2222222222222222222222222222bbbb".to_string()),
+            codebase: None,
+        },
+    )
+    .expect("other run");
+    fx.touch_run(&mut theirs, Utc::now());
+
+    let resolved = resolve_latest_in_scope(&fx.paths, RefKinds::RUN, None).expect("latest --all");
+
+    assert_eq!(resolved_id(&resolved), theirs.run_id);
+}
+
+#[test]
+fn latest_orders_by_updated_at_across_kinds() {
+    let fx = fixture();
+    let mut run = fx.run("1111111111111111111111111111aaaa", "the run");
+    let plan = fx.plan("2222222222222222222222222222bbbb", None);
+
+    // The plan was just written, so an older run must lose to it.
+    fx.touch_run(&mut run, Utc::now() - chrono::Duration::hours(2));
+    let newest = resolve_latest_in_scope(&fx.paths, RefKinds::ALL, None).expect("latest");
+    assert_eq!(resolved_id(&newest), plan.plan_id, "plan is newer");
+
+    // Move the run's clock ahead and the same call must flip to the run.
+    fx.touch_run(&mut run, Utc::now() + chrono::Duration::hours(2));
+    let newest = resolve_latest_in_scope(&fx.paths, RefKinds::ALL, None).expect("latest");
+    assert_eq!(resolved_id(&newest), run.run_id, "run is now newer");
+}
+
+#[test]
+fn latest_resolves_to_a_plan_when_the_scope_has_no_runs() {
+    let fx = fixture();
+    // The reproduction's shape: plans exist, no runs. `status` refused here.
+    let plan = fx.plan("2222222222222222222222222222bbbb", None);
+
+    let resolved = resolve_latest_in_scope(&fx.paths, RefKinds::ALL, None).expect("latest");
+
+    assert_eq!(resolved.kind(), RefKind::Plan);
+    assert_eq!(resolved_id(&resolved), plan.plan_id);
+}
+
+#[test]
+fn latest_in_empty_scope_names_other_scopes_when_they_have_work() {
+    let fx = fixture();
+    let elsewhere = other_cwd();
+    create_run(
+        &fx.paths,
+        RunOptions {
+            goal: "somewhere else".to_string(),
+            cwd: elsewhere.path().to_path_buf(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: Some("2222222222222222222222222222bbbb".to_string()),
+            codebase: None,
+        },
+    )
+    .expect("other run");
+
+    let error = resolve_latest_in_scope(&fx.paths, RefKinds::ALL, Some(&fx.scope()))
+        .expect_err("empty scope");
+    let text = err_text(&error);
+
+    assert!(text.contains("nothing in this project yet"), "{text}");
+    assert!(text.contains("deadreckon list --all"), "{text}");
+}
+
+#[test]
+fn latest_in_a_wholly_empty_home_points_at_start() {
+    let fx = fixture();
+
+    let error =
+        resolve_latest_in_scope(&fx.paths, RefKinds::ALL, Some(&fx.scope())).expect_err("empty");
+    let text = err_text(&error);
+
+    assert!(text.contains("nothing in this project yet"), "{text}");
+    assert!(text.contains("deadreckon start"), "{text}");
+    assert!(
+        !text.contains("--all"),
+        "nothing anywhere to widen to: {text}"
+    );
+}
+
+#[test]
+fn latest_respects_accepts() {
+    let fx = fixture();
+    let mut run = fx.run("1111111111111111111111111111aaaa", "the run");
+    let plan = fx.plan("2222222222222222222222222222bbbb", None);
+    fx.touch_run(&mut run, Utc::now() - chrono::Duration::hours(2));
+
+    // Plan is newer, but a run-only verb must still land on the run.
+    let resolved = resolve_latest_in_scope(&fx.paths, RefKinds::RUN, None).expect("latest run");
+    assert_eq!(resolved_id(&resolved), run.run_id);
+
+    let resolved = resolve_latest_in_scope(&fx.paths, RefKinds::PLAN, None).expect("latest plan");
+    assert_eq!(resolved_id(&resolved), plan.plan_id);
+}
+
+#[test]
+fn campaigns_are_not_candidates_for_a_scope_bound_latest() {
+    let fx = fixture();
+    // A campaign carries no scope of its own, so it cannot be attributed to
+    // this project; `--all` is the only way to reach it via `latest`.
+    fx.campaign("4444444444444444444444444444dddd");
+
+    let error = resolve_latest_in_scope(&fx.paths, RefKinds::ALL, Some(&fx.scope()))
+        .expect_err("no scoped candidate");
+    assert!(err_text(&error).contains("nothing in this project yet"));
+
+    let resolved = resolve_latest_in_scope(&fx.paths, RefKinds::ALL, None).expect("latest --all");
+    assert_eq!(resolved.kind(), RefKind::Campaign);
+}
