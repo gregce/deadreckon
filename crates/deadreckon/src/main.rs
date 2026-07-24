@@ -129,7 +129,7 @@ mod ui;
 // Shakedown moved id resolution into `commands::reference`. Re-exporting at the
 // crate root keeps it reachable through the `use super::super::*` that every
 // command module already relies on, so no call site had to change with the move.
-pub(crate) use commands::reference::{PlanChildSelection, resolve_plan_child_ref, resolve_plan_id};
+pub(crate) use commands::reference::{PlanChildSelection, resolve_plan_id};
 
 use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, CampaignCommand, ChainCommandArgs, Cli,
@@ -10509,53 +10509,80 @@ struct ShowCommandArgs<'a> {
 
 fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    if let Some((campaign_dir, campaign)) =
-        commands::campaign::resolve_campaign(&paths, args.run_id)?
-    {
-        let rollup = deadreckon_core::campaign::read_campaign_rollup(&campaign_dir).ok();
-        let report = if args.why_failed {
-            commands::campaign::campaign_why_failed_report(&paths, &campaign, rollup.as_ref())
-        } else {
-            commands::campaign::campaign_attach_summary(Some(&paths), &campaign, rollup.as_ref())
-        };
-        if args.json_output {
-            let surface = commands::campaign::campaign_verdict_surface(
-                Some(&paths),
-                &campaign,
-                rollup.as_ref(),
-            );
-            let value = surface.add_to_json(json!({
-                "campaign_id": campaign.campaign_id,
-                "status": commands::campaign::campaign_status_text(campaign.status),
-                "n": campaign.n,
-                "merged_run_id": campaign.merged_run_id,
-                "next_actions": [surface.primary_action.command.clone()],
-                "rollup": rollup
-                    .as_ref()
-                    .map(|r| commands::campaign::rollup_verdict_text(r.rollup_verdict)),
-            }));
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&value).unwrap_or_default()
-            );
-        } else {
-            print!("{report}");
-        }
-        return Ok(());
-    }
+    // Shakedown P6: the hand-rolled cascade (campaign, plan child, run, plan --
+    // and no chain at all) becomes one resolution. Each branch body below is the
+    // one that was already here; the characterization goldens are the guard that
+    // this stayed a move rather than a rewrite.
+    let resolved = commands::reference::resolve_ref(
+        &paths,
+        commands::reference::RefQuery {
+            reference: Some(args.run_id),
+            accepts: commands::reference::RefKinds::ALL,
+            all_scopes: false,
+            verb: "show",
+        },
+    )?;
     let mut child_context: Option<PlanChildSelection> = None;
-    let state = if let Some(selection) = resolve_plan_child_ref(&paths, args.run_id)? {
-        let state = load_run(&paths, &selection.run_id)?;
-        child_context = Some(selection);
-        state
-    } else {
-        match load_cli_run(&paths, args.run_id) {
-            Ok(state) => state,
-            Err(run_error) => {
-                if let Ok(plan_id) = resolve_plan_id(&paths, args.run_id) {
-                    let plan = load_plan(&paths, &plan_id)?;
-                    if args.json_output {
-                        let value = commands::plan::plan_verdict_surface(&paths, &plan)
+    let state = match resolved {
+        commands::reference::ResolvedRef::Run(state) => *state,
+        commands::reference::ResolvedRef::PlanChild { selection, state } => {
+            child_context = Some(selection);
+            *state
+        }
+        commands::reference::ResolvedRef::Chain(chain) => {
+            // `show` has never resolved a chain; the shared resolver hands it
+            // one, and `chain show` is the renderer that already exists.
+            return commands::chain::chain_show_command(
+                &paths,
+                &chain.chain_id,
+                args.why_failed,
+                args.json_output,
+            );
+        }
+        commands::reference::ResolvedRef::Campaign {
+            dir: campaign_dir,
+            campaign,
+        } => {
+            let campaign = *campaign;
+            let rollup = deadreckon_core::campaign::read_campaign_rollup(&campaign_dir).ok();
+            let report = if args.why_failed {
+                commands::campaign::campaign_why_failed_report(&paths, &campaign, rollup.as_ref())
+            } else {
+                commands::campaign::campaign_attach_summary(
+                    Some(&paths),
+                    &campaign,
+                    rollup.as_ref(),
+                )
+            };
+            if args.json_output {
+                let surface = commands::campaign::campaign_verdict_surface(
+                    Some(&paths),
+                    &campaign,
+                    rollup.as_ref(),
+                );
+                let value = surface.add_to_json(json!({
+                    "campaign_id": campaign.campaign_id,
+                    "status": commands::campaign::campaign_status_text(campaign.status),
+                    "n": campaign.n,
+                    "merged_run_id": campaign.merged_run_id,
+                    "next_actions": [surface.primary_action.command.clone()],
+                    "rollup": rollup
+                        .as_ref()
+                        .map(|r| commands::campaign::rollup_verdict_text(r.rollup_verdict)),
+                }));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                );
+            } else {
+                print!("{report}");
+            }
+            return Ok(());
+        }
+        commands::reference::ResolvedRef::Plan(plan) => {
+            let plan = *plan;
+            if args.json_output {
+                let value = commands::plan::plan_verdict_surface(&paths, &plan)
                             .add_to_json(json!({
                                 "kind": "plan",
                                 "id": &plan.plan_id,
@@ -10572,19 +10599,16 @@ fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
                                 },
                                 "plan": plan,
                             }));
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                        return Ok(());
-                    }
-                    if args.why_failed {
-                        show_plan_why_failed(&paths, &plan);
-                        return Ok(());
-                    }
-                    print_plan_summary(&paths, &plan, true);
-                    println!("{}", serde_json::to_string_pretty(&plan)?);
-                    return Ok(());
-                }
-                return Err(run_error);
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
             }
+            if args.why_failed {
+                show_plan_why_failed(&paths, &plan);
+                return Ok(());
+            }
+            print_plan_summary(&paths, &plan, true);
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+            return Ok(());
         }
     };
     if args.flight || args.file.is_some() {

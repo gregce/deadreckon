@@ -1996,3 +1996,116 @@ fn journey_ids_from_list_are_accepted_or_redirected_by_verdict() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shakedown P6 — show and attach move onto the shared resolver.
+//
+// Both already resolved most kinds; this phase is behavior-preserving except
+// that `show` gains chains, which it has never handled. The characterization
+// goldens are the guard: if a golden moves, the rewire is wrong.
+// ---------------------------------------------------------------------------
+
+fn shakedown_chain_fixture(paths: &DeadreckonPaths, cwd: &std::path::Path) -> Chain {
+    let chain = Chain::new(ChainNewOptions {
+        root_goal: "a two step chain".to_string(),
+        goals: vec!["first step".to_string(), "second step".to_string()],
+        scope: workspace_scope(cwd).expect("scope"),
+        base_branch: "main".to_string(),
+        base_sha: "0123456789abcdef".to_string(),
+        cwd: cwd.to_path_buf(),
+        provider: None,
+        model: None,
+        sandbox: "none".to_string(),
+        branch_policy: BranchPolicy::Stack,
+        apply_mode: ApplyMode::Manual,
+        apply_strategy: ApplyStrategy::Squash,
+        apply_allowlist: Vec::new(),
+        on_fail: OnFail::Stop,
+        circuit_breaker_threshold: 1,
+        max_spend_usd: Some(1.0),
+        max_wall_seconds: None,
+        deadreckon_version: "0.1.0".to_string(),
+    })
+    .expect("chain");
+    save_chain(paths, &chain).expect("save chain");
+    chain
+}
+
+#[test]
+fn show_resolves_a_chain_id() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let chain = shakedown_chain_fixture(&paths, &cwd);
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["show", &chain.chain_id[..8], "--plain"])
+        .output()
+        .expect("show chain");
+
+    assert!(
+        output.status.success(),
+        "show has never resolved a chain id: {}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains(&chain.chain_id[..8]),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn journey_ids_from_list_are_accepted_by_show_and_attach() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    shakedown_plan_fixture(&paths, &scope);
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "a real run".to_string(),
+            cwd: cwd.clone(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+    state.status = RunStatus::Completed;
+    save_state(&state).expect("save");
+
+    for id in shakedown_listed_ids(&paths, &cwd) {
+        for verb in ["show", "attach"] {
+            let output = deadreckon(&paths)
+                .current_dir(&cwd)
+                .args([verb, &id, "--plain"])
+                .output()
+                .expect(verb);
+            if output.status.success() {
+                continue;
+            }
+            let combined = format!("{}{}", stdout(&output), stderr(&output));
+            let try_line = combined
+                .lines()
+                .find(|line| line.contains("try:"))
+                .unwrap_or_default();
+            assert!(
+                !try_line.is_empty(),
+                "{verb} refused {id} with no way forward: {combined}"
+            );
+            assert!(
+                !try_line.contains("deadreckon list"),
+                "{verb} sent {id} back to the command that printed it: {try_line}"
+            );
+        }
+    }
+}
