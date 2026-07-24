@@ -12,12 +12,28 @@ pub(crate) struct ReportCommandArgs {
 pub(crate) fn report_command(args: ReportCommandArgs) -> Result<()> {
     let _ = args.plain;
     let paths = DeadreckonPaths::discover();
-    let state = load_cli_run(&paths, &args.run_id).map_err(|err| {
-        CliError::Core(deadreckon_core::user_error(
-            &format!("run {} not found ({err})", args.run_id),
-            "deadreckon list",
-        ))
-    })?;
+    // A report renders one run's evidence, so plans and chains redirect rather
+    // than coming back as "run <id> not found" for an id that plainly exists.
+    let resolved = super::reference::resolve_ref(
+        &paths,
+        super::reference::RefQuery {
+            reference: Some(&args.run_id),
+            accepts: super::reference::RefKinds::RUN.union(super::reference::RefKinds::PLAN_CHILD),
+            all_scopes: false,
+            verb: "report",
+        },
+    )?;
+    let state = match resolved {
+        super::reference::ResolvedRef::Run(state) => *state,
+        super::reference::ResolvedRef::PlanChild { state, .. } => *state,
+        other => {
+            return Err(super::reference::refusal_for(
+                other.kind(),
+                "report",
+                &super::reference::resolved_id(&other),
+            ));
+        }
+    };
     if matches!(
         state.status,
         RunStatus::Pending | RunStatus::Planned | RunStatus::Executing

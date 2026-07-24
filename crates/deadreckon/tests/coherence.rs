@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 mod common;
 
-use common::{deadreckon, repo_tempdir, stderr, stdout};
+use common::{deadreckon, isolated_tempdir, repo_tempdir, stderr, stdout};
 
 #[test]
 fn runstatus_executing_renders_running_through_glossary() {
@@ -1634,6 +1634,26 @@ fn section_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str>
 // closed.
 // ---------------------------------------------------------------------------
 
+/// Every id `deadreckon list` prints, as an operator would read them off the
+/// table. The journey tests cross these with each rewired verb.
+fn shakedown_listed_ids(paths: &DeadreckonPaths, cwd: &std::path::Path) -> Vec<String> {
+    let listed = deadreckon(paths)
+        .current_dir(cwd)
+        .args(["list", "--plain"])
+        .output()
+        .expect("list");
+    let stdout = stdout(&listed);
+    let ids = stdout
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|token| token.len() == 8 && token.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(!ids.is_empty(), "list printed no ids: {stdout}");
+    ids
+}
+
 /// A plan attributable to `scope`, with no runs anywhere — the exact shape the
 /// reproduction was found in.
 fn shakedown_plan_fixture(paths: &DeadreckonPaths, scope: &str) -> Plan {
@@ -1784,23 +1804,7 @@ fn journey_ids_from_list_are_accepted_by_status() {
     state.status = RunStatus::Completed;
     save_state(&state).expect("save");
 
-    let listed = deadreckon(&paths)
-        .current_dir(&cwd)
-        .args(["list", "--plain"])
-        .output()
-        .expect("list");
-    let listed_stdout = stdout(&listed);
-
-    let ids = listed_stdout
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|token| token.len() == 8 && token.chars().all(|c| c.is_ascii_hexdigit()))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    assert!(!ids.is_empty(), "list printed no ids: {listed_stdout}");
-
-    for id in ids {
+    for id in shakedown_listed_ids(&paths, &cwd) {
         let output = deadreckon(&paths)
             .current_dir(&cwd)
             .args(["status", &id, "--plain"])
@@ -1821,6 +1825,174 @@ fn journey_ids_from_list_are_accepted_by_status() {
         assert!(
             !try_line.contains("deadreckon list"),
             "status sent {id} back to the command that printed it: {try_line}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shakedown P5 — a verdict describes one gated run, and says so.
+//
+// `verdict` and `report` stay run-only: a verdict is a statement about a gate,
+// and plans and chains do not have one. What changes is the refusal. Both used
+// to answer "unknown run <id>" and point at `list` -- false, because the id was
+// known, and circular, because `list` is where it came from.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn verdict_on_a_plan_id_points_at_show_not_list() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    let plan = shakedown_plan_fixture(&paths, &scope);
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["verdict", &plan.plan_id[..8], "--plain"])
+        .output()
+        .expect("verdict");
+
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        !output.status.success(),
+        "a plan has no verdict: {combined}"
+    );
+    assert!(
+        !combined.contains("unknown run"),
+        "the id is known; it is a plan: {combined}"
+    );
+    assert!(combined.contains("is a plan"), "{combined}");
+    assert!(
+        combined.contains(&format!("deadreckon show {}", &plan.plan_id[..8])),
+        "{combined}"
+    );
+}
+
+#[test]
+fn report_on_a_plan_id_points_at_show_not_list() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    let plan = shakedown_plan_fixture(&paths, &scope);
+
+    let output = deadreckon(&paths)
+        .current_dir(&cwd)
+        .args(["report", &plan.plan_id[..8], "--plain"])
+        .output()
+        .expect("report");
+
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(!output.status.success(), "{combined}");
+    assert!(combined.contains("is a plan"), "{combined}");
+    assert!(
+        combined.contains(&format!("deadreckon show {}", &plan.plan_id[..8])),
+        "{combined}"
+    );
+}
+
+#[test]
+fn verdict_latest_is_scope_bound_like_every_other_verb() {
+    // Isolated, not `repo_tempdir`: that helper builds under the deadreckon
+    // checkout, so `workspace_scope` walks up to this repo's git root and both
+    // directories land in one scope, which is precisely what this test must
+    // distinguish.
+    let temp = isolated_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    // A completed run in one workspace.
+    let mine = temp.path().join("mine");
+    fs::create_dir_all(&mine).expect("mine");
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "in scope".to_string(),
+            cwd: mine.clone(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+    state.status = RunStatus::Completed;
+    save_state(&state).expect("save");
+
+    // From an unrelated workspace, `verdict latest` must not silently reach
+    // into another project the way it used to.
+    let elsewhere = temp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let output = deadreckon(&paths)
+        .current_dir(&elsewhere)
+        .args(["verdict", "latest", "--plain"])
+        .output()
+        .expect("verdict latest");
+
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        !output.status.success(),
+        "verdict latest must be scope-bound: {combined}"
+    );
+    assert!(
+        combined.contains("nothing in this project yet"),
+        "{combined}"
+    );
+    // And the way out must be a command that actually works.
+    assert!(combined.contains("deadreckon list --all"), "{combined}");
+}
+
+#[test]
+fn journey_ids_from_list_are_accepted_or_redirected_by_verdict() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let scope = workspace_scope(&cwd).expect("scope");
+    shakedown_plan_fixture(&paths, &scope);
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "a real run".to_string(),
+            cwd: cwd.clone(),
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+    state.status = RunStatus::Completed;
+    save_state(&state).expect("save");
+
+    for id in shakedown_listed_ids(&paths, &cwd) {
+        let output = deadreckon(&paths)
+            .current_dir(&cwd)
+            .args(["verdict", &id, "--plain"])
+            .output()
+            .expect("verdict");
+        if output.status.success() {
+            continue;
+        }
+        let combined = format!("{}{}", stdout(&output), stderr(&output));
+        let try_line = combined
+            .lines()
+            .find(|line| line.contains("try:"))
+            .unwrap_or_default();
+        assert!(
+            !try_line.is_empty(),
+            "verdict refused {id} with no way forward: {combined}"
+        );
+        assert!(
+            !try_line.contains("deadreckon list"),
+            "verdict sent {id} back to the command that printed it: {try_line}"
         );
     }
 }
