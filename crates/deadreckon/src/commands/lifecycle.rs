@@ -35,7 +35,11 @@ pub(crate) fn materialize_command(
                 let dest = dest.or_else(|| Some(default_plan_materialize_dest(&result.plan)));
                 (result.state, Some(result.plan), dest)
             }
-            None => return Err(run_error),
+            None => {
+                return Err(super::reference::refusal_for_reference(
+                    &paths, &run_id, "finish", run_error,
+                ));
+            }
         },
     };
     if let Some(plan) = plan_context.as_ref() {
@@ -77,7 +81,11 @@ pub(crate) fn finish_command(
                     Some(dest.unwrap_or_else(|| default_plan_materialize_dest(&result.plan)));
                 (result.state, Some(result.plan), dest)
             }
-            None => return Err(run_error),
+            None => {
+                return Err(super::reference::refusal_for_reference(
+                    &paths, &requested, "finish", run_error,
+                ));
+            }
         },
     };
     if let Some(plan) = plan_context.as_ref() {
@@ -208,10 +216,17 @@ pub(crate) fn materialize_completed_run(
     }
     let library_dir = paths.library_dir(&state.scope, &state.run_id);
     if !library_dir.is_dir() {
-        return Err(CliError::Core(DeadreckonError::NotFound(format!(
-            "library missing for run {}; was promotion successful?",
-            state.run_id
-        ))));
+        // A bare `NotFound` renders the generic "try: deadreckon list to find
+        // valid run ids" hint, which reads as "your id is wrong" when the id is
+        // fine and the promotion is what is missing. The run resolved; point at
+        // the command that explains why it has nothing to export.
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "library missing for run {}; was promotion successful?",
+                run_prefix(&state.run_id)
+            ),
+            &format!("deadreckon show {}", run_prefix(&state.run_id)),
+        )));
     }
 
     let dest = absolute_dest(dest.unwrap_or_else(|| {
@@ -343,7 +358,11 @@ fn apply_command_inner(
                 }
                 prepare_plan_result_apply_state(&paths, &result.plan, &result.state)?
             }
-            None => return Err(run_error),
+            None => {
+                return Err(super::reference::refusal_for_reference(
+                    &paths, &run_id, "finish", run_error,
+                ));
+            }
         },
     };
     ensure_completed_run(&state, "apply")?;

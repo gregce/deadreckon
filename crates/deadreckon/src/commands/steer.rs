@@ -4,7 +4,7 @@ const STEERABLE_PROVIDER_ROUTE: &str = "cli:codex-server";
 
 pub(crate) fn steer_command(run_id: &str, text: String) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = load_cli_run(&paths, run_id)?;
+    let state = super::reference::resolve_run_like(&paths, Some(run_id), "steer")?;
     let prefix = run_prefix(&state.run_id);
     queue_steer_for_state(&state, deadreckon_core::steer_inbox::SteerSource::Cli, text)?;
 

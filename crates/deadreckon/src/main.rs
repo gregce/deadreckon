@@ -1333,7 +1333,7 @@ async fn main_inner() -> Result<()> {
             ui::set_plain_output(plain);
             resume_command(run_id, from_turn, max_wall_seconds, no_docs, plain).await
         }
-        Commands::Undo { run, turn } => undo_command(run, turn),
+        Commands::Undo { run, turn } => undo_command(run.as_deref(), turn),
         Commands::Rewind {
             run_id,
             to_turn,
@@ -9111,38 +9111,50 @@ fn narrative_provider_selection(explicit_provider: Option<&str>) -> NarrativePro
 #[allow(clippy::needless_pass_by_value)]
 fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    if let Some((campaign_dir, mut campaign)) =
-        commands::campaign::resolve_campaign(&paths, &run_id)?
-    {
-        for sub_plan_id in commands::campaign::campaign_kill_targets(&campaign) {
-            // Cascade into each sub-orchestrator's plan (and thus its children).
-            let _ = kill_command(sub_plan_id, force, plain);
-        }
-        campaign.status = deadreckon_core::campaign::CampaignStatus::Killed;
-        deadreckon_core::campaign::write_campaign(&campaign_dir, &campaign)?;
-        deadreckon_core::campaign::append_campaign_event(
-            &campaign_dir,
-            "campaign_killed",
-            serde_json::json!({ "subs": campaign.n }),
-        )?;
-        print!(
-            "{}",
-            commands::campaign::campaign_verdict_surface(Some(&paths), &campaign, None)
-                .render_plain(false)
-        );
-        return Ok(());
-    }
-    let mut state = match load_cli_run(&paths, &run_id) {
-        Ok(state) => state,
-        Err(run_error) => {
-            if let Ok(plan_id) = resolve_plan_id(&paths, &run_id) {
-                return kill_plan_command(&paths, &plan_id, force);
+    // Shakedown P7: `kill` probed campaign, run, plan, chain and silently missed
+    // plan children, so `kill <plan>:task-0` -- an id `attach` accepts and
+    // prints -- came back as "not found".
+    let resolved = commands::reference::resolve_ref(
+        &paths,
+        commands::reference::RefQuery {
+            reference: Some(&run_id),
+            accepts: commands::reference::RefKinds::ALL,
+            all_scopes: false,
+            verb: "kill",
+        },
+    )?;
+    let mut state = match resolved {
+        commands::reference::ResolvedRef::Campaign {
+            dir: campaign_dir,
+            campaign,
+        } => {
+            let mut campaign = *campaign;
+            for sub_plan_id in commands::campaign::campaign_kill_targets(&campaign) {
+                // Cascade into each sub-orchestrator's plan (and thus its children).
+                let _ = kill_command(sub_plan_id, force, plain);
             }
-            if let Ok(chain_id) = commands::chain::resolve_chain_id(&paths, &run_id, false) {
-                return commands::chain::chain_kill_command(&paths, &chain_id, force);
-            }
-            return Err(run_error);
+            campaign.status = deadreckon_core::campaign::CampaignStatus::Killed;
+            deadreckon_core::campaign::write_campaign(&campaign_dir, &campaign)?;
+            deadreckon_core::campaign::append_campaign_event(
+                &campaign_dir,
+                "campaign_killed",
+                serde_json::json!({ "subs": campaign.n }),
+            )?;
+            print!(
+                "{}",
+                commands::campaign::campaign_verdict_surface(Some(&paths), &campaign, None)
+                    .render_plain(false)
+            );
+            return Ok(());
         }
+        commands::reference::ResolvedRef::Plan(plan) => {
+            return kill_plan_command(&paths, &plan.plan_id, force);
+        }
+        commands::reference::ResolvedRef::Chain(chain) => {
+            return commands::chain::chain_kill_command(&paths, &chain.chain_id, force);
+        }
+        commands::reference::ResolvedRef::Run(state) => *state,
+        commands::reference::ResolvedRef::PlanChild { state, .. } => *state,
     };
     kill_loaded_run(&paths, &mut state, force)?;
     print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain, true);
@@ -9434,7 +9446,7 @@ async fn resume_command(
     plain: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let mut state = load_cli_run(&paths, &run_id)?;
+    let mut state = commands::reference::resolve_run_like(&paths, Some(&run_id), "resume")?;
     if state.status == RunStatus::Completed {
         let id = run_prefix(&state.run_id);
         let primary = format!("deadreckon show {id}");
@@ -9557,12 +9569,9 @@ async fn resume_command(
     Ok(())
 }
 
-fn undo_command(run: Option<String>, turn: Option<u32>) -> Result<()> {
+fn undo_command(run: Option<&str>, turn: Option<u32>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = match run {
-        Some(run_id) => load_cli_run(&paths, &run_id)?,
-        None => latest_run(&paths, false)?,
-    };
+    let state = commands::reference::resolve_run_like(&paths, run, "undo")?;
     let target_turn = turn.unwrap_or_else(|| state.turn.saturating_sub(1));
     let restore_state = undo_restore_state(&state)?;
     restore_snapshot(&restore_state, target_turn)?;
@@ -9651,7 +9660,7 @@ struct ResolvedRewindTarget {
 
 fn rewind_command(run_id: &str, options: &RewindCliOptions) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let state = load_cli_run(&paths, run_id)?;
+    let state = commands::reference::resolve_run_like(&paths, Some(run_id), "rewind")?;
     let mode = rewind_mode(options)?;
     let resolved = resolve_rewind_target(&state, options)?;
     let checkpoint = read_checkpoint_by_id(&state, &resolved.checkpoint_id)?;

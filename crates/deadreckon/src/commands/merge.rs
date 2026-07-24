@@ -17,7 +17,11 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
         completion_surface,
     } = args;
     let paths = DeadreckonPaths::discover();
-    let resolved_id = resolve_plan_id(&paths, &plan_id)?;
+    // Merge reconciles a plan's children, so a run or chain id refuses by kind
+    // rather than as a missing plan.
+    let resolved_id = resolve_plan_id(&paths, &plan_id).map_err(|plan_error| {
+        super::reference::refusal_for_reference(&paths, &plan_id, "merge", plan_error)
+    })?;
     let mut plan = load_plan(&paths, &resolved_id)?;
     if !matches!(plan.status, PlanStatus::Forked | PlanStatus::Failed) {
         return Err(CliError::Surface {

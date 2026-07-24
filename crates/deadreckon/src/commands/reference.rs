@@ -332,6 +332,63 @@ fn resolve_latest(paths: &DeadreckonPaths, query: RefQuery<'_>) -> Result<Resolv
     resolve_latest_in_scope(paths, query.accepts, scope.as_deref())
 }
 
+/// Resolve a reference for a verb that only operates on a single gated run.
+///
+/// Shakedown P7: these verbs used to call the run loader directly, so a plan or
+/// chain id -- an id `list` had just printed -- came back as "not found", which
+/// was false. The shared resolver identifies the kind and the refusal table
+/// names a verb that accepts it.
+pub(crate) fn resolve_run_like(
+    paths: &DeadreckonPaths,
+    reference: Option<&str>,
+    verb: &'static str,
+) -> Result<PipelineState> {
+    let resolved = resolve_ref(
+        paths,
+        RefQuery {
+            reference,
+            accepts: RefKinds::RUN.union(RefKinds::PLAN_CHILD),
+            all_scopes: false,
+            verb,
+        },
+    )?;
+    match resolved {
+        ResolvedRef::Run(state) => Ok(*state),
+        ResolvedRef::PlanChild { state, .. } => Ok(*state),
+        other => Err(refusal_for(other.kind(), verb, &resolved_id(&other))),
+    }
+}
+
+/// Explain a reference this verb could not use, by naming what it actually is.
+///
+/// For verbs whose fallback is richer than the acceptance matrix -- `finish` and
+/// `doc` map a plan reference onto that plan's merged result run, which is a
+/// real feature, not a guessing cascade -- the fallback stays. Only its final
+/// "not found" becomes a kind-aware refusal, so a chain id stops being reported
+/// as a missing run.
+pub(crate) fn refusal_for_reference(
+    paths: &DeadreckonPaths,
+    reference: &str,
+    verb: &'static str,
+    fallback: CliError,
+) -> CliError {
+    match resolve_ref(
+        paths,
+        RefQuery {
+            reference: Some(reference),
+            accepts: RefKinds::ALL,
+            all_scopes: false,
+            verb,
+        },
+    ) {
+        Ok(resolved) => refusal_for(resolved.kind(), verb, &resolved_id(&resolved)),
+        // Genuinely unresolvable, or ambiguous: the resolver's own message is
+        // better than the caller's, but a caller that already has a specific
+        // refusal keeps it.
+        Err(_) => fallback,
+    }
+}
+
 /// One candidate for `latest`, reduced to the only two things the ranking needs.
 struct LatestCandidate {
     kind: RefKind,
