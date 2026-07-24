@@ -513,8 +513,18 @@ fn probe_run(paths: &DeadreckonPaths, reference: &str) -> Result<Option<Pipeline
     match load_run(paths, reference) {
         Ok(state) => Ok(Some(state)),
         Err(DeadreckonError::NotFound(_)) => Ok(None),
-        Err(source) => Err(CliError::from(source)),
+        // The loader's ambiguity text names the candidate ids, which is the
+        // useful part; `list` is a legal `try:` here because an ambiguous prefix
+        // is a typo, not an id `list` handed the operator.
+        Err(source) => Err(ambiguous_within_kind(source.to_string())),
     }
+}
+
+/// Every ambiguity refusal carries the same way forward. Guidance like "use a
+/// longer prefix" is advice, not a command, and this slice holds refusals to
+/// naming something the operator can run.
+fn ambiguous_within_kind(message: String) -> CliError {
+    CliError::Core(deadreckon_core::user_error(&message, "deadreckon list"))
 }
 
 fn probe_plan(paths: &DeadreckonPaths, reference: &str) -> Result<Option<Plan>> {
@@ -522,12 +532,9 @@ fn probe_plan(paths: &DeadreckonPaths, reference: &str) -> Result<Option<Plan>> 
     match ids.len() {
         1 => Ok(Some(load_plan(paths, &ids.remove(0))?)),
         0 => Ok(None),
-        _ => Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "ambiguous plan id prefix {reference}; matches {}",
-                ids.join(", ")
-            ),
-            "use a longer plan id prefix",
+        _ => Err(ambiguous_within_kind(format!(
+            "ambiguous plan id prefix {reference}; matches {}",
+            ids.join(", ")
         ))),
     }
 }
@@ -542,16 +549,13 @@ fn probe_chain(paths: &DeadreckonPaths, reference: &str, all: bool) -> Result<Op
     match matches.len() {
         1 => Ok(Some(matches.remove(0))),
         0 => Ok(None),
-        _ => Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "ambiguous chain id prefix {reference}; matches {}",
-                matches
-                    .iter()
-                    .map(|chain| chain.chain_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            "use a longer chain id prefix",
+        _ => Err(ambiguous_within_kind(format!(
+            "ambiguous chain id prefix {reference}; matches {}",
+            matches
+                .iter()
+                .map(|chain| chain.chain_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ))),
     }
 }

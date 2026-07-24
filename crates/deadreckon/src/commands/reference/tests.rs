@@ -683,3 +683,25 @@ fn steering_a_plan_points_at_attach_and_resuming_one_points_at_fork() {
         "{chain}"
     );
 }
+
+#[test]
+fn every_ambiguity_refusal_carries_a_runnable_try() {
+    // Caught in P5: routing runs through `probe_run` dropped the `try:` the old
+    // verdict path wrapped around the loader's ambiguity error, leaving a
+    // refusal with no way forward. "use a longer prefix" is advice; a refusal in
+    // this slice names something the operator can run.
+    let fx = fixture();
+    fx.run("abcd1111111111111111111111111111", "first");
+    fx.run("abcd2222222222222222222222222222", "second");
+    fx.plan("beef1111111111111111111111111111", None);
+    fx.plan("beef2222222222222222222222222222", None);
+    fx.chain("f00d1111111111111111111111111111");
+    fx.chain("f00d2222222222222222222222222222");
+
+    for prefix in ["abcd", "beef", "f00d"] {
+        let text = err_text(&resolve_ref(&fx.paths, fx.query(prefix)).expect_err("ambiguous"));
+        assert!(text.contains("ambiguous"), "{prefix}: {text}");
+        assert!(text.contains("try:"), "{prefix}: no way forward: {text}");
+        assert!(text.contains("deadreckon "), "{prefix}: {text}");
+    }
+}

@@ -51,36 +51,37 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the run to verify: an explicit id/prefix, or the most recent run
-/// across all scopes when no id is given. Not-found and ambiguous-prefix become
-/// `try:`-footer refusals so a typo reads as guidance, not a stack trace.
+/// Resolve the run to verify.
+///
+/// A verdict is a statement about a gate, and only runs have one, so this stays
+/// run-only. What changed in Shakedown is the refusal: a plan id used to come
+/// back as "unknown run <id>" pointing at `deadreckon list` — false, because the
+/// id was perfectly well known, and circular, because `list` is where the
+/// operator read it. The shared resolver identifies the kind first and names a
+/// verb that accepts it.
 pub(crate) fn resolve_verdict_run(
     paths: &DeadreckonPaths,
     id_arg: Option<&str>,
 ) -> Result<deadreckon_core::PipelineState> {
-    match id_arg {
-        None | Some("latest") | Some("last") => resolve_latest_run(paths),
-        Some(id) => deadreckon_core::load_run(paths, id).map_err(|err| {
-            let message = err.to_string();
-            let refusal = if message.contains("ambiguous") {
-                message
-            } else {
-                format!("unknown run {id}")
-            };
-            CliError::Core(deadreckon_core::user_error(&refusal, "deadreckon list"))
-        }),
+    let resolved = crate::commands::reference::resolve_ref(
+        paths,
+        crate::commands::reference::RefQuery {
+            reference: id_arg,
+            accepts: crate::commands::reference::RefKinds::RUN
+                .union(crate::commands::reference::RefKinds::PLAN_CHILD),
+            all_scopes: false,
+            verb: "verdict",
+        },
+    )?;
+    match resolved {
+        crate::commands::reference::ResolvedRef::Run(state) => Ok(*state),
+        crate::commands::reference::ResolvedRef::PlanChild { state, .. } => Ok(*state),
+        other => Err(crate::commands::reference::refusal_for(
+            other.kind(),
+            "verdict",
+            &crate::commands::reference::resolved_id(&other),
+        )),
     }
-}
-
-/// Shakedown P2: `latest` now means the same thing here as everywhere else.
-///
-/// This used to search every scope and sort by `updated_at` while `main.rs`'s
-/// `latest_run` was scope-bound — so `deadreckon status` and `deadreckon verdict`
-/// could land on different runs from the same directory. Both now share one rule,
-/// which makes `verdict latest` scope-bound like the rest of the surface. P8
-/// deletes this shim.
-fn resolve_latest_run(paths: &DeadreckonPaths) -> Result<deadreckon_core::PipelineState> {
-    latest_run(paths, false)
 }
 
 /// A one-row verdict summary for the `--all` comparison.
