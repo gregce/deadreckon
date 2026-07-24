@@ -9,12 +9,6 @@
 //! name?", so a verb can only disagree with another verb by declaring different
 //! `accepts` — which is data, and testable.
 
-// P1 lands the resolver and its depth tests; P4-P7 rewire the verbs onto it and
-// P8 deletes the old per-verb cascades. Until the first verb calls it, the
-// non-test build sees this whole API as unreachable. Remove this allowance in
-// P8, where every call site is expected to route through here.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 use deadreckon_core::campaign::Campaign;
@@ -68,13 +62,13 @@ impl RefKinds {
     pub(crate) const CHAIN: Self = Self(RefKind::Chain.bit());
     pub(crate) const CAMPAIGN: Self = Self(RefKind::Campaign.bit());
     /// Every kind. `status`, `show` and `attach` orient across all of them.
-    pub(crate) const ALL: Self = Self(
-        RefKind::Run.bit()
-            | RefKind::PlanChild.bit()
-            | RefKind::Plan.bit()
-            | RefKind::Chain.bit()
-            | RefKind::Campaign.bit(),
-    );
+    /// Built from the five constants rather than the bits directly, so adding a
+    /// kind without adding it here is a compile-visible omission.
+    pub(crate) const ALL: Self = Self::RUN
+        .union(Self::PLAN_CHILD)
+        .union(Self::PLAN)
+        .union(Self::CHAIN)
+        .union(Self::CAMPAIGN);
 
     pub(crate) const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -114,7 +108,10 @@ impl ResolvedRef {
     }
 }
 
-/// Every kind, in the order refusals and ambiguity messages name them.
+/// Every kind, in the order refusals and ambiguity messages name them. Used by
+/// the refusal-table tests to iterate the matrix exhaustively; the resolver
+/// itself matches on `RefKind` and needs no list.
+#[cfg(test)]
 pub(crate) const ALL_REF_KINDS: [RefKind; 5] = [
     RefKind::Run,
     RefKind::PlanChild,
@@ -155,6 +152,23 @@ pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
     VerbRefSpec {
         verb: "finish",
         accepts: RUN_LIKE.union(RefKinds::PLAN).union(RefKinds::CHAIN),
+    },
+    // export/apply accept a plan because they map it onto its merged result run.
+    VerbRefSpec {
+        verb: "export",
+        accepts: RUN_LIKE.union(RefKinds::PLAN),
+    },
+    VerbRefSpec {
+        verb: "apply",
+        accepts: RUN_LIKE.union(RefKinds::PLAN),
+    },
+    VerbRefSpec {
+        verb: "abandon",
+        accepts: RUN_LIKE,
+    },
+    VerbRefSpec {
+        verb: "cleanup",
+        accepts: RUN_LIKE,
     },
     // A verdict describes one gated run, so plans and chains redirect.
     VerbRefSpec {
@@ -236,14 +250,36 @@ pub(crate) fn refusal_for(kind: RefKind, verb: &str, reference: &str) -> CliErro
     ))
 }
 
-/// One resolution request. `verb` appears only in refusal text.
+/// One resolution request.
+///
+/// There is deliberately no `accepts` field. A verb's accepted kinds come from
+/// `VERB_REF_SPECS` via its name, so the acceptance matrix the tests iterate is
+/// the same one the code obeys. Carrying `accepts` at the call site would be a
+/// second source of truth that could drift from the table -- the same shape of
+/// defect this slice exists to remove.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RefQuery<'a> {
     pub(crate) reference: Option<&'a str>,
-    pub(crate) accepts: RefKinds,
     pub(crate) all_scopes: bool,
-    /// Names the refusing verb in the P3 refusal table.
     pub(crate) verb: &'static str,
+}
+
+impl RefQuery<'_> {
+    fn accepts(&self) -> RefKinds {
+        accepts_for(self.verb)
+    }
+}
+
+/// What this verb can be handed, from the one table. An unlisted verb accepts
+/// everything, which is the safe direction: it can only make a refusal less
+/// likely, never send an operator somewhere wrong. `every_verb_used_in_source_is_listed`
+/// keeps the list honest.
+pub(crate) fn accepts_for(verb: &str) -> RefKinds {
+    VERB_REF_SPECS
+        .iter()
+        .find(|spec| spec.verb == verb)
+        .map(|spec| spec.accepts)
+        .unwrap_or(RefKinds::ALL)
 }
 
 /// A plan child, named as `<plan-ref>:<task>` or `<plan-ref>/<task>`.
@@ -275,7 +311,7 @@ pub(crate) fn resolve_ref(paths: &DeadreckonPaths, query: RefQuery<'_>) -> Resul
     // existed and was simply a plan -- a false statement, and the far end of the
     // status/list loop. Identify first, then decide whether this verb can take it.
     if let Some(selection) = resolve_plan_child_ref(paths, reference)? {
-        if !query.accepts.contains(RefKind::PlanChild) {
+        if !query.accepts().contains(RefKind::PlanChild) {
             return Err(refusal_for(RefKind::PlanChild, query.verb, reference));
         }
         let state = load_run(paths, &selection.run_id)?;
@@ -305,7 +341,7 @@ pub(crate) fn resolve_ref(paths: &DeadreckonPaths, query: RefQuery<'_>) -> Resul
     match matches.len() {
         1 => {
             let resolved = matches.remove(0);
-            if query.accepts.contains(resolved.kind()) {
+            if query.accepts().contains(resolved.kind()) {
                 Ok(resolved)
             } else {
                 Err(refusal_for(
@@ -329,7 +365,7 @@ fn resolve_latest(paths: &DeadreckonPaths, query: RefQuery<'_>) -> Result<Resolv
     } else {
         Some(current_scope()?)
     };
-    resolve_latest_in_scope(paths, query.accepts, scope.as_deref())
+    resolve_latest_in_scope(paths, query.accepts(), scope.as_deref())
 }
 
 /// Resolve a reference for a verb that only operates on a single gated run.
@@ -347,7 +383,6 @@ pub(crate) fn resolve_run_like(
         paths,
         RefQuery {
             reference,
-            accepts: RefKinds::RUN.union(RefKinds::PLAN_CHILD),
             all_scopes: false,
             verb,
         },
@@ -356,6 +391,33 @@ pub(crate) fn resolve_run_like(
         ResolvedRef::Run(state) => Ok(*state),
         ResolvedRef::PlanChild { state, .. } => Ok(*state),
         other => Err(refusal_for(other.kind(), verb, &resolved_id(&other))),
+    }
+}
+
+/// Resolve to a run when the reference names one, without refusing when it
+/// names something else.
+///
+/// `finish`, `export`, `apply` and `doc` have a fallback richer than the
+/// acceptance matrix: a plan reference maps onto that plan's merged result run,
+/// or its doc target. That is a real feature, not a guessing cascade, so it must
+/// still get its turn. `Err` is reserved for a reference that resolves to
+/// nothing at all, or ambiguously.
+pub(crate) fn try_resolve_run(
+    paths: &DeadreckonPaths,
+    reference: &str,
+    verb: &'static str,
+) -> Result<Option<PipelineState>> {
+    match resolve_ref(
+        paths,
+        RefQuery {
+            reference: Some(reference),
+            all_scopes: false,
+            verb,
+        },
+    )? {
+        ResolvedRef::Run(state) => Ok(Some(*state)),
+        ResolvedRef::PlanChild { state, .. } => Ok(Some(*state)),
+        _ => Ok(None),
     }
 }
 
@@ -370,22 +432,21 @@ pub(crate) fn refusal_for_reference(
     paths: &DeadreckonPaths,
     reference: &str,
     verb: &'static str,
-    fallback: CliError,
 ) -> CliError {
     match resolve_ref(
         paths,
         RefQuery {
             reference: Some(reference),
-            accepts: RefKinds::ALL,
             all_scopes: false,
             verb,
         },
     ) {
         Ok(resolved) => refusal_for(resolved.kind(), verb, &resolved_id(&resolved)),
-        // Genuinely unresolvable, or ambiguous: the resolver's own message is
-        // better than the caller's, but a caller that already has a specific
-        // refusal keeps it.
-        Err(_) => fallback,
+        // Genuinely unresolvable, or ambiguous. The resolver's own message is
+        // always at least as good as anything the caller could supply, so there
+        // is no fallback to override it -- one fewer place that can invent a
+        // worse refusal.
+        Err(error) => error,
     }
 }
 
@@ -621,6 +682,7 @@ fn probe_chain(paths: &DeadreckonPaths, reference: &str, all: bool) -> Result<Op
 /// a different `try:` — pointing a first-time operator at `list` shows them an
 /// empty table and no way forward.
 fn unresolved_reference(paths: &DeadreckonPaths, reference: &str, query: RefQuery<'_>) -> CliError {
+    let accepts = query.accepts();
     let has_any_state = deadreckon_core::list_runs(paths, None)
         .map(|runs| !runs.is_empty())
         .unwrap_or(false)
@@ -631,7 +693,7 @@ fn unresolved_reference(paths: &DeadreckonPaths, reference: &str, query: RefQuer
         CliError::Core(deadreckon_core::user_error(
             &format!(
                 "no {} matches {reference}",
-                accepted_nouns(query.accepts).join(", ")
+                accepted_nouns(accepts).join(", ")
             ),
             "deadreckon list",
         ))

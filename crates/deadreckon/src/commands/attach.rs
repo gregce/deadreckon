@@ -40,7 +40,6 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
         &paths,
         super::reference::RefQuery {
             reference: Some(&run_ref),
-            accepts: super::reference::RefKinds::ALL,
             all_scopes: false,
             verb: "attach",
         },

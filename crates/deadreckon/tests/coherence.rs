@@ -2223,6 +2223,52 @@ fn resume_on_a_plan_id_points_at_fork() {
 }
 
 #[test]
+fn every_id_taking_verb_declares_its_accepted_kinds() {
+    // The structural guard: once a verb resolves through the shared table, it
+    // must not reach for a kind loader on its own. A new cascade is how the
+    // original defect grew, one well-meaning verb at a time.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    for entry in walk_rust_files(&src) {
+        let name = entry.to_string_lossy().to_string();
+        if name.contains("commands/reference") {
+            continue;
+        }
+        let text = fs::read_to_string(&entry).expect("source");
+        for (number, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            if line.contains("load_cli_run(") || line.contains("load_cli_run_with_scope(") {
+                offenders.push(format!("{name}:{}", number + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these call the legacy run loader instead of resolve_ref:\n{}",
+        offenders.join("\n")
+    );
+}
+
+fn walk_rust_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_rust_files(&path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[test]
 fn journey_ids_from_list_are_accepted_or_redirected_by_finish_and_kill() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
