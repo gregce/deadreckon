@@ -121,21 +121,27 @@ refusal table. `RefKind::noun()` returns the operator-facing word: `run`,
 
 ### Probe order
 
-For an explicit reference, probe in this fixed order and take the **first**
-match:
+**Revised in P1 — first-match-wins was wrong.** The rider originally specified
+"probe in a fixed order, take the first match". Implementing it exposed the
+contradiction: under first-match-wins, a prefix matching both a run and a plan
+resolves silently to the run and the operator who meant the plan gets the wrong
+object with no signal. That is the same class of defect as the `status`/`list`
+loop — the tool quietly deciding what the operator meant. The spec is therefore:
 
-1. Plan child ref (`<plan-id>/<task>` shapes handled by
-   `resolve_plan_child_ref`, `main.rs:6172`)
-2. Run (`deadreckon_core::load_run`, prefix-capable)
-3. Plan (`resolve_plan_id`, `main.rs:4335`)
-4. Chain (`commands::chain::resolve_chain_id`, `chain/mod.rs:3216`)
-5. Campaign (`commands::campaign::resolve_campaign`, `campaign.rs:2227`)
+1. **Plan-child ref first, on syntax, not precedence.** A plan-child reference
+   contains `:` or `/` (`resolve_plan_child_ref`, now in `reference.rs`), which
+   a bare id never does. The shapes are disjoint, so checking it first is
+   disambiguation, not ranking.
+2. **Every other accepted kind is probed, and all matches are collected** — run
+   (`deadreckon_core::load_run`), plan (`plan_ids_matching`), chain
+   (`commands::chain::list_chain_records`), campaign
+   (`commands::campaign::resolve_campaign`). Exactly one match resolves; two or
+   more is the cross-kind ambiguity refusal below.
 
-Plan-child goes first because its reference shape is unambiguous and would
-otherwise be swallowed by a prefix match. Campaign goes last because
-`resolve_campaign` walks the whole `plans/` directory and is the most
-expensive probe — today `show_command` and `kill_command` run it *first* on
-every invocation, which this reordering also fixes.
+The listed order still governs which id a refusal names first, so messages stay
+deterministic. Probing every kind costs no more than the old cascade: the plan
+and campaign probes read the same `plans/` directory, and `show`/`kill` already
+walked it on every invocation.
 
 ### Prefix rule
 
@@ -152,7 +158,8 @@ Two distinct failure modes, two distinct refusals — do not collapse them:
 - **Across kinds:** a prefix matching one run *and* one plan is a refusal that
   names both full ids and asks for more characters. This case cannot arise
   today because no verb probes more than one kind by prefix, so it needs a
-  fixture, not a search for a live example.
+  fixture, not a search for a live example. After Shakedown every multi-kind
+  verb can reach it, which is why collect-all replaced first-match-wins.
 
 ### `latest`
 
@@ -266,18 +273,36 @@ CHANGELOG entry naming the SHA.
 - Add `commands/reference.rs` with `ResolvedRef`, `RefKind`, `RefKinds`,
   `RefQuery` and `resolve_ref`, implementing the probe order, prefix rule and
   both ambiguity refusals.
-- Move `resolve_plan_child_ref` and `resolve_plan_id` out of `main.rs` into
-  `reference.rs` unchanged. Leave `main.rs` calling the moved functions.
-- No verb is rewired. No behavior changes.
+- Move `resolve_plan_child_ref`, `resolve_plan_child_task`, `resolve_plan_id`
+  and `PlanChildSelection` out of `main.rs` into `reference.rs` unchanged, and
+  re-export them at the crate root with `pub(crate) use` so the
+  `use super::super::*` in every command module keeps resolving and no existing
+  call site changes with the move.
+- Factor `plan_ids_matching` out of `resolve_plan_id` so plans can be probed
+  without a refusal on zero matches.
+- No verb is rewired. No behavior changes. Because nothing calls `resolve_ref`
+  until P4, the module carries a `#![allow(dead_code)]` with a comment naming
+  P8 as its removal point — `make clippy` lints the non-test build and would
+  otherwise fail the phase.
 
-Depth tests (`crates/deadreckon/src/commands/reference.rs`, `#[cfg(test)]`):
+Depth tests (`crates/deadreckon/src/commands/reference/tests.rs`):
 - `probe_order_prefers_plan_child_over_run_prefix`
-- `run_prefix_resolves_before_plan_with_same_prefix`
+- `prefix_matching_both_a_run_and_a_plan_is_refused_as_ambiguous`
+  (replaces `run_prefix_resolves_before_plan_with_same_prefix`, which asserted
+  the first-match-wins behavior the revised probe-order spec rejects)
 - `chain_id_resolves_when_no_run_or_plan_matches`
-- `campaign_probe_runs_last_and_is_skipped_when_a_run_matches`
+- `campaign_id_resolves_when_no_other_kind_matches`
+  (replaces `campaign_probe_runs_last_and_is_skipped_when_a_run_matches`;
+  under collect-all no probe is skipped, so the old name asserted a property
+  the spec no longer has)
 - `ambiguous_prefix_within_runs_passes_through_loader_message`
 - `ambiguous_prefix_across_run_and_plan_names_both_full_ids`
 - `unknown_reference_with_no_state_refuses_with_start_not_list`
+- `unknown_reference_with_existing_state_refuses_with_list`
+- `accepts_narrows_which_kinds_are_probed`
+- `ref_kinds_all_contains_every_kind`
+- `plan_ids_matching_with_empty_prefix_lists_every_plan`
+- `plan_ids_matching_ignores_directories_without_plan_json`
 
 ### P2 — One `latest`
 
@@ -371,6 +396,9 @@ Depth tests (`coherence.rs`):
 - Remove `load_cli_run`, `load_cli_run_with_scope`, `latest_run`,
   `resolve_verdict_run`, `resolve_latest_run` and every per-verb probe
   sequence. All 58 call sites now route through `resolve_ref`.
+- Remove the `#![allow(dead_code)]` P1 added to `reference.rs`. If anything in
+  the module is still unreachable with every verb rewired, it is unused code
+  and gets deleted, not re-allowed.
 - Update the `public_surface` baseline in the same commit, deliberately.
 - Net line count in `main.rs` must go **down**; record the delta in the commit
   body.
