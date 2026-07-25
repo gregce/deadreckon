@@ -39,37 +39,11 @@ pub enum ChainStepStatus {
     Undone,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BranchPolicy {
-    Stack,
-    Base,
-    Merge,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApplyMode {
-    Auto,
-    Preview,
-    Manual,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ApplyStrategy {
-    Squash,
-    Merge,
-    CherryPick,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OnFail {
-    Stop,
-    Skip,
-    Continue,
-}
+// The apply/branch/failure policy vocabulary is owned by `plan`, because a
+// plan is the execution unit these settings describe; a chain is one shape of
+// plan. Re-exported here so `deadreckon_core::chain::BranchPolicy` and the
+// crate-root re-export in lib.rs keep resolving unchanged.
+pub use crate::plan::{ApplyMode, ApplyStrategy, BranchPolicy, OnFail};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChainStep {

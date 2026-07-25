@@ -3159,6 +3159,8 @@ mod model_routing_tests {
             provider: None,
             role: deadreckon_core::plan::PlanRole::Child,
             depends_on: Vec::new(),
+            subplan: None,
+            attempts: Vec::new(),
             worker_spec: std::path::PathBuf::new(),
             summary_path: None,
             review_status: None,
