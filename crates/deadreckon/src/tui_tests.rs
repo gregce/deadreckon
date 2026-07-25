@@ -2547,30 +2547,206 @@ fn start_auto_defaults_to_run_for_simple_goal() {
     assert!(decision.reason.contains("single supervised run"));
 }
 
+/// A word in the goal must not choose the shape any more.
+///
+/// "review", "audit", "harden" used to latch Review here as a Heuristic, and
+/// Review then short-circuited apply_goal_shape_recommendation — so the signal
+/// ladder and the provider classifier were both discarded and the operator's
+/// bill doubled on a keyword match they never saw. Auto mode now starts from
+/// the conservative floor and lets the classifier move it.
 #[test]
-fn start_auto_recommends_review_for_review_goal() {
-    let decision = start_launch_decision(StartLaunchInput {
+fn start_auto_does_not_let_a_keyword_choose_the_shape() {
+    for goal in [
+        "review and harden the provider setup flow",
+        "audit the payment module",
+        "parallelize the API, frontend, docs, and release workstreams",
+    ] {
+        let decision = start_launch_decision(StartLaunchInput {
+            goal,
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+
+        assert_eq!(
+            decision.selected_mode,
+            StartSelectedMode::Run,
+            "auto mode floor for {goal:?}"
+        );
+        assert_eq!(
+            decision.selection_source,
+            StartSelectionSource::Default,
+            "no heuristic may claim the decision for {goal:?}"
+        );
+    }
+}
+
+/// The classifier's recommendation overrides the floor — including for a goal
+/// whose wording would previously have latched Review and blocked it.
+#[test]
+fn the_classifier_moves_auto_mode_off_the_floor() {
+    let goal_text;
+    let mut decision = start_launch_decision(StartLaunchInput {
         goal: "review and harden the provider setup flow",
         requested_mode: CliStartMode::Auto,
         stdin_is_tty: true,
     });
+    goal_text = decision.goal.clone();
 
-    assert_eq!(decision.selected_mode, StartSelectedMode::Review);
-    assert_eq!(decision.selection_source, StartSelectionSource::Heuristic);
-    assert!(decision.reason.contains("review"));
-}
-
-#[test]
-fn start_auto_recommends_full_plan_for_parallel_goal() {
-    let decision = start_launch_decision(StartLaunchInput {
-        goal: "parallelize the API, frontend, docs, and release workstreams",
-        requested_mode: CliStartMode::Auto,
-        stdin_is_tty: true,
-    });
+    apply_goal_shape_recommendation(
+        &mut decision,
+        GoalShapeRecommendation {
+            schema_version: 1,
+            goal: goal_text.clone(),
+            shape: GoalShape::Orchestrate,
+            n: Some(3),
+            rationale: "three separable pieces".to_string(),
+            source: GoalShapeSource::Provider,
+            provider: Some("cli:planner".to_string()),
+            pieces: Vec::new(),
+        },
+    );
 
     assert_eq!(decision.selected_mode, StartSelectedMode::FullPlan);
-    assert_eq!(decision.selection_source, StartSelectionSource::Heuristic);
-    assert!(decision.reason.contains("parallel"));
+    assert_eq!(decision.selection_source, StartSelectionSource::GoalShape);
+    assert_eq!(decision.child_count, Some(3));
+}
+
+/// An explicit --mode review is the operator's own call and still wins.
+#[test]
+fn an_explicit_review_flag_still_beats_the_classifier() {
+    let goal_text;
+    let mut decision = start_launch_decision(StartLaunchInput {
+        goal: "harden the payment module",
+        requested_mode: CliStartMode::Review,
+        stdin_is_tty: true,
+    });
+    goal_text = decision.goal.clone();
+
+    apply_goal_shape_recommendation(
+        &mut decision,
+        GoalShapeRecommendation {
+            schema_version: 1,
+            goal: goal_text.clone(),
+            shape: GoalShape::Orchestrate,
+            n: Some(4),
+            rationale: "four separable pieces".to_string(),
+            source: GoalShapeSource::Provider,
+            provider: Some("cli:planner".to_string()),
+            pieces: Vec::new(),
+        },
+    );
+
+    assert_eq!(decision.selected_mode, StartSelectedMode::Review);
+    assert_eq!(
+        decision.selection_source,
+        StartSelectionSource::ExplicitFlag
+    );
+}
+
+fn resolve_graph(json: &str) -> super::commands::course::ResolvedCoursePlan {
+    let signals = super::commands::course::SignalBundle {
+        budget: super::commands::course::budget_signal(None),
+        ..Default::default()
+    };
+    let ladder = super::commands::course::ladder_decision(&signals);
+    super::commands::course::resolve_provider_course_plan(
+        json,
+        &signals,
+        &ladder,
+        super::commands::course::SHAPE_CONFIDENCE_FLOOR_DEFAULT,
+    )
+    .expect("resolved")
+}
+
+/// The whole point of P3: the planner can now say "do these in order".
+/// The old schema had no depends_on field at all, so the one shape deadreckon
+/// runs sequentially was unreachable no matter how the prompt was tuned.
+#[test]
+fn the_planner_can_express_ordering() {
+    let (shape, n, pieces, _resolution) = resolve_graph(
+        r#"{"nodes":[
+             {"id":"n0","goal":"migrate the schema","depends_on":[]},
+             {"id":"n1","goal":"update the callers","depends_on":["n0"]},
+             {"id":"n2","goal":"delete the shim","depends_on":["n1"]}],
+           "apply":"per-node","confidence":0.9,"rationale":"ordered migration"}"#,
+    );
+
+    assert_eq!(shape, super::commands::course::CourseShape::Plan);
+    assert_eq!(n, Some(3));
+    assert_eq!(pieces.len(), 3);
+    assert!(pieces[0].depends_on.is_empty());
+    assert_eq!(pieces[1].depends_on, vec!["p1".to_string()]);
+    assert_eq!(pieces[2].depends_on, vec!["p2".to_string()]);
+}
+
+/// Shape is read off the graph rather than picked from a menu.
+#[test]
+fn shape_is_derived_from_the_graph_not_a_word() {
+    let (single, _, _, _) = resolve_graph(
+        r#"{"nodes":[{"id":"n0","goal":"fix the bug"}],"confidence":0.9,"rationale":"one change"}"#,
+    );
+    assert_eq!(single, super::commands::course::CourseShape::Single);
+
+    let (plan, _, _, _) = resolve_graph(
+        r#"{"nodes":[{"id":"n0","goal":"auth"},{"id":"n1","goal":"billing"}],"confidence":0.9,"rationale":"two pieces"}"#,
+    );
+    assert_eq!(plan, super::commands::course::CourseShape::Plan);
+
+    let (nested, _, pieces, _) = resolve_graph(
+        r#"{"nodes":[
+             {"id":"n0","goal":"rebuild billing","subplan":{"apply":"per-node","nodes":[{"id":"s0","goal":"schema"},{"id":"s1","goal":"cutover","depends_on":["s0"]}]}},
+             {"id":"n1","goal":"rebuild search"}],
+           "confidence":0.9,"rationale":"two sub-projects"}"#,
+    );
+    assert_eq!(nested, super::commands::course::CourseShape::Campaign);
+    assert!(pieces[0].is_subplan, "the nested node is marked");
+    assert!(!pieces[1].is_subplan);
+}
+
+/// What the executor cannot honor yet is recorded, so the trail shows what was
+/// asked for and not only what ran.
+#[test]
+fn lowering_records_what_the_executor_cannot_run_yet() {
+    let (_, _, _, resolution) = resolve_graph(
+        r#"{"nodes":[
+             {"id":"n0","goal":"a","subplan":{"nodes":[{"id":"s0","goal":"x"},{"id":"s1","goal":"y"}]}},
+             {"id":"n1","goal":"b"}],
+           "apply":"per-node","confidence":0.9,"rationale":"nested and ordered"}"#,
+    );
+
+    let clamps = resolution.clamps_applied.join(" | ");
+    assert!(clamps.contains("per-node lowered to at-end"), "{clamps}");
+    assert!(clamps.contains("subplan"), "{clamps}");
+}
+
+/// An edge naming a node that does not exist is dropped and recorded, never
+/// fatal — the planner shapes a launch, it cannot make one impossible.
+#[test]
+fn an_unresolvable_edge_is_dropped_and_recorded() {
+    let (_, _, pieces, resolution) = resolve_graph(
+        r#"{"nodes":[
+             {"id":"n0","goal":"a","depends_on":["ghost"]},
+             {"id":"n1","goal":"b","depends_on":["n1"]}],
+           "confidence":0.9,"rationale":"bad edges"}"#,
+    );
+
+    assert!(pieces[0].depends_on.is_empty());
+    assert!(pieces[1].depends_on.is_empty());
+    let clamps = resolution.clamps_applied.join(" | ");
+    assert!(clamps.contains("unknown node ghost"), "{clamps}");
+    assert!(clamps.contains("self-dependency"), "{clamps}");
+}
+
+/// A model still answering in the old shape vocabulary is understood rather
+/// than discarded, so the change does not depend on prompt adherence.
+#[test]
+fn a_legacy_shape_answer_still_resolves() {
+    let (shape, n, _, _) = resolve_graph(
+        r#"{"shape":"campaign","n":9,"confidence":0.9,"rationale":"three independent services"}"#,
+    );
+
+    assert_eq!(shape, super::commands::course::CourseShape::Campaign);
+    assert_eq!(n, Some(6), "n is still clamped into 2..=6");
 }
 
 #[test]
@@ -2684,6 +2860,7 @@ fn classified_campaign_shape_is_suggested_not_auto_launched() {
         rationale: "three independent surfaces".to_string(),
         source: GoalShapeSource::Provider,
         provider: Some("cli:planner".to_string()),
+        pieces: Vec::new(),
     };
 
     apply_goal_shape_recommendation(&mut decision, recommendation);

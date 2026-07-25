@@ -7,7 +7,7 @@ pub(crate) async fn plan_command(args: PlanCommandArgs) -> Result<()> {
     if !prepare_orchestration_source(args.init_git, quiet)? {
         return Ok(());
     }
-    let plan = create_orchestration_plan(args).await?;
+    let plan = create_orchestration_plan(args, &[]).await?;
     if json_output {
         print_plan_json(&plan)?;
         return Ok(());
@@ -40,7 +40,10 @@ pub(crate) fn prepare_orchestration_source(init_git: bool, quiet: bool) -> Resul
     }
 }
 
-pub(crate) async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<Plan> {
+pub(crate) async fn create_orchestration_plan(
+    args: PlanCommandArgs,
+    seed_pieces: &[commands::course::CoursePiece],
+) -> Result<Plan> {
     let PlanCommandArgs {
         goal,
         n,
@@ -133,18 +136,23 @@ pub(crate) async fn create_orchestration_plan(args: PlanCommandArgs) -> Result<P
         PlanMode::FullPlan => {
             let overrides = parse_child_provider_overrides(&child_provider, n)?;
             providers.children = overrides.clone();
-            build_full_plan_tasks(
-                &paths,
-                &goal,
-                n,
-                &providers,
-                &overrides,
-                &cwd,
-                plain,
-                no_hints,
-                json_output,
-            )
-            .await?
+            match plan_tasks_from_seed(seed_pieces, n, &providers, &overrides) {
+                Some(tasks) => tasks,
+                None => {
+                    build_full_plan_tasks(
+                        &paths,
+                        &goal,
+                        n,
+                        &providers,
+                        &overrides,
+                        &cwd,
+                        plain,
+                        no_hints,
+                        json_output,
+                    )
+                    .await?
+                }
+            }
         }
         PlanMode::Review => build_review_plan_tasks(&goal, &providers),
     };
@@ -343,6 +351,65 @@ pub(crate) fn parse_child_provider_overrides(
         overrides.insert(index, provider.to_string());
     }
     Ok(overrides)
+}
+
+/// Turn the launch classifier's graph into plan tasks.
+///
+/// This is what makes the classifier's answer the plan. Without it the shape
+/// decision came from one planner and the executed child graph from a second,
+/// so a goal the classifier read as ordered could still run as N independent
+/// nodes — the preview and the execution disagreeing about the same launch.
+///
+/// Returns `None` when there is no usable seed, so plan creation falls back to
+/// its own planner. The count must match `n` exactly: `n` is the number the
+/// operator saw and confirmed on the preview, and silently planning a
+/// different number would make the confirmation meaningless.
+fn plan_tasks_from_seed(
+    seed: &[commands::course::CoursePiece],
+    n: u8,
+    providers: &PlanProviders,
+    overrides: &BTreeMap<u32, String>,
+) -> Option<Vec<PlanTask>> {
+    if seed.len() != usize::from(n) {
+        return None;
+    }
+    if seed.iter().any(|piece| piece.goal.trim().is_empty()) {
+        return None;
+    }
+    // Piece ids are positional (p1, p2, ...), so an edge maps to the task at
+    // that position. Anything unresolvable is dropped rather than guessed.
+    let positions: BTreeMap<&str, String> = seed
+        .iter()
+        .enumerate()
+        .map(|(index, piece)| (piece.id.as_str(), format!("task-{index}")))
+        .collect();
+    let mut tasks = Vec::new();
+    for (index, piece) in seed.iter().enumerate() {
+        let task_index = index as u32;
+        let provider = overrides
+            .get(&task_index)
+            .cloned()
+            .or_else(|| providers.default_child.clone());
+        let subject = commands::course::piece_subject(piece);
+        let mut task = PlanTask::new(
+            task_index,
+            subject,
+            piece.goal.trim(),
+            PlanRole::Child,
+            provider,
+        );
+        task.depends_on = piece
+            .depends_on
+            .iter()
+            .filter_map(|dependency| positions.get(dependency.as_str()).cloned())
+            .filter(|dependency| dependency != &task.task_id)
+            .collect();
+        tasks.push(task);
+    }
+    // A seed that does not form a valid DAG is discarded wholesale rather than
+    // repaired; the planner fallback is the safer answer.
+    deadreckon_core::validate_task_graph(&tasks).ok()?;
+    Some(tasks)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3418,6 +3485,94 @@ mod tests {
     #[test]
     fn parse_planner_response_rejects_non_json() {
         assert!(parse_planner_response("I could not produce a plan.").is_err());
+    }
+}
+
+#[cfg(test)]
+mod seed_graph_tests {
+    use super::plan_tasks_from_seed;
+    use crate::commands::course::CoursePiece;
+    use deadreckon_core::plan::PlanProviders;
+    use std::collections::BTreeMap;
+
+    fn piece(id: &str, goal: &str, depends_on: &[&str]) -> CoursePiece {
+        CoursePiece {
+            id: id.to_string(),
+            goal: goal.to_string(),
+            done_hint: None,
+            role: None,
+            provider: None,
+            model: None,
+            budget_usd: None,
+            depends_on: depends_on.iter().map(ToString::to_string).collect(),
+            is_subplan: false,
+        }
+    }
+
+    fn providers() -> PlanProviders {
+        PlanProviders {
+            default_child: Some("smoke".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The edges the classifier drew must be the edges the executor runs.
+    /// Before this, plan creation asked a *second* planner for the child
+    /// graph, so an ordered goal could be previewed as ordered and then run
+    /// as N independent nodes.
+    #[test]
+    fn the_classifier_graph_becomes_the_plan_tasks() {
+        let seed = [
+            piece("p1", "migrate the schema", &[]),
+            piece("p2", "update the callers", &["p1"]),
+            piece("p3", "delete the shim", &["p2"]),
+        ];
+
+        let tasks = plan_tasks_from_seed(&seed, 3, &providers(), &BTreeMap::new())
+            .expect("seed becomes tasks");
+
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].goal, "migrate the schema");
+        assert!(tasks[0].depends_on.is_empty());
+        assert_eq!(tasks[1].depends_on, vec!["task-0".to_string()]);
+        assert_eq!(tasks[2].depends_on, vec!["task-1".to_string()]);
+        assert!(
+            tasks
+                .iter()
+                .all(|task| task.provider.as_deref() == Some("smoke")),
+            "child provider routing still applies"
+        );
+    }
+
+    /// `n` is the number the operator saw and confirmed on the preview.
+    /// Planning a different number would make that confirmation meaningless,
+    /// so a mismatched seed is refused and the planner fallback runs.
+    #[test]
+    fn a_seed_that_disagrees_with_the_confirmed_count_is_refused() {
+        let seed = [piece("p1", "one", &[]), piece("p2", "two", &[])];
+
+        assert!(plan_tasks_from_seed(&seed, 3, &providers(), &BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn a_seed_with_an_empty_goal_is_refused() {
+        let seed = [piece("p1", "one", &[]), piece("p2", "   ", &[])];
+
+        assert!(plan_tasks_from_seed(&seed, 2, &providers(), &BTreeMap::new()).is_none());
+    }
+
+    /// A cyclic seed is discarded wholesale rather than repaired; falling back
+    /// to the planner is safer than executing a guess.
+    #[test]
+    fn a_cyclic_seed_is_refused() {
+        let seed = [piece("p1", "one", &["p2"]), piece("p2", "two", &["p1"])];
+
+        assert!(plan_tasks_from_seed(&seed, 2, &providers(), &BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn no_seed_falls_back_to_the_planner() {
+        assert!(plan_tasks_from_seed(&[], 3, &providers(), &BTreeMap::new()).is_none());
     }
 }
 

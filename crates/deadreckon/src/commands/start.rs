@@ -35,7 +35,8 @@ impl StartSelectedMode {
 pub(crate) enum StartSelectionSource {
     ExplicitFlag,
     GoalShape,
-    Heuristic,
+    // `Heuristic` is gone: it existed only for the keyword matcher that used
+    // to choose the shape before any classifier ran.
     InteractiveChoice,
     Default,
 }
@@ -45,7 +46,6 @@ impl StartSelectionSource {
         match self {
             Self::ExplicitFlag => "explicit_flag",
             Self::GoalShape => "goal_shape",
-            Self::Heuristic => "heuristic",
             Self::InteractiveChoice => "interactive_choice",
             Self::Default => "default",
         }
@@ -86,7 +86,8 @@ impl GoalShapeSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Not Eq: pieces carry an optional budget_usd.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GoalShapeRecommendation {
     pub(crate) schema_version: u8,
     pub(crate) goal: String,
@@ -97,6 +98,16 @@ pub(crate) struct GoalShapeRecommendation {
     pub(crate) source: GoalShapeSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) provider: Option<String>,
+    /// The graph the classifier drew, carried through to plan creation.
+    ///
+    /// Previously the classifier's decomposition was discarded after the
+    /// shape and `n` were read, and `build_full_plan_tasks` asked a *second*
+    /// planner for the child graph. That second call was the only one that
+    /// could express dependencies, so the shape decision — the expensive,
+    /// irreversible one — was made blind to the structure that followed it.
+    /// Keeping the nodes here makes one classifier's answer the plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pieces: Vec<commands::course::CoursePiece>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,26 +349,19 @@ pub(crate) fn start_launch_decision(input: StartLaunchInput<'_>) -> StartLaunchD
     }
 }
 
+/// The conservative floor for auto mode.
+///
+/// This used to keyword-match the goal first — "audit", "harden", "validate"
+/// latched Review; parallel-sounding words latched FullPlan — and whatever it
+/// picked won outright, because `apply_goal_shape_recommendation` then
+/// returned early for Review and discarded both the signal ladder and the
+/// provider classifier. A word in the goal could double the bill with no
+/// visible decision. Shape now comes from one classifier; this only supplies
+/// the starting point it refines.
 fn start_auto_mode_decision(
-    goal: &str,
+    _goal: &str,
     stdin_is_tty: bool,
 ) -> (StartSelectedMode, StartSelectionSource, String) {
-    let lower = goal.to_ascii_lowercase();
-    if start_goal_recommends_review(&lower) {
-        return (
-            StartSelectedMode::Review,
-            StartSelectionSource::Heuristic,
-            "goal asks for review, hardening, validation, or a second pass".to_string(),
-        );
-    }
-    if start_goal_recommends_full_plan(&lower) {
-        return (
-            StartSelectedMode::FullPlan,
-            StartSelectionSource::Heuristic,
-            "goal names parallel or separable workstreams that fit full-plan orchestration"
-                .to_string(),
-        );
-    }
     if !stdin_is_tty {
         return (
             StartSelectedMode::Run,
@@ -438,7 +442,7 @@ pub(crate) async fn classify_goal_shape_for_start(
         && let Some(resolved) =
             provider_course_plan(paths, cwd, goal, provider, plain, &signals, &ladder).await
     {
-        let (shape, n, _pieces, resolution) = resolved;
+        let (shape, n, pieces, resolution) = resolved;
         return GoalShapeRecommendation {
             schema_version: 1,
             goal: goal.to_string(),
@@ -447,6 +451,7 @@ pub(crate) async fn classify_goal_shape_for_start(
             rationale: resolution.rationale,
             source: GoalShapeSource::Provider,
             provider: Some(provider.to_string()),
+            pieces,
         };
     }
     ladder_goal_shape_recommendation(goal, &ladder)
@@ -530,6 +535,9 @@ pub(crate) fn ladder_goal_shape_recommendation(
         rationale: resolution.rationale,
         source: GoalShapeSource::Fallback,
         provider: None,
+        // The ladder decides shape and n from measured signals; it does not
+        // author node goals, so plan creation falls back to its own planner.
+        pieces: Vec::new(),
     }
 }
 
@@ -545,7 +553,12 @@ pub(crate) fn apply_goal_shape_recommendation(
     decision: &mut StartLaunchDecision,
     recommendation: GoalShapeRecommendation,
 ) {
-    if matches!(decision.selected_mode, StartSelectedMode::Review) {
+    // An explicit --mode review is the operator's call and still wins; what no
+    // longer wins is a keyword match, which used to reach here as Review and
+    // silently discard this recommendation.
+    if matches!(decision.selected_mode, StartSelectedMode::Review)
+        && decision.selection_source == StartSelectionSource::ExplicitFlag
+    {
         decision.goal_shape = Some(recommendation);
         return;
     }
@@ -590,38 +603,6 @@ pub(crate) fn write_goal_shape_preview_record(
         })?,
     )?;
     Ok(())
-}
-
-fn start_goal_recommends_review(lower_goal: &str) -> bool {
-    let words = [
-        "review",
-        "audit",
-        "critique",
-        "validate",
-        "validation",
-        "verify",
-        "verification",
-        "hardening",
-        "harden",
-        "cleanup",
-    ];
-    let phrases = ["second pass", "second-pass", "clean up"];
-    words
-        .iter()
-        .any(|word| start_goal_contains_word(lower_goal, word))
-        || phrases.iter().any(|phrase| lower_goal.contains(phrase))
-}
-
-fn start_goal_recommends_full_plan(lower_goal: &str) -> bool {
-    // One keyword list, owned by the course ladder (rule 2.5), so the
-    // auto-mode heuristic and the deterministic floor can never drift.
-    commands::course::goal_names_parallel_workstreams(lower_goal)
-}
-
-fn start_goal_contains_word(lower_goal: &str, needle: &str) -> bool {
-    lower_goal
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|word| word == needle)
 }
 
 pub(crate) fn maybe_prompt_start_mode(
@@ -3063,6 +3044,13 @@ async fn dispatch_start_command(
             let reviewer_provider = decision.reviewer_provider_route.clone().or(provider_route);
             let result = commands::orchestrate::orchestrate_command(
                 commands::orchestrate::OrchestrateRunArgs {
+                    // The classifier already drew this graph; plan creation
+                    // uses it rather than asking a second planner.
+                    seed_pieces: decision
+                        .goal_shape
+                        .as_ref()
+                        .map(|shape| shape.pieces.clone())
+                        .unwrap_or_default(),
                     plan: PlanCommandArgs {
                         goal: args.goal,
                         n: decision.child_count.unwrap_or_else(|| {
