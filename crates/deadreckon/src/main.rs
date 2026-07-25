@@ -1334,7 +1334,8 @@ async fn main_inner() -> Result<()> {
             ui::set_plain_output(plain);
             resume_command(run_id, from_turn, max_wall_seconds, no_docs, plain).await
         }
-        Commands::Undo { run, turn } => undo_command(run.as_deref(), turn),
+        // The positional id wins; --run stays for anyone who scripted it.
+        Commands::Undo { id, run, turn } => undo_command(id.or(run).as_deref(), turn),
         Commands::Rewind {
             run_id,
             to_turn,
@@ -9553,8 +9554,24 @@ async fn resume_command(
     Ok(())
 }
 
+/// Put the last committed thing back, whatever kind of thing it was.
+///
+/// A run undoes to a turn snapshot; a chain unwinds its last applied step.
+/// These were two commands (`undo --run` and `chain undo <id> --step`) with
+/// two id spaces for one intent. The resolver already knew both kinds — only
+/// this dispatch was missing.
 fn undo_command(run: Option<&str>, turn: Option<u32>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
+    if let Ok(commands::reference::ResolvedRef::Chain(chain)) = commands::reference::resolve_ref(
+        &paths,
+        commands::reference::RefQuery {
+            reference: run,
+            all_scopes: false,
+            verb: "undo",
+        },
+    ) {
+        return commands::chain::chain_undo_command(&paths, &chain.chain_id, turn, false);
+    }
     let state = commands::reference::resolve_run_like(&paths, run, "undo")?;
     let target_turn = turn.unwrap_or_else(|| state.turn.saturating_sub(1));
     let restore_state = undo_restore_state(&state)?;

@@ -187,9 +187,12 @@ pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
         verb: "steer",
         accepts: RUN_LIKE,
     },
+    // Undo reverses the last committed step of whatever it is handed. For a
+    // run that is a snapshot restore; for a chain it is unwinding an applied
+    // step. Both are "put this back", so both belong on one verb.
     VerbRefSpec {
         verb: "undo",
-        accepts: RUN_LIKE,
+        accepts: RUN_LIKE.union(RefKinds::CHAIN),
     },
     VerbRefSpec {
         verb: "rewind",

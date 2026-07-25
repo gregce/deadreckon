@@ -2578,7 +2578,7 @@ fn chain_kill_command_inner(
     Ok(())
 }
 
-fn chain_undo_command(
+pub(crate) fn chain_undo_command(
     paths: &DeadreckonPaths,
     id: &str,
     through_step: Option<u32>,

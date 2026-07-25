@@ -833,6 +833,87 @@ fn library_list_search_show_reads_promoted_manifests() {
     assert!(!show_stdout.contains("next:"), "{show_stdout}");
 }
 
+/// A drafted chain must appear in `deadreckon list`.
+///
+/// It did not: `deadreckon status <chain-id>` resolved a chain while `list`
+/// omitted it entirely, so the only way to find one was to already know it
+/// existed and type `deadreckon chain list` — a second command with different
+/// column names and a different date format.
+#[test]
+fn list_shows_chains_next_to_runs_and_plans() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let draft = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "step one",
+            "step two",
+            "--provider",
+            "smoke",
+            "--draft",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("chain draft");
+    assert_success(&draft);
+
+    let list = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["list", "--plain"])
+        .output()
+        .expect("list");
+
+    assert_success(&list);
+    let stdout = stdout(&list);
+    assert!(
+        stdout.contains("chain"),
+        "the chain must be visible in the one inventory: {stdout}"
+    );
+    assert!(
+        stdout.contains("sequential"),
+        "and described in the same vocabulary as the other rows: {stdout}"
+    );
+}
+
+#[test]
+fn list_json_carries_chains() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let draft = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "step one",
+            "step two",
+            "--provider",
+            "smoke",
+            "--draft",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("chain draft");
+    assert_success(&draft);
+
+    let list = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["list", "--json"])
+        .output()
+        .expect("list");
+
+    assert_success(&list);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&list)).expect("json");
+    let chains = value["chains"].as_array().expect("chains array");
+    assert_eq!(chains.len(), 1, "{value}");
+    assert_eq!(chains[0]["steps"]["total"], 2, "{value}");
+}
+
 #[test]
 fn list_empty_current_scope_has_one_primary_recovery_action() {
     let temp = repo_tempdir();

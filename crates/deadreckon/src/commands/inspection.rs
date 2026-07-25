@@ -18,6 +18,7 @@ pub(crate) fn list_command(
     };
     let runs = list_runs(&paths, effective_scope.as_deref())?;
     let plans = list_plan_entries(&paths, effective_scope.as_deref())?;
+    let chains = super::chain::list_chain_records(&paths, effective_scope.clone())?;
     if json_output {
         let runs = runs
             .iter()
@@ -51,7 +52,30 @@ pub(crate) fn list_command(
                 })
             })
             .collect::<Vec<_>>();
-        let empty = runs.is_empty() && plans.is_empty();
+        let chains = chains
+            .iter()
+            .map(|chain| {
+                json!({
+                    "chain_id": &chain.chain_id,
+                    "scope": &chain.scope,
+                    "goal": &chain.root_goal,
+                    "status": deadreckon_core::chain_status_label(chain.status),
+                    "updated_at": chain
+                        .completed_at
+                        .or(chain.started_at)
+                        .unwrap_or(chain.created_at),
+                    "steps": {
+                        "applied": chain
+                            .steps
+                            .iter()
+                            .filter(|step| step.status == ChainStepStatus::Applied)
+                            .count(),
+                        "total": chain.steps.len(),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let empty = runs.is_empty() && plans.is_empty() && chains.is_empty();
         let empty_surface = empty.then(|| empty_list_surface(effective_scope.as_deref(), all));
         let next_actions = if let Some(surface) = empty_surface.as_ref() {
             let mut actions = vec![surface.primary_action.command.clone()];
@@ -80,6 +104,7 @@ pub(crate) fn list_command(
             },
             "runs": runs,
             "plans": plans,
+            "chains": chains,
         });
         if let Some(surface) = empty_surface.as_ref() {
             value = surface.add_to_json(value);
@@ -110,6 +135,11 @@ pub(crate) fn list_command(
         .into_iter()
         .map(ListEntry::Run)
         .chain(plans.into_iter().map(ListEntry::Plan))
+        .chain(
+            chains
+                .into_iter()
+                .map(|chain| ListEntry::Chain(Box::new(chain))),
+        )
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| Reverse(entry.updated_at()));
     if entries.is_empty() {
@@ -150,6 +180,37 @@ pub(crate) fn list_command(
                         goal: run.goal.clone(),
                         goal_width,
                         orchestration: false,
+                        child: false,
+                    },
+                );
+            }
+            ListEntry::Chain(chain) => {
+                let applied = chain
+                    .steps
+                    .iter()
+                    .filter(|step| step.status == ChainStepStatus::Applied)
+                    .count();
+                append_list_row(
+                    &mut output,
+                    &ListRow {
+                        id: run_prefix(&chain.chain_id),
+                        status: deadreckon_core::chain_status_label(chain.status).to_string(),
+                        age: relative_age(
+                            chain
+                                .completed_at
+                                .or(chain.started_at)
+                                .unwrap_or(chain.created_at),
+                        ),
+                        scope: chain.scope.clone(),
+                        kind: "chain".to_string(),
+                        // A chain is a sequential graph that lands each step;
+                        // progress belongs in the action column, matching how
+                        // plan rows read ("attach 2/3").
+                        mode: "sequential".to_string(),
+                        action: chain_action_label(chain.status, applied, chain.steps.len()),
+                        goal: chain.root_goal.clone(),
+                        goal_width,
+                        orchestration: true,
                         child: false,
                     },
                 );
@@ -435,6 +496,13 @@ fn wrap_words(value: &str, width: usize) -> Vec<String> {
 enum ListEntry {
     Run(RunListEntry),
     Plan(PlanListEntry),
+    /// Chains were invisible here until now: `deadreckon status <chain-id>`
+    /// resolved one while `deadreckon list` omitted it entirely, so the only
+    /// way to find a chain was to already know it existed and type a second,
+    /// differently-formatted command.
+    /// Boxed: a Chain carries its full step vector, dwarfing the other
+    /// variants inline (the same reason ResolvedRef boxes its payloads).
+    Chain(Box<Chain>),
 }
 
 impl ListEntry {
@@ -442,6 +510,11 @@ impl ListEntry {
         match self {
             Self::Run(run) => run.updated_at,
             Self::Plan(plan) => plan.updated_at,
+            // Chain records lifecycle stamps rather than a single mtime.
+            Self::Chain(chain) => chain
+                .completed_at
+                .or(chain.started_at)
+                .unwrap_or(chain.created_at),
         }
     }
 }
@@ -510,6 +583,23 @@ pub(crate) fn list_plan_entries(
     }
     plans.sort_by_key(|plan| Reverse(plan.updated_at));
     Ok(plans)
+}
+
+/// The one thing to do next with a chain, in the same vocabulary the run and
+/// plan rows use.
+fn chain_action_label(
+    status: deadreckon_core::ChainStatus,
+    applied: usize,
+    total: usize,
+) -> String {
+    match status {
+        ChainStatus::Pending => "run".to_string(),
+        ChainStatus::Running => format!("attach {applied}/{total}"),
+        ChainStatus::Paused => format!("resume {applied}/{total}"),
+        ChainStatus::Completed => "finish".to_string(),
+        ChainStatus::Failed => "show failure".to_string(),
+        ChainStatus::Killed | ChainStatus::Undone => "show".to_string(),
+    }
 }
 
 fn plan_action_label(plan: &PlanListEntry) -> String {

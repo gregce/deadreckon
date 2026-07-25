@@ -287,6 +287,45 @@ fn accepts_narrows_which_kinds_a_verb_will_take() {
     assert_eq!(resolved_id(&resolved), plan.plan_id);
 }
 
+/// One verb, both kinds. `undo` on a run restores a turn snapshot; on a chain
+/// it unwinds an applied step. Those were two commands with two id spaces
+/// (`undo --run` and `chain undo <id> --step`) for one intent.
+#[test]
+fn undo_accepts_a_chain_as_well_as_a_run() {
+    let fx = fixture();
+    let chain = fx.chain("7777777777777777777777777777aaaa");
+
+    let resolved = resolve_ref(
+        &fx.paths,
+        RefQuery {
+            reference: Some("7777"),
+            all_scopes: true,
+            verb: "undo",
+        },
+    )
+    .expect("undo accepts a chain");
+
+    assert_eq!(resolved_id(&resolved), chain.chain_id);
+}
+
+/// Undo still refuses kinds that have nothing to put back, so widening it did
+/// not turn it into a catch-all.
+#[test]
+fn undo_still_refuses_a_plan() {
+    let fx = fixture();
+    fx.plan("8888888888888888888888888888bbbb", None);
+
+    resolve_ref(
+        &fx.paths,
+        RefQuery {
+            reference: Some("8888"),
+            all_scopes: true,
+            verb: "undo",
+        },
+    )
+    .expect_err("a plan has no committed step of its own to undo");
+}
+
 #[test]
 fn ref_kinds_all_contains_every_kind() {
     for kind in [

@@ -2675,6 +2675,7 @@ fn the_planner_can_express_ordering() {
 
     assert_eq!(shape, super::commands::course::CourseShape::Plan);
     assert_eq!(n, Some(3));
+    assert_eq!(apply, deadreckon_core::plan::ApplyWhen::PerNode);
     assert_eq!(pieces.len(), 3);
     assert!(pieces[0].depends_on.is_empty());
     assert_eq!(pieces[1].depends_on, vec!["p1".to_string()]);
