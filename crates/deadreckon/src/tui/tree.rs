@@ -581,6 +581,19 @@ fn fold_plan_event(model: &mut TreeModel, event: &PlanEvent) {
                 NodeStatus::Running,
             );
         }
+        // The node is going back around, so it reads as pending work rather
+        // than a failure — the plan as a whole is still running.
+        PlanEventKind::TaskRetrying { task_id, .. } => {
+            set_status(model, &NodeId::plan(&event.plan_id), NodeStatus::Running);
+            set_status(
+                model,
+                &NodeId::task(&event.plan_id, task_id),
+                NodeStatus::Pending,
+            );
+        }
+        PlanEventKind::CircuitBreakerTripped { .. } => {
+            set_status(model, &NodeId::plan(&event.plan_id), NodeStatus::Failed);
+        }
         PlanEventKind::TaskRunDiscovered {
             task_id,
             run_id: Some(run_id),
