@@ -488,13 +488,22 @@ branch in that already-applied state.
 Restore the previous turn snapshot:
 
 ```bash
-deadreckon undo --run <run-id>
+deadreckon undo <run-id>
 ```
 
 Restore a specific turn:
 
 ```bash
-deadreckon undo --run <run-id> --turn 1
+deadreckon undo <run-id> --turn 1
+```
+
+Undo takes the id positionally, like every other lifecycle verb. `--run <id>`
+still works as a deprecated alias.
+
+Given a chain id, undo unwinds that chain's last applied step instead:
+
+```bash
+deadreckon undo <chain-id>
 ```
 
 Undo restores the run working directory from `snapshots/turn-<N>/` and records
