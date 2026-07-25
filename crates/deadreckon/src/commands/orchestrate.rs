@@ -2,6 +2,9 @@ use super::super::*;
 
 pub(crate) struct OrchestrateRunArgs {
     pub(crate) plan: PlanCommandArgs,
+    /// The graph the launch classifier already drew. When present, plan
+    /// creation uses it instead of asking a second planner for a child graph.
+    pub(crate) seed_pieces: Vec<commands::course::CoursePiece>,
     pub(crate) preview: bool,
     pub(crate) yes: bool,
     pub(crate) no_repair: bool,
@@ -35,6 +38,7 @@ pub(crate) fn orchestrate_request_from_cli(
 ) -> Result<OrchestrateRunArgs> {
     match command {
         Some(OrchestrateCommand::Review(args)) => Ok(OrchestrateRunArgs {
+            seed_pieces: Vec::new(),
             plan: PlanCommandArgs {
                 goal: resolve_required_goal_input(
                     "orchestrate review",
@@ -78,6 +82,7 @@ pub(crate) fn orchestrate_request_from_cli(
             narrator_model: args.narrator_model.or(bare.narrator_model),
         }),
         Some(OrchestrateCommand::FullPlan(args)) => Ok(OrchestrateRunArgs {
+            seed_pieces: Vec::new(),
             plan: PlanCommandArgs {
                 goal: resolve_required_goal_input(
                     "orchestrate full-plan",
@@ -221,6 +226,7 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         }
     }
     Ok(OrchestrateRunArgs {
+        seed_pieces: Vec::new(),
         plan,
         preview,
         yes,
@@ -466,7 +472,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     if !commands::plan::prepare_orchestration_source(args.plan.init_git, quiet)? {
         return Ok(());
     }
-    let plan = commands::plan::create_orchestration_plan(args.plan).await?;
+    let plan = commands::plan::create_orchestration_plan(args.plan, &args.seed_pieces).await?;
     let plan_id = plan.plan_id.clone();
     if let Ok(launch_dir) = std::env::var(deadreckon_core::campaign::ENV_SUB_RESULT) {
         commands::campaign::publish_sub_plan_id(std::path::Path::new(&launch_dir), &plan_id);

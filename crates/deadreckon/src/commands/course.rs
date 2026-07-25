@@ -109,6 +109,16 @@ pub(crate) struct CoursePiece {
     pub(crate) model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) budget_usd: Option<f64>,
+    /// Ids of pieces that must finish before this one starts. Carries the
+    /// planner's edges through to `PlanTask::depends_on`, which the fork
+    /// executor already honors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) depends_on: Vec<String>,
+    /// This piece is a project in its own right and wants its own graph.
+    /// Recorded here so the shape read and the preview can say so; the
+    /// executor gains subplan support in a later phase.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) is_subplan: bool,
 }
 
 /// Per-role provider routes recorded for the launch.
@@ -737,26 +747,68 @@ pub(crate) fn ladder_resolution(decision: &LadderDecision) -> CourseResolution {
     }
 }
 
-/// The provider planner's raw draft (classify→plan upgrade of the old
-/// goal-shape classifier): typed pieces, confidence, rationale.
+/// The provider planner's raw draft.
+///
+/// The planner returns a graph, not a shape word. The old vocabulary
+/// (`single | plan | campaign`) could not express ordering at all — there was
+/// no `depends_on` in the schema — so the one shape deadreckon runs
+/// sequentially was unreachable from the planner no matter how it was tuned.
+/// `shape`/`n` are still accepted so a model that answers in the old
+/// vocabulary is understood rather than discarded.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProviderCoursePlanDraft {
-    shape: String,
+    #[serde(default)]
+    nodes: Vec<ProviderCourseNodeDraft>,
+    /// `at-end` (default) or `per-node`.
+    #[serde(default)]
+    apply: Option<String>,
+    #[serde(default)]
+    shape: Option<String>,
     #[serde(default)]
     n: Option<u8>,
+    /// Legacy field name for `nodes`.
     #[serde(default)]
-    pieces: Vec<ProviderCoursePieceDraft>,
+    pieces: Vec<ProviderCourseNodeDraft>,
     #[serde(default)]
     confidence: Option<f64>,
     #[serde(default)]
     rationale: Option<String>,
 }
 
+impl ProviderCoursePlanDraft {
+    /// The drafted nodes under either field name.
+    fn drafted_nodes(&self) -> &[ProviderCourseNodeDraft] {
+        if self.nodes.is_empty() {
+            &self.pieces
+        } else {
+            &self.nodes
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
-pub(crate) struct ProviderCoursePieceDraft {
+pub(crate) struct ProviderCourseNodeDraft {
+    #[serde(default)]
+    id: Option<String>,
     goal: String,
     #[serde(default)]
     done_hint: Option<String>,
+    /// Ids of nodes that must finish first. This is the field the old schema
+    /// had no way to express.
+    #[serde(default)]
+    depends_on: Vec<String>,
+    /// Set when this node is a project in its own right and should be run as
+    /// its own graph rather than a single run.
+    #[serde(default)]
+    subplan: Option<Box<ProviderCourseSubplanDraft>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProviderCourseSubplanDraft {
+    #[serde(default)]
+    apply: Option<String>,
+    #[serde(default)]
+    nodes: Vec<ProviderCourseNodeDraft>,
 }
 
 /// Below this confidence a provider shape that disagrees with the ladder is
@@ -794,29 +846,182 @@ pub(crate) fn course_planner_prompt(goal: &str, signals: &SignalBundle) -> Strin
         .ceiling_usd
         .map(|c| format!("${c:.2} ceiling"))
         .unwrap_or_else(|| "no explicit ceiling".to_string());
+    let affordable = affordable_node_count(signals.budget.ceiling_usd);
     format!(
         "You are a read-only launch planner for deadreckon. Do not write files, install packages, or mutate state.\n\n\
-         Return JSON only: {{\"shape\":\"single|plan|campaign\",\"n\":3,\"pieces\":[{{\"goal\":\"...\",\"done_hint\":\"...\"}}],\"confidence\":0.8,\"rationale\":\"one short line\"}}.\n\n\
-         Rubric:\n\
-         - single: one cohesive change a single supervised run handles.\n\
-         - plan: one project with 2-6 parallelizable pieces; name each piece's goal and a done hint.\n\
-         - campaign: several independent projects, each warranting its own coordination; use sparingly.\n\
-         Signals (already measured — ground your answer in them):\n\
+         deadreckon executes a GRAPH of supervised agent runs. Your job is to choose its shape.\n\n\
+         EXECUTION MODEL\n\
+         - Each node is one supervised run in an isolated git worktree, checked by a separate\n\
+           gate process the agent cannot forge. A node that misses its checks is retried\n\
+           automatically (up to {max_attempts} attempts) before the plan gives up on it.\n\
+         - Edges are dependencies. Nodes with no edge between them run in parallel; a node\n\
+           listing depends_on waits for those nodes to finish.\n\
+         - apply=\"at-end\": every node runs, then one merge composes the result. Best when the\n\
+           nodes touch different areas and do not need each other's changes.\n\
+         - apply=\"per-node\": each node lands on the branch as it passes and later nodes build\n\
+           on it. Required when a node needs an earlier node's changes present in its working\n\
+           tree. Costs serialization; buys incremental landing.\n\
+         - A node may carry a \"subplan\": its goal is decomposed and executed as its own graph,\n\
+           reconciled before its dependents run. Use when one node is itself a multi-part\n\
+           project. A subplan has its own apply mode, so it may be sequential even when the\n\
+           parent is parallel. Maximum nesting depth: {max_depth}.\n\
+         - A node whose job is to review another node should depend on it; a different provider\n\
+           will be routed to it so the review starts from fresh assumptions.\n\n\
+         WHAT THIS RUN CAN AFFORD (measured — do not second-guess these)\n\
+         - budget: {budget}\n\
+         - roughly ${min_piece:.2} of work per node at current routes\n\
+         - affordable nodes in total: {affordable}\n\
+         - flat multi-node plan feasible: {plan_feasible}\n\
+         - nested (subplan) work feasible: {campaign_feasible}\n\n\
+         MEASURED SIGNALS (ground your answer in these)\n\
          - detected done contract: {contract}\n\
          - workspace: {workspace}\n\
          - history: {history}\n\
-         - budget: {budget}\n\
          - text analysis: {enumerated} enumerated items, {clauses} clauses, {imperatives} imperative verbs\n\n\
+         Return JSON only:\n\
+         {{\"nodes\":[{{\"id\":\"n0\",\"goal\":\"self-contained goal\",\"done_hint\":\"what proves it\",\"depends_on\":[],\"subplan\":null}}],\n\
+          \"apply\":\"at-end\",\"confidence\":0.8,\"rationale\":\"one short line\"}}\n\n\
+         Rules:\n\
+         - Prefer the fewest nodes that fit the work. One node is a valid and common answer.\n\
+         - depends_on must reference ids of earlier nodes in the array and form a DAG.\n\
+         - If the goal names ordered steps (\"then\", \"after\", \"once X is done\"), express that\n\
+           with edges and set apply=\"per-node\".\n\
+         - A subplan is {{\"apply\":\"...\",\"nodes\":[...]}} using the same node shape.\n\
+         - Every node goal must be self-contained: the agent running it never sees this prompt.\n\n\
          Goal: {goal}",
+        max_attempts = deadreckon_core::plan::DEFAULT_MAX_ATTEMPTS,
+        max_depth = deadreckon_core::plan::MAX_SUBPLAN_DEPTH,
+        min_piece = MIN_PIECE_BUDGET_USD,
+        affordable = affordable
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "no explicit ceiling".to_string()),
+        plan_feasible = yes_no(signals.budget.plan_feasible),
+        campaign_feasible = yes_no(signals.budget.campaign_feasible),
         enumerated = signals.decomposability.enumerated_items,
         clauses = signals.decomposability.conjunction_clauses,
         imperatives = signals.decomposability.imperative_verbs,
     )
 }
 
+/// How many nodes the ceiling pays for at the per-piece floor. The old prompt
+/// said "use campaign sparingly" without ever naming a price, then clamped the
+/// answer afterward; telling the planner the arithmetic removes the guess.
+fn affordable_node_count(ceiling_usd: Option<f64>) -> Option<u32> {
+    let ceiling = ceiling_usd?;
+    if ceiling <= 0.0 {
+        return Some(0);
+    }
+    Some((ceiling / MIN_PIECE_BUDGET_USD).floor().max(1.0) as u32)
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
 /// The planner's resolved output: shape, clamped n, typed pieces, and a
 /// resolution carrying every clamp applied on the way.
 pub(crate) type ResolvedCoursePlan = (CourseShape, Option<u8>, Vec<CoursePiece>, CourseResolution);
+
+/// A short imperative label for a piece, derived from its goal. Pieces carry a
+/// goal but no subject; plan tasks need both, and subjects must be unique
+/// (validate_task_graph rejects duplicates), so a too-similar prefix is
+/// lengthened rather than truncated blindly.
+pub(crate) fn piece_subject(piece: &CoursePiece) -> String {
+    const SUBJECT_WORDS: usize = 8;
+    let goal = piece.goal.trim();
+    let short = goal
+        .split_whitespace()
+        .take(SUBJECT_WORDS)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if short.is_empty() {
+        return piece.id.clone();
+    }
+    if short.len() < goal.len() {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
+fn normalized_apply(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+/// Read a shape out of the drafted graph.
+///
+/// The shape is no longer something the planner picks — it is a description of
+/// what it drew. One node is a single run; any node carrying its own graph is
+/// campaign-shaped; anything else is a plan.
+fn shape_of_graph(nodes: &[ProviderCourseNodeDraft]) -> CourseShape {
+    if nodes.iter().any(|node| {
+        node.subplan
+            .as_deref()
+            .is_some_and(|subplan| !subplan.nodes.is_empty())
+    }) {
+        return CourseShape::Campaign;
+    }
+    if nodes.len() <= 1 {
+        return CourseShape::Single;
+    }
+    CourseShape::Plan
+}
+
+/// Convert drafted nodes into course pieces, rewriting the planner's node ids
+/// into piece ids so `depends_on` survives the translation. Edges naming an
+/// unknown node are dropped and recorded rather than failing the launch — the
+/// planner can never make a launch impossible, only shape it.
+fn course_pieces_from_nodes(
+    nodes: &[ProviderCourseNodeDraft],
+    clamps: &mut Vec<String>,
+) -> Vec<CoursePiece> {
+    let ids: BTreeMap<String, String> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            node.id
+                .as_deref()
+                .map(|id| (id.trim().to_string(), format!("p{}", index + 1)))
+        })
+        .collect();
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            let mut depends_on = Vec::new();
+            for dependency in &node.depends_on {
+                match ids.get(dependency.trim()) {
+                    Some(piece_id) if piece_id != &format!("p{}", index + 1) => {
+                        depends_on.push(piece_id.clone());
+                    }
+                    Some(_) => {
+                        clamps.push(format!("dropped self-dependency on {}", dependency.trim()))
+                    }
+                    None => clamps.push(format!(
+                        "dropped edge to unknown node {}",
+                        dependency.trim()
+                    )),
+                }
+            }
+            depends_on.sort();
+            depends_on.dedup();
+            CoursePiece {
+                id: format!("p{}", index + 1),
+                goal: node.goal.clone(),
+                done_hint: node.done_hint.clone(),
+                role: None,
+                provider: None,
+                model: None,
+                budget_usd: None,
+                depends_on,
+                is_subplan: node
+                    .subplan
+                    .as_deref()
+                    .is_some_and(|subplan| !subplan.nodes.is_empty()),
+            }
+        })
+        .collect()
+}
 
 /// Parse + clamp a provider draft against the ladder floor. `None` on any
 /// parse miss — the caller falls back to the ladder; the planner can never
@@ -834,14 +1039,36 @@ pub(crate) fn resolve_provider_course_plan(
                 .and_then(|slice| serde_json::from_str::<ProviderCoursePlanDraft>(slice).ok())
         })?;
     let mut clamps: Vec<String> = Vec::new();
-    let shape = match draft.shape.trim().to_ascii_lowercase().as_str() {
-        "single" | "run" => CourseShape::Single,
-        "plan" | "orchestrate" | "orchestration" | "full-plan" | "full_plan" => CourseShape::Plan,
-        "campaign" => CourseShape::Campaign,
-        _ => return None,
+    // The graph is the answer. A shape word is only consulted when the planner
+    // returned no nodes at all, so a model still answering in the old
+    // vocabulary is understood rather than thrown away.
+    let nodes = draft.drafted_nodes();
+    let shape = if nodes.is_empty() {
+        match draft
+            .shape
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "single" | "run" => CourseShape::Single,
+            "plan" | "orchestrate" | "orchestration" | "full-plan" | "full_plan" => {
+                CourseShape::Plan
+            }
+            "campaign" => CourseShape::Campaign,
+            _ => return None,
+        }
+    } else {
+        shape_of_graph(nodes)
     };
     let confidence = draft.confidence.unwrap_or(0.5).clamp(0.0, 1.0);
-    let rationale = draft.rationale.unwrap_or_default().trim().to_string();
+    let rationale = draft
+        .rationale
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if rationale.is_empty() {
         return None;
     }
@@ -868,8 +1095,9 @@ pub(crate) fn resolve_provider_course_plan(
     // C-P11: de-escalation — a decomposition of exactly one piece is not a
     // plan; it collapses to a single run instead of inflating to n=2 (the
     // old refusal path becomes graceful fallback, recorded in the trail).
+    let drafted = draft.drafted_nodes().len();
     let shape = if shape == CourseShape::Plan
-        && (draft.n == Some(1) || (draft.n.is_none() && draft.pieces.len() == 1))
+        && (draft.n == Some(1) || (draft.n.is_none() && drafted == 1))
     {
         clamps.push("plan collapsed to single: decomposition yielded one piece".to_string());
         CourseShape::Single
@@ -879,7 +1107,10 @@ pub(crate) fn resolve_provider_course_plan(
     let n = match shape {
         CourseShape::Single | CourseShape::ChainExtend => None,
         CourseShape::Plan | CourseShape::Campaign => {
-            let raw = draft.n.unwrap_or(3);
+            let raw = draft
+                .n
+                .or_else(|| u8::try_from(drafted).ok().filter(|count| *count > 0))
+                .unwrap_or(3);
             let clamped = raw.clamp(2, PLAN_MAX_PIECES);
             if clamped != raw {
                 clamps.push(format!("n clamped {raw}->{clamped}"));
@@ -887,20 +1118,25 @@ pub(crate) fn resolve_provider_course_plan(
             Some(clamped)
         }
     };
-    let mut pieces: Vec<CoursePiece> = draft
-        .pieces
-        .into_iter()
-        .enumerate()
-        .map(|(idx, piece)| CoursePiece {
-            id: format!("p{}", idx + 1),
-            goal: piece.goal,
-            done_hint: piece.done_hint,
-            role: None,
-            provider: None,
-            model: None,
-            budget_usd: None,
-        })
-        .collect();
+    let mut pieces = course_pieces_from_nodes(draft.drafted_nodes(), &mut clamps);
+    // Lowering: record what the executor cannot honor yet so the trail says
+    // what was asked for, not just what ran. Each of these disappears as the
+    // corresponding executor phase lands.
+    if draft
+        .apply
+        .as_deref()
+        .map(normalized_apply)
+        .is_some_and(|apply| apply == "per-node")
+    {
+        clamps
+            .push("apply per-node lowered to at-end: the executor merges once for now".to_string());
+    }
+    let subplans = pieces.iter().filter(|piece| piece.is_subplan).count();
+    if subplans > 0 {
+        clamps.push(format!(
+            "{subplans} subplan(s) flattened into single nodes: nested execution lands later"
+        ));
+    }
     if let Some(n) = n
         && pieces.len() > usize::from(n)
     {
@@ -1348,6 +1584,9 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
             .collect();
     let goal = plan.goal.clone();
     super::orchestrate::orchestrate_command(super::orchestrate::OrchestrateRunArgs {
+        // A reshape already carries the accepted decomposition; hand it to
+        // plan creation instead of re-planning the same goal.
+        seed_pieces: plan.pieces.clone(),
         plan: crate::cli::PlanCommandArgs {
             goal: goal.clone(),
             n,
@@ -1501,6 +1740,8 @@ mod tests {
                 provider: Some("cli:claude-code".to_string()),
                 model: None,
                 budget_usd: Some(5.0),
+                depends_on: Vec::new(),
+                is_subplan: false,
             },
             CoursePiece {
                 id: "p2".to_string(),
@@ -1510,6 +1751,8 @@ mod tests {
                 provider: None,
                 model: None,
                 budget_usd: Some(3.0),
+                depends_on: vec!["p1".to_string()],
+                is_subplan: false,
             },
         ];
         plan.providers = CourseProviders {
