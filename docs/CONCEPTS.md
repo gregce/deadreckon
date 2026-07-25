@@ -76,9 +76,10 @@ Each of these is a first-class capability; usage lives in [HOWTO](../HOWTO.md):
 - **Your checkout is never touched.** Runs default to an isolated `git worktree` on a `dr/...` branch; your real checkout changes only when you `deadreckon apply`. Copy, fresh, and explicit in-place modes are available too.
 - **Crash-proof.** Every turn writes durable state. If the terminal dies, attach from another; if the run crashes, resume from the last completed turn.
 - **Budgets and time limits.** `--max-spend 15` and `--max-wall-seconds 1800` cap a run, then walk away. High spend requires explicit confirmation.
-- **Undo a single bad turn.** Snapshot-based rollback to any turn (`deadreckon undo --run <id> --turn 3`), recorded in the run trace, not just a `git reset`.
+- **Undo a single bad turn.** Snapshot-based rollback to any turn (`deadreckon undo <id> --turn 3`), recorded in the run trace, not just a `git reset`. The same verb unwinds a chain's last applied step.
 - **Resume, kill, extend, or export any run.** Runs are lifecycle objects, not one terminal session.
-- **Autonomous chains for multi-step work.** Break a big goal into ordered steps, each with its own signed gate; the chain stops on the first gate failure.
+- **Ordered multi-step work.** A goal that names its steps in order ("migrate the schema, then update the callers, then delete the shim") runs them one at a time, each behind its own signed gate, landing on your branch as it passes. `deadreckon start` reaches this directly; `deadreckon chain` is the explicit form when you already know the steps.
+- **Retries instead of a pause.** A step that misses its done criteria is told exactly what failed and tried again — twice by default — before the plan decides whether the rest of the work continues. An unattended run should not stop and wait for someone who walked away.
 
 ## The mental model
 
@@ -108,7 +109,7 @@ promoted artifact           ◄── narrative, decisions, file lineage
 your branch or library
 ```
 
-For multi-step work, `deadreckon chain` wraps this whole loop and runs N of them in order, stopping on the first gate failure. The agent owns the coding. deadreckon owns the boundary.
+For multi-step work, this whole loop runs N times. Independent pieces run in parallel and merge once; pieces the goal puts in order run one at a time, each landing on your branch before the next starts. `deadreckon start` picks the shape and shows you why; `deadreckon chain` states it outright. The agent owns the coding. deadreckon owns the boundary.
 
 ## Compared with agentic coding CLIs
 

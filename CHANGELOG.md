@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+Seven slices collapsing six named orchestration shapes onto the one graph
+executor that was already underneath them. (Chart)
+
+**The classifier draws the work instead of naming it.** A keyword matcher used
+to read the goal before any classifier ran: "audit", "harden", or "validate"
+latched a coder/reviewer pass — roughly double the spend — and then
+short-circuited the signal ladder and the provider classifier entirely, so a
+word in the goal could pick your execution shape with no visible decision.
+`deadreckon start "audit the payment module and harden it"` reported `path:
+review orchestration`; it now reports `path: run`. The planner's own vocabulary
+was three words (`single | plan | campaign`) with no way to express a
+dependency, so the one shape DeadReckon runs sequentially was unreachable no
+matter how the prompt was tuned. It now returns nodes, edges, an apply mode,
+and optional subplans, is told the execution model and the measured budget
+arithmetic rather than "use campaign sparingly", and the graph it draws becomes
+the plan — plan creation no longer asks a second planner for a child graph the
+first one already decided.
+
+**A failed node retries instead of pausing the plan.** Healing already existed
+inside a run and at merge; it stopped at the graph. A node that missed its done
+contract ended the run with `paused plan <id>` and `Recommended: deadreckon
+attach` — advice for an operator who walked away. A node now gets two more
+attempts, each resuming the previous attempt's working tree and seeded with the
+gate's actual complaint, before the failure policy decides whether the rest of
+the graph continues. A circuit breaker halts a plan whose nodes are failing in a
+row, and every attempt is recorded with its run, reason, and spend.
+
+**Ordered work reaches the front door.** `start` could not reach `chain` at all,
+so nothing launched from the front door landed incrementally. A plan can now
+apply each node as its gate passes — chain's execution model, with chain's
+guards kept whole — and the deterministic ladder recognises a goal that spells
+out an order, so this works with no provider call.
+
+**A node can be a project.** A plan node may carry its own graph, executed and
+reconciled before its dependents run. Unlike `campaign`, which hardcodes a
+parallel sub-shape for every sub-goal, a subplan carries its own apply mode: the
+parent can be parallel while a sub-project is sequential.
+
+**One inventory, one undo.** A chain existed, `deadreckon status <chain-id>`
+resolved it, and `deadreckon list` did not show it — the only way to find one
+was to already know it existed and type a second command with different columns
+and a different date format. Chains now sort in with runs and plans in the same
+vocabulary, and `list --json` carries them. `deadreckon undo` takes a positional
+id like every sibling verb and unwinds a chain's last applied step as readily as
+it restores a run's snapshot.
+
+Compatibility: `plan.json` gains execution-policy fields, all defaulted, so
+files written by earlier versions load with their previous behaviour and no
+migration step runs.
+
 ## 0.7.0 — Sea trials — 2026-07-25
 
 Six slices since 0.6.0. The harness stopped guessing at its agents and started
