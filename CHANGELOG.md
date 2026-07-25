@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.7.0 — Sea trials — 2026-07-25
+
+Six slices since 0.6.0. The harness stopped guessing at its agents and started
+reading them, gained a rudder, put one keel under its ledgers, and had the
+contradictions shaken out of its front door.
+
+**The front door agrees with itself.** Every id-taking verb used to resolve
+references its own way, so `deadreckon status` could report `not found: run
+<id>` for an id `deadreckon list` had just printed. One resolver now answers for
+all 18 of them, `latest` means one thing, and a refusal always names a command
+that accepts the id it was given. `list` shows one row per plan with children
+folded beneath, and surfaces cap their supporting actions at three. (Shakedown)
+
+**The CLI agents are read, not scraped.** Codex and Claude Code publish
+structured event streams; DeadReckon now consumes them for real token counts,
+answers extracted from the result event, and per-run session resume, instead of
+treating raw stdout as the whole response. (Semaphore)
+
+**New provider contracts are configuration.** A compatible agent CLI can declare
+its wire contract in descriptor TOML — structured-output arguments, JSON
+pointers, resume arguments, capability probes — rather than needing a bespoke
+Rust driver. Pi and Copilot onboard this way. (Pennant)
+
+**You can steer a running child.** `deadreckon steer` and Helm's `:steer` inject
+operator input into a live Codex turn over the app-server protocol, with a
+durable at-least-once inbox, interrupt-before-kill, and approvals answered from
+the run's own capability posture. Server loss degrades to the exec route rather
+than failing the turn. (Rudder)
+
+**One protocol crate under the ledgers.** Every persisted ledger line type moved
+into `deadreckon-protocol` as one tagged vocabulary with generated, drift-tested
+JSON Schemas and a single persistence policy. Bytes on disk are unchanged.
+(Keel)
+
+### Behavior changes
+
+- `deadreckon verdict latest` is now scope-bound like every other verb. It
+  previously searched every project on the machine. `verdict --all` already
+  means "compare several recent runs", so there is no widening flag for it yet;
+  use `deadreckon list --all` to find the id and pass it explicitly. Tracked in
+  `docs/V1-CANDIDATES.md`.
+- Refusals for a wrong-kind reference now name a verb that accepts it
+  (`deadreckon show <id>`) instead of `deadreckon list`.
+- `deadreckon doctor` prints at most three secondary actions plus a `help-all`
+  pointer, down from ten.
+
 ## Shakedown (stable) — one reference resolver — 2026-07-24
 
 Every id-taking verb hand-rolled its own resolution cascade, and no two covered
