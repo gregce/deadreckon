@@ -22,6 +22,12 @@ pub const WORKER_SPECS_DIR: &str = "worker-specs";
 pub const SUMMARIES_DIR: &str = "summaries";
 pub const PLAN_CHILD_PARENT_JSON: &str = ".deadreckon/parent.json";
 
+/// Schema 2 adds the execution-policy fields (`apply`, `on_fail`,
+/// `max_attempts`, the apply/branch settings) and per-node `subplan` /
+/// `attempts`. Every addition is `#[serde(default)]`, so schema-1 files load
+/// unchanged and no migration step is required.
+pub const PLAN_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanMode {
@@ -36,6 +42,90 @@ impl PlanMode {
             Self::Review => "review",
         }
     }
+}
+
+/// When a plan's node results reach the operator's branch.
+///
+/// `AtEnd` is the historical behavior: every node runs, then `merge` composes
+/// one result. `PerNode` lands each node as its gate passes, so later nodes
+/// build on earlier ones — the execution model `chain` owns today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApplyWhen {
+    #[default]
+    AtEnd,
+    PerNode,
+}
+
+impl ApplyWhen {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AtEnd => "at-end",
+            Self::PerNode => "per-node",
+        }
+    }
+}
+
+/// Which ref a per-node apply builds on. Owned here rather than in `chain`
+/// because a plan is the execution unit; `chain` re-exports for compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchPolicy {
+    #[default]
+    Stack,
+    Base,
+    Merge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyMode {
+    #[default]
+    Auto,
+    Preview,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApplyStrategy {
+    #[default]
+    Squash,
+    Merge,
+    CherryPick,
+}
+
+/// What a plan does with the remaining graph once a node has exhausted its
+/// attempts. `Skip` is the plan default: an unattended run should keep the
+/// independent work moving rather than pause for an operator who walked away.
+/// `chain` sets `Stop` explicitly to preserve its historical semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFail {
+    Stop,
+    #[default]
+    Skip,
+    Continue,
+}
+
+/// Default retry budget for a node that fails its done contract. The first
+/// run plus two retries, each seeded with the gate's complaint.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+/// Default consecutive-node-failure count that halts a plan outright.
+pub const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 2;
+
+/// The hard ceiling on subplan nesting. A top-level plan sits at depth 0; a
+/// plan reached through one `PlanTask::subplan` hop sits at depth 1. Mirrors
+/// the guard `campaign::guard_campaign_depth` enforces today.
+pub const MAX_SUBPLAN_DEPTH: u32 = 2;
+
+fn default_max_attempts() -> u32 {
+    DEFAULT_MAX_ATTEMPTS
+}
+
+fn default_circuit_breaker_threshold() -> u32 {
+    DEFAULT_CIRCUIT_BREAKER_THRESHOLD
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +207,40 @@ pub struct PlanProviders {
     pub child_models: BTreeMap<u32, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One execution of a node. `child_run_id` records the run that counts (the
+/// last attempt); this records every attempt, so `status` can report what a
+/// self-healing plan actually tried and what each attempt cost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskAttempt {
+    /// 1-based. Attempt 1 is the original run; 2 and beyond are retries
+    /// seeded with the previous attempt's gate failure.
+    pub attempt: u32,
+    pub run_id: String,
+    pub status: PlanTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub spend_usd: f64,
+}
+
+impl TaskAttempt {
+    pub fn new(attempt: u32, run_id: impl Into<String>) -> Self {
+        Self {
+            attempt,
+            run_id: run_id.into(),
+            status: PlanTaskStatus::Running,
+            failure_reason: None,
+            started_at: Utc::now(),
+            finished_at: None,
+            spend_usd: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanTask {
     pub index: u32,
     pub task_id: String,
@@ -128,6 +251,17 @@ pub struct PlanTask {
     pub role: PlanRole,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// When set, this node is executed as its own plan rather than as a single
+    /// run: the value is a `plan_id` whose merged result becomes this node's
+    /// result. The mechanism `campaign` reaches for today, without the
+    /// separate id space or the hardcoded parallel sub-shape.
+    #[serde(default)]
+    pub subplan: Option<String>,
+    /// Every run this node has taken, oldest first. Empty on plans written
+    /// before self-healing; `child_run_id` remains the authoritative pointer
+    /// to the run whose result counts.
+    #[serde(default)]
+    pub attempts: Vec<TaskAttempt>,
     pub worker_spec: PathBuf,
     pub summary_path: Option<PathBuf>,
     pub review_status: Option<String>,
@@ -160,6 +294,8 @@ impl PlanTask {
             provider,
             role,
             depends_on: Vec::new(),
+            subplan: None,
+            attempts: Vec::new(),
             worker_spec: PathBuf::from(format!("{WORKER_SPECS_DIR}/{task_id}.md")),
             summary_path: None,
             review_status: None,
@@ -185,6 +321,33 @@ pub struct Plan {
     pub parent_cwd: Option<PathBuf>,
     #[serde(default)]
     pub acceptance_path: Option<PathBuf>,
+    // --- Execution policy (schema 2) --------------------------------------
+    // Every field below defaults to the pre-schema-2 behavior, so a plan.json
+    // written by an older binary deserializes unchanged.
+    /// When node results reach the branch. `AtEnd` preserves today's
+    /// run-everything-then-merge behavior.
+    #[serde(default)]
+    pub apply: ApplyWhen,
+    #[serde(default)]
+    pub branch_policy: BranchPolicy,
+    #[serde(default)]
+    pub apply_strategy: ApplyStrategy,
+    #[serde(default)]
+    pub apply_allowlist: Vec<String>,
+    /// What happens to the rest of the graph once a node is out of attempts.
+    #[serde(default)]
+    pub on_fail: OnFail,
+    /// Total runs a node may take, including the first. See
+    /// [`DEFAULT_MAX_ATTEMPTS`].
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    /// Consecutive node failures that halt the plan. 0 disables the breaker.
+    #[serde(default = "default_circuit_breaker_threshold")]
+    pub circuit_breaker_threshold: u32,
+    /// Set when this plan is a node's subplan. The lineage this forms is what
+    /// bounds nesting depth; see [`MAX_SUBPLAN_DEPTH`].
+    #[serde(default)]
+    pub parent_plan_id: Option<String>,
     pub status: PlanStatus,
     pub created_at: DateTime<Utc>,
     pub forked_at: Option<DateTime<Utc>>,
@@ -204,7 +367,7 @@ impl Plan {
     ) -> Result<Self> {
         validate_task_graph(&tasks)?;
         Ok(Self {
-            schema_version: 1,
+            schema_version: PLAN_SCHEMA_VERSION,
             plan_id: Uuid::new_v4().simple().to_string(),
             root_goal: root_goal.into(),
             mode,
@@ -215,6 +378,14 @@ impl Plan {
             parent_scope,
             parent_cwd: None,
             acceptance_path: None,
+            apply: ApplyWhen::default(),
+            branch_policy: BranchPolicy::default(),
+            apply_strategy: ApplyStrategy::default(),
+            apply_allowlist: Vec::new(),
+            on_fail: OnFail::default(),
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            circuit_breaker_threshold: DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+            parent_plan_id: None,
             status: PlanStatus::Pending,
             created_at: Utc::now(),
             forked_at: None,
@@ -490,9 +661,52 @@ pub fn validate_task_graph(tasks: &[PlanTask]) -> Result<()> {
                 )));
             }
         }
+        if let Some(subplan) = task.subplan.as_deref() {
+            validate_nonempty(subplan, "subplan")?;
+            if subplan == task.task_id {
+                return Err(DeadreckonError::InvalidInput(format!(
+                    "child {} names itself as its subplan",
+                    task.task_id
+                )));
+            }
+        }
     }
     detect_task_cycle(tasks)?;
     Ok(())
+}
+
+/// Guard a subplan launch against the nesting cap.
+///
+/// `current_depth` is the depth of the plan requesting the subplan (0 for a
+/// top-level plan). The subplan would sit at `current_depth + 1`; if that
+/// reaches [`MAX_SUBPLAN_DEPTH`] it is refused. Mirrors
+/// `campaign::guard_campaign_depth`, which this replaces once subplans land.
+pub fn guard_subplan_depth(current_depth: u32) -> Result<()> {
+    if current_depth + 1 >= MAX_SUBPLAN_DEPTH {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "subplan refused: nesting cap {MAX_SUBPLAN_DEPTH} reached\n\
+             a plan at depth {current_depth} cannot launch another subplan"
+        )));
+    }
+    Ok(())
+}
+
+/// Walk `parent_plan_id` to this plan's nesting depth. Stops at
+/// [`MAX_SUBPLAN_DEPTH`] hops so a corrupted lineage cannot loop forever.
+pub fn plan_depth(paths: &DeadreckonPaths, plan: &Plan) -> u32 {
+    let mut depth = 0;
+    let mut parent = plan.parent_plan_id.clone();
+    while let Some(parent_id) = parent {
+        depth += 1;
+        if depth >= MAX_SUBPLAN_DEPTH {
+            break;
+        }
+        parent = match load_plan(paths, &parent_id) {
+            Ok(parent_plan) => parent_plan.parent_plan_id,
+            Err(_) => break,
+        };
+    }
+    depth
 }
 
 pub fn save_plan(paths: &DeadreckonPaths, plan: &Plan) -> Result<()> {
@@ -1100,6 +1314,130 @@ mod plan_providers_compat_tests {
         assert_eq!(
             providers.children.get(&1).map(String::as_str),
             Some("cli:codex")
+        );
+    }
+}
+
+#[cfg(test)]
+mod plan_schema2_compat_tests {
+    use super::*;
+
+    /// A schema-1 plan.json — written before execution policy existed — must
+    /// load with every schema-2 field defaulted to the old behavior. This is
+    /// what makes schema 2 a no-migration change.
+    const SCHEMA_1_PLAN: &str = r#"{
+        "schema_version": 1,
+        "plan_id": "a8ed1c09341a43ab8ccd374cdaac6813",
+        "root_goal": "add auth, add billing, and add an audit log",
+        "mode": "full_plan",
+        "n": 1,
+        "providers": {"planner": "smoke", "default_child": "smoke",
+                      "coder": null, "reviewer": null, "children": {}},
+        "capability_preview": {"network": "deny", "deploy": false,
+                               "global_install": false, "filesystem": [], "notes": []},
+        "tasks": [{
+            "index": 0, "task_id": "task-0", "subject": "Create foundation",
+            "goal": "create the foundation", "active_form": "Creating foundation",
+            "provider": "smoke", "role": "child", "depends_on": [],
+            "worker_spec": "worker-specs/task-0.md", "summary_path": null,
+            "review_status": null, "child_run_id": null, "child_scope": null,
+            "status": "pending"
+        }],
+        "parent_scope": null,
+        "status": "pending",
+        "created_at": "2026-07-25T15:13:03.491323273Z",
+        "forked_at": null, "merged_at": null, "merged_run_id": null,
+        "deadreckon_version": "0.7.0"
+    }"#;
+
+    #[test]
+    fn schema_1_plan_json_loads_with_pre_schema_2_behavior() {
+        let plan: Plan = serde_json::from_str(SCHEMA_1_PLAN).expect("parse schema-1 plan");
+
+        assert_eq!(plan.schema_version, 1, "the file's own version is preserved");
+        assert_eq!(
+            plan.apply,
+            ApplyWhen::AtEnd,
+            "an existing plan must keep merging at the end, not start applying per node"
+        );
+        assert_eq!(plan.branch_policy, BranchPolicy::Stack);
+        assert_eq!(plan.apply_strategy, ApplyStrategy::Squash);
+        assert!(plan.apply_allowlist.is_empty());
+        assert_eq!(plan.on_fail, OnFail::Skip);
+        assert_eq!(plan.max_attempts, DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(
+            plan.circuit_breaker_threshold,
+            DEFAULT_CIRCUIT_BREAKER_THRESHOLD
+        );
+        assert_eq!(plan.parent_plan_id, None);
+        assert_eq!(plan.tasks[0].subplan, None);
+        assert!(plan.tasks[0].attempts.is_empty());
+    }
+
+    #[test]
+    fn new_plans_are_written_at_schema_2() {
+        let plan = Plan::new(
+            "goal",
+            PlanMode::FullPlan,
+            vec![
+                PlanTask::new(0, "one", "do one", PlanRole::Child, None),
+                PlanTask::new(1, "two", "do two", PlanRole::Child, None),
+            ],
+            PlanProviders::default(),
+            None,
+            "0.7.0",
+        )
+        .expect("plan");
+
+        assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION);
+        assert_eq!(plan.apply, ApplyWhen::AtEnd);
+        assert_eq!(plan.max_attempts, DEFAULT_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn schema_2_plan_survives_a_save_load_round_trip() {
+        let mut plan = Plan::new(
+            "goal",
+            PlanMode::FullPlan,
+            vec![
+                PlanTask::new(0, "one", "do one", PlanRole::Child, None),
+                PlanTask::new(1, "two", "do two", PlanRole::Child, None),
+            ],
+            PlanProviders::default(),
+            None,
+            "0.7.0",
+        )
+        .expect("plan");
+        plan.apply = ApplyWhen::PerNode;
+        plan.on_fail = OnFail::Stop;
+        plan.max_attempts = 5;
+        plan.parent_plan_id = Some("parent".to_string());
+        plan.tasks[0].subplan = Some("sub".to_string());
+        plan.tasks[0].attempts.push(TaskAttempt::new(1, "run-1"));
+
+        let raw = serde_json::to_string(&plan).expect("serialize");
+        let parsed: Plan = serde_json::from_str(&raw).expect("deserialize");
+
+        assert_eq!(parsed, plan);
+    }
+
+    #[test]
+    fn a_node_may_not_name_itself_as_its_subplan() {
+        let mut first = PlanTask::new(0, "one", "do one", PlanRole::Child, None);
+        first.subplan = Some("task-0".to_string());
+        let second = PlanTask::new(1, "two", "do two", PlanRole::Child, None);
+
+        let err = validate_task_graph(&[first, second]).expect_err("self-subplan must refuse");
+
+        assert!(err.to_string().contains("subplan"), "{err}");
+    }
+
+    #[test]
+    fn subplan_depth_guard_refuses_past_the_cap() {
+        assert!(guard_subplan_depth(0).is_ok(), "a top-level plan may nest once");
+        assert!(
+            guard_subplan_depth(1).is_err(),
+            "a plan already one level deep may not nest again"
         );
     }
 }
