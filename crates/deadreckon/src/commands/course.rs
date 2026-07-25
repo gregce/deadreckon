@@ -273,6 +273,12 @@ pub(crate) struct DecompositionHints {
     pub(crate) imperative_verbs: usize,
     pub(crate) goal_words: usize,
     pub(crate) strong: bool,
+    /// Words that put the pieces in an order ("then", "after", "once").
+    /// Without this the deterministic floor had no way to recognise ordered
+    /// work, so sequential execution was reachable only when a provider
+    /// classifier happened to be configured and happened to ask for it.
+    #[serde(default)]
+    pub(crate) sequential_markers: usize,
 }
 
 const IMPERATIVE_VERBS: &[&str] = &[
@@ -322,7 +328,24 @@ pub(crate) fn analyze_goal_structure(goal: &str) -> DecompositionHints {
         imperative_verbs,
         goal_words,
         strong,
+        sequential_markers: count_sequential_markers(&lower),
     }
+}
+
+/// Ordering words, counted as whole words so "then" does not match "strengthen"
+/// and "after" does not match "rafter".
+fn count_sequential_markers(lower: &str) -> usize {
+    const MARKERS: &[&str] = &["then", "afterwards", "subsequently", "finally"];
+    const PHRASES: &[&str] = &["after that", "once that", "followed by", "and then"];
+    let words = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| MARKERS.contains(word))
+        .count();
+    let phrases = PHRASES
+        .iter()
+        .filter(|phrase| lower.contains(*phrase))
+        .count();
+    words + phrases
 }
 
 /// Count explicit list markers: `1.` / `2)` numbered tokens or leading `-`
@@ -655,6 +678,8 @@ pub(crate) struct LadderDecision {
     pub(crate) n: Option<u8>,
     pub(crate) rationale: String,
     pub(crate) rule: &'static str,
+    /// Ordered work lands as it passes; everything else merges once.
+    pub(crate) apply: deadreckon_core::plan::ApplyWhen,
 }
 
 pub(crate) const PLAN_MAX_PIECES: u8 = 6;
@@ -678,6 +703,7 @@ pub(crate) fn ladder_decision(signals: &SignalBundle) -> LadderDecision {
                     .unwrap_or_default()
             ),
             rule: "continuation",
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
         };
     }
     // Rule 2 — money decides: never propose a shape that cannot fit.
@@ -687,10 +713,31 @@ pub(crate) fn ladder_decision(signals: &SignalBundle) -> LadderDecision {
             n: None,
             rationale: "budget ceiling below the plan floor — single run fits the money"
                 .to_string(),
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
             rule: "budget",
         };
     }
     let d = &signals.decomposability;
+    // Rule 2.4 — the operator spelled out an order. Checked before the
+    // parallel-keyword rule because "then" describes structure, while a
+    // parallel-sounding noun only describes subject matter. This is the shape
+    // `start` could not reach at all: chain was unreachable from the front
+    // door, and nothing else landed work incrementally.
+    // Enough ordering words to chain every clause, not just the last one.
+    // "migrate, then update, then delete" (3 clauses, 2 markers) is ordered
+    // work. "add limiter and write docs then wire ci" (3 clauses, 1 marker)
+    // is mostly parallel with a tail, and serializing all of it would spend
+    // wall-clock the goal never asked for.
+    if d.conjunction_clauses >= 2 && d.sequential_markers + 1 >= d.conjunction_clauses {
+        let n = pieces_hint(d).clamp(2, PLAN_MAX_PIECES);
+        return LadderDecision {
+            shape: CourseShape::Plan,
+            n: Some(n),
+            rationale: format!("goal names {n} steps in order — each lands before the next starts"),
+            rule: "sequence",
+            apply: deadreckon_core::plan::ApplyWhen::PerNode,
+        };
+    }
     // Rule 2.5 — the operator named parallel workstreams explicitly; honor
     // the ask (the proven keyword heuristic the old classifier carried).
     if goal_names_parallel_workstreams(&signals.goal) {
@@ -699,6 +746,7 @@ pub(crate) fn ladder_decision(signals: &SignalBundle) -> LadderDecision {
             shape: CourseShape::Plan,
             n: Some(n),
             rationale: "goal names parallel or separable workstreams".to_string(),
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
             rule: "parallel-keywords",
         };
     }
@@ -715,6 +763,7 @@ pub(crate) fn ladder_decision(signals: &SignalBundle) -> LadderDecision {
                 signals.workspace.members
             ),
             rule: "decomposition+workspace",
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
         };
     }
     // Rule 4 — strong decomposition in a single-package tree.
@@ -725,6 +774,7 @@ pub(crate) fn ladder_decision(signals: &SignalBundle) -> LadderDecision {
             n: Some(n),
             rationale: format!("{} separable pieces named in the goal", pieces_hint(d)),
             rule: "decomposition",
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
         };
     }
     // Rules 5/7 — focused goal (or nothing else fired): one supervised run.
@@ -734,6 +784,7 @@ pub(crate) fn ladder_decision(signals: &SignalBundle) -> LadderDecision {
         n: None,
         rationale: format!("goal reads focused enough for one {NOUN_VERIFIED_RUN}"),
         rule: "default-single",
+        apply: deadreckon_core::plan::ApplyWhen::AtEnd,
     }
 }
 
@@ -2117,6 +2168,66 @@ mod tests {
         assert_eq!(single_pkg.shape, CourseShape::Plan, "{single_pkg:?}");
         assert!(single_pkg.n.unwrap() <= 4, "{single_pkg:?}");
         assert_eq!(single_pkg.rule, "decomposition");
+    }
+
+    /// The shape `start` could not reach at all: chain was unreachable from
+    /// the front door, and nothing else landed work incrementally. A fully
+    /// ordered goal now resolves to a sequential plan with no provider call.
+    #[test]
+    fn a_fully_ordered_goal_lands_each_step_as_it_passes() {
+        let decision = ladder_decision(&bundle_with(
+            analyze_goal_structure(
+                "migrate the schema, then update the callers, then delete the shim",
+            ),
+            0,
+            HistorySignal::default(),
+            None,
+        ));
+
+        assert_eq!(decision.shape, CourseShape::Plan, "{decision:?}");
+        assert_eq!(decision.rule, "sequence", "{decision:?}");
+        assert_eq!(
+            decision.apply,
+            deadreckon_core::plan::ApplyWhen::PerNode,
+            "{decision:?}"
+        );
+    }
+
+    /// One ordering word does not order everything. A goal that is mostly
+    /// parallel with an ordered tail must not be serialized end to end —
+    /// that spends wall-clock the operator never asked for.
+    #[test]
+    fn a_mostly_parallel_goal_with_one_then_is_not_serialized() {
+        let decision = ladder_decision(&bundle_with(
+            analyze_goal_structure("add limiter and write docs then wire ci"),
+            0,
+            HistorySignal::default(),
+            None,
+        ));
+
+        assert_eq!(decision.shape, CourseShape::Plan, "{decision:?}");
+        assert_eq!(decision.rule, "decomposition", "{decision:?}");
+        assert_eq!(
+            decision.apply,
+            deadreckon_core::plan::ApplyWhen::AtEnd,
+            "{decision:?}"
+        );
+    }
+
+    /// Ordering words are counted as whole words, so ordinary prose does not
+    /// accidentally serialize a launch.
+    #[test]
+    fn ordering_words_do_not_match_inside_other_words() {
+        for goal in [
+            "strengthen the rafters and shorten the beams",
+            "add authentication and add authorization",
+        ] {
+            assert_eq!(
+                analyze_goal_structure(goal).sequential_markers,
+                0,
+                "{goal:?}"
+            );
+        }
     }
 
     // ---- C-P7: the course card ----
