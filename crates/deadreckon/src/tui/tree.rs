@@ -594,6 +594,15 @@ fn fold_plan_event(model: &mut TreeModel, event: &PlanEvent) {
         PlanEventKind::CircuitBreakerTripped { .. } => {
             set_status(model, &NodeId::plan(&event.plan_id), NodeStatus::Failed);
         }
+        // Landing is the strongest completion signal a node has: gated,
+        // applied, and on the branch.
+        PlanEventKind::TaskApplied { task_id, .. } => {
+            set_status(
+                model,
+                &NodeId::task(&event.plan_id, task_id),
+                NodeStatus::Verified,
+            );
+        }
         PlanEventKind::TaskRunDiscovered {
             task_id,
             run_id: Some(run_id),

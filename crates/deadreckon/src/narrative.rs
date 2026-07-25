@@ -3506,6 +3506,7 @@ fn plan_event_summary_for_narrative(event: &PlanEventKind) -> String {
         } => format!(
             "circuit breaker tripped after {consecutive_failures} consecutive failures (threshold {threshold})"
         ),
+        PlanEventKind::TaskApplied { task_id, .. } => format!("{task_id} landed on the branch"),
         PlanEventKind::TaskKilled { task_id, .. } => format!("{task_id} killed"),
         PlanEventKind::MergeStarted => "merge started".to_string(),
         PlanEventKind::MergeConflict { conflict_count } => {

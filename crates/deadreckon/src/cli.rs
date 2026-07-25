@@ -2599,6 +2599,9 @@ pub(crate) struct PlanCommandArgs {
     pub(crate) goal: String,
     pub(crate) n: u8,
     pub(crate) mode: CliPlanMode,
+    /// When node results reach the branch: once at the end, or as each node
+    /// passes its gate.
+    pub(crate) apply: deadreckon_core::plan::ApplyWhen,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
     pub(crate) sandbox: Option<String>,

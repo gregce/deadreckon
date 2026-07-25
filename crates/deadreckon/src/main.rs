@@ -938,6 +938,7 @@ async fn main_inner() -> Result<()> {
                 goal,
                 n,
                 mode,
+                apply: deadreckon_core::plan::ApplyWhen::AtEnd,
                 max_spend: None,
                 max_wall_seconds: None,
                 sandbox: None,

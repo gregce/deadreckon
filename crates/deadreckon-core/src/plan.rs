@@ -582,6 +582,13 @@ pub enum PlanEventKind {
         consecutive_failures: u32,
         threshold: u32,
     },
+    /// Under `ApplyWhen::PerNode`, this node's gated result landed on the
+    /// operator's branch, so nodes that follow start from a tree containing it.
+    TaskApplied {
+        task_id: String,
+        task_index: usize,
+        run_id: String,
+    },
     TaskKilled {
         task_id: String,
         task_index: usize,
@@ -1294,6 +1301,11 @@ mod tests {
             PlanEventKind::CircuitBreakerTripped {
                 consecutive_failures: 2,
                 threshold: 2,
+            },
+            PlanEventKind::TaskApplied {
+                task_id: "task-1".to_string(),
+                task_index: 1,
+                run_id: "run-1".to_string(),
             },
             PlanEventKind::TaskKilled {
                 task_id: "task-1".to_string(),
