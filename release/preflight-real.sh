@@ -34,7 +34,21 @@ fi
 routes=${*:-"cli:claude-code cli:codex"}
 
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/deadreckon-preflight.XXXXXX")
-trap 'rm -rf "$workdir"' EXIT INT TERM
+# On success the workdir is noise; on failure it is the only evidence of WHY
+# the proof failed -- the run state, the agent's tree, and the gate's output.
+# Deleting it unconditionally made a failed preflight undiagnosable after the
+# fact and forced a second real-provider run just to see the error.
+cleanup_workdir() {
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    rm -rf "$workdir"
+  else
+    echo "preflight failed (exit $status) — evidence preserved at $workdir" >&2
+  fi
+}
+trap cleanup_workdir EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 binary_for_route() {
   case "$1" in
@@ -149,10 +163,16 @@ if [ -z "$results" ]; then
 fi
 
 recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# The version actually proved. Without it a stale file from a previous release
+# cycle is indistinguishable from a fresh pass: on failure this file is left
+# untouched, so it keeps the last successful run's contents and still looks
+# valid. The release trust gate compares this against the tag.
+proved_version=$("$deadreckon_bin" --version 2>/dev/null | awk '{print $2}')
 cat > "$known_good" <<EOF
 {
   "schema_version": 1,
   "recorded_at": "$recorded_at",
+  "deadreckon_version": "$proved_version",
   "providers": [
     $results
   ]

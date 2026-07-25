@@ -162,11 +162,44 @@ function validateRelease(localArgs = args) {
     if (!localArgs["skip-changelog"] && !changelogHasVersion(lane.version, localArgs.changelog ?? "CHANGELOG.md")) {
       errors.push(`CHANGELOG.md must contain a release section for ${lane.version}`);
     }
+    // The real-provider preflight writes known-good-providers.json only on
+    // success, so a FAILED preflight leaves the previous cycle's file in place,
+    // still valid JSON with a convincing proof string. Comparing the proved
+    // version against the tag is what distinguishes "proved this build" from
+    // "proved some earlier build and today's run failed silently".
+    const proved = provedProviderVersion(localArgs["known-good"] ?? "release/known-good-providers.json");
+    if (proved === null) {
+      errors.push(
+        "release/known-good-providers.json has no deadreckon_version — re-run release/preflight-real.sh",
+      );
+    } else if (proved !== lane.version) {
+      errors.push(
+        `release/known-good-providers.json proves ${proved}, not ${lane.version} — re-run release/preflight-real.sh`,
+      );
+    }
   }
   if (errors.length > 0) {
     throw new Error(errors.join("\n"));
   }
   writeJson(lane);
+}
+
+/// The deadreckon version the real-provider preflight last proved, or null when
+/// the file is absent or predates the field. Absent is treated as unproven
+/// rather than acceptable: a missing proof and a stale proof fail the same way.
+function provedProviderVersion(knownGoodPath) {
+  const file = path.resolve(knownGoodPath);
+  if (!fs.existsSync(file)) {
+    return null;
+  }
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    return typeof value.deadreckon_version === "string" && value.deadreckon_version.length > 0
+      ? value.deadreckon_version
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function preflight(localArgs = args) {
