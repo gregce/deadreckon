@@ -2701,29 +2701,96 @@ fn shape_is_derived_from_the_graph_not_a_word() {
            "confidence":0.9,"rationale":"two sub-projects"}"#,
     );
     assert_eq!(nested, super::commands::course::CourseShape::Campaign);
-    assert!(pieces[0].is_subplan, "the nested node is marked");
-    assert!(!pieces[1].is_subplan);
+    assert!(
+        pieces[0].subplan.is_some(),
+        "the nested node keeps its graph"
+    );
+    assert!(pieces[1].subplan.is_none());
 }
 
-/// Per-node apply is executable, so it is honored rather than lowered.
-/// Subplans are still flattened, and that is recorded — the trail shows what
-/// was asked for and not only what ran.
+/// Nothing is lowered any more: a nested, ordered graph survives intact.
+/// This is the case campaign cannot express at all — campaign hardcodes
+/// `orchestrate full-plan` for every sub-project, so its subs are always
+/// parallel. Here the parent is parallel and the sub is sequential.
 #[test]
-fn per_node_is_honored_and_only_subplans_are_still_lowered() {
-    let (_, _, _, apply, resolution) = resolve_graph(
+fn a_nested_graph_keeps_its_sub_nodes_and_their_own_apply_mode() {
+    let (shape, _, pieces, apply, resolution) = resolve_graph(
         r#"{"nodes":[
-             {"id":"n0","goal":"a","subplan":{"nodes":[{"id":"s0","goal":"x"},{"id":"s1","goal":"y"}]}},
-             {"id":"n1","goal":"b"}],
-           "apply":"per-node","confidence":0.9,"rationale":"nested and ordered"}"#,
+             {"id":"n0","goal":"rebuild billing","subplan":{"apply":"per-node","nodes":[
+                 {"id":"s0","goal":"migrate the schema"},
+                 {"id":"s1","goal":"cut over","depends_on":["s0"]}]}},
+             {"id":"n1","goal":"rebuild search"}],
+           "apply":"at-end","confidence":0.9,"rationale":"two sub-projects"}"#,
     );
 
-    assert_eq!(apply, deadreckon_core::plan::ApplyWhen::PerNode);
+    assert_eq!(shape, super::commands::course::CourseShape::Campaign);
+    assert_eq!(apply, deadreckon_core::plan::ApplyWhen::AtEnd, "parent");
+
+    let sub = pieces[0].subplan.as_ref().expect("sub-nodes survive");
+    assert_eq!(
+        sub.apply,
+        deadreckon_core::plan::ApplyWhen::PerNode,
+        "the sub-project is sequential while its parent is parallel"
+    );
+    assert_eq!(sub.pieces.len(), 2);
+    assert_eq!(sub.pieces[1].depends_on, vec!["p1".to_string()]);
+    assert!(pieces[1].subplan.is_none());
+
     let clamps = resolution.clamps_applied.join(" | ");
     assert!(
-        !clamps.contains("per-node lowered"),
-        "per-node is no longer lowered: {clamps}"
+        !clamps.contains("flattened"),
+        "nothing is lowered now: {clamps}"
     );
-    assert!(clamps.contains("subplan"), "{clamps}");
+}
+
+/// A sub-project of one node is just a node. Same de-escalation the top
+/// level already applies, so "campaign of one" cannot happen.
+#[test]
+fn a_subplan_of_one_node_is_inlined() {
+    let (_, _, pieces, _, resolution) = resolve_graph(
+        r#"{"nodes":[
+             {"id":"n0","goal":"rebuild billing","subplan":{"nodes":[{"id":"s0","goal":"only piece"}]}},
+             {"id":"n1","goal":"rebuild search"}],
+           "confidence":0.9,"rationale":"one is not a project"}"#,
+    );
+
+    assert!(pieces[0].subplan.is_none());
+    assert!(
+        resolution
+            .clamps_applied
+            .iter()
+            .any(|clamp| clamp.contains("inlined")),
+        "{:?}",
+        resolution.clamps_applied
+    );
+}
+
+/// Nesting past the cap is flattened and recorded, never refused.
+#[test]
+fn nesting_past_the_cap_is_flattened_not_refused() {
+    let (_, _, pieces, _, resolution) = resolve_graph(
+        r#"{"nodes":[
+             {"id":"n0","goal":"outer","subplan":{"nodes":[
+                 {"id":"s0","goal":"middle","subplan":{"nodes":[
+                     {"id":"t0","goal":"inner one"},{"id":"t1","goal":"inner two"}]}},
+                 {"id":"s1","goal":"sibling"}]}},
+             {"id":"n1","goal":"other"}],
+           "confidence":0.9,"rationale":"too deep"}"#,
+    );
+
+    let sub = pieces[0].subplan.as_ref().expect("first level survives");
+    assert!(
+        sub.pieces[0].subplan.is_none(),
+        "the second level is flattened"
+    );
+    assert!(
+        resolution
+            .clamps_applied
+            .iter()
+            .any(|clamp| clamp.contains("nesting cap")),
+        "{:?}",
+        resolution.clamps_applied
+    );
 }
 
 /// An ordered goal now reaches the executor as ordered work that lands
