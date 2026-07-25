@@ -953,7 +953,15 @@ fn newest_plan_failure(events: &[PlanEvent]) -> Option<String> {
         | deadreckon_core::PlanEventKind::TaskFailed { reason, .. }
         | deadreckon_core::PlanEventKind::TaskBlocked { reason, .. }
         | deadreckon_core::PlanEventKind::MergeRepairFailed { reason } => Some(reason.clone()),
-        deadreckon_core::PlanEventKind::PlanCreated { .. }
+        deadreckon_core::PlanEventKind::CircuitBreakerTripped {
+            consecutive_failures,
+            threshold,
+        } => Some(format!(
+            "circuit breaker: {consecutive_failures} nodes failed in a row (threshold {threshold})"
+        )),
+        // A retry is the plan healing itself, not a failure state to surface.
+        deadreckon_core::PlanEventKind::TaskRetrying { .. }
+        | deadreckon_core::PlanEventKind::PlanCreated { .. }
         | deadreckon_core::PlanEventKind::PlanStarted
         | deadreckon_core::PlanEventKind::TaskReady { .. }
         | deadreckon_core::PlanEventKind::TaskStarted { .. }

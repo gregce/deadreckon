@@ -1684,10 +1684,22 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanStarted)?;
     write_coordinator_snapshot(&paths, &plan, None)?;
 
+    // Self-healing bookkeeping. A node that misses its done contract is put
+    // back to Pending with its failure recorded, so the loop below picks it up
+    // again and `child_argv` extends the failed run instead of restarting it.
+    // `halt` is set when the failure policy is Stop or the breaker trips —
+    // in-flight children still finish and are recorded, but nothing new starts.
+    let mut consecutive_failures: u32 = 0;
+    let mut halt: Option<String> = None;
+
     let mut made_progress = true;
     while made_progress {
         made_progress = false;
-        let ready = plan.ready_pending_task_indices();
+        let ready = if halt.is_some() {
+            Vec::new()
+        } else {
+            plan.ready_pending_task_indices()
+        };
         if !ready.is_empty() {
             made_progress = true;
         }
@@ -1881,6 +1893,33 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                 Ok(run_id) => {
                     let state = load_run(&paths, &run_id)?;
                     let status = plan_status_from_run_status(state.status);
+                    // A missed done contract arrives here, not in the Err arm:
+                    // the child process exits cleanly and the run carries the
+                    // failure. That is the case worth another attempt, because
+                    // there is a run to extend and a reason to seed it with.
+                    if status == PlanTaskStatus::Failed
+                        && let NodeFailureOutcome::Retrying =
+                            record_node_failure(RecordNodeFailure {
+                                paths: &paths,
+                                plan: &mut plan,
+                                task_index,
+                                run_id: Some(run_id.as_str()),
+                                failure_reason: state.failure_reason.clone(),
+                                spend_usd: state.total_spend_usd,
+                                consecutive_failures: &mut consecutive_failures,
+                                halt: &mut halt,
+                                quiet,
+                                plain,
+                            })?
+                    {
+                        made_progress = true;
+                        save_plan(&paths, &plan)?;
+                        write_coordinator_snapshot(&paths, &plan, None)?;
+                        continue;
+                    }
+                    if status == PlanTaskStatus::Completed {
+                        consecutive_failures = 0;
+                    }
                     let summary =
                         summarize_child_run(&paths, &plan, &plan.tasks[task_index], &state);
                     write_child_summary(&paths, &plan.plan_id, &task_id, &summary)?;
@@ -1935,6 +1974,26 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                     }
                 }
                 Err(error) => {
+                    // The child never produced a run (spawn or source-prep
+                    // failure). Still an attempt, and still retryable — but a
+                    // retry starts fresh, because there is nothing to extend.
+                    if let NodeFailureOutcome::Retrying = record_node_failure(RecordNodeFailure {
+                        paths: &paths,
+                        plan: &mut plan,
+                        task_index,
+                        run_id: None,
+                        failure_reason: Some(error.to_string()),
+                        spend_usd: 0.0,
+                        consecutive_failures: &mut consecutive_failures,
+                        halt: &mut halt,
+                        quiet,
+                        plain,
+                    })? {
+                        made_progress = true;
+                        save_plan(&paths, &plan)?;
+                        write_coordinator_snapshot(&paths, &plan, None)?;
+                        continue;
+                    }
                     mark_plan_task_status(&mut plan, task_index, PlanTaskStatus::Failed)?;
                     append_plan_event(
                         &paths,
@@ -1963,7 +2022,22 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         }
     }
 
-    mark_blocked_pending_tasks(&paths, &mut plan)?;
+    mark_blocked_pending_tasks(&paths, &mut plan, halt.as_deref())?;
+    if let Some(reason) = halt.as_deref()
+        && plan.status != PlanStatus::Failed
+    {
+        // Record why the plan stopped launching before the generic terminal
+        // sweep does — "circuit breaker: 2 nodes failed in a row" is a usable
+        // account; "one or more child tasks failed" is not.
+        plan.status = PlanStatus::Failed;
+        append_plan_event(
+            &paths,
+            &plan.plan_id,
+            PlanEventKind::PlanFailed {
+                reason: reason.to_string(),
+            },
+        )?;
+    }
     mark_failed_fork_plan_terminal(&paths, &mut plan)?;
     save_plan(&paths, &plan)?;
     let _ = fs::remove_file(paths.coordinator_json(&plan.plan_id));
@@ -1971,6 +2045,174 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         print_fork_finished(&plan, no_hints);
     }
     Ok(())
+}
+
+/// What the plan does with a node whose attempt just failed.
+#[derive(Debug, PartialEq, Eq)]
+enum NodeFailureOutcome {
+    /// Attempts remain. The node is Pending again and will be relaunched,
+    /// extending its failed run where there is one.
+    Retrying,
+    /// Out of attempts. The caller records the terminal failure as before.
+    Exhausted,
+}
+
+struct RecordNodeFailure<'a> {
+    paths: &'a DeadreckonPaths,
+    plan: &'a mut Plan,
+    task_index: usize,
+    run_id: Option<&'a str>,
+    failure_reason: Option<String>,
+    spend_usd: f64,
+    consecutive_failures: &'a mut u32,
+    halt: &'a mut Option<String>,
+    quiet: bool,
+    plain: bool,
+}
+
+/// Record a failed attempt and decide whether the node gets another run.
+///
+/// This is what keeps an unattended plan moving. Before this existed, a node
+/// that missed its done contract ended the plan with `paused plan <id>` and
+/// `Recommended: deadreckon attach` — advice for an operator who walked away.
+fn record_node_failure(context: RecordNodeFailure<'_>) -> Result<NodeFailureOutcome> {
+    let RecordNodeFailure {
+        paths,
+        plan,
+        task_index,
+        run_id,
+        failure_reason,
+        spend_usd,
+        consecutive_failures,
+        halt,
+        quiet,
+        plain,
+    } = context;
+
+    let max_attempts = plan.max_attempts;
+    let on_fail = plan.on_fail;
+    let threshold = plan.circuit_breaker_threshold;
+    let plan_id = plan.plan_id.clone();
+    let task_id = plan.tasks[task_index].task_id.clone();
+
+    let attempt_number = plan.tasks[task_index].attempts_used() + 1;
+    plan.tasks[task_index]
+        .attempts
+        .push(deadreckon_core::plan::TaskAttempt::failed(
+            attempt_number,
+            run_id.map(ToString::to_string),
+            failure_reason.clone(),
+            spend_usd,
+        ));
+
+    let reason =
+        failure_reason.unwrap_or_else(|| "child did not satisfy the done contract".to_string());
+
+    if plan.tasks[task_index].may_retry(max_attempts) {
+        let next_attempt = attempt_number + 1;
+        // Back to Pending so the fork loop relaunches it; child_argv reads the
+        // recorded attempt to extend the failed run rather than start over.
+        mark_plan_task_status(plan, task_index, PlanTaskStatus::Pending)?;
+        append_plan_event(
+            paths,
+            &plan_id,
+            PlanEventKind::TaskRetrying {
+                task_id: task_id.clone(),
+                task_index,
+                attempt: next_attempt,
+                max_attempts,
+                reason: reason.clone(),
+                parent_run_id: run_id.map(ToString::to_string),
+            },
+        )?;
+        append_plan_message(
+            paths,
+            &plan_id,
+            &PlanMessage::new(
+                "coordinator",
+                &task_id,
+                PlanMessageKind::Progress,
+                format!("{task_id} retrying ({next_attempt}/{max_attempts})"),
+                json!({
+                    "task_index": task_index,
+                    "attempt": next_attempt,
+                    "max_attempts": max_attempts,
+                    "reason": reason,
+                    "parent_run_id": run_id,
+                }),
+            )?,
+        )?;
+        if !quiet {
+            print_plan_child_retry_line(
+                &task_id,
+                next_attempt,
+                max_attempts,
+                &reason,
+                run_id,
+                plain,
+            );
+        }
+        return Ok(NodeFailureOutcome::Retrying);
+    }
+
+    // Out of attempts. Count it against the breaker, then let the failure
+    // policy decide whether the rest of the graph keeps going.
+    *consecutive_failures += 1;
+    if halt.is_some() {
+        // Already halted; siblings still in flight land here as they finish.
+        // Recording the breaker again would double-count the same event.
+    } else if threshold > 0 && *consecutive_failures >= threshold {
+        append_plan_event(
+            paths,
+            &plan_id,
+            PlanEventKind::CircuitBreakerTripped {
+                consecutive_failures: *consecutive_failures,
+                threshold,
+            },
+        )?;
+        *halt = Some(format!(
+            "circuit breaker: {consecutive} nodes failed in a row (threshold {threshold})",
+            consecutive = *consecutive_failures
+        ));
+    } else if on_fail == OnFail::Stop {
+        *halt = Some(format!(
+            "{task_id} failed and the plan's failure policy is stop"
+        ));
+    }
+
+    Ok(NodeFailureOutcome::Exhausted)
+}
+
+fn print_plan_child_retry_line(
+    task_id: &str,
+    attempt: u32,
+    max_attempts: u32,
+    reason: &str,
+    parent_run_id: Option<&str>,
+    plain: bool,
+) {
+    let continues = parent_run_id
+        .map(|run_id| format!(" continuing {}", run_prefix(run_id)))
+        .unwrap_or_default();
+    let line = format!(
+        "{task_id} retry {attempt}/{max_attempts}{continues}: {}",
+        one_line_reason(reason)
+    );
+    if plain {
+        println!("{line}");
+    } else {
+        println!("{}", ui_status(&line));
+    }
+}
+
+/// Failure reasons arrive multi-line from the gate; the progress line wants one.
+fn one_line_reason(reason: &str) -> String {
+    let compact = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= 160 {
+        return compact;
+    }
+    let clipped = compact.chars().take(160).collect::<String>();
+    format!("{clipped}...")
 }
 
 fn fork_refusal_surface(paths: &DeadreckonPaths, plan: &Plan) -> VerdictSurface {
@@ -2336,6 +2578,16 @@ async fn plan_child_source_dir(
 ) -> Result<PathBuf> {
     let task = &plan.tasks[task_index];
     let plan_cwd = plan.parent_cwd.as_deref().unwrap_or(parent_cwd);
+    // A retry resumes from the tree the failed attempt left behind, so the
+    // agent fixes its own near-miss rather than starting the node over. Falls
+    // back to the normal source when that run is unreadable (or the attempt
+    // never produced one), which keeps a retry possible either way.
+    if let Some(parent_run_id) = task.retry_parent_run_id()
+        && let Ok(parent_state) = load_run(paths, parent_run_id)
+        && parent_state.working_dir.is_dir()
+    {
+        return Ok(parent_state.working_dir);
+    }
     if task.depends_on.is_empty() {
         return Ok(plan_cwd.to_path_buf());
     }
@@ -2659,6 +2911,11 @@ fn child_argv(
     narrator_model: Option<&str>,
 ) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
+    // A retry stays a `run`, not an `extend`: `extend` requires a completed
+    // parent with promoted artifacts, and a node that missed its gate is
+    // Failed by definition. The partial work is carried instead through the
+    // source dir (see plan_child_source_dir), which hands the retry the failed
+    // attempt's working tree.
     let review_parent = review_parent_run_id(plan, task);
     if let Some(parent_run_id) = review_parent.as_deref() {
         argv.extend([
@@ -2910,8 +3167,24 @@ fn plan_child_prompt(plan: &Plan, task: &PlanTask, spec: &str, spec_path: &Path)
         PlanRole::Coder => "This is the coding lane for review-mode orchestration.",
         PlanRole::Child => "This is one full-plan child run in a larger plan.",
     };
+    // On a retry, lead with why the last attempt was refused. This mirrors
+    // what turn_loop already does inside a single run when the gate fails —
+    // the agent is told the specific complaint and told not to declare done
+    // until dr-gate passes. Here the same feedback crosses a run boundary.
+    let retry_note = match (task.attempts_used(), task.last_failure_reason()) {
+        (0, _) | (_, None) => String::new(),
+        (used, Some(reason)) => format!(
+            "RETRY {attempt} of {max}. The previous attempt did not satisfy the done contract.\n\n\
+             Gate failure: {reason}\n\n\
+             Fix the root cause of that failure. Do not weaken, edit, or delete the done \
+             criteria, and do not declare done until dr-gate passes. Stay within this \
+             child's scope.\n\n",
+            attempt = used + 1,
+            max = plan.max_attempts,
+        ),
+    };
     format!(
-        "{role_note}\n\nRoot goal: {}\nPlan: {}\nTask: {}\nWorker spec path: {}\n\n{}\n",
+        "{retry_note}{role_note}\n\nRoot goal: {}\nPlan: {}\nTask: {}\nWorker spec path: {}\n\n{}\n",
         plan.root_goal,
         plan.plan_id,
         task.task_id,
@@ -2989,7 +3262,14 @@ fn plan_child_marker(
     }
 }
 
-fn mark_blocked_pending_tasks(paths: &DeadreckonPaths, plan: &mut Plan) -> Result<()> {
+/// Mark whatever never ran. `halt` carries the reason the plan stopped
+/// launching work, so a node stranded by a stop policy or a tripped breaker
+/// says so instead of reporting "missing dependencies: unknown".
+fn mark_blocked_pending_tasks(
+    paths: &DeadreckonPaths,
+    plan: &mut Plan,
+    halt: Option<&str>,
+) -> Result<()> {
     let completed = plan
         .tasks
         .iter()
@@ -3029,14 +3309,11 @@ fn mark_blocked_pending_tasks(paths: &DeadreckonPaths, plan: &mut Plan) -> Resul
             PlanEventKind::TaskBlocked {
                 task_id: task_id.clone(),
                 task_index: index,
-                reason: format!(
-                    "missing dependencies: {}",
-                    if missing.is_empty() {
-                        "unknown".to_string()
-                    } else {
-                        missing.join(", ")
-                    }
-                ),
+                reason: match (missing.is_empty(), halt) {
+                    (true, Some(halt)) => format!("never started: {halt}"),
+                    (true, None) => "missing dependencies: unknown".to_string(),
+                    (false, _) => format!("missing dependencies: {}", missing.join(", ")),
+                },
             },
         )?;
         append_plan_message(
@@ -3147,7 +3424,7 @@ mod tests {
 #[cfg(test)]
 mod model_routing_tests {
     use super::{child_argv, child_model_for_task};
-    use deadreckon_core::plan::{Plan, PlanProviders, PlanTask, PlanTaskStatus};
+    use deadreckon_core::plan::{Plan, PlanProviders, PlanTask, PlanTaskStatus, TaskAttempt};
 
     fn task(index: u32) -> PlanTask {
         PlanTask {
@@ -3221,6 +3498,139 @@ mod model_routing_tests {
             "test",
         )
         .expect("plan")
+    }
+
+    fn failed_attempt(attempt: u32, run_id: Option<&str>, reason: &str) -> TaskAttempt {
+        TaskAttempt::failed(
+            attempt,
+            run_id.map(ToString::to_string),
+            Some(reason.to_string()),
+            0.4,
+        )
+    }
+
+    /// A retry must stay a `run`. `extend` refuses a parent that is not
+    /// Completed, and a node that missed its gate is Failed by definition —
+    /// an extend-based retry dies instantly with "cannot be extended yet".
+    /// The partial work is carried by the source dir instead.
+    #[test]
+    fn a_retry_is_a_run_not_an_extend() {
+        let mut plan = narrate_plan();
+        plan.tasks[0].attempts.push(failed_attempt(
+            1,
+            Some("0abf0f7a"),
+            "acceptance failed after turn 12",
+        ));
+
+        let argv = child_argv(
+            &plan,
+            &plan.tasks[0],
+            "do the thing",
+            std::path::Path::new("/src"),
+            false,
+            "none",
+            None,
+            None,
+            false,
+            None,
+        );
+
+        assert_eq!(argv.first().map(String::as_str), Some("run"), "{argv:?}");
+        assert!(
+            argv.iter().any(|arg| arg == "--from"),
+            "the retry is seeded from a source tree: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn a_first_attempt_still_starts_a_fresh_run() {
+        let plan = narrate_plan();
+
+        let argv = child_argv(
+            &plan,
+            &plan.tasks[0],
+            "do the thing",
+            std::path::Path::new("/src"),
+            false,
+            "none",
+            None,
+            None,
+            false,
+            None,
+        );
+
+        assert_eq!(argv.first().map(String::as_str), Some("run"), "{argv:?}");
+    }
+
+    #[test]
+    fn a_reviewer_node_still_extends_its_coder_dependency() {
+        let mut plan = narrate_plan();
+        plan.tasks[1].role = deadreckon_core::plan::PlanRole::Reviewer;
+        plan.tasks[1].depends_on = vec!["task-0".to_string()];
+        plan.tasks[0].child_run_id = Some("0abf0f7a".to_string());
+
+        let argv = child_argv(
+            &plan,
+            &plan.tasks[1],
+            "review it",
+            std::path::Path::new("/src"),
+            false,
+            "none",
+            None,
+            None,
+            false,
+            None,
+        );
+
+        assert_eq!(argv.first().map(String::as_str), Some("extend"), "{argv:?}");
+        assert_eq!(
+            argv.get(1).map(String::as_str),
+            Some("0abf0f7a"),
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn a_retry_prompt_leads_with_the_gate_complaint() {
+        let mut plan = narrate_plan();
+        plan.max_attempts = 3;
+        plan.tasks[0].attempts.push(failed_attempt(
+            1,
+            Some("0abf0f7a"),
+            "acceptance failed after turn 12: billing.rs missing",
+        ));
+
+        let prompt = super::plan_child_prompt(
+            &plan,
+            &plan.tasks[0],
+            "spec body",
+            std::path::Path::new("/spec.md"),
+        );
+
+        assert!(prompt.starts_with("RETRY 2 of 3"), "{prompt}");
+        assert!(prompt.contains("billing.rs missing"), "{prompt}");
+        assert!(
+            prompt.contains("do not declare done until dr-gate passes"),
+            "the retry must not be allowed to self-certify: {prompt}"
+        );
+        assert!(
+            prompt.contains("Do not weaken, edit, or delete the done"),
+            "a retry must not be able to pass by loosening the contract: {prompt}"
+        );
+    }
+
+    #[test]
+    fn a_first_attempt_prompt_has_no_retry_preamble() {
+        let plan = narrate_plan();
+
+        let prompt = super::plan_child_prompt(
+            &plan,
+            &plan.tasks[0],
+            "spec body",
+            std::path::Path::new("/spec.md"),
+        );
+
+        assert!(!prompt.contains("RETRY"), "{prompt}");
     }
 
     #[test]

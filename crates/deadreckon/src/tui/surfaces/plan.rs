@@ -617,6 +617,26 @@ pub(crate) fn plan_event_summary(event: &PlanEventKind) -> String {
         PlanEventKind::PlanStarted => "plan started".to_string(),
         PlanEventKind::TaskReady { task_id, .. } => format!("{task_id} ready"),
         PlanEventKind::TaskStarted { task_id, .. } => format!("{task_id} started"),
+        PlanEventKind::TaskRetrying {
+            task_id,
+            attempt,
+            max_attempts,
+            reason,
+            parent_run_id,
+            ..
+        } => {
+            let continues = parent_run_id
+                .as_deref()
+                .map(|run_id| format!(" continuing {}", run_prefix(run_id)))
+                .unwrap_or_default();
+            format!("{task_id} retry {attempt}/{max_attempts}{continues}: {reason}")
+        }
+        PlanEventKind::CircuitBreakerTripped {
+            consecutive_failures,
+            threshold,
+        } => format!(
+            "circuit breaker tripped {consecutive_failures}/{threshold} consecutive failures"
+        ),
         PlanEventKind::TaskRunDiscovered {
             task_id,
             run_id,

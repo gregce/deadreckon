@@ -215,7 +215,10 @@ pub struct TaskAttempt {
     /// 1-based. Attempt 1 is the original run; 2 and beyond are retries
     /// seeded with the previous attempt's gate failure.
     pub attempt: u32,
-    pub run_id: String,
+    /// The run this attempt produced. `None` when the child process never got
+    /// far enough to create one — a spawn or source-preparation failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub status: PlanTaskStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
@@ -227,15 +230,33 @@ pub struct TaskAttempt {
 }
 
 impl TaskAttempt {
-    pub fn new(attempt: u32, run_id: impl Into<String>) -> Self {
+    pub fn new(attempt: u32, run_id: Option<String>) -> Self {
         Self {
             attempt,
-            run_id: run_id.into(),
+            run_id,
             status: PlanTaskStatus::Running,
             failure_reason: None,
             started_at: Utc::now(),
             finished_at: None,
             spend_usd: 0.0,
+        }
+    }
+
+    /// A finished attempt that did not satisfy the done contract.
+    pub fn failed(
+        attempt: u32,
+        run_id: Option<String>,
+        failure_reason: Option<String>,
+        spend_usd: f64,
+    ) -> Self {
+        Self {
+            attempt,
+            run_id,
+            status: PlanTaskStatus::Failed,
+            failure_reason,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            spend_usd,
         }
     }
 }
@@ -303,6 +324,37 @@ impl PlanTask {
             child_scope: None,
             status: PlanTaskStatus::Pending,
         }
+    }
+
+    /// Runs this node has already taken, including the first.
+    pub fn attempts_used(&self) -> u32 {
+        self.attempts.len() as u32
+    }
+
+    /// Whether this node has budget left for another run under `max_attempts`.
+    pub fn may_retry(&self, max_attempts: u32) -> bool {
+        self.attempts_used() < max_attempts
+    }
+
+    /// The run a retry should continue from: the most recent failed attempt
+    /// that produced one. A retry extends that run so the agent keeps its
+    /// working tree and context instead of starting the node over.
+    pub fn retry_parent_run_id(&self) -> Option<&str> {
+        let last = self.attempts.last()?;
+        if last.status != PlanTaskStatus::Failed {
+            return None;
+        }
+        last.run_id.as_deref()
+    }
+
+    /// Why the most recent attempt failed — the text a retry is seeded with.
+    pub fn last_failure_reason(&self) -> Option<&str> {
+        self.attempts.last()?.failure_reason.as_deref()
+    }
+
+    /// Everything this node has spent across all of its attempts.
+    pub fn attempts_spend_usd(&self) -> f64 {
+        self.attempts.iter().map(|attempt| attempt.spend_usd).sum()
     }
 }
 
@@ -404,10 +456,24 @@ impl Plan {
     }
 
     pub fn ready_pending_task_indices(&self) -> Vec<usize> {
-        let completed = self
+        self.ready_pending_task_indices_for(self.on_fail)
+    }
+
+    /// Readiness under a failure policy.
+    ///
+    /// Under `Stop` and `Skip`, a node waits for every dependency to complete —
+    /// a dependent of a failed node stays blocked, which is the safe default.
+    /// `Continue` is the operator saying the remaining work does not need the
+    /// failed node's output, so a terminally-failed dependency stops blocking.
+    pub fn ready_pending_task_indices_for(&self, on_fail: OnFail) -> Vec<usize> {
+        let satisfied = self
             .tasks
             .iter()
-            .filter(|task| task.status == PlanTaskStatus::Completed)
+            .filter(|task| {
+                task.status == PlanTaskStatus::Completed
+                    || (on_fail == OnFail::Continue
+                        && matches!(task.status, PlanTaskStatus::Failed | PlanTaskStatus::Killed))
+            })
             .map(|task| task.task_id.as_str())
             .collect::<BTreeSet<_>>();
         self.tasks
@@ -418,10 +484,18 @@ impl Plan {
                     && task
                         .depends_on
                         .iter()
-                        .all(|dependency| completed.contains(dependency.as_str()))
+                        .all(|dependency| satisfied.contains(dependency.as_str()))
             })
             .map(|(index, _)| index)
             .collect()
+    }
+
+    /// Total spend recorded across every attempt of every node.
+    pub fn attempts_spend_usd(&self) -> f64 {
+        self.tasks
+            .iter()
+            .map(|task| task.attempts_spend_usd())
+            .sum()
     }
 }
 
@@ -488,6 +562,25 @@ pub enum PlanEventKind {
         task_id: String,
         task_index: usize,
         reason: String,
+    },
+    /// A node missed its done contract but still has attempts left, so the
+    /// plan is running it again rather than pausing for an operator.
+    TaskRetrying {
+        task_id: String,
+        task_index: usize,
+        /// The attempt about to start, 1-based.
+        attempt: u32,
+        max_attempts: u32,
+        /// The failure the retry is seeded with.
+        reason: String,
+        /// The run the retry extends, when the failed attempt produced one.
+        parent_run_id: Option<String>,
+    },
+    /// Consecutive node failures reached `circuit_breaker_threshold`; the
+    /// plan stopped launching work rather than spend the rest of the budget.
+    CircuitBreakerTripped {
+        consecutive_failures: u32,
+        threshold: u32,
     },
     TaskKilled {
         task_id: String,
@@ -1190,6 +1283,18 @@ mod tests {
                 task_index: 1,
                 reason: "red".to_string(),
             },
+            PlanEventKind::TaskRetrying {
+                task_id: "task-1".to_string(),
+                task_index: 1,
+                attempt: 2,
+                max_attempts: 3,
+                reason: "acceptance failed after turn 8".to_string(),
+                parent_run_id: Some("run-1".to_string()),
+            },
+            PlanEventKind::CircuitBreakerTripped {
+                consecutive_failures: 2,
+                threshold: 2,
+            },
             PlanEventKind::TaskKilled {
                 task_id: "task-1".to_string(),
                 task_index: 1,
@@ -1354,7 +1459,10 @@ mod plan_schema2_compat_tests {
     fn schema_1_plan_json_loads_with_pre_schema_2_behavior() {
         let plan: Plan = serde_json::from_str(SCHEMA_1_PLAN).expect("parse schema-1 plan");
 
-        assert_eq!(plan.schema_version, 1, "the file's own version is preserved");
+        assert_eq!(
+            plan.schema_version, 1,
+            "the file's own version is preserved"
+        );
         assert_eq!(
             plan.apply,
             ApplyWhen::AtEnd,
@@ -1413,7 +1521,9 @@ mod plan_schema2_compat_tests {
         plan.max_attempts = 5;
         plan.parent_plan_id = Some("parent".to_string());
         plan.tasks[0].subplan = Some("sub".to_string());
-        plan.tasks[0].attempts.push(TaskAttempt::new(1, "run-1"));
+        plan.tasks[0]
+            .attempts
+            .push(TaskAttempt::new(1, Some("run-1".to_string())));
 
         let raw = serde_json::to_string(&plan).expect("serialize");
         let parsed: Plan = serde_json::from_str(&raw).expect("deserialize");
@@ -1432,9 +1542,110 @@ mod plan_schema2_compat_tests {
         assert!(err.to_string().contains("subplan"), "{err}");
     }
 
+    fn two_node_plan() -> Plan {
+        let mut second = PlanTask::new(1, "two", "do two", PlanRole::Child, None);
+        second.depends_on = vec!["task-0".to_string()];
+        Plan::new(
+            "goal",
+            PlanMode::FullPlan,
+            vec![
+                PlanTask::new(0, "one", "do one", PlanRole::Child, None),
+                second,
+            ],
+            PlanProviders::default(),
+            None,
+            "0.7.0",
+        )
+        .expect("plan")
+    }
+
+    #[test]
+    fn a_node_may_retry_until_max_attempts_is_reached() {
+        let mut task = PlanTask::new(0, "one", "do one", PlanRole::Child, None);
+        assert!(task.may_retry(DEFAULT_MAX_ATTEMPTS), "no attempts used yet");
+
+        for attempt in 1..=DEFAULT_MAX_ATTEMPTS {
+            task.attempts.push(TaskAttempt::failed(
+                attempt,
+                Some(format!("run-{attempt}")),
+                Some("acceptance failed".to_string()),
+                0.5,
+            ));
+        }
+
+        assert!(
+            !task.may_retry(DEFAULT_MAX_ATTEMPTS),
+            "the attempt budget is spent"
+        );
+        assert_eq!(task.attempts_used(), DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(task.attempts_spend_usd(), 1.5);
+    }
+
+    #[test]
+    fn a_retry_continues_the_failed_run_and_carries_its_reason() {
+        let mut task = PlanTask::new(0, "one", "do one", PlanRole::Child, None);
+        task.attempts.push(TaskAttempt::failed(
+            1,
+            Some("run-1".to_string()),
+            Some("acceptance failed after turn 8: billing.rs missing".to_string()),
+            0.4,
+        ));
+
+        assert_eq!(task.retry_parent_run_id(), Some("run-1"));
+        assert_eq!(
+            task.last_failure_reason(),
+            Some("acceptance failed after turn 8: billing.rs missing")
+        );
+    }
+
+    #[test]
+    fn a_spawn_failure_leaves_no_tree_for_the_retry_to_resume_from() {
+        let mut task = PlanTask::new(0, "one", "do one", PlanRole::Child, None);
+        task.attempts.push(TaskAttempt::failed(
+            1,
+            None,
+            Some("child process failed to start".to_string()),
+            0.0,
+        ));
+
+        assert_eq!(
+            task.retry_parent_run_id(),
+            None,
+            "no run means no working tree to resume; the retry starts from the plan source"
+        );
+    }
+
+    #[test]
+    fn skip_keeps_dependents_blocked_but_continue_releases_them() {
+        let mut plan = two_node_plan();
+        plan.tasks[0].status = PlanTaskStatus::Failed;
+
+        assert!(
+            plan.ready_pending_task_indices_for(OnFail::Skip).is_empty(),
+            "skip must not run work that depends on a failed node"
+        );
+        assert_eq!(
+            plan.ready_pending_task_indices_for(OnFail::Continue),
+            vec![1],
+            "continue is the operator saying the dependent does not need that output"
+        );
+    }
+
+    #[test]
+    fn readiness_defaults_to_the_plans_own_failure_policy() {
+        let mut plan = two_node_plan();
+        plan.tasks[0].status = PlanTaskStatus::Failed;
+        plan.on_fail = OnFail::Continue;
+
+        assert_eq!(plan.ready_pending_task_indices(), vec![1]);
+    }
+
     #[test]
     fn subplan_depth_guard_refuses_past_the_cap() {
-        assert!(guard_subplan_depth(0).is_ok(), "a top-level plan may nest once");
+        assert!(
+            guard_subplan_depth(0).is_ok(),
+            "a top-level plan may nest once"
+        );
         assert!(
             guard_subplan_depth(1).is_err(),
             "a plan already one level deep may not nest again"
