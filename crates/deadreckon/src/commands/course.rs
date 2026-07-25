@@ -114,11 +114,22 @@ pub(crate) struct CoursePiece {
     /// executor already honors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) depends_on: Vec<String>,
-    /// This piece is a project in its own right and wants its own graph.
-    /// Recorded here so the shape read and the preview can say so; the
-    /// executor gains subplan support in a later phase.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) is_subplan: bool,
+    /// This piece is a project in its own right: its goal is decomposed and
+    /// executed as its own graph, reconciled before this piece's dependents
+    /// run. What `campaign` reaches for, except a subplan carries its own
+    /// apply mode — so a sub-project may be sequential even when its parent
+    /// is parallel, which campaign cannot express.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subplan: Option<CourseSubplan>,
+}
+
+/// A node's own graph. Same shape as the parent's node list, plus its own
+/// apply mode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CourseSubplan {
+    #[serde(default)]
+    pub(crate) apply: deadreckon_core::plan::ApplyWhen,
+    pub(crate) pieces: Vec<CoursePiece>,
 }
 
 /// Per-role provider routes recorded for the launch.
@@ -803,6 +814,24 @@ pub(crate) struct ProviderCourseNodeDraft {
     subplan: Option<Box<ProviderCourseSubplanDraft>>,
 }
 
+impl ProviderCourseNodeDraft {
+    /// A short label for clamp messages, so the audit trail names the node
+    /// that was changed rather than an opaque index.
+    fn goal_label(&self) -> String {
+        let words = self
+            .goal
+            .split_whitespace()
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if words.is_empty() {
+            self.id.clone().unwrap_or_else(|| "node".to_string())
+        } else {
+            words
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProviderCourseSubplanDraft {
     #[serde(default)]
@@ -981,6 +1010,14 @@ fn course_pieces_from_nodes(
     nodes: &[ProviderCourseNodeDraft],
     clamps: &mut Vec<String>,
 ) -> Vec<CoursePiece> {
+    course_pieces_at_depth(nodes, clamps, 0)
+}
+
+fn course_pieces_at_depth(
+    nodes: &[ProviderCourseNodeDraft],
+    clamps: &mut Vec<String>,
+    depth: u32,
+) -> Vec<CoursePiece> {
     let ids: BTreeMap<String, String> = nodes
         .iter()
         .enumerate()
@@ -1020,13 +1057,48 @@ fn course_pieces_from_nodes(
                 model: None,
                 budget_usd: None,
                 depends_on,
-                is_subplan: node
-                    .subplan
-                    .as_deref()
-                    .is_some_and(|subplan| !subplan.nodes.is_empty()),
+                subplan: subplan_for_node(node, clamps, depth),
             }
         })
         .collect()
+}
+
+/// A node's own graph, if it has a usable one at this depth.
+///
+/// A subplan of a single node is inlined: a project of one is just a node,
+/// the same de-escalation the top level already applies. Nesting past
+/// `MAX_SUBPLAN_DEPTH` is flattened and recorded rather than refused — the
+/// planner shapes a launch, it cannot make one impossible.
+fn subplan_for_node(
+    node: &ProviderCourseNodeDraft,
+    clamps: &mut Vec<String>,
+    depth: u32,
+) -> Option<CourseSubplan> {
+    let drafted = node.subplan.as_deref()?;
+    if drafted.nodes.is_empty() {
+        return None;
+    }
+    if drafted.nodes.len() == 1 {
+        clamps.push(format!(
+            "subplan on {} inlined: decomposition yielded one node",
+            node.goal_label()
+        ));
+        return None;
+    }
+    if depth + 1 >= deadreckon_core::plan::MAX_SUBPLAN_DEPTH {
+        clamps.push(format!(
+            "subplan on {} flattened: nesting cap {} reached",
+            node.goal_label(),
+            deadreckon_core::plan::MAX_SUBPLAN_DEPTH
+        ));
+        return None;
+    }
+    let pieces = course_pieces_at_depth(&drafted.nodes, clamps, depth + 1);
+    let apply = match drafted.apply.as_deref().map(normalized_apply) {
+        Some(apply) if apply == "per-node" => deadreckon_core::plan::ApplyWhen::PerNode,
+        _ => deadreckon_core::plan::ApplyWhen::AtEnd,
+    };
+    Some(CourseSubplan { apply, pieces })
 }
 
 /// Parse + clamp a provider draft against the ladder floor. `None` on any
@@ -1147,15 +1219,7 @@ pub(crate) fn resolve_provider_course_plan(
         (true, _) => deadreckon_core::plan::ApplyWhen::PerNode,
         (false, _) => deadreckon_core::plan::ApplyWhen::AtEnd,
     };
-    // Lowering: record what the executor cannot honor yet so the trail says
-    // what was asked for, not just what ran. This disappears when subplan
-    // execution lands.
-    let subplans = pieces.iter().filter(|piece| piece.is_subplan).count();
-    if subplans > 0 {
-        clamps.push(format!(
-            "{subplans} subplan(s) flattened into single nodes: nested execution lands later"
-        ));
-    }
+
     if let Some(n) = n
         && pieces.len() > usize::from(n)
     {
@@ -1763,7 +1827,7 @@ mod tests {
                 model: None,
                 budget_usd: Some(5.0),
                 depends_on: Vec::new(),
-                is_subplan: false,
+                subplan: None,
             },
             CoursePiece {
                 id: "p2".to_string(),
@@ -1774,7 +1838,7 @@ mod tests {
                 model: None,
                 budget_usd: Some(3.0),
                 depends_on: vec!["p1".to_string()],
-                is_subplan: false,
+                subplan: None,
             },
         ];
         plan.providers = CourseProviders {

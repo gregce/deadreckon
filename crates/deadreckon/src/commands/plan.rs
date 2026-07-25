@@ -179,6 +179,12 @@ pub(crate) async fn create_orchestration_plan(
     }
     plan.acceptance_path = acceptance_source.as_ref().map(|source| source.path.clone());
     plan.capability_preview = infer_capability_preview(&plan.root_goal);
+    // A node that is a project in its own right gets its own plan, linked by
+    // id. This is campaign's nesting without campaign's separate id space,
+    // sub-result sidecar, or lineage env vars — and unlike campaign, each
+    // subplan carries its own apply mode, so a sub-project may be sequential
+    // while its parent is parallel.
+    attach_subplans(&paths, &mut plan, seed_pieces)?;
     for task in &plan.tasks {
         let spec = render_worker_spec(&plan, task);
         write_worker_spec(&paths, &plan.plan_id, &task.task_id, &spec)?;
@@ -359,6 +365,93 @@ pub(crate) fn parse_child_provider_overrides(
         overrides.insert(index, provider.to_string());
     }
     Ok(overrides)
+}
+
+/// Create a child plan for every seeded node that carries its own graph, and
+/// link it by id.
+///
+/// Runs after the parent exists because the link is bidirectional: the child
+/// records `parent_plan_id` (which bounds nesting depth) and the parent's task
+/// records `subplan`. A child that cannot be built is skipped, leaving the
+/// node to run as an ordinary single node — a degraded shape beats a refused
+/// launch.
+fn attach_subplans(
+    paths: &DeadreckonPaths,
+    plan: &mut Plan,
+    seed: &[commands::course::CoursePiece],
+) -> Result<()> {
+    if seed.len() != plan.tasks.len() {
+        return Ok(());
+    }
+    let depth = deadreckon_core::plan::plan_depth(paths, plan);
+    for (index, piece) in seed.iter().enumerate() {
+        let Some(subplan) = piece.subplan.as_ref() else {
+            continue;
+        };
+        if deadreckon_core::plan::guard_subplan_depth(depth).is_err() {
+            continue;
+        }
+        let child_tasks = subplan
+            .pieces
+            .iter()
+            .enumerate()
+            .map(|(child_index, child_piece)| {
+                let mut task = PlanTask::new(
+                    child_index as u32,
+                    commands::course::piece_subject(child_piece),
+                    child_piece.goal.trim(),
+                    PlanRole::Child,
+                    plan.providers.default_child.clone(),
+                );
+                task.depends_on = child_piece
+                    .depends_on
+                    .iter()
+                    .filter_map(|dependency| {
+                        subplan
+                            .pieces
+                            .iter()
+                            .position(|candidate| &candidate.id == dependency)
+                            .map(|position| format!("task-{position}"))
+                    })
+                    .filter(|dependency| dependency != &task.task_id)
+                    .collect();
+                task
+            })
+            .collect::<Vec<_>>();
+        let Ok(mut child) = Plan::new(
+            piece.goal.trim(),
+            PlanMode::FullPlan,
+            child_tasks,
+            plan.providers.clone(),
+            plan.parent_scope.clone(),
+            env!("CARGO_PKG_VERSION"),
+        ) else {
+            continue;
+        };
+        child.parent_plan_id = Some(plan.plan_id.clone());
+        child.parent_cwd = plan.parent_cwd.clone();
+        child.acceptance_path = plan.acceptance_path.clone();
+        child.capability_preview = plan.capability_preview.clone();
+        child.apply = subplan.apply;
+        if child.apply == deadreckon_core::plan::ApplyWhen::PerNode {
+            child.on_fail = OnFail::Stop;
+        }
+        for task in &child.tasks {
+            let spec = render_worker_spec(&child, task);
+            write_worker_spec(paths, &child.plan_id, &task.task_id, &spec)?;
+        }
+        save_plan(paths, &child)?;
+        append_plan_event(
+            paths,
+            &child.plan_id,
+            PlanEventKind::PlanCreated {
+                mode: child.mode,
+                task_count: child.tasks.len(),
+            },
+        )?;
+        plan.tasks[index].subplan = Some(child.plan_id);
+    }
+    Ok(())
 }
 
 /// Turn the launch classifier's graph into plan tasks.
@@ -3239,6 +3332,76 @@ fn child_argv(
     argv
 }
 
+/// Run a node that is itself a plan: fork the child graph, merge it, and hand
+/// back the merged run as this node's result.
+///
+/// The parent sees one gated run per node either way, so nothing downstream —
+/// summaries, markers, dependency composition, merge — needs to know a node
+/// was nested. That is the whole benefit of a subplan being a plan id rather
+/// than a separate subsystem.
+///
+/// A subplan reconciles inside its own worktree and never applies per node
+/// into the parent's tree. Looser than that and the failure semantics stop
+/// being explainable: a partially-applied sub-project inside a parent that is
+/// still deciding whether to merge has no good answer.
+fn run_subplan_child(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task_index: usize,
+    subplan_id: &str,
+    source_dir: &Path,
+    sandbox: &str,
+    quiet: bool,
+) -> Result<String> {
+    let task_id = plan.tasks[task_index].task_id.clone();
+    for (verb, extra) in [
+        ("fork", vec!["--sandbox", sandbox]),
+        ("merge", vec!["--yes"]),
+    ] {
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
+            .current_dir(source_dir)
+            .env("DEADRECKON_HOME", paths.home())
+            .env("DEADRECKON_HINTS", "0")
+            .arg(verb)
+            .arg(subplan_id)
+            .arg("--quiet")
+            .arg("--no-hints")
+            .args(extra);
+        let status = command.status()?;
+        if !status.success() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "{task_id} subplan {} failed during {verb}",
+                    run_prefix(subplan_id)
+                ),
+                &format!("deadreckon show {}", run_prefix(subplan_id)),
+            )));
+        }
+    }
+    let child = load_plan(paths, subplan_id)?;
+    let merged_run_id = child.merged_run_id.ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "{task_id} subplan {} produced no merged result",
+                run_prefix(subplan_id)
+            ),
+            &format!("deadreckon show {}", run_prefix(subplan_id)),
+        ))
+    })?;
+    if !quiet {
+        println!(
+            "{}",
+            ui_status(format!(
+                "{task_id} subplan {} merged into run {}",
+                run_prefix(subplan_id),
+                run_prefix(&merged_run_id)
+            ))
+        );
+    }
+    Ok(merged_run_id)
+}
+
 fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
     let PlanChildLaunch {
         paths,
@@ -3257,6 +3420,17 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         signal_sender,
     } = launch;
     let task = &plan.tasks[task_index];
+    if let Some(subplan_id) = task.subplan.clone() {
+        return run_subplan_child(
+            paths,
+            plan,
+            task_index,
+            &subplan_id,
+            source_dir,
+            sandbox,
+            quiet,
+        );
+    }
     let worker_spec_path = paths.worker_spec(&plan.plan_id, &task.task_id);
     let worker_spec = render_launch_worker_spec(paths, plan, task);
     write_worker_spec(paths, &plan.plan_id, &task.task_id, &worker_spec)?;
@@ -3697,7 +3871,7 @@ mod seed_graph_tests {
             model: None,
             budget_usd: None,
             depends_on: depends_on.iter().map(ToString::to_string).collect(),
-            is_subplan: false,
+            subplan: None,
         }
     }
 
