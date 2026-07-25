@@ -1695,8 +1695,13 @@ pub(crate) enum Commands {
     )]
     Undo {
         #[arg(
-            long,
+            value_name = "ID",
             help = "Run id, unique prefix, or latest; defaults to current project's latest"
+        )]
+        id: Option<String>,
+        #[arg(
+            long,
+            help = "Deprecated alias for the positional id; every other lifecycle verb takes it positionally"
         )]
         run: Option<String>,
         #[arg(long, help = "Snapshot turn to restore")]
