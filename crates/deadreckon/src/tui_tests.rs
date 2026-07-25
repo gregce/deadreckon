@@ -2603,6 +2603,7 @@ fn the_classifier_moves_auto_mode_off_the_floor() {
             source: GoalShapeSource::Provider,
             provider: Some("cli:planner".to_string()),
             pieces: Vec::new(),
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
         },
     );
 
@@ -2633,6 +2634,7 @@ fn an_explicit_review_flag_still_beats_the_classifier() {
             source: GoalShapeSource::Provider,
             provider: Some("cli:planner".to_string()),
             pieces: Vec::new(),
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
         },
     );
 
@@ -2663,7 +2665,7 @@ fn resolve_graph(json: &str) -> super::commands::course::ResolvedCoursePlan {
 /// runs sequentially was unreachable no matter how the prompt was tuned.
 #[test]
 fn the_planner_can_express_ordering() {
-    let (shape, n, pieces, _resolution) = resolve_graph(
+    let (shape, n, pieces, apply, _resolution) = resolve_graph(
         r#"{"nodes":[
              {"id":"n0","goal":"migrate the schema","depends_on":[]},
              {"id":"n1","goal":"update the callers","depends_on":["n0"]},
@@ -2682,17 +2684,17 @@ fn the_planner_can_express_ordering() {
 /// Shape is read off the graph rather than picked from a menu.
 #[test]
 fn shape_is_derived_from_the_graph_not_a_word() {
-    let (single, _, _, _) = resolve_graph(
+    let (single, _, _, _, _) = resolve_graph(
         r#"{"nodes":[{"id":"n0","goal":"fix the bug"}],"confidence":0.9,"rationale":"one change"}"#,
     );
     assert_eq!(single, super::commands::course::CourseShape::Single);
 
-    let (plan, _, _, _) = resolve_graph(
+    let (plan, _, _, _, _) = resolve_graph(
         r#"{"nodes":[{"id":"n0","goal":"auth"},{"id":"n1","goal":"billing"}],"confidence":0.9,"rationale":"two pieces"}"#,
     );
     assert_eq!(plan, super::commands::course::CourseShape::Plan);
 
-    let (nested, _, pieces, _) = resolve_graph(
+    let (nested, _, pieces, _, _) = resolve_graph(
         r#"{"nodes":[
              {"id":"n0","goal":"rebuild billing","subplan":{"apply":"per-node","nodes":[{"id":"s0","goal":"schema"},{"id":"s1","goal":"cutover","depends_on":["s0"]}]}},
              {"id":"n1","goal":"rebuild search"}],
@@ -2703,27 +2705,68 @@ fn shape_is_derived_from_the_graph_not_a_word() {
     assert!(!pieces[1].is_subplan);
 }
 
-/// What the executor cannot honor yet is recorded, so the trail shows what was
-/// asked for and not only what ran.
+/// Per-node apply is executable, so it is honored rather than lowered.
+/// Subplans are still flattened, and that is recorded — the trail shows what
+/// was asked for and not only what ran.
 #[test]
-fn lowering_records_what_the_executor_cannot_run_yet() {
-    let (_, _, _, resolution) = resolve_graph(
+fn per_node_is_honored_and_only_subplans_are_still_lowered() {
+    let (_, _, _, apply, resolution) = resolve_graph(
         r#"{"nodes":[
              {"id":"n0","goal":"a","subplan":{"nodes":[{"id":"s0","goal":"x"},{"id":"s1","goal":"y"}]}},
              {"id":"n1","goal":"b"}],
            "apply":"per-node","confidence":0.9,"rationale":"nested and ordered"}"#,
     );
 
+    assert_eq!(apply, deadreckon_core::plan::ApplyWhen::PerNode);
     let clamps = resolution.clamps_applied.join(" | ");
-    assert!(clamps.contains("per-node lowered to at-end"), "{clamps}");
+    assert!(
+        !clamps.contains("per-node lowered"),
+        "per-node is no longer lowered: {clamps}"
+    );
     assert!(clamps.contains("subplan"), "{clamps}");
+}
+
+/// An ordered goal now reaches the executor as ordered work that lands
+/// incrementally — the shape `start` could not reach at all before.
+#[test]
+fn an_ordered_graph_resolves_to_per_node_apply() {
+    let (_, _, pieces, apply, _) = resolve_graph(
+        r#"{"nodes":[
+             {"id":"n0","goal":"migrate the schema","depends_on":[]},
+             {"id":"n1","goal":"update the callers","depends_on":["n0"]}],
+           "apply":"per-node","confidence":0.9,"rationale":"ordered"}"#,
+    );
+
+    assert_eq!(apply, deadreckon_core::plan::ApplyWhen::PerNode);
+    assert_eq!(pieces[1].depends_on, vec!["p1".to_string()]);
+}
+
+/// One node has nothing to sequence, so per-node is meaningless there and is
+/// ignored rather than silently serializing a single run.
+#[test]
+fn per_node_is_ignored_for_a_single_node_graph() {
+    let (shape, _, _, apply, resolution) = resolve_graph(
+        r#"{"nodes":[{"id":"n0","goal":"fix the bug"}],
+           "apply":"per-node","confidence":0.9,"rationale":"one change"}"#,
+    );
+
+    assert_eq!(shape, super::commands::course::CourseShape::Single);
+    assert_eq!(apply, deadreckon_core::plan::ApplyWhen::AtEnd);
+    assert!(
+        resolution
+            .clamps_applied
+            .iter()
+            .any(|clamp| clamp.contains("nothing to sequence")),
+        "{:?}",
+        resolution.clamps_applied
+    );
 }
 
 /// An edge naming a node that does not exist is dropped and recorded, never
 /// fatal — the planner shapes a launch, it cannot make one impossible.
 #[test]
 fn an_unresolvable_edge_is_dropped_and_recorded() {
-    let (_, _, pieces, resolution) = resolve_graph(
+    let (_, _, pieces, _apply, resolution) = resolve_graph(
         r#"{"nodes":[
              {"id":"n0","goal":"a","depends_on":["ghost"]},
              {"id":"n1","goal":"b","depends_on":["n1"]}],
@@ -2741,7 +2784,7 @@ fn an_unresolvable_edge_is_dropped_and_recorded() {
 /// than discarded, so the change does not depend on prompt adherence.
 #[test]
 fn a_legacy_shape_answer_still_resolves() {
-    let (shape, n, _, _) = resolve_graph(
+    let (shape, n, _, _, _) = resolve_graph(
         r#"{"shape":"campaign","n":9,"confidence":0.9,"rationale":"three independent services"}"#,
     );
 
@@ -2758,7 +2801,7 @@ fn goal_shape_classifier_validates_and_clamps_provider_output() {
         ..Default::default()
     };
     let ladder = super::commands::course::ladder_decision(&signals);
-    let (shape, n, _pieces, resolution) = super::commands::course::resolve_provider_course_plan(
+    let (shape, n, _pieces, _apply, resolution) = super::commands::course::resolve_provider_course_plan(
         r#"{"shape":"campaign","n":9,"confidence":0.9,"rationale":"three independent services"}"#,
         &signals,
         &ladder,
@@ -2861,6 +2904,7 @@ fn classified_campaign_shape_is_suggested_not_auto_launched() {
         source: GoalShapeSource::Provider,
         provider: Some("cli:planner".to_string()),
         pieces: Vec::new(),
+        apply: deadreckon_core::plan::ApplyWhen::AtEnd,
     };
 
     apply_goal_shape_recommendation(&mut decision, recommendation);

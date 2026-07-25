@@ -48,6 +48,7 @@ pub(crate) async fn create_orchestration_plan(
         goal,
         n,
         mode,
+        apply,
         max_spend: _,
         max_wall_seconds: _,
         sandbox: _,
@@ -169,6 +170,13 @@ pub(crate) async fn create_orchestration_plan(
     )
     .map_err(CliError::Core)?;
     plan.parent_cwd = Some(plan_cwd);
+    // Per-node apply serializes execution and lands work incrementally, so a
+    // stop-on-failure policy matches what the operator asked for: a half-
+    // applied branch should not keep growing after something breaks.
+    plan.apply = apply;
+    if apply == deadreckon_core::plan::ApplyWhen::PerNode {
+        plan.on_fail = OnFail::Stop;
+    }
     plan.acceptance_path = acceptance_source.as_ref().map(|source| source.path.clone());
     plan.capability_preview = infer_capability_preview(&plan.root_goal);
     for task in &plan.tasks {
@@ -1762,11 +1770,19 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     let mut made_progress = true;
     while made_progress {
         made_progress = false;
-        let ready = if halt.is_some() {
+        let mut ready = if halt.is_some() {
             Vec::new()
         } else {
             plan.ready_pending_task_indices()
         };
+        // Per-node apply lands each node on the branch before the next starts,
+        // so the next node's source tree contains it. Running siblings in
+        // parallel would race on that same base, so this shape is serial by
+        // construction — one ready node per pass.
+        if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode {
+            ready.truncate(1);
+        }
+        let ready = ready;
         if !ready.is_empty() {
             made_progress = true;
         }
@@ -1830,6 +1846,25 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                     continue;
                 }
             };
+            // Stack policy branches each node off the branch tip as it stands
+            // now, so it sees every earlier node that has landed. Base policy
+            // pins every node to the ref the plan started from.
+            let per_node_base = if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode {
+                let repo = plan
+                    .parent_cwd
+                    .clone()
+                    .unwrap_or_else(|| parent_cwd.clone());
+                match plan.branch_policy {
+                    BranchPolicy::Base => Some("HEAD".to_string()),
+                    BranchPolicy::Stack | BranchPolicy::Merge => Some(
+                        git_stdout(&repo, &["rev-parse", "HEAD"])?
+                            .trim()
+                            .to_string(),
+                    ),
+                }
+            } else {
+                None
+            };
             let paths_for_child = paths.clone();
             let plan_for_child = plan.clone();
             let sandbox_for_child = sandbox.clone();
@@ -1843,6 +1878,7 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                         plan: &plan_for_child,
                         task_index,
                         source_dir: &source_dir,
+                        per_node_base,
                         sandbox: &sandbox_for_child,
                         max_spend,
                         max_wall_seconds,
@@ -2039,6 +2075,45 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                     if !quiet {
                         print_plan_child_finished_line(&plan, task_index, status, &run_id, plain);
                     }
+                    if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode
+                        && status == PlanTaskStatus::Completed
+                    {
+                        // A landing failure is not a gate failure: the node did
+                        // its work and passed. Retrying it would re-run good
+                        // work against the same conflict, so the plan halts
+                        // with the reason instead, leaving earlier nodes
+                        // applied and the rest unstarted.
+                        if let Err(error) = apply_node(&paths, &plan, task_index, &run_id) {
+                            let reason = error.to_string();
+                            append_plan_event(
+                                &paths,
+                                &plan.plan_id,
+                                PlanEventKind::TaskBlocked {
+                                    task_id: task_id.clone(),
+                                    task_index,
+                                    reason: reason.clone(),
+                                },
+                            )?;
+                            halt = Some(reason);
+                        } else {
+                            append_plan_event(
+                                &paths,
+                                &plan.plan_id,
+                                PlanEventKind::TaskApplied {
+                                    task_id: task_id.clone(),
+                                    task_index,
+                                    run_id: run_id.clone(),
+                                },
+                            )?;
+                            if !quiet {
+                                println!(
+                                    "{}",
+                                    ui_status(format!("{task_id} landed on the branch"))
+                                );
+                            }
+                        }
+                        save_plan(&paths, &plan)?;
+                    }
                 }
                 Err(error) => {
                     // The child never produced a run (spawn or source-prep
@@ -2112,6 +2187,89 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         print_fork_finished(&plan, no_hints);
     }
     Ok(())
+}
+
+/// Land one completed node's work on the operator's branch.
+///
+/// Lifted from `chain`'s auto_apply_chain_step, which had exactly this logic
+/// bound to chain state. The guards are the point and are kept whole: the
+/// acceptance marker must validate (an unsigned or forged result never
+/// lands), the target must be clean, and every changed file must sit inside
+/// the plan's allowlist when one is set.
+///
+/// Applying to the parent repo is also what lets the next node see this work:
+/// nodes source from `plan.parent_cwd`, so a node that starts after this
+/// returns copies a tree that already contains it.
+fn apply_node(paths: &DeadreckonPaths, plan: &Plan, task_index: usize, run_id: &str) -> Result<()> {
+    let state = load_run(paths, run_id)?;
+    validate_acceptance_marker(&state)?;
+    let record = read_codebase_record(&state.working_dir)?;
+    let git_root = record.source_git_root.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "missing source_git_root".to_string(),
+        ))
+    })?;
+    let task_id = plan.tasks[task_index].task_id.clone();
+    if !git_stdout(git_root, &["status", "--porcelain"])?
+        .trim()
+        .is_empty()
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("{task_id} refused to land (target has uncommitted changes)"),
+            &format!(
+                "git -C {} stash && deadreckon fork {}",
+                git_root.display(),
+                run_prefix(&plan.plan_id)
+            ),
+        )));
+    }
+    if !plan.apply_allowlist.is_empty() {
+        let branch = record.branch_name.as_deref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "missing branch_name".to_string(),
+            ))
+        })?;
+        let files = git_stdout(
+            git_root,
+            &["diff", "--name-only", &format!("HEAD..{branch}")],
+        )?;
+        for file in files.lines().filter(|line| !line.trim().is_empty()) {
+            if !plan
+                .apply_allowlist
+                .iter()
+                .any(|pattern| apply_allowlist_matches(pattern, file))
+            {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    &format!("{task_id} refused to land (outside_allowlist {file})"),
+                    &format!("deadreckon show {}", run_prefix(run_id)),
+                )));
+            }
+        }
+    }
+    super::lifecycle::apply_command_quiet(
+        run_id.to_string(),
+        apply_strategy_label(plan.apply_strategy).to_string(),
+        None,
+        true,
+        true,
+        false,
+        None,
+    )
+}
+
+pub(crate) fn apply_strategy_label(value: ApplyStrategy) -> &'static str {
+    match value {
+        ApplyStrategy::Squash => "squash",
+        ApplyStrategy::Merge => "merge",
+        ApplyStrategy::CherryPick => "cherry-pick",
+    }
+}
+
+fn apply_allowlist_matches(pattern: &str, file: &str) -> bool {
+    pattern == "*"
+        || pattern == file
+        || file.starts_with(pattern.trim_end_matches('*'))
+        || file.starts_with(pattern.trim_end_matches('/'))
 }
 
 /// What the plan does with a node whose attempt just failed.
@@ -2655,6 +2813,12 @@ async fn plan_child_source_dir(
     {
         return Ok(parent_state.working_dir);
     }
+    if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode {
+        // Earlier nodes have already landed on this branch, so the parent repo
+        // *is* the composed source. Composing dependency artifacts here would
+        // reapply work that is already present.
+        return Ok(plan_cwd.to_path_buf());
+    }
     if task.depends_on.is_empty() {
         return Ok(plan_cwd.to_path_buf());
     }
@@ -2950,6 +3114,9 @@ struct PlanChildLaunch<'a> {
     plan: &'a Plan,
     task_index: usize,
     source_dir: &'a Path,
+    /// The git ref a per-node child branches from. `None` for at-end plans,
+    /// which copy a source tree instead of branching.
+    per_node_base: Option<String>,
     sandbox: &'a str,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
@@ -2976,6 +3143,7 @@ fn child_argv(
     max_wall_seconds: Option<f64>,
     narrate: bool,
     narrator_model: Option<&str>,
+    per_node_base: Option<&str>,
 ) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
     // A retry stays a `run`, not an `extend`: `extend` requires a completed
@@ -2991,6 +3159,28 @@ fn child_argv(
             prompt.to_string(),
             "--no-docs".to_string(),
         ]);
+    } else if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode {
+        // Per-node apply lands each node with `deadreckon apply`, which needs
+        // real git ancestry: a branch off a known base, not a copied tree.
+        // This is the same shape chain steps have always used.
+        argv.extend([
+            "run".to_string(),
+            prompt.to_string(),
+            "--worktree".to_string(),
+            "--base".to_string(),
+            per_node_base.unwrap_or("HEAD").to_string(),
+            "--yes".to_string(),
+            "--no-confirm".to_string(),
+            "--no-hints".to_string(),
+            "--no-docs".to_string(),
+        ]);
+        if plain {
+            argv.push("--plain".to_string());
+        }
+        if let Some(acceptance_path) = plan.acceptance_path.as_deref() {
+            argv.push("--acceptance".to_string());
+            argv.push(acceptance_path.display().to_string());
+        }
     } else {
         argv.extend([
             "run".to_string(),
@@ -3055,6 +3245,7 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         plan,
         task_index,
         source_dir,
+        per_node_base,
         sandbox,
         max_spend,
         max_wall_seconds,
@@ -3100,6 +3291,7 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         max_wall_seconds,
         narrate,
         narrator_model.as_deref(),
+        per_node_base.as_deref(),
     ));
     command
         .stdout(std::process::Stdio::piped())
@@ -3688,6 +3880,7 @@ mod model_routing_tests {
             None,
             false,
             None,
+            None,
         );
 
         assert_eq!(argv.first().map(String::as_str), Some("run"), "{argv:?}");
@@ -3695,6 +3888,73 @@ mod model_routing_tests {
             argv.iter().any(|arg| arg == "--from"),
             "the retry is seeded from a source tree: {argv:?}"
         );
+    }
+
+    /// Per-node apply lands work with `deadreckon apply`, which needs real git
+    /// ancestry. A copied source tree has none — the first cut of this failed
+    /// on a live run with "missing source_git_root" — so a per-node child
+    /// branches off the tip instead, exactly as a chain step does.
+    #[test]
+    fn a_per_node_child_branches_instead_of_copying() {
+        let mut plan = narrate_plan();
+        plan.apply = deadreckon_core::plan::ApplyWhen::PerNode;
+
+        let argv = child_argv(
+            &plan,
+            &plan.tasks[0],
+            "do the thing",
+            std::path::Path::new("/src"),
+            false,
+            "none",
+            None,
+            None,
+            false,
+            None,
+            Some("abc123"),
+        );
+
+        assert_eq!(argv.first().map(String::as_str), Some("run"), "{argv:?}");
+        assert!(argv.iter().any(|arg| arg == "--worktree"), "{argv:?}");
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "--base" && pair[1] == "abc123"),
+            "the child branches off the tip the parent measured: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg == "--from"),
+            "a per-node child must not copy a source tree: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn an_at_end_child_still_copies_its_source() {
+        let plan = narrate_plan();
+
+        let argv = child_argv(
+            &plan,
+            &plan.tasks[0],
+            "do the thing",
+            std::path::Path::new("/src"),
+            false,
+            "none",
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+
+        assert!(argv.iter().any(|arg| arg == "--from"), "{argv:?}");
+        assert!(!argv.iter().any(|arg| arg == "--worktree"), "{argv:?}");
+    }
+
+    #[test]
+    fn the_apply_allowlist_bounds_what_may_land() {
+        assert!(super::apply_allowlist_matches("*", "anything.rs"));
+        assert!(super::apply_allowlist_matches("src/", "src/main.rs"));
+        assert!(super::apply_allowlist_matches("src/*", "src/main.rs"));
+        assert!(super::apply_allowlist_matches("Cargo.toml", "Cargo.toml"));
+        assert!(!super::apply_allowlist_matches("src/", "docs/README.md"));
     }
 
     #[test]
@@ -3711,6 +3971,7 @@ mod model_routing_tests {
             None,
             None,
             false,
+            None,
             None,
         );
 
@@ -3734,6 +3995,7 @@ mod model_routing_tests {
             None,
             None,
             false,
+            None,
             None,
         );
 
@@ -3803,6 +4065,7 @@ mod model_routing_tests {
             None,
             true,
             None,
+            None,
         );
         assert!(with.iter().any(|a| a == "--narrate"), "{with:?}");
         let without = child_argv(
@@ -3815,6 +4078,7 @@ mod model_routing_tests {
             None,
             None,
             false,
+            None,
             None,
         );
         assert!(
@@ -3838,6 +4102,7 @@ mod model_routing_tests {
             None,
             true,
             Some("haiku"),
+            None,
         );
         // run child: leads with run/--from/--no-docs, then --narrate + model.
         assert_eq!(argv[0], "run");

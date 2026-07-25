@@ -918,9 +918,15 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
-/// The planner's resolved output: shape, clamped n, typed pieces, and a
-/// resolution carrying every clamp applied on the way.
-pub(crate) type ResolvedCoursePlan = (CourseShape, Option<u8>, Vec<CoursePiece>, CourseResolution);
+/// The planner's resolved output: shape, clamped n, typed pieces, when the
+/// results land, and a resolution carrying every clamp applied on the way.
+pub(crate) type ResolvedCoursePlan = (
+    CourseShape,
+    Option<u8>,
+    Vec<CoursePiece>,
+    deadreckon_core::plan::ApplyWhen,
+    CourseResolution,
+);
 
 /// A short imperative label for a piece, derived from its goal. Pieces carry a
 /// goal but no subject; plan tasks need both, and subjects must be unique
@@ -1081,7 +1087,13 @@ pub(crate) fn resolve_provider_course_plan(
         ));
         let mut resolution = ladder_resolution(ladder);
         resolution.clamps_applied = clamps;
-        return Some((ladder.shape, ladder.n, Vec::new(), resolution));
+        return Some((
+            ladder.shape,
+            ladder.n,
+            Vec::new(),
+            deadreckon_core::plan::ApplyWhen::AtEnd,
+            resolution,
+        ));
     }
     // Budget clamp: an infeasible shape downgrades, recorded.
     let (shape, downgraded) = match shape {
@@ -1119,18 +1131,25 @@ pub(crate) fn resolve_provider_course_plan(
         }
     };
     let mut pieces = course_pieces_from_nodes(draft.drafted_nodes(), &mut clamps);
-    // Lowering: record what the executor cannot honor yet so the trail says
-    // what was asked for, not just what ran. Each of these disappears as the
-    // corresponding executor phase lands.
-    if draft
+    // Per-node apply is executable now, so it is honored rather than lowered.
+    // A single node has nothing to sequence, so it stays at-end regardless.
+    let requested_per_node = draft
         .apply
         .as_deref()
         .map(normalized_apply)
-        .is_some_and(|apply| apply == "per-node")
-    {
-        clamps
-            .push("apply per-node lowered to at-end: the executor merges once for now".to_string());
-    }
+        .is_some_and(|apply| apply == "per-node");
+    let apply = match (requested_per_node, shape) {
+        (true, CourseShape::Single) => {
+            clamps
+                .push("apply per-node ignored: a single node has nothing to sequence".to_string());
+            deadreckon_core::plan::ApplyWhen::AtEnd
+        }
+        (true, _) => deadreckon_core::plan::ApplyWhen::PerNode,
+        (false, _) => deadreckon_core::plan::ApplyWhen::AtEnd,
+    };
+    // Lowering: record what the executor cannot honor yet so the trail says
+    // what was asked for, not just what ran. This disappears when subplan
+    // execution lands.
     let subplans = pieces.iter().filter(|piece| piece.is_subplan).count();
     if subplans > 0 {
         clamps.push(format!(
@@ -1150,6 +1169,7 @@ pub(crate) fn resolve_provider_course_plan(
         shape,
         n,
         pieces,
+        apply,
         CourseResolution {
             source: ResolutionSource::Provider,
             confidence,
@@ -1591,6 +1611,8 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
             goal: goal.clone(),
             n,
             mode: crate::cli::CliPlanMode::FullPlan,
+            // LaunchPlan predates apply modes; a reshape lands once at the end.
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
             max_spend: plan.budget.ceiling_usd,
             max_wall_seconds: None,
             sandbox: None,
@@ -2318,7 +2340,7 @@ checks:
             r#"{"shape":"plan","confidence":0.9,"rationale":"one piece really",
                 "pieces":[{"goal":"the only piece"}]}"#,
         ] {
-            let (shape, n, _pieces, resolution) = resolve_provider_course_plan(
+            let (shape, n, _pieces, _apply, resolution) = resolve_provider_course_plan(
                 draft,
                 &signals,
                 &ladder,
@@ -2339,7 +2361,7 @@ checks:
             None,
         );
         let ladder = ladder_decision(&signals);
-        let (_shape, _n, _pieces, resolution) = resolve_provider_course_plan(
+        let (_shape, _n, _pieces, _apply, resolution) = resolve_provider_course_plan(
             r#"{"shape":"plan","n":1,"confidence":0.9,"rationale":"one piece really"}"#,
             &signals,
             &ladder,
@@ -2397,7 +2419,7 @@ checks:
         );
         let ladder = ladder_decision(&signals);
         assert_eq!(ladder.shape, CourseShape::Single);
-        let (shape, n, pieces, resolution) = resolve_provider_course_plan(
+        let (shape, n, pieces, _apply, resolution) = resolve_provider_course_plan(
             r#"{"shape":"campaign","n":4,"confidence":0.3,"rationale":"maybe several things"}"#,
             &signals,
             &ladder,
@@ -2429,7 +2451,7 @@ checks:
         let draft = r#"{"shape":"plan","n":9,"confidence":0.9,"rationale":"nine pieces",
             "pieces":[{"goal":"a"},{"goal":"b"},{"goal":"c"},{"goal":"d"},{"goal":"e"},
                       {"goal":"f"},{"goal":"g"},{"goal":"h"},{"goal":"i"}]}"#;
-        let (shape, n, pieces, resolution) =
+        let (shape, n, pieces, _apply, resolution) =
             resolve_provider_course_plan(draft, &signals, &ladder, SHAPE_CONFIDENCE_FLOOR_DEFAULT)
                 .expect("resolved");
         assert_eq!(shape, CourseShape::Plan);
@@ -2486,7 +2508,7 @@ checks:
             Some(3.0),
         );
         let tight_ladder = ladder_decision(&tight);
-        let (shape, _n, _pieces, resolution) = resolve_provider_course_plan(
+        let (shape, _n, _pieces, _apply, resolution) = resolve_provider_course_plan(
             r#"{"shape":"campaign","n":3,"confidence":0.95,"rationale":"three projects"}"#,
             &tight,
             &tight_ladder,

@@ -637,6 +637,9 @@ pub(crate) fn plan_event_summary(event: &PlanEventKind) -> String {
         } => format!(
             "circuit breaker tripped {consecutive_failures}/{threshold} consecutive failures"
         ),
+        PlanEventKind::TaskApplied {
+            task_id, run_id, ..
+        } => format!("{task_id} applied run {}", run_prefix(run_id)),
         PlanEventKind::TaskRunDiscovered {
             task_id,
             run_id,

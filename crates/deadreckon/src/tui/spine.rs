@@ -961,6 +961,7 @@ fn newest_plan_failure(events: &[PlanEvent]) -> Option<String> {
         )),
         // A retry is the plan healing itself, not a failure state to surface.
         deadreckon_core::PlanEventKind::TaskRetrying { .. }
+        | deadreckon_core::PlanEventKind::TaskApplied { .. }
         | deadreckon_core::PlanEventKind::PlanCreated { .. }
         | deadreckon_core::PlanEventKind::PlanStarted
         | deadreckon_core::PlanEventKind::TaskReady { .. }

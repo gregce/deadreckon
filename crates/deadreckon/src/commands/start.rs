@@ -108,6 +108,10 @@ pub(crate) struct GoalShapeRecommendation {
     /// Keeping the nodes here makes one classifier's answer the plan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) pieces: Vec<commands::course::CoursePiece>,
+    /// When the classifier wants results to land: at the end, or as each node
+    /// passes its gate.
+    #[serde(default)]
+    pub(crate) apply: deadreckon_core::plan::ApplyWhen,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,7 +446,7 @@ pub(crate) async fn classify_goal_shape_for_start(
         && let Some(resolved) =
             provider_course_plan(paths, cwd, goal, provider, plain, &signals, &ladder).await
     {
-        let (shape, n, pieces, resolution) = resolved;
+        let (shape, n, pieces, apply, resolution) = resolved;
         return GoalShapeRecommendation {
             schema_version: 1,
             goal: goal.to_string(),
@@ -452,6 +456,7 @@ pub(crate) async fn classify_goal_shape_for_start(
             source: GoalShapeSource::Provider,
             provider: Some(provider.to_string()),
             pieces,
+            apply,
         };
     }
     ladder_goal_shape_recommendation(goal, &ladder)
@@ -538,6 +543,9 @@ pub(crate) fn ladder_goal_shape_recommendation(
         // The ladder decides shape and n from measured signals; it does not
         // author node goals, so plan creation falls back to its own planner.
         pieces: Vec::new(),
+        // The deterministic floor never asks for incremental landing; that is
+        // a spend-and-risk choice the classifier or the operator makes.
+        apply: deadreckon_core::plan::ApplyWhen::AtEnd,
     }
 }
 
@@ -3053,6 +3061,11 @@ async fn dispatch_start_command(
                         .unwrap_or_default(),
                     plan: PlanCommandArgs {
                         goal: args.goal,
+                        apply: decision
+                            .goal_shape
+                            .as_ref()
+                            .map(|shape| shape.apply)
+                            .unwrap_or_default(),
                         n: decision.child_count.unwrap_or_else(|| {
                             commands::orchestrate::recommend_child_count_for_goal(
                                 &decision.goal,
