@@ -3833,6 +3833,118 @@ output tokens but no input-token count in the recorded result. OpenCode needs a
 richer event mirror before onboarding. Gemini needs a successful current
 structured fixture before onboarding.
 
+## 56. Shakedown: One Reference Resolver
+
+### 56.1 The problem: per-verb cascades and two meanings of `latest`
+
+Every id-taking verb hand-rolled its own resolution cascade, and no two covered
+the same kinds in the same order. `show` probed campaign, plan child, run, plan
+and missed chains entirely. `kill` probed campaign, run, plan, chain and missed
+plan children. `status` and `verdict` saw runs only. `latest` meant "newest in
+this scope" to `status` (`main.rs::latest_run`) and "newest across every scope"
+to `verdict` (`verdict.rs::resolve_latest_run`), so the two verbs could land on
+different runs from the same directory. 58 call sites across 14 files.
+
+The operator-visible result was a closed loop between the two most-used
+orientation verbs, reachable in thirty seconds on a clean checkout:
+
+```
+$ deadreckon status
+error: not found: latest run for current project (deadreckon-6283b242)
+  hint: try: run `deadreckon list` to find valid run ids or config keys
+$ deadreckon list
+0c11f68e  pending  orchestrate  full-plan  fork  Build from review shorthand
+Recommended
+deadreckon status latest        <- refuses identically
+$ deadreckon status 0c11f68e    <- an id `list` just printed
+error: not found: run 0c11f68e  <- false: the id exists, it is a plan
+```
+
+### 56.2 `ResolvedRef` and the acceptance matrix
+
+`commands/reference.rs` is the only module that answers "what does this
+reference name?". `ResolvedRef` is `Run | PlanChild | Plan | Chain | Campaign`.
+`VERB_REF_SPECS` declares what each of the 18 id-taking verbs accepts, and
+`RefQuery` deliberately has **no** `accepts` field: a verb's accepted kinds are
+derived from its name via that table, so the matrix the tests iterate is the one
+the code obeys. Carrying `accepts` at the call site was a second source of truth
+that could drift — the same shape of defect this section removes.
+
+### 56.3 Probe order, prefix rule, ambiguity
+
+Plan-child refs are checked first on *syntax*, not precedence: they contain `:`
+or `/`, which a bare id never does. Every other kind is then probed — regardless
+of what the verb accepts — and all matches are collected. `accepts` narrows the
+decision, not the probe; probing only the accepted kinds is exactly what
+produced `not found: run 0c11f68e` for an id that existed.
+
+Exactly one match resolves. Two or more is a cross-kind ambiguity refusal naming
+both full ids, because resolving it by verb would be guessing which the operator
+meant. Within-kind ambiguity passes the loader's own candidate-id text through
+`ambiguous_within_kind`, which always attaches a runnable `try:`.
+
+### 56.4 One `latest`
+
+`latest` / `last` / no argument all mean: the most recently updated item, among
+the kinds the verb accepts, in the current scope; `--all` widens scope and
+changes nothing else. Scope comes from the fields `list` already uses
+(`PipelineState::scope`, `Plan::parent_scope`, `Chain::scope`) and the ordering
+key matches `list_plan_entries`, so `latest` resolves to what `list` puts at the
+top. Campaigns carry no scope of their own and are therefore candidates only
+under `--all`; they stay resolvable by explicit id everywhere.
+
+`verdict latest` became scope-bound as a result. `verdict --all` already means
+"compare several recent runs", so there is no widening flag for it — the open
+question of one uniform widening spelling is in V1-CANDIDATES.
+
+### 56.5 Kind-aware refusals and the no-loop invariant
+
+`refusal_for` is the one place a wrong-kind refusal is written. Every message
+names the reference, the kind it actually is, and one command that accepts that
+kind: `0c11f68e is a plan, not a run` + `try: deadreckon show 0c11f68e`.
+`deadreckon list` is deliberately absent from wrong-kind refusals — an id that
+came from `list` must never be sent back to `list`. It remains legal for typos
+and ambiguity, which are references `list` did not hand over.
+
+### 56.6 The cross-verb journey test
+
+`docs/FRIENDLINESS-AUDIT.md` scored `status` and `verdict` as **pass** on
+"Refuse with try:", citing the exact lines that formed the loop. Both verbs were
+individually well-behaved; a per-verb matrix structurally cannot express "the
+command this refusal names must accept this id".
+
+`tests/coherence.rs` holds that sentence as a test. For every id `list` prints,
+each of `status`, `show`, `verdict`, `attach`, `finish`, `kill` must either
+succeed or refuse with a next command that is not `list` and that itself accepts
+the id. `assert_refusal_leads_somewhere` accepts either of the codebase's two
+idioms — a `try:` footer or a `VerdictSurface` `Recommended` line.
+`every_id_taking_verb_declares_its_accepted_kinds` and
+`every_verb_used_in_source_is_listed_in_the_acceptance_table` are the structural
+guards against a sixth cascade growing back.
+
+### 56.7 List folding and the secondary-action cap
+
+One plan with six children rendered as seven peer rows, each repeating the
+parent's four-line goal, each child's goal column carrying the launch prompt
+("This is one full-plan child run in a larger plan. Root goal: ..."). Children
+now fold under their parent and show `PlanTask::subject` — the operator-
+meaningful name for that work — rather than a parsed prompt. A child whose
+parent is not in the listing stays top-level. `list --json` stays flat.
+
+`VerdictSurface::try_new` caps secondary actions at `MAX_SECONDARY_ACTIONS` (3),
+spending the last slot on `deadreckon help-all` so truncation never implies
+there is nothing else. `doctor` printed ten; it inherits the cap without any
+doctor-specific code.
+
+### 56.8 V1 boundaries
+
+Out of scope and logged in `docs/V1-CANDIDATES.md`: a uniform scope-widening
+flag across verbs, giving campaigns a real scope (a schema change), `list --json`
+folding, a `RunView`-backed projection for plans/chains/campaigns, verb
+namespacing, and a durable id index.
+
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*
+---
+
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs; the last broad source audit remains the 2026-05-26 agent-team pass. Line numbers are best-effort locators — small, stable files (`state.rs`, `lock.rs`, `gate.rs`, `http.rs`, `commands.rs`, `process.rs`) are kept current, while `main.rs` (~11.9k lines after decomposition) and `turn_loop.rs`/`cli.rs` cite approximate positions or symbol names; always cross-check against the code before relying on a specific line.*

@@ -8,6 +8,17 @@ Legend: `pass` means the current surface satisfies the clause, `fail` means it i
 part of the Effortless backlog, and `n-a` means the clause does not apply to that
 verb.
 
+> **This table scores each verb alone, and that is its blind spot.** Shakedown
+> (AS-BUILT §56) found `status` and `verdict` both scoring **pass** on "Refuse
+> with try:" — accurately — while together forming a closed loop: `status`
+> refused and named `list`, `list` recommended `status latest`, and that refused
+> identically. No per-verb clause can express *the command a refusal names must
+> accept the id it was given*, because that is a property of a pair of verbs.
+> That sentence now lives in `tests/coherence.rs` as the cross-verb journey
+> test, and the structural guards beside it. Read this table as necessary, not
+> sufficient: a row can be honestly green while the surface is broken between
+> rows.
+
 | Verb | Clause | Status | Note |
 |---|---|---|---|
 | `init` | Auto-detect, don't ask | pass | Detects subscription CLIs during setup and offers the obvious provider path. |
@@ -252,7 +263,7 @@ verb.
 | `history` | Lifecycle hint | pass | Help points at show/import. |
 | `status` | Auto-detect, don't ask | pass | Defaults to latest/current-scope run or plan. |
 | `status` | Preview before mutate | n-a | Read-only orientation. |
-| `status` | Refuse with try: | pass | Missing state points at start/list. |
+| `status` | Refuse with try: | pass | Resolves every kind (Shakedown §56); missing state points at `start` when the machine is empty and `list --all` when other projects have work — never back at `list` for an id `list` printed. |
 | `status` | One-command rollback | n-a | Read-only orientation. |
 | `status` | One verdict + ONE primary action | pass | Status now prints one primary action before secondary lifecycle actions. |
 | `status` | Lifecycle hint | pass | Status includes natural next commands. |
@@ -264,7 +275,7 @@ verb.
 | `import` | Lifecycle hint | pass | Help points at show. |
 | `verdict` | Auto-detect, don't ask | pass | Defaults to the latest run; no prompt when the run is implied or named. |
 | `verdict` | Preview before mutate | n-a | Read-only report; it never mutates run state. |
-| `verdict` | Refuse with try: | pass | Unknown or ambiguous run ids refuse with a `deadreckon list` retry. |
+| `verdict` | Refuse with try: | pass | A plan or chain id refuses by kind and names `show` (Shakedown §56); `list` remains the retry only for genuine typos and ambiguous prefixes, which are references `list` did not hand over. |
 | `verdict` | One-command rollback | n-a | Read-only; there is nothing to roll back. |
 | `verdict` | One verdict + ONE primary action | pass | Renders through VerdictSurface with one state and one primary next action. |
 | `verdict` | Lifecycle hint | pass | Points at finish or resume depending on the verdict. |
