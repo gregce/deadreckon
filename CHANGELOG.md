@@ -1,5 +1,56 @@
 # Changelog
 
+## Shakedown (stable) — one reference resolver — 2026-07-24
+
+Every id-taking verb hand-rolled its own resolution cascade, and no two covered
+the same kinds in the same order, so the five commands the README calls "the
+whole tool" contradicted each other. `deadreckon status` refused and pointed at
+`deadreckon list`; `list` printed plan ids and recommended `status latest`; and
+`status <that id>` answered `not found: run 0c11f68e` — false, because the id
+existed and was simply a plan. One `resolve_ref` now answers "what does this
+reference name?" for all 18 id-taking verbs, `latest` means one thing, and a
+cross-verb journey test pins the invariant a per-verb audit structurally cannot
+express.
+
+Every implementation phase passed `make verify`:
+
+- P1 (`e402b12`): added `commands/reference.rs` with `ResolvedRef`, the probe
+  order and both ambiguity refusals; moved `resolve_plan_id` and
+  `resolve_plan_child_ref` out of `main.rs` without changing a call site.
+  Revised the rider's first-match-wins probe order — it would have resolved a
+  prefix matching both a run and a plan silently to the run.
+- P2 (`292cd68`): collapsed `latest_run` (scope-bound) and
+  `resolve_latest_run` (all-scopes) into one rule that resolves to whatever
+  `list` puts at the top. `verdict latest` became scope-bound as a result.
+- P3 (`7fcc4c6`): added the refusal table and `VERB_REF_SPECS`. Every kind is
+  now probed regardless of `accepts`, so a plan id refuses as a plan instead of
+  being reported as a missing run.
+- P4 (`e006eb1`): rewired `status` across every kind, reusing `show`'s
+  renderers. Closes the reproduction.
+- P5 (`84655e2`): `verdict` and `report` refuse by kind and name `show`; fixed
+  a regression where routing through `probe_run` dropped the `try:` footer from
+  ambiguity refusals.
+- P6 (`5bc6c0d`): `show` and `attach` moved onto the resolver with the
+  characterization goldens unchanged; `show` gained chains.
+- P7 (`16068ad`): `kill` gained plan-child refs; `steer`, `resume`, `undo`,
+  `rewind` and `merge` refuse by kind. `finish`/`doc` kept their plan-to-result-
+  run mapping, which is a feature rather than a guessing cascade.
+- P8 (`da7be1a`): deleted `load_cli_run`, `load_cli_run_with_scope`,
+  `latest_run`, `resolve_verdict_run` and `resolve_latest_run`. Removed
+  `RefQuery::accepts` so the acceptance table is load-bearing rather than
+  test-only; the honesty test for it immediately found four verbs silently
+  defaulting.
+- P9 (`b0e38eb`): `list` shows one row per plan with children folded beneath,
+  showing the task subject instead of the launch prompt they were handed.
+- P10 (`b23d593`): capped secondary actions at three in
+  `VerdictSurface::try_new`, with a `help-all` pointer when any were dropped.
+  `doctor` went from ten to three. The cap then exposed two surfaces that had
+  never had to prioritise: a paused chain listed its recovery actions last and
+  lost `undo`, and `detect` was carrying per-provider install commands as
+  actions rather than as evidence.
+- P11: documented AS-BUILT §56, corrected the per-verb blind spot note in
+  `FRIENDLINESS-AUDIT.md`, and recorded V1 boundaries.
+
 ## Keel (stable) — one protocol crate under the ledgers — 2026-07-20
 
 - `deadreckon-protocol` owns every persisted ledger line type as one tagged
