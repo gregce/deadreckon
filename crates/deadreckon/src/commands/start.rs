@@ -380,12 +380,32 @@ fn start_auto_mode_decision(
     )
 }
 
+/// Auto mode always classifies.
+///
+/// This used to require an interactive terminal, `--preview`, or `--json`, so
+/// `deadreckon start "goal" --yes --plain` — the unattended path this tool
+/// exists for — never classified at all and always fell to the conservative
+/// floor. The deterministic ladder is free and instant, so there is no reason
+/// to withhold it from a scripted launch; only the provider call is gated,
+/// and that gating lives in `start_goal_shape_provider_route`.
 fn start_goal_shape_should_classify(
+    args: &StartCommandArgs,
+    _eligibility: StartPromptEligibility,
+) -> bool {
+    matches!(args.mode, crate::cli::CliStartMode::Auto)
+}
+
+/// Whether to spend a provider call refining the ladder's answer.
+///
+/// The ladder runs either way. This only decides whether a bounded, read-only
+/// planning call is worth making: it is when the operator is watching or
+/// asking for a preview, and when they explicitly named a provider for an
+/// unattended launch.
+fn start_should_ask_provider_for_shape(
     args: &StartCommandArgs,
     eligibility: StartPromptEligibility,
 ) -> bool {
-    matches!(args.mode, crate::cli::CliStartMode::Auto)
-        && (eligibility.allows_prompts() || args.preview || args.json)
+    eligibility.allows_prompts() || args.preview || args.json || args.provider.is_some()
 }
 
 fn start_goal_shape_provider_route(
@@ -543,9 +563,11 @@ pub(crate) fn ladder_goal_shape_recommendation(
         // The ladder decides shape and n from measured signals; it does not
         // author node goals, so plan creation falls back to its own planner.
         pieces: Vec::new(),
-        // The deterministic floor never asks for incremental landing; that is
-        // a spend-and-risk choice the classifier or the operator makes.
-        apply: deadreckon_core::plan::ApplyWhen::AtEnd,
+        // The ladder does ask for incremental landing, but only when the goal
+        // spells out an order ("migrate, then update, then delete"). Ordering
+        // is a structural fact in the text, not a spend gamble — and it is the
+        // one shape `start` previously could not reach at all.
+        apply: ladder.apply,
     }
 }
 
@@ -2604,7 +2626,9 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     let eligibility = StartPromptEligibility::from_args(&args, stdin_is_tty);
     if start_goal_shape_should_classify(&args, eligibility) {
         let defaults = config_defaults(&paths)?;
-        let provider = start_goal_shape_provider_route(&paths, &defaults, &args);
+        let provider = start_should_ask_provider_for_shape(&args, eligibility)
+            .then(|| start_goal_shape_provider_route(&paths, &defaults, &args))
+            .flatten();
         let recommendation = classify_goal_shape_for_start(
             &paths,
             &cwd,
