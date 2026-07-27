@@ -420,6 +420,11 @@ pub struct Plan {
     /// bounds nesting depth; see [`MAX_SUBPLAN_DEPTH`].
     #[serde(default)]
     pub parent_plan_id: Option<String>,
+    /// The process supervising this plan's fork, while one is. A Forked plan
+    /// whose conductor is dead is resumable; one whose conductor is alive is
+    /// not — the same liveness model chain's conductor uses.
+    #[serde(default)]
+    pub conductor_pid: Option<u32>,
     pub status: PlanStatus,
     pub created_at: DateTime<Utc>,
     pub forked_at: Option<DateTime<Utc>>,
@@ -458,6 +463,7 @@ impl Plan {
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             circuit_breaker_threshold: DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
             parent_plan_id: None,
+            conductor_pid: None,
             status: PlanStatus::Pending,
             created_at: Utc::now(),
             forked_at: None,

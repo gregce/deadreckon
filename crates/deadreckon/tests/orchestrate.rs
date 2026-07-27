@@ -7565,6 +7565,136 @@ fn git_stdout_count(repo: &std::path::Path) -> usize {
         .expect("count")
 }
 
+/// A crashed fork used to be unrecoverable: the plan sat Forked forever and
+/// fork refused re-entry. With the conductor pid recorded and attempts
+/// durable, a dead conductor's plan resumes — the orphaned child's failure is
+/// adopted as a recorded attempt and the retry machinery takes it from there.
+#[test]
+fn fork_resumes_after_a_lost_conductor_and_finishes_the_plan() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny resumable work",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+
+    // Simulate the crash: the plan is mid-fork on disk, its conductor pid
+    // belongs to a process that no longer exists, and task-0 was running a
+    // child whose run failed its gate just before the lights went out.
+    let mut dead = Command::new("true").spawn().expect("spawn");
+    let dead_pid = dead.id();
+    dead.wait().expect("wait");
+    let mut orphan = create_test_run(
+        &paths,
+        &repo,
+        "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "orphaned child work",
+    );
+    orphan.status = RunStatus::Failed;
+    orphan.failure_reason = Some("acceptance failed after turn 2: check failed".to_string());
+    save_state(&orphan).expect("orphan state");
+    plan.status = PlanStatus::Forked;
+    plan.conductor_pid = Some(dead_pid);
+    plan.tasks[0].status = PlanTaskStatus::Running;
+    plan.tasks[0].child_run_id = Some(orphan.run_id.clone());
+    save_plan(&paths, &plan).expect("crashed plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--plain"])
+        .output()
+        .expect("fork resume");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("resumed plan"), "{out}");
+    let finished = load_plan(&paths, &plan.plan_id).expect("plan");
+    assert!(
+        finished
+            .tasks
+            .iter()
+            .all(|task| task.status == PlanTaskStatus::Completed),
+        "{finished:?}"
+    );
+    assert_eq!(
+        finished.tasks[0].attempts.len(),
+        1,
+        "the orphan's failure is on the trail: {:?}",
+        finished.tasks[0].attempts
+    );
+    assert_eq!(
+        finished.tasks[0].attempts[0].run_id.as_deref(),
+        Some(orphan.run_id.as_str()),
+    );
+    assert_ne!(
+        finished.tasks[0].child_run_id.as_deref(),
+        Some(orphan.run_id.as_str()),
+        "the retry was a fresh run"
+    );
+    assert_eq!(finished.conductor_pid, None, "a finished fork holds no pid");
+}
+
+/// Two supervisors over one plan is the failure mode resume must not create:
+/// a live conductor refuses the second fork outright.
+#[test]
+fn fork_refuses_to_resume_under_a_live_conductor() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "tiny guarded work",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+
+    let mut live = Command::new("sleep").arg("60").spawn().expect("sleep");
+    plan.status = PlanStatus::Forked;
+    plan.conductor_pid = Some(live.id());
+    plan.tasks[0].status = PlanTaskStatus::Running;
+    save_plan(&paths, &plan).expect("supervised plan");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--plain"])
+        .output()
+        .expect("fork refusal");
+
+    live.kill().ok();
+    live.wait().ok();
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(err.contains("already being supervised"), "{err}");
+    assert!(err.contains("deadreckon attach"), "{err}");
+}
+
 fn clean_git_repo(temp: &TempDir) -> PathBuf {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");

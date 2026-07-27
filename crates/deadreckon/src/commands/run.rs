@@ -20,6 +20,7 @@ pub(crate) async fn run_command_with_launch_plan(
 ) -> Result<()> {
     let RunCommandArgs {
         goal,
+        tamper_baseline,
         fresh,
         worktree,
         from,
@@ -336,6 +337,10 @@ pub(crate) async fn run_command_with_launch_plan(
         },
     )?;
     commands::course::save_launch_plan_best_effort(&state.run_root, &launch_plan);
+    if let Some(baseline) = tamper_baseline.as_deref() {
+        deadreckon_core::tamper::write_tamper_baseline(&state.run_root, baseline)
+            .map_err(CliError::Core)?;
+    }
     if let Some(source_path) = codebase
         .source_path
         .as_ref()
