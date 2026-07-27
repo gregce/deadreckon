@@ -499,12 +499,19 @@ fn plan_tasks_from_seed(
             PlanRole::Child,
             provider,
         );
-        task.depends_on = piece
-            .depends_on
-            .iter()
-            .filter_map(|dependency| positions.get(dependency.as_str()).cloned())
-            .filter(|dependency| dependency != &task.task_id)
-            .collect();
+        // An edge naming a piece that is not in this seed means the ordering
+        // was damaged upstream (n-clamping can truncate the piece an edge
+        // points at). Silently dropping the edge would run dependent work in
+        // parallel with the thing it depends on; the whole seed is rejected
+        // instead and the planner fallback re-plans from scratch.
+        let mut depends_on = Vec::new();
+        for dependency in &piece.depends_on {
+            let resolved = positions.get(dependency.as_str())?;
+            if resolved != &task.task_id {
+                depends_on.push(resolved.clone());
+            }
+        }
+        task.depends_on = depends_on;
         tasks.push(task);
     }
     // A seed that does not form a valid DAG is discarded wholesale rather than
@@ -2251,7 +2258,31 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                         // work against the same conflict, so the plan halts
                         // with the reason instead, leaving earlier nodes
                         // applied and the rest unstarted.
-                        if let Err(error) = apply_node(&paths, &plan, task_index, &run_id) {
+                        // Landing is git work — sync process spawns — and this
+                        // loop runs on the async runtime; landing inline would
+                        // stall progress ticks and signal draining for its
+                        // duration.
+                        let apply_result = {
+                            let paths_for_apply = paths.clone();
+                            let plan_for_apply = plan.clone();
+                            let run_for_apply = run_id.clone();
+                            tokio::task::spawn_blocking(move || {
+                                apply_node(
+                                    &paths_for_apply,
+                                    &plan_for_apply,
+                                    task_index,
+                                    &run_for_apply,
+                                )
+                            })
+                            .await
+                            .map_err(|join| {
+                                CliError::Core(DeadreckonError::InvalidInput(format!(
+                                    "landing task panicked: {join}"
+                                )))
+                            })
+                            .and_then(|result| result)
+                        };
+                        if let Err(error) = apply_result {
                             let reason = error.to_string();
                             append_plan_event(
                                 &paths,
@@ -4698,6 +4729,16 @@ mod seed_graph_tests {
     #[test]
     fn a_seed_with_an_empty_goal_is_refused() {
         let seed = [piece("p1", "one", &[]), piece("p2", "   ", &[])];
+
+        assert!(plan_tasks_from_seed(&seed, 2, &providers(), &BTreeMap::new()).is_none());
+    }
+
+    /// An edge naming a piece not in the seed (n-clamping can truncate the
+    /// piece an edge points at) rejects the whole seed. Silently dropping the
+    /// edge would run dependent work in parallel with its dependency.
+    #[test]
+    fn a_seed_with_a_dangling_edge_is_refused() {
+        let seed = [piece("p1", "one", &[]), piece("p2", "two", &["p7"])];
 
         assert!(plan_tasks_from_seed(&seed, 2, &providers(), &BTreeMap::new()).is_none());
     }

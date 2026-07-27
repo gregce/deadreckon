@@ -9565,17 +9565,30 @@ async fn resume_command(
 /// this dispatch was missing.
 fn undo_command(run: Option<&str>, turn: Option<u32>) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    if let Ok(commands::reference::ResolvedRef::Chain(chain)) = commands::reference::resolve_ref(
+    // One resolution, one dispatch by kind — the same shape every other
+    // id-taking verb uses.
+    let resolved = commands::reference::resolve_ref(
         &paths,
         commands::reference::RefQuery {
             reference: run,
             all_scopes: false,
             verb: "undo",
         },
-    ) {
-        return commands::chain::chain_undo_command(&paths, &chain.chain_id, turn, false);
-    }
-    let state = commands::reference::resolve_run_like(&paths, run, "undo")?;
+    )?;
+    let state = match resolved {
+        commands::reference::ResolvedRef::Chain(chain) => {
+            return commands::chain::chain_undo_command(&paths, &chain.chain_id, turn, false);
+        }
+        commands::reference::ResolvedRef::Run(state) => *state,
+        commands::reference::ResolvedRef::PlanChild { state, .. } => *state,
+        other => {
+            return Err(commands::reference::refusal_for(
+                other.kind(),
+                "undo",
+                &commands::reference::resolved_id(&other),
+            ));
+        }
+    };
     let target_turn = turn.unwrap_or_else(|| state.turn.saturating_sub(1));
     let restore_state = undo_restore_state(&state)?;
     restore_snapshot(&restore_state, target_turn)?;
