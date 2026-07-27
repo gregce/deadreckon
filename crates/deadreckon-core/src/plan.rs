@@ -243,6 +243,11 @@ impl TaskAttempt {
     }
 
     /// A finished attempt that did not satisfy the done contract.
+    ///
+    /// Stamps both endpoints with the recording time. When the attempt has a
+    /// real run behind it, the caller overrides `started_at`/`finished_at`
+    /// from the run's own state — otherwise durations read as zero, which
+    /// deliberately under-counts (see `attempts_wall_seconds`).
     pub fn failed(
         attempt: u32,
         run_id: Option<String>,
@@ -355,6 +360,21 @@ impl PlanTask {
     /// Everything this node has spent across all of its attempts.
     pub fn attempts_spend_usd(&self) -> f64 {
         self.attempts.iter().map(|attempt| attempt.spend_usd).sum()
+    }
+
+    /// Wall-clock seconds this node has consumed across all attempts, from
+    /// the attempts that recorded both endpoints. An attempt missing either
+    /// stamp contributes zero — undercounting keeps a retry possible, while
+    /// overcounting would refuse retries on missing data.
+    pub fn attempts_wall_seconds(&self) -> f64 {
+        self.attempts
+            .iter()
+            .filter_map(|attempt| {
+                let finished = attempt.finished_at?;
+                let elapsed = (finished - attempt.started_at).num_milliseconds();
+                (elapsed > 0).then_some(elapsed as f64 / 1000.0)
+            })
+            .sum()
     }
 }
 
