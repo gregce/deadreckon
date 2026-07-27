@@ -7455,6 +7455,116 @@ esac
     write_fake_cli_subagent_provider(paths, root, id, &script);
 }
 
+/// Retry and per-node apply, together — the composition the per-feature E2Es
+/// missed. A node fails its gate once (a flag file outside the repo makes the
+/// check fail exactly once), the plan retries it from a fresh branch off the
+/// tip rather than from the failed attempt's worktree, and both nodes land as
+/// commits in dependency order.
+#[test]
+fn a_per_node_plan_retries_a_failed_node_and_still_lands_everything() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    // The gate runs every turn, so a naive fail-once flag would heal inside
+    // attempt 1 (turn-loop healing working as designed). Keying on the
+    // working directory fails the whole first RUN instead: the first check
+    // records its tree, every check in that same tree keeps failing, and the
+    // retry's fresh worktree is a different tree and passes.
+    let flag = temp.path().join("first-attempt.tree");
+    fs::create_dir_all(repo.join(".deadreckon")).expect("dot dir");
+    fs::write(
+        repo.join(".deadreckon/acceptance.yaml"),
+        format!(
+            "name: fail-first-run\nchecks:\n  - kind: shell\n    command: \"test -f {flag} || pwd > {flag}; test \\\"$(cat {flag})\\\" != \\\"$(pwd)\\\"\"\n",
+            flag = flag.display()
+        ),
+    )
+    .expect("acceptance");
+    git(&repo, &["add", "-A"]).expect("add");
+    git(&repo, &["commit", "-m", "acceptance"]).expect("commit");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "plan",
+            "touch base twice",
+            "--planner-provider",
+            "smoke",
+            "--provider",
+            "smoke",
+            "--n",
+            "2",
+            "--quiet",
+        ])
+        .output()
+        .expect("plan");
+    assert_success(&output);
+    let mut plan = newest_plan(&paths);
+    plan.apply = deadreckon_core::plan::ApplyWhen::PerNode;
+    plan.on_fail = deadreckon_core::plan::OnFail::Stop;
+    plan.tasks[1].depends_on = vec![plan.tasks[0].task_id.clone()];
+    save_plan(&paths, &plan).expect("save per-node plan");
+
+    let before = git_stdout_count(&repo);
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["fork", &plan.plan_id[..8], "--sandbox", "none", "--plain"])
+        .output()
+        .expect("fork");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    assert!(out.contains("retry 2/"), "the failed node retried: {out}");
+    assert!(
+        out.matches("landed on the branch").count() == 2,
+        "both nodes landed: {out}"
+    );
+    let after = git_stdout_count(&repo);
+    assert_eq!(after, before + 2, "two commits stacked on the branch");
+    let forked = load_plan(&paths, &plan.plan_id).expect("plan");
+    assert!(
+        forked
+            .tasks
+            .iter()
+            .all(|task| task.status == PlanTaskStatus::Completed),
+        "{forked:?}"
+    );
+    // The trail records failed attempts; the run that counted is
+    // child_run_id. One recorded failure, and the surviving run is a
+    // different run than the one that failed.
+    assert_eq!(
+        forked.tasks[0].attempts.len(),
+        1,
+        "{:?}",
+        forked.tasks[0].attempts
+    );
+    let failed_run = forked.tasks[0].attempts[0]
+        .run_id
+        .as_deref()
+        .expect("failed attempt has a run");
+    let surviving_run = forked.tasks[0].child_run_id.as_deref().expect("result run");
+    assert_ne!(failed_run, surviving_run, "the retry was a fresh run");
+    assert!(
+        forked.tasks[0].attempts[0]
+            .finished_at
+            .is_some_and(|finished| finished > forked.tasks[0].attempts[0].started_at),
+        "the attempt records a real duration: {:?}",
+        forked.tasks[0].attempts[0]
+    );
+}
+
+fn git_stdout_count(repo: &std::path::Path) -> usize {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .expect("rev-list");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("count")
+}
+
 fn clean_git_repo(temp: &TempDir) -> PathBuf {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");

@@ -2102,6 +2102,10 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                                 run_id: Some(run_id.as_str()),
                                 failure_reason: state.failure_reason.clone(),
                                 spend_usd: state.total_spend_usd,
+                                max_spend,
+                                max_wall_seconds,
+                                run_started_at: Some(state.started_at),
+                                run_finished_at: Some(state.updated_at),
                                 consecutive_failures: &mut consecutive_failures,
                                 halt: &mut halt,
                                 quiet,
@@ -2219,6 +2223,10 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                         run_id: None,
                         failure_reason: Some(error.to_string()),
                         spend_usd: 0.0,
+                        max_spend,
+                        max_wall_seconds,
+                        run_started_at: None,
+                        run_finished_at: None,
                         consecutive_failures: &mut consecutive_failures,
                         halt: &mut halt,
                         quiet,
@@ -2382,10 +2390,45 @@ struct RecordNodeFailure<'a> {
     run_id: Option<&'a str>,
     failure_reason: Option<String>,
     spend_usd: f64,
+    /// The per-node caps the operator confirmed on the preflight. Retries
+    /// spend what remains under them, never a fresh allowance.
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    /// The failed run's own lifecycle stamps, when it got far enough to have
+    /// them. Without these an attempt's duration reads as zero.
+    run_started_at: Option<DateTime<Utc>>,
+    run_finished_at: Option<DateTime<Utc>>,
     consecutive_failures: &'a mut u32,
     halt: &'a mut Option<String>,
     quiet: bool,
     plain: bool,
+}
+
+/// Floors keep a retry from launching with a budget too small to do anything
+/// but fail again — a $0.001 run is a wasted spawn, not a second chance.
+const MIN_RETRY_SPEND_USD: f64 = 0.01;
+const MIN_RETRY_WALL_SECONDS: f64 = 5.0;
+
+/// What a cap has left for another attempt. Uncapped and exhausted are
+/// different answers and must not share a representation: one launches a
+/// retry with no limit, the other refuses it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RetryBudget {
+    Uncapped,
+    Remaining(f64),
+    Exhausted,
+}
+
+fn remaining_retry_budget(cap: Option<f64>, spent: f64, floor: f64) -> RetryBudget {
+    let Some(cap) = cap else {
+        return RetryBudget::Uncapped;
+    };
+    let remaining = (cap - spent).max(0.0);
+    if remaining >= floor {
+        RetryBudget::Remaining(remaining)
+    } else {
+        RetryBudget::Exhausted
+    }
 }
 
 /// Record a failed attempt and decide whether the node gets another run.
@@ -2401,6 +2444,10 @@ fn record_node_failure(context: RecordNodeFailure<'_>) -> Result<NodeFailureOutc
         run_id,
         failure_reason,
         spend_usd,
+        max_spend,
+        max_wall_seconds,
+        run_started_at,
+        run_finished_at,
         consecutive_failures,
         halt,
         quiet,
@@ -2414,20 +2461,101 @@ fn record_node_failure(context: RecordNodeFailure<'_>) -> Result<NodeFailureOutc
     let task_id = plan.tasks[task_index].task_id.clone();
 
     let attempt_number = plan.tasks[task_index].attempts_used() + 1;
-    plan.tasks[task_index]
-        .attempts
-        .push(deadreckon_core::plan::TaskAttempt::failed(
-            attempt_number,
-            run_id.map(ToString::to_string),
-            failure_reason.clone(),
-            spend_usd,
-        ));
+    let mut attempt = deadreckon_core::plan::TaskAttempt::failed(
+        attempt_number,
+        run_id.map(ToString::to_string),
+        failure_reason.clone(),
+        spend_usd,
+    );
+    // The constructor stamps recording time; a run that existed knows better.
+    if let Some(started) = run_started_at {
+        attempt.started_at = started;
+    }
+    if let Some(finished) = run_finished_at {
+        attempt.finished_at = Some(finished);
+    }
+    plan.tasks[task_index].attempts.push(attempt);
 
     let reason =
         failure_reason.unwrap_or_else(|| "child did not satisfy the done contract".to_string());
 
+    // A subplan node never retries. Its inner nodes already got their own
+    // retries, and re-running `fork` on a child plan that is now Forked or
+    // Failed is refused on arrival — the retry would burn an attempt on a
+    // guaranteed error.
+    let retry_refusal: Option<String> = if plan.tasks[task_index].subplan.is_some() {
+        Some("subplan nodes do not retry; their inner nodes already did".to_string())
+    } else if remaining_retry_budget(
+        max_spend,
+        plan.tasks[task_index].attempts_spend_usd(),
+        MIN_RETRY_SPEND_USD,
+    ) == RetryBudget::Exhausted
+    {
+        Some(format!(
+            "spend cap exhausted: ${spent:.2} of ${cap:.2} used across {attempt_number} attempt(s)",
+            spent = plan.tasks[task_index].attempts_spend_usd(),
+            cap = max_spend.unwrap_or_default(),
+        ))
+    } else if remaining_retry_budget(
+        max_wall_seconds,
+        plan.tasks[task_index].attempts_wall_seconds(),
+        MIN_RETRY_WALL_SECONDS,
+    ) == RetryBudget::Exhausted
+    {
+        Some(format!(
+            "wall cap exhausted: {spent:.0}s of {cap:.0}s used across {attempt_number} attempt(s)",
+            spent = plan.tasks[task_index].attempts_wall_seconds(),
+            cap = max_wall_seconds.unwrap_or_default(),
+        ))
+    } else {
+        None
+    };
+    if let Some(refusal) = retry_refusal {
+        append_plan_message(
+            paths,
+            &plan_id,
+            &PlanMessage::new(
+                "coordinator",
+                &task_id,
+                PlanMessageKind::Blocker,
+                format!("{task_id} retry refused: {refusal}"),
+                json!({ "task_index": task_index, "attempt": attempt_number, "reason": refusal }),
+            )?,
+        )?;
+        *consecutive_failures += 1;
+        if halt.is_none() {
+            if threshold > 0 && *consecutive_failures >= threshold {
+                append_plan_event(
+                    paths,
+                    &plan_id,
+                    PlanEventKind::CircuitBreakerTripped {
+                        consecutive_failures: *consecutive_failures,
+                        threshold,
+                    },
+                )?;
+                *halt = Some(format!(
+                    "circuit breaker: {consecutive} nodes failed in a row (threshold {threshold})",
+                    consecutive = *consecutive_failures
+                ));
+            } else if on_fail == OnFail::Stop {
+                *halt = Some(format!(
+                    "{task_id} failed and the plan's failure policy is stop"
+                ));
+            }
+        }
+        return Ok(NodeFailureOutcome::Exhausted);
+    }
+
     if plan.tasks[task_index].may_retry(max_attempts) {
         let next_attempt = attempt_number + 1;
+        // Only an at-end retry resumes the failed run's tree; a per-node
+        // retry re-branches from the tip (see plan_child_source_dir), so
+        // claiming "continuing <run>" there would be false.
+        let continues_run = if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode {
+            None
+        } else {
+            run_id.map(ToString::to_string)
+        };
         // Back to Pending so the fork loop relaunches it; child_argv reads the
         // recorded attempt to extend the failed run rather than start over.
         mark_plan_task_status(plan, task_index, PlanTaskStatus::Pending)?;
@@ -2440,7 +2568,7 @@ fn record_node_failure(context: RecordNodeFailure<'_>) -> Result<NodeFailureOutc
                 attempt: next_attempt,
                 max_attempts,
                 reason: reason.clone(),
-                parent_run_id: run_id.map(ToString::to_string),
+                parent_run_id: continues_run.clone(),
             },
         )?;
         append_plan_message(
@@ -2456,7 +2584,7 @@ fn record_node_failure(context: RecordNodeFailure<'_>) -> Result<NodeFailureOutc
                     "attempt": next_attempt,
                     "max_attempts": max_attempts,
                     "reason": reason,
-                    "parent_run_id": run_id,
+                    "parent_run_id": continues_run,
                 }),
             )?,
         )?;
@@ -2466,7 +2594,7 @@ fn record_node_failure(context: RecordNodeFailure<'_>) -> Result<NodeFailureOutc
                 next_attempt,
                 max_attempts,
                 &reason,
-                run_id,
+                continues_run.as_deref(),
                 plain,
             );
         }
@@ -2896,6 +3024,15 @@ async fn plan_child_source_dir(
 ) -> Result<PathBuf> {
     let task = &plan.tasks[task_index];
     let plan_cwd = plan.parent_cwd.as_deref().unwrap_or(parent_cwd);
+    // Per-node wins over retry-resume. A per-node child branches off the
+    // parent repo with --worktree --base, so "resume the failed attempt's
+    // tree" would mean creating a worktree from inside another run's worktree
+    // against a base measured elsewhere — incoherent. The branch already holds
+    // every landed node; a per-node retry re-branches from the tip and the
+    // gate complaint in its prompt carries what to fix.
+    if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode {
+        return Ok(plan_cwd.to_path_buf());
+    }
     // A retry resumes from the tree the failed attempt left behind, so the
     // agent fixes its own near-miss rather than starting the node over. Falls
     // back to the normal source when that run is unreadable (or the attempt
@@ -2905,12 +3042,6 @@ async fn plan_child_source_dir(
         && parent_state.working_dir.is_dir()
     {
         return Ok(parent_state.working_dir);
-    }
-    if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode {
-        // Earlier nodes have already landed on this branch, so the parent repo
-        // *is* the composed source. Composing dependency artifacts here would
-        // reapply work that is already present.
-        return Ok(plan_cwd.to_path_buf());
     }
     if task.depends_on.is_empty() {
         return Ok(plan_cwd.to_path_buf());
@@ -3431,6 +3562,26 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
             quiet,
         );
     }
+    // The preflight the operator confirmed says "$X per child" — per child,
+    // not per attempt. A retry gets whatever the cap has left after the
+    // attempts before it; record_node_failure already refused the retry when
+    // that remainder fell under the floor, so Exhausted here only defends
+    // against a race and clamps to the floor rather than a fresh allowance.
+    let max_spend =
+        match remaining_retry_budget(max_spend, task.attempts_spend_usd(), MIN_RETRY_SPEND_USD) {
+            RetryBudget::Uncapped => None,
+            RetryBudget::Remaining(remaining) => Some(remaining),
+            RetryBudget::Exhausted => Some(MIN_RETRY_SPEND_USD),
+        };
+    let max_wall_seconds = match remaining_retry_budget(
+        max_wall_seconds,
+        task.attempts_wall_seconds(),
+        MIN_RETRY_WALL_SECONDS,
+    ) {
+        RetryBudget::Uncapped => None,
+        RetryBudget::Remaining(remaining) => Some(remaining),
+        RetryBudget::Exhausted => Some(MIN_RETRY_WALL_SECONDS),
+    };
     let worker_spec_path = paths.worker_spec(&plan.plan_id, &task.task_id);
     let worker_spec = render_launch_worker_spec(paths, plan, task);
     write_worker_spec(paths, &plan.plan_id, &task.task_id, &worker_spec)?;
@@ -3851,6 +4002,198 @@ mod tests {
     #[test]
     fn parse_planner_response_rejects_non_json() {
         assert!(parse_planner_response("I could not produce a plan.").is_err());
+    }
+}
+
+#[cfg(test)]
+mod retry_gate_tests {
+    use super::{
+        MIN_RETRY_SPEND_USD, NodeFailureOutcome, RecordNodeFailure, RetryBudget,
+        record_node_failure, remaining_retry_budget,
+    };
+    use chrono::{Duration, Utc};
+    use deadreckon_core::plan::{Plan, PlanMode, PlanProviders, PlanRole, PlanTask, TaskAttempt};
+    use deadreckon_core::{DeadreckonPaths, read_plan_events, read_plan_messages};
+
+    fn plan_on_disk(paths: &DeadreckonPaths) -> Plan {
+        let plan = Plan::new(
+            "goal",
+            PlanMode::FullPlan,
+            vec![
+                PlanTask::new(0, "one", "do one", PlanRole::Child, None),
+                PlanTask::new(1, "two", "do two", PlanRole::Child, None),
+            ],
+            PlanProviders::default(),
+            None,
+            "test",
+        )
+        .expect("plan");
+        std::fs::create_dir_all(paths.plan_dir(&plan.plan_id)).expect("plan dir");
+        plan
+    }
+
+    fn record(
+        paths: &DeadreckonPaths,
+        plan: &mut Plan,
+        spend_usd: f64,
+        max_spend: Option<f64>,
+    ) -> NodeFailureOutcome {
+        let mut consecutive_failures = 0;
+        let mut halt = None;
+        record_node_failure(RecordNodeFailure {
+            paths,
+            plan,
+            task_index: 0,
+            run_id: Some("run-1"),
+            failure_reason: Some("acceptance failed".to_string()),
+            spend_usd,
+            max_spend,
+            max_wall_seconds: None,
+            run_started_at: None,
+            run_finished_at: None,
+            consecutive_failures: &mut consecutive_failures,
+            halt: &mut halt,
+            quiet: true,
+            plain: true,
+        })
+        .expect("record")
+    }
+
+    #[test]
+    fn uncapped_exhausted_and_remaining_are_three_different_answers() {
+        assert_eq!(
+            remaining_retry_budget(None, 100.0, 0.01),
+            RetryBudget::Uncapped
+        );
+        assert_eq!(
+            remaining_retry_budget(Some(5.0), 2.0, 0.01),
+            RetryBudget::Remaining(3.0)
+        );
+        assert_eq!(
+            remaining_retry_budget(Some(5.0), 4.995, 0.01),
+            RetryBudget::Exhausted
+        );
+        assert_eq!(
+            remaining_retry_budget(Some(5.0), 9.0, 0.01),
+            RetryBudget::Exhausted,
+            "overspend must not wrap into a fresh allowance"
+        );
+    }
+
+    /// The preflight says "$X per child" — per child, not per attempt. A node
+    /// whose attempts have consumed the cap gets no retry, and the refusal is
+    /// written to the trail rather than silently downgraded.
+    #[test]
+    fn a_node_that_spent_its_cap_gets_no_retry() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut plan = plan_on_disk(&paths);
+
+        assert_eq!(
+            record(&paths, &mut plan, 2.0, Some(5.0)),
+            NodeFailureOutcome::Retrying,
+            "with budget left the node retries"
+        );
+        assert_eq!(
+            record(&paths, &mut plan, 2.995, Some(5.0)),
+            NodeFailureOutcome::Exhausted,
+            "the second failure leaves less than the floor"
+        );
+
+        let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+        let retries = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    deadreckon_core::PlanEventKind::TaskRetrying { .. }
+                )
+            })
+            .count();
+        assert_eq!(retries, 1, "only the affordable retry was offered");
+        let messages = read_plan_messages(&paths, &plan.plan_id).expect("messages");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.summary.contains("retry refused")
+                    && message.summary.contains("spend cap")),
+            "the refusal names the money: {messages:?}"
+        );
+    }
+
+    /// A subplan node never retries: re-running fork on a child plan that is
+    /// now Forked or Failed is refused on arrival, so the retry would burn an
+    /// attempt on a guaranteed error. Its inner nodes already got retries.
+    #[test]
+    fn a_subplan_node_is_exhausted_after_one_attempt() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut plan = plan_on_disk(&paths);
+        plan.tasks[0].subplan = Some("child-plan".to_string());
+
+        assert_eq!(
+            record(&paths, &mut plan, 0.0, None),
+            NodeFailureOutcome::Exhausted
+        );
+        let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event.event,
+                deadreckon_core::PlanEventKind::TaskRetrying { .. }
+            )),
+            "no retry was promised"
+        );
+    }
+
+    /// Attempts carry the run's own lifecycle stamps, so durations are real
+    /// and the wall cap has something honest to subtract from.
+    #[test]
+    fn attempts_record_the_runs_own_timestamps() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut plan = plan_on_disk(&paths);
+        let started = Utc::now() - Duration::seconds(90);
+        let finished = Utc::now();
+        let mut consecutive_failures = 0;
+        let mut halt = None;
+
+        record_node_failure(RecordNodeFailure {
+            paths: &paths,
+            plan: &mut plan,
+            task_index: 0,
+            run_id: Some("run-1"),
+            failure_reason: Some("acceptance failed".to_string()),
+            spend_usd: 0.5,
+            max_spend: None,
+            max_wall_seconds: None,
+            run_started_at: Some(started),
+            run_finished_at: Some(finished),
+            consecutive_failures: &mut consecutive_failures,
+            halt: &mut halt,
+            quiet: true,
+            plain: true,
+        })
+        .expect("record");
+
+        let attempt = &plan.tasks[0].attempts[0];
+        assert_eq!(attempt.started_at, started);
+        assert_eq!(attempt.finished_at, Some(finished));
+        let wall = plan.tasks[0].attempts_wall_seconds();
+        assert!((wall - 90.0).abs() < 1.0, "wall {wall}");
+    }
+
+    /// A retry launches with the remainder, not a fresh allowance — the same
+    /// arithmetic run_plan_child applies before spawning.
+    #[test]
+    fn the_retry_budget_is_the_remainder_not_the_cap() {
+        let mut task = PlanTask::new(0, "one", "do one", PlanRole::Child, None);
+        task.attempts
+            .push(TaskAttempt::failed(1, Some("run-1".to_string()), None, 3.5));
+
+        match remaining_retry_budget(Some(5.0), task.attempts_spend_usd(), MIN_RETRY_SPEND_USD) {
+            RetryBudget::Remaining(remaining) => assert!((remaining - 1.5).abs() < 1e-9),
+            other => panic!("expected a remainder, got {other:?}"),
+        }
     }
 }
 
