@@ -60,10 +60,7 @@ pub(crate) fn list_command(
                     "scope": &chain.scope,
                     "goal": &chain.root_goal,
                     "status": deadreckon_core::chain_status_label(chain.status),
-                    "updated_at": chain
-                        .completed_at
-                        .or(chain.started_at)
-                        .unwrap_or(chain.created_at),
+                    "updated_at": chain_activity_at(&paths, chain),
                     "steps": {
                         "applied": chain
                             .steps
@@ -135,11 +132,13 @@ pub(crate) fn list_command(
         .into_iter()
         .map(ListEntry::Run)
         .chain(plans.into_iter().map(ListEntry::Plan))
-        .chain(
-            chains
-                .into_iter()
-                .map(|chain| ListEntry::Chain(Box::new(chain))),
-        )
+        .chain(chains.into_iter().map(|chain| {
+            let activity = chain_activity_at(&paths, &chain);
+            ListEntry::Chain {
+                chain: Box::new(chain),
+                activity,
+            }
+        }))
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| Reverse(entry.updated_at()));
     if entries.is_empty() {
@@ -184,7 +183,7 @@ pub(crate) fn list_command(
                     },
                 );
             }
-            ListEntry::Chain(chain) => {
+            ListEntry::Chain { chain, activity } => {
                 let applied = chain
                     .steps
                     .iter()
@@ -195,12 +194,7 @@ pub(crate) fn list_command(
                     &ListRow {
                         id: run_prefix(&chain.chain_id),
                         status: deadreckon_core::chain_status_label(chain.status).to_string(),
-                        age: relative_age(
-                            chain
-                                .completed_at
-                                .or(chain.started_at)
-                                .unwrap_or(chain.created_at),
-                        ),
+                        age: relative_age(activity),
                         scope: chain.scope.clone(),
                         kind: "chain".to_string(),
                         // A chain is a sequential graph that lands each step;
@@ -502,7 +496,13 @@ enum ListEntry {
     /// differently-formatted command.
     /// Boxed: a Chain carries its full step vector, dwarfing the other
     /// variants inline (the same reason ResolvedRef boxes its payloads).
-    Chain(Box<Chain>),
+    /// `activity` is when the chain last changed, not when it started — a
+    /// chain paused for days must not sort as if nothing happened since its
+    /// first step.
+    Chain {
+        chain: Box<Chain>,
+        activity: DateTime<Utc>,
+    },
 }
 
 impl ListEntry {
@@ -510,13 +510,24 @@ impl ListEntry {
         match self {
             Self::Run(run) => run.updated_at,
             Self::Plan(plan) => plan.updated_at,
-            // Chain records lifecycle stamps rather than a single mtime.
-            Self::Chain(chain) => chain
-                .completed_at
-                .or(chain.started_at)
-                .unwrap_or(chain.created_at),
+            Self::Chain { activity, .. } => *activity,
         }
     }
+}
+
+/// When this chain last changed. Every lifecycle transition rewrites
+/// chain.json, so its mtime is the honest activity stamp; the lifecycle
+/// fields are the fallback when the filesystem will not say.
+fn chain_activity_at(paths: &DeadreckonPaths, chain: &Chain) -> DateTime<Utc> {
+    std::fs::metadata(paths.chain_json(&chain.chain_id))
+        .and_then(|meta| meta.modified())
+        .map(DateTime::<Utc>::from)
+        .unwrap_or_else(|_| {
+            chain
+                .completed_at
+                .or(chain.started_at)
+                .unwrap_or(chain.created_at)
+        })
 }
 
 #[derive(Debug)]

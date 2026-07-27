@@ -506,6 +506,16 @@ Given a chain id, undo unwinds that chain's last applied step instead:
 deadreckon undo <chain-id>
 ```
 
+## Ordered work runs one node at a time
+
+A plan that lands each node as it passes (`apply: per-node` — what `chain`
+does, and what `start` picks for a goal that spells out an order) is serial by
+construction, even where nodes do not depend on each other. Each node branches
+off the tip the previous node just landed on; running siblings in parallel
+would race on that same base. If the pieces are independent and speed matters
+more than incremental landing, at-end apply runs them in parallel and merges
+once.
+
 Undo restores the run working directory from `snapshots/turn-<N>/` and records
 an undo trace. For in-place runs, undo restores the original source path because
 the agent edited that directory directly.
