@@ -2877,6 +2877,7 @@ async fn dispatch_start_command(
             let result = commands::run::run_command_with_launch_plan(
                 RunCommandArgs {
                     goal: args.goal,
+                    tamper_baseline: None,
                     fresh: args.fresh || decision.source_fresh,
                     worktree: args.worktree || decision.source_worktree,
                     from: args.from.or_else(|| decision.source_from.clone()),

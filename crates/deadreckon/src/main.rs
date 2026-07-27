@@ -720,6 +720,7 @@ async fn main_inner() -> Result<()> {
         }
         Commands::Run {
             goal,
+            tamper_baseline,
             goal_file,
             fresh,
             worktree,
@@ -764,6 +765,7 @@ async fn main_inner() -> Result<()> {
             )?;
             commands::run::run_command(RunCommandArgs {
                 goal,
+                tamper_baseline,
                 fresh,
                 worktree,
                 from,
@@ -3423,6 +3425,7 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
     std::env::set_current_dir(&try_dir)?;
     let run_result = commands::run::run_command(RunCommandArgs {
         goal: TRY_GOAL.to_string(),
+        tamper_baseline: None,
         fresh: true,
         worktree: false,
         from: None,

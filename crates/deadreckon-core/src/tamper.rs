@@ -121,7 +121,7 @@ pub fn evaluate(
     if checks
         .iter()
         .any(|check| matches!(check, AcceptanceCheck::CargoTest { .. }))
-        && let Some(snapshot) = earliest_snapshot_dir(run_root)?
+        && let Some(snapshot) = baseline_snapshot_dir(run_root)?
     {
         for path in rust_test_files(&snapshot)? {
             coverage.push(CheckCoverage {
@@ -137,7 +137,7 @@ pub fn evaluate(
     // (gone from the post-run working dir) still refuses like a deleted Rust test.
     if checks.iter().any(|check| {
         matches!(check, AcceptanceCheck::Shell { command, .. } if shell_program_is_test_runner(command))
-    }) && let Some(snapshot) = earliest_snapshot_dir(run_root)?
+    }) && let Some(snapshot) = baseline_snapshot_dir(run_root)?
     {
         for path in conventional_test_files(&snapshot)? {
             coverage.push(CheckCoverage {
@@ -181,7 +181,7 @@ pub fn touched_files(
     run_root: &Path,
     working_dir: &Path,
 ) -> Result<BTreeMap<PathBuf, TouchedChange>> {
-    let first_snapshot = earliest_snapshot_dir(run_root)?;
+    let first_snapshot = baseline_snapshot_dir(run_root)?;
     let first_inventory = match first_snapshot.as_deref() {
         Some(snapshot) => relative_inventory(snapshot)?,
         None => BTreeSet::new(),
@@ -471,7 +471,55 @@ fn spec_modified(run_root: &Path, working_dir: &Path) -> Result<bool> {
     }))
 }
 
-fn earliest_snapshot_dir(run_root: &Path) -> Result<Option<PathBuf>> {
+/// The baseline file a retry writes: `gate/baseline` names the snapshot dir
+/// of the node's FIRST attempt. Without it, attempt N's baseline is attempt
+/// N-1's finished tree, so a test file edited in attempt 1 to game the gate
+/// looks pre-existing to every later attempt — the tamper detector loses
+/// vision exactly across the boundary self-healing introduced.
+pub const TAMPER_BASELINE_FILE: &str = "gate/baseline";
+
+pub fn tamper_baseline_path_for_run_root(run_root: &Path) -> PathBuf {
+    run_root.join(TAMPER_BASELINE_FILE)
+}
+
+pub fn write_tamper_baseline(run_root: &Path, snapshot: &Path) -> Result<()> {
+    let path = tamper_baseline_path_for_run_root(run_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_path(parent)?;
+    }
+    fs::write(&path, snapshot.display().to_string()).with_path(&path)
+}
+
+/// The snapshot this run's changes are judged against: the recorded baseline
+/// when one exists, else the run's own earliest snapshot. A recorded baseline
+/// whose directory has vanished is a hard error, not a silent fallback — a
+/// tamper check that quietly weakens itself is the defect this file exists
+/// to catch in others.
+fn baseline_snapshot_dir(run_root: &Path) -> Result<Option<PathBuf>> {
+    let recorded = tamper_baseline_path_for_run_root(run_root);
+    match fs::read_to_string(&recorded) {
+        Ok(content) => {
+            let target = PathBuf::from(content.trim());
+            if target.is_dir() {
+                Ok(Some(target))
+            } else {
+                Err(DeadreckonError::InvalidInput(format!(
+                    "tamper baseline {} no longer exists; refusing to judge against a weaker one",
+                    target.display()
+                )))
+            }
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            earliest_snapshot_dir(run_root)
+        }
+        Err(source) => Err(DeadreckonError::Io {
+            path: recorded,
+            source,
+        }),
+    }
+}
+
+pub fn earliest_snapshot_dir(run_root: &Path) -> Result<Option<PathBuf>> {
     let snapshots = run_root.join("snapshots");
     if !snapshots.is_dir() {
         return Ok(None);
@@ -787,6 +835,71 @@ mod tests {
             },
         )
         .expect("provenance");
+    }
+
+    /// The cross-attempt blind spot self-healing introduced: a retry resumes
+    /// the failed attempt's tree, so its own snapshot-0 already contains
+    /// whatever attempt 1 did — including a deleted test. Judged against its
+    /// own snapshot the deletion is invisible; judged against the FIRST
+    /// attempt's snapshot it refuses, exactly as it would have in one run.
+    #[test]
+    fn a_recorded_baseline_keeps_tamper_vision_across_attempts() {
+        // Attempt 1: the honest starting tree, with the gate's test present.
+        let (_temp_first, first) = fixture_run("attempt one");
+        std::fs::create_dir_all(first.working_dir.join("tests")).expect("tests");
+        std::fs::write(
+            first.working_dir.join("tests/gate_test.rs"),
+            "#[test]\nfn gate() {}\n",
+        )
+        .expect("test file");
+        snapshot_working(&first, 0).expect("first snapshot");
+        let first_snapshot = super::earliest_snapshot_dir(&first.run_root)
+            .expect("snapshot lookup")
+            .expect("snapshot exists");
+
+        // The retry: its tree is attempt 1's aftermath — the test is gone —
+        // and its own snapshot-0 faithfully records that already-tainted tree.
+        let (_temp_retry, retry) = fixture_run("attempt two");
+        std::fs::create_dir_all(retry.working_dir.join("src")).expect("src");
+        std::fs::write(retry.working_dir.join("src/lib.rs"), "pub fn f() {}\n").expect("lib");
+        snapshot_working(&retry, 0).expect("retry snapshot");
+        record_files(&retry, vec![retry.working_dir.join("src/lib.rs")]);
+        let checks = vec![AcceptanceCheck::CargoTest {
+            args: Vec::new(),
+            must_pass: true,
+        }];
+
+        let blind = super::evaluate("retry", &retry.run_root, &retry.working_dir, &checks)
+            .expect("evaluate without baseline");
+        assert_ne!(
+            blind.verdict,
+            AcceptanceTamperVerdict::Refuse,
+            "against its own snapshot the deletion is invisible: {blind:?}"
+        );
+
+        super::write_tamper_baseline(&retry.run_root, &first_snapshot).expect("baseline");
+        let sighted = super::evaluate("retry", &retry.run_root, &retry.working_dir, &checks)
+            .expect("evaluate with baseline");
+        assert_eq!(
+            sighted.verdict,
+            AcceptanceTamperVerdict::Refuse,
+            "against attempt 1's snapshot the deleted test refuses: {sighted:?}"
+        );
+    }
+
+    /// A recorded baseline whose directory has vanished is a hard error, not
+    /// a silent fallback to a weaker comparison.
+    #[test]
+    fn a_vanished_baseline_refuses_rather_than_weakening() {
+        let (_temp, state) = fixture_run("vanished baseline");
+        snapshot_working(&state, 0).expect("snapshot");
+        super::write_tamper_baseline(&state.run_root, &state.run_root.join("gone"))
+            .expect("baseline");
+
+        let error = super::evaluate("run", &state.run_root, &state.working_dir, &[])
+            .expect_err("must refuse");
+
+        assert!(error.to_string().contains("tamper baseline"), "{error}");
     }
 
     #[test]

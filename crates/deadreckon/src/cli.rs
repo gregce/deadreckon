@@ -759,6 +759,13 @@ pub(crate) enum Commands {
         goal: Option<String>,
         #[arg(
             long,
+            hide = true,
+            value_name = "PATH",
+            help = "Judge tamper against this snapshot instead of the run's own (set by plan retries)"
+        )]
+        tamper_baseline: Option<PathBuf>,
+        #[arg(
+            long,
             value_name = "PATH",
             value_hint = clap::ValueHint::FilePath,
             help = "Read the natural-language goal from a file; relative paths try cwd, then git root"
@@ -2540,6 +2547,9 @@ pub(crate) enum LibraryCommand {
 
 pub(crate) struct RunCommandArgs {
     pub(crate) goal: String,
+    /// A retry judges tamper against its node's FIRST attempt's snapshot, so
+    /// files edited in an earlier attempt to game the gate stay visible.
+    pub(crate) tamper_baseline: Option<PathBuf>,
     pub(crate) fresh: bool,
     pub(crate) worktree: bool,
     pub(crate) from: Option<PathBuf>,
