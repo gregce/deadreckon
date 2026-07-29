@@ -61,6 +61,75 @@ deadreckon def-done check
 deadreckon def-done "what should count as done"
 ```
 
+### Durable guided-start posture
+
+When `start` selects a single, review, full-plan, or campaign shape, it freezes
+the approved goal, definition of done, policy, launch plan, source digest, and
+source revision under one Job ID before any agent turn begins. It then starts
+`deadreckon supervisor serve --once <job-id>` with detached stdio. The ordinary
+commands accept that Job ID:
+
+```bash
+deadreckon status <job-id>
+deadreckon attach <job-id>
+deadreckon list
+deadreckon finish <job-id>
+```
+
+Closing the launching terminal does not cancel this detached process. That is
+process-level durability. For restart-at-login posture, explicitly install and
+start the per-user service:
+
+```bash
+deadreckon supervisor install
+deadreckon supervisor start
+deadreckon supervisor status
+```
+
+On macOS this manages a user LaunchAgent. On Linux it manages a systemd user
+unit. The generated definition pins the exact current binary,
+`DEADRECKON_HOME`, and `PATH`; installation refuses to overwrite an unmanaged
+same-name unit. `install` does not activate a new service. `start` enables and
+reloads the current definition. To stop it without removing the definition:
+
+```bash
+deadreckon supervisor stop
+```
+
+The service definitions and lifecycle commands are implemented and tested
+without invoking the host service manager in the test suite. A live
+machine-restart drill is still an operator acceptance step; do not infer that
+it ran from a successful unit-rendering test.
+
+Guided Single, Graph and Campaign Jobs use a strict two-key completion rule:
+
+1. The frozen deterministic checks pass under a real sandbox and produce a
+   valid native `dr-gate` marker.
+2. A fresh read-only semantic judge returns `achieved` for the approved goal,
+   contract, diff, and cited evidence.
+
+The semantic judge cannot override failed checks. For a Single Job, `revise`
+gives the worker another bounded correction opportunity. For a Graph or
+Campaign parent, `revise` stops `NEEDS_REVIEW`; safe parent repair is not
+implemented yet. `uncertain`, an unavailable judge, an uncontained gate, or a
+receipt-sealing error also produces `NEEDS_REVIEW`.
+
+Guided review and full-plan work always use at-end delivery. The conductor
+first merges in isolation. The supervisor then copies the merged result into a
+run with the parent Job ID, runs the native gate, asks a fresh read-only
+semantic judge, validates the receipt and promotes that parent. `finish`
+revalidates the receipt and result-tree digest before exporting the
+receipt-bound parent.
+
+A guided Campaign Job can recover an exactly linked persisted sub-plan. Before
+parent verification, it rebuilds the campaign's worst-of roll-up from the leaf
+evidence and compares it with the stored roll-up. A refused or changed roll-up
+fails the parent gate and never reaches the semantic judge.
+
+Guided `start` does not create a durable continuation Job. If it selects a
+follow-up, it refuses before work and prints the exact process-owned
+`deadreckon extend <run-id> "<goal>"` command.
+
 ## Normal Single Run
 
 Use `run` directly when you already know this should be one supervised coding
@@ -73,7 +142,11 @@ deadreckon finish latest
 ```
 
 `run` is still the canonical power-user command for source-mode flags, spend
-caps, sandbox overrides, and one-run scripting.
+caps, sandbox overrides, and one-run scripting. It is also a compatibility
+path: it persists run state and uses the deterministic gate, but it is driven
+by the invoking process and does not create a Watchkeeper Job, run the
+independent semantic judge, or issue the combined Job receipt. Use
+`deadreckon start --mode run` when the durable Job contract is required.
 
 ## Multi-Agent Work
 
@@ -88,7 +161,15 @@ deadreckon finish latest
 ```
 
 `start --mode review` and `start --mode full-plan` route through the same
-orchestration machinery when you want the guided front door first.
+orchestration machinery when you want the guided front door first. Guided
+review, full-plan, and campaign launches are durable parent Jobs supervised
+under one lease. Their child graph still uses the established conductor. The
+supervisor verifies, receipts and promotes the same-ID parent result after the
+merge. A semantic `revise` stops `NEEDS_REVIEW`; it does not yet repair and
+rerun the parent graph.
+
+Direct `orchestrate`, `chain`, and `campaign` invocations remain process-owned
+compatibility paths. Direct `run` and `extend` have the same boundary.
 
 ## Build And Install Alias
 
@@ -171,6 +252,27 @@ snapshots/turn-<N>/
 proofs/turn-acceptance.json
 working/ or library/<scope>/<run-id>/
 ```
+
+For a durable Job, control truth and frozen authority live separately:
+
+```text
+~/.deadreckon/jobs/<job-id>/
+  job.json
+  job-events.jsonl
+  projection.json
+  lease.json
+  launch-plan.json
+  acceptance.yaml
+  authority.json
+  supervised-child.json
+  receipt.json                 # after parent two-key verification
+```
+
+The HMAC key is outside the run and Job workspaces under
+`~/.deadreckon/gate-keys/`. The worker sandbox denies that key store and makes
+Job authority/proof paths read-only or inaccessible. Rich turn, spend, trace,
+snapshot, and narrative evidence remains in the normal run directory; the Job
+event log owns lifecycle truth.
 
 Completed accepted runs are promoted to:
 

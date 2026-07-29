@@ -6,8 +6,8 @@
 
 <p align="center">
 DeadReckon is a harness around the agent CLI you already use.<br>
-A separate watchdog process, not the agent, decides when the work is actually done.<br>
-You get a signed, auditable artifact instead of a chat transcript you have to take on faith.
+A guided <code>start</code> creates one durable Job and detached supervisor.<br>
+Guided Single, Graph and Campaign Jobs require independent two-key verification.
 </p>
 
 ---
@@ -32,7 +32,7 @@ Then the whole tool is five commands:
 
 | Command | What it does |
 |---|---|
-| `deadreckon start "build the app"` | Kick off a supervised run. Walk away. |
+| `deadreckon start "build the app"` | Create a durable job, return its ID, and supervise the selected shape in isolation. |
 | `deadreckon attach latest` | Watch it work live. `Ctrl-D` leaves it running. |
 | `deadreckon status` | What happened, and the one thing to do next. |
 | `deadreckon list` | Find recent runs and plans. |
@@ -54,13 +54,32 @@ For a higher-level read while it runs, `deadreckon attach latest --view narrativ
 Everything else (budgets, undo, multi-step chains, provider routing) is optional power you reach for later. No API keys? `deadreckon run "hello" --smoke --sandbox none` exercises the whole harness against a faked provider.
 
 > [!TIP]
-> DeadReckon is on the production-release track. The core lifecycle (isolated runs, signed gates, durable state, undo, docs, orchestration, and apply) is implemented and tested; release notes call out any compatibility migrations.
+> Guided `start` now puts single, review, full-plan, and campaign shapes behind
+> one durable Job ID and lease supervisor. Each shape verifies its same-ID
+> parent result with a native gate and a fresh read-only semantic judge before
+> it validates a receipt and promotes the result. Direct `run`, `orchestrate`,
+> `chain`, and `campaign` remain process-owned compatibility paths. A guided
+> follow-up refuses before work and prints the exact legacy `extend` command.
 
 ## Why it's different
 
-- **It can't fake the finish.** A separate watchdog (`dr-gate`) holds a secret the agent process can't read and signs the result with it. No valid signature, no "done." The agent literally cannot mark its own work accepted.
-- **Walk away for real.** Every turn is saved to disk. Close your laptop, lose the network, kill the model, then attach from another terminal and resume from the last completed turn.
-- **Evidence, not a transcript.** Each accepted run promotes to a reviewable artifact: what changed, why, which prompt touched which file, what it spent.
+- **Two independent keys to “done.”** A guided Job is verified only when its
+  deterministic checks pass inside a real sandbox and a fresh read-only
+  semantic judge says the result meets the approved goal. Either key can
+  refuse completion; the semantic judge cannot overrule a failed check.
+- **Survives the launching terminal.** `start` freezes the goal, contract,
+  policy, source digest, and launch plan before detaching a supervised process.
+  Install and start the per-user supervisor service for restart-at-login
+  posture; without it, durability is process-level rather than machine-level.
+- **Evidence, not a transcript.** A verified Job leaves an HMAC-SHA-256 receipt
+  binding its authority, deterministic marker, semantic judgment, source and
+  result digests, revisions, and confinement facts.
+
+If `auto` cannot resolve to a real sandbox, or the semantic judge is unavailable
+or uncertain, a strict Job becomes `NEEDS_REVIEW`; it is not silently accepted.
+The repository has hermetic tests for these invariants. The cross-provider
+20–30-task live dogfood matrix and live machine-restart acceptance are still
+operator work, not completed claims.
 
 → The full story (the loop, the mental model, and how it compares) is in **[Concepts & How It Works](docs/CONCEPTS.md)**.
 
@@ -72,7 +91,12 @@ Everything else (budgets, undo, multi-step chains, provider routing) is optional
 | **[HOWTO](HOWTO.md)** | Practical usage: setup, providers, sandboxes, configuration, every command |
 | **[DESIGN](DESIGN.md)** | Product and architecture intent |
 | **[As-Built Architecture](docs/AS-BUILT-ARCHITECTURE.md)** | Detailed implementation reference |
+| **[Watchkeeper acceptance](docs/WATCHKEEPER-OPERATOR-ACCEPTANCE.md)** | Manual tests for detach, service recovery, receipts, tamper refusal, and current limits |
 | **[Resume Semantics](docs/RESUME-SEMANTICS.md)** · **[Multi-Run](docs/MULTI-RUN.md)** | Crash/resume behavior and concurrency rules |
 | **[V1 Candidates](docs/V1-CANDIDATES.md)** | Deferred features and roadmap |
 
-DeadReckon is maintained as production-release software. The core lifecycle is implemented and tested, alongside multi-agent orchestration (`plan` / `fork` / `merge`), autonomous chains, the provider flight recorder with `rewind`, and a local self-improvement loop (`learn` / `improve`).
+DeadReckon is maintained as production-release software. Guided `start` Jobs
+and older direct execution surfaces coexist during the migration. Every
+supported guided shape has one parent Job lifecycle and a parent two-key
+receipt before promotion. Direct advanced verbs retain their established
+run/plan/chain/campaign state and process ownership.

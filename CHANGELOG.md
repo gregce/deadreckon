@@ -52,6 +52,66 @@ Compatibility: `plan.json` gains execution-policy fields, all defaulted, so
 files written by earlier versions load with their previous behaviour and no
 migration step runs.
 
+## Watchkeeper one durable Job and two-key completion 2026-07-28
+
+Watchkeeper makes guided `start` durable before the first agent turn. It
+freezes the approved goal, definition of done, policy, launch plan, source tree
+and revision under one Job ID. It then detaches a lease-fenced supervisor.
+`attach`, `status`, `list`, `kill`, `finish` and `report` resolve that Job
+without duplicating its backing run, plan or campaign.
+
+### Guided Jobs have 2 completion keys
+
+A contained native gate must pass the frozen deterministic checks. A fresh
+read-only semantic judge must then return `achieved`. The supervisor seals an
+HMAC-SHA-256 receipt that binds the authority, policy, launch plan, source and
+result revisions, tree digests, gate marker, judgment and confinement.
+
+A deterministic failure cannot be overruled. A Single Job can use semantic
+`revise` for another bounded worker turn. A Graph or Campaign parent records
+`revise` as `NEEDS_REVIEW`; safe parent repair is deferred. Uncertainty, judge
+failure, missing containment or an invalid receipt also stop
+`NEEDS_REVIEW`.
+
+### Graph and Campaign verify the parent result
+
+Guided review and full-plan work always uses at-end delivery. The supervisor
+copies the merged result into a same-ID parent run, runs its native gate, asks
+the semantic judge, validates the receipt and then promotes the parent.
+`finish` exports that receipt-bound parent, not a mutable child artifact.
+
+A guided Campaign can recover an exactly linked persisted sub-plan. Before
+parent verification, it rebuilds the worst-of roll-up from current leaf
+evidence and compares it with the stored and merged copies. A refused or
+changed roll-up fails before the semantic judge. A clean campaign parent then
+uses the same gate, judgment, receipt and promotion sequence as a Graph.
+
+Direct `run`, `orchestrate`, `chain` and `campaign` remain process-owned
+compatibility paths. Guided automatic continuation refuses before starting
+work and prints the exact legacy `extend` command.
+
+### The worker cannot mint its proof
+
+Gate keys live outside the agent-visible workspace. Authority, lifecycle,
+gate, proof, snapshot, provenance and receipt paths are denied or read-only
+across the supported sandbox and provider routes. Version-2 markers and
+receipts fail closed on missing key material, synthetic proof,
+`sandbox_backend = none` or `contained = false`. Legacy runs retain their
+historical marker validator.
+
+### Service support is conditional
+
+`deadreckon supervisor install|start|status|stop` manages an owned per-user
+launchd or systemd definition. It pins the current binary, `DEADRECKON_HOME`
+and `PATH`, and refuses an unmanaged same-name unit. Repository tests cover the
+definitions and state classification. They do not prove an active service or a
+live reboot.
+
+The operator dogfood kit contains 24 tasks across 2 repository and provider
+slots. It also includes a metrics collector and human-review schema. Every task
+is `not_run`. This release does not claim live task rates, cross-provider
+results, machine-restart results, or false-accept and false-reject rates.
+
 ## 0.7.0 — Sea trials — 2026-07-25
 
 Six slices since 0.6.0. The harness stopped guessing at its agents and started

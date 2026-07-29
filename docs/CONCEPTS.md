@@ -9,17 +9,35 @@ it*. For step-by-step usage, see [HOWTO](../HOWTO.md).
 1. **You write "done" in plain English.** deadreckon compiles it into executable checks: tests that must pass, files that must exist, scripts that must succeed.
 2. **The agent runs in an isolated worktree**, inside a sandbox. Your real checkout is never touched.
 3. **Every turn is saved** (state, spend, traces, file provenance, snapshots) so you can attach, kill, resume, undo, or audit any moment.
-4. **A separate watchdog process (`dr-gate`) decides when the work is done.** It holds a secret the agent process cannot read, and signs the result with that secret. The agent cannot forge the signature, so it cannot mark its own work as accepted.
-5. **If the checks fail, the loop keeps going.** The agent gets another turn. When the watchdog finally signs off for real, the run is atomically promoted to a reviewable artifact: narrative, decisions, file provenance, full audit trail.
+4. **A separate watchdog process (`dr-gate`) runs the approved checks.** For a
+   strict Job, the signing key is outside the agent workspace and protected
+   paths are denied across the provider sandbox.
+5. **A fresh read-only semantic judge checks the meaning.** It sees the goal,
+   frozen contract, diff, deterministic evidence, and authority digests, but
+   has no worker session or write posture. It returns `achieved`, `revise`, or
+   `uncertain`.
+6. **The trusted supervisor seals the final parent receipt.** Only a contained
+   deterministic pass plus semantic `achieved` produces the HMAC-SHA-256
+   two-key receipt required to promote a guided Job. A Single Job can use
+   `revise` for another bounded turn. A Graph or Campaign parent stops
+   `NEEDS_REVIEW` because safe parent repair is not implemented yet.
 
-The loop is the product. The agent CLI does the coding. deadreckon decides when "done" actually means done.
+The loop is the product. The agent CLI does the coding. deadreckon owns the
+approved inputs, execution boundary, independent checks, and final receipt.
 
 ## Why this matters
 
 **The agent does the coding. deadreckon decides when it's done.**
 
-- **It can't fake the finish.** The watchdog (`dr-gate`) holds a secret the agent process can't read and signs the result with it. No valid signature, no "done." The agent literally cannot forge its own acceptance.
-- **Walk away for real.** Every turn is saved to disk: state, spend, file lineage, a full snapshot. Close your laptop, lose the network, kill the model, then attach from another terminal and resume from the last completed turn. Nothing replays, nothing is lost.
+- **A contained Job cannot self-approve.** The worker cannot read the protected
+  key or write the frozen authority/proof paths. The final receipt also needs
+  an independent semantic judgment. If no real sandbox is available, the Job
+  is uncontained and cannot be verified.
+- **Walk away from the terminal.** Every turn and Job lifecycle fact is saved
+  to disk. A detached Job supervisor keeps running after the launching
+  shell exits. Install the per-user service for restart-at-login posture.
+  Recovery may adopt or retry bounded work; it never treats process exit alone
+  as proof of completion.
 - **You get evidence, not a transcript.** Each accepted run promotes to a reviewable artifact: what changed, why, which prompt touched which file, what it spent. Auditable on disk, not scrolled back in a chat window.
 - **Bring the agent you already trust.** Claude Code, Codex, Gemini, Copilot, OpenCode, Pi, or a raw API key: deadreckon supervises any of them. It owns the boundary, not the intelligence.
 
@@ -42,7 +60,7 @@ Already have history in another tool? `deadreckon import claude-code | codex | c
 
 ## The two things that make it different
 
-### Write "Done" In English, Verified By A Watchdog The Agent Can't Fool
+### Write "done" in English, verified independently
 
 Tell deadreckon what success looks like in plain language. It compiles your sentence into executable checks that an independent watchdog runs:
 
@@ -53,7 +71,19 @@ deadreckon def-done check
 deadreckon run "finish the app"
 ```
 
-**Why the watchdog matters.** `dr-gate` holds a run-local secret the agent process cannot read, and stamps the result with it. Without a valid stamp, the run can't terminate, and the agent can't produce the stamp itself. If the checks fail, the run doesn't end; the agent gets another turn with a corrective hint.
+**Why the watchdog matters.** For a contained Job, `dr-gate` receives protected
+signing material that is not visible to the worker and stamps the deterministic
+check results. The runtime then asks a fresh read-only model to assess the
+goal's meaning. The check marker is necessary but no longer sufficient: the
+supervisor issues a verified receipt only when both decisions agree.
+
+This stronger completion contract belongs to guided `deadreckon start`.
+Review and full-plan work merges at the end, then becomes a same-ID Graph
+parent result. Campaign completion also revalidates the worst-of leaf roll-up.
+Both paths then run the native parent gate, ask a fresh read-only semantic
+judge, validate the parent receipt and promote. Direct `deadreckon run`,
+`orchestrate`, `chain`, and `campaign` retain their historical process-owned
+behavior; their artifacts must not be described as two-key Job receipts.
 
 If no acceptance file is configured, the default is "the working directory exists and `cargo test` passes" (when `Cargo.toml` is present). Supported check kinds are `cargo_test`, `file_exists`, `content_match`, `build_success`, and `shell`. Full reference, packs, and the compiled YAML format: [HOWTO § Done Criteria](../HOWTO.md#done-criteria).
 
@@ -74,7 +104,12 @@ Agentic CLIs usually leave you with a patch and a transcript. deadreckon turns t
 Each of these is a first-class capability; usage lives in [HOWTO](../HOWTO.md):
 
 - **Your checkout is never touched.** Runs default to an isolated `git worktree` on a `dr/...` branch; your real checkout changes only when you `deadreckon apply`. Copy, fresh, and explicit in-place modes are available too.
-- **Crash-proof.** Every turn writes durable state. If the terminal dies, attach from another; if the run crashes, resume from the last completed turn.
+- **Durable at two levels.** All runs persist state. Guided Jobs created by
+  `start` also have an append-only lifecycle, a fenced renewable lease, process
+  group metadata, and a detached supervisor. The optional user service adds
+  restart-at-login posture. Guided graphs and campaigns wrap their established
+  conductor under that lease and verify the parent after merge. Direct
+  advanced commands remain process-owned.
 - **Budgets and time limits.** `--max-spend 15` and `--max-wall-seconds 1800` cap a run, then walk away. High spend requires explicit confirmation.
 - **Undo a single bad turn.** Snapshot-based rollback to any turn (`deadreckon undo <id> --turn 3`), recorded in the run trace, not just a `git reset`. The same verb unwinds a chain's last applied step.
 - **Resume, kill, extend, or export any run.** Runs are lifecycle objects, not one terminal session.
@@ -87,7 +122,7 @@ Each of these is a first-class capability; usage lives in [HOWTO](../HOWTO.md):
 your repo
   |
   | deadreckon def-done "what 'finished' looks like, in English"
-  | deadreckon run  "what to build"
+  | deadreckon start --mode run "what to build"
   v
 isolated worktree or copy   ◄── your real checkout untouched
   |
@@ -98,18 +133,29 @@ sandboxed turn loop         ◄── agent works here
   | every turn: trace, spend, provenance, snapshot, docs
   | check fails? agent gets another turn
   v
-dr-gate watchdog            ◄── separate process, holds hidden nonce
-  |                              agent CANNOT produce a valid marker
-  | checks pass + signature valid?
+dr-gate watchdog            ◄── separate process, uses protected HMAC key
+  |                              contained agent cannot forge a valid marker
+  | checks pass + HMAC marker valid?
   v
-promoted artifact           ◄── narrative, decisions, file lineage
+read-only semantic judge    ◄── goal + contract + diff + cited evidence
+  |
+  | achieved? seal two-key receipt
+  | revise? another bounded turn
+  | uncertain/unavailable? NEEDS_REVIEW
+  v
+promoted artifact           ◄── receipt, narrative, decisions, file lineage
   |
   | inspect, doc, apply, discard, extend, export, cleanup
   v
 your branch or library
 ```
 
-For multi-step work, this whole loop runs N times. Independent pieces run in parallel and merge once; pieces the goal puts in order run one at a time, each landing on your branch before the next starts. `deadreckon start` picks the shape and shows you why; `deadreckon chain` states it outright. The agent owns the coding. deadreckon owns the boundary.
+For multi-step work, a guided review, full-plan, or campaign start puts its
+existing conductor under one durable parent Job and lease. Child results are
+evidence, not parent authority. The supervisor verifies the same-ID merged
+parent and promotes it only after a valid two-key receipt. A semantic request
+to revise that parent stops `NEEDS_REVIEW`; deterministic parent gate failure
+stops `FAILED`. Direct plan, chain and campaign verbs remain process-owned.
 
 ## Compared with agentic coding CLIs
 
@@ -118,10 +164,10 @@ deadreckon doesn't replace Claude Code, Codex, or the rest; it supervises them. 
 | Operational concern | Agentic CLI alone | deadreckon supervising the CLI |
 |---|---|---|
 | Workspace safety | Often runs where you start it | Isolated worktree by default; your checkout untouched |
-| Long-running attach | Tied to the current terminal | Durable state; attach from another terminal later |
+| Long-running attach | Tied to the current terminal | Durable state; guided `start` Jobs also detach their supervisor |
 | Spend control | Varies by provider | Tracks totals; enforces spend and wall-clock caps |
 | Undo | git-level or manual | Snapshots every turn; restores a specific turn |
-| Done criteria | The agent may declare itself done | Requires a signed `dr-gate` marker before promotion |
+| Done criteria | The agent may declare itself done | Strict Jobs require contained checks and semantic `achieved` |
 | Output | A patch and a transcript | A promoted, auditable artifact with file provenance |
 
 Use the agentic CLI for intelligence. Use deadreckon for isolation, supervision, evidence, recovery, and promotion.
