@@ -1,5 +1,34 @@
 # V1 Candidates
 
+## Watchkeeper follow-ups (§58)
+
+The durable local Job queue, shared reference resolver, lease-fenced
+supervisor, two-key completion for guided Single, Graph and Campaign Jobs,
+fault harness, and explicit per-user service operations are implemented in
+this tree. These are the remaining boundaries:
+
+- Move direct `orchestrate`, `chain`, and `campaign` plus chain extension under
+  the Job lifecycle. They remain process-coordinated compatibility surfaces.
+- Add safe parent repair for guided Graph and Campaign Jobs. A semantic
+  `revise` currently stops `NEEDS_REVIEW`, while a deterministic parent gate
+  failure stops `FAILED`.
+- Close the launch-before-link crash window and strengthen process identity
+  beyond a persisted PID before promising automatic recovery from every
+  interruption.
+- Add live launchd/systemd acceptance and machine-restart drills, service
+  preflight/repair UX, and a designed Windows service posture. Current tests
+  cover rendered definitions and state classification, not an active service
+  manager or reboot.
+- Run live Campaign interruption drills across persisted sub-plan recovery,
+  worst-of roll-up refusal, parent verification, promotion and `finish`.
+- Run the 20–30-task cross-repository/provider dogfood matrix and report
+  verified completion, recovery, intervention, comprehension time, judge cost,
+  false acceptance and false rejection.
+- Add port, environment and other resource leases above the local scheduler.
+  Cross-machine or hosted scheduling remains a separate product decision.
+- Make repository/team rules a signed acceptance input and name their evidence
+  in the combined receipt.
+
 ## Guided first-use follow-ups
 
 - Durable launch profiles: save a reusable launch shape only after the current `start` path proves which choices users actually repeat. This would be new durable config, so it stays out of the schema-preserving production pass.
@@ -49,7 +78,11 @@
 ## General candidates
 
 - Windows signing hardening: stable Windows artifacts now require Authenticode signing through CI secrets. V1 can move that key material to a managed signing service, hardware-backed certificate, or key-vault flow after the basic signed-artifact path proves out.
-- Tamper-evidence hardening beyond the production gate: causal proof that a covered-file edit caused a pass, language-aware test detection beyond Rust heuristics, a separate signed tamper/audit log distinct from learning logs, fleet/plan-level tamper reporting, and sandboxing acceptance checks' own filesystem writes.
+- Tamper-evidence hardening beyond the shipped guided Job two-key gate: causal
+  proof that a covered-file edit caused a pass, language-aware test detection
+  beyond Rust heuristics, a separate signed tamper/audit log distinct from
+  learning logs, fleet/plan-level combined receipts, and sandboxing acceptance
+  checks' own filesystem writes.
 - Explicit sub-agent forking command: `deadreckon fork <run-id> --prompt "..."`, from AS-BUILT §10 and REPORT.md coordination needs.
 - Richer provider retry policy: the turn loop now performs one bounded retry on transient provider failures (`ProviderError::Http` carries an explicit `retryable` flag tagged at each construction site for 408/429/5xx and transport blips; CLI rate-limit phrasings are recognized). V1 can add exponential multi-attempt backoff, `Retry-After` header parsing, per-provider retry budgets, and retry-aware route fallthrough ordering.
 - OpenCode SQLite ingest: current provider CLI ingest reads OpenCode file-mode `storage/session`, `storage/message`, and `storage/part` JSON only. Add SQLite-backed discovery/parsing after choosing a dependency-light strategy and fixture shape.
@@ -205,9 +238,12 @@
 - Per-check provenance: the compiled model does not record which draft or
   critic note produced a check. A V1 provenance ledger would need a sidecar
   format and retention policy.
-- Semantic goal coverage: reconciliation is deterministic keyword coverage plus
-  the single critic. Embedding or semantic coverage remains out until privacy,
-  cost, and explainability are explicit.
+- Semantic-judge evaluation and provider parity: a read-only judge now returns
+  `achieved`, `revise`, or `uncertain` for guided Jobs after
+  deterministic checks pass. V1 work is a measured evaluation set, calibrated
+  prompts/providers, explainable disagreement handling, and safe parent repair
+  for Graph and Campaign `revise`. Embedding-based contract compilation remains
+  out until privacy, cost and explainability are explicit.
 - Auto-generating missing build/test harnesses in the target project: the
   compiler may propose helpers under `.deadreckon/acceptance/`, but scaffolding
   the project itself is V1.

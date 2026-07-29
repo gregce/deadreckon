@@ -69,6 +69,12 @@ verb.
 | `start` | One-command rollback | pass | Launched worktree runs point at cleanup/abandon paths. |
 | `start` | One verdict + ONE primary action | pass | Start preview and lifecycle launch surfaces use VerdictSurface; JSON goldens assert `primary_action` parity. |
 | `start` | Lifecycle hint | pass | Successful launches print attach/status/kill/finish commands. |
+| `supervisor` | Auto-detect, don't ask | pass | The command detects the supported per-user service manager, current binary, state home, and existing managed definition. |
+| `supervisor` | Preview before mutate | fail | `install`, `start`, and `stop` are explicit operator actions, but there is no dry-run rendering or confirmation path yet. |
+| `supervisor` | Refuse with try: | fail | Common stale and missing-unit errors name recovery commands, but not every platform and service-manager failure uses the canonical `try:` surface. |
+| `supervisor` | One-command rollback | fail | `stop` reverses activation but retains the managed definition; this slice has no uninstall or restore-previous-definition command. |
+| `supervisor` | One verdict + ONE primary action | pass | Each lifecycle command reports one service state and one next command without presenting competing recommendations. |
+| `supervisor` | Lifecycle hint | pass | Install points to start, status points to install when absent, and stop explains how to restart. |
 | `run` | Auto-detect, don't ask | pass | Defaults resolve provider, source mode, and done criteria without prompts when explicit. |
 | `run` | Preview before mutate | pass | Worktree/in-place/high-spend paths preview or require confirmation. |
 | `run` | Refuse with try: | pass | Common provider/source/safety refusals end with `try:` guidance. |
