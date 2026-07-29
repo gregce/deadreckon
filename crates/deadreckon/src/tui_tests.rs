@@ -3353,6 +3353,7 @@ fn detected_contract_asks_zero_questions() {
         temp.path(),
         Some(&mut prompter),
         false,
+        true,
     )
     .expect("resolve");
 
@@ -3385,8 +3386,14 @@ fn yes_flag_skips_question_and_carries_caveat() {
         stdin_is_tty: false,
     });
 
-    super::commands::start::resolve_start_done_criteria(&mut decision, temp.path(), None, true)
-        .expect("resolve");
+    super::commands::start::resolve_start_done_criteria(
+        &mut decision,
+        temp.path(),
+        None,
+        true,
+        true,
+    )
+    .expect("resolve");
 
     assert!(decision.recovery.is_none(), "yes proceeds, never refuses");
     assert_eq!(
@@ -3406,8 +3413,14 @@ fn yes_flag_skips_question_and_carries_caveat() {
         requested_mode: CliStartMode::Auto,
         stdin_is_tty: false,
     });
-    super::commands::start::resolve_start_done_criteria(&mut refused, temp.path(), None, false)
-        .expect("resolve");
+    super::commands::start::resolve_start_done_criteria(
+        &mut refused,
+        temp.path(),
+        None,
+        false,
+        true,
+    )
+    .expect("resolve");
     assert!(
         refused.recovery.is_some(),
         "non-TTY without yes still refuses"

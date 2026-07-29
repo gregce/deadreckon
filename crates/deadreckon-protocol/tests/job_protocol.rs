@@ -68,6 +68,7 @@ fn job_stop_reasons_are_distinct() {
             "\"semantic_unavailable\"",
             "\"semantic_uncertain\"",
             "\"spend_cap\"",
+            "\"transient_provider\"",
             "\"verified\"",
             "\"wall_cap\"",
         ]

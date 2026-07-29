@@ -1,10 +1,37 @@
 use super::super::*;
 
+const DURABLE_ORCHESTRATION_SIGNAL: &str = "watchkeeper_orchestration";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DurableOrchestrationSpec {
+    pub(crate) planner_model: Option<String>,
+    pub(crate) child_models: Vec<String>,
+    pub(crate) coder_model: Option<String>,
+    pub(crate) reviewer_model: Option<String>,
+    pub(crate) no_repair: bool,
+    pub(crate) narrate: bool,
+    pub(crate) narrator_model: Option<String>,
+}
+
+pub(crate) fn durable_orchestration_spec(
+    plan: &commands::course::LaunchPlan,
+) -> Result<Option<DurableOrchestrationSpec>> {
+    plan.signals
+        .get(DURABLE_ORCHESTRATION_SIGNAL)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(CliError::from)
+}
+
 pub(crate) struct OrchestrateRunArgs {
     pub(crate) plan: PlanCommandArgs,
     /// The graph the launch classifier already drew. When present, plan
     /// creation uses it instead of asking a second planner for a child graph.
     pub(crate) seed_pieces: Vec<commands::course::CoursePiece>,
+    /// An already accepted launch decision, used by reshape/replay callers
+    /// that must preserve lineage and decision provenance in the durable Job.
+    pub(crate) accepted_launch_plan: Option<commands::course::LaunchPlan>,
     pub(crate) preview: bool,
     pub(crate) yes: bool,
     pub(crate) no_repair: bool,
@@ -39,6 +66,7 @@ pub(crate) fn orchestrate_request_from_cli(
     match command {
         Some(OrchestrateCommand::Review(args)) => Ok(OrchestrateRunArgs {
             seed_pieces: Vec::new(),
+            accepted_launch_plan: None,
             plan: PlanCommandArgs {
                 goal: resolve_required_goal_input(
                     "orchestrate review",
@@ -64,12 +92,11 @@ pub(crate) fn orchestrate_request_from_cli(
                 reviewer_model: args.reviewer_model,
                 init_git: args.init_git || bare.init_git,
                 acceptance: args.acceptance.or(bare.acceptance),
-                skip_acceptance_prompt: args.yes
-                    || args.preview
-                    || args.quiet
-                    || bare.yes
-                    || bare.preview
-                    || bare.quiet,
+                skip_acceptance_prompt: orchestration_acceptance_prompt_may_skip(
+                    args.yes || bare.yes,
+                    args.preview || bare.preview,
+                    args.quiet || bare.quiet,
+                ),
                 no_hints: args.no_hints || bare.no_hints,
                 quiet: args.quiet || bare.quiet,
                 json: false,
@@ -84,6 +111,7 @@ pub(crate) fn orchestrate_request_from_cli(
         }),
         Some(OrchestrateCommand::FullPlan(args)) => Ok(OrchestrateRunArgs {
             seed_pieces: Vec::new(),
+            accepted_launch_plan: None,
             plan: PlanCommandArgs {
                 goal: resolve_required_goal_input(
                     "orchestrate full-plan",
@@ -109,12 +137,11 @@ pub(crate) fn orchestrate_request_from_cli(
                 reviewer_model: None,
                 init_git: args.init_git || bare.init_git,
                 acceptance: args.acceptance.or(bare.acceptance),
-                skip_acceptance_prompt: args.yes
-                    || args.preview
-                    || args.quiet
-                    || bare.yes
-                    || bare.preview
-                    || bare.quiet,
+                skip_acceptance_prompt: orchestration_acceptance_prompt_may_skip(
+                    args.yes || bare.yes,
+                    args.preview || bare.preview,
+                    args.quiet || bare.quiet,
+                ),
                 no_hints: args.no_hints || bare.no_hints,
                 quiet: args.quiet || bare.quiet,
                 json: false,
@@ -210,7 +237,7 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         reviewer_model: None,
         init_git,
         acceptance,
-        skip_acceptance_prompt: yes || preview || quiet,
+        skip_acceptance_prompt: orchestration_acceptance_prompt_may_skip(yes, preview, quiet),
         no_hints,
         quiet,
         json: false,
@@ -230,6 +257,7 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
     }
     Ok(OrchestrateRunArgs {
         seed_pieces: Vec::new(),
+        accepted_launch_plan: None,
         plan,
         preview,
         yes,
@@ -238,6 +266,10 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         narrate: narrate && !no_narrate,
         narrator_model,
     })
+}
+
+fn orchestration_acceptance_prompt_may_skip(yes: bool, preview: bool, _quiet: bool) -> bool {
+    yes || preview
 }
 
 fn orchestrate_mode_refusal_error(goal: &str, message: &str, no_hints: bool) -> CliError {
@@ -466,6 +498,15 @@ fn orchestrate_provider_choice_lines(
 }
 
 pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
+    let internal_sub_orchestration =
+        std::env::var_os(deadreckon_core::campaign::ENV_SUB_RESULT).is_some();
+    if commands::graph_job::current_parent_job_id().is_none()
+        && !internal_sub_orchestration
+        && !commands::plan::test_foreground_advanced_requested()
+        && !args.preview
+    {
+        return schedule_direct_orchestration(args).await;
+    }
     let quiet = args.plan.quiet;
     let plain = args.plan.plain;
     let no_hints = args.plan.no_hints;
@@ -513,6 +554,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
         reviewer_provider: None,
         no_repair: args.no_repair,
         repair_provider: None,
+        yes: true,
         no_hints,
         quiet,
         plain,
@@ -548,8 +590,213 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     merge_result
 }
 
+pub(crate) async fn schedule_direct_orchestration(args: OrchestrateRunArgs) -> Result<()> {
+    let quiet = args.plan.quiet;
+    let explicitly_approved = orchestration_approval_policy(args.yes, quiet, prompt::is_tty())?;
+    if !commands::plan::prepare_orchestration_source(args.plan.init_git, quiet)? {
+        return Ok(());
+    }
+    if let Some(model) = args.narrator_model.as_deref() {
+        let paths = DeadreckonPaths::discover();
+        if let Ok(registry) =
+            deadreckon_providers::registry::ProviderRegistry::with_overrides(paths.home())
+            && !crate::narrator::narrator_model_known(&registry, model)
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                crate::narrator::narrator_model_refusal(model),
+            )));
+        }
+    }
+    let paths = DeadreckonPaths::discover();
+    let defaults = config_defaults(&paths)?;
+    let cwd = std::env::current_dir()?;
+    let max_spend_usd = args.plan.max_spend.or(defaults.max_spend).unwrap_or(10.0);
+    let max_wall_seconds = args
+        .plan
+        .max_wall_seconds
+        .or(defaults.cli_max_wall_seconds)
+        .unwrap_or(36_000.0)
+        .max(1.0) as u64;
+    let sandbox_requested = args
+        .plan
+        .sandbox
+        .clone()
+        .or(defaults.sandbox)
+        .unwrap_or_else(|| "auto".to_string());
+    if sandbox_requested == "none" {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "durable orchestration requires a containment backend; sandbox `none` cannot produce a trusted receipt",
+            "omit `--sandbox none` or choose auto, sandbox-exec, bwrap, or docker",
+        )));
+    }
+    let contract_provider = args
+        .plan
+        .planner_provider
+        .clone()
+        .or_else(|| args.plan.provider.clone())
+        .or_else(|| args.plan.coder_provider.clone());
+    let contract_model = args
+        .plan
+        .planner_model
+        .clone()
+        .or_else(|| args.plan.model.clone())
+        .or_else(|| args.plan.coder_model.clone());
+    let contract = commands::acceptance::ensure_acceptance_before_start(
+        &cwd,
+        args.plan.acceptance.as_deref(),
+        &args.plan.goal,
+        contract_provider,
+        contract_model,
+        explicitly_approved,
+        "orchestrate",
+    )
+    .await?;
+    if !explicitly_approved && !prompt::confirm("queue this durable orchestration job?", true)? {
+        eprintln!("cancelled before job creation");
+        return Ok(());
+    }
+
+    let kind = match args.plan.mode {
+        CliPlanMode::Review => commands::graph_job::DriverKind::Review,
+        CliPlanMode::FullPlan => commands::graph_job::DriverKind::FullPlan,
+    };
+    let driver = commands::graph_job::DriverSpec {
+        kind,
+        child_count: Some(args.plan.n),
+        apply: args.plan.apply,
+        planner_provider: args.plan.planner_provider.clone(),
+        child_provider: args.plan.provider.clone(),
+        child_provider_overrides: args.plan.child_provider.clone(),
+        coder_provider: args.plan.coder_provider.clone(),
+        reviewer_provider: args.plan.reviewer_provider.clone(),
+        model: args.plan.model.clone(),
+        source_init_git: args.plan.init_git,
+    };
+    let accepted_launch_plan = args.accepted_launch_plan.clone();
+    let mut launch_plan = accepted_launch_plan.clone().unwrap_or_else(|| {
+        commands::course::trivial_operator_plan(
+            &args.plan.goal,
+            commands::course::CourseShape::Plan,
+            "orchestrate",
+        )
+    });
+    launch_plan.n = Some(args.plan.n);
+    launch_plan.pieces = args.seed_pieces;
+    launch_plan.providers = commands::course::CourseProviders {
+        planner: args.plan.planner_provider.clone(),
+        coder: args.plan.coder_provider.clone(),
+        reviewer: args.plan.reviewer_provider.clone(),
+    };
+    launch_plan.budget.ceiling_usd = Some(max_spend_usd);
+    launch_plan.budget.wall_seconds = Some(max_wall_seconds);
+    if accepted_launch_plan.is_none() {
+        launch_plan.accepted_by = Some(if explicitly_approved {
+            "yes-flag-guardrail".to_string()
+        } else {
+            "operator".to_string()
+        });
+    }
+    let execution = DurableOrchestrationSpec {
+        planner_model: args.plan.planner_model,
+        child_models: args.plan.child_model,
+        coder_model: args.plan.coder_model,
+        reviewer_model: args.plan.reviewer_model,
+        no_repair: args.no_repair,
+        narrate: args.narrate,
+        narrator_model: args.narrator_model,
+    };
+    let mut signals = launch_plan.signals.as_object().cloned().unwrap_or_default();
+    signals.insert(
+        DURABLE_ORCHESTRATION_SIGNAL.to_string(),
+        serde_json::to_value(execution)?,
+    );
+    launch_plan.signals = serde_json::Value::Object(signals);
+
+    let source = if deadreckon_core::find_git_root(&cwd)?.is_some() {
+        commands::job::DurableSource {
+            mode: commands::job::DurableSourceMode::Worktree,
+            from: None,
+            allow_dirty: false,
+        }
+    } else {
+        commands::job::DurableSource {
+            mode: commands::job::DurableSourceMode::Copy,
+            from: Some(cwd.clone()),
+            allow_dirty: false,
+        }
+    };
+    let accepted_by = if explicitly_approved {
+        deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+    } else {
+        deadreckon_protocol::AuthorityAcceptedBy::Operator
+    };
+    let job = persist_direct_orchestration_job(
+        &paths,
+        &cwd,
+        launch_plan,
+        driver,
+        contract.as_ref().map(|source| source.path.as_path()),
+        source,
+        max_spend_usd,
+        max_wall_seconds,
+        sandbox_requested,
+        accepted_by,
+    )?;
+    commands::job::launch_detached_supervisor(&paths, &job.job_id)?;
+    if !quiet {
+        let view = deadreckon_core::JobView::load(&paths, job.job_id.as_ref())?;
+        commands::job::print_job_status(&view, false)?;
+    }
+    Ok(())
+}
+
+fn orchestration_approval_policy(yes: bool, _quiet: bool, is_tty: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !is_tty {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "durable orchestration needs explicit approval before its immutable Job is queued",
+            "rerun with --yes after reviewing the goal, definition of done, child graph, budget and sandbox",
+        )));
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_direct_orchestration_job(
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+    launch_plan: commands::course::LaunchPlan,
+    driver: commands::graph_job::DriverSpec,
+    contract_source: Option<&Path>,
+    source: commands::job::DurableSource,
+    max_spend_usd: f64,
+    max_wall_seconds: u64,
+    sandbox_requested: String,
+    accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
+) -> Result<deadreckon_protocol::Job> {
+    commands::job::create_job(commands::job::CreateJob {
+        paths,
+        source_cwd: cwd,
+        scope: workspace_scope(cwd)?,
+        launch_plan,
+        shape: deadreckon_protocol::JobShape::Graph,
+        driver: Some(driver),
+        contract_source,
+        source,
+        max_spend_usd,
+        max_wall_seconds,
+        max_attempts: 3,
+        sandbox_requested,
+        accepted_by,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
 
     #[test]
@@ -579,5 +826,108 @@ mod tests {
         );
         assert!(!rendered.contains("recommended:"), "{rendered}");
         assert!(!rendered.contains("try:"), "{rendered}");
+    }
+
+    #[test]
+    fn direct_orchestration_persists_one_bounded_graph_job_with_parent_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("README.md"), "durable graph").expect("source file");
+        let mut launch = commands::course::trivial_operator_plan(
+            "finish the graph task",
+            commands::course::CourseShape::Plan,
+            "orchestrate",
+        );
+        launch.n = Some(2);
+        let execution = DurableOrchestrationSpec {
+            planner_model: Some("planner-model".to_string()),
+            child_models: vec!["1=review-model".to_string()],
+            coder_model: Some("coder-model".to_string()),
+            reviewer_model: Some("reviewer-model".to_string()),
+            no_repair: true,
+            narrate: false,
+            narrator_model: None,
+        };
+        launch.signals = serde_json::json!({
+            DURABLE_ORCHESTRATION_SIGNAL: execution
+        });
+        let driver = commands::graph_job::DriverSpec {
+            kind: commands::graph_job::DriverKind::Review,
+            child_count: Some(2),
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
+            planner_provider: None,
+            child_provider: None,
+            child_provider_overrides: Vec::new(),
+            coder_provider: Some("coder".to_string()),
+            reviewer_provider: Some("reviewer".to_string()),
+            model: None,
+            source_init_git: false,
+        };
+
+        let job = persist_direct_orchestration_job(
+            &paths,
+            &source,
+            launch,
+            driver.clone(),
+            None,
+            commands::job::DurableSource {
+                mode: commands::job::DurableSourceMode::Copy,
+                from: Some(source.clone()),
+                allow_dirty: false,
+            },
+            12.0,
+            600,
+            "auto".to_string(),
+            deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail,
+        )
+        .expect("persist graph job");
+        let authority: deadreckon_protocol::JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority"),
+        )
+        .expect("authority json");
+        let frozen =
+            commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
+                .expect("launch plan");
+
+        assert_eq!(job.shape, deadreckon_protocol::JobShape::Graph);
+        assert_eq!(job.job_id.as_ref(), authority.run_id.as_ref());
+        assert_eq!(job.policy.max_attempts, 3);
+        assert_eq!(
+            commands::graph_job::driver_spec(&frozen).expect("driver"),
+            driver
+        );
+        assert_eq!(
+            durable_orchestration_spec(&frozen)
+                .expect("execution spec")
+                .expect("execution"),
+            DurableOrchestrationSpec {
+                planner_model: Some("planner-model".to_string()),
+                child_models: vec!["1=review-model".to_string()],
+                coder_model: Some("coder-model".to_string()),
+                reviewer_model: Some("reviewer-model".to_string()),
+                no_repair: true,
+                narrate: false,
+                narrator_model: None,
+            }
+        );
+    }
+
+    #[test]
+    fn quiet_non_tty_orchestration_is_not_operator_approval() {
+        let error = orchestration_approval_policy(false, true, false)
+            .expect_err("quiet cannot approve a graph job");
+        assert!(error.to_string().contains("needs explicit approval"));
+        assert!(orchestration_approval_policy(true, true, false).expect("yes approves"));
+    }
+
+    #[test]
+    fn quiet_does_not_skip_orchestration_contract_approval() {
+        assert!(!orchestration_acceptance_prompt_may_skip(
+            false, false, true
+        ));
+        assert!(orchestration_acceptance_prompt_may_skip(false, true, true));
+        assert!(orchestration_acceptance_prompt_may_skip(true, false, true));
     }
 }

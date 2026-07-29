@@ -1045,10 +1045,17 @@ fn orchestration_help_uses_plan_child_provider_language() {
         (["merge", "--help"], "merge"),
     ] {
         let out = help(args);
-        assert!(
-            !out.contains("job"),
-            "{label} help should not say job:\n{out}"
-        );
+        if label == "fork" {
+            assert!(
+                out.contains("durable Graph Job") && out.contains("<job-id>"),
+                "fork help should explain the plan-to-job execution boundary:\n{out}"
+            );
+        } else {
+            assert!(
+                !out.contains("job"),
+                "{label} help should not say job:\n{out}"
+            );
+        }
         assert!(
             !out.contains("descriptor"),
             "{label} help should reserve descriptor for technical docs:\n{out}"

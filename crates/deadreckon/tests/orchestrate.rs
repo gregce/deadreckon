@@ -22,7 +22,17 @@ use tempfile::TempDir;
 
 mod common;
 
-use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
+use common::{assert_success, deadreckon as deadreckon_binary, repo_tempdir, stderr, stdout};
+
+/// This suite characterizes the inner Plan conductor and merge machinery.
+/// Public `fork` and `orchestrate` now queue durable Jobs; debug test binaries
+/// retain this explicit route so the inner executor can still be exercised
+/// without turning every conductor assertion into a supervisor integration.
+fn deadreckon(paths: &DeadreckonPaths) -> Command {
+    let mut command = deadreckon_binary(paths);
+    command.env("DEADRECKON_TEST_FOREGROUND_ADVANCED", "1");
+    command
+}
 
 fn assert_verdict_surface(text: &str, verdict: &str, recommended: &str) {
     assert!(text.contains(verdict), "{text}");
@@ -2242,6 +2252,7 @@ fn quiet_plain_combined_emits_no_stdout() {
             "--sandbox",
             "none",
             "--no-hints",
+            "--yes",
         ])
         .output()
         .expect("run");
@@ -2268,6 +2279,7 @@ fn quiet_emits_no_stdout_on_success() {
             "--sandbox",
             "none",
             "--no-hints",
+            "--yes",
         ])
         .output()
         .expect("run");
@@ -7020,16 +7032,32 @@ fn job_ids(paths: &DeadreckonPaths) -> BTreeSet<String> {
         .collect()
 }
 
-fn new_job_root(paths: &DeadreckonPaths, before: &BTreeSet<String>) -> std::path::PathBuf {
+fn new_replayed_graph_job_root(
+    paths: &DeadreckonPaths,
+    before: &BTreeSet<String>,
+) -> std::path::PathBuf {
     let new = job_roots(paths)
         .into_iter()
         .filter(|root| {
-            root.file_name()
+            let is_new = root
+                .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| !before.contains(name))
+                .is_some_and(|name| !before.contains(name));
+            if !is_new {
+                return false;
+            }
+            let job: Value = fs::read(root.join("job.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_slice(&raw).ok())
+                .unwrap_or(Value::Null);
+            if job["shape"] != "graph" {
+                return false;
+            }
+            let launch = read_launch_plan(root);
+            launch["resolution"]["source"] == "replay"
         })
         .collect::<Vec<_>>();
-    assert_eq!(new.len(), 1, "expected exactly one new durable Job");
+    assert_eq!(new.len(), 1, "expected exactly one new replayed Graph Job");
     new[0].clone()
 }
 
@@ -7274,20 +7302,28 @@ fn accepted_reshape_dispatches_plan_with_parent_lineage() {
     write_start_ready_setup(&paths, &repo);
     let run_id = smoke_run_with_proposal(&paths, &repo);
 
-    let output = deadreckon(&paths)
+    let output = deadreckon_binary(&paths)
         .current_dir(&repo)
         .args(["reshape", &run_id, "--yes", "--plain", "--quiet"])
         .output()
         .expect("reshape accept");
     assert_success(&output);
 
-    let dispatched = newest_plan(&paths);
-    assert_eq!(dispatched.root_goal, "parent run for reshape");
-    assert_eq!(dispatched.tasks.len(), 2, "planned n honored");
-    let record = read_launch_plan(&paths.plan_dir(&dispatched.plan_id));
+    let root = only_job_root(&paths);
+    let job: Value =
+        serde_json::from_slice(&fs::read(root.join("job.json")).expect("job")).expect("job json");
+    assert_eq!(job["goal"], "parent run for reshape", "{job}");
+    assert_eq!(job["shape"], "graph", "{job}");
+    let record = read_launch_plan(&root);
     assert_eq!(record["parent"], run_id.as_str(), "{record}");
     assert_eq!(record["accepted_by"], "operator", "{record}");
     assert_eq!(record["shape"], "plan", "{record}");
+    assert_eq!(record["n"], 2, "{record}");
+    assert_eq!(
+        record["pieces"].as_array().map(Vec::len),
+        Some(2),
+        "{record}"
+    );
 }
 
 // ---- C-P10: replay + launch JSON parity ----
@@ -7299,7 +7335,7 @@ fn start_plan_replays_identical_shape_and_pieces() {
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
 
-    let output = deadreckon(&paths)
+    let output = deadreckon_binary(&paths)
         .current_dir(&repo)
         .args([
             "start",
@@ -7325,7 +7361,7 @@ fn start_plan_replays_identical_shape_and_pieces() {
     fs::copy(first.join("launch-plan.json"), &saved).expect("copy plan");
     let before = job_ids(&paths);
 
-    let output = deadreckon(&paths)
+    let output = deadreckon_binary(&paths)
         .current_dir(&repo)
         .args([
             "start",
@@ -7338,7 +7374,7 @@ fn start_plan_replays_identical_shape_and_pieces() {
         .expect("replay");
     assert_success(&output);
 
-    let replayed = new_job_root(&paths, &before);
+    let replayed = new_replayed_graph_job_root(&paths, &before);
     let replayed_id = replayed
         .file_name()
         .and_then(|name| name.to_str())
@@ -7423,9 +7459,8 @@ fn start_json_emits_launch_envelope_no_card() {
 
     assert_success(&output);
     let out = stdout(&output);
-    let start = out.find('{').expect("json start");
-    let envelope: serde_json::Value = serde_json::from_str(out[start..].trim())
-        .unwrap_or_else(|err| panic!("stdout tail must be one JSON envelope: {err}\n{out}"));
+    let envelope: serde_json::Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|err| panic!("stdout must be exactly one JSON envelope: {err}\n{out}"));
     assert_eq!(envelope["kind"], "launch", "{envelope}");
     assert_eq!(envelope["plan"]["shape"], "single", "{envelope}");
     assert!(

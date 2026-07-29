@@ -105,6 +105,8 @@ Common provider/model changes:
 
 Headless:
   deadreckon run \"goal\" --plain --quiet --sandbox none
+  Explicit `--sandbox none` uses the uncontained foreground compatibility path;
+  it does not create a durable Job or trusted completion receipt.
 
 Done criteria:
   deadreckon def-done \"build, test, and open in a browser\"
@@ -198,12 +200,13 @@ Advanced orchestration building block. Most users reach this through
 `deadreckon orchestrate` or `deadreckon start --mode full-plan`.
 
 Lifecycle:
-  deadreckon fork <plan-id>
-  deadreckon attach <plan-id>
-  deadreckon merge <plan-id>
+  deadreckon fork <plan-id> --yes
+  deadreckon attach <job-id>
+  deadreckon finish <job-id>
 
-Fork starts the plan coordinator. Each child is still a normal deadreckon run,
-using the provider route recorded in plan.json unless you override it here.";
+Fork compiles a pending plan into one durable Graph Job and detaches. The
+approved Job retains the provider routes recorded in plan.json unless you
+override them here.";
 
 const MERGE_HELP: &str = "\
 Advanced orchestration building block. `deadreckon finish <plan-id>` is the
@@ -270,7 +273,7 @@ already know the ordered step sequence.
 Chain subcommands:
   deadreckon chain plan \"large goal\" --n 4
   deadreckon chain \"step one\" \"step two\" --yes
-  deadreckon chain run latest
+  deadreckon status latest
   deadreckon chain attach latest
   deadreckon chain status latest
   deadreckon chain show latest --why-failed
@@ -283,15 +286,17 @@ Chain subcommands:
   deadreckon chain hooks list
 
 Lifecycle:
-  plan/expand drafts provider-generated steps.
-  run/resume executes the conductor.
-  attach watches the chain TUI.
+  plan/expand creates a durable linear Job from provider-generated steps.
+  direct ordered goals create the same durable linear Job and detach.
+  run/resume refuses unsafe legacy conductor execution and shows a migration command.
+  attach watches legacy chain state; use ordinary attach/status for new Jobs.
   pause/kill/undo/redo recover specific steps.
   extend adds a new step to an existing chain.
 
-Apply flags:
-  --apply-mode controls the chain policy: auto, preview, or manual.
-  --apply-strategy controls the git strategy for applied steps: squash, merge, or cherry-pick.";
+Compatibility:
+  new durable chain Jobs support 2-6 ordered steps, at-end apply, and default
+  stack/squash/stop policy. Legacy policy variants remain inspectable but are
+  refused for new execution rather than silently changing their meaning.";
 
 const DOCTOR_HELP: &str = "\
 Lifecycle:
@@ -994,6 +999,12 @@ pub(crate) enum Commands {
         sandbox: Option<String>,
         #[arg(
             long,
+            value_name = "PATH",
+            help = "Approved done-criteria file to freeze into the durable Campaign Job"
+        )]
+        acceptance: Option<PathBuf>,
+        #[arg(
+            long,
             help = "Show the resolved campaign preflight without starting work"
         )]
         preview: bool,
@@ -1091,6 +1102,8 @@ pub(crate) enum Commands {
         no_repair: bool,
         #[arg(long, help = "Repair provider route for dependency merge repair")]
         repair_provider: Option<String>,
+        #[arg(long, help = "Approve and queue the immutable durable Job")]
+        yes: bool,
         #[arg(long, help = "Suppress post-action hints")]
         no_hints: bool,
         #[arg(long, help = "Suppress success chatter and post-action hints")]
@@ -1200,6 +1213,12 @@ pub(crate) enum Commands {
         model: Option<String>,
         #[arg(long, default_value = "auto", help = "Sandbox backend")]
         sandbox: String,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Approved done-criteria file to freeze into the durable Chain Job"
+        )]
+        acceptance: Option<PathBuf>,
         #[arg(long, help = "Base git ref; defaults to current HEAD")]
         base: Option<String>,
         #[arg(
@@ -2692,6 +2711,7 @@ pub(crate) struct ForkCommandArgs {
     pub(crate) reviewer_provider: Option<String>,
     pub(crate) no_repair: bool,
     pub(crate) repair_provider: Option<String>,
+    pub(crate) yes: bool,
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
     pub(crate) plain: bool,
@@ -2734,6 +2754,7 @@ pub(crate) struct ChainCommandArgs {
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) sandbox: String,
+    pub(crate) acceptance: Option<PathBuf>,
     pub(crate) base: Option<String>,
     pub(crate) n: u8,
     pub(crate) no_hints: bool,
@@ -2772,4 +2793,38 @@ pub(crate) struct ExtendCommandArgs {
     pub(crate) narrate: bool,
     pub(crate) no_narrate: bool,
     pub(crate) narrator_model: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn fork_yes_is_explicit_and_quiet_does_not_set_it() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let approved =
+                    Cli::try_parse_from(["deadreckon", "fork", "plan-123", "--yes", "--quiet"])
+                        .expect("approved fork parses");
+                let Some(Commands::Fork { yes, quiet, .. }) = approved.command else {
+                    panic!("fork command");
+                };
+                assert!(yes);
+                assert!(quiet);
+
+                let quiet_only = Cli::try_parse_from(["deadreckon", "fork", "plan-123", "--quiet"])
+                    .expect("quiet fork parses");
+                let Some(Commands::Fork { yes, quiet, .. }) = quiet_only.command else {
+                    panic!("fork command");
+                };
+                assert!(!yes);
+                assert!(quiet);
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test");
+    }
 }

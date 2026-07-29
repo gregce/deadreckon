@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeadReckon Watchkeeper sanitized live trial results",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "recorded_at",
+    "sanitized",
+    "source",
+    "summary",
+    "results",
+    "limitations"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sanitized": {
+      "const": true
+    },
+    "source": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "object",
+      "required": ["total_tasks", "attempted", "not_run", "verified"],
+      "properties": {
+        "total_tasks": {
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 30
+        },
+        "attempted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "not_run": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "verified": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "results": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "execution_status",
+          "repository_slot",
+          "provider_route",
+          "job_id_prefix",
+          "terminal",
+          "receipt_present",
+          "finish_attempted"
+        ],
+        "properties": {
+          "execution_status": {
+            "const": "attempted"
+          },
+          "repository_slot": {
+            "type": "string",
+            "minLength": 1
+          },
+          "provider_route": {
+            "type": "string"
+          },
+          "job_id_prefix": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}$"
+          },
+          "terminal": {
+            "type": "object",
+            "required": ["outcome", "stop_reason"],
+            "properties": {
+              "outcome": {
+                "type": "string",
+                "minLength": 1
+              },
+              "stop_reason": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          },
+          "receipt_present": {
+            "type": "boolean"
+          },
+          "finish_attempted": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}

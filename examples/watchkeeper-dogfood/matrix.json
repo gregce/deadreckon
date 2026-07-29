@@ -39,7 +39,8 @@
       "provider": "independent",
       "category": "documentation",
       "goal": "Correct one verifiable documentation mismatch and cite the exact command or source that proves the correction.",
-      "execution_status": "not_run",
+      "execution_status": "attempted",
+      "result_ref": "trial-results.json#/results/dr-self-02",
       "max_spend_usd": 2.0
     },
     {
@@ -138,7 +139,8 @@
       "provider": "primary",
       "category": "bug-fix",
       "goal": "Fix one reproducible input-validation bug and add a focused regression test.",
-      "execution_status": "not_run",
+      "execution_status": "attempted",
+      "result_ref": "trial-results.json#/results/fixture-01",
       "max_spend_usd": 2.0
     },
     {

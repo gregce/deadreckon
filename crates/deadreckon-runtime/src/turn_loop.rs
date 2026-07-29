@@ -214,6 +214,10 @@ pub async fn run_turn_loop(
         return Ok(RunLoopOutcome::Killed);
     }
     state.set_phase_status(PhaseId(40), PhaseStatus::Executing)?;
+    // A new loop attempt supersedes any provider disposition from the prior
+    // process attempt. If this attempt reaches a provider failure it records
+    // a fresh typed classification below.
+    state.provider_failure = None;
     save_state(state)?;
     if let Some(from_turn) = config.from_turn {
         state.turn = from_turn;
@@ -395,7 +399,10 @@ pub async fn run_turn_loop(
                 )?;
                 return Ok(RunLoopOutcome::PausedAtCap);
             }
-            Some(Ok(response)) => response,
+            Some(Ok(response)) => {
+                state.provider_failure = None;
+                response
+            }
             Some(Err(err)) if should_cancel_run(state, &run_token) => {
                 if let Some(recorder) = flight_recorder.take() {
                     recorder
@@ -418,6 +425,7 @@ pub async fn run_turn_loop(
                 // show as Failed with a reason in list/status, never linger
                 // as a zombie Executing until someone probes pid liveness.
                 state.failure_reason = Some(format!("provider error: {err}"));
+                state.provider_failure = Some(provider_failure_disposition(&err));
                 let _ = state.set_phase_status(PhaseId(40), PhaseStatus::Failed);
                 save_state(state)?;
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
@@ -1105,6 +1113,16 @@ fn should_cancel_run(state: &PipelineState, token: &CancellationToken) -> bool {
 /// Backoff before the single transient-error retry: long enough for a rate
 /// limit window to move, short enough to be negligible against a turn.
 const PROVIDER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+fn provider_failure_disposition(
+    error: &deadreckon_providers::ProviderError,
+) -> deadreckon_core::ProviderFailureDisposition {
+    if error.is_retryable() {
+        deadreckon_core::ProviderFailureDisposition::Retryable
+    } else {
+        deadreckon_core::ProviderFailureDisposition::Fatal
+    }
+}
 
 /// Run a provider completion bounded by the remaining wall budget. `None`
 /// means the budget elapsed first: the turn token is cancelled so the
@@ -2540,8 +2558,9 @@ mod tests {
         ensure_sandbox_toml, implementation_notes_ready_or_request_followup,
         is_direct_api_provider_kind, load_or_reconstruct_history,
         load_tool_policy_from_sandbox_toml, policy_seam_refusal, policy_seam_refusal_message,
-        provider_output_name, record_semantic_judge_accounting, run_turn_loop, safe_working_path,
-        safe_working_path_with_policy, save_history, semantic_completion_disposition,
+        provider_failure_disposition, provider_output_name, record_semantic_judge_accounting,
+        run_turn_loop, safe_working_path, safe_working_path_with_policy, save_history,
+        semantic_completion_disposition,
     };
 
     fn base_run_loop_config() -> RunLoopConfig {
@@ -4707,6 +4726,25 @@ exit 0\n",
                 1
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn provider_retryability_is_preserved_as_typed_run_state_evidence() {
+        let transient = deadreckon_providers::ProviderError::Http {
+            provider: "test".to_string(),
+            detail: "opaque transient".to_string(),
+            retryable: true,
+        };
+        let fatal = deadreckon_providers::ProviderError::MissingCredential("test".to_string());
+
+        assert_eq!(
+            provider_failure_disposition(&transient),
+            deadreckon_core::ProviderFailureDisposition::Retryable
+        );
+        assert_eq!(
+            provider_failure_disposition(&fatal),
+            deadreckon_core::ProviderFailureDisposition::Fatal
         );
     }
 }

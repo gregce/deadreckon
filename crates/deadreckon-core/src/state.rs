@@ -30,6 +30,16 @@ pub enum RunStatus {
     Killed,
 }
 
+/// Typed provider disposition retained with a failed Run so an outer durable
+/// supervisor can decide whether another process attempt is legitimate
+/// without reinterpreting human-readable error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureDisposition {
+    Retryable,
+    Fatal,
+}
+
 impl fmt::Display for RunStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(crate::glossary::run_status_label(*self))
@@ -91,6 +101,8 @@ pub struct PipelineState {
     pub turn: u32,
     pub pause_reason: Option<String>,
     pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_failure: Option<ProviderFailureDisposition>,
     #[serde(default)]
     pub child_pids: Vec<u32>,
     pub killed_at: Option<DateTime<Utc>>,
@@ -239,6 +251,7 @@ pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<Pipeli
         turn: 0,
         pause_reason: None,
         failure_reason: None,
+        provider_failure: None,
         child_pids: Vec::new(),
         killed_at: None,
         promoted_library_dir: None,

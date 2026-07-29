@@ -66,7 +66,7 @@ pub(crate) async fn create_orchestration_plan(
         acceptance,
         skip_acceptance_prompt,
         no_hints,
-        quiet,
+        quiet: _,
         json: json_output,
         plain,
     } = args;
@@ -129,7 +129,7 @@ pub(crate) async fn create_orchestration_plan(
         &goal,
         acceptance_provider,
         None,
-        skip_acceptance_prompt || quiet,
+        skip_acceptance_prompt,
         "orchestration",
     )
     .await?;
@@ -540,15 +540,46 @@ pub(crate) async fn build_full_plan_tasks(
     no_hints: bool,
     json_output: bool,
 ) -> Result<Vec<PlanTask>> {
-    let drafts = if providers
+    Ok(build_full_plan_tasks_accounted(
+        paths,
+        goal,
+        n,
+        providers,
+        overrides,
+        cwd,
+        plain,
+        no_hints,
+        json_output,
+    )
+    .await?
+    .tasks)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_full_plan_tasks_accounted(
+    paths: &DeadreckonPaths,
+    goal: &str,
+    n: u8,
+    providers: &PlanProviders,
+    overrides: &BTreeMap<u32, String>,
+    cwd: &Path,
+    plain: bool,
+    no_hints: bool,
+    json_output: bool,
+) -> Result<BuiltPlanTasks> {
+    let batch = if providers
         .planner
         .as_deref()
         .is_some_and(|provider| provider == "smoke" || provider.starts_with("smoke:"))
     {
-        deterministic_plan_drafts(goal, n)
+        PlannerDraftBatch {
+            drafts: deterministic_plan_drafts(goal, n),
+            accounting: None,
+        }
     } else {
         provider_plan_drafts(paths, goal, n, providers.planner.as_deref(), cwd, plain).await?
     };
+    let PlannerDraftBatch { drafts, accounting } = batch;
     if drafts.len() != usize::from(n) {
         return Err(plan_refusal_error(
             format!("provider returned {} children; need {n}", drafts.len()),
@@ -584,7 +615,10 @@ pub(crate) async fn build_full_plan_tasks(
         task.depends_on = draft.depends_on;
         tasks.push(task);
     }
-    Ok(tasks)
+    Ok(BuiltPlanTasks {
+        tasks,
+        planner_accounting: accounting,
+    })
 }
 
 fn validate_plan_task_count(goal: &str, n: u8, no_hints: bool, json_output: bool) -> Result<()> {
@@ -703,6 +737,22 @@ struct PlannerObjectDraft {
     tasks: Vec<PlannerDraft>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PlannerAccounting {
+    pub(crate) spend: deadreckon_providers::SpendEstimate,
+    pub(crate) wall_seconds: f64,
+}
+
+pub(crate) struct BuiltPlanTasks {
+    pub(crate) tasks: Vec<PlanTask>,
+    pub(crate) planner_accounting: Option<PlannerAccounting>,
+}
+
+struct PlannerDraftBatch {
+    drafts: Vec<PlannerDraft>,
+    accounting: Option<PlannerAccounting>,
+}
+
 async fn provider_plan_drafts(
     paths: &DeadreckonPaths,
     goal: &str,
@@ -710,7 +760,7 @@ async fn provider_plan_drafts(
     planner_provider: Option<&str>,
     cwd: &Path,
     plain: bool,
-) -> Result<Vec<PlannerDraft>> {
+) -> Result<PlannerDraftBatch> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), planner_provider)?;
     let prompt = planner_prompt(goal, n);
     let request = ProviderRequest {
@@ -726,10 +776,18 @@ async fn provider_plan_drafts(
         output_schema: None,
         capability_posture: None,
     };
+    let started = std::time::Instant::now();
     let response =
         maybe_with_cli_wait_status(!plain, "planning child graph", router.complete(&request))
             .await?;
-    parse_planner_response(&response.content)
+    let drafts = parse_planner_response(&response.content)?;
+    Ok(PlannerDraftBatch {
+        drafts,
+        accounting: Some(PlannerAccounting {
+            spend: response.spend,
+            wall_seconds: started.elapsed().as_secs_f64(),
+        }),
+    })
 }
 
 fn planner_prompt(goal: &str, n: u8) -> String {
@@ -1820,6 +1878,51 @@ fn refresh_parent_aggregate(
     }
 }
 
+pub(crate) async fn fork_command_from_cli(args: ForkCommandArgs) -> Result<()> {
+    let internal_sub_orchestration =
+        std::env::var_os(deadreckon_core::campaign::ENV_SUB_RESULT).is_some();
+    if fork_execution_route(
+        commands::graph_job::current_parent_job_id(),
+        internal_sub_orchestration,
+        test_foreground_advanced_requested(),
+    ) == ForkExecutionRoute::DurableJob
+    {
+        return schedule_pending_plan_job(args).await;
+    }
+    fork_command(args).await
+}
+
+#[cfg(debug_assertions)]
+const TEST_FOREGROUND_ADVANCED_ENV: &str = "DEADRECKON_TEST_FOREGROUND_ADVANCED";
+
+#[cfg(debug_assertions)]
+pub(crate) fn test_foreground_advanced_requested() -> bool {
+    std::env::var(TEST_FOREGROUND_ADVANCED_ENV).as_deref() == Ok("1")
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) const fn test_foreground_advanced_requested() -> bool {
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkExecutionRoute {
+    DurableJob,
+    TrustedDriver,
+}
+
+fn fork_execution_route(
+    parent_job_id: Option<&str>,
+    internal_sub_orchestration: bool,
+    test_foreground_advanced: bool,
+) -> ForkExecutionRoute {
+    if parent_job_id.is_none() && !internal_sub_orchestration && !test_foreground_advanced {
+        ForkExecutionRoute::DurableJob
+    } else {
+        ForkExecutionRoute::TrustedDriver
+    }
+}
+
 pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     let ForkCommandArgs {
         plan_id,
@@ -1832,6 +1935,7 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         reviewer_provider,
         no_repair,
         repair_provider,
+        yes: _,
         no_hints,
         quiet,
         plain,
@@ -2400,6 +2504,171 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         print_fork_finished(&plan, no_hints);
     }
     Ok(())
+}
+
+async fn schedule_pending_plan_job(args: ForkCommandArgs) -> Result<()> {
+    let ForkCommandArgs {
+        plan_id,
+        max_spend,
+        max_wall_seconds,
+        sandbox,
+        provider,
+        child_provider,
+        coder_provider,
+        reviewer_provider,
+        no_repair,
+        repair_provider,
+        yes,
+        no_hints,
+        quiet,
+        plain,
+        completion_surface,
+        narrate,
+        narrator_model,
+    } = args;
+    if repair_provider.is_some() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "a durable plan Job cannot freeze the legacy --repair-provider override",
+            "route coder/reviewer/child providers on the plan, or omit --repair-provider",
+        )));
+    }
+    let paths = DeadreckonPaths::discover();
+    let resolved_id = resolve_plan_id(&paths, &plan_id)?;
+    let mut plan = load_plan(&paths, &resolved_id)?;
+    if plan.status != PlanStatus::Pending {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "plan {} already entered the legacy process-owned lifecycle",
+                run_prefix(&plan.plan_id)
+            ),
+            &format!(
+                "deadreckon attach {}; create a new durable job with `deadreckon orchestrate` if recovery is required",
+                run_prefix(&plan.plan_id)
+            ),
+        )));
+    }
+    if plan.tasks.iter().any(|task| task.subplan.is_some()) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "this stored plan references pre-created nested plan state and cannot be compiled losslessly into one durable Job",
+            "launch the root goal with `deadreckon orchestrate full-plan --yes`",
+        )));
+    }
+    let cwd = std::env::current_dir()?;
+    if let Some(parent_cwd) = plan.parent_cwd.as_deref()
+        && fs::canonicalize(parent_cwd).ok() != fs::canonicalize(&cwd).ok()
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "plan {} belongs to source workspace {}",
+                run_prefix(&plan.plan_id),
+                parent_cwd.display()
+            ),
+            &format!(
+                "cd {} && deadreckon fork {}",
+                parent_cwd.display(),
+                plan.plan_id
+            ),
+        )));
+    }
+    apply_fork_provider_overrides(
+        &mut plan,
+        provider,
+        &child_provider,
+        coder_provider,
+        reviewer_provider,
+    )?;
+    let n = u8::try_from(plan.n).map_err(|_| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "plan {} has too many children for durable orchestration",
+            plan.plan_id
+        )))
+    })?;
+    let mode = match plan.mode {
+        PlanMode::Review => CliPlanMode::Review,
+        PlanMode::FullPlan => CliPlanMode::FullPlan,
+    };
+    let seed_pieces = plan
+        .tasks
+        .iter()
+        .map(|task| commands::course::CoursePiece {
+            id: task.task_id.clone(),
+            goal: task.goal.clone(),
+            done_hint: None,
+            role: Some(
+                match task.role {
+                    PlanRole::Child => "child",
+                    PlanRole::Coder => "coder",
+                    PlanRole::Reviewer => "reviewer",
+                }
+                .to_string(),
+            ),
+            provider: task.provider.clone(),
+            model: plan
+                .providers
+                .child_models
+                .get(&task.index)
+                .cloned()
+                .or_else(|| match task.role {
+                    PlanRole::Child => plan.providers.default_child_model.clone(),
+                    PlanRole::Coder => plan.providers.coder_model.clone(),
+                    PlanRole::Reviewer => plan.providers.reviewer_model.clone(),
+                }),
+            budget_usd: None,
+            depends_on: task.depends_on.clone(),
+            subplan: None,
+        })
+        .collect::<Vec<_>>();
+    let child_provider = plan
+        .providers
+        .children
+        .iter()
+        .map(|(index, provider)| format!("{index}={provider}"))
+        .collect::<Vec<_>>();
+    let child_model = plan
+        .providers
+        .child_models
+        .iter()
+        .map(|(index, model)| format!("{index}={model}"))
+        .collect::<Vec<_>>();
+    commands::orchestrate::schedule_direct_orchestration(
+        commands::orchestrate::OrchestrateRunArgs {
+            plan: PlanCommandArgs {
+                goal: plan.root_goal,
+                n,
+                mode,
+                apply: plan.apply,
+                max_spend,
+                max_wall_seconds,
+                sandbox,
+                planner_provider: plan.providers.planner,
+                provider: plan.providers.default_child,
+                child_provider,
+                coder_provider: plan.providers.coder,
+                reviewer_provider: plan.providers.reviewer,
+                planner_model: plan.providers.planner_model,
+                model: plan.providers.default_child_model,
+                child_model,
+                coder_model: plan.providers.coder_model,
+                reviewer_model: plan.providers.reviewer_model,
+                init_git: false,
+                acceptance: plan.acceptance_path,
+                skip_acceptance_prompt: true,
+                no_hints,
+                quiet,
+                json: false,
+                plain,
+            },
+            seed_pieces,
+            accepted_launch_plan: None,
+            preview: false,
+            yes,
+            no_repair,
+            completion_surface,
+            narrate,
+            narrator_model,
+        },
+    )
+    .await
 }
 
 /// Land one completed node's work on the operator's branch.
@@ -4401,6 +4670,26 @@ mod tests {
         // --no-narrate / --quiet still win regardless.
         assert!(!orchestrate_aggregate_enabled(false, false, false));
         assert!(!orchestrate_aggregate_enabled(true, true, false));
+    }
+
+    #[test]
+    fn cli_fork_queues_a_job_while_trusted_drivers_use_the_inner_executor() {
+        assert_eq!(
+            fork_execution_route(None, false, false),
+            ForkExecutionRoute::DurableJob
+        );
+        assert_eq!(
+            fork_execution_route(Some("job-123"), false, false),
+            ForkExecutionRoute::TrustedDriver
+        );
+        assert_eq!(
+            fork_execution_route(None, true, false),
+            ForkExecutionRoute::TrustedDriver
+        );
+        assert_eq!(
+            fork_execution_route(None, false, true),
+            ForkExecutionRoute::TrustedDriver
+        );
     }
 
     const PLAN_JSON: &str = r#"{"tasks":[{"subject":"scaffold","goal":"g0","active_form":"scaffolding","depends_on":[]},{"subject":"sync","goal":"g1","active_form":"syncing","depends_on":["task-0"]}]}"#;

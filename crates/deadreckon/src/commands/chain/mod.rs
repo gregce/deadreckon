@@ -20,7 +20,7 @@ fn print_chain_help(topic: Option<&str>) {
             println!(
                 "purpose: ask the configured provider to split a large goal into ordered steps"
             );
-            print_chain_help_recommended("deadreckon chain run latest");
+            print_chain_help_recommended("deadreckon status latest");
         }
         "run" | "resume" => {
             println!("{}", ui_heading("deadreckon chain run"));
@@ -29,8 +29,10 @@ fn print_chain_help(topic: Option<&str>) {
                 "usage: {}",
                 ui_command("deadreckon chain resume latest --from-step 2")
             );
-            println!("purpose: execute or continue the conductor for a chain");
-            print_chain_help_recommended("deadreckon chain attach latest");
+            println!(
+                "purpose: inspect a legacy chain's migration command; unsafe conductor execution is refused"
+            );
+            print_chain_help_recommended("deadreckon chain show latest");
         }
         "attach" | "watch" => {
             println!("{}", ui_heading("deadreckon chain attach"));
@@ -57,7 +59,7 @@ fn print_chain_help(topic: Option<&str>) {
                 ui_command("deadreckon chain show latest --why-failed")
             );
             println!("purpose: inspect steps, policies, failures, applied SHAs, and run ids");
-            print_chain_help_recommended("deadreckon chain resume latest");
+            print_chain_help_recommended("deadreckon chain show latest");
         }
         "pause" | "kill" => {
             println!("{}", ui_heading("deadreckon chain pause/kill"));
@@ -98,7 +100,7 @@ fn print_chain_help(topic: Option<&str>) {
                 ui_command("deadreckon chain extend latest \"new step goal\" --insert-at 2")
             );
             println!("purpose: add a new step to an existing chain");
-            print_chain_help_recommended("deadreckon chain run latest");
+            print_chain_help_recommended("deadreckon chain show latest");
         }
         "hooks" => {
             println!("{}", ui_heading("deadreckon chain hooks"));
@@ -141,6 +143,7 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
         provider,
         model,
         sandbox,
+        acceptance,
         base,
         n,
         no_hints,
@@ -162,6 +165,12 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
         json,
     } = args;
     let paths = DeadreckonPaths::discover();
+    if draft && acceptance.is_some() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "--acceptance cannot be preserved in a legacy chain draft; no draft was written",
+            "remove --draft to create a durable Chain Job with the approved contract",
+        )));
+    }
     if args.first().is_some_and(|arg| arg == "help") {
         print_chain_help(args.get(1).map(String::as_str));
         return Ok(());
@@ -169,9 +178,10 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
     let Some(first) = args.first().map(String::as_str) else {
         if from_file.is_some() || from_stdin {
             let goals = collect_chain_goals(&[], from_file, from_stdin, no_hints)?;
+            let root_goal = format!("manual: {} steps", goals.len());
             return chain_create_command(ChainCreateOptions {
                 paths,
-                root_goal: format!("manual: {} steps", goals.len()),
+                root_goal,
                 goals,
                 from_file: None,
                 from_stdin: false,
@@ -186,9 +196,12 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 circuit_breaker_threshold,
                 max_spend,
                 max_wall_seconds,
+                pre_job_spend_usd: 0.0,
+                pre_job_wall_seconds: 0.0,
                 provider,
                 model,
                 sandbox,
+                acceptance,
                 base,
                 n,
                 no_hints,
@@ -234,9 +247,12 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 circuit_breaker_threshold,
                 max_spend,
                 max_wall_seconds,
+                pre_job_spend_usd: 0.0,
+                pre_job_wall_seconds: 0.0,
                 provider,
                 model,
                 sandbox,
+                acceptance,
                 base,
                 n,
                 no_hints,
@@ -380,9 +396,10 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
         }
         _ => {
             let goals = collect_chain_goals(&args, from_file, from_stdin, no_hints)?;
+            let root_goal = format!("manual: {} steps", goals.len());
             chain_create_command(ChainCreateOptions {
                 paths,
-                root_goal: format!("manual: {} steps", goals.len()),
+                root_goal,
                 goals,
                 from_file: None,
                 from_stdin: false,
@@ -397,9 +414,12 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 circuit_breaker_threshold,
                 max_spend,
                 max_wall_seconds,
+                pre_job_spend_usd: 0.0,
+                pre_job_wall_seconds: 0.0,
                 provider,
                 model,
                 sandbox,
+                acceptance,
                 base,
                 n,
                 no_hints,
@@ -429,9 +449,12 @@ struct ChainCreateOptions {
     circuit_breaker_threshold: u32,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
+    pre_job_spend_usd: f64,
+    pre_job_wall_seconds: f64,
     provider: Option<String>,
     model: Option<String>,
     sandbox: String,
+    acceptance: Option<PathBuf>,
     base: Option<String>,
     n: u8,
     no_hints: bool,
@@ -439,6 +462,7 @@ struct ChainCreateOptions {
     plain: bool,
 }
 
+#[allow(dead_code)]
 struct ChainRunOptions {
     detach: bool,
     quiet: bool,
@@ -459,6 +483,7 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
         options.model.as_deref(),
     )?;
     let prompt = chain_planner_prompt(&options.root_goal, n);
+    let planner_started = std::time::Instant::now();
     let response = with_cli_wait_status(
         "drafting chain plan",
         router.complete(&ProviderRequest {
@@ -493,8 +518,15 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
             options.no_hints,
         )
     })?;
+    let pre_job_wall_seconds = planner_started.elapsed().as_secs_f64();
     let goals = parse_planner_goals(&response.content, n, &options.root_goal, options.no_hints)?;
-    let chain_id = chain_create_command(ChainCreateOptions { goals, ..options }).await?;
+    let chain_id = chain_create_command(ChainCreateOptions {
+        goals,
+        pre_job_spend_usd: response.spend.cost_usd,
+        pre_job_wall_seconds,
+        ..options
+    })
+    .await?;
     append_chain_planner_spend(&paths, &chain_id, &response)?;
     Ok(())
 }
@@ -517,9 +549,12 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         circuit_breaker_threshold,
         max_spend,
         max_wall_seconds,
+        pre_job_spend_usd,
+        pre_job_wall_seconds,
         provider,
         model,
         sandbox,
+        acceptance,
         base,
         n: _,
         no_hints,
@@ -577,7 +612,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         )
     })?;
     let scope = workspace_scope(&cwd).map_err(CliError::from)?;
-    let base_ref = base.unwrap_or_else(|| "HEAD".to_string());
+    let base_ref = base.clone().unwrap_or_else(|| "HEAD".to_string());
     let base_sha = git_stdout(&git_root, &["rev-parse", &base_ref])?;
     let base_branch = git_stdout(&git_root, &["symbolic-ref", "--short", "HEAD"])
         .unwrap_or_else(|_| base_ref.clone());
@@ -587,7 +622,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         scope,
         base_branch,
         base_sha,
-        cwd: git_root.clone(),
+        cwd: git_root,
         provider,
         model,
         sandbox,
@@ -602,16 +637,139 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         deadreckon_version: env!("CARGO_PKG_VERSION").to_string(),
     })
     .map_err(CliError::from)?;
-    save_chain(&paths, &chain)?;
-    append_chain_event(
+    if chain.sandbox == "none" {
+        if acceptance.is_some() {
+            return Err(chain_create_refusal_surface(
+                VerdictKind::Blocked,
+                None,
+                "DeadReckon did not start this uncontained legacy chain with an approved contract.",
+                "An explicit --sandbox none chain can preserve the legacy foreground conductor, but it cannot produce the isolated, independently verified, trusted Job receipt promised by an approved definition of done.",
+                [
+                    ("sandbox".to_string(), "none".to_string()),
+                    ("trusted Job".to_string(), "not created".to_string()),
+                ],
+                durable_chain_start_command(&chain),
+                no_hints,
+            ));
+        }
+        return run_uncontained_legacy_chain_creation(
+            &paths, &chain, draft, yes, detach, no_hints, quiet, plain,
+        )
+        .await;
+    }
+    let contract_preview = if draft {
+        None
+    } else {
+        Some(chain_contract_preview(acceptance.as_deref(), &chain.cwd)?)
+    };
+    if !quiet && (draft || !yes) {
+        println!("{}", chain_preview(&chain));
+        if let Some(contract_preview) = contract_preview.as_ref() {
+            print_chain_contract_preview(contract_preview);
+        }
+    }
+    if !yes
+        && quiet
+        && let Some(contract_preview) = contract_preview.as_ref()
+    {
+        print_chain_contract_preview(contract_preview);
+    }
+    if draft {
+        save_chain(&paths, &chain)?;
+        append_chain_event(
+            &paths,
+            &chain.chain_id,
+            ChainEventKind::ChainCreated,
+            None,
+            json!({ "steps": chain.steps.len(), "draft": true }),
+        )?;
+        if completion_hints_enabled(no_hints) && !quiet {
+            println!(
+                "{} {} with {} steps",
+                ui_muted("drafted:"),
+                ui_id(&chain.chain_id),
+                chain.steps.len()
+            );
+            println!(
+                "{}    {}",
+                ui_muted("edit:"),
+                ui_command(format!(
+                    "vim {}",
+                    paths.chain_json(&chain.chain_id).display()
+                ))
+            );
+            println!(
+                "{}     {}",
+                ui_muted("run:"),
+                ui_command(durable_chain_migration_command(&chain))
+            );
+        }
+        return Ok(chain.chain_id);
+    }
+    validate_durable_chain_compatibility(&chain, base.as_deref(), no_hints)?;
+    if !yes {
+        if !io::stdin().is_terminal() {
+            return Err(chain_create_refusal_surface(
+                VerdictKind::Blocked,
+                None,
+                "DeadReckon did not start the chain because non-interactive chain start requires --yes.",
+                "This session cannot ask for launch confirmation, so DeadReckon refused before creating durable Job state.",
+                [
+                    ("steps".to_string(), chain.steps.len().to_string()),
+                    ("stdin".to_string(), "non-interactive".to_string()),
+                    ("job state".to_string(), "not created".to_string()),
+                ],
+                durable_chain_start_command(&chain),
+                no_hints,
+            ));
+        }
+        if !prompt::confirm("start the chain?", true)? {
+            println!("{}", ui_status("cancelled"));
+            return Ok(chain.chain_id);
+        }
+    }
+    let _ = (detach, plain);
+    schedule_linear_chain_job(
         &paths,
+        &chain,
+        pre_job_spend_usd,
+        pre_job_wall_seconds,
+        acceptance.as_deref(),
+        chain_accepted_by(yes),
+        contract_preview.as_ref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "durable chain launch is missing its contract preview".to_string(),
+            ))
+        })?,
+        quiet,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_uncontained_legacy_chain_creation(
+    paths: &DeadreckonPaths,
+    chain: &Chain,
+    draft: bool,
+    yes: bool,
+    detach: bool,
+    no_hints: bool,
+    quiet: bool,
+    plain: bool,
+) -> Result<String> {
+    save_chain(paths, chain)?;
+    append_chain_event(
+        paths,
         &chain.chain_id,
         ChainEventKind::ChainCreated,
         None,
-        json!({ "steps": chain.steps.len(), "draft": draft }),
+        json!({
+            "steps": chain.steps.len(),
+            "draft": draft,
+            "execution_trust": "legacy-uncontained"
+        }),
     )?;
     if !quiet && (draft || !yes) {
-        println!("{}", chain_preview(&chain));
+        println!("{}", chain_preview(chain));
     }
     if draft {
         if completion_hints_enabled(no_hints) && !quiet {
@@ -638,7 +796,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
                 ))
             );
         }
-        return Ok(chain.chain_id);
+        return Ok(chain.chain_id.clone());
     }
     if !yes {
         if !io::stdin().is_terminal() {
@@ -646,25 +804,29 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
                 VerdictKind::Blocked,
                 Some(&chain.chain_id),
                 "DeadReckon did not start the chain because non-interactive chain start requires --yes.",
-                "The chain was drafted, but this session cannot ask for launch confirmation, so DeadReckon stopped before starting the conductor.",
+                "The explicitly uncontained compatibility chain was drafted, but this session cannot answer the launch confirmation prompt.",
                 [
                     ("chain".to_string(), chain_prefix(&chain.chain_id)),
                     ("steps".to_string(), chain.steps.len().to_string()),
                     ("stdin".to_string(), "non-interactive".to_string()),
+                    (
+                        "execution trust".to_string(),
+                        "legacy uncontained; no trusted Job receipt".to_string(),
+                    ),
                 ],
-                "deadreckon chain --yes \"step one\" \"step two\"".to_string(),
+                "deadreckon chain --yes --sandbox none \"step one\" \"step two\"".to_string(),
                 no_hints,
             ));
         }
-        if !prompt::confirm("start the chain?", true)? {
+        if !prompt::confirm("start the uncontained compatibility chain?", true)? {
             println!("{}", ui_status("cancelled"));
-            return Ok(chain.chain_id);
+            return Ok(chain.chain_id.clone());
         }
     }
     let chain_id = chain.chain_id.clone();
     let auto_attach = chain_should_auto_attach(io::stdout().is_terminal(), detach, quiet, plain);
     chain_run_command(
-        &paths,
+        paths,
         &chain_id,
         ChainRunOptions {
             detach: detach || auto_attach,
@@ -679,7 +841,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
     )
     .await?;
     if auto_attach {
-        chain_attach_command(&paths, &chain_id, false).await?;
+        chain_attach_command(paths, &chain_id, false).await?;
     }
     Ok(chain_id)
 }
@@ -713,7 +875,445 @@ where
 }
 
 fn quote_chain_goal_arg(goal: &str) -> String {
-    format!("\"{}\"", goal.replace('\\', "\\\\").replace('"', "\\\""))
+    let escaped = goal
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`");
+    format!("\"{escaped}\"")
+}
+
+struct ChainContractPreview {
+    source: String,
+    name: String,
+    checks: Vec<String>,
+}
+
+fn chain_contract_preview(acceptance: Option<&Path>, cwd: &Path) -> Result<ChainContractPreview> {
+    if let Some(path) = acceptance {
+        let spec: deadreckon_core::AcceptanceSpec = serde_yaml::from_slice(&fs::read(path)?)
+            .map_err(|source| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "could not read chain acceptance contract {}: {source}",
+                    path.display()
+                )))
+            })?;
+        return Ok(ChainContractPreview {
+            source: format!("selected {}", path.display()),
+            name: spec
+                .name
+                .unwrap_or_else(|| "unnamed acceptance contract".to_string()),
+            checks: spec
+                .checks
+                .iter()
+                .map(chain_acceptance_check_label)
+                .collect(),
+        });
+    }
+    let kind = deadreckon_core::acceptance_defaults::detect_project_kind(cwd);
+    let checks = deadreckon_core::acceptance_defaults::default_checks_for(&kind, cwd);
+    Ok(ChainContractPreview {
+        source: format!(
+            "detected {}",
+            deadreckon_core::acceptance_defaults::kind_label(&kind)
+        ),
+        name: format!(
+            "deadreckon detected {}",
+            deadreckon_core::acceptance_defaults::kind_label(&kind)
+        ),
+        checks: checks.iter().map(chain_acceptance_check_label).collect(),
+    })
+}
+
+fn chain_acceptance_check_label(check: &deadreckon_core::AcceptanceCheck) -> String {
+    serde_json::to_value(check)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "acceptance_check".to_string())
+}
+
+fn print_chain_contract_preview(preview: &ChainContractPreview) {
+    println!("  done contract: {} — {}", preview.source, preview.name);
+    if preview.checks.is_empty() {
+        println!("    checks: none (semantic judge remains required)");
+    } else {
+        println!("    checks: {}", preview.checks.join(", "));
+    }
+}
+
+fn chain_accepted_by(yes: bool) -> deadreckon_protocol::AuthorityAcceptedBy {
+    if yes {
+        deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+    } else {
+        deadreckon_protocol::AuthorityAcceptedBy::Operator
+    }
+}
+
+fn ordered_chain_goal(goals: &[String]) -> String {
+    let ordered = goals
+        .iter()
+        .enumerate()
+        .map(|(index, goal)| format!("{}. {}", index + 1, goal.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Complete these steps in order:\n{ordered}")
+}
+
+fn durable_chain_start_command(chain: &Chain) -> String {
+    let mut parts = vec!["deadreckon chain --yes".to_string()];
+    if let Some(provider) = chain.provider.as_deref() {
+        parts.push(format!("--provider {}", quote_chain_goal_arg(provider)));
+    }
+    if let Some(model) = chain.model.as_deref() {
+        parts.push(format!("--model {}", quote_chain_goal_arg(model)));
+    }
+    if chain.sandbox != "auto" && chain.sandbox != "none" {
+        parts.push(format!(
+            "--sandbox {}",
+            quote_chain_goal_arg(&chain.sandbox)
+        ));
+    }
+    if let Some(max_spend) = chain.max_spend_usd {
+        parts.push(format!("--max-spend {max_spend:.6}"));
+    }
+    if let Some(max_wall) = chain.max_wall_seconds {
+        parts.push(format!("--max-wall-seconds {max_wall:.3}"));
+    }
+    parts.extend(
+        chain
+            .steps
+            .iter()
+            .map(|step| quote_chain_goal_arg(&step.goal)),
+    );
+    parts.join(" ")
+}
+
+fn durable_chain_migration_command(chain: &Chain) -> String {
+    durable_chain_start_command(chain)
+}
+
+fn legacy_chain_start_command(chain: &Chain, requested_base: Option<&str>) -> String {
+    let mut parts = vec![
+        "deadreckon chain --yes".to_string(),
+        "--sandbox none".to_string(),
+        format!(
+            "--branch-policy {}",
+            quote_chain_goal_arg(branch_policy_label(chain.branch_policy))
+        ),
+        format!(
+            "--apply-mode {}",
+            quote_chain_goal_arg(apply_mode_label(chain.apply_mode))
+        ),
+        format!(
+            "--apply-strategy {}",
+            quote_chain_goal_arg(apply_strategy_label(chain.apply_strategy))
+        ),
+        format!(
+            "--on-fail {}",
+            quote_chain_goal_arg(on_fail_label(chain.on_fail))
+        ),
+        format!(
+            "--circuit-breaker-threshold {}",
+            chain.circuit_breaker_threshold
+        ),
+    ];
+    if let Some(provider) = chain.provider.as_deref() {
+        parts.push(format!("--provider {}", quote_chain_goal_arg(provider)));
+    }
+    if let Some(model) = chain.model.as_deref() {
+        parts.push(format!("--model {}", quote_chain_goal_arg(model)));
+    }
+    for allow in &chain.apply_allowlist {
+        parts.push(format!("--apply-allowlist {}", quote_chain_goal_arg(allow)));
+    }
+    if let Some(max_spend) = chain.max_spend_usd {
+        parts.push(format!("--max-spend {max_spend:.6}"));
+    }
+    if let Some(max_wall) = chain.max_wall_seconds {
+        parts.push(format!("--max-wall-seconds {max_wall:.3}"));
+    }
+    if let Some(base) = requested_base {
+        parts.push(format!("--base {}", quote_chain_goal_arg(base)));
+    }
+    parts.extend(
+        chain
+            .steps
+            .iter()
+            .map(|step| quote_chain_goal_arg(&step.goal)),
+    );
+    parts.join(" ")
+}
+
+fn validate_durable_chain_compatibility(
+    chain: &Chain,
+    requested_base: Option<&str>,
+    no_hints: bool,
+) -> Result<()> {
+    let mut unsupported = Vec::new();
+    if chain.steps.len() > 6 {
+        unsupported.push(format!(
+            "{} steps (durable linear jobs currently support at most 6)",
+            chain.steps.len()
+        ));
+    }
+    if chain.branch_policy != BranchPolicy::Stack {
+        unsupported.push(format!(
+            "branch policy {}",
+            branch_policy_label(chain.branch_policy)
+        ));
+    }
+    if chain.apply_mode != ApplyMode::Auto {
+        unsupported.push(format!("apply mode {}", apply_mode_label(chain.apply_mode)));
+    }
+    if chain.apply_strategy != ApplyStrategy::Squash {
+        unsupported.push(format!(
+            "apply strategy {}",
+            apply_strategy_label(chain.apply_strategy)
+        ));
+    }
+    if !chain.apply_allowlist.is_empty() {
+        unsupported.push("apply allowlist".to_string());
+    }
+    if chain.on_fail != OnFail::Stop {
+        unsupported.push(format!("on-fail {}", on_fail_label(chain.on_fail)));
+    }
+    if chain.circuit_breaker_threshold != 2 {
+        unsupported.push(format!(
+            "circuit breaker threshold {}",
+            chain.circuit_breaker_threshold
+        ));
+    }
+    if chain.sandbox == "none" {
+        unsupported.push("sandbox none (durable trusted Jobs require isolation)".to_string());
+    }
+    if requested_base.is_some_and(|base| base != "HEAD") {
+        unsupported.push(format!("base {}", requested_base.unwrap_or("HEAD")));
+    }
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(chain_create_refusal_surface(
+        VerdictKind::Blocked,
+        None,
+        "DeadReckon did not start this chain because it uses legacy conductor-only policies.",
+        "New chain execution is a durable linear Job verified once at the end. DeadReckon refuses options it cannot preserve truthfully instead of silently changing their meaning. The recommended command selects the explicitly uncontained legacy conductor and cannot produce a trusted Job receipt.",
+        [
+            ("unsupported".to_string(), unsupported.join(", ")),
+            ("job state".to_string(), "not created".to_string()),
+            (
+                "compatibility receipt".to_string(),
+                "untrusted; no verified Job receipt".to_string(),
+            ),
+        ],
+        legacy_chain_start_command(chain, requested_base),
+        no_hints,
+    ))
+}
+
+fn linear_chain_launch_plan(chain: &Chain) -> commands::course::LaunchPlan {
+    let ordered_goal = ordered_chain_goal(
+        &chain
+            .steps
+            .iter()
+            .map(|step| step.goal.clone())
+            .collect::<Vec<_>>(),
+    );
+    let durable_goal = if chain.root_goal.starts_with("manual:") || chain.root_goal == ordered_goal
+    {
+        ordered_goal
+    } else {
+        format!("{}\n\n{}", chain.root_goal.trim(), ordered_goal)
+    };
+    let mut launch = commands::course::trivial_operator_plan(
+        &durable_goal,
+        commands::course::CourseShape::Plan,
+        "chain",
+    );
+    launch.n = Some(chain.steps.len() as u8);
+    launch.pieces = chain
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let id = format!("step-{}", index + 1);
+            commands::course::CoursePiece {
+                id,
+                goal: step.goal.clone(),
+                done_hint: None,
+                role: Some("child".to_string()),
+                provider: chain.provider.clone(),
+                model: chain.model.clone(),
+                budget_usd: None,
+                depends_on: if index > 0 {
+                    vec![format!("step-{index}")]
+                } else {
+                    Vec::new()
+                },
+                subplan: None,
+            }
+        })
+        .collect();
+    launch
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_linear_chain_job(
+    paths: &DeadreckonPaths,
+    chain: &Chain,
+    pre_job_spend_usd: f64,
+    pre_job_wall_seconds: f64,
+    acceptance: Option<&Path>,
+    accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
+    contract_preview: &ChainContractPreview,
+    quiet: bool,
+) -> Result<String> {
+    let job = create_linear_chain_job(
+        paths,
+        chain,
+        pre_job_spend_usd,
+        pre_job_wall_seconds,
+        acceptance,
+        accepted_by,
+        contract_preview,
+    )?;
+    commands::job::launch_detached_supervisor(paths, &job.job_id)?;
+    if quiet {
+        println!("{}", job.job_id);
+    } else {
+        let view = deadreckon_core::JobView::load(paths, job.job_id.as_ref())?;
+        commands::job::print_job_status(&view, false)?;
+    }
+    Ok(job.job_id.to_string())
+}
+
+fn create_linear_chain_job(
+    paths: &DeadreckonPaths,
+    chain: &Chain,
+    pre_job_spend_usd: f64,
+    pre_job_wall_seconds: f64,
+    acceptance: Option<&Path>,
+    accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
+    contract_preview: &ChainContractPreview,
+) -> Result<deadreckon_protocol::Job> {
+    let defaults = config_defaults(paths)?;
+    let approved_max_spend_usd = chain.max_spend_usd.or(defaults.max_spend).unwrap_or(10.0);
+    let approved_max_wall_seconds = chain
+        .max_wall_seconds
+        .or(defaults.cli_max_wall_seconds)
+        .unwrap_or(36_000.0);
+    if !approved_max_spend_usd.is_finite() || approved_max_spend_usd <= 0.0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain max spend must be a positive finite value".to_string(),
+        )));
+    }
+    if !approved_max_wall_seconds.is_finite() || approved_max_wall_seconds <= 0.0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain wall cap must be a positive finite value".to_string(),
+        )));
+    }
+    if !pre_job_spend_usd.is_finite() || pre_job_spend_usd < 0.0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "chain planner reported invalid pre-Job spend; no Job was created".to_string(),
+        )));
+    }
+    if !pre_job_wall_seconds.is_finite() || pre_job_wall_seconds < 0.0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "chain planner reported invalid pre-Job wall time; no Job was created".to_string(),
+        )));
+    }
+    let execution_max_spend_usd = approved_max_spend_usd - pre_job_spend_usd;
+    let execution_max_wall_seconds = approved_max_wall_seconds - pre_job_wall_seconds;
+    if execution_max_spend_usd <= 0.0 || execution_max_wall_seconds <= 0.0 {
+        let message = format!(
+            "one token-bounded chain planner completion used ${pre_job_spend_usd:.6} and {pre_job_wall_seconds:.3}s of the approved ${approved_max_spend_usd:.6} / {approved_max_wall_seconds:.3}s total; planning exhausted a cap, so no Job was created"
+        );
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &message,
+            "raise --max-spend/--max-wall-seconds or provide ordered goals directly to skip planning",
+        )));
+    }
+    let execution_max_wall_seconds = execution_max_wall_seconds as u64;
+    if execution_max_wall_seconds == 0 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "less than one second remains under the approved chain wall cap; no Job was created",
+            "raise --max-wall-seconds or provide ordered goals directly to skip planning",
+        )));
+    }
+    let mut launch = linear_chain_launch_plan(chain);
+    launch.budget.ceiling_usd = Some(execution_max_spend_usd);
+    launch.budget.wall_seconds = Some(execution_max_wall_seconds);
+    let mut signals = launch.signals.as_object().cloned().unwrap_or_default();
+    signals.insert(
+        "watchkeeper_pre_job_budget".to_string(),
+        json!({
+            "approved_total_spend_usd": approved_max_spend_usd,
+            "planner_spend_usd": pre_job_spend_usd,
+            "job_execution_spend_cap_usd": execution_max_spend_usd,
+            "approved_total_wall_seconds": approved_max_wall_seconds,
+            "planner_wall_seconds": pre_job_wall_seconds,
+            "job_execution_wall_cap_seconds": execution_max_wall_seconds,
+            "planner_overrun_policy": "one planner completion is token-bounded but may cross a very small cap; Job execution is refused if planning exhausts the total",
+        }),
+    );
+    signals.insert(
+        "watchkeeper_contract_approval".to_string(),
+        json!({
+            "source": contract_preview.source,
+            "name": contract_preview.name,
+            "checks": contract_preview.checks,
+            "approval": match accepted_by {
+                deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail => "yes_flag_guardrail",
+                deadreckon_protocol::AuthorityAcceptedBy::Operator => "interactive_operator",
+            },
+        }),
+    );
+    launch.signals = serde_json::Value::Object(signals);
+    launch.accepted_by = Some(match accepted_by {
+        deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail => {
+            "yes-flag-guardrail".to_string()
+        }
+        deadreckon_protocol::AuthorityAcceptedBy::Operator => "operator".to_string(),
+    });
+    let child_count = u8::try_from(chain.steps.len()).map_err(|_| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain child count exceeds u8".to_string(),
+        ))
+    })?;
+    commands::job::create_job(commands::job::CreateJob {
+        paths,
+        source_cwd: &chain.cwd,
+        scope: chain.scope.clone(),
+        launch_plan: launch,
+        shape: deadreckon_protocol::JobShape::Graph,
+        driver: Some(commands::graph_job::DriverSpec {
+            kind: commands::graph_job::DriverKind::FullPlan,
+            child_count: Some(child_count),
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
+            planner_provider: None,
+            child_provider: chain.provider.clone(),
+            child_provider_overrides: Vec::new(),
+            coder_provider: None,
+            reviewer_provider: None,
+            model: chain.model.clone(),
+            source_init_git: false,
+        }),
+        contract_source: acceptance,
+        source: commands::job::DurableSource {
+            mode: commands::job::DurableSourceMode::Worktree,
+            from: Some(chain.cwd.clone()),
+            allow_dirty: false,
+        },
+        max_spend_usd: execution_max_spend_usd,
+        max_wall_seconds: execution_max_wall_seconds,
+        max_attempts: 3,
+        sandbox_requested: chain.sandbox.clone(),
+        accepted_by,
+    })
 }
 
 async fn chain_run_command(
@@ -722,6 +1322,19 @@ async fn chain_run_command(
     options: ChainRunOptions,
 ) -> Result<()> {
     let chain_id = resolve_chain_id(paths, chain_id, false)?;
+    let chain = load_chain(paths, &chain_id)?;
+    append_chain_event(
+        paths,
+        &chain.chain_id,
+        ChainEventKind::LegacyExecutionSelected,
+        options.from_step,
+        json!({
+            "selection": "explicit-chain-run-or-resume",
+            "persisted_sandbox": chain.sandbox,
+            "trusted_job": false,
+            "verified_job_receipt": false
+        }),
+    )?;
     ensure_chain_acceptance_before_start(paths, &chain_id, &options).await?;
     if options.detach {
         return detach_chain_conductor(paths, &chain_id, &options);
@@ -729,6 +1342,7 @@ async fn chain_run_command(
     run_chain_conductor(paths, &chain_id, options).await
 }
 
+#[allow(dead_code)]
 async fn ensure_chain_acceptance_before_start(
     paths: &DeadreckonPaths,
     chain_id: &str,
@@ -751,6 +1365,7 @@ async fn ensure_chain_acceptance_before_start(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn run_chain_conductor(
     paths: &DeadreckonPaths,
     chain_id: &str,
@@ -1117,6 +1732,7 @@ async fn run_chain_step(
     command
         .current_dir(&chain.cwd)
         .env("DEADRECKON_HOME", paths.home())
+        .env(super::run::LEGACY_CHAIN_FOREGROUND_ENV, "1")
         .arg("run")
         .arg(&step.goal)
         .arg("--worktree")
@@ -1484,6 +2100,7 @@ fn pause_chain_at_step(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn detach_chain_conductor(
     paths: &DeadreckonPaths,
     chain_id: &str,
@@ -3101,7 +3718,11 @@ fn append_chain_planner_spend(
     chain_id: &str,
     response: &deadreckon_providers::ProviderResponse,
 ) -> Result<()> {
-    let path = paths.chain_dir(chain_id).join("spend.jsonl");
+    let path = if paths.job_json(chain_id).is_file() {
+        paths.job_dir(chain_id).join("planner-spend.jsonl")
+    } else {
+        paths.chain_dir(chain_id).join("spend.jsonl")
+    };
     let parent = path.parent().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(format!(
             "path has no parent: {}",
@@ -3421,6 +4042,7 @@ fn chain_step_base_ref(chain: &Chain) -> Result<String> {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn chain_should_auto_attach(
     stdout_is_terminal: bool,
     detach: bool,
@@ -3714,6 +4336,273 @@ fn print_chain_paused_footer(paths: &DeadreckonPaths, chain: &Chain) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_chain(goals: &[&str]) -> Chain {
+        Chain::new(ChainNewOptions {
+            root_goal: ordered_chain_goal(
+                &goals.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ),
+            goals: goals.iter().map(ToString::to_string).collect(),
+            scope: "test-scope".to_string(),
+            base_branch: "main".to_string(),
+            base_sha: "a".repeat(40),
+            cwd: PathBuf::from("/tmp/deadreckon-chain-test"),
+            provider: Some("cli:test".to_string()),
+            model: Some("test-model".to_string()),
+            sandbox: "auto".to_string(),
+            branch_policy: BranchPolicy::Stack,
+            apply_mode: ApplyMode::Auto,
+            apply_strategy: ApplyStrategy::Squash,
+            apply_allowlist: Vec::new(),
+            on_fail: OnFail::Stop,
+            circuit_breaker_threshold: 2,
+            max_spend_usd: Some(3.0),
+            max_wall_seconds: Some(120.0),
+            deadreckon_version: "test".to_string(),
+        })
+        .expect("sample chain")
+    }
+
+    #[test]
+    fn durable_chain_compiles_to_a_strict_linear_graph() {
+        let chain = sample_chain(&["first", "second", "third"]);
+        let launch = linear_chain_launch_plan(&chain);
+
+        assert_eq!(launch.shape, commands::course::CourseShape::Plan);
+        assert_eq!(launch.n, Some(3));
+        assert_eq!(
+            launch
+                .pieces
+                .iter()
+                .map(|piece| piece.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["step-1", "step-2", "step-3"]
+        );
+        assert!(launch.pieces[0].depends_on.is_empty());
+        assert_eq!(launch.pieces[1].depends_on, vec!["step-1"]);
+        assert_eq!(launch.pieces[2].depends_on, vec!["step-2"]);
+        assert!(launch.goal.contains("1. first"));
+        assert!(launch.goal.contains("3. third"));
+    }
+
+    #[test]
+    fn durable_chain_freezes_one_graph_job_with_at_end_verification() {
+        let home = tempfile::tempdir().expect("home");
+        let source = tempfile::tempdir().expect("source");
+        fs::write(source.path().join("README.md"), "source\n").expect("source file");
+        let paths = DeadreckonPaths::from_home(home.path());
+        let mut chain = sample_chain(&["first", "second", "third"]);
+        chain.cwd = source.path().to_path_buf();
+        let acceptance = source.path().join("acceptance.yaml");
+        fs::write(
+            &acceptance,
+            "name: chain job contract\nchecks:\n  - kind: file_exists\n    path: README.md\n",
+        )
+        .expect("acceptance");
+        let contract_preview =
+            chain_contract_preview(Some(&acceptance), &chain.cwd).expect("contract preview");
+
+        let job = create_linear_chain_job(
+            &paths,
+            &chain,
+            0.5,
+            5.25,
+            Some(&acceptance),
+            deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail,
+            &contract_preview,
+        )
+        .expect("create graph job");
+        let launch =
+            commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
+                .expect("launch plan");
+        let driver = commands::graph_job::driver_spec(&launch).expect("driver");
+
+        assert_eq!(job.shape, deadreckon_protocol::JobShape::Graph);
+        assert_eq!(job.policy.max_spend_usd, 2.5);
+        assert_eq!(job.policy.max_wall_seconds, 114);
+        assert_ne!(job.job_id.as_ref(), chain.chain_id);
+        assert_eq!(launch.pieces.len(), 3);
+        assert_eq!(driver.kind, commands::graph_job::DriverKind::FullPlan);
+        assert_eq!(driver.apply, deadreckon_core::plan::ApplyWhen::AtEnd);
+        assert_eq!(driver.child_count, Some(3));
+        assert_eq!(
+            launch.signals["watchkeeper_pre_job_budget"]["approved_total_spend_usd"],
+            3.0
+        );
+        assert_eq!(
+            launch.signals["watchkeeper_pre_job_budget"]["planner_spend_usd"],
+            0.5
+        );
+        assert_eq!(
+            launch.signals["watchkeeper_pre_job_budget"]["job_execution_spend_cap_usd"],
+            2.5
+        );
+        assert!(paths.job_authority(job.job_id.as_ref()).is_file());
+        assert!(paths.job_events(job.job_id.as_ref()).is_file());
+        assert_eq!(
+            fs::read(commands::job::job_acceptance_path(
+                &paths,
+                job.job_id.as_ref()
+            ))
+            .expect("frozen acceptance"),
+            fs::read(&acceptance).expect("source acceptance")
+        );
+        let authority: deadreckon_protocol::JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority"),
+        )
+        .expect("authority json");
+        assert_eq!(
+            authority.accepted_by,
+            deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+        );
+    }
+
+    #[test]
+    fn exhausted_pre_job_planner_budget_refuses_before_job_creation() {
+        let home = tempfile::tempdir().expect("home");
+        let source = tempfile::tempdir().expect("source");
+        let paths = DeadreckonPaths::from_home(home.path());
+        let mut chain = sample_chain(&["first", "second"]);
+        chain.cwd = source.path().to_path_buf();
+        let contract_preview = chain_contract_preview(None, &chain.cwd).expect("contract preview");
+
+        let error = create_linear_chain_job(
+            &paths,
+            &chain,
+            3.0,
+            1.0,
+            None,
+            deadreckon_protocol::AuthorityAcceptedBy::Operator,
+            &contract_preview,
+        )
+        .expect_err("planner exhausted the approved total");
+
+        assert!(error.to_string().contains("planning exhausted"));
+        assert!(!paths.jobs_dir().exists());
+    }
+
+    #[test]
+    fn durable_chain_refuses_policies_the_graph_cannot_preserve() {
+        let mut chain = sample_chain(&["first", "second"]);
+        chain.branch_policy = BranchPolicy::Base;
+        chain.apply_mode = ApplyMode::Manual;
+        chain.apply_strategy = ApplyStrategy::CherryPick;
+        chain.apply_allowlist = vec!["src/**".to_string()];
+        chain.on_fail = OnFail::Continue;
+        chain.circuit_breaker_threshold = 4;
+
+        let error = validate_durable_chain_compatibility(&chain, Some("release/base"), false)
+            .expect_err("manual apply must remain a legacy-only inspection artifact");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("legacy conductor-only policies"));
+        assert!(rendered.contains("apply mode manual"));
+        for preserved in [
+            "--sandbox none",
+            "--branch-policy \"base\"",
+            "--apply-mode \"manual\"",
+            "--apply-strategy \"cherry-pick\"",
+            "--apply-allowlist \"src/**\"",
+            "--on-fail \"continue\"",
+            "--circuit-breaker-threshold 4",
+            "--base \"release/base\"",
+        ] {
+            assert!(
+                rendered.contains(preserved),
+                "missing {preserved}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_chain_refuses_unsandboxed_trusted_execution() {
+        let mut chain = sample_chain(&["first", "second"]);
+        chain.sandbox = "none".to_string();
+
+        let error = validate_durable_chain_compatibility(&chain, None, false)
+            .expect_err("sandbox none must fail closed");
+
+        assert!(error.to_string().contains("sandbox none"));
+        assert!(error.to_string().contains("require isolation"));
+    }
+
+    #[test]
+    fn migration_command_shell_quotes_agent_authored_goal_text() {
+        let chain = sample_chain(&["first $(touch /tmp/not-allowed)", "it's second"]);
+        let command = durable_chain_migration_command(&chain);
+
+        assert!(command.contains("\"first \\$(touch /tmp/not-allowed)\""));
+        assert!(command.contains("\"it's second\""));
+    }
+
+    #[test]
+    fn chain_yes_and_interactive_approval_have_distinct_authority() {
+        assert_eq!(
+            chain_accepted_by(true),
+            deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+        );
+        assert_eq!(
+            chain_accepted_by(false),
+            deadreckon_protocol::AuthorityAcceptedBy::Operator
+        );
+    }
+
+    #[test]
+    fn selected_chain_contract_is_parsed_for_pre_approval_display() {
+        let temp = tempfile::tempdir().expect("temp");
+        let acceptance = temp.path().join("acceptance.yaml");
+        fs::write(
+            &acceptance,
+            "name: explicit chain done\nchecks:\n  - kind: file_exists\n    path: README.md\n",
+        )
+        .expect("acceptance");
+
+        let preview =
+            chain_contract_preview(Some(&acceptance), temp.path()).expect("contract preview");
+
+        assert_eq!(preview.source, format!("selected {}", acceptance.display()));
+        assert_eq!(preview.name, "explicit chain done");
+        assert_eq!(preview.checks, vec!["file_exists"]);
+    }
+
+    #[tokio::test]
+    async fn persisted_chain_run_records_untrusted_legacy_selection_before_child_work() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path());
+        let mut chain = sample_chain(&["first", "second"]);
+        chain.scope = workspace_scope(&std::env::current_dir().expect("cwd")).expect("scope");
+        save_chain(&paths, &chain).expect("save chain");
+
+        let error = chain_run_command(
+            &paths,
+            &chain.chain_id,
+            ChainRunOptions {
+                detach: false,
+                quiet: true,
+                plain: true,
+                from_step: None,
+                max_spend_add: None,
+                reset_breaker: false,
+                apply_mode: None,
+                skip_acceptance_prompt: true,
+            },
+        )
+        .await
+        .expect_err("fixture cwd is deliberately not a git repository");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("rev-parse"), "{rendered}");
+        let events = fs::read_to_string(paths.chain_events(&chain.chain_id)).expect("events");
+        assert!(events.contains("legacy_execution_selected"), "{events}");
+        assert!(events.contains("\"trusted_job\":false"), "{events}");
+        assert!(!paths.jobs_dir().exists());
+        assert!(
+            !paths
+                .chain_dir(&chain.chain_id)
+                .join("conductor.out")
+                .exists()
+        );
+    }
 
     #[test]
     fn missing_inner_run_id_error_has_one_primary_hint() {

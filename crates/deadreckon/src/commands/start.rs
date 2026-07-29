@@ -1793,7 +1793,13 @@ fn resolve_start_setup(
             return Ok(());
         }
         let cwd = std::env::current_dir()?;
-        resolve_start_done_criteria(decision, &cwd, Some(&mut *prompter), args.yes)?;
+        resolve_start_done_criteria(
+            decision,
+            &cwd,
+            Some(&mut *prompter),
+            args.yes,
+            !args.json && !args.quiet,
+        )?;
         if decision.recovery.is_none()
             && !matches!(
                 decision.selected_mode,
@@ -1824,7 +1830,7 @@ fn resolve_start_setup(
             return Ok(());
         }
         let cwd = std::env::current_dir()?;
-        resolve_start_done_criteria(decision, &cwd, None, args.yes)?;
+        resolve_start_done_criteria(decision, &cwd, None, args.yes, !args.json && !args.quiet)?;
         if decision.recovery.is_none()
             && !matches!(
                 decision.selected_mode,
@@ -1933,6 +1939,7 @@ pub(crate) fn resolve_start_done_criteria(
     cwd: &Path,
     prompter: Option<&mut dyn StartPrompter>,
     yes: bool,
+    emit_human_output: bool,
 ) -> Result<()> {
     let source = commands::acceptance::resolve_acceptance_source(cwd, None)?;
     if source.is_some() {
@@ -1959,7 +1966,7 @@ pub(crate) fn resolve_start_done_criteria(
                 "done contract does not cover the run goal strongly enough for --yes",
                 contract_review_try_lines(decision),
             );
-        } else {
+        } else if emit_human_output {
             print_start_contract_divergence(decision);
         }
         return Ok(());
@@ -2711,7 +2718,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     if decision.recovery.is_none() && eligibility.allows_prompts() {
         prompt_start_launch_confirmation(&mut decision, &args, &paths, &mut terminal_prompter)?;
     }
-    if !args.quiet && decision.recovery.is_none() {
+    if !args.quiet && !args.json && decision.recovery.is_none() {
         println!("{}", ui_heading("guided start"));
         let seam_label =
             seam_preview_label(&read_seams_config(&paths.config_path(), args.no_seams)?);
@@ -3691,7 +3698,7 @@ checks:
         fs::write(acceptance_dir.join("acceptance.md"), "# Done\n").expect("write md");
         let mut decision = decision("build a realtime dashboard");
 
-        resolve_start_done_criteria(&mut decision, dir.path(), None, true).expect("resolve");
+        resolve_start_done_criteria(&mut decision, dir.path(), None, true, true).expect("resolve");
 
         assert!(decision.done_divergence.is_some(), "{decision:#?}");
     }
@@ -3714,7 +3721,7 @@ checks:
         .expect("write yaml");
         let mut decision = decision("build a realtime dashboard");
 
-        resolve_start_done_criteria(&mut decision, dir.path(), None, true).expect("resolve");
+        resolve_start_done_criteria(&mut decision, dir.path(), None, true, true).expect("resolve");
 
         assert!(decision.recovery.is_some(), "{decision:#?}");
         assert!(

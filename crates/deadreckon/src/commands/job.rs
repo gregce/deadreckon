@@ -60,7 +60,7 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         commands::course::CourseShape::Campaign => JobShape::LegacyCampaign,
         commands::course::CourseShape::ChainExtend => {
             return Err(CliError::Core(DeadreckonError::InvalidInput(
-                "legacy chain jobs remain process-bound; guided ordered work must use a durable graph plan until chain hooks, apply, undo, and child adoption share the job event history".to_string(),
+                "legacy chain jobs remain process-bound; direct chain execution must compile to a durable linear graph".to_string(),
             )));
         }
     };
@@ -349,18 +349,25 @@ fn print_job_status_with_open_action(
 ) -> Result<()> {
     let id = view.job.job_id.as_ref();
     let status = job_status_label(view);
-    let next_action = if view.projection.is_terminal() {
-        match view.projection.outcome {
-            Some(deadreckon_protocol::JobOutcome::Verified) => {
-                format!("deadreckon finish {}", run_prefix(id))
-            }
-            _ => format!("deadreckon {open_action} {}", run_prefix(id)),
-        }
-    } else {
-        format!("deadreckon {open_action} {}", run_prefix(id))
-    };
+    let next_action = format!(
+        "deadreckon {} {}",
+        job_primary_action(view, open_action),
+        run_prefix(id)
+    );
     let (process_durability, machine_restart_durability) =
         super::supervisor_service::guided_durability_labels();
+    let delivery = view
+        .projection
+        .delivery
+        .as_ref()
+        .map(|delivery| serialized_label(delivery.kind))
+        .unwrap_or_else(|| "-".to_string());
+    let delivered_to = view
+        .projection
+        .delivery
+        .as_ref()
+        .map(|delivery| delivery.destination.display().to_string())
+        .unwrap_or_else(|| "-".to_string());
     if json_output {
         println!(
             "{}",
@@ -399,10 +406,28 @@ fn print_job_status_with_open_action(
         ),
         ("process durability", process_durability),
         ("machine restart", &machine_restart_durability),
+        ("delivery", &delivery),
+        ("delivered to", &delivered_to),
     ]);
     println!();
     println!("  {} {}", ui_muted("next:"), ui_command(next_action));
     Ok(())
+}
+
+pub(crate) fn job_primary_action<'a>(
+    view: &deadreckon_core::JobView,
+    open_action: &'a str,
+) -> &'a str {
+    if !view.projection.is_terminal() {
+        return open_action;
+    }
+    match view.projection.outcome {
+        Some(deadreckon_protocol::JobOutcome::Verified) if view.projection.delivery.is_some() => {
+            "report"
+        }
+        Some(deadreckon_protocol::JobOutcome::Verified) => "finish",
+        _ => open_action,
+    }
 }
 
 fn serialized_label<T: Serialize>(value: T) -> String {
@@ -909,6 +934,23 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].detail["destination"], json!(destination));
         assert_eq!(delivered[0].detail["resulting_revision"], "result-revision");
+        let view = deadreckon_core::JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Verified)
+        );
+        let delivery = view
+            .projection
+            .delivery
+            .as_ref()
+            .expect("projected delivery");
+        assert_eq!(delivery.kind, deadreckon_core::JobDeliveryKind::Exported);
+        assert_eq!(delivery.destination, destination);
+        assert_eq!(
+            delivery.resulting_revision.as_deref(),
+            Some("result-revision")
+        );
+        assert_eq!(job_primary_action(&view, "attach"), "report");
     }
 
     #[test]

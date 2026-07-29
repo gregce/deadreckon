@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-07-29T18:04:43Z",
+  "sanitized": true,
+  "source": "operator-observed live dogfood",
+  "summary": {
+    "total_tasks": 24,
+    "attempted": 2,
+    "not_run": 22,
+    "verified": 0
+  },
+  "results": {
+    "dr-self-02": {
+      "execution_status": "attempted",
+      "repository_slot": "deadreckon-self",
+      "provider_route": "cli:gemini",
+      "job_id_prefix": "7163c742",
+      "terminal": {
+        "outcome": "retry_exhausted",
+        "stop_reason": "attempt_limit"
+      },
+      "attempt_count": 3,
+      "failure": {
+        "classification": "non_retryable_provider_authentication",
+        "identical_observations": 3
+      },
+      "receipt_present": false,
+      "finish_attempted": false
+    },
+    "fixture-01": {
+      "execution_status": "attempted",
+      "repository_slot": "fixture-app",
+      "provider_route": "cli:codex",
+      "job_id_prefix": "275b8e86",
+      "terminal": {
+        "outcome": "needs_review",
+        "stop_reason": "semantic_unavailable"
+      },
+      "worker_completed": true,
+      "deterministic_checks_passed": true,
+      "semantic_judge_observation": "provider_event_envelope_with_type_field",
+      "detached_continuation_observed": true,
+      "harness_exit": "start_stdout_was_not_pure_json",
+      "receipt_present": false,
+      "finish_attempted": false
+    }
+  },
+  "limitations": [
+    "Raw provider prompts and responses are intentionally omitted.",
+    "Credentials, absolute paths and repository contents are intentionally omitted.",
+    "Neither attempted task reached verified completion or produced a completion receipt."
+  ]
+}

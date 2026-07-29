@@ -1148,5 +1148,6 @@ fn chain_event_label(event: &ChainEventKind) -> &'static str {
         ChainEventKind::ChainHookInvoked => "hook",
         ChainEventKind::ChainStepExtended => "extended",
         ChainEventKind::ChainStepRedone => "redone",
+        ChainEventKind::LegacyExecutionSelected => "legacy execution",
     }
 }

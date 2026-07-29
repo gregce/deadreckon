@@ -767,7 +767,8 @@ fn fold_chain_event(model: &mut TreeModel, event: &ChainEvent) {
         | ChainEventKind::ChainRunCompleted
         | ChainEventKind::ChainHookInvoked
         | ChainEventKind::ChainStepExtended
-        | ChainEventKind::ChainStepRedone => {
+        | ChainEventKind::ChainStepRedone
+        | ChainEventKind::LegacyExecutionSelected => {
             set_status(model, &NodeId::chain(&event.chain_id), NodeStatus::Running);
             if let Some(step_index) = event.step_index {
                 set_status(

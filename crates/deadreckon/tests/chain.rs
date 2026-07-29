@@ -37,14 +37,14 @@ fn chain_help_topics_use_one_next_footer() {
     let temp = TempDir::new().expect("tempdir");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let topics = [
-        ("plan", "deadreckon chain run latest"),
-        ("run", "deadreckon chain attach latest"),
+        ("plan", "deadreckon status latest"),
+        ("run", "deadreckon chain show latest"),
         ("attach", "deadreckon chain status latest"),
         ("status", "deadreckon chain show latest"),
-        ("show", "deadreckon chain resume latest"),
+        ("show", "deadreckon chain show latest"),
         ("pause", "deadreckon chain resume latest"),
         ("undo", "deadreckon chain show latest"),
-        ("extend", "deadreckon chain run latest"),
+        ("extend", "deadreckon chain show latest"),
     ];
 
     for (topic, command) in topics {
@@ -1526,6 +1526,105 @@ fn chain_resume_runs_pending_draft() {
 }
 
 #[test]
+fn historical_auto_chain_resume_keeps_foreground_children_without_jobs() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    assert_success(
+        &deadreckon(&paths)
+            .current_dir(&repo)
+            .args([
+                "chain",
+                "--draft",
+                "--provider",
+                "smoke",
+                "--max-spend",
+                "4",
+                "historical auto one",
+                "historical auto two",
+            ])
+            .output()
+            .expect("historical draft"),
+    );
+    let drafted = newest_chain(&paths);
+    assert_eq!(drafted.sandbox, "auto");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "resume", &drafted.chain_id])
+        .output()
+        .expect("historical resume");
+
+    assert_success(&output);
+    let completed = load_chain(&paths, &drafted.chain_id).expect("completed chain");
+    assert_eq!(completed.status, ChainStatus::Completed);
+    assert!(
+        completed.steps.iter().all(|step| step
+            .run_id
+            .as_deref()
+            .is_some_and(|run_id| load_run(&paths, run_id).is_ok())),
+        "{completed:#?}"
+    );
+    assert!(
+        !paths.jobs_dir().exists()
+            || fs::read_dir(paths.jobs_dir())
+                .expect("jobs")
+                .next()
+                .is_none(),
+        "legacy Chain children must not be reclassified as durable Jobs"
+    );
+    let events = fs::read_to_string(paths.chain_events(&drafted.chain_id)).expect("events");
+    assert!(events.contains("legacy_execution_selected"), "{events}");
+    assert!(events.contains("\"trusted_job\":false"), "{events}");
+}
+
+#[test]
+fn uncontained_chain_with_approved_contract_creates_no_chain_or_job() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let acceptance = repo.join("acceptance.yaml");
+    fs::write(
+        &acceptance,
+        "name: trusted chain\nchecks:\n  - kind: file_exists\n    path: README.md\n",
+    )
+    .expect("acceptance");
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("chain")
+        .arg("--yes")
+        .arg("--sandbox")
+        .arg("none")
+        .arg("--acceptance")
+        .arg(&acceptance)
+        .args(["contract one", "contract two"])
+        .output()
+        .expect("uncontained contract");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("cannot produce"), "{stderr}");
+    assert!(stderr.contains("trusted Job receipt"), "{stderr}");
+    assert!(
+        !paths.chains_dir().exists()
+            || fs::read_dir(paths.chains_dir())
+                .expect("chains")
+                .next()
+                .is_none(),
+        "refusal must not leave legacy Chain state"
+    );
+    assert!(
+        !paths.jobs_dir().exists()
+            || fs::read_dir(paths.jobs_dir())
+                .expect("jobs")
+                .next()
+                .is_none(),
+        "refusal must not leave durable Job state"
+    );
+}
+
+#[test]
 fn chain_completion_uses_one_verdict_surface() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -2296,7 +2395,7 @@ fn chain_off_tty_without_yes_refuses_with_try_yes() {
     assert!(stderr.contains("Evidence\n"), "{stderr}");
     assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
     assert!(
-        stderr.contains("Recommended\ndeadreckon chain --yes \"step one\" \"step two\""),
+        stderr.contains("Recommended\ndeadreckon chain --yes \"needs yes one\" \"needs yes two\""),
         "{stderr}"
     );
     assert!(!stderr.contains("try:"), "{stderr}");

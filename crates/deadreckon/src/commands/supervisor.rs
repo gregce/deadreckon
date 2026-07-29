@@ -11,9 +11,10 @@ use std::time::Duration;
 use chrono::Utc;
 use deadreckon_core::{
     DeadreckonError, DeadreckonPaths, JobProjection, JobView, LeaseClaimDisposition, LeaseOwner,
-    LeaseReclaimReason, LeaseToken, SupervisedProcess, append_fenced_job_event, claim_job_lease,
-    heartbeat_job_lease, load_run, pid_is_alive, read_supervised_process, spawn_grouped,
-    validate_acceptance_marker, validate_completion_receipt, write_supervised_process,
+    LeaseReclaimReason, LeaseToken, ProviderFailureDisposition, SupervisedProcess,
+    append_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_run, pid_is_alive,
+    read_supervised_process, spawn_grouped, validate_acceptance_marker,
+    validate_completion_receipt, write_supervised_process,
 };
 use deadreckon_protocol::{
     Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence, JobSchemaVersion, JobShape, RunId,
@@ -24,7 +25,9 @@ use uuid::Uuid;
 
 use super::super::{CliError, Result};
 use super::course::{CourseShape, LaunchPlan};
-use super::run::{TRUSTED_SUPERVISOR_JOB_ID_ENV, TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV};
+use super::run::{
+    TRUSTED_SUPERVISOR_JOB_ID_ENV, TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV, durable_leaf_spec,
+};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const LEASE_TTL: Duration = Duration::from_secs(15);
@@ -834,6 +837,36 @@ fn build_leaf_command(
     if let Some(model) = piece.and_then(|piece| piece.model.as_deref()) {
         command.arg("--model").arg(model);
     }
+    if let Ok(Some(leaf)) = durable_leaf_spec(&launch.plan) {
+        if let Some(base) = leaf.base {
+            command.arg("--base").arg(base);
+        }
+        if let Some(branch) = leaf.branch {
+            command.arg("--branch").arg(branch);
+        }
+        if leaf.no_seams {
+            command.arg("--no-seams");
+        }
+        if let Some(provider) = leaf.doc_provider {
+            command.arg("--doc-provider").arg(provider);
+        }
+        command.arg("--skill").arg(leaf.skill);
+        if leaf.no_docs {
+            command.arg("--no-docs");
+        }
+        if let Some(skill) = leaf.doc_skill {
+            command.arg("--doc-skill").arg(skill);
+        }
+        if leaf.narrate {
+            command.arg("--narrate");
+        }
+        if leaf.no_narrate {
+            command.arg("--no-narrate");
+        }
+        if let Some(model) = leaf.narrator_model {
+            command.arg("--narrator-model").arg(model);
+        }
+    }
     command
 }
 
@@ -932,45 +965,39 @@ fn maybe_schedule_leaf_retry(
         // continue safely. The caller classifies this as a terminal failure.
         return Ok(false);
     };
-    let terminal_by_policy = match state.status {
-        deadreckon_core::RunStatus::Completed | deadreckon_core::RunStatus::Killed => true,
-        deadreckon_core::RunStatus::Failed
-            if state
-                .failure_reason
-                .as_deref()
-                .is_some_and(|reason| reason.starts_with("NEEDS_REVIEW:")) =>
-        {
-            true
-        }
-        deadreckon_core::RunStatus::Failed
-            if state
-                .max_spend_usd
-                .is_some_and(|cap| state.total_spend_usd >= cap) =>
-        {
-            true
-        }
-        deadreckon_core::RunStatus::Failed
-            if state
-                .max_wall_seconds
-                .is_some_and(|cap| state.total_wall_seconds >= cap) =>
-        {
-            true
-        }
-        _ => false,
-    };
+    let terminal_by_policy = state
+        .max_spend_usd
+        .is_some_and(|cap| state.total_spend_usd >= cap)
+        || state
+            .max_wall_seconds
+            .is_some_and(|cap| state.total_wall_seconds >= cap);
     if terminal_by_policy {
         return Ok(false);
     }
+    let retry_stop_reason = match state.status {
+        deadreckon_core::RunStatus::Pending
+        | deadreckon_core::RunStatus::Planned
+        | deadreckon_core::RunStatus::Executing => StopReason::LostContainment,
+        deadreckon_core::RunStatus::Failed
+            if state.provider_failure == Some(ProviderFailureDisposition::Retryable) =>
+        {
+            StopReason::TransientProvider
+        }
+        deadreckon_core::RunStatus::Completed
+        | deadreckon_core::RunStatus::Killed
+        | deadreckon_core::RunStatus::Failed => return Ok(false),
+    };
 
     append_attempt_stopped(
         paths,
         token,
-        StopReason::FatalProvider,
+        retry_stop_reason,
         json!({
             "attempt": attempt,
             "exit": exit_detail(exit),
             "run_status": state.status,
             "failure_reason": state.failure_reason,
+            "provider_failure": state.provider_failure,
             "reason": "worker stopped with a resumable isolated run"
         }),
     )?;
@@ -2098,6 +2125,35 @@ mod tests {
         save_state(&state).expect("save executing state");
     }
 
+    fn failed_provider_attempt(
+        paths: &DeadreckonPaths,
+        job: &Job,
+        disposition: ProviderFailureDisposition,
+    ) {
+        executing_attempt(paths, job);
+        let mut state = load_run(paths, job.job_id.as_ref()).expect("attempt state");
+        state.status = RunStatus::Failed;
+        state.failure_reason = Some("opaque provider failure".to_string());
+        state.provider_failure = Some(disposition);
+        save_state(&state).expect("save provider failure");
+    }
+
+    fn claim_started_attempt(paths: &DeadreckonPaths, job: &Job, attempt: u32) -> LeaseToken {
+        let owner = instance(PathBuf::from("/opt/deadreckon")).owner;
+        let claim = claim_job_lease(paths, &job.job_id, &owner, Utc::now(), LEASE_TTL)
+            .expect("claim attempt");
+        let token = claim.token().clone();
+        append_control_event(
+            paths,
+            &token,
+            JobEventKind::AttemptStarted,
+            format!("test-attempt-{attempt}"),
+            attempt_detail(job, attempt),
+        )
+        .expect("attempt");
+        token
+    }
+
     fn graph_fixture(
         temp: &TempDir,
         status: deadreckon_core::plan::PlanStatus,
@@ -3117,6 +3173,56 @@ mod tests {
     }
 
     #[test]
+    fn root_run_replays_frozen_direct_options_in_the_detached_child() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 1);
+        let mut launch = load_launch_inputs(&paths, &job).expect("launch");
+        let leaf = super::super::run::DurableLeafSpec {
+            base: Some("main".to_string()),
+            branch: Some("deadreckon/direct".to_string()),
+            no_seams: true,
+            doc_provider: Some("docs".to_string()),
+            skill: "coder".to_string(),
+            no_docs: true,
+            doc_skill: Some("documenter".to_string()),
+            narrate: false,
+            no_narrate: true,
+            narrator_model: Some("narrator-model".to_string()),
+        };
+        let mut signals = launch.plan.signals.as_object().cloned().unwrap_or_default();
+        signals.insert(
+            "watchkeeper_leaf".to_string(),
+            serde_json::to_value(leaf).expect("leaf json"),
+        );
+        launch.plan.signals = Value::Object(signals);
+
+        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        for expected in [
+            "--base",
+            "main",
+            "--branch",
+            "deadreckon/direct",
+            "--no-seams",
+            "--doc-provider",
+            "docs",
+            "--skill",
+            "coder",
+            "--no-docs",
+            "--doc-skill",
+            "documenter",
+            "--no-narrate",
+            "--narrator-model",
+            "narrator-model",
+        ] {
+            assert!(
+                args.contains(&OsString::from(expected)),
+                "missing {expected:?} in {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn retry_resumes_the_exact_persisted_job_instead_of_creating_a_second_run() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, job) = fixture(&temp, 2);
@@ -3182,6 +3288,85 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == JobEventKind::RetryScheduled)
         );
+    }
+
+    #[test]
+    fn fatal_provider_failure_stops_after_one_attempt_without_retry() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 3);
+        failed_provider_attempt(&paths, &job, ProviderFailureDisposition::Fatal);
+        let token = claim_started_attempt(&paths, &job, 1);
+        let exit = ChildExit {
+            status: None,
+            adopted: false,
+        };
+
+        assert!(
+            !maybe_schedule_leaf_retry(&paths, &job, &token, &exit, 1, 3)
+                .expect("fatal classification")
+        );
+        classify_persisted_attempt(&paths, &job, &token, exit, false)
+            .expect("terminal fatal attempt");
+
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("view");
+        assert!(view.projection.is_terminal());
+        assert_eq!(view.projection.attempt_count, 1);
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Failed)
+        );
+        assert_eq!(view.projection.stop_reason, Some(StopReason::FatalProvider));
+        let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))
+            .expect("history");
+        assert!(
+            history
+                .events()
+                .iter()
+                .all(|event| event.kind != JobEventKind::RetryScheduled)
+        );
+    }
+
+    #[test]
+    fn transient_provider_failure_may_resume_within_attempt_cap() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 3);
+        failed_provider_attempt(&paths, &job, ProviderFailureDisposition::Retryable);
+        let token = claim_started_attempt(&paths, &job, 1);
+
+        assert!(
+            maybe_schedule_leaf_retry(
+                &paths,
+                &job,
+                &token,
+                &ChildExit {
+                    status: None,
+                    adopted: false,
+                },
+                1,
+                3,
+            )
+            .expect("transient classification")
+        );
+        let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))
+            .expect("history");
+        let stopped = history
+            .events()
+            .iter()
+            .find(|event| event.kind == JobEventKind::AttemptStopped)
+            .expect("attempt stopped");
+        assert_eq!(
+            stopped.detail.get("stop_reason").and_then(Value::as_str),
+            Some("transient_provider")
+        );
+        assert!(
+            history
+                .events()
+                .iter()
+                .any(|event| event.kind == JobEventKind::RetryScheduled)
+        );
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("view");
+        assert!(!view.projection.is_terminal());
+        assert_eq!(view.projection.attempt_count, 1);
     }
 
     #[tokio::test]

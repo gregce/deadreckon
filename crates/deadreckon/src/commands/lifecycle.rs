@@ -2479,6 +2479,7 @@ mod tests {
                 current_lease_epoch: 1,
                 attempt_count: 1,
                 child_run_ids: Vec::new(),
+                delivery: None,
                 updated_at: Some(Utc::now()),
                 caveats: Vec::new(),
             },

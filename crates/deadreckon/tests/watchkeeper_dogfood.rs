@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -32,12 +33,93 @@ fn dogfood_harness_uses_public_start_status_finish_and_receipt() {
     assert!(status < receipt);
     assert!(receipt < finish);
     assert!(source.contains("DEADRECKON_DOGFOOD_EXECUTE"));
+    assert!(source.contains("--quiet"));
     assert!(source.contains("\"contained\": True"));
     assert!(source.contains("\"proof_kind\": \"two_key_completion\""));
+    assert!(source.contains("\"terminal_outcome\": projection.get(\"outcome\")"));
+    assert!(source.contains("\"receipt_validation_exit_status\""));
+    assert!(source.contains("\"finish_exit_status\""));
 }
 
 #[test]
-fn dogfood_matrix_has_at_least_twenty_tasks_and_two_provider_slots() {
+fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
+    let source =
+        fs::read_to_string(dogfood_dir().join("adversarial.py")).expect("adversarial runner");
+    for trial in [
+        "terminal_detach",
+        "worker_kill",
+        "supervisor_restart",
+        "network_denial",
+        "gate_key_search_and_forgery",
+        "receipt_mutation",
+        "result_delivery",
+    ] {
+        assert!(source.contains(trial), "missing adversarial trial {trial}");
+    }
+    for unproven in [
+        "live_provider_worker_kill",
+        "live_provider_supervisor_restart",
+        "live_provider_network_loss",
+        "machine_reboot",
+        "cross_provider_gate_attack",
+    ] {
+        assert!(
+            source.contains(unproven),
+            "missing live boundary {unproven}"
+        );
+    }
+    assert!(source.contains("\"status\": \"unproven\""));
+    assert!(source.contains("\"matrix_status\": matrix_status(repo)"));
+    assert!(source.contains("\"seatbelt_preflight\": seatbelt"));
+}
+
+#[test]
+fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
+    let result_path = dogfood_dir().join("credential-free-results.json");
+    if !result_path.is_file() {
+        return;
+    }
+    let matrix: Value =
+        serde_json::from_slice(&fs::read(dogfood_dir().join("matrix.json")).expect("matrix"))
+            .expect("matrix JSON");
+    let tasks = matrix["tasks"].as_array().expect("matrix tasks");
+    let expected_counts = tasks.iter().fold(
+        std::collections::BTreeMap::<&str, u64>::new(),
+        |mut counts, task| {
+            let status = task["execution_status"]
+                .as_str()
+                .expect("matrix execution status");
+            *counts.entry(status).or_default() += 1;
+            counts
+        },
+    );
+    let payload: Value =
+        serde_json::from_slice(&fs::read(&result_path).expect("results")).expect("results JSON");
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["credential_free"], true);
+    assert_eq!(payload["matrix_status"]["total_tasks"], tasks.len());
+    for (status, count) in expected_counts {
+        assert_eq!(
+            payload["matrix_status"]["by_execution_status"][status],
+            count
+        );
+    }
+    assert_eq!(payload["summary"]["failed"], 0);
+    assert_eq!(
+        payload["runner_sha256"],
+        deadreckon_core::flight::sha256_file(&dogfood_dir().join("adversarial.py"))
+            .expect("runner digest")
+    );
+    let live = payload["live_claims"].as_array().expect("live claims");
+    assert!(!live.is_empty());
+    assert!(
+        live.iter()
+            .all(|claim| claim["status"].as_str() == Some("unproven"))
+    );
+}
+
+#[test]
+fn dogfood_matrix_and_sanitized_results_agree() {
     let raw = fs::read_to_string(dogfood_dir().join("matrix.json")).expect("matrix");
     let matrix: Value = serde_json::from_str(&raw).expect("valid matrix JSON");
     let tasks = matrix["tasks"].as_array().expect("tasks");
@@ -61,12 +143,135 @@ fn dogfood_matrix_has_at_least_twenty_tasks_and_two_provider_slots() {
     assert!(provider_slots.len() >= 2);
     assert!(used_repositories.len() >= 2);
     assert!(used_providers.len() >= 2);
+    let attempted = tasks
+        .iter()
+        .filter(|task| task["execution_status"] == "attempted")
+        .collect::<Vec<_>>();
+    let not_run = tasks
+        .iter()
+        .filter(|task| task["execution_status"] == "not_run")
+        .count();
     assert!(
-        tasks
-            .iter()
-            .all(|task| task["execution_status"] == "not_run")
+        attempted.len() >= 2,
+        "the checked matrix must retain the live attempts already performed"
     );
+    assert_eq!(attempted.len() + not_run, tasks.len());
     assert_eq!(matrix["execution_policy"], "operator_only");
+
+    let results_raw =
+        fs::read_to_string(dogfood_dir().join("trial-results.json")).expect("trial results");
+    assert!(!results_raw.contains("/Users/"), "absolute path leaked");
+    let results: Value = serde_json::from_str(&results_raw).expect("trial results JSON");
+    assert_eq!(results["sanitized"], true);
+    assert_eq!(results["summary"]["total_tasks"], tasks.len());
+    assert_eq!(results["summary"]["attempted"], attempted.len());
+    assert_eq!(results["summary"]["not_run"], not_run);
+    let result_entries = results["results"].as_object().expect("result entries");
+    assert_eq!(result_entries.len(), attempted.len());
+    let verified = result_entries
+        .values()
+        .filter(|result| {
+            result["terminal"]["outcome"] == "verified" && result["receipt_present"] == true
+        })
+        .count();
+    assert_eq!(results["summary"]["verified"], verified);
+    for task in attempted {
+        let id = task["id"].as_str().expect("attempted task id");
+        assert_eq!(
+            task["result_ref"],
+            format!("trial-results.json#/results/{id}")
+        );
+        assert_eq!(results["results"][id]["execution_status"], "attempted");
+        assert!(results["results"][id]["receipt_present"].is_boolean());
+        assert!(results["results"][id]["finish_attempted"].is_boolean());
+        if results["results"][id]["receipt_present"] == true {
+            assert_eq!(results["results"][id]["terminal"]["outcome"], "verified");
+        }
+        assert_eq!(
+            results["results"][id]["job_id_prefix"]
+                .as_str()
+                .expect("sanitized job prefix")
+                .len(),
+            8
+        );
+    }
+}
+
+#[test]
+fn failed_terminal_job_leaves_an_operator_observation_before_receipt_refusal() {
+    let temp = TempDir::new().expect("tempdir");
+    let repository = temp.path().join("repo");
+    let home = temp.path().join("home");
+    let artifacts = temp.path().join("artifacts");
+    let fake_deadreckon = temp.path().join("deadreckon");
+    let matrix = temp.path().join("matrix.json");
+    fs::create_dir_all(&repository).expect("repo");
+    fs::create_dir_all(&home).expect("home");
+    fs::write(
+        &fake_deadreckon,
+        r#"#!/bin/sh
+case "$1" in
+  start) printf '%s\n' '{"dispatched":{"ids":["job-failed"]}}' ;;
+  status) printf '%s\n' '{"job":{"projection":{"phase":"terminal","outcome":"retry_exhausted","stop_reason":"attempt_limit"}}}' ;;
+  finish) exit 99 ;;
+  *) exit 98 ;;
+esac
+"#,
+    )
+    .expect("fake deadreckon");
+    let mut permissions = fs::metadata(&fake_deadreckon)
+        .expect("fake metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_deadreckon, permissions).expect("fake executable");
+    fs::write(
+        &matrix,
+        serde_json::to_vec_pretty(&json!({
+            "repositories": [{
+                "slot": "repo",
+                "path_env": "WATCHKEEPER_TEST_REPO"
+            }],
+            "providers": [{
+                "slot": "provider",
+                "route_env": "WATCHKEEPER_TEST_PROVIDER"
+            }],
+            "tasks": [{
+                "id": "failed-task",
+                "repository": "repo",
+                "provider": "provider",
+                "goal": "observe a bounded failure",
+                "max_spend_usd": 1.0
+            }]
+        }))
+        .expect("matrix JSON"),
+    )
+    .expect("matrix");
+
+    let output = Command::new("bash")
+        .arg(dogfood_dir().join("run.sh"))
+        .arg("failed-task")
+        .env("DEADRECKON_DOGFOOD_EXECUTE", "1")
+        .env("DEADRECKON_DOGFOOD_MATRIX", &matrix)
+        .env("DEADRECKON_DOGFOOD_ARTIFACTS", &artifacts)
+        .env("DEADRECKON_DOGFOOD_MAX_POLLS", "1")
+        .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_BIN", &fake_deadreckon)
+        .env("WATCHKEEPER_TEST_REPO", &repository)
+        .env("WATCHKEEPER_TEST_PROVIDER", "smoke")
+        .output()
+        .expect("dogfood harness");
+
+    assert!(!output.status.success(), "missing receipt must refuse");
+    let observation_path = artifacts.join("failed-task/job-failed/operator-run.json");
+    let observation: Value =
+        serde_json::from_slice(&fs::read(observation_path).expect("operator observation"))
+            .expect("operator observation JSON");
+    assert_eq!(observation["terminal_outcome"], "retry_exhausted");
+    assert_eq!(observation["terminal_stop_reason"], "attempt_limit");
+    assert_eq!(observation["receipt_validation_attempted"], true);
+    assert_eq!(observation["receipt_validated"], false);
+    assert_ne!(observation["receipt_validation_exit_status"], 0);
+    assert_eq!(observation["finish_attempted"], false);
 }
 
 #[test]

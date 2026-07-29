@@ -269,6 +269,7 @@ pub enum ChainEventKind {
     ChainHookInvoked,
     ChainStepExtended,
     ChainStepRedone,
+    LegacyExecutionSelected,
 }
 
 pub fn validate_goal_count(count: usize) -> Result<()> {
