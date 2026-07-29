@@ -1,0 +1,244 @@
+{
+  "schema_version": 1,
+  "execution_policy": "operator_only",
+  "repositories": [
+    {
+      "slot": "deadreckon-self",
+      "path_env": "DEADRECKON_DOGFOOD_REPO_A",
+      "description": "Disposable clone of DeadReckon for self-hosting trials"
+    },
+    {
+      "slot": "fixture-app",
+      "path_env": "DEADRECKON_DOGFOOD_REPO_B",
+      "description": "Disposable application repository with its own approved done contract"
+    }
+  ],
+  "providers": [
+    {
+      "slot": "primary",
+      "route_env": "DEADRECKON_DOGFOOD_PROVIDER_A"
+    },
+    {
+      "slot": "independent",
+      "route_env": "DEADRECKON_DOGFOOD_PROVIDER_B"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "dr-self-01",
+      "repository": "deadreckon-self",
+      "provider": "primary",
+      "category": "targeted-test",
+      "goal": "Add one focused regression test for a documented CLI behavior without changing that behavior.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-02",
+      "repository": "deadreckon-self",
+      "provider": "independent",
+      "category": "documentation",
+      "goal": "Correct one verifiable documentation mismatch and cite the exact command or source that proves the correction.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-03",
+      "repository": "deadreckon-self",
+      "provider": "primary",
+      "category": "error-message",
+      "goal": "Improve one confusing user-facing error while preserving its typed failure classification and tests.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-04",
+      "repository": "deadreckon-self",
+      "provider": "independent",
+      "category": "schema-test",
+      "goal": "Add a serialization round-trip test for one persisted protocol type that lacks direct coverage.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-05",
+      "repository": "deadreckon-self",
+      "provider": "primary",
+      "category": "cli-help",
+      "goal": "Clarify one public command help paragraph without adding a new command or option.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-06",
+      "repository": "deadreckon-self",
+      "provider": "independent",
+      "category": "portability",
+      "goal": "Add a hermetic portability assertion for a path-handling edge case and make the smallest required correction.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-07",
+      "repository": "deadreckon-self",
+      "provider": "primary",
+      "category": "event-history",
+      "goal": "Add a regression test proving one append-only event invariant under duplicate input.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-08",
+      "repository": "deadreckon-self",
+      "provider": "independent",
+      "category": "receipt-display",
+      "goal": "Improve factual receipt display for one missing optional field without inventing fallback evidence.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-09",
+      "repository": "deadreckon-self",
+      "provider": "primary",
+      "category": "refactor",
+      "goal": "Remove one small duplication by reusing an existing helper, with no public output change.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-10",
+      "repository": "deadreckon-self",
+      "provider": "independent",
+      "category": "boundary-test",
+      "goal": "Add a hostile-input test for one protected control-plane path without weakening containment.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-11",
+      "repository": "deadreckon-self",
+      "provider": "primary",
+      "category": "operator-output",
+      "goal": "Make one status field easier to understand while keeping its underlying JobView value unchanged.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "dr-self-12",
+      "repository": "deadreckon-self",
+      "provider": "independent",
+      "category": "dependency-hygiene",
+      "goal": "Document one direct dependency's actual runtime use and verify no dependency version changes are needed.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-01",
+      "repository": "fixture-app",
+      "provider": "primary",
+      "category": "bug-fix",
+      "goal": "Fix one reproducible input-validation bug and add a focused regression test.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-02",
+      "repository": "fixture-app",
+      "provider": "independent",
+      "category": "accessibility",
+      "goal": "Correct one keyboard or label accessibility defect and cover it with the repository's existing test style.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-03",
+      "repository": "fixture-app",
+      "provider": "primary",
+      "category": "empty-state",
+      "goal": "Improve one empty state using existing components and preserve all loading and error states.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-04",
+      "repository": "fixture-app",
+      "provider": "independent",
+      "category": "api-contract",
+      "goal": "Add a regression test for one API response edge case and make the minimum implementation correction.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-05",
+      "repository": "fixture-app",
+      "provider": "primary",
+      "category": "documentation",
+      "goal": "Update one setup instruction that can be proven stale from the repository's current scripts.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-06",
+      "repository": "fixture-app",
+      "provider": "independent",
+      "category": "logging",
+      "goal": "Make one operational log message actionable without logging credentials or request bodies.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-07",
+      "repository": "fixture-app",
+      "provider": "primary",
+      "category": "performance",
+      "goal": "Remove one demonstrably redundant computation and add a test that preserves observable behavior.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-08",
+      "repository": "fixture-app",
+      "provider": "independent",
+      "category": "configuration",
+      "goal": "Validate one malformed configuration case with a precise error and focused test.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-09",
+      "repository": "fixture-app",
+      "provider": "primary",
+      "category": "responsive-ui",
+      "goal": "Fix one narrow-screen layout defect using the existing responsive conventions.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-10",
+      "repository": "fixture-app",
+      "provider": "independent",
+      "category": "test-reliability",
+      "goal": "Replace one timing-sensitive test wait with an observable condition while keeping the assertion intent.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-11",
+      "repository": "fixture-app",
+      "provider": "primary",
+      "category": "data-integrity",
+      "goal": "Add a regression test for duplicate submission and ensure the operation remains idempotent.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    },
+    {
+      "id": "fixture-12",
+      "repository": "fixture-app",
+      "provider": "independent",
+      "category": "cleanup",
+      "goal": "Remove one unreachable compatibility branch only after proving its replacement path is covered.",
+      "execution_status": "not_run",
+      "max_spend_usd": 2.0
+    }
+  ]
+}

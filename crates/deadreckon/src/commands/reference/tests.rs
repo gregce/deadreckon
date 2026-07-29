@@ -8,7 +8,12 @@ use deadreckon_core::campaign::{Campaign, CampaignStatus, write_campaign};
 use deadreckon_core::paths::workspace_scope;
 use deadreckon_core::{
     ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainNewOptions, OnFail, Plan, PlanMode,
-    PlanProviders, PlanRole, PlanTask, RunOptions, create_run, save_chain, save_plan,
+    PlanProviders, PlanRole, PlanTask, RunOptions, append_job_event, create_run, save_chain,
+    save_plan, write_job,
+};
+use deadreckon_protocol::{
+    Job, JobEvent, JobEventKind, JobEventSequence, JobId, JobPolicy, JobSchemaVersion, JobShape,
+    SemanticJudgeMode,
 };
 use tempfile::TempDir;
 
@@ -123,6 +128,50 @@ impl Fixture {
         campaign
     }
 
+    fn job(&self, job_id: &str, updated_at: DateTime<Utc>) -> JobView {
+        let job_id = JobId(job_id.to_string());
+        let job = Job {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: job_id.clone(),
+            scope: self.scope(),
+            goal: "durable job goal".to_string(),
+            shape: JobShape::Single,
+            created_at: updated_at - chrono::Duration::seconds(1),
+            source_cwd: self.cwd.clone(),
+            launch_plan_sha256: "launch".to_string(),
+            authority_sha256: "authority".to_string(),
+            policy: JobPolicy {
+                max_spend_usd: 1.0,
+                max_wall_seconds: 60,
+                max_attempts: 2,
+                deadline: None,
+                semantic_judge: SemanticJudgeMode::Required,
+            },
+        };
+        write_job(&self.paths, &job).expect("write job");
+        for (index, kind) in [JobEventKind::Created, JobEventKind::Queued]
+            .into_iter()
+            .enumerate()
+        {
+            append_job_event(
+                &self.paths,
+                &JobEvent {
+                    schema_version: JobSchemaVersion::CURRENT,
+                    job_id: job_id.clone(),
+                    sequence: JobEventSequence::new(index as u64 + 1).expect("sequence"),
+                    event_id: format!("job-event-{index}-{job_id}"),
+                    causation_id: format!("job-fixture-{job_id}"),
+                    timestamp: updated_at,
+                    lease_epoch: 0,
+                    kind,
+                    detail: Value::Null,
+                },
+            )
+            .expect("job event");
+        }
+        JobView::load(&self.paths, job_id.as_ref()).expect("job view")
+    }
+
     fn query<'a>(&self, reference: &'a str) -> RefQuery<'a> {
         RefQuery {
             reference: Some(reference),
@@ -199,6 +248,20 @@ fn campaign_id_resolves_when_no_other_kind_matches() {
 
     assert_eq!(resolved.kind(), RefKind::Campaign);
     assert_eq!(resolved_id(&resolved), campaign.campaign_id);
+}
+
+#[test]
+fn job_root_outranks_same_id_backing_run_plan_and_campaign() {
+    let fx = fixture();
+    let job = fx.job("abababababababababababababababab", Utc::now());
+    fx.run(job.job.job_id.as_ref(), "backing run");
+    fx.plan(job.job.job_id.as_ref(), None);
+    fx.campaign(job.job.job_id.as_ref());
+
+    let resolved = resolve_ref(&fx.paths, fx.query(job.job.job_id.as_ref())).expect("job");
+
+    assert_eq!(resolved.kind(), RefKind::Job);
+    assert_eq!(resolved_id(&resolved), job.job.job_id.as_ref());
 }
 
 #[test]
@@ -329,6 +392,7 @@ fn undo_still_refuses_a_plan() {
 #[test]
 fn ref_kinds_all_contains_every_kind() {
     for kind in [
+        RefKind::Job,
         RefKind::Run,
         RefKind::PlanChild,
         RefKind::Plan,
@@ -338,6 +402,51 @@ fn ref_kinds_all_contains_every_kind() {
         assert!(RefKinds::ALL.contains(kind), "{} missing", kind.noun());
     }
     assert!(!RefKinds::RUN.contains(RefKind::Plan));
+}
+
+#[test]
+fn latest_is_the_first_listed_job() {
+    let fx = fixture();
+    fx.job(
+        "1111111111111111111111111111aaaa",
+        Utc::now() - chrono::Duration::minutes(1),
+    );
+    let newest = fx.job("2222222222222222222222222222bbbb", Utc::now());
+
+    let listed = super::super::job::list_jobs(&fx.paths, Some(&fx.scope())).expect("jobs");
+    let first_listed = listed.iter().rev().next().expect("first listed job");
+    let latest =
+        resolve_latest_in_scope(&fx.paths, RefKinds::ALL, Some(&fx.scope())).expect("latest job");
+
+    assert_eq!(first_listed.job.job_id, newest.job.job_id);
+    assert_eq!(latest.kind(), RefKind::Job);
+    assert_eq!(resolved_id(&latest), first_listed.job.job_id.as_ref());
+}
+
+#[test]
+fn every_listed_job_has_a_non_looping_five_command_journey() {
+    let fx = fixture();
+    let job = fx.job("3333333333333333333333333333cccc", Utc::now());
+    let listed = super::super::job::list_jobs(&fx.paths, Some(&fx.scope())).expect("list");
+    assert_eq!(listed.len(), 1, "start creates one row in list");
+
+    for verb in ["attach", "status", "finish", "kill"] {
+        let resolved = resolve_ref(
+            &fx.paths,
+            RefQuery {
+                reference: Some(job.job.job_id.as_ref()),
+                all_scopes: false,
+                verb,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{verb} must accept the listed job: {error}"));
+        assert_eq!(resolved.kind(), RefKind::Job, "{verb}");
+        assert_ne!(
+            redirect_verb_for(RefKind::Job, verb),
+            "list",
+            "{verb} must not send the listed id back to list"
+        );
+    }
 }
 
 #[test]
@@ -556,6 +665,27 @@ fn latest_respects_accepts() {
 
     let resolved = resolve_latest_in_scope(&fx.paths, RefKinds::PLAN, None).expect("latest plan");
     assert_eq!(resolved_id(&resolved), plan.plan_id);
+}
+
+#[test]
+fn report_accepts_durable_jobs() {
+    let fx = fixture();
+    let job = fx.job(
+        "3333333333333333333333333333cccc",
+        Utc::now() - chrono::Duration::minutes(1),
+    );
+
+    assert!(accepts_for("report").contains(RefKind::Job));
+    let resolved = resolve_ref(
+        &fx.paths,
+        RefQuery {
+            reference: Some(job.job.job_id.as_ref()),
+            all_scopes: true,
+            verb: "report",
+        },
+    )
+    .expect("report resolves a durable job");
+    assert_eq!(resolved.kind(), RefKind::Job);
 }
 
 #[test]

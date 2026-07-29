@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::copy_tree;
+use crate::completion::validate_completion_receipt;
 use crate::error::{DeadreckonError, IoContext, Result};
 use crate::events::emit_event;
 use crate::gate::validate_acceptance_marker;
@@ -29,7 +30,11 @@ pub fn promote_completed_run(
     paths: &DeadreckonPaths,
     state: &mut PipelineState,
 ) -> Result<PathBuf> {
-    validate_acceptance_marker(state)?;
+    if paths.job_json(&state.run_id).is_file() {
+        validate_completion_receipt(paths, state)?;
+    } else {
+        validate_acceptance_marker(state)?;
+    }
     recover_promotion(paths, state)?;
     let library_dir = paths.library_dir(&state.scope, &state.run_id);
     if library_dir.exists() && library_dir.join("manifest.json").exists() {

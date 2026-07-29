@@ -15,6 +15,9 @@ use tokio_util::sync::CancellationToken;
 use which::which;
 
 use deadreckon_core::NetworkCapability;
+use deadreckon_sandbox::{
+    SandboxBackend, SandboxSpec, ToolSandboxPolicy, WorkspaceAccess, build_command,
+};
 
 use crate::cli_codex::CliCodexProvider;
 use crate::cli_contract::ProviderSession;
@@ -402,6 +405,17 @@ impl Decision {
 /// capability posture. This function deliberately has no I/O: callers are
 /// responsible for building the posture and recording the returned decision.
 fn answer_approval(posture: &CapabilityPosture, request: &ApprovalRequest) -> Decision {
+    if posture.workspace_access == WorkspaceAccess::ReadOnly {
+        return match request {
+            ApprovalRequest::CommandExecution { .. } => {
+                Decision::deny("read-only provider cannot approve commands", "read-only")
+            }
+            ApprovalRequest::FileChange { .. } => Decision::deny(
+                "read-only provider cannot approve file changes",
+                "read-only",
+            ),
+        };
+    }
     match request {
         ApprovalRequest::CommandExecution { command: None } => {
             Decision::deny("command could not be determined", "commandExecution")
@@ -671,6 +685,7 @@ fn default_capability_posture(cwd: &Path) -> CapabilityPosture {
         install: false,
         working_dir: cwd.to_path_buf(),
         additional_write_roots: Vec::new(),
+        workspace_access: WorkspaceAccess::ReadWrite,
     }
 }
 
@@ -681,6 +696,8 @@ pub(crate) struct CodexAppServerSpec {
     pub(crate) extra_args: Vec<String>,
     pub(crate) cwd: PathBuf,
     pub(crate) pid_file: Option<PathBuf>,
+    pub(crate) sandbox_backend: Option<SandboxBackend>,
+    pub(crate) workspace_access: WorkspaceAccess,
 }
 
 type ChildRpcClient = RpcClient<BufReader<ChildStdout>, ChildStdin>;
@@ -691,6 +708,13 @@ pub(crate) struct CodexAppServer {
     cwd: PathBuf,
     thread_id: Option<String>,
     pid_file: Option<PathBuf>,
+}
+
+struct AppServerLaunch {
+    program: PathBuf,
+    args: Vec<std::ffi::OsString>,
+    env: BTreeMap<String, String>,
+    cwd: PathBuf,
 }
 
 #[derive(Debug)]
@@ -704,11 +728,12 @@ pub(crate) struct ServerTurn {
 
 impl CodexAppServer {
     async fn spawn(spec: CodexAppServerSpec) -> Result<Self> {
-        let mut command = Command::new(&spec.binary);
+        let launch = app_server_launch_command(&spec)?;
+        let mut command = Command::new(launch.program);
         command
-            .arg("app-server")
-            .args(&spec.extra_args)
-            .current_dir(&spec.cwd)
+            .args(launch.args)
+            .envs(launch.env)
+            .current_dir(launch.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -784,12 +809,18 @@ impl CodexAppServer {
         &mut self,
         session_dir: Option<&Path>,
         model: Option<&str>,
+        workspace_access: WorkspaceAccess,
     ) -> Result<String> {
         const ROUTE: &str = "cli:codex-server";
-        if let Some(thread_id) = self.thread_id.as_ref() {
+        if workspace_access == WorkspaceAccess::ReadWrite
+            && let Some(thread_id) = self.thread_id.as_ref()
+        {
             return Ok(thread_id.clone());
         }
-        let prior = session_dir.and_then(|dir| ProviderSession::read(dir, ROUTE));
+        let prior = (workspace_access == WorkspaceAccess::ReadWrite)
+            .then(|| session_dir.and_then(|dir| ProviderSession::read(dir, ROUTE)))
+            .flatten();
+        let sandbox = app_server_sandbox_mode(workspace_access);
         let (method, mut params) = match prior.as_ref() {
             Some(session) => (
                 "thread/resume",
@@ -798,7 +829,7 @@ impl CodexAppServer {
                     "cwd": self.cwd.display().to_string(),
                     "approvalPolicy": "on-request",
                     "approvalsReviewer": "user",
-                    "sandbox": "workspace-write"
+                    "sandbox": sandbox
                 }),
             ),
             None => (
@@ -807,7 +838,7 @@ impl CodexAppServer {
                     "cwd": self.cwd.display().to_string(),
                     "approvalPolicy": "on-request",
                     "approvalsReviewer": "user",
-                    "sandbox": "workspace-write"
+                    "sandbox": sandbox
                 }),
             ),
         };
@@ -839,10 +870,14 @@ impl CodexAppServer {
         session.touch(now);
         session.route = Some(ROUTE.to_string());
         session.server_pid = self.pid();
-        if let Some(session_dir) = session_dir {
+        if workspace_access == WorkspaceAccess::ReadWrite
+            && let Some(session_dir) = session_dir
+        {
             session.write(session_dir)?;
         }
-        self.thread_id = Some(thread_id.clone());
+        if workspace_access == WorkspaceAccess::ReadWrite {
+            self.thread_id = Some(thread_id.clone());
+        }
         Ok(thread_id)
     }
 
@@ -1138,6 +1173,75 @@ impl CodexAppServer {
     }
 }
 
+fn app_server_launch_command(spec: &CodexAppServerSpec) -> Result<AppServerLaunch> {
+    let mut args = vec![std::ffi::OsString::from("app-server")];
+    args.extend(spec.extra_args.iter().map(std::ffi::OsString::from));
+    let Some(backend) = spec.sandbox_backend else {
+        return Ok(AppServerLaunch {
+            program: PathBuf::from(&spec.binary),
+            args,
+            env: BTreeMap::new(),
+            cwd: spec.cwd.clone(),
+        });
+    };
+
+    let program = which(&spec.binary).unwrap_or_else(|_| PathBuf::from(&spec.binary));
+    let mut read_allowlist = vec![program.clone()];
+    let mut write_allowlist = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        read_allowlist.push(home.join(".codex"));
+        write_allowlist.push(home.join(".codex"));
+    }
+    let policy = ToolSandboxPolicy::cli_provider(spec.cwd.clone(), read_allowlist, write_allowlist);
+    let mut env = BTreeMap::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+    }
+    let command = build_command(&SandboxSpec {
+        backend,
+        cwd: spec.cwd.clone(),
+        program: program.into_os_string(),
+        args,
+        stdin: None,
+        env,
+        allow_network: policy.allow_network,
+        pid_file: None,
+        cancellation_token: None,
+        profile_dir: spec
+            .pid_file
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .map(|root| root.join("sandbox").join("app-server")),
+        read_allowlist: policy.read_allowlist,
+        write_allowlist: policy.write_allowlist,
+        read_denylist: Vec::new(),
+        write_denylist: Vec::new(),
+        network_allowlist: policy.network_allowlist,
+        workspace_access: spec.workspace_access,
+    })
+    .map_err(|source| ProviderError::Cli {
+        provider: spec.provider.clone(),
+        detail: format!("could not protect codex app-server: {source}"),
+    })?;
+    Ok(AppServerLaunch {
+        program: PathBuf::from(command.program),
+        args: command.args,
+        env: command.env,
+        cwd: command.cwd,
+    })
+}
+
+fn app_server_sandbox_mode(workspace_access: WorkspaceAccess) -> &'static str {
+    match workspace_access {
+        WorkspaceAccess::ReadWrite => "workspace-write",
+        WorkspaceAccess::ReadOnly => "read-only",
+    }
+}
+
 fn steer_inbox_error(error: &deadreckon_core::DeadreckonError) -> ProviderError {
     ProviderError::Cli {
         provider: "cli:codex-server".to_string(),
@@ -1252,6 +1356,8 @@ impl CliCodexServerProvider {
                 extra_args: self.extra_args.clone(),
                 cwd: cwd.clone(),
                 pid_file: request.pid_file.clone(),
+                sandbox_backend: request.sandbox_backend,
+                workspace_access: request.workspace_access,
             })
             .await
             {
@@ -1268,20 +1374,29 @@ impl CliCodexServerProvider {
                 provider: self.name.clone(),
                 detail: "app-server was not retained after startup".to_string(),
             })?;
+            let session_dir = (request.workspace_access == WorkspaceAccess::ReadWrite)
+                .then_some(request.session_dir.as_deref())
+                .flatten();
             let thread_id = server
-                .ensure_thread(request.session_dir.as_deref(), self.model_arg.as_deref())
+                .ensure_thread(
+                    session_dir,
+                    self.model_arg.as_deref(),
+                    request.workspace_access,
+                )
                 .await?;
             let pid = server.pid();
+            let mut capability_posture = request
+                .capability_posture
+                .clone()
+                .unwrap_or_else(|| default_capability_posture(&cwd));
+            capability_posture.workspace_access = request.workspace_access;
             let turn = server
                 .run_turn(
-                    request.session_dir.as_deref(),
+                    session_dir,
                     &thread_id,
                     &request.prompt,
                     request.output_schema.as_ref(),
-                    request
-                        .capability_posture
-                        .clone()
-                        .unwrap_or_else(|| default_capability_posture(&cwd)),
+                    capability_posture,
                     request.cancellation_token.as_ref(),
                 )
                 .await?;
@@ -1346,6 +1461,7 @@ impl CliCodexServerProvider {
                 "transport": "app-server-stdio-jsonl",
                 "binary": self.binary,
                 "pid": pid,
+                "workspace_access": request.workspace_access.as_str(),
                 "thread_id": thread_id,
                 "turn_id": turn.turn_id,
                 "duration_ms": duration_ms,
@@ -1458,13 +1574,15 @@ mod tests {
 
     use super::{
         ApprovalRequest, CapabilityPosture, CodexAppServerSpec, DecisionOutcome, RpcClient,
-        ServerStart, answer_approval, default_capability_posture, start_server_or_degrade,
+        ServerStart, WorkspaceAccess, answer_approval, app_server_launch_command,
+        app_server_sandbox_mode, default_capability_posture, start_server_or_degrade,
     };
     use crate::cli_contract::ProviderSession;
     use crate::{
         ProviderConfigFile, ProviderEntry, ProviderRequest, ProviderRouter, ProviderUsage,
     };
-    use deadreckon_core::NetworkCapability;
+    use deadreckon_core::{DeadreckonPaths, NetworkCapability};
+    use deadreckon_sandbox::SandboxBackend;
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1479,7 +1597,40 @@ mod tests {
             install: false,
             working_dir: PathBuf::from("/workspace"),
             additional_write_roots: Vec::new(),
+            workspace_access: WorkspaceAccess::ReadWrite,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_server_requested_backend_crosses_the_same_outer_boundary() {
+        if which::which("sandbox-exec").is_err() {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let launch = app_server_launch_command(&CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["normal".to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: None,
+            sandbox_backend: Some(SandboxBackend::SandboxExec),
+            workspace_access: WorkspaceAccess::ReadWrite,
+        })
+        .expect("launch");
+
+        assert_eq!(launch.program, PathBuf::from("sandbox-exec"));
+        let profile = launch
+            .args
+            .windows(2)
+            .find(|parts| parts[0] == "-p")
+            .map(|parts| parts[1].to_string_lossy().into_owned())
+            .expect("seatbelt profile");
+        let key_store = DeadreckonPaths::discover().home().join("gate-keys");
+        assert!(profile.contains(&format!(
+            "(deny file-read* (literal \"{}\"))",
+            key_store.display()
+        )));
     }
 
     #[test]
@@ -1520,6 +1671,34 @@ mod tests {
         assert_eq!(decision.outcome, DecisionOutcome::Deny);
         assert_eq!(decision.reason, "file change outside writable roots");
         assert_eq!(decision.capability, "filesystem");
+    }
+
+    #[test]
+    fn read_only_server_uses_read_only_sandbox_and_denies_approvals() {
+        assert_eq!(
+            app_server_sandbox_mode(WorkspaceAccess::ReadOnly),
+            "read-only"
+        );
+        let mut posture = approval_posture(NetworkCapability::Full);
+        posture.workspace_access = WorkspaceAccess::ReadOnly;
+
+        let command = answer_approval(
+            &posture,
+            &ApprovalRequest::CommandExecution {
+                command: Some("git status".to_string()),
+            },
+        );
+        let change = answer_approval(
+            &posture,
+            &ApprovalRequest::FileChange {
+                paths: vec![PathBuf::from("/workspace/result.rs")],
+            },
+        );
+
+        assert_eq!(command.outcome, DecisionOutcome::Deny);
+        assert_eq!(change.outcome, DecisionOutcome::Deny);
+        assert_eq!(command.capability, "read-only");
+        assert_eq!(change.capability, "read-only");
     }
 
     #[tokio::test]
@@ -1608,6 +1787,8 @@ mod tests {
             extra_args: vec!["normal".to_string()],
             cwd: temp.path().to_path_buf(),
             pid_file: Some(pid_file.clone()),
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await;
         let ServerStart::Ready(server) = started else {
@@ -1640,6 +1821,8 @@ mod tests {
             extra_args: vec!["handshake-failure".to_string()],
             cwd: temp.path().to_path_buf(),
             pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await;
         let ServerStart::Degraded { trace } = started else {
@@ -1664,13 +1847,15 @@ mod tests {
             extra_args: vec!["normal".to_string(), log.display().to_string()],
             cwd: temp.path().to_path_buf(),
             pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
         };
 
         let ServerStart::Ready(mut first) = start_server_or_degrade(spec()).await else {
             panic!("first server")
         };
         let first_id = first
-            .ensure_thread(Some(temp.path()), None)
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadWrite)
             .await
             .expect("start thread");
         assert_eq!(first_id, "thread-fixture");
@@ -1685,13 +1870,45 @@ mod tests {
             panic!("second server")
         };
         let resumed_id = second
-            .ensure_thread(Some(temp.path()), None)
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadWrite)
             .await
             .expect("resume thread");
         assert_eq!(resumed_id, "thread-fixture");
         let calls = std::fs::read_to_string(log).expect("rpc log");
         assert!(calls.contains("thread/start"));
         assert!(calls.contains("thread/resume"));
+    }
+
+    #[tokio::test]
+    async fn read_only_server_request_never_resumes_worker_thread() {
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join("rpc.log");
+        let ServerStart::Ready(mut server) = start_server_or_degrade(CodexAppServerSpec {
+            provider: "cli:codex-server".to_string(),
+            binary: fixture().display().to_string(),
+            extra_args: vec!["normal".to_string(), log.display().to_string()],
+            cwd: temp.path().to_path_buf(),
+            pid_file: None,
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
+        })
+        .await
+        else {
+            panic!("server")
+        };
+
+        server
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadWrite)
+            .await
+            .expect("worker thread");
+        server
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadOnly)
+            .await
+            .expect("judge thread");
+
+        let calls = std::fs::read_to_string(log).expect("rpc log");
+        assert_eq!(calls.matches("thread/start").count(), 2);
+        assert!(!calls.contains("thread/resume"));
     }
 
     #[tokio::test]
@@ -1703,13 +1920,15 @@ mod tests {
             extra_args: vec!["normal".to_string()],
             cwd: temp.path().to_path_buf(),
             pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await
         else {
             panic!("server")
         };
         let thread_id = server
-            .ensure_thread(Some(temp.path()), None)
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadWrite)
             .await
             .expect("thread");
         let turn = server
@@ -1741,13 +1960,15 @@ mod tests {
             extra_args: vec!["turn-failed".to_string()],
             cwd: temp.path().to_path_buf(),
             pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await
         else {
             panic!("server")
         };
         let thread_id = server
-            .ensure_thread(Some(temp.path()), None)
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadWrite)
             .await
             .expect("thread");
 
@@ -1782,13 +2003,15 @@ mod tests {
             extra_args: vec!["normal".to_string(), log.display().to_string()],
             cwd: temp.path().to_path_buf(),
             pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await
         else {
             panic!("server")
         };
         let thread_id = server
-            .ensure_thread(Some(temp.path()), None)
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadWrite)
             .await
             .expect("thread");
 
@@ -1843,13 +2066,15 @@ mod tests {
             extra_args: vec!["stale-steer-once".to_string(), log.display().to_string()],
             cwd: temp.path().to_path_buf(),
             pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await
         else {
             panic!("server")
         };
         let thread_id = server
-            .ensure_thread(Some(temp.path()), None)
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadWrite)
             .await
             .expect("thread");
 
@@ -1922,13 +2147,15 @@ mod tests {
             extra_args: vec!["normal".to_string(), log.display().to_string()],
             cwd: temp.path().to_path_buf(),
             pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await
         else {
             panic!("server")
         };
         let thread_id = server
-            .ensure_thread(Some(temp.path()), None)
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadWrite)
             .await
             .expect("thread");
 
@@ -1963,13 +2190,15 @@ mod tests {
             extra_args: vec!["wait-for-steer".to_string(), log.display().to_string()],
             cwd: temp.path().to_path_buf(),
             pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await
         else {
             panic!("server")
         };
         let thread_id = server
-            .ensure_thread(Some(temp.path()), None)
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadWrite)
             .await
             .expect("thread");
         let run_root = temp.path().to_path_buf();
@@ -2117,13 +2346,15 @@ mod tests {
             extra_args: vec!["wait-for-interrupt".to_string(), log.display().to_string()],
             cwd: temp.path().to_path_buf(),
             pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await
         else {
             panic!("server")
         };
         let thread_id = server
-            .ensure_thread(Some(temp.path()), None)
+            .ensure_thread(Some(temp.path()), None, WorkspaceAccess::ReadWrite)
             .await
             .expect("thread");
         let pid = server.pid().expect("server pid");

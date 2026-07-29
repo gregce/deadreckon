@@ -169,6 +169,9 @@ pub(crate) async fn create_orchestration_plan(
         env!("CARGO_PKG_VERSION"),
     )
     .map_err(CliError::Core)?;
+    if let Some(job_id) = commands::graph_job::current_parent_job_id() {
+        plan.plan_id = job_id.to_string();
+    }
     plan.parent_cwd = Some(plan_cwd);
     // Per-node apply serializes execution and lands work incrementally, so a
     // stop-on-failure policy matches what the operator asked for: a half-
@@ -190,6 +193,11 @@ pub(crate) async fn create_orchestration_plan(
         write_worker_spec(&paths, &plan.plan_id, &task.task_id, &spec)?;
     }
     save_plan(&paths, &plan)?;
+    let driver_kind = match plan_mode {
+        PlanMode::Review => commands::graph_job::DriverKind::Review,
+        PlanMode::FullPlan => commands::graph_job::DriverKind::FullPlan,
+    };
+    commands::graph_job::record_current_artifact(&paths, driver_kind, "plan", &plan.plan_id)?;
     append_plan_event(
         &paths,
         &plan.plan_id,
@@ -711,6 +719,7 @@ async fn provider_plan_drafts(
         cwd: Some(cwd.to_path_buf()),
         output_path: None,
         sandbox_backend: None,
+        workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
         pid_file: None,
         cancellation_token: None,
         session_dir: None,

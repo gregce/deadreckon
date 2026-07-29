@@ -6,7 +6,9 @@ use std::time::Duration;
 use chrono::Utc;
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_providers::ModelCatalogOverride;
-use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as run_sandbox};
+use deadreckon_sandbox::{
+    SandboxBackend, SandboxSpec, ToolSandboxPolicy, WorkspaceAccess, run as run_sandbox,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -318,6 +320,7 @@ fn seam_sandbox_spec(
         read_denylist: denied.clone(),
         write_denylist: denied,
         network_allowlist: Vec::new(),
+        workspace_access: WorkspaceAccess::ReadWrite,
     }
 }
 

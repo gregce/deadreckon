@@ -16,8 +16,19 @@ pub(crate) fn list_command(
     } else {
         Some(scope.unwrap_or(current_scope()?))
     };
-    let runs = list_runs(&paths, effective_scope.as_deref())?;
-    let plans = list_plan_entries(&paths, effective_scope.as_deref())?;
+    let jobs = super::job::list_jobs(&paths, effective_scope.as_deref())?;
+    let job_ids = jobs
+        .iter()
+        .map(|view| view.job.job_id.as_ref().to_string())
+        .collect::<BTreeSet<_>>();
+    let runs = list_runs(&paths, effective_scope.as_deref())?
+        .into_iter()
+        .filter(|run| !job_ids.contains(&run.run_id))
+        .collect::<Vec<_>>();
+    let plans = list_plan_entries(&paths, effective_scope.as_deref())?
+        .into_iter()
+        .filter(|plan| !job_ids.contains(&plan.plan_id))
+        .collect::<Vec<_>>();
     let chains = super::chain::list_chain_records(&paths, effective_scope.clone())?;
     if json_output {
         let runs = runs
@@ -72,7 +83,22 @@ pub(crate) fn list_command(
                 })
             })
             .collect::<Vec<_>>();
-        let empty = runs.is_empty() && plans.is_empty() && chains.is_empty();
+        let jobs = jobs
+            .iter()
+            .map(|view| {
+                json!({
+                    "job_id": view.job.job_id,
+                    "scope": view.job.scope,
+                    "goal": view.job.goal,
+                    "status": super::job::job_status_label(view),
+                    "updated_at": view.projection.updated_at.unwrap_or(view.job.created_at),
+                    "attempts": view.projection.attempt_count,
+                    "outcome": view.projection.outcome,
+                    "stop_reason": view.projection.stop_reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        let empty = runs.is_empty() && plans.is_empty() && chains.is_empty() && jobs.is_empty();
         let empty_surface = empty.then(|| empty_list_surface(effective_scope.as_deref(), all));
         let next_actions = if let Some(surface) = empty_surface.as_ref() {
             let mut actions = vec![surface.primary_action.command.clone()];
@@ -100,6 +126,7 @@ pub(crate) fn list_command(
                 "home": paths.home(),
             },
             "runs": runs,
+            "jobs": jobs,
             "plans": plans,
             "chains": chains,
         });
@@ -131,6 +158,7 @@ pub(crate) fn list_command(
     let mut entries = top_level_runs
         .into_iter()
         .map(ListEntry::Run)
+        .chain(jobs.into_iter().map(|view| ListEntry::Job(Box::new(view))))
         .chain(plans.into_iter().map(ListEntry::Plan))
         .chain(chains.into_iter().map(|chain| {
             let activity = chain_activity_at(&paths, &chain);
@@ -156,6 +184,35 @@ pub(crate) fn list_command(
     let goal_width = list_goal_width();
     for entry in entries {
         match entry {
+            ListEntry::Job(view) => {
+                let status = super::job::job_status_label(&view);
+                let action = if view.projection.is_terminal() {
+                    match view.projection.outcome {
+                        Some(deadreckon_protocol::JobOutcome::Verified) => "finish",
+                        _ => "attach",
+                    }
+                } else {
+                    "attach"
+                };
+                append_list_row(
+                    &mut output,
+                    &ListRow {
+                        id: run_prefix(view.job.job_id.as_ref()),
+                        status,
+                        age: relative_age(
+                            view.projection.updated_at.unwrap_or(view.job.created_at),
+                        ),
+                        scope: view.job.scope,
+                        kind: "job".to_string(),
+                        mode: format!("{:?}", view.job.shape).to_ascii_lowercase(),
+                        action: action.to_string(),
+                        goal: view.job.goal,
+                        goal_width,
+                        orchestration: false,
+                        child: false,
+                    },
+                );
+            }
             ListEntry::Run(run) => {
                 let state = load_state(&run.state_path).ok();
                 let mode = state
@@ -488,6 +545,7 @@ fn wrap_words(value: &str, width: usize) -> Vec<String> {
 
 #[derive(Debug)]
 enum ListEntry {
+    Job(Box<deadreckon_core::JobView>),
     Run(RunListEntry),
     Plan(PlanListEntry),
     /// Chains were invisible here until now: `deadreckon status <chain-id>`
@@ -508,6 +566,7 @@ enum ListEntry {
 impl ListEntry {
     fn updated_at(&self) -> DateTime<Utc> {
         match self {
+            Self::Job(view) => view.projection.updated_at.unwrap_or(view.job.created_at),
             Self::Run(run) => run.updated_at,
             Self::Plan(plan) => plan.updated_at,
             Self::Chain { activity, .. } => *activity,

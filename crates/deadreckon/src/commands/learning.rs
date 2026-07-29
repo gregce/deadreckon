@@ -344,6 +344,7 @@ async fn learn_propose_command(
             cwd: Some(std::env::current_dir()?),
             output_path: Some(paths.learning_dir().join("reflection.out")),
             sandbox_backend: None,
+            workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,

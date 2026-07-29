@@ -4,6 +4,7 @@ crate: deadreckon-core
   artifacts::append_trace
   artifacts::copy_tree
   artifacts::diff_snapshots
+  artifacts::diff_working_trees
   artifacts::DiffSummary
   artifacts::FileDelta
   artifacts::FileDeltaStatus
@@ -62,6 +63,9 @@ crate: deadreckon-core
   codebase::user_error
   codebase::WorktreeOptions
   codebase::write_codebase_record
+  completion::seal_completion_receipt
+  completion::SEMANTIC_JUDGMENT_JSON
+  completion::validate_completion_receipt
   docs::append_parent_narrative_update
   docs::append_turn_doc
   docs::apply_commit_body
@@ -123,22 +127,48 @@ crate: deadreckon-core
   events::event_preview
   events::RUN_EVENTS_JSONL
   events::RunEventBus
+  exec::ChildTerminator
+  exec::HeadTailBuffer
+  exec::ProcessGroupTerminator
+  exec::RawPidTerminator
+  exec::read_supervised_process
+  exec::spawn_grouped
+  exec::SupervisedProcess
+  exec::TerminationOutcome
+  exec::TruncationPolicy
+  exec::write_supervised_process
   gate::ACCEPTANCE_PROGRESS_JSONL
   gate::acceptance_progress_path_for_run_root
   gate::acceptance_spec_path_for_run_root
   gate::AcceptanceCheck
   gate::AcceptanceCheckResult
+  gate::AcceptanceContainment
   gate::AcceptanceMarker
   gate::AcceptanceProgressEntry
+  gate::AcceptanceProofKind
+  gate::AcceptanceSignatureStrength
   gate::AcceptanceSpec
+  gate::create_gate_key
+  gate::decode_gate_key
+  gate::encode_gate_key
   gate::evaluate_acceptance
   gate::evaluate_acceptance_checks
   gate::evaluate_acceptance_checks_with_progress
+  gate::GATE_CONTAINED_ENV
+  gate::GATE_KEY_ENV
+  gate::GATE_SANDBOX_BACKEND_ENV
+  gate::gate_key_path
+  gate::gate_key_path_for_run_root
   gate::gate_nonce_path_for_run_root
   gate::marker_path_for_run_root
+  gate::read_gate_key
+  gate::read_gate_key_for_run_root
   gate::validate_acceptance_marker
+  gate::verify_v2_marker_signature
   gate::write_acceptance_marker
   gate::write_acceptance_marker_with_results
+  gate::write_gate_key
+  gate::write_native_acceptance_marker_with_results_and_key
   glossary::chain_status_label
   glossary::chain_step_status_label
   glossary::NOUN_CHAIN
@@ -151,6 +181,35 @@ crate: deadreckon-core
   glossary::run_status_label
   glossary::StatusLabel
   glossary::status_label
+  job::append_job_event
+  job::JobHistory
+  job::JOB_CONTROL_LOCK
+  job::JOB_EVENTS_JSONL
+  job::JOB_JSON
+  job::JobProjection
+  job::JOB_PROJECTION_JSON
+  job::JobView
+  job::legacy_campaign_job_view
+  job::legacy_chain_job_view
+  job::legacy_plan_job_view
+  job::legacy_run_job_view
+  job::LegacyJobKind
+  job::LegacyJobView
+  job::load_job
+  job::load_job_projection
+  job::read_job_history
+  job::rebuild_job_projection
+  job::reduce_job_history
+  job::write_job
+  job_lease::append_fenced_job_event
+  job_lease::claim_job_lease
+  job_lease::heartbeat_job_lease
+  job_lease::LeaseClaim
+  job_lease::LeaseClaimDisposition
+  job_lease::LeaseOwner
+  job_lease::LeaseReclaimReason
+  job_lease::LeaseToken
+  job_lease::load_job_lease
   lock::acquire_lock
   lock::lock_status
   lock::LockGuard
@@ -242,6 +301,7 @@ crate: deadreckon-providers
   auth_probe::probe_cli_auth
   config::default_config_path
   config::read_config
+  deadreckon_sandbox::WorkspaceAccess
   error::ProviderError
   error::Result
   http::ProviderAdapter
@@ -265,9 +325,32 @@ crate: deadreckon-providers
   types::ProviderUsage
   types::SpendEstimate
 crate: deadreckon-protocol
+  ids::JobId
   ids::PlanId
   ids::RunId
   ids::TurnId
+  job::AuthorityAcceptedBy
+  job::CompletionProofKind
+  job::CompletionReceipt
+  job::CompletionReceiptIssuer
+  job::GoalCoverage
+  job::GoalCoverageStatus
+  job::Job
+  job::JOB_SCHEMA_VERSION
+  job::JobAuthority
+  job::JobEvent
+  job::JobEventKind
+  job::JobEventSequence
+  job::JobLease
+  job::JobOutcome
+  job::JobPhase
+  job::JobPolicy
+  job::JobSchemaVersion
+  job::JobShape
+  job::SemanticDecision
+  job::SemanticJudgment
+  job::SemanticJudgeMode
+  job::StopReason
   ledger::EventLine
   ledger::FlightEvent
   ledger::FlightEventKind
@@ -320,7 +403,17 @@ crate: deadreckon-runtime
   seam::SeamRunCtx
   seam::SeamsConfig
   seam::write_seams_audit
+  semantic_judge::build_semantic_evidence
+  semantic_judge::build_semantic_evidence_against_source
+  semantic_judge::EvidenceItem
+  semantic_judge::run_semantic_judge
+  semantic_judge::run_semantic_judge_against_source
+  semantic_judge::SEMANTIC_JUDGMENT_PATH
+  semantic_judge::semantic_judgment_path
+  semantic_judge::SemanticEvidencePack
+  semantic_judge::SemanticJudgeResult
   turn_loop::NarratorConfig
+  turn_loop::run_deterministic_completion_gate
   turn_loop::run_turn_loop
   turn_loop::RunLoopConfig
   turn_loop::RunLoopDocsConfig
@@ -334,7 +427,9 @@ crate: deadreckon-sandbox
   commands::SandboxCommand
   doctor::BackendAvailability
   doctor::doctor
+  policy::ProtectedPathPolicy
   policy::ToolSandboxPolicy
   process::run
   process::SandboxRunOutput
   spec::SandboxSpec
+  spec::WorkspaceAccess

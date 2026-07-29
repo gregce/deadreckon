@@ -136,7 +136,7 @@ use crate::cli::{
     CliDocKind, CliPlanMode, CliSeamKind, Commands, CompletionCommand, ConfigCommand,
     ExtendCommandArgs, ForkCommandArgs, HistoryCommand, HistoryKind, ImproveCommand, LearnCommand,
     LibraryCommand, MergeCommandArgs, OrchestrateCommand, PlanCommandArgs, ProvidersCommand,
-    RunCommandArgs, SeamsCommand, StartCommandArgs,
+    RunCommandArgs, SeamsCommand, StartCommandArgs, SupervisorCommand,
 };
 use crate::narrative::{AttachViewMode, NarrativeVisualMode};
 use crate::plan_event_bus::{PlanEventBus, PlanFeedEvent};
@@ -718,8 +718,30 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
+        Commands::Supervisor { command } => match command {
+            SupervisorCommand::Serve { once, job_id } => {
+                commands::supervisor::supervisor_serve_command(once, job_id).await
+            }
+            SupervisorCommand::Drive { job_id } => {
+                commands::graph_job::drive_job_command(job_id).await
+            }
+            SupervisorCommand::Resume { job_id } => trusted_supervisor_resume_command(job_id).await,
+            SupervisorCommand::Install => {
+                commands::supervisor_service::supervisor_service_install_command()
+            }
+            SupervisorCommand::Start => {
+                commands::supervisor_service::supervisor_service_start_command()
+            }
+            SupervisorCommand::Status => {
+                commands::supervisor_service::supervisor_service_status_command()
+            }
+            SupervisorCommand::Stop => {
+                commands::supervisor_service::supervisor_service_stop_command()
+            }
+        },
         Commands::Run {
             goal,
+            run_id,
             tamper_baseline,
             goal_file,
             fresh,
@@ -765,6 +787,7 @@ async fn main_inner() -> Result<()> {
             )?;
             commands::run::run_command(RunCommandArgs {
                 goal,
+                run_id,
                 tamper_baseline,
                 fresh,
                 worktree,
@@ -1499,7 +1522,10 @@ fn start_startup_update_check(
 fn startup_update_check_enabled(command: &Commands) -> bool {
     std::env::var("DEADRECKON_UPDATE_CHECK").as_deref() != Ok("0")
         && startup_update_stdout_is_tty()
-        && !matches!(command, Commands::Update { .. } | Commands::Doctor { .. })
+        && !matches!(
+            command,
+            Commands::Update { .. } | Commands::Doctor { .. } | Commands::Supervisor { .. }
+        )
 }
 
 fn startup_update_stdout_is_tty() -> bool {
@@ -3425,6 +3451,7 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
     std::env::set_current_dir(&try_dir)?;
     let run_result = commands::run::run_command(RunCommandArgs {
         goal: TRY_GOAL.to_string(),
+        run_id: None,
         tamper_baseline: None,
         fresh: true,
         worktree: false,
@@ -5025,6 +5052,7 @@ async fn refresh_plan_docs(
             cwd: plan.parent_cwd.clone(),
             output_path: Some(plan_doc_path(paths, &plan.plan_id, "plan-doc-provider.out")),
             sandbox_backend: Some(SandboxBackend::None),
+            workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -6839,6 +6867,7 @@ async fn invoke_merge_repair_planner(
         cwd: Some(cwd),
         output_path: None,
         sandbox_backend: None,
+        workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
         pid_file: None,
         cancellation_token: None,
         session_dir: None,
@@ -9112,6 +9141,9 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
         },
     )?;
     let mut state = match resolved {
+        commands::reference::ResolvedRef::Job(job) => {
+            return commands::job::cancel_job(&paths, &job, force);
+        }
         commands::reference::ResolvedRef::Campaign {
             dir: campaign_dir,
             campaign,
@@ -9434,7 +9466,36 @@ async fn resume_command(
     plain: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let mut state = commands::reference::resolve_run_like(&paths, Some(&run_id), "resume")?;
+    let state = commands::reference::resolve_run_like(&paths, Some(&run_id), "resume")?;
+    resume_loaded_command(&paths, state, from_turn, max_wall_seconds, no_docs, plain).await
+}
+
+async fn trusted_supervisor_resume_command(job_id: String) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    if std::env::var(commands::run::TRUSTED_SUPERVISOR_JOB_ID_ENV).as_deref() != Ok(job_id.as_str())
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "job resume may only be launched by the durable supervisor".to_string(),
+        )));
+    }
+    let job = deadreckon_core::load_job(&paths, &job_id)?;
+    if job.job_id.as_ref() != job_id || job.shape != deadreckon_protocol::JobShape::Single {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "trusted resume requires the exact single-leaf job identity".to_string(),
+        )));
+    }
+    let state = deadreckon_core::load_run(&paths, &job_id)?;
+    resume_loaded_command(&paths, state, None, None, true, true).await
+}
+
+async fn resume_loaded_command(
+    paths: &DeadreckonPaths,
+    mut state: deadreckon_core::PipelineState,
+    from_turn: Option<u32>,
+    max_wall_seconds: Option<f64>,
+    no_docs: bool,
+    plain: bool,
+) -> Result<()> {
     if state.status == RunStatus::Completed {
         let id = run_prefix(&state.run_id);
         let primary = format!("deadreckon show {id}");
@@ -9461,7 +9522,7 @@ async fn resume_command(
         return Ok(());
     }
     let mut lock = acquire_lock(
-        &paths,
+        paths,
         &state.task_key,
         &state.run_id,
         &state.scope,
@@ -9483,7 +9544,7 @@ async fn resume_command(
     let provider = state.provider.clone();
     let backend: SandboxBackend = state.sandbox.parse()?;
     let router = provider_router_for_run_with_catalog_seam(
-        &paths,
+        paths,
         &state,
         backend,
         provider.as_deref(),
@@ -9492,9 +9553,9 @@ async fn resume_command(
     )
     .await?;
     let selected_route = router.selected_route_info();
-    let defaults = config_defaults(&paths)?;
+    let defaults = config_defaults(paths)?;
     let doc_provider_selection = doc_provider_selection_from_setup(&doc_provider_setup_selection(
-        &paths,
+        paths,
         &defaults,
         None,
         provider.as_deref(),
@@ -9553,7 +9614,7 @@ async fn resume_command(
     save_state(&state)?;
     lock.release()?;
     print_exit_summary_card(&state, &outcome, plain, true);
-    commands::lifecycle::fire_lifecycle_notification(&paths, &state, &outcome).await;
+    commands::lifecycle::fire_lifecycle_notification(paths, &state, &outcome).await;
     Ok(())
 }
 
@@ -10549,6 +10610,9 @@ fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
     )?;
     let mut child_context: Option<PlanChildSelection> = None;
     let state = match resolved {
+        commands::reference::ResolvedRef::Job(job) => {
+            return commands::job::print_job_status(&job, args.json_output);
+        }
         commands::reference::ResolvedRef::Run(state) => *state,
         commands::reference::ResolvedRef::PlanChild { selection, state } => {
             child_context = Some(selection);
@@ -10981,6 +11045,9 @@ fn status_command(run_id: Option<&str>, all: bool, plain: bool, json_output: boo
         },
     )?;
     let state = match resolved {
+        commands::reference::ResolvedRef::Job(job) => {
+            return commands::job::print_job_status(&job, json_output);
+        }
         commands::reference::ResolvedRef::Run(state) => *state,
         commands::reference::ResolvedRef::PlanChild { state, .. } => *state,
         commands::reference::ResolvedRef::Plan(plan) => {
@@ -14599,6 +14666,7 @@ async fn refresh_narrative_projection_with_provider(
             cwd,
             output_path: Some(output_path),
             sandbox_backend: None,
+            workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token,
             session_dir: None,

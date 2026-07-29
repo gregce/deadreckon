@@ -1,22 +1,89 @@
 use std::collections::hash_map::DefaultHasher;
+use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
+use crate::paths::DeadreckonPaths;
 use crate::state::{PipelineState, append_json_line};
 use crate::tamper::AcceptanceTamperVerdict;
 
 pub const ACCEPTANCE_MARKER: &str = "turn-acceptance.json";
 pub const ACCEPTANCE_PROGRESS_JSONL: &str = "acceptance-progress.jsonl";
 pub const ACCEPTANCE_SPEC: &str = "acceptance.yaml";
+pub const GATE_KEY_ENV: &str = "DEADRECKON_GATE_KEY";
+pub const GATE_CONTAINED_ENV: &str = "DEADRECKON_GATE_CONTAINED";
+pub const GATE_SANDBOX_BACKEND_ENV: &str = "DEADRECKON_GATE_SANDBOX_BACKEND";
 const GATE_NONCE: &str = "gate/nonce";
+const GATE_KEY_BYTES: usize = 32;
+const V2_CANONICAL_MAGIC: &[u8] = b"deadreckon.acceptance-marker.v2\0";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptanceProofKind {
+    NativeGate,
+    SyntheticController,
+    DerivedRollup,
+    #[default]
+    LegacyUnknown,
+}
+
+impl AcceptanceProofKind {
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::NativeGate => "native_gate",
+            Self::SyntheticController => "synthetic_controller",
+            Self::DerivedRollup => "derived_rollup",
+            Self::LegacyUnknown => "legacy_unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptanceSignatureStrength {
+    HmacSha256,
+    LegacyWeak,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceContainment {
+    pub contained: bool,
+    pub sandbox_backend: String,
+}
+
+impl AcceptanceContainment {
+    pub fn contained(backend: impl Into<String>) -> Self {
+        Self {
+            contained: true,
+            sandbox_backend: backend.into(),
+        }
+    }
+
+    pub fn uncontained(backend: impl Into<String>) -> Self {
+        Self {
+            contained: false,
+            sandbox_backend: backend.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarkerSigningIdentity {
+    issuer: &'static str,
+    proof_kind: AcceptanceProofKind,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AcceptanceMarker {
@@ -24,14 +91,38 @@ pub struct AcceptanceMarker {
     pub run_id: String,
     pub status: String,
     pub produced_by: String,
+    #[serde(default)]
+    pub issuer: String,
+    #[serde(default)]
+    pub proof_kind: AcceptanceProofKind,
     pub checked_at: DateTime<Utc>,
     pub working_dir: PathBuf,
+    #[serde(default)]
+    pub contained: bool,
+    #[serde(default)]
+    pub sandbox_backend: String,
     #[serde(default)]
     pub signature: String,
     #[serde(default)]
     pub check_count: usize,
     #[serde(default)]
     pub checks: Vec<AcceptanceCheckResult>,
+}
+
+impl AcceptanceMarker {
+    pub fn signature_strength(&self) -> AcceptanceSignatureStrength {
+        if self.schema_version >= 2 {
+            AcceptanceSignatureStrength::HmacSha256
+        } else {
+            AcceptanceSignatureStrength::LegacyWeak
+        }
+    }
+
+    pub fn is_native_gate_proof(&self) -> bool {
+        self.schema_version >= 2
+            && self.proof_kind == AcceptanceProofKind::NativeGate
+            && self.issuer == "dr-gate"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,34 +214,195 @@ pub fn gate_nonce_path_for_run_root(run_root: &Path) -> PathBuf {
     run_root.join(GATE_NONCE)
 }
 
+pub fn gate_key_path(paths: &DeadreckonPaths, run_id: &str) -> PathBuf {
+    paths
+        .home()
+        .join("gate-keys")
+        .join(format!("{}.key", gate_key_file_stem(run_id)))
+}
+
+pub fn gate_key_path_for_run_root(run_root: &Path, run_id: &str) -> Result<PathBuf> {
+    let home = run_root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            DeadreckonError::InvalidInput(format!(
+                "cannot infer DeadReckon home from run root {}",
+                run_root.display()
+            ))
+        })?;
+    Ok(gate_key_path(&DeadreckonPaths::from_home(home), run_id))
+}
+
+pub fn create_gate_key(paths: &DeadreckonPaths, run_id: &str) -> Result<Vec<u8>> {
+    let path = gate_key_path(paths, run_id);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return read_gate_key_at_path(&path, run_id),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(DeadreckonError::Io { path, source });
+        }
+    }
+
+    // UUID v4 uses the platform CSPRNG but reserves version/variant bits. Hash
+    // three independent UUIDs so the stored 32-byte key has at least 256 bits
+    // of random input without adding a second OS-random dependency surface.
+    let mut derivation = Sha256::new();
+    for _ in 0..3 {
+        derivation.update(Uuid::new_v4().as_bytes());
+    }
+    let key = derivation.finalize().to_vec();
+    match write_gate_key(paths, run_id, &key) {
+        Ok(()) => Ok(key),
+        // A concurrent creator may have won the create_new race. Reuse only
+        // the protected, valid key it wrote; never replace key material.
+        Err(DeadreckonError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            read_gate_key_at_path(&path, run_id)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn write_gate_key(paths: &DeadreckonPaths, run_id: &str, key: &[u8]) -> Result<()> {
+    if key.len() != GATE_KEY_BYTES {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "gate key must be {GATE_KEY_BYTES} bytes, got {}",
+            key.len()
+        )));
+    }
+    let path = gate_key_path(paths, run_id);
+    let parent = path.parent().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!("gate key path {} has no parent", path.display()))
+    })?;
+    std::fs::create_dir_all(parent).with_path(parent)?;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).with_path(&path)?;
+    file.write_all(hex_encode(key).as_bytes())
+        .with_path(&path)?;
+    file.sync_all().with_path(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).with_path(&path)?;
+    }
+    Ok(())
+}
+
+pub fn read_gate_key(paths: &DeadreckonPaths, run_id: &str) -> Result<Vec<u8>> {
+    read_gate_key_at_path(&gate_key_path(paths, run_id), run_id)
+}
+
+pub fn read_gate_key_for_run_root(run_root: &Path, run_id: &str) -> Result<Vec<u8>> {
+    let path = gate_key_path_for_run_root(run_root, run_id)?;
+    read_gate_key_at_path(&path, run_id)
+}
+
+pub fn decode_gate_key(value: &str) -> Result<Vec<u8>> {
+    let decoded = hex_decode(value.trim()).map_err(DeadreckonError::InvalidInput)?;
+    if decoded.len() != GATE_KEY_BYTES {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "gate key must decode to {GATE_KEY_BYTES} bytes, got {}",
+            decoded.len()
+        )));
+    }
+    Ok(decoded)
+}
+
+pub fn encode_gate_key(key: &[u8]) -> Result<String> {
+    require_gate_key_length(key)?;
+    Ok(hex_encode(key))
+}
+
+fn read_gate_key_at_path(path: &Path, run_id: &str) -> Result<Vec<u8>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "protected gate key is missing for run {run_id}; acceptance cannot be verified\ntry: deadreckon verdict {run_id}"
+            )));
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "protected gate key for run {run_id} is not a regular file; acceptance cannot be verified\ntry: deadreckon verdict {run_id}"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "protected gate key for run {run_id} is accessible to other users; acceptance cannot be verified\ntry: deadreckon verdict {run_id}"
+            )));
+        }
+    }
+
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "protected gate key is missing for run {run_id}; acceptance cannot be verified\ntry: deadreckon verdict {run_id}"
+            )));
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    decode_gate_key(&raw).map_err(|err| {
+        DeadreckonError::InvalidInput(format!(
+            "protected gate key for run {run_id} is unreadable: {err}\ntry: deadreckon verdict {run_id}"
+        ))
+    })
+}
+
 pub fn validate_acceptance_marker(state: &PipelineState) -> Result<AcceptanceMarker> {
     // AS-BUILT §8/§17: completion is accepted only from an external marker
     // written by a binary runner and bound to this run_id.
     let path = marker_path(state);
     let raw = std::fs::read(&path).with_path(&path)?;
     let marker: AcceptanceMarker = serde_json::from_slice(&raw).with_json_path(&path)?;
-    if marker.schema_version != 1 {
-        return Err(DeadreckonError::InvalidInput(format!(
-            "unsupported acceptance marker schema {}",
-            marker.schema_version
-        )));
-    }
     if marker.run_id != state.run_id {
         return Err(DeadreckonError::InvalidInput(format!(
             "acceptance marker run_id {} does not match {}",
             marker.run_id, state.run_id
         )));
     }
-    if marker.status != "pass" || marker.produced_by != "dr-gate" {
+    if marker.status != "pass" {
         return Err(DeadreckonError::InvalidInput(
-            "acceptance marker was not produced by dr-gate with pass status".to_string(),
+            "acceptance marker does not record pass status".to_string(),
         ));
     }
-    let expected = marker_signature(&state.run_root, &marker)?;
-    if marker.signature != expected {
-        return Err(DeadreckonError::InvalidInput(
-            "acceptance marker signature is invalid; forged self-attestation refused".to_string(),
-        ));
+    match marker.schema_version {
+        1 => validate_legacy_marker_signature(&state.run_root, &marker)?,
+        2 => {
+            let key = read_gate_key_for_run_root(&state.run_root, &state.run_id)?;
+            verify_v2_marker_signature(&state.run_root, &marker, &key)?;
+        }
+        version => {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "unsupported acceptance marker schema {version}"
+            )));
+        }
     }
     Ok(marker)
 }
@@ -183,20 +435,76 @@ pub fn write_acceptance_marker_with_results(
     working_dir: PathBuf,
     checks: Vec<AcceptanceCheckResult>,
 ) -> Result<AcceptanceMarker> {
+    let key = read_gate_key_for_run_root(run_root, &run_id)?;
+    write_acceptance_marker_with_context_and_key(
+        run_root,
+        run_id,
+        working_dir,
+        checks,
+        &key,
+        MarkerSigningIdentity {
+            issuer: "deadreckon-controller",
+            proof_kind: AcceptanceProofKind::SyntheticController,
+        },
+        AcceptanceContainment::uncontained("synthetic"),
+    )
+}
+
+pub fn write_native_acceptance_marker_with_results_and_key(
+    run_root: &Path,
+    run_id: String,
+    working_dir: PathBuf,
+    checks: Vec<AcceptanceCheckResult>,
+    gate_key: &[u8],
+    containment: AcceptanceContainment,
+) -> Result<AcceptanceMarker> {
+    write_acceptance_marker_with_context_and_key(
+        run_root,
+        run_id,
+        working_dir,
+        checks,
+        gate_key,
+        MarkerSigningIdentity {
+            issuer: "dr-gate",
+            proof_kind: AcceptanceProofKind::NativeGate,
+        },
+        containment,
+    )
+}
+
+fn write_acceptance_marker_with_context_and_key(
+    run_root: &Path,
+    run_id: String,
+    working_dir: PathBuf,
+    checks: Vec<AcceptanceCheckResult>,
+    gate_key: &[u8],
+    identity: MarkerSigningIdentity,
+    containment: AcceptanceContainment,
+) -> Result<AcceptanceMarker> {
+    if gate_key.len() != GATE_KEY_BYTES {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "gate key must be {GATE_KEY_BYTES} bytes, got {}",
+            gate_key.len()
+        )));
+    }
     let proofs = run_root.join("proofs");
     std::fs::create_dir_all(&proofs).with_path(&proofs)?;
     let mut marker = AcceptanceMarker {
-        schema_version: 1,
+        schema_version: 2,
         run_id,
         status: "pass".to_string(),
-        produced_by: "dr-gate".to_string(),
+        produced_by: identity.issuer.to_string(),
+        issuer: identity.issuer.to_string(),
+        proof_kind: identity.proof_kind,
         checked_at: Utc::now(),
         working_dir,
+        contained: containment.contained,
+        sandbox_backend: containment.sandbox_backend,
         signature: String::new(),
         check_count: checks.len(),
         checks,
     };
-    marker.signature = marker_signature(run_root, &marker)?;
+    marker.signature = v2_marker_signature(run_root, &marker, gate_key)?;
     std::fs::write(
         proofs.join(ACCEPTANCE_MARKER),
         serde_json::to_vec_pretty(&marker).map_err(|source| DeadreckonError::Json {
@@ -232,11 +540,14 @@ pub fn run_acceptance_gate_and_write_marker(
             failed.detail
         )));
     }
-    write_acceptance_marker_with_results(
+    let key = read_gate_key_for_run_root(run_root, run_id)?;
+    write_native_acceptance_marker_with_results_and_key(
         run_root,
         run_id.to_string(),
         working_dir.to_path_buf(),
         results,
+        &key,
+        AcceptanceContainment::uncontained("none"),
     )
 }
 
@@ -428,7 +739,7 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
     match check {
         AcceptanceCheck::CargoTest { args, must_pass } => {
             let started = Instant::now();
-            let output = Command::new("cargo")
+            let output = gate_check_command("cargo")
                 .arg("test")
                 .args(&args)
                 .current_dir(working_dir)
@@ -497,7 +808,7 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
         AcceptanceCheck::BuildSuccess { cwd, must_pass } => {
             let cwd = render_template(working_dir, &cwd);
             let started = Instant::now();
-            let output = Command::new("cargo")
+            let output = gate_check_command("cargo")
                 .arg("build")
                 .current_dir(&cwd)
                 .output()
@@ -530,7 +841,7 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
                 .map(|cwd| render_template(working_dir, &cwd))
                 .unwrap_or_else(|| working_dir.to_path_buf());
             let started = Instant::now();
-            let output = Command::new("sh")
+            let output = gate_check_command("sh")
                 .arg("-lc")
                 .arg(&command)
                 .current_dir(&cwd)
@@ -557,6 +868,17 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
             })
         }
     }
+}
+
+fn gate_check_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    // dr-gate receives the protected signing key from its trusted parent. The
+    // checks it runs may execute repository-controlled build scripts, so none of
+    // the signing context may cross that child-process boundary.
+    command.env_remove(GATE_KEY_ENV);
+    command.env_remove(GATE_CONTAINED_ENV);
+    command.env_remove(GATE_SANDBOX_BACKEND_ENV);
+    command
 }
 
 fn duration_ms(started: Instant) -> u64 {
@@ -749,7 +1071,36 @@ fn render_template(working_dir: &Path, value: &str) -> PathBuf {
     PathBuf::from(value.replace("{working_dir}", &working_dir.to_string_lossy()))
 }
 
+#[cfg(test)]
 fn marker_signature(run_root: &Path, marker: &AcceptanceMarker) -> Result<String> {
+    match marker.schema_version {
+        1 => legacy_marker_signature(run_root, marker),
+        2 => {
+            let key = read_gate_key_for_run_root(run_root, &marker.run_id)?;
+            v2_marker_signature(run_root, marker, &key)
+        }
+        version => Err(DeadreckonError::InvalidInput(format!(
+            "unsupported acceptance marker schema {version}"
+        ))),
+    }
+}
+
+fn validate_legacy_marker_signature(run_root: &Path, marker: &AcceptanceMarker) -> Result<()> {
+    if marker.produced_by != "dr-gate" {
+        return Err(DeadreckonError::InvalidInput(
+            "legacy acceptance marker was not produced by dr-gate".to_string(),
+        ));
+    }
+    let expected = legacy_marker_signature(run_root, marker)?;
+    if marker.signature != expected {
+        return Err(DeadreckonError::InvalidInput(
+            "acceptance marker signature is invalid; forged self-attestation refused".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_marker_signature(run_root: &Path, marker: &AcceptanceMarker) -> Result<String> {
     let nonce_path = gate_nonce_path_for_run_root(run_root);
     let nonce = std::fs::read_to_string(&nonce_path).with_path(&nonce_path)?;
     let mut hasher = DefaultHasher::new();
@@ -792,6 +1143,238 @@ fn marker_signature(run_root: &Path, marker: &AcceptanceMarker) -> Result<String
     Ok(format!("{:016x}", hasher.finish()))
 }
 
+pub fn canonical_marker_bytes(run_root: &Path, marker: &AcceptanceMarker) -> Result<Vec<u8>> {
+    if marker.schema_version != 2 {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "canonical HMAC bytes require marker schema 2, got {}",
+            marker.schema_version
+        )));
+    }
+    let tamper = read_optional_bound_bytes(&crate::tamper::acceptance_tamper_path_for_run_root(
+        run_root,
+    ))?;
+    let campaign_rollup =
+        read_optional_bound_bytes(&crate::campaign::rollup_path_at_run_root(run_root))?;
+    let mut checks = Vec::new();
+    for check in &marker.checks {
+        let bytes = serde_json::to_vec(check).map_err(|source| DeadreckonError::Json {
+            path: marker_path_for_run_root(run_root),
+            source,
+        })?;
+        append_sized_bytes(&mut checks, &bytes)?;
+    }
+
+    let mut bytes = V2_CANONICAL_MAGIC.to_vec();
+    append_canonical_field(
+        &mut bytes,
+        "schema_version",
+        marker.schema_version.to_string().as_bytes(),
+    )?;
+    append_canonical_field(&mut bytes, "run_id", marker.run_id.as_bytes())?;
+    append_canonical_field(&mut bytes, "status", marker.status.as_bytes())?;
+    append_canonical_field(&mut bytes, "produced_by", marker.produced_by.as_bytes())?;
+    append_canonical_field(&mut bytes, "issuer", marker.issuer.as_bytes())?;
+    append_canonical_field(
+        &mut bytes,
+        "proof_kind",
+        marker.proof_kind.canonical_name().as_bytes(),
+    )?;
+    append_canonical_field(
+        &mut bytes,
+        "checked_at",
+        marker.checked_at.to_rfc3339().as_bytes(),
+    )?;
+    append_canonical_field(
+        &mut bytes,
+        "working_dir",
+        marker.working_dir.to_string_lossy().as_bytes(),
+    )?;
+    append_canonical_field(
+        &mut bytes,
+        "contained",
+        if marker.contained { b"true" } else { b"false" },
+    )?;
+    append_canonical_field(
+        &mut bytes,
+        "sandbox_backend",
+        marker.sandbox_backend.as_bytes(),
+    )?;
+    append_canonical_field(
+        &mut bytes,
+        "check_count",
+        marker.check_count.to_string().as_bytes(),
+    )?;
+    append_canonical_field(&mut bytes, "checks", &checks)?;
+    append_canonical_field(&mut bytes, "tamper", &tamper)?;
+    append_canonical_field(&mut bytes, "campaign_rollup", &campaign_rollup)?;
+    Ok(bytes)
+}
+
+pub fn v2_marker_signature(
+    run_root: &Path,
+    marker: &AcceptanceMarker,
+    gate_key: &[u8],
+) -> Result<String> {
+    require_gate_key_length(gate_key)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(gate_key).map_err(|_| {
+        DeadreckonError::InvalidInput("HMAC-SHA-256 refused the gate key".to_string())
+    })?;
+    mac.update(&canonical_marker_bytes(run_root, marker)?);
+    Ok(hex_encode(&mac.finalize().into_bytes()))
+}
+
+pub fn verify_v2_marker_signature(
+    run_root: &Path,
+    marker: &AcceptanceMarker,
+    gate_key: &[u8],
+) -> Result<()> {
+    require_gate_key_length(gate_key)?;
+    let signature = hex_decode(&marker.signature).map_err(|reason| {
+        DeadreckonError::InvalidInput(format!(
+            "acceptance marker signature is invalid: {reason}; forged self-attestation refused"
+        ))
+    })?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(gate_key).map_err(|_| {
+        DeadreckonError::InvalidInput("HMAC-SHA-256 refused the gate key".to_string())
+    })?;
+    mac.update(&canonical_marker_bytes(run_root, marker)?);
+    mac.verify_slice(&signature).map_err(|_| {
+        DeadreckonError::InvalidInput(
+            "acceptance marker signature is invalid; forged self-attestation refused".to_string(),
+        )
+    })
+}
+
+fn require_gate_key_length(gate_key: &[u8]) -> Result<()> {
+    if gate_key.len() != GATE_KEY_BYTES {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "gate key must be {GATE_KEY_BYTES} bytes, got {}",
+            gate_key.len()
+        )));
+    }
+    Ok(())
+}
+
+fn read_optional_bound_bytes(path: &Path) -> Result<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn append_canonical_field(output: &mut Vec<u8>, name: &str, value: &[u8]) -> Result<()> {
+    append_sized_bytes(output, name.as_bytes())?;
+    append_sized_bytes(output, value)
+}
+
+fn append_sized_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    let len = u32::try_from(value.len()).map_err(|_| {
+        DeadreckonError::InvalidInput("acceptance marker field exceeds 4 GiB".to_string())
+    })?;
+    output.extend_from_slice(&len.to_be_bytes());
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn gate_key_file_stem(run_id: &str) -> String {
+    let mut output = String::with_capacity(run_id.len());
+    for byte in run_id.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_') {
+            output.push(char::from(*byte));
+        } else {
+            output.push('%');
+            output.push_str(&hex_encode(&[*byte]));
+        }
+    }
+    output
+}
+
+fn hex_decode(value: &str) -> std::result::Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(2) {
+        return Err("hex value has odd length".to_string());
+    }
+    let mut output = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        output.push((high << 4) | low);
+    }
+    Ok(output)
+}
+
+fn hex_nibble(value: u8) -> std::result::Result<u8, String> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err("hex value contains a non-hex character".to_string()),
+    }
+}
+
+#[cfg(test)]
+fn canonical_marker_field_labels(bytes: &[u8]) -> Result<Vec<String>> {
+    let mut remaining = bytes.strip_prefix(V2_CANONICAL_MAGIC).ok_or_else(|| {
+        DeadreckonError::InvalidInput("canonical marker magic is missing".to_string())
+    })?;
+    let mut labels = Vec::new();
+    while !remaining.is_empty() {
+        let (label, after_label) = take_sized_bytes(remaining)?;
+        let (_, after_value) = take_sized_bytes(after_label)?;
+        labels.push(String::from_utf8(label.to_vec()).map_err(|_| {
+            DeadreckonError::InvalidInput("canonical marker label is not UTF-8".to_string())
+        })?);
+        remaining = after_value;
+    }
+    Ok(labels)
+}
+
+#[cfg(test)]
+fn take_sized_bytes(bytes: &[u8]) -> Result<(&[u8], &[u8])> {
+    let prefix = bytes.get(..4).ok_or_else(|| {
+        DeadreckonError::InvalidInput("canonical marker field is truncated".to_string())
+    })?;
+    let len = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+    let value = bytes.get(4..4 + len).ok_or_else(|| {
+        DeadreckonError::InvalidInput("canonical marker value is truncated".to_string())
+    })?;
+    Ok((value, &bytes[4 + len..]))
+}
+
+#[cfg(test)]
+fn v2_test_marker(run_root: &Path) -> AcceptanceMarker {
+    AcceptanceMarker {
+        schema_version: 2,
+        run_id: "canonical-test".to_string(),
+        status: "pass".to_string(),
+        produced_by: "dr-gate".to_string(),
+        issuer: "dr-gate".to_string(),
+        proof_kind: AcceptanceProofKind::NativeGate,
+        checked_at: DateTime::parse_from_rfc3339("2026-07-29T00:00:00Z")
+            .expect("fixture timestamp")
+            .with_timezone(&Utc),
+        working_dir: run_root.join("working"),
+        contained: true,
+        sandbox_backend: "seatbelt".to_string(),
+        signature: String::new(),
+        check_count: 0,
+        checks: Vec::new(),
+    }
+}
+
 fn default_must_pass() -> bool {
     true
 }
@@ -807,8 +1390,419 @@ mod tests {
     use crate::tamper::{AcceptanceTamperVerdict, read_acceptance_tamper_for_run_root};
 
     use super::{
-        ACCEPTANCE_MARKER, AcceptanceCheckResult, AcceptanceMarker, validate_acceptance_marker,
+        ACCEPTANCE_MARKER, AcceptanceCheckResult, AcceptanceMarker, AcceptanceProofKind,
+        validate_acceptance_marker,
     };
+
+    // ---- Binnacle P1-P4: protected key, cryptographic marker, containment ----
+
+    #[test]
+    fn gate_key_is_written_outside_the_run_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "protected gate key".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("outside-key".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+
+        let key_path = super::gate_key_path(&paths, &state.run_id);
+        assert!(key_path.exists());
+        assert!(!key_path.starts_with(&state.run_root));
+        assert_eq!(
+            super::read_gate_key(&paths, &state.run_id)
+                .expect("key")
+                .len(),
+            32
+        );
+        assert!(!super::gate_nonce_path_for_run_root(&state.run_root).exists());
+    }
+
+    #[test]
+    fn creating_the_same_run_identity_reuses_its_protected_gate_key() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+        let first = super::create_gate_key(&paths, "same-run").expect("first key");
+        let second = super::create_gate_key(&paths, "same-run").expect("reused key");
+
+        assert_eq!(second, first);
+        assert_eq!(
+            super::read_gate_key(&paths, "same-run").expect("stored key"),
+            first
+        );
+    }
+
+    #[test]
+    fn existing_invalid_gate_key_is_never_replaced() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let key_path = super::gate_key_path(&paths, "invalid-existing");
+        std::fs::create_dir_all(key_path.parent().expect("key parent")).expect("key directory");
+        std::fs::write(&key_path, "not-a-key").expect("invalid key fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("private fixture permissions");
+        }
+
+        let error = super::create_gate_key(&paths, "invalid-existing")
+            .expect_err("invalid existing key must fail closed");
+
+        assert!(error.to_string().contains("unreadable"));
+        assert_eq!(
+            std::fs::read_to_string(&key_path).expect("fixture remains"),
+            "not-a-key"
+        );
+    }
+
+    #[test]
+    fn gate_key_path_cannot_escape_the_key_store() {
+        let paths = DeadreckonPaths::from_home("/tmp/deadreckon-home");
+        let path = super::gate_key_path(&paths, "../../outside");
+
+        assert!(path.starts_with(paths.home().join("gate-keys")));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("%2e%2e%2f%2e%2e%2foutside.key")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_key_file_is_owner_read_write_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "private gate key".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("private-key".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+
+        let mode = std::fs::metadata(super::gate_key_path(&paths, &state.run_id))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn missing_gate_key_refuses_validation_rather_than_passing() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "missing key refuses".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("missing-key".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let key = super::read_gate_key(&paths, &state.run_id).expect("key");
+        super::write_native_acceptance_marker_with_results_and_key(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            Vec::new(),
+            &key,
+            super::AcceptanceContainment::uncontained("none"),
+        )
+        .expect("marker");
+        std::fs::remove_file(super::gate_key_path(&paths, &state.run_id)).expect("remove key");
+
+        let err = validate_acceptance_marker(&state).expect_err("missing key refuses");
+        assert!(err.to_string().contains("missing"), "{err}");
+        assert!(err.to_string().contains("deadreckon verdict"), "{err}");
+    }
+
+    #[test]
+    fn v2_marker_signature_is_hmac_sha256_over_the_canonical_bytes() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "hmac marker".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "seatbelt".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("hmac-marker".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let key = super::read_gate_key(&paths, &state.run_id).expect("key");
+        let marker = super::write_native_acceptance_marker_with_results_and_key(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            Vec::new(),
+            &key,
+            super::AcceptanceContainment::contained("seatbelt"),
+        )
+        .expect("marker");
+
+        assert_eq!(marker.schema_version, 2);
+        assert_eq!(marker.signature.len(), 64);
+        assert_eq!(
+            marker.signature,
+            super::v2_marker_signature(&state.run_root, &marker, &key).expect("signature")
+        );
+        validate_acceptance_marker(&state).expect("marker validates");
+    }
+
+    #[test]
+    fn v1_marker_still_validates_through_the_legacy_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "legacy receipt".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("legacy-marker".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(
+            super::gate_nonce_path_for_run_root(&state.run_root),
+            "legacy-secret",
+        )
+        .expect("legacy nonce");
+        let mut marker = AcceptanceMarker {
+            schema_version: 1,
+            run_id: state.run_id.clone(),
+            status: "pass".to_string(),
+            produced_by: "dr-gate".to_string(),
+            issuer: String::new(),
+            proof_kind: AcceptanceProofKind::LegacyUnknown,
+            checked_at: Utc::now(),
+            working_dir: state.working_dir.clone(),
+            contained: false,
+            sandbox_backend: String::new(),
+            signature: String::new(),
+            check_count: 0,
+            checks: Vec::new(),
+        };
+        marker.signature =
+            super::legacy_marker_signature(&state.run_root, &marker).expect("legacy signature");
+        let path = super::marker_path(&state);
+        std::fs::create_dir_all(path.parent().expect("proofs")).expect("proofs");
+        std::fs::write(&path, serde_json::to_vec_pretty(&marker).expect("json")).expect("marker");
+
+        let validated = validate_acceptance_marker(&state).expect("legacy validates");
+        assert_eq!(
+            validated.signature_strength(),
+            super::AcceptanceSignatureStrength::LegacyWeak
+        );
+        assert!(!validated.is_native_gate_proof());
+    }
+
+    #[test]
+    fn v1_marker_is_reported_as_legacy_not_verified() {
+        let mut marker = super::v2_test_marker(std::path::Path::new("/tmp/legacy-strength"));
+        marker.schema_version = 1;
+        marker.issuer.clear();
+        marker.proof_kind = AcceptanceProofKind::LegacyUnknown;
+
+        assert_eq!(
+            marker.signature_strength(),
+            super::AcceptanceSignatureStrength::LegacyWeak
+        );
+        assert!(!marker.is_native_gate_proof());
+    }
+
+    #[test]
+    fn signature_comparison_is_constant_time() {
+        let temp = TempDir::new().expect("tempdir");
+        let marker = super::v2_test_marker(temp.path());
+        let key = [7_u8; 32];
+        let valid = super::v2_marker_signature(temp.path(), &marker, &key).expect("signature");
+        let mut invalid = super::hex_decode(&valid).expect("hex");
+        invalid[31] ^= 1;
+        let mut tampered = marker;
+        tampered.signature = super::hex_encode(&invalid);
+
+        let err = super::verify_v2_marker_signature(temp.path(), &tampered, &key)
+            .expect_err("hmac verify rejects");
+        assert!(err.to_string().contains("signature is invalid"), "{err}");
+    }
+
+    #[test]
+    fn marker_bytes_are_canonical_and_field_order_is_pinned() {
+        let temp = TempDir::new().expect("tempdir");
+        let marker = super::v2_test_marker(temp.path());
+        let canonical =
+            super::canonical_marker_bytes(temp.path(), &marker).expect("canonical bytes");
+        let labels = super::canonical_marker_field_labels(&canonical).expect("labels");
+        assert_eq!(
+            labels,
+            [
+                "schema_version",
+                "run_id",
+                "status",
+                "produced_by",
+                "issuer",
+                "proof_kind",
+                "checked_at",
+                "working_dir",
+                "contained",
+                "sandbox_backend",
+                "check_count",
+                "checks",
+                "tamper",
+                "campaign_rollup",
+            ]
+        );
+    }
+
+    #[test]
+    fn editing_contained_after_signing_invalidates_the_marker() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "containment is authority".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "seatbelt".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("containment-bound".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let key = super::read_gate_key(&paths, &state.run_id).expect("key");
+        let mut marker = super::write_native_acceptance_marker_with_results_and_key(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            Vec::new(),
+            &key,
+            super::AcceptanceContainment::contained("seatbelt"),
+        )
+        .expect("marker");
+        marker.contained = false;
+        std::fs::write(
+            super::marker_path(&state),
+            serde_json::to_vec_pretty(&marker).expect("json"),
+        )
+        .expect("rewrite");
+
+        let err = validate_acceptance_marker(&state).expect_err("containment edit rejected");
+        assert!(err.to_string().contains("signature"), "{err}");
+    }
+
+    #[test]
+    fn marker_records_the_resolved_backend_not_the_requested_one() {
+        let temp = TempDir::new().expect("tempdir");
+        let marker = super::write_native_acceptance_marker_with_results_and_key(
+            temp.path(),
+            "resolved-backend".to_string(),
+            temp.path().join("working"),
+            Vec::new(),
+            &[9_u8; 32],
+            super::AcceptanceContainment::contained("sandbox-exec"),
+        )
+        .expect("marker");
+
+        assert!(marker.contained);
+        assert_eq!(marker.sandbox_backend, "sandbox-exec");
+    }
+
+    #[test]
+    fn sandbox_fallback_to_none_records_contained_false() {
+        let temp = TempDir::new().expect("tempdir");
+        let marker = super::write_native_acceptance_marker_with_results_and_key(
+            temp.path(),
+            "fallback-none".to_string(),
+            temp.path().join("working"),
+            Vec::new(),
+            &[11_u8; 32],
+            super::AcceptanceContainment::uncontained("none"),
+        )
+        .expect("marker");
+
+        assert!(!marker.contained);
+        assert_eq!(marker.sandbox_backend, "none");
+    }
+
+    #[test]
+    fn synthetic_marker_is_not_native_gate_proof() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "synthetic controller result".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("synthetic-proof".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let marker = super::write_acceptance_marker(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            1,
+        )
+        .expect("synthetic marker");
+
+        assert_eq!(
+            marker.proof_kind,
+            super::AcceptanceProofKind::SyntheticController
+        );
+        assert!(!marker.is_native_gate_proof());
+    }
 
     // ---- P5: detection wired into compiled_acceptance_checks + spec persisted ----
 
@@ -936,6 +1930,19 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_subprocesses_cannot_inherit_the_gate_key() {
+        let command = super::gate_check_command("sh");
+        let removed = command
+            .get_envs()
+            .filter_map(|(name, value)| value.is_none().then_some(name))
+            .collect::<Vec<_>>();
+
+        assert!(removed.contains(&std::ffi::OsStr::new(super::GATE_KEY_ENV)));
+        assert!(removed.contains(&std::ffi::OsStr::new(super::GATE_CONTAINED_ENV)));
+        assert!(removed.contains(&std::ffi::OsStr::new(super::GATE_SANDBOX_BACKEND_ENV)));
+    }
+
+    #[test]
     fn rejects_agent_written_marker_with_wrong_run_id() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -961,8 +1968,12 @@ mod tests {
             run_id: "wrong-run".to_string(),
             status: "pass".to_string(),
             produced_by: "agent".to_string(),
+            issuer: String::new(),
+            proof_kind: AcceptanceProofKind::LegacyUnknown,
             checked_at: Utc::now(),
             working_dir: state.working_dir.clone(),
+            contained: false,
+            sandbox_backend: String::new(),
             signature: "forged".to_string(),
             check_count: 0,
             checks: Vec::new(),
@@ -1586,6 +2597,11 @@ checks:
             },
         )
         .expect("run");
+        std::fs::write(
+            super::gate_nonce_path_for_run_root(&state.run_root),
+            "legacy-self-attest-secret",
+        )
+        .expect("legacy nonce");
         let proofs = state.run_root.join("proofs");
         std::fs::create_dir_all(&proofs).expect("proofs");
         let marker = AcceptanceMarker {
@@ -1593,8 +2609,12 @@ checks:
             run_id: state.run_id.clone(),
             status: "pass".to_string(),
             produced_by: "dr-gate".to_string(),
+            issuer: String::new(),
+            proof_kind: AcceptanceProofKind::LegacyUnknown,
             checked_at: Utc::now(),
             working_dir: state.working_dir.clone(),
+            contained: false,
+            sandbox_backend: String::new(),
             signature: "agent-forged".to_string(),
             check_count: 1,
             checks: Vec::new(),

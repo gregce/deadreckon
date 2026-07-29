@@ -32,6 +32,7 @@ deadreckon-runtime = { path = "crates/deadreckon-runtime" }
 deadreckon-sandbox = { path = "crates/deadreckon-sandbox" }
 fs2 = "0.4.3"
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+hmac = "0.12.1"
 ignore = "0.4.25"
 nix = { version = "0.30.1", features = ["signal", "process"] }
 pulldown-cmark = "0.13.0"

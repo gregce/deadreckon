@@ -1,13 +1,51 @@
 use super::super::*;
 
+pub(crate) const TRUSTED_SUPERVISOR_JOB_ID_ENV: &str = "DEADRECKON_SUPERVISOR_JOB_ID";
+pub(crate) const TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV: &str = "DEADRECKON_SUPERVISOR_LAUNCH_PLAN";
+
+fn trusted_supervisor_run_id(requested: Option<String>) -> Result<Option<String>> {
+    let Some(run_id) = requested else {
+        return Ok(None);
+    };
+    let trusted = std::env::var(TRUSTED_SUPERVISOR_JOB_ID_ENV).map_err(|_| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "--run-id is reserved for trusted supervisor launches".to_string(),
+        ))
+    })?;
+    if trusted != run_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "trusted supervisor job id does not match --run-id".to_string(),
+        )));
+    }
+    if run_id.len() != 32 || !run_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "trusted supervisor job id must be exactly 32 hexadecimal characters".to_string(),
+        )));
+    }
+    Ok(Some(run_id))
+}
+
 /// Direct `deadreckon run`: a trivial operator plan records the decision so
 /// every run root carries `launch-plan.json`, however the launch began.
 pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
-    let plan = commands::course::trivial_operator_plan(
-        &args.goal,
-        commands::course::CourseShape::Single,
-        "run",
-    );
+    let plan = if args.run_id.is_some() {
+        let path = std::env::var_os(TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "trusted supervisor launch is missing its immutable launch-plan path"
+                        .to_string(),
+                ))
+            })?;
+        commands::course::load_launch_plan(&path)?
+    } else {
+        commands::course::trivial_operator_plan(
+            &args.goal,
+            commands::course::CourseShape::Single,
+            "run",
+        )
+    };
     run_command_with_launch_plan(args, plan).await
 }
 
@@ -20,6 +58,7 @@ pub(crate) async fn run_command_with_launch_plan(
 ) -> Result<()> {
     let RunCommandArgs {
         goal,
+        run_id: requested_run_id,
         tamper_baseline,
         fresh,
         worktree,
@@ -55,6 +94,7 @@ pub(crate) async fn run_command_with_launch_plan(
         narrator_model,
         infer_contract,
     } = args;
+    let requested_run_id = trusted_supervisor_run_id(requested_run_id)?;
     if let Err(message) = crate::narrator::validate_narration_flags(narrate, no_narrate) {
         return Err(CliError::Core(DeadreckonError::InvalidInput(message)));
     }
@@ -198,7 +238,7 @@ pub(crate) async fn run_command_with_launch_plan(
     if init_git {
         init_git_repo(&cwd)?;
     }
-    let run_id = Uuid::new_v4().simple().to_string();
+    let run_id = requested_run_id.unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     let mut mode_flags = ModeFlags {
         fresh,
         worktree,

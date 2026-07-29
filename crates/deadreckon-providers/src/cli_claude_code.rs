@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use deadreckon_sandbox::WorkspaceAccess;
 use serde_json::json;
 use which::which;
 
@@ -47,11 +48,21 @@ impl CliClaudeCodeProvider {
         caps: &crate::claude_events::ClaudeCapabilities,
         resume_id: Option<&str>,
     ) -> Vec<String> {
-        let mut args = self.extra_args.clone();
+        let mut args = if request.workspace_access == WorkspaceAccess::ReadOnly {
+            self.extra_args
+                .iter()
+                .filter(|arg| arg.as_str() != "--dangerously-skip-permissions")
+                .cloned()
+                .collect()
+        } else {
+            self.extra_args.clone()
+        };
         if let Some(model) = self.model_arg.as_deref() {
             args.extend(["--model".to_string(), model.to_string()]);
         }
-        args.push("--dangerously-skip-permissions".to_string());
+        if request.workspace_access == WorkspaceAccess::ReadWrite {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
         if caps.stream_json {
             args.extend([
                 "--output-format".to_string(),
@@ -82,6 +93,8 @@ impl CliClaudeCodeProvider {
             request.sandbox_backend,
             request.pid_file.clone(),
             request.cancellation_token.clone(),
+            request.workspace_access,
+            false,
         )
         .await?;
         Ok(ClaudeAttempt { output, args })
@@ -89,7 +102,9 @@ impl CliClaudeCodeProvider {
 
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let caps = probe_claude_capabilities(&self.binary);
-        let session_dir = request.session_dir.clone();
+        let session_dir = (request.workspace_access == WorkspaceAccess::ReadWrite)
+            .then(|| request.session_dir.clone())
+            .flatten();
         let session = session_dir
             .as_deref()
             .and_then(|dir| ProviderSession::read(dir, PROVIDER_ID_CLAUDE));
@@ -158,6 +173,7 @@ impl CliClaudeCodeProvider {
             "duration_ms": (wall * 1000.0).round() as u64,
             "exit_code": output.status_code,
             "pid": output.pid,
+            "workspace_access": request.workspace_access.as_str(),
             "sandbox_backend": output.sandbox_backend,
             "sandbox_warning": output.sandbox_warning,
             "contract": {
@@ -275,5 +291,60 @@ impl WithWallTime for SpendEstimate {
     fn with_wall_time(mut self, seconds: f64) -> Self {
         self.wall_time_seconds = Some(seconds);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliClaudeCodeProvider;
+    use crate::claude_events::ClaudeCapabilities;
+    use crate::{ProviderEntry, ProviderRequest};
+    use deadreckon_sandbox::WorkspaceAccess;
+
+    fn provider() -> CliClaudeCodeProvider {
+        CliClaudeCodeProvider::new(
+            "cli:claude-code",
+            ProviderEntry {
+                kind: None,
+                api_key: None,
+                api_key_env: None,
+                base_url: None,
+                model: None,
+                input_cost_per_million: None,
+                output_cost_per_million: None,
+                binary: Some("claude".to_string()),
+                extra_args: vec!["--dangerously-skip-permissions".to_string()],
+            },
+        )
+    }
+
+    #[test]
+    fn read_only_claude_never_skips_permissions() {
+        let args = provider().build_args(
+            &ProviderRequest {
+                workspace_access: WorkspaceAccess::ReadOnly,
+                ..ProviderRequest::default()
+            },
+            &ClaudeCapabilities::none(),
+            None,
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
+    }
+
+    #[test]
+    fn worker_claude_keeps_legacy_permission_posture() {
+        let args = provider().build_args(
+            &ProviderRequest::default(),
+            &ClaudeCapabilities::none(),
+            None,
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
     }
 }

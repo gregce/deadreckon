@@ -377,6 +377,7 @@ impl NarratorEngine {
                 cwd: None,
                 output_path: None,
                 sandbox_backend: None,
+                workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
                 pid_file: None,
                 // Interruptible: a shutdown cancel aborts the in-flight beat call
                 // so emit() falls through to a floor beat instead of the task

@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use deadreckon_sandbox::WorkspaceAccess;
 use serde_json::json;
 
 use crate::{
@@ -69,6 +70,42 @@ impl Provider for ScriptedSmokeProvider {
 
     fn complete<'a>(&'a self, request: &'a ProviderRequest) -> ProviderFuture<'a> {
         Box::pin(async move {
+            if request.workspace_access == WorkspaceAccess::ReadOnly
+                && request.output_schema.is_some()
+            {
+                let content = json!({
+                    "decision": "achieved",
+                    "summary": "the deterministic smoke result satisfies the approved fixture goal",
+                    "goal_coverage": [{
+                        "claim": "approved smoke goal",
+                        "status": "met",
+                        "evidence": [
+                            "approved-goal",
+                            "approved-contract",
+                            "source-diff",
+                            "deterministic-gate"
+                        ]
+                    }],
+                    "missing": []
+                })
+                .to_string();
+                let usage = ProviderUsage {
+                    input_tokens: (request.prompt.len() / 4) as u64,
+                    output_tokens: (content.len() / 4) as u64,
+                };
+                return Ok(ProviderResponse {
+                    provider: self.name().to_string(),
+                    model: self.model().to_string(),
+                    content,
+                    usage: usage.clone(),
+                    spend: self.estimate_spend(usage),
+                    trace: json!({
+                        "kind": "scripted_smoke_semantic_judge",
+                        "workspace_access": "read_only",
+                        "session": false,
+                    }),
+                });
+            }
             let (content, remaining_steps) = {
                 let mut responses = self.responses.lock().map_err(|_| ProviderError::Cli {
                     provider: self.name().to_string(),
@@ -99,5 +136,33 @@ impl Provider for ScriptedSmokeProvider {
                 }),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use deadreckon_sandbox::WorkspaceAccess;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn semantic_smoke_response_is_read_only_and_does_not_consume_worker_steps() {
+        let provider = ScriptedSmokeProvider::new();
+        let semantic = provider
+            .complete(&ProviderRequest {
+                workspace_access: WorkspaceAccess::ReadOnly,
+                output_schema: Some(json!({ "type": "object" })),
+                ..ProviderRequest::default()
+            })
+            .await
+            .expect("semantic response");
+        assert!(semantic.content.contains("\"decision\":\"achieved\""));
+        assert_eq!(semantic.trace["workspace_access"], "read_only");
+
+        let worker = provider
+            .complete(&ProviderRequest::default())
+            .await
+            .expect("worker response");
+        assert!(worker.content.contains("\"tool_call_id\":\"smoke-bash-1\""));
     }
 }

@@ -498,6 +498,7 @@ async fn provider_course_plan(
         cwd: Some(cwd.to_path_buf()),
         output_path: None,
         sandbox_backend: None,
+        workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
         pid_file: None,
         cancellation_token: None,
         session_dir: None,
@@ -2787,6 +2788,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         // machine envelope carrying the plan and what actually launched.
         let before_runs = start_run_ids(&paths)?;
         let before_plans = start_plan_ids(&paths)?;
+        let before_jobs = start_job_ids(&paths)?;
         let goal = decision.goal.clone();
         let mode_label = decision.selected_mode.label().to_string();
         let mut quiet_args = args;
@@ -2799,6 +2801,11 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         if let Some(plan_entry) = newest_start_plan(&paths, &before_plans, &goal)? {
             dispatched_ids.push(plan_entry.plan_id);
         }
+        if let Some(job_id) = newest_start_job_id(&paths, &before_jobs, &goal)?
+            && !dispatched_ids.iter().any(|id| id == &job_id)
+        {
+            dispatched_ids.insert(0, job_id);
+        }
         let next_actions: Vec<String> = dispatched_ids
             .first()
             .map(|id| {
@@ -2808,6 +2815,8 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
                 ]
             })
             .unwrap_or_default();
+        let (process_durability, machine_restart_durability) =
+            commands::supervisor_service::guided_durability_labels();
         let envelope = json!({
             "kind": "launch",
             "goal": goal,
@@ -2815,6 +2824,10 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             "plan": &launch_plan,
             "done_contract": start_done_contract_json(&decision),
             "dispatched": { "mode": mode_label, "ids": dispatched_ids },
+            "durability": {
+                "process": process_durability,
+                "machine_restart": machine_restart_durability,
+            },
             "next_actions": next_actions,
         });
         println!("{}", serde_json::to_string_pretty(&envelope)?);
@@ -2870,296 +2883,230 @@ async fn dispatch_start_command(
     match decision.selected_mode {
         StartSelectedMode::Run => {
             let paths = DeadreckonPaths::discover();
-            let before = start_run_ids(&paths)?;
-            let goal = args.goal.clone();
-            let quiet = args.quiet;
-            let auto_confirm = args.yes || args.quiet || decision.confirmed_by_start_picker;
-            let result = commands::run::run_command_with_launch_plan(
-                RunCommandArgs {
-                    goal: args.goal,
-                    tamper_baseline: None,
-                    fresh: args.fresh || decision.source_fresh,
-                    worktree: args.worktree || decision.source_worktree,
-                    from: args.from.or_else(|| decision.source_from.clone()),
-                    in_place: false,
-                    base: None,
-                    branch: None,
-                    allow_dirty: args.allow_dirty || decision.source_allow_dirty,
-                    init_git: decision.source_init_git,
-                    yes: auto_confirm,
-                    preview: false,
-                    brief: false,
-                    no_seams: args.no_seams,
-                    plain: args.plain,
-                    prevent_sleep: None,
-                    quiet: args.quiet,
-                    max_spend: args.max_spend,
-                    max_wall_seconds: None,
-                    sandbox: None,
-                    provider: decision.provider_route.clone(),
-                    model: decision.model.clone().or_else(|| args.model.clone()),
-                    doc_provider: None,
-                    acceptance: None,
-                    skill: "deadreckon".to_string(),
-                    smoke: false,
-                    i_know_its_a_lot: false,
-                    no_confirm: auto_confirm
-                        || matches!(decision.done_action, StartDoneAction::DefaultGate),
-                    no_hints: args.quiet,
-                    no_docs: false,
-                    doc_skill: None,
-                    narrate: false,
-                    no_narrate: false,
-                    narrator_model: None,
-                    infer_contract: false,
+            let cwd = std::env::current_dir()?;
+            let defaults = config_defaults(&paths)?;
+            let max_spend_usd = args.max_spend.or(defaults.max_spend).unwrap_or(10.0);
+            let max_wall_seconds =
+                defaults.cli_max_wall_seconds.unwrap_or(36_000.0).max(1.0) as u64;
+            let sandbox_requested = defaults.sandbox.unwrap_or_else(|| "auto".to_string());
+            let source = commands::job::DurableSource {
+                mode: match decision.source_mode {
+                    StartSourceMode::Worktree => commands::job::DurableSourceMode::Worktree,
+                    StartSourceMode::Copy => commands::job::DurableSourceMode::Copy,
+                    StartSourceMode::Fresh => commands::job::DurableSourceMode::Fresh,
+                    StartSourceMode::InitGit => commands::job::DurableSourceMode::InitGit,
+                    StartSourceMode::ParentArtifact | StartSourceMode::Missing => {
+                        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                            "durable start cannot freeze source mode {}",
+                            decision.source_mode.label()
+                        ))));
+                    }
                 },
+                from: decision.source_from.clone().or(args.from),
+                allow_dirty: args.allow_dirty || decision.source_allow_dirty,
+            };
+            let accepted_by = if launch_plan.accepted_by.as_deref() == Some("yes-flag-guardrail") {
+                deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+            } else {
+                deadreckon_protocol::AuthorityAcceptedBy::Operator
+            };
+            let job = commands::job::create_job(commands::job::CreateJob {
+                paths: &paths,
+                source_cwd: &cwd,
+                scope: workspace_scope(&cwd)?,
                 launch_plan,
-            )
-            .await;
-            if result.is_ok()
-                && !quiet
-                && let Some(run) = newest_start_run(&paths, &before, &goal)?
-            {
-                print_start_lifecycle_footer("run", &run.run_id, run_launch_state(run.status));
-                maybe_start_attach(&run.run_id, &args_snapshot).await;
+                shape: deadreckon_protocol::JobShape::Single,
+                driver: None,
+                contract_source: decision
+                    .done_contract
+                    .as_ref()
+                    .map(|contract| contract.source_path.as_path()),
+                source,
+                max_spend_usd,
+                max_wall_seconds,
+                max_attempts: 3,
+                sandbox_requested,
+                accepted_by,
+            })?;
+            commands::job::launch_detached_supervisor(&paths, &job.job_id)?;
+            if !args.quiet {
+                print_start_lifecycle_footer(
+                    "job",
+                    job.job_id.as_ref(),
+                    StartLaunchState::InFlight,
+                );
             }
-            result
+            if !args_snapshot.json {
+                maybe_start_attach(job.job_id.as_ref(), &args_snapshot).await;
+            }
+            Ok(())
         }
         StartSelectedMode::Extend => {
-            if start_source_flags_present(&args) {
-                return Err(CliError::Core(deadreckon_core::user_error(
-                    "source mode flags are not used when start extends prior history",
-                    "omit source flags or use deadreckon extend directly",
-                )));
-            }
-            let parent_run_id = decision.base_run_id.clone().ok_or_else(|| {
-                CliError::Core(deadreckon_core::user_error(
-                    "guided start did not select a parent run to extend",
-                    "deadreckon list",
-                ))
-            })?;
-            let paths = DeadreckonPaths::discover();
-            let before = start_run_ids(&paths)?;
-            let goal = args.goal.clone();
-            let quiet = args.quiet;
-            let result = super::lifecycle::extend_command(ExtendCommandArgs {
-                parent_run_id,
-                new_goal: args.goal,
-                dest: None,
-                max_context_turns: None,
-                no_context: false,
-                max_spend: args.max_spend,
-                max_wall_seconds: None,
-                provider: decision.provider_route.clone(),
-                model: decision.model.clone().or_else(|| args.model.clone()),
-                sandbox: None,
-                no_docs: false,
-                doc_skill: None,
-                post_actions: !args.quiet,
-                narrate: false,
-                no_narrate: false,
-                narrator_model: None,
-            })
-            .await;
-            if result.is_ok()
-                && let Some(run) = newest_start_run(&paths, &before, &goal)?
-            {
-                if let Some(root) = run.state_path.parent() {
-                    commands::course::save_launch_plan_best_effort(root, &launch_plan);
-                }
-                if !quiet {
-                    print_start_lifecycle_footer("run", &run.run_id, run_launch_state(run.status));
-                    maybe_start_attach(&run.run_id, &args_snapshot).await;
-                }
-            }
-            result
+            // `extend` still owns a process-bound parent-artifact state
+            // machine. Pretending that it is a durable Single Job would bind
+            // authority to the current checkout while the child actually
+            // starts from a promoted parent artifact. Refuse before either
+            // state machine writes anything and give the exact compatibility
+            // command instead.
+            let _ = (args, args_snapshot, launch_plan);
+            Err(guided_extend_requires_explicit_legacy_command(decision))
         }
         StartSelectedMode::Campaign => {
-            if start_source_flags_present(&args)
-                || decision.source_fresh
-                || decision.source_from.is_some()
-                || decision.source_allow_dirty
-            {
-                return Err(CliError::Core(deadreckon_core::user_error(
-                    "source mode flags are only supported by start --mode run",
-                    "omit source flags or use deadreckon campaign directly",
-                )));
-            }
-            let paths = DeadreckonPaths::discover();
-            let before = start_plan_ids(&paths)?;
-            let goal = args.goal.clone();
-            let quiet = args.quiet;
-            let provider_route = decision.provider_route.clone();
-            let planner_provider = decision
-                .planner_provider_route
-                .clone()
-                .or_else(|| provider_route.clone());
-            let child_provider = decision
-                .child_provider_route
-                .clone()
-                .or_else(|| provider_route.clone());
-            let result = commands::campaign::campaign_command(commands::campaign::CampaignArgs {
-                goal: args.goal,
-                n: decision.child_count,
-                planner_provider,
-                provider: child_provider,
-                planner_model: None,
-                model: args.model.clone(),
-                max_spend: args.max_spend,
-                max_wall_seconds: None,
-                sandbox: None,
-                preview: false,
-                yes: args.yes || args.quiet || decision.confirmed_by_start_picker,
-                no_hints: args.quiet,
-                quiet: args.quiet,
-                plain: args.plain,
-                narrate: false,
-                no_narrate: false,
-                narrator_model: None,
-            })
-            .await;
-            if result.is_ok()
-                && let Some(plan) = newest_start_plan(&paths, &before, &goal)?
-            {
-                commands::course::save_launch_plan_best_effort(
-                    &paths.plan_dir(&plan.plan_id),
-                    &launch_plan,
-                );
-                if !quiet {
-                    print_start_lifecycle_footer(
-                        "campaign",
-                        &plan.plan_id,
-                        plan_launch_state(&plan),
-                    );
-                    maybe_start_attach(&plan.plan_id, &args_snapshot).await;
-                }
-            }
-            result
+            dispatch_advanced_start_job(
+                args,
+                decision,
+                launch_plan,
+                args_snapshot,
+                commands::graph_job::DriverKind::Campaign,
+            )
+            .await
         }
         StartSelectedMode::Review | StartSelectedMode::FullPlan => {
-            if start_source_flags_present(&args)
-                || decision.source_fresh
-                || decision.source_from.is_some()
-                || decision.source_allow_dirty
-            {
-                return Err(CliError::Core(deadreckon_core::user_error(
-                    "source mode flags are only supported by start --mode run",
-                    "omit source flags or use deadreckon run directly",
-                )));
-            }
-            let paths = DeadreckonPaths::discover();
-            let before = start_plan_ids(&paths)?;
-            let goal = args.goal.clone();
-            let quiet = args.quiet;
-            let mode = match decision.selected_mode {
-                StartSelectedMode::Extend
-                | StartSelectedMode::Run
-                | StartSelectedMode::Campaign => {
-                    unreachable!("run, extend, and campaign handled above")
-                }
-                StartSelectedMode::Review => CliPlanMode::Review,
-                StartSelectedMode::FullPlan => CliPlanMode::FullPlan,
+            let kind = match decision.selected_mode {
+                StartSelectedMode::Review => commands::graph_job::DriverKind::Review,
+                StartSelectedMode::FullPlan => commands::graph_job::DriverKind::FullPlan,
+                StartSelectedMode::Run
+                | StartSelectedMode::Extend
+                | StartSelectedMode::Campaign => unreachable!("handled above"),
             };
-            let auto_confirm = args.yes || args.quiet || decision.confirmed_by_start_picker;
-            let provider_route = decision.provider_route.clone();
-            let planner_provider = decision
-                .planner_provider_route
-                .clone()
-                .or_else(|| provider_route.clone());
-            let child_provider = decision
-                .child_provider_route
-                .clone()
-                .or_else(|| provider_route.clone());
-            let coder_provider = decision
-                .coder_provider_route
-                .clone()
-                .or_else(|| provider_route.clone());
-            let reviewer_provider = decision.reviewer_provider_route.clone().or(provider_route);
-            let result = commands::orchestrate::orchestrate_command(
-                commands::orchestrate::OrchestrateRunArgs {
-                    // The classifier already drew this graph; plan creation
-                    // uses it rather than asking a second planner.
-                    seed_pieces: decision
-                        .goal_shape
-                        .as_ref()
-                        .map(|shape| shape.pieces.clone())
-                        .unwrap_or_default(),
-                    plan: PlanCommandArgs {
-                        goal: args.goal,
-                        apply: decision
-                            .goal_shape
-                            .as_ref()
-                            .map(|shape| shape.apply)
-                            .unwrap_or_default(),
-                        n: decision.child_count.unwrap_or_else(|| {
-                            commands::orchestrate::recommend_child_count_for_goal(
-                                &decision.goal,
-                                mode,
-                            )
-                        }),
-                        mode,
-                        max_spend: args.max_spend,
-                        max_wall_seconds: None,
-                        sandbox: None,
-                        planner_provider: if mode == CliPlanMode::FullPlan {
-                            planner_provider
-                        } else {
-                            None
-                        },
-                        provider: if mode == CliPlanMode::FullPlan {
-                            child_provider
-                        } else {
-                            None
-                        },
-                        child_provider: decision.child_provider_overrides.clone(),
-                        coder_provider: if mode == CliPlanMode::Review {
-                            coder_provider
-                        } else {
-                            None
-                        },
-                        reviewer_provider: if mode == CliPlanMode::Review {
-                            reviewer_provider
-                        } else {
-                            None
-                        },
-                        planner_model: None,
-                        model: args.model.clone(),
-                        child_model: Vec::new(),
-                        coder_model: None,
-                        reviewer_model: None,
-                        init_git: decision.source_init_git,
-                        acceptance: None,
-                        skip_acceptance_prompt: auto_confirm
-                            || matches!(decision.done_action, StartDoneAction::DefaultGate),
-                        no_hints: args.quiet,
-                        quiet: args.quiet,
-                        json: false,
-                        plain: args.plain,
-                    },
-                    preview: false,
-                    yes: auto_confirm,
-                    no_repair: false,
-                    completion_surface: false,
-                    narrate: false,
-                    narrator_model: None,
-                },
-            )
-            .await;
-            if result.is_ok()
-                && let Some(plan) = newest_start_plan(&paths, &before, &goal)?
-            {
-                commands::course::save_launch_plan_best_effort(
-                    &paths.plan_dir(&plan.plan_id),
-                    &launch_plan,
-                );
-                if !quiet {
-                    print_start_lifecycle_footer("plan", &plan.plan_id, plan_launch_state(&plan));
-                    maybe_start_attach(&plan.plan_id, &args_snapshot).await;
-                }
-            }
-            result
+            dispatch_advanced_start_job(args, decision, launch_plan, args_snapshot, kind).await
         }
     }
+}
+
+fn guided_extend_requires_explicit_legacy_command(decision: &StartLaunchDecision) -> CliError {
+    let command = decision.base_run_id.as_ref().map_or_else(
+        || "deadreckon list".to_string(),
+        |parent| {
+            format!(
+                "deadreckon extend {} \"{}\"",
+                run_prefix(parent),
+                shell_display_quote(&decision.goal)
+            )
+        },
+    );
+    CliError::Core(deadreckon_core::user_error(
+        "guided start cannot durably continue a parent artifact yet; no work was started",
+        &command,
+    ))
+}
+
+async fn dispatch_advanced_start_job(
+    args: StartCommandArgs,
+    decision: &StartLaunchDecision,
+    launch_plan: commands::course::LaunchPlan,
+    attach_flags: StartAttachFlags,
+    kind: commands::graph_job::DriverKind,
+) -> Result<()> {
+    if start_source_flags_present(&args)
+        || decision.source_fresh
+        || decision.source_from.is_some()
+        || decision.source_allow_dirty
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "source mode flags are only supported by start --mode run",
+            "omit source flags; graph jobs isolate their child workspaces internally",
+        )));
+    }
+    let paths = DeadreckonPaths::discover();
+    let cwd = std::env::current_dir()?;
+    let defaults = config_defaults(&paths)?;
+    let max_spend_usd = args.max_spend.or(defaults.max_spend).unwrap_or(10.0);
+    let max_wall_seconds = defaults.cli_max_wall_seconds.unwrap_or(36_000.0).max(1.0) as u64;
+    let sandbox_requested = defaults.sandbox.unwrap_or_else(|| "auto".to_string());
+    let provider_route = decision.provider_route.clone();
+    let graph = matches!(
+        kind,
+        commands::graph_job::DriverKind::Review | commands::graph_job::DriverKind::FullPlan
+    );
+    let review = kind == commands::graph_job::DriverKind::Review;
+    let driver = commands::graph_job::DriverSpec {
+        kind,
+        child_count: decision.child_count,
+        apply: decision
+            .goal_shape
+            .as_ref()
+            .map(|shape| shape.apply)
+            .unwrap_or_default(),
+        planner_provider: (!review)
+            .then(|| {
+                decision
+                    .planner_provider_route
+                    .clone()
+                    .or_else(|| provider_route.clone())
+            })
+            .flatten(),
+        child_provider: (!review)
+            .then(|| {
+                decision
+                    .child_provider_route
+                    .clone()
+                    .or_else(|| provider_route.clone())
+            })
+            .flatten(),
+        child_provider_overrides: decision.child_provider_overrides.clone(),
+        coder_provider: review
+            .then(|| {
+                decision
+                    .coder_provider_route
+                    .clone()
+                    .or_else(|| provider_route.clone())
+            })
+            .flatten(),
+        reviewer_provider: review
+            .then(|| {
+                decision
+                    .reviewer_provider_route
+                    .clone()
+                    .or_else(|| provider_route.clone())
+            })
+            .flatten(),
+        model: decision.model.clone().or_else(|| args.model.clone()),
+        source_init_git: decision.source_init_git,
+    };
+    let accepted_by = if launch_plan.accepted_by.as_deref() == Some("yes-flag-guardrail") {
+        deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+    } else {
+        deadreckon_protocol::AuthorityAcceptedBy::Operator
+    };
+    let job = commands::job::create_job(commands::job::CreateJob {
+        paths: &paths,
+        source_cwd: &cwd,
+        scope: workspace_scope(&cwd)?,
+        launch_plan,
+        shape: if graph {
+            deadreckon_protocol::JobShape::Graph
+        } else {
+            deadreckon_protocol::JobShape::LegacyCampaign
+        },
+        driver: Some(driver),
+        contract_source: decision
+            .done_contract
+            .as_ref()
+            .map(|contract| contract.source_path.as_path()),
+        source: commands::job::DurableSource {
+            mode: if decision.source_init_git {
+                commands::job::DurableSourceMode::InitGit
+            } else {
+                commands::job::DurableSourceMode::Worktree
+            },
+            from: None,
+            allow_dirty: false,
+        },
+        max_spend_usd,
+        max_wall_seconds,
+        max_attempts: 3,
+        sandbox_requested,
+        accepted_by,
+    })?;
+    commands::job::launch_detached_supervisor(&paths, &job.job_id)?;
+    if !args.quiet {
+        print_start_lifecycle_footer("job", job.job_id.as_ref(), StartLaunchState::InFlight);
+    }
+    if !attach_flags.json {
+        maybe_start_attach(job.job_id.as_ref(), &attach_flags).await;
+    }
+    Ok(())
 }
 
 fn start_source_flags_present(args: &StartCommandArgs) -> bool {
@@ -3185,6 +3132,19 @@ fn start_plan_ids(paths: &DeadreckonPaths) -> Result<BTreeSet<String>> {
     Ok(super::inspection::list_plan_entries(paths, None)?
         .into_iter()
         .map(|plan| plan.plan_id)
+        .collect())
+}
+
+fn start_job_ids(paths: &DeadreckonPaths) -> Result<BTreeSet<String>> {
+    let entries = match fs::read_dir(paths.jobs_dir()) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(source) => return Err(source.into()),
+    };
+    Ok(entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(ToString::to_string))
+        .filter(|id| paths.job_json(id).is_file())
         .collect())
 }
 
@@ -3214,16 +3174,37 @@ fn newest_start_plan(
     Ok(plans.pop())
 }
 
+fn newest_start_job_id(
+    paths: &DeadreckonPaths,
+    before: &BTreeSet<String>,
+    goal: &str,
+) -> Result<Option<String>> {
+    let mut jobs = start_job_ids(paths)?
+        .into_iter()
+        .filter(|job_id| !before.contains(job_id))
+        .filter_map(|job_id| {
+            deadreckon_core::load_job(paths, &job_id)
+                .ok()
+                .filter(|job| job.goal == goal)
+                .map(|job| (job.created_at, job_id))
+        })
+        .collect::<Vec<_>>();
+    jobs.sort_by_key(|(created_at, _)| *created_at);
+    Ok(jobs.pop().map(|(_, job_id)| job_id))
+}
+
 /// Whether the work a guided `start` launched is still running (recommend
 /// attach to observe) or has already finished (recommend finish to land it).
 /// A synchronous full-plan/run returns to the footer already terminal, so a
 /// fixed "attach to observe" recommendation pointed at nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum StartLaunchState {
     InFlight,
     Completed,
 }
 
+#[cfg(test)]
 fn run_launch_state(status: RunStatus) -> StartLaunchState {
     match status {
         RunStatus::Completed => StartLaunchState::Completed,
@@ -3231,10 +3212,7 @@ fn run_launch_state(status: RunStatus) -> StartLaunchState {
     }
 }
 
-fn plan_launch_state(plan: &super::inspection::PlanListEntry) -> StartLaunchState {
-    plan_launch_state_from(plan.status, plan.completed_children, plan.total_children)
-}
-
+#[cfg(test)]
 fn plan_launch_state_from(
     status: deadreckon_core::PlanStatus,
     completed_children: usize,
@@ -3293,6 +3271,8 @@ fn print_start_lifecycle_footer(kind: &str, id: &str, launch_state: StartLaunchS
         ),
     };
     debug_assert!(recommended.contains(recommended_verb));
+    let (process_durability, machine_restart_durability) =
+        commands::supervisor_service::guided_durability_labels();
     print!(
         "{}",
         VerdictSurface::must_new(
@@ -3305,6 +3285,11 @@ fn print_start_lifecycle_footer(kind: &str, id: &str, launch_state: StartLaunchS
                 vec![
                     ("target".to_string(), kind.to_string()),
                     ("id".to_string(), id.clone()),
+                    (
+                        "process durability".to_string(),
+                        process_durability.to_string(),
+                    ),
+                    ("machine restart".to_string(), machine_restart_durability,),
                 ],
             ),
             vec![("Recommended", recommended)],
@@ -3316,7 +3301,11 @@ fn print_start_lifecycle_footer(kind: &str, id: &str, launch_state: StartLaunchS
 
 #[cfg(test)]
 mod start_footer_tests {
-    use super::{StartLaunchState, plan_launch_state_from, run_launch_state, start_footer_content};
+    use super::{
+        StartLaunchInput, StartLaunchState, StartSelectedMode, dispatch_start_command,
+        plan_launch_state_from, run_launch_state, start_footer_content, start_launch_decision,
+    };
+    use crate::cli::{CliStartMode, StartCommandArgs};
     use deadreckon_core::{PlanStatus, RunStatus};
 
     #[test]
@@ -3332,6 +3321,60 @@ mod start_footer_tests {
     fn in_flight_launch_recommends_attach() {
         let (_summary, _detail, verb) = start_footer_content("run", StartLaunchState::InFlight);
         assert_eq!(verb, "attach");
+    }
+
+    #[tokio::test]
+    async fn guided_history_continuation_refuses_before_foreground_extend() {
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "add a durable follow-up",
+            requested_mode: CliStartMode::Auto,
+            stdin_is_tty: true,
+        });
+        decision.selected_mode = StartSelectedMode::Extend;
+        decision.base_run_id = Some("1234567890abcdef".to_string());
+        let plan = crate::commands::course::trivial_operator_plan(
+            &decision.goal,
+            crate::commands::course::CourseShape::Single,
+            "test",
+        );
+
+        let error = dispatch_start_command(
+            StartCommandArgs {
+                goal: decision.goal.clone(),
+                mode: CliStartMode::Auto,
+                plan: None,
+                max_spend: None,
+                provider: None,
+                model: None,
+                children: None,
+                planner_provider: None,
+                child_provider: Vec::new(),
+                coder_provider: None,
+                reviewer_provider: None,
+                preview: false,
+                review_done: false,
+                yes: true,
+                no_seams: false,
+                fresh: false,
+                worktree: false,
+                from: None,
+                allow_dirty: false,
+                plain: true,
+                quiet: true,
+                json: false,
+            },
+            &decision,
+            plan,
+        )
+        .await
+        .expect_err("guided continuation must not enter foreground extend");
+        let message = error.to_string();
+
+        assert!(message.contains("no work was started"), "{message}");
+        assert!(
+            message.contains("deadreckon extend 12345678 \"add a durable follow-up\""),
+            "{message}"
+        );
     }
 
     #[test]

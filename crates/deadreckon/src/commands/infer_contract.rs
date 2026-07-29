@@ -182,6 +182,7 @@ pub(crate) async fn propose_contract(
         cwd: Some(working_dir.to_path_buf()),
         output_path: None,
         sandbox_backend: None,
+        workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
         pid_file: None,
         cancellation_token: None,
         session_dir: None,

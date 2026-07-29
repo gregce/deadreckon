@@ -1585,6 +1585,11 @@ pub(crate) fn launch_plan_from_decision(
         },
     };
     let mut plan = LaunchPlan::new(&decision.goal, shape, resolution);
+    plan.pieces = decision
+        .goal_shape
+        .as_ref()
+        .map(|shape| shape.pieces.clone())
+        .unwrap_or_default();
     plan.n = decision.child_count;
     plan.providers = CourseProviders {
         planner: decision.planner_provider_route.clone(),

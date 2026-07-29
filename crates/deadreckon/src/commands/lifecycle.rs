@@ -68,28 +68,47 @@ pub(crate) fn finish_command(
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let requested = run_id.unwrap_or_else(|| "latest".to_string());
-    let (state, plan_context, dest) =
-        match super::reference::try_resolve_run(&paths, &requested, "finish")? {
-            Some(state) => (state, None, dest),
-            None => match resolve_plan_result_run(&paths, &requested, "finish")? {
-                Some(result) => {
-                    if dest.is_none() && plan_apply_git_root(&result.plan)?.is_some() {
-                        return apply_command_inner(
-                            requested, strategy, branch, no_confirm, autostash, cleanup, message,
-                            false, false,
-                        );
-                    }
-                    let dest =
-                        Some(dest.unwrap_or_else(|| default_plan_materialize_dest(&result.plan)));
-                    (result.state, Some(result.plan), dest)
-                }
-                None => {
-                    return Err(super::reference::refusal_for_reference(
-                        &paths, &requested, "finish",
-                    ));
-                }
-            },
-        };
+    let resolved = super::reference::resolve_ref(
+        &paths,
+        super::reference::RefQuery {
+            reference: Some(&requested),
+            all_scopes: false,
+            verb: "finish",
+        },
+    )?;
+    let (state, plan_context, dest, finished_job_id) = match resolved {
+        super::reference::ResolvedRef::Job(job) => {
+            let job_id = job.job.job_id.as_ref().to_string();
+            (finish_job_state(&paths, &job)?, None, dest, Some(job_id))
+        }
+        super::reference::ResolvedRef::Run(state) => (*state, None, dest, None),
+        super::reference::ResolvedRef::PlanChild { state, .. } => (*state, None, dest, None),
+        super::reference::ResolvedRef::Plan(plan) => {
+            let plan_id = plan.plan_id.clone();
+            let Some(result) = resolve_plan_result_run(&paths, &plan_id, "finish")? else {
+                return Err(super::reference::refusal_for(
+                    super::reference::RefKind::Plan,
+                    "finish",
+                    &plan_id,
+                ));
+            };
+            if dest.is_none() && plan_apply_git_root(&result.plan)?.is_some() {
+                return apply_command_inner(
+                    plan_id, strategy, branch, no_confirm, autostash, cleanup, message, false,
+                    false, None,
+                );
+            }
+            let dest = Some(dest.unwrap_or_else(|| default_plan_materialize_dest(&result.plan)));
+            (result.state, Some(result.plan), dest, None)
+        }
+        other => {
+            return Err(super::reference::refusal_for(
+                other.kind(),
+                "finish",
+                &super::reference::resolved_id(&other),
+            ));
+        }
+    };
     if let Some(plan) = plan_context.as_ref() {
         print_plan_result_context(plan, &state);
         let library_dir = paths.library_dir(&state.scope, &state.run_id);
@@ -117,19 +136,52 @@ pub(crate) fn finish_command(
         .map(|record| record.mode)
         .unwrap_or(CodebaseMode::Fresh);
     match mode {
-        CodebaseMode::Worktree => apply_command(
-            state.run_id,
-            strategy,
-            branch,
-            no_confirm,
-            autostash,
-            cleanup,
-            message,
-            false,
-        ),
+        CodebaseMode::Worktree => {
+            let record = read_codebase_record(&state.working_dir)?;
+            let destination = record.source_git_root.ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "verified worktree result is missing its source git root".to_string(),
+                ))
+            })?;
+            apply_command_inner(
+                state.run_id.clone(),
+                strategy,
+                branch,
+                no_confirm,
+                autostash,
+                cleanup,
+                message,
+                false,
+                false,
+                Some(state),
+            )?;
+            if let Some(job_id) = finished_job_id.as_deref() {
+                let revision = delivered_git_revision(&destination);
+                super::job::record_job_delivery(
+                    &paths,
+                    job_id,
+                    super::job::JobDeliveryKind::Applied,
+                    &destination,
+                    revision.as_deref(),
+                )?;
+            }
+            Ok(())
+        }
         CodebaseMode::Copy | CodebaseMode::Fresh => {
-            materialize_completed_run(&paths, &state, dest, force, include_manifest)
-                .map(|materialized| print_materialized(&materialized))
+            let materialized =
+                materialize_completed_run(&paths, &state, dest, force, include_manifest)?;
+            print_materialized(&materialized);
+            if let Some(job_id) = finished_job_id.as_deref() {
+                let revision = delivered_git_revision(&materialized.dest);
+                super::job::record_job_delivery(
+                    &paths,
+                    job_id,
+                    super::job::JobDeliveryKind::Exported,
+                    &materialized.dest,
+                    revision.as_deref(),
+                )?;
+            }
+            Ok(())
         }
         CodebaseMode::InPlace => {
             let prefix = run_prefix(&state.run_id);
@@ -168,6 +220,58 @@ pub(crate) fn finish_command(
             Ok(())
         }
     }
+}
+
+fn delivered_git_revision(destination: &Path) -> Option<String> {
+    deadreckon_core::git::run_git(destination, &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|revision| !revision.is_empty())
+}
+
+pub(crate) fn finish_job_state(
+    paths: &DeadreckonPaths,
+    job: &deadreckon_core::JobView,
+) -> Result<deadreckon_core::PipelineState> {
+    if job.projection.outcome != Some(deadreckon_protocol::JobOutcome::Verified)
+        || job.projection.stop_reason != Some(deadreckon_protocol::StopReason::Verified)
+    {
+        let status = super::job::job_status_label(job);
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "job {} is {status}; no verified receipt is available",
+                job.job.job_id
+            ),
+            &format!("deadreckon attach {}", run_prefix(job.job.job_id.as_ref())),
+        )));
+    }
+    let receipt_path = paths.job_receipt(job.job.job_id.as_ref());
+    let receipt_raw = fs::read(&receipt_path).map_err(|_| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("job {} has no sealed completion receipt", job.job.job_id),
+            &format!("deadreckon attach {}", run_prefix(job.job.job_id.as_ref())),
+        ))
+    })?;
+    let receipt: deadreckon_protocol::CompletionReceipt = serde_json::from_slice(&receipt_raw)
+        .map_err(|_| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!("job {} completion receipt is unreadable", job.job.job_id),
+                &format!("deadreckon attach {}", run_prefix(job.job.job_id.as_ref())),
+            ))
+        })?;
+    if !receipt.contained || receipt.sandbox_backend == "none" {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "job {} receipt does not prove contained execution",
+                job.job.job_id
+            ),
+            &format!("deadreckon attach {}", run_prefix(job.job.job_id.as_ref())),
+        )));
+    }
+    let state = load_run(paths, job.job.job_id.as_ref())?;
+    deadreckon_core::validate_completion_receipt(paths, &state)?;
+    Ok(state)
 }
 
 fn print_finish_consistency_summary(state: &deadreckon_core::PipelineState) {
@@ -311,6 +415,7 @@ pub(crate) fn apply_command(
         message,
         false,
         plain,
+        None,
     )
 }
 
@@ -333,6 +438,7 @@ pub(crate) fn apply_command_quiet(
         message,
         true,
         false,
+        None,
     )
 }
 
@@ -349,24 +455,10 @@ fn apply_command_inner(
     message: Option<String>,
     quiet: bool,
     _plain: bool,
+    verified_job_state: Option<deadreckon_core::PipelineState>,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let mut state = match super::reference::try_resolve_run(&paths, &run_id, "apply")? {
-        Some(state) => state,
-        None => match resolve_plan_result_run(&paths, &run_id, "apply")? {
-            Some(result) => {
-                if !quiet {
-                    print_plan_result_context(&result.plan, &result.state);
-                }
-                prepare_plan_result_apply_state(&paths, &result.plan, &result.state)?
-            }
-            None => {
-                return Err(super::reference::refusal_for_reference(
-                    &paths, &run_id, "apply",
-                ));
-            }
-        },
-    };
+    let mut state = resolve_apply_state(&paths, &run_id, quiet, verified_job_state)?;
     ensure_completed_run(&state, "apply")?;
     let record = match read_codebase_record(&state.working_dir) {
         Ok(record) => record,
@@ -514,6 +606,34 @@ fn apply_command_inner(
         );
     }
     Ok(())
+}
+
+fn resolve_apply_state(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+    quiet: bool,
+    verified_job_state: Option<deadreckon_core::PipelineState>,
+) -> Result<deadreckon_core::PipelineState> {
+    let state = match verified_job_state {
+        Some(state) => state,
+        None => match super::reference::try_resolve_run(paths, run_id, "apply")? {
+            Some(state) => state,
+            None => match resolve_plan_result_run(paths, run_id, "apply")? {
+                Some(result) => {
+                    if !quiet {
+                        print_plan_result_context(&result.plan, &result.state);
+                    }
+                    prepare_plan_result_apply_state(paths, &result.plan, &result.state)?
+                }
+                None => {
+                    return Err(super::reference::refusal_for_reference(
+                        paths, run_id, "apply",
+                    ));
+                }
+            },
+        },
+    };
+    Ok(state)
 }
 
 fn prepare_result_run_apply_state(
@@ -2307,4 +2427,182 @@ pub(crate) fn default_materialize_dest(state: &deadreckon_core::PipelineState) -
     state
         .cwd
         .join(state.task_key.chars().take(24).collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use deadreckon_core::{JobProjection, JobView};
+    use deadreckon_protocol::{
+        CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer, Job, JobId, JobOutcome,
+        JobPhase, JobPolicy, JobSchemaVersion, JobShape, RunId, SemanticJudgeMode, StopReason,
+    };
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn job_view(
+        root: &Path,
+        outcome: Option<JobOutcome>,
+        stop_reason: Option<StopReason>,
+    ) -> JobView {
+        let job_id = JobId("abababababababababababababababab".to_string());
+        JobView {
+            job: Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: job_id.clone(),
+                scope: "test".to_string(),
+                goal: "finish safely".to_string(),
+                shape: JobShape::Single,
+                created_at: Utc::now(),
+                source_cwd: root.to_path_buf(),
+                launch_plan_sha256: "launch".to_string(),
+                authority_sha256: "authority".to_string(),
+                policy: JobPolicy {
+                    max_spend_usd: 1.0,
+                    max_wall_seconds: 60,
+                    max_attempts: 1,
+                    deadline: None,
+                    semantic_judge: SemanticJudgeMode::Required,
+                },
+            },
+            projection: JobProjection {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id,
+                phase: if outcome.is_some() {
+                    JobPhase::Terminal
+                } else {
+                    JobPhase::Waiting
+                },
+                outcome,
+                stop_reason,
+                last_sequence: 1,
+                current_lease_epoch: 1,
+                attempt_count: 1,
+                child_run_ids: Vec::new(),
+                updated_at: Some(Utc::now()),
+                caveats: Vec::new(),
+            },
+            attempts: Vec::new(),
+            missing_attempts: Vec::new(),
+        }
+    }
+
+    fn uncontained_receipt(job_id: &JobId) -> CompletionReceipt {
+        CompletionReceipt {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: job_id.clone(),
+            run_id: RunId(job_id.as_ref().to_string()),
+            issued_at: Utc::now(),
+            issuer: CompletionReceiptIssuer::DeadreckonSupervisor,
+            proof_kind: CompletionProofKind::TwoKeyCompletion,
+            outcome: JobOutcome::Verified,
+            stop_reason: StopReason::Verified,
+            authority_sha256: "authority".to_string(),
+            goal_sha256: "goal".to_string(),
+            contract_sha256: "contract".to_string(),
+            effective_policy_sha256: "policy".to_string(),
+            launch_plan_sha256: "launch".to_string(),
+            source_tree_sha256: "source".to_string(),
+            source_revision: None,
+            result_tree_sha256: "result".to_string(),
+            result_revision: None,
+            deterministic_marker_sha256: "marker".to_string(),
+            semantic_judgment_sha256: "semantic".to_string(),
+            contained: false,
+            sandbox_backend: "none".to_string(),
+            signature: "not-trusted".to_string(),
+        }
+    }
+
+    #[test]
+    fn finish_refuses_missing_uncertain_or_uncontained_receipt() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+        let missing = job_view(
+            temp.path(),
+            Some(JobOutcome::Verified),
+            Some(StopReason::Verified),
+        );
+        let error = finish_job_state(&paths, &missing).expect_err("missing receipt");
+        assert!(error.to_string().contains("no sealed completion receipt"));
+
+        let uncertain = job_view(
+            temp.path(),
+            Some(JobOutcome::NeedsReview),
+            Some(StopReason::SemanticUncertain),
+        );
+        let error = finish_job_state(&paths, &uncertain).expect_err("uncertain result");
+        assert!(error.to_string().contains("no verified receipt"));
+
+        let uncontained = job_view(
+            temp.path(),
+            Some(JobOutcome::Verified),
+            Some(StopReason::Verified),
+        );
+        let receipt_path = paths.job_receipt(uncontained.job.job_id.as_ref());
+        fs::create_dir_all(receipt_path.parent().expect("receipt parent")).expect("job dir");
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&uncontained_receipt(&uncontained.job.job_id))
+                .expect("receipt json"),
+        )
+        .expect("receipt");
+        let error = finish_job_state(&paths, &uncontained).expect_err("uncontained receipt");
+        assert!(error.to_string().contains("contained execution"));
+    }
+
+    #[test]
+    fn verified_finish_carries_backing_run_past_job_identity_precedence() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let job_id = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "deliver the verified result".to_string(),
+                cwd: source.clone(),
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some(job_id.to_string()),
+                codebase: None,
+            },
+        )
+        .expect("backing run");
+        deadreckon_core::write_job(
+            &paths,
+            &Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId(job_id.to_string()),
+                scope: state.scope.clone(),
+                goal: state.goal.clone(),
+                shape: JobShape::Single,
+                created_at: Utc::now(),
+                source_cwd: source,
+                launch_plan_sha256: "launch".to_string(),
+                authority_sha256: "authority".to_string(),
+                policy: JobPolicy {
+                    max_spend_usd: 1.0,
+                    max_wall_seconds: 60,
+                    max_attempts: 1,
+                    deadline: None,
+                    semantic_judge: SemanticJudgeMode::Required,
+                },
+            },
+        )
+        .expect("job identity");
+
+        let collision =
+            resolve_apply_state(&paths, job_id, true, None).expect_err("job outranks backing run");
+        assert!(collision.to_string().contains("is a job"), "{collision}");
+
+        let resolved = resolve_apply_state(&paths, job_id, true, Some(state))
+            .expect("finish already validated the Job and may retain its backing Run");
+        assert_eq!(resolved.run_id, job_id);
+    }
 }

@@ -13,9 +13,9 @@ mod spec;
 pub use backend::{Result, SandboxBackend, SandboxError, resolve_backend};
 pub use commands::{SandboxCommand, build_command};
 pub use doctor::{BackendAvailability, doctor};
-pub use policy::ToolSandboxPolicy;
+pub use policy::{ProtectedPathPolicy, ToolSandboxPolicy};
 pub use process::{SandboxRunOutput, run};
-pub use spec::SandboxSpec;
+pub use spec::{SandboxSpec, WorkspaceAccess};
 
 #[cfg(test)]
 pub(crate) use commands::sandbox_exec_profile;
@@ -31,7 +31,15 @@ mod tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{SandboxBackend, SandboxError, SandboxSpec, ToolSandboxPolicy, build_command, run};
+    #[cfg(target_os = "macos")]
+    use super::ProtectedPathPolicy;
+    #[cfg(target_os = "macos")]
+    use deadreckon_core::DeadreckonPaths;
+
+    use super::{
+        SandboxBackend, SandboxError, SandboxSpec, ToolSandboxPolicy, WorkspaceAccess,
+        build_command, run,
+    };
 
     fn shell_spec() -> SandboxSpec {
         SandboxSpec {
@@ -50,6 +58,7 @@ mod tests {
             read_denylist: Vec::new(),
             write_denylist: Vec::new(),
             network_allowlist: Vec::new(),
+            workspace_access: WorkspaceAccess::ReadWrite,
         }
     }
 
@@ -186,6 +195,7 @@ mod tests {
             read_denylist: Vec::new(),
             write_denylist: Vec::new(),
             network_allowlist: Vec::new(),
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await
         .expect("sandbox run");
@@ -221,9 +231,82 @@ mod tests {
             read_denylist: Vec::new(),
             write_denylist: Vec::new(),
             network_allowlist: Vec::new(),
+            workspace_access: WorkspaceAccess::ReadWrite,
         })
         .await
         .expect("sandbox run");
         assert_ne!(output.status_code, Some(0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn read_only_workspace_blocks_write_macos() {
+        if which::which("sandbox-exec").is_err() {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("work");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let forbidden = workspace.join("forbidden");
+        let mut spec = shell_spec();
+        spec.backend = SandboxBackend::SandboxExec;
+        spec.cwd = workspace;
+        spec.args = vec![
+            OsString::from("-c"),
+            OsString::from(format!("touch {}", forbidden.display())),
+        ];
+        spec.workspace_access = WorkspaceAccess::ReadOnly;
+
+        let output = run(spec).await.expect("sandbox run");
+
+        assert_ne!(output.status_code, Some(0));
+        assert!(!forbidden.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn hostile_agent_cannot_find_keys_or_forge_marker_macos() {
+        if which::which("sandbox-exec").is_err() {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("work");
+        let paths = DeadreckonPaths::from_home(workspace.join(".deadreckon"));
+        let run_root = paths.run_root("project", "run-1");
+        let key_store = paths.home().join("gate-keys");
+        let marker = run_root.join("proofs/turn-acceptance.json");
+        std::fs::create_dir_all(&key_store).expect("key store");
+        std::fs::create_dir_all(marker.parent().expect("proof parent")).expect("proofs");
+        std::fs::write(key_store.join("run-1.key"), "super-secret-signing-material").expect("key");
+        std::fs::write(&marker, "original-marker").expect("marker");
+        let boundary = ProtectedPathPolicy::for_paths(&paths);
+
+        let mut spec = shell_spec();
+        spec.backend = SandboxBackend::SandboxExec;
+        spec.cwd = workspace.clone();
+        spec.read_allowlist = vec![workspace.clone()];
+        spec.write_allowlist = vec![workspace.clone()];
+        spec.read_denylist = boundary.read_denylist;
+        spec.write_denylist = boundary.write_denylist;
+        spec.args = vec![
+            OsString::from("-c"),
+            OsString::from(format!(
+                "find '{}' -name '*.key' -exec cat {{}} \\; 2>/dev/null || true; \
+                 if printf forged > '{}'; then exit 41; fi; \
+                 test \"$(cat '{}')\" = original-marker",
+                workspace.display(),
+                marker.display(),
+                marker.display()
+            )),
+        ];
+
+        let output = run(spec).await.expect("sandbox run");
+
+        assert_eq!(output.status_code, Some(0), "{}", output.stderr);
+        assert!(!output.stdout.contains("super-secret-signing-material"));
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("marker"),
+            "original-marker"
+        );
     }
 }

@@ -80,6 +80,42 @@ impl DeadreckonPaths {
         self.home.join("locks")
     }
 
+    pub fn jobs_dir(&self) -> PathBuf {
+        self.home.join("jobs")
+    }
+
+    pub fn job_dir(&self, job_id: &str) -> PathBuf {
+        self.jobs_dir().join(job_id)
+    }
+
+    pub fn job_json(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("job.json")
+    }
+
+    pub fn job_events(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("job-events.jsonl")
+    }
+
+    pub fn job_projection(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("projection.json")
+    }
+
+    pub fn job_lease(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("lease.json")
+    }
+
+    pub fn job_launch_plan(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("launch-plan.json")
+    }
+
+    pub fn job_authority(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("authority.json")
+    }
+
+    pub fn job_receipt(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("receipt.json")
+    }
+
     pub fn chains_dir(&self) -> PathBuf {
         self.home.join("chains")
     }
@@ -333,6 +369,28 @@ mod tests {
                 "{} escaped {}",
                 path.display(),
                 paths.home().display()
+            );
+        }
+    }
+
+    #[test]
+    fn job_paths_stay_under_one_durable_identity() {
+        let paths = DeadreckonPaths::from_home("/tmp/deadreckon-home");
+        let root = paths.job_dir("job-1");
+
+        for path in [
+            paths.job_json("job-1"),
+            paths.job_events("job-1"),
+            paths.job_projection("job-1"),
+            paths.job_lease("job-1"),
+            paths.job_launch_plan("job-1"),
+            paths.job_authority("job-1"),
+            paths.job_receipt("job-1"),
+        ] {
+            assert!(
+                path.starts_with(&root),
+                "{} escaped job root",
+                path.display()
             );
         }
     }

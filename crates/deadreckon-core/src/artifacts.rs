@@ -163,6 +163,16 @@ pub fn snapshot_diff(state: &PipelineState, from: u32, to: u32) -> Result<DiffSu
     )
 }
 
+/// Compare two materialized work trees without first copying either tree into
+/// a run snapshot.
+///
+/// Durable graph completion uses this to judge the merged result against the
+/// operator-approved source tree. The ordinary single-run path continues to
+/// use turn snapshots.
+pub fn diff_working_trees(before: &Path, after: &Path) -> Result<DiffSummary> {
+    diff_snapshots(before, after)
+}
+
 fn snapshot_file_set(root: &Path) -> Result<BTreeSet<PathBuf>> {
     if !root.exists() {
         return Err(DeadreckonError::NotFound(format!(
@@ -308,6 +318,7 @@ pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use tempfile::TempDir;
 
@@ -315,8 +326,32 @@ mod tests {
     use crate::state::{RunOptions, create_run};
 
     use super::{
-        diff_snapshots, inventory_files, restore_snapshot, snapshot_diff, snapshot_working,
+        diff_snapshots, diff_working_trees, inventory_files, restore_snapshot, snapshot_diff,
+        snapshot_working,
     };
+
+    #[test]
+    fn graph_source_result_diff_carries_changed_content_without_snapshots() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let result = temp.path().join("result");
+        fs::create_dir_all(&source).expect("source");
+        fs::create_dir_all(&result).expect("result");
+        fs::write(source.join("answer.txt"), "before\n").expect("source file");
+        fs::write(result.join("answer.txt"), "after\n").expect("result file");
+        fs::write(result.join("receipt.txt"), "evidence\n").expect("added file");
+
+        let diff = diff_working_trees(&source, &result).expect("tree diff");
+        assert_eq!(diff.files_changed, 2);
+        let answer = diff
+            .files
+            .iter()
+            .find(|file| file.path == Path::new("answer.txt"))
+            .expect("answer diff");
+        let unified = answer.unified_diff.as_deref().expect("text diff");
+        assert!(unified.contains("-before"), "{unified}");
+        assert!(unified.contains("+after"), "{unified}");
+    }
 
     #[test]
     fn spend_record_kind_defaults_to_loop_when_absent() {

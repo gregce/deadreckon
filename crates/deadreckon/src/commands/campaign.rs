@@ -71,6 +71,9 @@ pub(crate) fn build_sub_orchestrator_command(
         .arg("--no-hints")
         .arg("--sandbox")
         .arg(launch.sandbox);
+    if let Some(acceptance) = commands::graph_job::current_acceptance_path() {
+        command.arg("--acceptance").arg(acceptance);
+    }
     if launch.plain {
         command.arg("--plain");
     }
@@ -103,6 +106,137 @@ pub(crate) fn discover_sub_result(
     launch_dir: &Path,
 ) -> Result<Option<deadreckon_core::campaign::SubResult>> {
     deadreckon_core::campaign::read_sub_result(launch_dir).map_err(CliError::Core)
+}
+
+fn recover_persisted_campaign_sub(
+    paths: &DeadreckonPaths,
+    source_dir: &Path,
+    launch_dir: &Path,
+    sub: &deadreckon_core::campaign::SubGoal,
+    sandbox: &str,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+) -> Result<Option<deadreckon_core::campaign::SubResult>> {
+    use deadreckon_core::plan::PlanStatus;
+
+    if let Some(result) = discover_sub_result(launch_dir)? {
+        if result.sub_id != sub.sub_id
+            || sub
+                .sub_plan_id
+                .as_ref()
+                .zip(result.plan_id.as_ref())
+                .is_some_and(|(expected, actual)| expected != actual)
+            || sub
+                .result_run_id
+                .as_ref()
+                .zip(result.result_run_id.as_ref())
+                .is_some_and(|(expected, actual)| expected != actual)
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "campaign sub-result identity {} does not match persisted {}",
+                result.sub_id, sub.sub_id
+            ))));
+        }
+        return Ok(Some(result));
+    }
+    let Some(plan_id) = read_sub_plan_id(launch_dir) else {
+        return Ok(None);
+    };
+    if sub
+        .sub_plan_id
+        .as_ref()
+        .is_some_and(|expected| expected != &plan_id)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "linked campaign sub-plan {plan_id} does not match persisted sub {} plan",
+            sub.sub_id
+        ))));
+    }
+    let plan = deadreckon_core::plan::load_plan(paths, &plan_id)?;
+    if plan.plan_id != plan_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "linked campaign sub-plan {plan_id} changed identity"
+        ))));
+    }
+    if plan.root_goal != sub.goal {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "linked campaign sub-plan {plan_id} does not match sub {} goal",
+            sub.sub_id
+        ))));
+    }
+    match plan.status {
+        PlanStatus::Failed => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "linked campaign sub-plan {plan_id} failed and cannot be resumed automatically"
+            ))));
+        }
+        PlanStatus::Merged => {}
+        PlanStatus::Pending | PlanStatus::Forked => {
+            let executable = std::env::current_exe()?;
+            let mut fork = std::process::Command::new(&executable);
+            fork.current_dir(source_dir)
+                .env("DEADRECKON_HOME", paths.home())
+                .env("DEADRECKON_SCOPE_ROOT", launch_dir)
+                .arg("fork")
+                .arg(&plan_id)
+                .arg("--sandbox")
+                .arg(sandbox)
+                .arg("--no-hints")
+                .arg("--quiet")
+                .arg("--plain");
+            if let Some(max_spend) = max_spend {
+                fork.arg("--max-spend").arg(format!("{max_spend:.6}"));
+            }
+            if let Some(max_wall_seconds) = max_wall_seconds {
+                fork.arg("--max-wall-seconds")
+                    .arg(format!("{max_wall_seconds:.3}"));
+            }
+            let status = fork.status()?;
+            if !status.success() {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "linked campaign sub-plan {plan_id} fork resume exited with {status}"
+                ))));
+            }
+            let status = std::process::Command::new(executable)
+                .current_dir(source_dir)
+                .env("DEADRECKON_HOME", paths.home())
+                .env("DEADRECKON_SCOPE_ROOT", launch_dir)
+                .arg("merge")
+                .arg(&plan_id)
+                .arg("--strategy")
+                .arg("dag-aware")
+                .arg("--yes")
+                .arg("--no-hints")
+                .arg("--quiet")
+                .arg("--plain")
+                .status()?;
+            if !status.success() {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "linked campaign sub-plan {plan_id} merge resume exited with {status}"
+                ))));
+            }
+        }
+    }
+    let resumed = deadreckon_core::plan::load_plan(paths, &plan_id)?;
+    if resumed.status != PlanStatus::Merged {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "linked campaign sub-plan {plan_id} did not persist a merged result"
+        ))));
+    }
+    let result_run_id = resumed.merged_run_id.ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "linked campaign sub-plan {plan_id} has no merged result run"
+        )))
+    })?;
+    let result = deadreckon_core::campaign::SubResult {
+        schema_version: 1,
+        sub_id: sub.sub_id.clone(),
+        plan_id: Some(plan_id),
+        result_run_id: Some(result_run_id),
+        ok: true,
+    };
+    deadreckon_core::campaign::write_sub_result(launch_dir, &result)?;
+    Ok(Some(result))
 }
 
 /// Filename of the early plan-id marker a sub-orchestrator publishes to its
@@ -520,8 +654,9 @@ pub(crate) fn campaign_drop_subgoal_before_launch(
     campaign_replace_sub_goals_before_launch(campaign, sub_goals)
 }
 
-/// Create a promoted result run from the composed campaign tree, binding the
-/// roll-up into the marker signature. Mirrors `create_merged_plan_run`.
+/// Create the evidence run from the composed campaign tree, binding the
+/// roll-up into the marker signature. Legacy direct campaigns promote here;
+/// durable parent Jobs wait for the parent receipt.
 fn promote_campaign_result(
     paths: &DeadreckonPaths,
     campaign_id: &str,
@@ -554,7 +689,9 @@ fn promote_campaign_result(
     )?;
     state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
     save_state(&state)?;
-    promote_completed_run(paths, &mut state)?;
+    if commands::graph_job::current_parent_job_id().is_none() {
+        promote_completed_run(paths, &mut state)?;
+    }
     Ok(state)
 }
 
@@ -970,7 +1107,9 @@ async fn repair_and_promote_campaign_result(
     campaign_obj.merged_at = Some(chrono::Utc::now());
     campaign_obj.status = campaign::CampaignStatus::Merged;
     campaign::write_campaign(campaign_dir, campaign_obj)?;
-    write_campaign_manifest(paths, campaign_obj, &result_state, rollup)?;
+    if commands::graph_job::current_parent_job_id().is_none() {
+        write_campaign_manifest(paths, campaign_obj, &result_state, rollup)?;
+    }
     campaign::append_campaign_event(
         campaign_dir,
         "campaign_completed",
@@ -1268,10 +1407,19 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         env!("CARGO_PKG_VERSION"),
     )
     .map_err(CliError::Core)?;
+    if let Some(job_id) = commands::graph_job::current_parent_job_id() {
+        campaign_obj.campaign_id = job_id.to_string();
+    }
     let campaign_id = campaign_obj.campaign_id.clone();
     let campaign_dir = paths.plan_dir(&campaign_id);
     fs::create_dir_all(&campaign_dir)?;
     campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+    commands::graph_job::record_current_artifact(
+        &paths,
+        commands::graph_job::DriverKind::Campaign,
+        "campaign",
+        &campaign_id,
+    )?;
     let mut lineage_scopes = lineage.ancestor_scopes.clone();
     lineage_scopes.push(scope.clone());
     campaign::write_lineage(
@@ -1354,10 +1502,60 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     }
     campaign::write_campaign(&campaign_dir, &campaign_obj)?;
 
+    execute_campaign_state(&paths, &cwd, &scope, &lineage, &args, campaign_obj).await
+}
+
+pub(crate) async fn resume_campaign_job(
+    paths: &DeadreckonPaths,
+    job: &deadreckon_protocol::Job,
+    args: &CampaignArgs,
+) -> Result<()> {
+    use deadreckon_core::campaign::{self, CampaignStatus};
+
+    let campaign_dir = paths.plan_dir(job.job_id.as_ref());
+    let campaign_obj = campaign::read_campaign(&campaign_dir)?;
+    if campaign_obj.campaign_id != job.job_id.as_ref()
+        || campaign_obj.root_goal != job.goal
+        || campaign_obj.status == CampaignStatus::Killed
+        || campaign_obj.status == CampaignStatus::Failed
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "campaign job {} does not have resumable persisted campaign state",
+            job.job_id
+        ))));
+    }
+    if campaign_obj.status == CampaignStatus::Merged {
+        return Ok(());
+    }
+    commands::graph_job::record_current_artifact(
+        paths,
+        commands::graph_job::DriverKind::Campaign,
+        "campaign",
+        job.job_id.as_ref(),
+    )?;
+    let lineage = campaign::read_lineage(&campaign_dir)?;
+    let scope = workspace_scope(&job.source_cwd)?;
+    execute_campaign_state(paths, &job.source_cwd, &scope, &lineage, args, campaign_obj).await
+}
+
+async fn execute_campaign_state(
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+    scope: &str,
+    lineage: &deadreckon_core::campaign::Lineage,
+    args: &CampaignArgs,
+    mut campaign_obj: deadreckon_core::campaign::Campaign,
+) -> Result<()> {
+    use deadreckon_core::campaign;
+
+    let campaign_id = campaign_obj.campaign_id.clone();
+    let campaign_dir = paths.plan_dir(&campaign_id);
+    let providers = campaign_obj.providers.clone();
     let sandbox = args.sandbox.clone().unwrap_or_else(|| "auto".to_string());
     let per_sub = campaign_obj
         .tree_budget_usd
         .map(|budget| campaign::allocate_budget(budget, campaign_obj.sub_goals.len()));
+    let tree_wall_seconds = campaign_obj.tree_wall_seconds;
     let home = paths.home().to_path_buf();
     let planner = providers.planner.clone();
     let child_provider = providers.default_child.clone();
@@ -1370,28 +1568,56 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     let mut ancestor_task_keys = lineage.ancestor_task_keys.clone();
     ancestor_task_keys.extend(final_sub_keys.iter().cloned());
     let mut ancestor_scopes = lineage.ancestor_scopes.clone();
-    ancestor_scopes.push(scope.clone());
-    let launch_paths = &paths;
-    let mut sub_index = 0usize;
+    ancestor_scopes.push(scope.to_string());
+    let sub_positions = campaign_obj
+        .sub_goals
+        .iter()
+        .enumerate()
+        .map(|(index, sub)| (sub.sub_id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
     let campaign_narrate = args.narrate && !args.no_narrate;
     let campaign_narrator_model = args.narrator_model.clone();
     let campaign_quiet = args.quiet;
     let n_subs = campaign_obj.sub_goals.len();
     let campaign_prefix = run_prefix(&campaign_id);
 
-    run_campaign_fork(
+    run_campaign_fork_with_recovery(
         &campaign_dir,
         &mut campaign_obj,
         |sub, launch_dir| {
+            let position = sub_positions.get(&sub.sub_id).copied().ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "campaign sub {} is absent from its approved schedule",
+                    sub.sub_id
+                )))
+            })?;
+            recover_persisted_campaign_sub(
+                paths,
+                cwd,
+                launch_dir,
+                sub,
+                &sandbox,
+                per_sub
+                    .as_ref()
+                    .and_then(|shares| shares.get(position).copied()),
+                tree_wall_seconds,
+            )
+        },
+        |sub, launch_dir| {
+            let sub_index = sub_positions.get(&sub.sub_id).copied().ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "campaign sub {} is absent from its approved schedule",
+                    sub.sub_id
+                )))
+            })?;
             let share = per_sub
                 .as_ref()
                 .and_then(|shares| shares.get(sub_index).copied());
             let position = sub_index + 1;
-            sub_index += 1;
             let aggregate_on = campaign_narrate && !campaign_quiet;
             let mut command = build_sub_orchestrator_command(&CampaignSubLaunch {
                 home: &home,
-                source_dir: &cwd,
+                source_dir: cwd,
                 launch_dir,
                 campaign_id: &campaign_id,
                 sub_goal: &sub.goal,
@@ -1415,10 +1641,6 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
                     sub.sub_id
                 );
             }
-            // Non-blocking spawn so the campaign parent can tick its own
-            // aggregate line (tailing this sub's grandchildren) while the
-            // sub-orchestrator runs. Sequential semantics are preserved — we
-            // still wait for this sub before the next.
             let mut child = command.spawn()?;
             let mut last_tick = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(2))
@@ -1429,18 +1651,14 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
                 }
                 if aggregate_on && last_tick.elapsed() >= std::time::Duration::from_secs(2) {
                     let headline = read_sub_plan_id(launch_dir)
-                        .and_then(|plan_id| {
-                            deadreckon_core::plan::load_plan(launch_paths, &plan_id).ok()
-                        })
+                        .and_then(|plan_id| deadreckon_core::plan::load_plan(paths, &plan_id).ok())
                         .map(|plan| {
                             plan.tasks
                                 .iter()
                                 .filter_map(|task| task.child_run_id.clone())
                                 .collect::<Vec<_>>()
                         })
-                        .and_then(|run_ids| {
-                            narrative::freshest_child_headline(launch_paths, &run_ids)
-                        });
+                        .and_then(|run_ids| narrative::freshest_child_headline(paths, &run_ids));
                     let line = narrative::campaign_aggregate_line(
                         &campaign_prefix,
                         &sub.sub_id,
@@ -1496,13 +1714,13 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
             result
                 .result_run_id
                 .as_deref()
-                .and_then(|run_id| load_run(launch_paths, run_id).ok())
+                .and_then(|run_id| load_run(paths, run_id).ok())
                 .map(|state| state.total_spend_usd)
                 .unwrap_or(0.0)
         },
     )?;
 
-    let rollup = campaign::build_rollup(&campaign_obj, |run_id| match load_run(&paths, run_id) {
+    let rollup = campaign::build_rollup(&campaign_obj, |run_id| match load_run(paths, run_id) {
         Ok(state) => {
             let tamper =
                 deadreckon_core::tamper::read_acceptance_tamper_for_run_root(&state.run_root)
@@ -1529,11 +1747,11 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     campaign::write_campaign_rollup(&campaign_dir, &rollup)?;
 
     let result_state = repair_and_promote_campaign_result(CampaignRepairExecution {
-        paths: &paths,
+        paths,
         campaign_dir: &campaign_dir,
         campaign_obj: &mut campaign_obj,
         rollup: &rollup,
-        parent_cwd: &cwd,
+        parent_cwd: cwd,
         repair_provider: None,
         repair_mode: MergeRepairMode::Auto,
         repair_attempts: 1,
@@ -1541,7 +1759,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     })
     .await?;
     if !args.quiet {
-        print_campaign_completion(&paths, &campaign_obj, &rollup, &result_state, args.no_hints);
+        print_campaign_completion(paths, &campaign_obj, &rollup, &result_state, args.no_hints);
     }
     Ok(())
 }
@@ -2283,10 +2501,37 @@ pub(crate) fn resolve_campaign(
 pub(crate) fn run_campaign_fork<F, S>(
     campaign_dir: &Path,
     campaign: &mut deadreckon_core::campaign::Campaign,
+    launch: F,
+    spend_of: S,
+) -> Result<()>
+where
+    F: FnMut(
+        &deadreckon_core::campaign::SubGoal,
+        &Path,
+    ) -> Result<deadreckon_core::campaign::SubResult>,
+    S: Fn(&deadreckon_core::campaign::SubResult) -> f64,
+{
+    run_campaign_fork_with_recovery(
+        campaign_dir,
+        campaign,
+        |_sub, _launch_dir| Ok(None),
+        launch,
+        spend_of,
+    )
+}
+
+pub(crate) fn run_campaign_fork_with_recovery<R, F, S>(
+    campaign_dir: &Path,
+    campaign: &mut deadreckon_core::campaign::Campaign,
+    mut recover: R,
     mut launch: F,
     spend_of: S,
 ) -> Result<()>
 where
+    R: FnMut(
+        &deadreckon_core::campaign::SubGoal,
+        &Path,
+    ) -> Result<Option<deadreckon_core::campaign::SubResult>>,
     F: FnMut(
         &deadreckon_core::campaign::SubGoal,
         &Path,
@@ -2310,6 +2555,17 @@ where
 
     let mut spent_usd = 0.0_f64;
     for index in 0..campaign.sub_goals.len() {
+        let persisted_sub = campaign.sub_goals[index].clone();
+        if persisted_sub.status == SubGoalStatus::Merged {
+            spent_usd += spend_of(&deadreckon_core::campaign::SubResult {
+                schema_version: 1,
+                sub_id: persisted_sub.sub_id,
+                plan_id: persisted_sub.sub_plan_id,
+                result_run_id: persisted_sub.result_run_id,
+                ok: true,
+            });
+            continue;
+        }
         if tree_budget_exhausted(tree_budget, spent_usd) {
             append_campaign_event(
                 campaign_dir,
@@ -2321,6 +2577,29 @@ where
         let sub = campaign.sub_goals[index].clone();
         let launch_dir = campaign_dir.join("launch").join(&sub.sub_id);
         fs::create_dir_all(&launch_dir)?;
+        if let Some(result) = recover(&sub, &launch_dir)? {
+            spent_usd += spend_of(&result);
+            let target = &mut campaign.sub_goals[index];
+            target.sub_plan_id = result.plan_id.clone();
+            target.result_run_id = result.result_run_id.clone();
+            target.status = if result.ok {
+                SubGoalStatus::Merged
+            } else {
+                SubGoalStatus::Failed
+            };
+            append_campaign_event(
+                campaign_dir,
+                "sub_recovered",
+                serde_json::json!({
+                    "sub_id": sub.sub_id,
+                    "plan_id": result.plan_id,
+                    "result_run_id": result.result_run_id,
+                    "ok": result.ok,
+                }),
+            )?;
+            campaign::write_campaign(campaign_dir, campaign)?;
+            continue;
+        }
         append_campaign_event(
             campaign_dir,
             "sub_launched",

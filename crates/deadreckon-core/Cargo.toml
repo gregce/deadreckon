@@ -12,6 +12,7 @@ workspace = true
 chrono.workspace = true
 deadreckon-protocol.workspace = true
 fs2.workspace = true
+hmac.workspace = true
 ignore.workspace = true
 nix.workspace = true
 regex.workspace = true

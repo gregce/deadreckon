@@ -45,52 +45,49 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
         },
     )?;
     let state = match resolved {
+        super::reference::ResolvedRef::Job(job) => {
+            if let Ok(state) = load_run(&paths, job.job.job_id.as_ref()) {
+                state
+            } else {
+                if let Some(driver) = job_attach_driver_state(&paths, job.job.job_id.as_ref())? {
+                    match driver.kind {
+                        commands::graph_job::DriverKind::Review
+                        | commands::graph_job::DriverKind::FullPlan => {
+                            let plan = load_plan(&paths, &driver.artifact_id)?;
+                            attach_plan_read_model(&paths, &plan, &args, &narrative_config).await?;
+                        }
+                        commands::graph_job::DriverKind::Campaign => {
+                            let (campaign_dir, campaign) = commands::campaign::resolve_campaign(
+                                &paths,
+                                &driver.artifact_id,
+                            )?
+                            .ok_or_else(|| {
+                                CliError::Core(DeadreckonError::InvalidInput(format!(
+                                    "campaign driver state for job {} names missing artifact {}",
+                                    job.job.job_id, driver.artifact_id
+                                )))
+                            })?;
+                            attach_campaign_read_model(
+                                &paths,
+                                &campaign_dir,
+                                &campaign,
+                                &args,
+                                &narrative_config,
+                            )
+                            .await?;
+                        }
+                    }
+                    return Ok(());
+                }
+                return super::job::print_job_status_after_attach(&job, args.json);
+            }
+        }
         super::reference::ResolvedRef::Campaign {
             dir: campaign_dir,
             campaign,
         } => {
-            let state =
-                commands::campaign::CampaignAttachState::new(&paths, &campaign_dir, *campaign);
-            if args.why {
-                print!(
-                    "{}",
-                    commands::campaign::campaign_why_failed_report(
-                        &paths,
-                        &state.campaign,
-                        state.rollup.as_ref()
-                    )
-                );
-            } else if args.view.is_narrative() && args.json {
-                print_campaign_narrative_json(&paths, &state.campaign, args.visual)?;
-            } else if args.view.is_narrative() && (!io::stdout().is_terminal() || args.plain) {
-                print_campaign_narrative_plain(&paths, &state.campaign, args.visual)?;
-            } else if args.json {
-                print!(
-                    "{}",
-                    commands::campaign::campaign_attach_json_text(Some(&paths), &state)?
-                );
-            } else if io::stdout().is_terminal() && !args.plain {
-                let show_hints = completion_hints_enabled(args.no_hints);
-                print_attach_banner("campaign", &state.campaign.campaign_id);
-                attach_campaign_tui(
-                    &paths,
-                    state,
-                    show_hints,
-                    args.view,
-                    args.visual,
-                    narrative_config.clone(),
-                )
+            attach_campaign_read_model(&paths, &campaign_dir, &campaign, &args, &narrative_config)
                 .await?;
-            } else {
-                print!(
-                    "{}",
-                    commands::campaign::campaign_attach_summary(
-                        Some(&paths),
-                        &state.campaign,
-                        state.rollup.as_ref(),
-                    )
-                );
-            }
             return Ok(());
         }
         super::reference::ResolvedRef::Run(state) => *state,
@@ -103,27 +100,7 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
             *state
         }
         super::reference::ResolvedRef::Plan(plan) => {
-            let plan = *plan;
-            let show_hints = completion_hints_enabled(args.no_hints);
-            if args.view.is_narrative() && args.json {
-                print_plan_narrative_json(&paths, &plan, args.visual)?;
-            } else if args.view.is_narrative() && (!io::stdout().is_terminal() || args.plain) {
-                print_plan_narrative_plain(&paths, &plan, args.visual)?;
-            } else if io::stdout().is_terminal() && !args.plain && !args.json {
-                print_attach_banner("plan", &plan.plan_id);
-                attach_plan_session(
-                    &paths,
-                    &plan.plan_id,
-                    show_hints,
-                    args.view,
-                    args.visual,
-                    &narrative_config,
-                    None,
-                )
-                .await?;
-            } else {
-                print_plan_summary(&paths, &plan, show_hints);
-            }
+            attach_plan_read_model(&paths, &plan, &args, &narrative_config).await?;
             return Ok(());
         }
         super::reference::ResolvedRef::Chain(chain) => {
@@ -242,6 +219,118 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
         print_run_summary(&state);
     }
     print_steer_inbox_state(&state)?;
+    Ok(())
+}
+
+fn job_attach_driver_state(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+) -> Result<Option<commands::graph_job::DriverState>> {
+    let path = commands::graph_job::driver_state_path(paths, job_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let driver = commands::graph_job::load_driver_state(paths, job_id)?;
+    if driver.job_id.as_ref() != job_id || driver.artifact_id != job_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "advanced attach mapping for job {job_id} does not retain the Job identity"
+        ))));
+    }
+    match driver.kind {
+        commands::graph_job::DriverKind::Review | commands::graph_job::DriverKind::FullPlan
+            if driver.artifact_kind != "plan" =>
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "advanced attach mapping for job {job_id} expected a plan artifact"
+            ))));
+        }
+        commands::graph_job::DriverKind::Campaign if driver.artifact_kind != "campaign" => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "advanced attach mapping for job {job_id} expected a campaign artifact"
+            ))));
+        }
+        _ => {}
+    }
+    Ok(Some(driver))
+}
+
+async fn attach_plan_read_model(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::Plan,
+    args: &AttachCommandArgs,
+    narrative_config: &NarrativeAttachConfig,
+) -> Result<()> {
+    let show_hints = completion_hints_enabled(args.no_hints);
+    if args.view.is_narrative() && args.json {
+        print_plan_narrative_json(paths, plan, args.visual)?;
+    } else if args.view.is_narrative() && (!io::stdout().is_terminal() || args.plain) {
+        print_plan_narrative_plain(paths, plan, args.visual)?;
+    } else if io::stdout().is_terminal() && !args.plain && !args.json {
+        print_attach_banner("plan", &plan.plan_id);
+        attach_plan_session(
+            paths,
+            &plan.plan_id,
+            show_hints,
+            args.view,
+            args.visual,
+            narrative_config,
+            None,
+        )
+        .await?;
+    } else {
+        print_plan_summary(paths, plan, show_hints);
+    }
+    Ok(())
+}
+
+async fn attach_campaign_read_model(
+    paths: &DeadreckonPaths,
+    campaign_dir: &Path,
+    campaign: &deadreckon_core::campaign::Campaign,
+    args: &AttachCommandArgs,
+    narrative_config: &NarrativeAttachConfig,
+) -> Result<()> {
+    let state = commands::campaign::CampaignAttachState::new(paths, campaign_dir, campaign.clone());
+    if args.why {
+        print!(
+            "{}",
+            commands::campaign::campaign_why_failed_report(
+                paths,
+                &state.campaign,
+                state.rollup.as_ref()
+            )
+        );
+    } else if args.view.is_narrative() && args.json {
+        print_campaign_narrative_json(paths, &state.campaign, args.visual)?;
+    } else if args.view.is_narrative() && (!io::stdout().is_terminal() || args.plain) {
+        print_campaign_narrative_plain(paths, &state.campaign, args.visual)?;
+    } else if args.json {
+        print!(
+            "{}",
+            commands::campaign::campaign_attach_json_text(Some(paths), &state)?
+        );
+    } else if io::stdout().is_terminal() && !args.plain {
+        let show_hints = completion_hints_enabled(args.no_hints);
+        print_attach_banner("campaign", &state.campaign.campaign_id);
+        attach_campaign_tui(
+            paths,
+            state,
+            show_hints,
+            args.view,
+            args.visual,
+            narrative_config.clone(),
+        )
+        .await?;
+    } else {
+        print!(
+            "{}",
+            commands::campaign::campaign_attach_summary(
+                Some(paths),
+                &state.campaign,
+                state.rollup.as_ref(),
+            )
+        );
+    }
     Ok(())
 }
 
@@ -1431,6 +1520,69 @@ fn wait_for_return(message: &str) -> Result<()> {
     let _ = disable_raw_mode();
     println!();
     outcome
+}
+
+#[cfg(test)]
+mod job_attach_tests {
+    use chrono::Utc;
+    use deadreckon_protocol::JobId;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn graph_job_without_result_delegates_attach_to_same_identity_driver() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "durable-plan-job";
+        commands::job::write_json_synced(
+            &commands::graph_job::driver_state_path(&paths, job_id),
+            &commands::graph_job::DriverState {
+                schema_version: 1,
+                job_id: JobId(job_id.to_string()),
+                kind: commands::graph_job::DriverKind::FullPlan,
+                artifact_kind: "plan".to_string(),
+                artifact_id: job_id.to_string(),
+                recorded_at: Utc::now(),
+            },
+        )
+        .expect("driver state");
+
+        let target = job_attach_driver_state(&paths, job_id)
+            .expect("attach target")
+            .expect("advanced read model");
+
+        assert_eq!(target.artifact_id, job_id);
+        assert_eq!(target.artifact_kind, "plan");
+        assert_eq!(target.kind, commands::graph_job::DriverKind::FullPlan);
+    }
+
+    #[test]
+    fn advanced_attach_fails_closed_when_driver_drops_job_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "durable-campaign-job";
+        commands::job::write_json_synced(
+            &commands::graph_job::driver_state_path(&paths, job_id),
+            &commands::graph_job::DriverState {
+                schema_version: 1,
+                job_id: JobId(job_id.to_string()),
+                kind: commands::graph_job::DriverKind::Campaign,
+                artifact_kind: "campaign".to_string(),
+                artifact_id: "different-artifact".to_string(),
+                recorded_at: Utc::now(),
+            },
+        )
+        .expect("driver state");
+
+        let error = job_attach_driver_state(&paths, job_id)
+            .expect_err("identity mismatch must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not retain the Job identity")
+        );
+    }
 }
 
 const PLAN_LIST_PAGE: usize = 10;

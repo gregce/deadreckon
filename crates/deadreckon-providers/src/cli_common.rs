@@ -3,7 +3,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as run_sandbox};
+use deadreckon_sandbox::{
+    SandboxBackend, SandboxSpec, ToolSandboxPolicy, WorkspaceAccess, run as run_sandbox,
+};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +22,7 @@ pub(crate) struct CliOutput {
     pub sandbox_warning: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_cli(
     provider: &str,
     binary: &str,
@@ -28,6 +31,8 @@ pub(crate) async fn run_cli(
     sandbox_backend: Option<SandboxBackend>,
     pid_file: Option<PathBuf>,
     cancellation_token: Option<CancellationToken>,
+    workspace_access: WorkspaceAccess,
+    inner_read_only_enforced: bool,
 ) -> Result<CliOutput> {
     run_cli_with_options(
         provider,
@@ -39,6 +44,8 @@ pub(crate) async fn run_cli(
             pid_file,
             cancellation_token,
             extra_write_allowlist: Vec::new(),
+            workspace_access,
+            inner_read_only_enforced,
         },
     )
     .await
@@ -50,6 +57,11 @@ pub(crate) struct CliRunOptions {
     pub(crate) pid_file: Option<PathBuf>,
     pub(crate) cancellation_token: Option<CancellationToken>,
     pub(crate) extra_write_allowlist: Vec<PathBuf>,
+    pub(crate) workspace_access: WorkspaceAccess,
+    /// True only when the provider CLI has its own enforceable read-only
+    /// sandbox (currently Codex). This permits a read-only request without an
+    /// outer backend while preserving fail-closed behavior for other CLIs.
+    pub(crate) inner_read_only_enforced: bool,
 }
 
 pub(crate) async fn run_cli_with_options(
@@ -58,6 +70,16 @@ pub(crate) async fn run_cli_with_options(
     args: &[String],
     options: CliRunOptions,
 ) -> Result<CliOutput> {
+    if options.workspace_access == WorkspaceAccess::ReadOnly
+        && options.sandbox_backend.is_none()
+        && !options.inner_read_only_enforced
+    {
+        return Err(ProviderError::Cli {
+            provider: provider.to_string(),
+            detail: "read-only workspace access requires an enforceable sandbox backend"
+                .to_string(),
+        });
+    }
     if let Some(backend) = options.sandbox_backend {
         let cwd = options
             .cwd
@@ -92,6 +114,7 @@ pub(crate) async fn run_cli_with_options(
             read_denylist: Vec::new(),
             write_denylist: Vec::new(),
             network_allowlist: policy.network_allowlist,
+            workspace_access: options.workspace_access,
         })
         .await
         .map_err(|source| ProviderError::Cli {
@@ -307,12 +330,39 @@ pub(crate) fn ensure_success(provider: &str, output: &CliOutput) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::cli_provider_write_allowlist;
+    use super::{CliRunOptions, cli_provider_write_allowlist, run_cli_with_options};
+    use deadreckon_sandbox::WorkspaceAccess;
 
     #[test]
     fn migrated_cli_codex_uses_descriptor_sandbox_writes() {
         let paths = cli_provider_write_allowlist("cli:codex");
         assert!(paths.iter().any(|path| path.ends_with(".codex")));
         assert!(!paths.iter().any(|path| path.ends_with(".claude")));
+    }
+
+    #[tokio::test]
+    async fn read_only_cli_without_inner_or_outer_sandbox_fails_closed() {
+        let error = run_cli_with_options(
+            "cli:generic",
+            "true",
+            &[],
+            CliRunOptions {
+                cwd: None,
+                sandbox_backend: None,
+                pid_file: None,
+                cancellation_token: None,
+                extra_write_allowlist: Vec::new(),
+                workspace_access: WorkspaceAccess::ReadOnly,
+                inner_read_only_enforced: false,
+            },
+        )
+        .await
+        .expect_err("read-only must be enforced");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires an enforceable sandbox backend")
+        );
     }
 }

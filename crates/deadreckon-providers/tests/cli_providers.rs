@@ -2,6 +2,7 @@ use std::fs;
 
 use deadreckon_providers::{
     ProviderConfigFile, ProviderEntry, ProviderKind, ProviderRequest, ProviderRouter,
+    WorkspaceAccess,
 };
 use deadreckon_sandbox::SandboxBackend;
 use tempfile::TempDir;
@@ -45,6 +46,7 @@ async fn cli_claude_code_provider_runs_fake_binary_and_captures_output() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: Some(output_path.clone()),
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -107,6 +109,7 @@ async fn cli_provider_cancellation_stops_non_sandbox_process() {
         cwd: Some(temp.path().to_path_buf()),
         output_path: None,
         sandbox_backend: None,
+        workspace_access: WorkspaceAccess::ReadWrite,
         pid_file: Some(pid_file.clone()),
         cancellation_token: Some(token.clone()),
         session_dir: None,
@@ -160,6 +163,7 @@ async fn cli_codex_provider_uses_exec_verb() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -213,6 +217,7 @@ async fn cli_codex_provider_delimits_option_like_prompt_payload() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -277,6 +282,7 @@ async fn cli_codex_model_override_passes_model_flag() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -331,6 +337,7 @@ async fn cli_claude_model_config_passes_model_flag() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -391,6 +398,7 @@ try_lines = ["install local-test"]
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -982,6 +990,7 @@ args_template = ["exec", "--", "{{prompt}}"]
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -1044,6 +1053,7 @@ model_arg = "--model"
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -1102,6 +1112,7 @@ model_arg = "--model"
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -1155,6 +1166,7 @@ async fn generic_cli_provider_runs_builtin_copilot_descriptor() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -1213,6 +1225,7 @@ async fn generic_cli_provider_passes_copilot_model_arg() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -1265,6 +1278,7 @@ async fn generic_cli_provider_runs_builtin_pi_descriptor() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -1323,6 +1337,7 @@ async fn generic_cli_provider_passes_pi_model_arg() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -1379,6 +1394,7 @@ args_template = ["run", "{{prompt}}"]
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -1439,6 +1455,7 @@ async fn cli_provider_runs_inside_requested_sandbox_backend() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: None,
             sandbox_backend: Some(SandboxBackend::None),
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: Some(pid_file.clone()),
             cancellation_token: None,
             session_dir: None,
@@ -1498,6 +1515,7 @@ async fn cli_provider_resolves_user_path_binary_inside_sandbox_exec() {
                 cwd: Some(temp_path),
                 output_path: None,
                 sandbox_backend: Some(SandboxBackend::SandboxExec),
+                workspace_access: WorkspaceAccess::ReadWrite,
                 pid_file: None,
                 cancellation_token: None,
                 session_dir: None,
@@ -1584,6 +1602,7 @@ async fn cli_provider_errors_on_nonzero_exit_after_capturing_output() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: Some(output_path.clone()),
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,
@@ -1966,6 +1985,45 @@ async fn distinct_runs_never_share_a_conversation() {
     // Each run's first turn is fresh — a distinct run never resumes another's.
     assert_eq!(a.trace["contract"]["resumed"], false);
     assert_eq!(b.trace["contract"]["resumed"], false);
+}
+
+#[tokio::test]
+async fn semantic_judge_has_no_worker_session_or_write_capability() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    write_fake_codex(&binary, CODEX_TURN_JSONL, "{\"decision\":\"achieved\"}");
+    let session_dir = temp.path().join("worker-run");
+    let router = codex_router(&binary);
+
+    router
+        .complete(&ProviderRequest {
+            prompt: "worker turn".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            session_dir: Some(session_dir.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("worker turn");
+
+    let judgment = router
+        .complete(&ProviderRequest {
+            prompt: "judge this evidence".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            session_dir: Some(session_dir),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            ..Default::default()
+        })
+        .await
+        .expect("read-only judgment");
+
+    let args = judgment.trace["args"].as_array().expect("args");
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--sandbox" && pair[1] == "read-only")
+    );
+    assert!(!args.iter().any(|arg| arg == "resume"));
+    assert_eq!(judgment.trace["contract"]["resumed"], false);
+    assert_eq!(judgment.trace["workspace_access"], "read-only");
 }
 
 #[allow(clippy::expect_used)]

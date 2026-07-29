@@ -276,6 +276,7 @@ pub async fn run_turn_loop(
             cwd: Some(state.working_dir.clone()),
             output_path: Some(turn_dir.join(stdout_name)),
             sandbox_backend: Some(config.sandbox_backend),
+            workspace_access: deadreckon_sandbox::WorkspaceAccess::ReadWrite,
             pid_file: Some(
                 state
                     .run_root
@@ -653,13 +654,38 @@ pub async fn run_turn_loop(
             save_history(state, &history)?;
             save_state(state)?;
             complete_run_docs(state, router, &config).await?;
-            if !acceptance_gate_passed_or_record_failure(
+            let Some(marker) = acceptance_gate_passed_or_record_failure(
                 state,
                 config.event_sender.as_ref(),
                 turn,
                 &mut history,
-            )? {
+                config.sandbox_backend,
+            )?
+            else {
                 continue;
+            };
+            match semantic_completion_disposition(
+                state,
+                router,
+                &config,
+                turn,
+                &marker,
+                &mut history,
+            )
+            .await?
+            {
+                SemanticCompletionDisposition::Achieved => {}
+                SemanticCompletionDisposition::Revise => continue,
+                SemanticCompletionDisposition::NeedsReview => {
+                    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+                    save_state(state)?;
+                    emit_run_completed(
+                        state,
+                        config.event_sender.as_ref(),
+                        RunLoopOutcome::Failed,
+                    )?;
+                    return Ok(RunLoopOutcome::Failed);
+                }
             }
             promote_if_ready(state)?;
             state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
@@ -753,6 +779,7 @@ pub async fn run_turn_loop(
                     read_denylist: Vec::new(),
                     write_denylist: Vec::new(),
                     network_allowlist: policy.network_allowlist,
+                    workspace_access: deadreckon_sandbox::WorkspaceAccess::ReadWrite,
                 })
                 .await
                 {
@@ -1015,13 +1042,38 @@ pub async fn run_turn_loop(
                     continue;
                 }
                 complete_run_docs(state, router, &config).await?;
-                if !acceptance_gate_passed_or_record_failure(
+                let Some(marker) = acceptance_gate_passed_or_record_failure(
                     state,
                     config.event_sender.as_ref(),
                     turn,
                     &mut history,
-                )? {
+                    config.sandbox_backend,
+                )?
+                else {
                     continue;
+                };
+                match semantic_completion_disposition(
+                    state,
+                    router,
+                    &config,
+                    turn,
+                    &marker,
+                    &mut history,
+                )
+                .await?
+                {
+                    SemanticCompletionDisposition::Achieved => {}
+                    SemanticCompletionDisposition::Revise => continue,
+                    SemanticCompletionDisposition::NeedsReview => {
+                        state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+                        save_state(state)?;
+                        emit_run_completed(
+                            state,
+                            config.event_sender.as_ref(),
+                            RunLoopOutcome::Failed,
+                        )?;
+                        return Ok(RunLoopOutcome::Failed);
+                    }
                 }
                 promote_if_ready(state)?;
                 state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
@@ -2085,8 +2137,21 @@ fn provider_output_name(provider: &str) -> String {
     }
 }
 
-fn run_acceptance_gate(state: &PipelineState) -> Result<()> {
+/// Execute the real `dr-gate` binary for an already-materialized result.
+///
+/// This is also used by the durable graph supervisor after it has copied the
+/// merged artifact into the parent job's result run. It intentionally does
+/// not expose marker construction: only `dr-gate` receives the signing key.
+pub fn run_deterministic_completion_gate(
+    state: &PipelineState,
+    requested_backend: SandboxBackend,
+) -> Result<()> {
     let gate = gate_binary_path()?;
+    let paths = paths_for_state(state)?;
+    let gate_key = deadreckon_core::read_gate_key(&paths, &state.run_id)?;
+    let encoded_key = deadreckon_core::encode_gate_key(&gate_key)?;
+    let (resolved_backend, _) = deadreckon_sandbox::resolve_backend(requested_backend)
+        .map_err(|err| sandbox_error(&err))?;
     let output = std::process::Command::new(&gate)
         .arg("--run")
         .arg(&state.run_id)
@@ -2094,6 +2159,19 @@ fn run_acceptance_gate(state: &PipelineState) -> Result<()> {
         .arg(&state.run_root)
         .arg("--working-dir")
         .arg(&state.working_dir)
+        .env(deadreckon_core::GATE_KEY_ENV, encoded_key)
+        .env(
+            deadreckon_core::GATE_CONTAINED_ENV,
+            if resolved_backend == SandboxBackend::None {
+                "false"
+            } else {
+                "true"
+            },
+        )
+        .env(
+            deadreckon_core::GATE_SANDBOX_BACKEND_ENV,
+            resolved_backend.to_string(),
+        )
         .output()
         .map_err(|source| DeadreckonError::Io {
             path: gate.clone(),
@@ -2109,14 +2187,242 @@ fn run_acceptance_gate(state: &PipelineState) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticCompletionDisposition {
+    Achieved,
+    Revise,
+    NeedsReview,
+}
+
+async fn semantic_completion_disposition(
+    state: &mut PipelineState,
+    router: &ProviderRouter,
+    config: &RunLoopConfig,
+    turn: u32,
+    marker: &deadreckon_core::AcceptanceMarker,
+    history: &mut Vec<String>,
+) -> Result<SemanticCompletionDisposition> {
+    let paths = paths_for_state(state)?;
+    if !paths.job_json(&state.run_id).is_file() {
+        // Compatibility runs predate Watchkeeper. They keep their historical
+        // deterministic completion path and are never presented as a new
+        // two-key Job receipt.
+        return Ok(SemanticCompletionDisposition::Achieved);
+    }
+    let job = deadreckon_core::load_job(&paths, &state.run_id)?;
+    if job.policy.semantic_judge == deadreckon_protocol::SemanticJudgeMode::Disabled {
+        record_needs_review(
+            state,
+            turn,
+            history,
+            "semantic judging is disabled; a new job cannot be reported verified without the second key",
+        )?;
+        return Ok(SemanticCompletionDisposition::NeedsReview);
+    }
+
+    let semantic_run = match crate::semantic_judge::run_semantic_judge(
+        state,
+        marker,
+        router,
+        config.sandbox_backend,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            record_needs_review(
+                state,
+                turn,
+                history,
+                &format!("strict semantic judge unavailable: {error}"),
+            )?;
+            return Ok(SemanticCompletionDisposition::NeedsReview);
+        }
+    };
+    record_semantic_judge_accounting(state, turn, config, &semantic_run)?;
+    match semantic_run.result {
+        crate::semantic_judge::SemanticJudgeResult::Achieved(judgment) => {
+            let seal_result = (|| -> Result<()> {
+                let authority_path = paths.job_authority(&state.run_id);
+                let raw = std::fs::read(&authority_path).map_err(|source| DeadreckonError::Io {
+                    path: authority_path.clone(),
+                    source,
+                })?;
+                let authority: deadreckon_protocol::JobAuthority = serde_json::from_slice(&raw)
+                    .map_err(|source| DeadreckonError::Json {
+                        path: authority_path,
+                        source,
+                    })?;
+                deadreckon_core::seal_completion_receipt(
+                    &paths, state, &authority, marker, &judgment,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = seal_result {
+                record_needs_review(
+                    state,
+                    turn,
+                    history,
+                    &format!(
+                        "semantic judgment achieved, but the combined receipt could not be sealed: {error}"
+                    ),
+                )?;
+                return Ok(SemanticCompletionDisposition::NeedsReview);
+            }
+            Ok(SemanticCompletionDisposition::Achieved)
+        }
+        crate::semantic_judge::SemanticJudgeResult::Revise(judgment) => {
+            let missing = if judgment.missing.is_empty() {
+                "no explicit missing clauses supplied".to_string()
+            } else {
+                judgment.missing.join("; ")
+            };
+            let feedback = format!(
+                "independent semantic judge requested revision after turn {turn}: {}. Missing: {missing}",
+                judgment.summary
+            );
+            history.push(feedback.clone());
+            state.failure_reason = Some(feedback);
+            save_history(state, history)?;
+            save_state(state)?;
+            Ok(SemanticCompletionDisposition::Revise)
+        }
+        crate::semantic_judge::SemanticJudgeResult::NeedsReview(judgment) => {
+            record_needs_review(
+                state,
+                turn,
+                history,
+                &format!("semantic judge was uncertain: {}", judgment.summary),
+            )?;
+            Ok(SemanticCompletionDisposition::NeedsReview)
+        }
+        crate::semantic_judge::SemanticJudgeResult::Unavailable(reason) => {
+            record_needs_review(state, turn, history, &reason)?;
+            Ok(SemanticCompletionDisposition::NeedsReview)
+        }
+    }
+}
+
+fn record_semantic_judge_accounting(
+    state: &mut PipelineState,
+    turn: u32,
+    config: &RunLoopConfig,
+    semantic_run: &crate::semantic_judge::SemanticJudgeRun,
+) -> Result<()> {
+    let accounting = &semantic_run.accounting;
+    state.total_spend_usd += accounting.cost_usd;
+    state.total_wall_seconds += accounting.wall_time_seconds;
+    append_spend(
+        state,
+        &SpendRecord {
+            timestamp: Utc::now(),
+            turn,
+            provider: accounting.provider.clone(),
+            model: accounting.model.clone(),
+            input_tokens: accounting.input_tokens,
+            output_tokens: accounting.output_tokens,
+            cost_usd: accounting.cost_usd,
+            total_cost_usd: state.total_spend_usd,
+            cap_usd: config.max_spend_usd,
+            subscription: accounting.subscription,
+            estimated: false,
+            wall_time_seconds: Some(accounting.wall_time_seconds),
+            wall_time_cap_seconds: config.max_wall_seconds,
+            kind: "semantic_judge".to_string(),
+        },
+    )?;
+    let (event, reason) = match &semantic_run.result {
+        crate::semantic_judge::SemanticJudgeResult::Achieved(_) => {
+            ("semantic_judge.achieved", None)
+        }
+        crate::semantic_judge::SemanticJudgeResult::Revise(_) => ("semantic_judge.revise", None),
+        crate::semantic_judge::SemanticJudgeResult::NeedsReview(_) => {
+            ("semantic_judge.uncertain", None)
+        }
+        crate::semantic_judge::SemanticJudgeResult::Unavailable(reason) => {
+            ("semantic_judge.unavailable", Some(reason.as_str()))
+        }
+    };
+    let input_sha256 = semantic_run
+        .result
+        .judgment()
+        .map(|judgment| judgment.input_sha256.clone());
+    let decision = semantic_run
+        .result
+        .judgment()
+        .map(|judgment| judgment.decision);
+    let summary = semantic_run
+        .result
+        .judgment()
+        .map(|judgment| judgment.summary.clone());
+    let missing = semantic_run
+        .result
+        .judgment()
+        .map(|judgment| judgment.missing.clone());
+    append_trace(
+        state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn,
+            event: event.to_string(),
+            latency_ms: Some((accounting.wall_time_seconds.max(0.0) * 1_000.0).round() as u128),
+            detail: json!({
+                "provider": accounting.provider,
+                "model": accounting.model,
+                "input_tokens": accounting.input_tokens,
+                "output_tokens": accounting.output_tokens,
+                "spend_usd": accounting.cost_usd,
+                "wall_time_seconds": accounting.wall_time_seconds,
+                "sandbox_backend": accounting.sandbox_backend,
+                "workspace_access": "read-only",
+                "worker_session": false,
+                "input_sha256": input_sha256,
+                "decision": decision,
+                "summary": summary,
+                "missing": missing,
+                "reason": reason,
+            }),
+        },
+    )
+}
+
+fn record_needs_review(
+    state: &mut PipelineState,
+    turn: u32,
+    history: &mut Vec<String>,
+    reason: &str,
+) -> Result<()> {
+    let message = format!("NEEDS_REVIEW: {reason}");
+    append_trace(
+        state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn,
+            event: "semantic_judge.needs_review".to_string(),
+            latency_ms: None,
+            detail: json!({ "reason": reason }),
+        },
+    )?;
+    history.push(message.clone());
+    state.failure_reason = Some(message);
+    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+    save_history(state, history)?;
+    save_state(state)
+}
+
 fn acceptance_gate_passed_or_record_failure(
     state: &mut PipelineState,
     sender: Option<&broadcast::Sender<RunEvent>>,
     turn: u32,
     history: &mut Vec<String>,
-) -> Result<bool> {
-    match run_acceptance_gate(state).and_then(|()| validate_acceptance_marker(state)) {
-        Ok(_) => Ok(true),
+    sandbox_backend: SandboxBackend,
+) -> Result<Option<deadreckon_core::AcceptanceMarker>> {
+    match run_deterministic_completion_gate(state, sandbox_backend)
+        .and_then(|()| validate_acceptance_marker(state))
+    {
+        Ok(marker) => Ok(Some(marker)),
         Err(err) => {
             let reason = err.to_string();
             append_trace(
@@ -2144,7 +2450,7 @@ fn acceptance_gate_passed_or_record_failure(
             state.failure_reason = Some(format!("acceptance failed after turn {turn}: {reason}"));
             save_history(state, history)?;
             save_state(state)?;
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -2229,12 +2535,13 @@ mod tests {
 
     use super::{
         NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
-        append_provider_approval_traces, append_tool_refusal, bash_policy_refusal,
-        build_cli_subagent_prompt, build_prompt, complete_within_wall_budget, ensure_sandbox_toml,
-        implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
-        load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, policy_seam_refusal,
-        policy_seam_refusal_message, provider_output_name, run_turn_loop, safe_working_path,
-        safe_working_path_with_policy, save_history,
+        SemanticCompletionDisposition, append_provider_approval_traces, append_tool_refusal,
+        bash_policy_refusal, build_cli_subagent_prompt, build_prompt, complete_within_wall_budget,
+        ensure_sandbox_toml, implementation_notes_ready_or_request_followup,
+        is_direct_api_provider_kind, load_or_reconstruct_history,
+        load_tool_policy_from_sandbox_toml, policy_seam_refusal, policy_seam_refusal_message,
+        provider_output_name, record_semantic_judge_accounting, run_turn_loop, safe_working_path,
+        safe_working_path_with_policy, save_history, semantic_completion_disposition,
     };
 
     fn base_run_loop_config() -> RunLoopConfig {
@@ -2385,6 +2692,137 @@ mod tests {
         )
         .expect("run");
         (paths, state)
+    }
+
+    #[test]
+    fn semantic_judge_spend_and_time_are_durable_even_when_unavailable() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, mut state) = create_smoke_run(&temp, "judge accounting");
+        let semantic_run = crate::semantic_judge::SemanticJudgeRun {
+            result: crate::semantic_judge::SemanticJudgeResult::Unavailable(
+                "malformed semantic output".to_string(),
+            ),
+            accounting: crate::semantic_judge::SemanticJudgeAccounting {
+                provider: "judge-provider".to_string(),
+                model: "judge-model".to_string(),
+                input_tokens: 12,
+                output_tokens: 3,
+                cost_usd: 0.25,
+                subscription: false,
+                wall_time_seconds: 1.5,
+                sandbox_backend: Some("sandbox-exec".to_string()),
+            },
+        };
+        let config = RunLoopConfig {
+            max_spend_usd: Some(2.0),
+            max_wall_seconds: Some(30.0),
+            ..base_run_loop_config()
+        };
+
+        record_semantic_judge_accounting(&mut state, 1, &config, &semantic_run)
+            .expect("record accounting");
+
+        assert_eq!(state.total_spend_usd, 0.25);
+        assert_eq!(state.total_wall_seconds, 1.5);
+        let spend = std::fs::read_to_string(state.run_root.join("spend.jsonl")).expect("spend");
+        let trace = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("trace");
+        assert!(spend.contains("\"kind\":\"semantic_judge\""), "{spend}");
+        assert!(
+            trace.contains("\"event\":\"semantic_judge.unavailable\""),
+            "{trace}"
+        );
+        assert!(trace.contains("\"worker_session\":false"), "{trace}");
+        assert!(
+            trace.contains("\"workspace_access\":\"read-only\""),
+            "{trace}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_sealing_failure_stops_strict_job_needs_review() {
+        use chrono::Utc;
+        use deadreckon_core::{AcceptanceMarker, AcceptanceProofKind, write_job};
+        use deadreckon_protocol::{
+            Job, JobId, JobPolicy, JobSchemaVersion, JobShape, SemanticJudgeMode,
+        };
+
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "strict semantic result");
+        write_job(
+            &paths,
+            &Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId(state.run_id.clone()),
+                scope: state.scope.clone(),
+                goal: state.goal.clone(),
+                shape: JobShape::Single,
+                created_at: Utc::now(),
+                source_cwd: state.cwd.clone(),
+                launch_plan_sha256: "sha256:launch".to_string(),
+                authority_sha256: "sha256:authority".to_string(),
+                policy: JobPolicy {
+                    max_spend_usd: 1.0,
+                    max_wall_seconds: 60,
+                    max_attempts: 1,
+                    deadline: None,
+                    semantic_judge: SemanticJudgeMode::Required,
+                },
+            },
+        )
+        .expect("job");
+        let authority_path = paths.job_authority(&state.run_id);
+        std::fs::create_dir_all(authority_path.parent().expect("authority parent"))
+            .expect("authority parent");
+        std::fs::write(&authority_path, "{}\n").expect("authority");
+        let marker = AcceptanceMarker {
+            schema_version: 2,
+            run_id: state.run_id.clone(),
+            status: "passed".to_string(),
+            produced_by: "dr-gate".to_string(),
+            issuer: "dr-gate".to_string(),
+            proof_kind: AcceptanceProofKind::NativeGate,
+            checked_at: Utc::now(),
+            working_dir: state.working_dir.clone(),
+            contained: true,
+            sandbox_backend: "sandbox-exec".to_string(),
+            signature: "test".to_string(),
+            check_count: 0,
+            checks: Vec::new(),
+        };
+        let mut history = Vec::new();
+        let router = ProviderRouter::smoke();
+
+        let disposition = semantic_completion_disposition(
+            &mut state,
+            &router,
+            &base_run_loop_config(),
+            1,
+            &marker,
+            &mut history,
+        )
+        .await
+        .expect("semantic disposition");
+
+        assert_eq!(disposition, SemanticCompletionDisposition::NeedsReview);
+        assert!(
+            state
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("NEEDS_REVIEW:"))
+        );
+        let trace = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("trace");
+        assert!(
+            trace.contains("\"event\":\"semantic_judge.achieved\""),
+            "{trace}"
+        );
+        assert!(trace.contains("\"event\":\"semantic_judge.needs_review\""));
+        assert!(
+            state
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("receipt could not be sealed"))
+        );
+        assert_eq!(state.status, RunStatus::Failed);
     }
 
     fn write_seams_config(paths: &DeadreckonPaths, raw: &str) -> PathBuf {
